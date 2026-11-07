@@ -449,33 +449,6 @@ fn unmount_stage() {
     }
 }
 
-/// The locked flags of the mount `path` is on, as `MS_*` bits: read-only,
-/// `nosuid`, `nodev`, `noexec`. Restating one already set changes nothing;
-/// a path whose mount cannot be read gives none, and the bind's own remount
-/// then says whether one was needed.
-pub(crate) fn locked_of(path: &Path) -> libc::c_ulong {
-    use nix::sys::statvfs::FsFlags;
-
-    let Ok(stat) = nix::sys::statfs::statfs(path) else {
-        return 0;
-    };
-    let flags = stat.flags();
-    let mut ms = 0;
-    if flags.contains(FsFlags::ST_RDONLY) {
-        ms |= libc::MS_RDONLY;
-    }
-    if flags.contains(FsFlags::ST_NOSUID) {
-        ms |= libc::MS_NOSUID;
-    }
-    if flags.contains(FsFlags::ST_NODEV) {
-        ms |= libc::MS_NODEV;
-    }
-    if flags.contains(FsFlags::ST_NOEXEC) {
-        ms |= libc::MS_NOEXEC;
-    }
-    ms
-}
-
 /// Creates the patch path `rel` beneath the tree at `root` when it does not
 /// exist yet: a read-write patch's missing directories and its file or
 /// directory, one component at a time, never out of the tree. A file is
@@ -757,7 +730,8 @@ mod tests {
         ) {
             return;
         }
-        let (root, _home, _outside) = home_and_outside();
+        let (root, home, _outside) = home_and_outside();
+        let locked = crate::locked_ms_flags(&home);
         let mut container = hakoniwa::Container::new();
         container.rootfs("/").unwrap();
         container.bindmount_rw(root.path().to_str().unwrap(), "/t");
@@ -777,7 +751,6 @@ mod tests {
                 {
                     return 12;
                 }
-                let locked = locked_of(Path::new("/t/home"));
                 if bind_clone(handle.as_fd(), handle.as_fd(), true, true, locked).is_err() {
                     return 13;
                 }
@@ -851,7 +824,7 @@ mod tests {
                 target: "/home/a/b".into(),
                 read_only: true,
                 is_file: false,
-                locked: locked_of(&t.join("home")),
+                locked: crate::locked_ms_flags(&t.join("home")),
             },
         ];
         let mut container = hakoniwa::Container::new();

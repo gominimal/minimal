@@ -2389,7 +2389,7 @@ impl<C: Channel> Sandbox<C> {
         let mounts = session_bind::plan(
             &trees,
             self.config.wd.fs_mappings(),
-            session_bind::locked_of,
+            locked_ms_flags,
         )
         .map_err(|path| {
             Error::Execution(ExecutionError::MountError {
@@ -2933,6 +2933,29 @@ fn log_input_collision(verb: &str, src: &Path, dest: &Path) {
 /// restrictions like RDONLY).
 #[cfg(target_os = "linux")]
 fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
+    let ms = locked_ms_flags(path);
+    let mut opts = hakoniwa::MountOptions::empty();
+    for (bit, opt) in [
+        (libc::MS_RDONLY, hakoniwa::MountOptions::RDONLY),
+        (libc::MS_NOSUID, hakoniwa::MountOptions::NOSUID),
+        (libc::MS_NODEV, hakoniwa::MountOptions::NODEV),
+        (libc::MS_NOEXEC, hakoniwa::MountOptions::NOEXEC),
+    ] {
+        if ms & bit != 0 {
+            opts |= opt;
+        }
+    }
+    opts
+}
+
+/// The kernel-locked flags of the mount `path` is on, as `MS_*` bits:
+/// read-only, `nosuid`, `nodev`, `noexec`. The one reading of them, for
+/// hakoniwa's binds ([`locked_mount_flags`]) and for the session binds the
+/// pre-exec closure remounts itself (`session_bind`). A path whose mount
+/// cannot be read gives none, with a warning; the remount then says whether
+/// one was needed.
+#[cfg(target_os = "linux")]
+pub(crate) fn locked_ms_flags(path: &Path) -> libc::c_ulong {
     use nix::sys::statfs::statfs;
     use nix::sys::statvfs::FsFlags;
 
@@ -2943,25 +2966,23 @@ fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
                 "statfs({}) failed: {e}, not adding locked mount flags",
                 path.to_string_lossy()
             );
-            return hakoniwa::MountOptions::empty();
+            return 0;
         }
     };
 
     let flags = stat.flags();
-    let mut opts = hakoniwa::MountOptions::empty();
-    if flags.contains(FsFlags::ST_RDONLY) {
-        opts |= hakoniwa::MountOptions::RDONLY;
+    let mut ms = 0;
+    for (flag, bit) in [
+        (FsFlags::ST_RDONLY, libc::MS_RDONLY),
+        (FsFlags::ST_NOSUID, libc::MS_NOSUID),
+        (FsFlags::ST_NODEV, libc::MS_NODEV),
+        (FsFlags::ST_NOEXEC, libc::MS_NOEXEC),
+    ] {
+        if flags.contains(flag) {
+            ms |= bit;
+        }
     }
-    if flags.contains(FsFlags::ST_NOSUID) {
-        opts |= hakoniwa::MountOptions::NOSUID;
-    }
-    if flags.contains(FsFlags::ST_NODEV) {
-        opts |= hakoniwa::MountOptions::NODEV;
-    }
-    if flags.contains(FsFlags::ST_NOEXEC) {
-        opts |= hakoniwa::MountOptions::NOEXEC;
-    }
-    opts
+    ms
 }
 
 /// Best-effort probe for whether this host can create network namespaces.
@@ -6608,12 +6629,6 @@ int main(int argc, char **argv) {
         );
     }
 
-    /// The devpts remount, in a real box launched from the production path:
-    /// the box's `/dev/pts` carries the per-instance `max=` cap, keeps the
-    /// `nosuid,noexec` it was mounted with, and keeps `ptmxmode=0666`, so the
-    /// box's own unprivileged user can still open a PTY pair. A remount that
-    /// restated only `max=` would reset `ptmxmode` to 0000 and break every
-    /// PTY in every box; this is the test that catches it.
     /// inbox#1152, end to end through the production launch: a session box
     /// with a read-only patch in its home, one in its workbench, and one from
     /// outside both that lands under `/home` has each of them mounted
@@ -6703,6 +6718,12 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// The devpts remount, in a real box launched from the production path:
+    /// the box's `/dev/pts` carries the per-instance `max=` cap, keeps the
+    /// `nosuid,noexec` it was mounted with, and keeps `ptmxmode=0666`, so the
+    /// box's own unprivileged user can still open a PTY pair. A remount that
+    /// restated only `max=` would reset `ptmxmode` to 0000 and break every
+    /// PTY in every box; this is the test that catches it.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn box_devpts_is_capped_and_still_opens_a_pty() {
