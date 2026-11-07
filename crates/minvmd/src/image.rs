@@ -9,11 +9,13 @@
 //! image whose override is unset, so all the defaulted images of one boot come
 //! from one directory, one install: a user directory missing a file (an
 //! interrupted or older install) is passed over whole, never mixed with the
-//! machine's copy. A default install works with no env setup, a system install
-//! serves every user with no per-user copy, and a genuinely missing image still
-//! errors rather than silently returning a non-existent path.
+//! machine's copy. [`resolve_boot_images`] selects that directory once for
+//! the three images of a boot. A default install works with no env setup, a
+//! system install serves every user with no per-user copy, and a genuinely
+//! missing image still errors rather than silently returning a non-existent
+//! path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{SearchedDir, VmError};
 
@@ -78,36 +80,53 @@ fn override_path(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The override of each image, in [`IMAGES`] order: kernel, rootfs, initramfs.
+fn overrides() -> [Option<PathBuf>; 3] {
+    IMAGES.map(|(var, _)| override_path(var))
+}
+
+/// The images whose override is `None` in `overrides`, each with its file:
+/// the ones the image directory must hold.
+fn unset_images(overrides: &[Option<PathBuf>; 3]) -> Vec<(&'static str, &'static str)> {
+    IMAGES
+        .iter()
+        .zip(overrides)
+        .filter(|(_, o)| o.is_none())
+        .map(|(image, _)| *image)
+        .collect()
+}
+
 /// Return the override in `var` when set and non-empty (used verbatim, without
 /// an existence check — the caller owns an explicit path). Otherwise return
-/// `default_file` in the image directory: the first of the user's data
-/// directory and the system data directories that holds, as regular files,
-/// every image whose override is unset (see the module doc).
+/// `default_file` in the image directory (see [`select_image_dir`]).
 ///
-/// Errors with `VmError::MissingImage` when no directory holds them all,
-/// including when there is no directory to look in (no `XDG_DATA_HOME`, no
-/// `HOME` and no absolute `XDG_DATA_DIRS` entry).
+/// This selects the directory for one image. A caller that needs more than
+/// one image of a boot uses [`resolve_boot_images`], which selects it once.
 fn resolve_or_default(var: &'static str, default_file: &str) -> Result<PathBuf, VmError> {
     if let Some(path) = override_path(var) {
         return Ok(path);
     }
-    let unset: Vec<_> = IMAGES
-        .iter()
-        .filter(|(v, _)| override_path(v).is_none())
-        .copied()
-        .collect();
-    resolve_in(var, default_file, &unset, data_dir(), system_data_dirs())
+    let unset = unset_images(&overrides());
+    select_image_dir(var, &unset, data_dir(), system_data_dirs(), Path::is_file)
+        .map(|dir| dir.join(default_file))
 }
 
-/// The lookup behind [`resolve_or_default`], with its inputs passed in: `unset`
-/// pairs each override that is unset with its file, `user` is the user's data
-/// directory (`None` when none resolves) and `system` the system ones.
-fn resolve_in(
+/// The image directory: the first of `user` (the user's data directory, `None`
+/// when none resolves) and `system` (the system data directories) that holds,
+/// as files by `has_file`, every image in `unset` (each unset override with
+/// its file; see the module doc). `has_file` is [`Path::is_file`] outside
+/// tests.
+///
+/// Errors with `VmError::MissingImage`, `var` naming the image being resolved,
+/// when no directory holds them all, including when there is no directory to
+/// look in (no `XDG_DATA_HOME`, no `HOME` and no absolute `XDG_DATA_DIRS`
+/// entry).
+fn select_image_dir(
     var: &'static str,
-    default_file: &str,
     unset: &[(&'static str, &'static str)],
     user: Option<PathBuf>,
     system: Vec<PathBuf>,
+    has_file: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf, VmError> {
     let mut searched = Vec::new();
     for dir in user.into_iter().chain(system) {
@@ -116,10 +135,10 @@ fn resolve_in(
         let missing: Vec<_> = unset
             .iter()
             .map(|(_, file)| *file)
-            .filter(|file| !dir.join(file).is_file())
+            .filter(|file| !has_file(&dir.join(file)))
             .collect();
         if missing.is_empty() {
-            return Ok(dir.join(default_file));
+            return Ok(dir);
         }
         searched.push(SearchedDir { dir, missing });
     }
@@ -128,6 +147,33 @@ fn resolve_in(
         unset: unset.iter().map(|(v, _)| *v).collect(),
         searched,
     })
+}
+
+/// The lookup behind [`resolve_boot_images`], with its inputs passed in: each
+/// image's override, then the inputs of [`select_image_dir`]. The directory is
+/// selected once, so every defaulted image comes from it even when an install
+/// changes the data directories while the boot resolves.
+fn resolve_images_in(
+    overrides: [Option<PathBuf>; 3],
+    user: Option<PathBuf>,
+    system: Vec<PathBuf>,
+    has_file: impl Fn(&Path) -> bool,
+) -> Result<(PathBuf, PathBuf, PathBuf), VmError> {
+    let unset = unset_images(&overrides);
+    let dir = match unset.first() {
+        Some(&(var, _)) => select_image_dir(var, &unset, user, system, has_file)?,
+        // Every image has its override, so nothing is joined to the directory
+        // and none is needed: a boot with all three overrides set needs no
+        // data directory at all.
+        None => PathBuf::new(),
+    };
+    let [kernel, rootfs, initramfs] = overrides;
+    let pick = |path: Option<PathBuf>, file: &str| path.unwrap_or_else(|| dir.join(file));
+    Ok((
+        pick(kernel, DEFAULT_KERNEL_FILE),
+        pick(rootfs, DEFAULT_ROOTFS_FILE),
+        pick(initramfs, DEFAULT_INITRAMFS_FILE),
+    ))
 }
 
 /// Arch-appropriate libkrun kernel format.
@@ -187,16 +233,18 @@ pub fn resolve_initramfs_path() -> Result<PathBuf, VmError> {
     resolve_or_default("MINVMD_INITRAMFS", DEFAULT_INITRAMFS_FILE)
 }
 
-/// Resolve all three boot image paths at once.
+/// Resolve all three boot image paths at once: (kernel, rootfs, initramfs).
 ///
-/// Errors with the first resolver failure encountered. Used by the supervisor
-/// to log the images a VM will boot before handing them to the VMM child, and
-/// by tests that prove a fresh install resolves its payload with no overrides.
+/// Each override is honoured as its resolver honours it, and the image
+/// directory is selected once for the three, so one boot never takes its
+/// images from two directories, even when an install finishes the user's copy
+/// between two lookups. Errors with `VmError::MissingImage`, `var` naming the
+/// first image whose override is unset, when no data directory holds them.
+/// Used by the VMM child for the images it boots, by `minvmd run` and `boot`
+/// to fail fast and log them, and by tests that prove a fresh install resolves
+/// its payload with no overrides.
 pub fn resolve_boot_images() -> Result<(PathBuf, PathBuf, PathBuf), VmError> {
-    let kernel = resolve_kernel_path()?;
-    let rootfs = resolve_rootfs_path()?;
-    let initramfs = resolve_initramfs_path()?;
-    Ok((kernel, rootfs, initramfs))
+    resolve_images_in(overrides(), data_dir(), system_data_dirs(), Path::is_file)
 }
 
 /// Resolve the host gvproxy binary path: the `MINVMD_GVPROXY_BIN` override,
@@ -444,32 +492,32 @@ mod tests {
     fn with_no_data_directory_the_systems_copy_serves() {
         // The no-HOME daemon (a service account, a scrubbed environment):
         // `data_dir` gives `None` (see the test above). Driven through
-        // `resolve_in` rather than by clearing HOME, which other modules'
-        // tests read outside ENV_LOCK.
+        // `select_image_dir` rather than by clearing HOME, which other
+        // modules' tests read outside ENV_LOCK.
         let system = tempfile::tempdir().unwrap();
         install(system.path(), &ALL_FILES);
         let dir = system.path().join("minimal");
-        let path = resolve_in(
+        let got = select_image_dir(
             "MINVMD_ROOTFS_PATH",
-            DEFAULT_ROOTFS_FILE,
             &IMAGES,
             None,
             vec![dir.clone()],
+            Path::is_file,
         )
         .unwrap();
-        assert_eq!(path, dir.join(DEFAULT_ROOTFS_FILE));
+        assert_eq!(got, dir);
     }
 
     #[test]
     fn with_no_data_directory_and_no_system_copy_the_error_names_the_system_dirs() {
         let system = tempfile::tempdir().unwrap();
         let dir = system.path().join("minimal");
-        let err = resolve_in(
+        let err = select_image_dir(
             "MINVMD_KERNEL_PATH",
-            DEFAULT_KERNEL_FILE,
             &IMAGES[..1],
             None,
             vec![dir.clone()],
+            Path::is_file,
         )
         .unwrap_err();
         let VmError::MissingImage { searched, .. } = &err else {
@@ -490,12 +538,12 @@ mod tests {
 
     #[test]
     fn with_no_directory_at_all_the_error_says_so() {
-        let err = resolve_in(
+        let err = select_image_dir(
             "MINVMD_KERNEL_PATH",
-            DEFAULT_KERNEL_FILE,
             &IMAGES,
             None,
             Vec::new(),
+            Path::is_file,
         )
         .unwrap_err();
         let text = err.to_string();
@@ -504,11 +552,74 @@ mod tests {
     }
 
     #[test]
+    fn a_boot_selects_its_image_directory_once() {
+        // An install finishes the user's copy while the boot resolves: the
+        // user's initramfs is absent at the first look and present at every
+        // later one. One selection sees one state, so all three images come
+        // from the system copy. A selection per image would take the kernel
+        // and rootfs from the system copy and the initramfs from the user's.
+        let user = PathBuf::from("/home/me/.local/share/minimal");
+        let system = PathBuf::from("/usr/share/minimal");
+        let late = user.join(DEFAULT_INITRAMFS_FILE);
+        let looks = std::cell::Cell::new(0);
+        let has_file = |path: &Path| {
+            if path != late.as_path() {
+                return true;
+            }
+            looks.set(looks.get() + 1);
+            looks.get() > 1
+        };
+        let (kernel, rootfs, initramfs) = resolve_images_in(
+            [None, None, None],
+            Some(user),
+            vec![system.clone()],
+            has_file,
+        )
+        .unwrap();
+        assert_eq!(kernel, system.join(DEFAULT_KERNEL_FILE));
+        assert_eq!(rootfs, system.join(DEFAULT_ROOTFS_FILE));
+        assert_eq!(initramfs, system.join(DEFAULT_INITRAMFS_FILE));
+        assert_eq!(looks.get(), 1, "the user's directory is looked at once");
+    }
+
+    #[test]
+    fn a_boot_with_every_override_needs_no_data_directory() {
+        let overrides = [
+            Some(PathBuf::from("/boot/vmlinuz")),
+            Some(PathBuf::from("/boot/rootfs.img")),
+            Some(PathBuf::from("/boot/initramfs.cpio")),
+        ];
+        let got = resolve_images_in(overrides, None, Vec::new(), |_: &Path| false).unwrap();
+        assert_eq!(
+            got,
+            (
+                PathBuf::from("/boot/vmlinuz"),
+                PathBuf::from("/boot/rootfs.img"),
+                PathBuf::from("/boot/initramfs.cpio"),
+            )
+        );
+    }
+
+    #[test]
+    fn a_boot_joins_only_its_unset_images_to_the_directory() {
+        let system = tempfile::tempdir().unwrap();
+        install(
+            system.path(),
+            &[DEFAULT_KERNEL_FILE, DEFAULT_INITRAMFS_FILE],
+        );
+        let dir = system.path().join("minimal");
+        let overrides = [None, Some(PathBuf::from("/srv/rootfs.img")), None];
+        let (kernel, rootfs, initramfs) =
+            resolve_images_in(overrides, None, vec![dir.clone()], Path::is_file).unwrap();
+        assert_eq!(kernel, dir.join(DEFAULT_KERNEL_FILE));
+        assert_eq!(rootfs, PathBuf::from("/srv/rootfs.img"));
+        assert_eq!(initramfs, dir.join(DEFAULT_INITRAMFS_FILE));
+    }
+
+    #[test]
     fn system_data_dirs_default_to_the_xdg_base_dirs() {
         let _g = ENV_LOCK.lock().unwrap();
-        // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
-        // writes the process environment meanwhile.
-        unsafe { std::env::remove_var("XDG_DATA_DIRS") };
+        unset_env("XDG_DATA_DIRS");
         assert_eq!(
             system_data_dirs(),
             vec![
@@ -516,9 +627,7 @@ mod tests {
                 PathBuf::from("/usr/share/minimal")
             ]
         );
-        // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
-        // writes the process environment meanwhile.
-        unsafe { std::env::set_var("XDG_DATA_DIRS", "/opt/data::share:/srv/share") };
+        set_env("XDG_DATA_DIRS", "/opt/data::share:/srv/share");
         assert_eq!(
             system_data_dirs(),
             vec![
@@ -527,9 +636,7 @@ mod tests {
             ],
             "an empty entry and a relative entry are skipped"
         );
-        // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
-        // writes the process environment meanwhile.
-        unsafe { std::env::remove_var("XDG_DATA_DIRS") };
+        unset_env("XDG_DATA_DIRS");
     }
 
     #[test]

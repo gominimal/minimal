@@ -38,10 +38,6 @@ pub enum VmError {
     #[error("krun_start_enter returned {ret} but libkrun's docs say it only returns on error")]
     StartEnterReturnedUnexpectedly { ret: i32 },
 
-    /// A required environment variable was unset or empty.
-    #[error("required environment variable {var} is unset or empty")]
-    MissingEnv { var: &'static str },
-
     /// The `MINVMD_KRUN_LOG` environment variable was set to a value that is
     /// not a recognised libkrun log level (a name `off`/`error`/`warn`/`info`/
     /// `debug`/`trace` or the numeric level `0`–`5`). `value` is the offending
