@@ -802,7 +802,12 @@ fn open_reached(root: BorrowedFd<'_>, reached: &[OsString]) -> io::Result<OwnedF
     } else {
         reached.iter().collect()
     };
-    openat2(root, &path, libc::O_PATH | libc::O_DIRECTORY, RESOLVE_IN_TREE)
+    openat2(
+        root,
+        &path,
+        libc::O_PATH | libc::O_DIRECTORY,
+        RESOLVE_IN_TREE,
+    )
 }
 
 /// The target of the link `link` holds (opened `O_PATH | O_NOFOLLOW`).
@@ -1129,9 +1134,7 @@ mod tests {
     /// staged mount.
     #[test]
     fn bind_all_lays_a_home_patch_over_a_staged_mapping_as_hakoniwa_did() {
-        if skip_without_userns(
-            "bind_all_lays_a_home_patch_over_a_staged_mapping_as_hakoniwa_did",
-        ) {
+        if skip_without_userns("bind_all_lays_a_home_patch_over_a_staged_mapping_as_hakoniwa_did") {
             return;
         }
         let root = tempfile::tempdir().unwrap();
@@ -1314,10 +1317,7 @@ mod tests {
         let refusal_of = |path: &str| {
             let err = resolve(home_fd.as_fd(), HOME, Path::new(path)).unwrap_err();
             let text = err.to_string();
-            assert!(
-                !text.contains("os error"),
-                "{path}: no bare errno: {text}"
-            );
+            assert!(!text.contains("os error"), "{path}: no bare errno: {text}");
             (why(&err, path).clone(), text)
         };
 

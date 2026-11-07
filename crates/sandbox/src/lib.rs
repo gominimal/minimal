@@ -1939,7 +1939,10 @@ fn wait_at_start_gate(gate: std::os::fd::OwnedFd) {
 fn exit_child(what: &str, err: &std::io::Error, report: Option<&Path>) -> ! {
     write_closure_report(
         report,
-        &format!("failed {what} errno {}", session_bind::errno_of(err).unwrap_or(0)),
+        &format!(
+            "failed {what} errno {}",
+            session_bind::errno_of(err).unwrap_or(0)
+        ),
     );
     let msg = format!("minimal: sandbox: {what} failed: {err}\n");
     // SAFETY: `write` and `_exit` are async-signal-safe; `msg` outlives the
@@ -2386,17 +2389,13 @@ impl<C: Channel> Sandbox<C> {
         };
         // Not `plan`: that is the network plan this function was given, whose
         // resolver and hosts are written below.
-        let mounts = session_bind::plan(
-            &trees,
-            self.config.wd.fs_mappings(),
-            locked_ms_flags,
-        )
-        .map_err(|path| {
-            Error::Execution(ExecutionError::MountError {
-                msg: "a patch from a session tree must land in the home or workbench",
-                path,
-            })
-        })?;
+        let mounts = session_bind::plan(&trees, self.config.wd.fs_mappings(), locked_ms_flags)
+            .map_err(|path| {
+                Error::Execution(ExecutionError::MountError {
+                    msg: "a patch from a session tree must land in the home or workbench",
+                    path,
+                })
+            })?;
         if mounts.stages() {
             container.tmpfsmount(session_bind::STAGE);
         }
