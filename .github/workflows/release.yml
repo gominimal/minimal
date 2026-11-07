@@ -1304,17 +1304,20 @@ jobs:
                     # tag; promote publishes it (promote.yml), and THAT
                     # creates v<semver> — last, on a smoked and promoted commit.
                     # A pre-release version (one with a `-` suffix) is marked a
-                    # GitHub prerelease so it never shows as "Latest". A
-                    # leftover draft from an earlier attempt at the same version
-                    # is replaced (it was never published).
+                    # GitHub prerelease so it never shows as "Latest".
                     extra+=(--draft)
                     case "$RELEASE_VERSION" in
                       *-*) extra+=(--prerelease) ;;
                     esac
-                    if gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null | grep -qx true; then
-                      echo "replacing the leftover draft $REL_TAG"
-                      gh release delete "$REL_TAG" --repo "$GITHUB_REPOSITORY" --yes
-                    fi
+                  fi
+                  # A rerun finds what an earlier attempt left. A draft was never
+                  # published, and a release-<sha> is this same commit's nightly,
+                  # so both are replaced. GitHub can answer 502 to a publish that
+                  # went through. A public v<semver> stays: create fails on it.
+                  is_draft="$(gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"
+                  if [ "$is_draft" = "true" ] || { [ -n "$is_draft" ] && [ -z "$RELEASE_VERSION" ]; }; then
+                    echo "replacing $REL_TAG from an earlier attempt"
+                    gh release delete "$REL_TAG" --repo "$GITHUB_REPOSITORY" --yes
                   fi
                   cd artifacts/
                   # --target pins the tag to the commit that was built. Without

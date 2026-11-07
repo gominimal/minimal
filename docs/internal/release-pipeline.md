@@ -569,7 +569,9 @@ for `mip`, `min`, and `minimald`. Then it does two things:
 - It creates the GitHub Release with the notes, the binaries, the guest
   artifacts, and `completions.tar.gz`. A nightly build gets
   `release-<sha>`. A versioned run gets a draft `vX.Y.Z` that points at the
-  commit. A version with a `-` suffix is a prerelease.
+  commit. A version with a `-` suffix is a prerelease. On a rerun, the job
+  replaces a draft or a `release-<sha>` that an earlier attempt left. It never
+  replaces a public `vX.Y.Z`, so a rerun fails on one.
 
 **stage-installer job.** A dry run skips this job.
 [`scripts/stage-release.sh`](../../scripts/stage-release.sh) uploads the
