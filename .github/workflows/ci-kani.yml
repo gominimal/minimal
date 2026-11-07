@@ -60,10 +60,14 @@ jobs:
                   filters: |
                       kani:
                         - "crates/rcache/**"
-                        - "crates/sessions/**"
-                        # The same crate after its rename to `boxes`; both
-                        # paths match until the old one is dropped.
+                        # `sessions`, renamed `boxes`; the old path is gone.
                         - "crates/boxes/**"
+                        # scripts/kani.sh also proves mlog (the OTel spool and
+                        # switch harnesses) and minvmd (vm.rs); without these
+                        # two a PR touching only one of them merged with its
+                        # proofs unrun (#3117).
+                        - "crates/mlog/**"
+                        - "crates/minvmd/**"
                         # The Box Egress Proxy's redemption decision and
                         # audit chain (docs/specs/24, BEP-019 to BEP-025,
                         # BEP-031, BEP-049, BEP-058, BEP-064) are proved
