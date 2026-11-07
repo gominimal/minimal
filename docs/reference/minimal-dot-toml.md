@@ -254,6 +254,41 @@ An entry writes its settings as flat keys, such as `timeout`, `pty_enabled`,
 `lifecycle_hooks` mean the same in an entry as in
 [`[defaults.session]`](#session).
 
+#### `timeout` - How long a box runs {#timeout}
+
+`timeout` sets how long a box can run. Set it in `[defaults.session]`, in
+the legacy `[session]` table, or in a task's `[tasks.<name>]` table:
+
+```toml
+[defaults.session]
+timeout = "8h"
+
+[tasks.lint]
+exec = ["cargo", "clippy"]
+timeout = 90
+```
+
+The value is one of these forms:
+
+- A whole number of seconds, such as `90`.
+- A string of a whole number followed by `s`, `m` or `h`, such as `"30s"`,
+  `"5m"` or `"1h"`.
+
+A timeout of zero, in any unit, means no timeout. Any other value fails the
+load with exit code 3, and the error names the key and the entry.
+
+The clock starts each time the box's first process starts, so a resumed
+box gets its full timeout again. When a session or a task box runs past its
+timeout, every process in the box gets SIGTERM, including processes that
+`min box exec` started. Processes that still run after a grace period of 10
+seconds get SIGKILL. The box then ends as `exited` with the reason
+`timeout`, and keeps its files and its record until you remove it. A box
+that you stop before its timeout ends as `stopped`.
+
+A `min task run` whose task runs past its timeout exits with code 124. It
+prints a line on stderr that says the task ran past its timeout. A task
+that exits with code 124 by itself gets no such line.
+
 
 
 ### `[outputs.*]` - Artifacts produced by `mip materialize` {#outputs}
