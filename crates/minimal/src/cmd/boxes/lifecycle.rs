@@ -987,8 +987,8 @@ pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<
     let hosts = crate::cmd::list::local_hosts(global)?;
     let resolved = resolve_box_on_hosts(hosts, &args.target, "box rename").await?;
     let mut client = gated_box_host_client(&resolved.host).await?;
-    // The record says whether the box holds its name in the VM host's zone,
-    // which the hold then moves to the new name.
+    // The record says how the box holds its name on the VM host (a zone
+    // hold or a host row), which then moves to the new name (#1116).
     let record = get_session_record(&mut client, &resolved.box_id.to_string())
         .await
         .ok()
@@ -1002,15 +1002,9 @@ pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<
         &args.new_name,
     )
     .await?;
-    if let Some(record) = record.filter(holds_name) {
+    if let Some(record) = record {
         let control_sock = box_host_control_sock(&resolved.host);
-        move_held_box_name(
-            control_sock,
-            record.id,
-            record.name.as_deref(),
-            &args.new_name,
-        )
-        .await;
+        rename_box_with_vm_host(control_sock, &record, &args.new_name).await;
     }
     Ok(())
 }

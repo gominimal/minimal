@@ -740,7 +740,7 @@ fn box_name_verdict(table: &BoxTable, record: &BoxRecord, dst: [u8; 4]) -> Optio
     }
     let name = format!(
         "{}.{}",
-        crate::box_registry::canonical_box_name(target.name()),
+        crate::box_registry::canonical_box_name(&target.name()),
         boxes::core::zone_answer::ZONE_APEX
     );
     Some(entries.contains(&name))
@@ -4140,7 +4140,7 @@ fn switch_rows_of(
     let mut seen: HashMap<String, u8> = HashMap::new();
     let mut switch_rows = Vec::with_capacity(rows.len());
     for record in rows {
-        let own = crate::box_registry::canonical_box_name(record.name());
+        let own = crate::box_registry::canonical_box_name(&record.name());
         let mut names = Vec::with_capacity(record.declared_names().len() + 1);
         for name in
             std::iter::once(own.as_str()).chain(record.declared_names().iter().map(String::as_str))
@@ -5088,7 +5088,7 @@ async fn relay_switch_frames_to_guest(
             {
                 limiter.warn_proxy_opening(
                     record.switch_addr().octets(),
-                    record.name(),
+                    &record.name(),
                     pkt.dst.port(),
                 );
                 continue;
@@ -5211,27 +5211,20 @@ async fn relay_frames_to_switch(
             Err(GateDrop::BoxName { src, dst, dst_port }) => {
                 // The line names both boxes by the rows that hold their
                 // addresses, so a host reads who reached for whom.
-                let source = table.by_source(src);
-                let target = table.by_source(dst);
-                limiter.warn_box_name(
-                    src,
-                    dst,
-                    dst_port,
-                    source.as_deref().map(BoxRecord::name),
-                    target.as_deref().map(BoxRecord::name),
-                );
+                let source = table.by_source(src).map(|record| record.name());
+                let target = table.by_source(dst).map(|record| record.name());
+                limiter.warn_box_name(src, dst, dst_port, source.as_deref(), target.as_deref());
                 continue;
             }
             Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
                 // The plan's diagnostics line wants the refusal to name the
                 // box, not only its address: the row the frame's source
-                // resolved to carries the name, when one did. The binding
-                // keeps the row alive for the borrow — and with no row, the
+                // resolved to carries the name, when one did, read as it is
+                // now (a rename moves it, #1116) — and with no row, the
                 // address the line already names is all the identity there
                 // is.
-                let record = table.by_source(src);
-                let name = record.as_deref().map(BoxRecord::name);
-                limiter.warn_proxy_lane(src, dst, dst_port, name);
+                let name = table.by_source(src).map(|record| record.name());
+                limiter.warn_proxy_lane(src, dst, dst_port, name.as_deref());
                 continue;
             }
             Err(GateDrop::UnregisteredSource { src }) => {
@@ -5809,7 +5802,7 @@ impl ReplyTables {
             egress::InboundFlow::RefusedAtCap => {
                 limiter.warn_inbound_flow_refused(
                     record.switch_addr().octets(),
-                    record.name(),
+                    &record.name(),
                     *pkt.src.ip(),
                 );
             }
@@ -7407,7 +7400,7 @@ impl DropLimiter {
                     .map_or_else(|| "none".to_string(), |rtype| rtype.to_string());
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
-                    namespace = refusal.record.name(),
+                    namespace = %refusal.record.name(),
                     name = refusal.name.as_str(),
                     query_type,
                     rule_matched = DENY_ALL_DNS_RULE,
