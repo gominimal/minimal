@@ -1,0 +1,3339 @@
+{
+ "packages": [
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "clap",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "shlex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Types for the argument schema of tasks and sideload parameters.",
+   "id": "path+file:///workbench/minimal/crates/args#0.0.1",
+   "manifest_path": "<root>/crates/args/Cargo.toml",
+   "name": "args"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "aes-gcm",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "base64",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "clap",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "client-config",
+     "path": "<root>/crates/client-config",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "getrandom",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "p256",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "rcgen",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "rustls",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "rustls-native-certs",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "rustls-pki-types",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "sha2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "time",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-rustls",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "zeroize",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "proptest",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "reqwest",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "rustls-webpki",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "core-foundation",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "security-framework",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "security-framework-sys",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Box Egress Proxy: credential modules and the sealed envelope a box carries in place of a credential.",
+   "id": "path+file:///workbench/minimal/crates/bep#0.0.1",
+   "manifest_path": "<root>/crates/bep/Cargo.toml",
+   "name": "bep"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Interactive terminal prompts over any async reader/writer (no TTY required).",
+   "id": "path+file:///workbench/minimal/crates/async-dialog#0.0.1",
+   "manifest_path": "<root>/crates/async-dialog/Cargo.toml",
+   "name": "async-dialog"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "blake3",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "path-absolutize",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Local cache of built artifacts, keyed by SpecHash.",
+   "id": "path+file:///workbench/minimal/crates/lcache#0.0.1",
+   "manifest_path": "<root>/crates/lcache/Cargo.toml",
+   "name": "lcache"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "args",
+     "path": "<root>/crates/args",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "blake3",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "bytes",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "bzip2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "copy_dir",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "either",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "flate2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "globset",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-auth",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-storage",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "jaq-all",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "lzma-rs",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "rand",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "reqwest",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "resolv-conf",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "sha2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tar",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "url",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "walkdir",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "zstd",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Common types and utilities (e.g. SpecHash) used across the codebase.",
+   "id": "path+file:///workbench/minimal/crates/common#0.0.1",
+   "manifest_path": "<root>/crates/common/Cargo.toml",
+   "name": "common"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "indicatif",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Operation tracking for progress rendering (render-agnostic core + drivers).",
+   "id": "path+file:///workbench/minimal/crates/ot#0.0.1",
+   "manifest_path": "<root>/crates/ot/Cargo.toml",
+   "name": "ot"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "arbitrary",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "args",
+     "path": "<root>/crates/args",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "blake3",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "checkouts",
+     "path": "<root>/crates/checkouts",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "decode",
+     "path": "<root>/crates/decode",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "generational-arena",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "smallvec",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "The in-memory, semantic dependency graph; the planner module orders builds.",
+   "id": "path+file:///workbench/minimal/crates/graph#0.0.1",
+   "manifest_path": "<root>/crates/graph/Cargo.toml",
+   "name": "graph"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "rand",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Git repository checkout management for source operations (upstream layers at pinned versions).",
+   "id": "path+file:///workbench/minimal/crates/checkouts#0.0.1",
+   "manifest_path": "<root>/crates/checkouts/Cargo.toml",
+   "name": "checkouts"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "args",
+     "path": "<root>/crates/args",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "boxes",
+     "path": "<root>/crates/boxes",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "shlex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tracing-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Finding and reading the minimal.toml file.",
+   "id": "path+file:///workbench/minimal/crates/mfile#0.0.1",
+   "manifest_path": "<root>/crates/mfile/Cargo.toml",
+   "name": "mfile"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "camino",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "client-config",
+     "path": "<root>/crates/client-config",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "globset",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "nutype",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "uuid",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "walkdir",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "proptest",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Box domain types shared by min and minimald: loadouts, lifecycle hooks and the client/daemon composition pipeline, the box's network mode and policy (including the pure egress verdict), on-disk box state, and the JSON wire forms of all of these.",
+   "id": "path+file:///workbench/minimal/crates/boxes#0.0.1",
+   "manifest_path": "<root>/crates/boxes/Cargo.toml",
+   "name": "boxes"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "camino",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "dirs",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Realm-tagged path types distinguishing host, sandbox, and daemon filesystems.",
+   "id": "path+file:///workbench/minimal/crates/paths#0.0.1",
+   "manifest_path": "<root>/crates/paths/Cargo.toml",
+   "name": "paths"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "args",
+     "path": "<root>/crates/args",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "blake3",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "either",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "generational-arena",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "regex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "shlex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "smallvec",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "stdlib",
+     "path": "<root>/crates/stdlib",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Evaluates a Nickel config layer into in-memory packages/profiles/stacks.",
+   "id": "path+file:///workbench/minimal/crates/decode#0.0.1",
+   "manifest_path": "<root>/crates/decode/Cargo.toml",
+   "name": "decode"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "fd-lock",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "The embedded Minimal standard library.",
+   "id": "path+file:///workbench/minimal/crates/stdlib#0.0.22",
+   "manifest_path": "<root>/crates/stdlib/Cargo.toml",
+   "name": "stdlib"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "bytes",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "crc32c",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-storage",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "hex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "lcache",
+     "path": "<root>/crates/lcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "reqwest",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "sha2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "mockall",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Remote cache: fetch/upload build artifacts over the network.",
+   "id": "path+file:///workbench/minimal/crates/rcache#0.0.1",
+   "manifest_path": "<root>/crates/rcache/Cargo.toml",
+   "name": "rcache"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "decode",
+     "path": "<root>/crates/decode",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "lcache",
+     "path": "<root>/crates/lcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mlog",
+     "path": "<root>/crates/mlog",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "moka",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "nix",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "object",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "op",
+     "path": "<root>/crates/op",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "path-absolutize",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "regex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "url",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "mip check linting of minimal.toml, packages, profiles, and stacks.",
+   "id": "path+file:///workbench/minimal/crates/check#0.0.1",
+   "manifest_path": "<root>/crates/check/Cargo.toml",
+   "name": "check"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "json-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-appender-tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-http",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-otlp",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-semantic-conventions",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry_sdk",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "reqwest",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-appender",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-opentelemetry",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "version",
+     "path": "<root>/crates/version",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry_sdk",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "serde_json",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "JSON file-log layer both minimald and minvmd write through; one definition of the on-disk log format.",
+   "id": "path+file:///workbench/minimal/crates/mlog#0.0.1",
+   "manifest_path": "<root>/crates/mlog/Cargo.toml",
+   "name": "mlog"
+  },
+  {
+   "dependencies": [],
+   "description": "Shared build-time version identity for min, mip, minimald, and minvmd.",
+   "id": "path+file:///workbench/minimal/crates/version#0.8.0",
+   "manifest_path": "<root>/crates/version/Cargo.toml",
+   "name": "version"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "base64",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "decode",
+     "path": "<root>/crates/decode",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "flate2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "globset",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "hex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "lcache",
+     "path": "<root>/crates/lcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "oci-spec",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "rayon",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "rcache",
+     "path": "<root>/crates/rcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "sandbox",
+     "path": "<root>/crates/sandbox",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "sha2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "shlex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "size",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tar",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml_edit",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "url",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "walkdir",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "smallvec",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Complex operations over the graph and packages (builds, cache object construction).",
+   "id": "path+file:///workbench/minimal/crates/op#0.0.1",
+   "manifest_path": "<root>/crates/op/Cargo.toml",
+   "name": "op"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "globset",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "sha2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "shlex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "walkdir",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hakoniwa",
+     "source": "git+https://github.com/souk4711/hakoniwa.git?rev=0810ffa37620ef5c57de263c8eaa1f4d7633c14a"
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "nix",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "The sandbox layer: namespaced (user, mount, network) process launch on Linux via hakoniwa, with the plan \u2192 container \u2192 spawn \u2192 attach sequence every box and package build goes through; network wiring is supplied by the consumer as an impl Network.",
+   "id": "path+file:///workbench/minimal/crates/sandbox#0.0.1",
+   "manifest_path": "<root>/crates/sandbox/Cargo.toml",
+   "name": "sandbox"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "async-compression",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "async-tar",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "chrono",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "walkdir",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio-stream",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "App-agnostic machinery for diagnostic support bundles.",
+   "id": "path+file:///workbench/minimal/crates/diagnostics#0.0.1",
+   "manifest_path": "<root>/crates/diagnostics/Cargo.toml",
+   "name": "diagnostics"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "args",
+     "path": "<root>/crates/args",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "check",
+     "path": "<root>/crates/check",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "checkouts",
+     "path": "<root>/crates/checkouts",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-auth",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-storage",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "lcache",
+     "path": "<root>/crates/lcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "op",
+     "path": "<root>/crates/op",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "orchestrator",
+     "path": "<root>/crates/orchestrator",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "rcache",
+     "path": "<root>/crates/rcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "sandbox",
+     "path": "<root>/crates/sandbox",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "shlex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "stdlib",
+     "path": "<root>/crates/stdlib",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml_edit",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "decode",
+     "path": "<root>/crates/decode",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "serial_test",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Top-level 'minimal context' API tying configuration, decoding, graph, and cache together.",
+   "id": "path+file:///workbench/minimal/crates/mctx#0.0.1",
+   "manifest_path": "<root>/crates/mctx/Cargo.toml",
+   "name": "mctx"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "decode",
+     "path": "<root>/crates/decode",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "either",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "generational-arena",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "lcache",
+     "path": "<root>/crates/lcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "op",
+     "path": "<root>/crates/op",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "rcache",
+     "path": "<root>/crates/rcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "sandbox",
+     "path": "<root>/crates/sandbox",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Runtime orchestration of builds behind a pluggable Backend.",
+   "id": "path+file:///workbench/minimal/crates/orchestrator#0.0.1",
+   "manifest_path": "<root>/crates/orchestrator/Cargo.toml",
+   "name": "orchestrator"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "args",
+     "path": "<root>/crates/args",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "blake3",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "check",
+     "path": "<root>/crates/check",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "checkouts",
+     "path": "<root>/crates/checkouts",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "clap",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "clap_complete",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "decode",
+     "path": "<root>/crates/decode",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "dirs",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "lcache",
+     "path": "<root>/crates/lcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mctx",
+     "path": "<root>/crates/mctx",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "op",
+     "path": "<root>/crates/op",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "orchestrator",
+     "path": "<root>/crates/orchestrator",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "petgraph",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "rayon",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "rcache",
+     "path": "<root>/crates/rcache",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "remote-client",
+     "path": "<root>/crates/remote-client",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "sandbox",
+     "path": "<root>/crates/sandbox",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "smallvec",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "version",
+     "path": "<root>/crates/version",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "serial_test",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "The Minimal package/build CLI.",
+   "id": "path+file:///workbench/minimal/crates/mip#0.8.0",
+   "manifest_path": "<root>/crates/mip/Cargo.toml",
+   "name": "mip"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "bytes",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "check",
+     "path": "<root>/crates/check",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "http-body",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "orchestrator",
+     "path": "<root>/crates/orchestrator",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "remote-proto",
+     "path": "<root>/crates/remote-proto",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-stream",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tonic",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Client for the Remote Execution Service, driving remote builds against the graph.",
+   "id": "path+file:///workbench/minimal/crates/remote-client#0.0.1",
+   "manifest_path": "<root>/crates/remote-client/Cargo.toml",
+   "name": "remote-client"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "prost",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "prost-types",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tonic",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tonic-prost",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "build",
+     "name": "prost-build",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "build",
+     "name": "tonic-prost-build",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Protobuf / wire types for the Remote Execution Service (RES).",
+   "id": "path+file:///workbench/minimal/crates/remote-proto#0.0.1",
+   "manifest_path": "<root>/crates/remote-proto/Cargo.toml",
+   "name": "remote-proto"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "async-compression",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "async-tar",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "base64",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "bep",
+     "path": "<root>/crates/bep",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "boxes",
+     "path": "<root>/crates/boxes",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "camino",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "chrono",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "clap",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "clap_complete",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "crossterm",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "diagnostics",
+     "path": "<root>/crates/diagnostics",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "dirs",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "getrandom",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hickory-proto",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "inquire",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "mctx",
+     "path": "<root>/crates/mctx",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "minimal-client",
+     "path": "<root>/crates/minimal-client",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc",
+     "path": "<root>/crates/minimald-rpc",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "minvmd",
+     "path": "<root>/crates/minvmd",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mlog",
+     "path": "<root>/crates/mlog",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "nix",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "op",
+     "path": "<root>/crates/op",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "p256",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "ratatui",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "reqwest",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "russh",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "sha2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "switch",
+     "path": "<root>/crates/switch",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-stream",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml_edit",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "unicode-width",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "url",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "version",
+     "path": "<root>/crates/version",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "zeroize",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "insta",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "minvmd",
+     "path": "<root>/crates/minvmd",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "nix",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "minimald",
+     "path": "<root>/crates/minimald",
+     "source": null
+    }
+   ],
+   "description": "The min CLI: sessions, tasks, loadouts, packages, networking, diagnostics, project setup, and the min dash session-manager TUI, over SSH to minimald, auto-spawning minvmd where the daemon lives in a microVM.",
+   "id": "path+file:///workbench/minimal/crates/minimal#0.8.0",
+   "manifest_path": "<root>/crates/minimal/Cargo.toml",
+   "name": "minimal"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "async-compression",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "async-tar",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "boxes",
+     "path": "<root>/crates/boxes",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "camino",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "constcat",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "indicatif",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc",
+     "path": "<root>/crates/minimald-rpc",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "nix",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "russh",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "version",
+     "path": "<root>/crates/version",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "SSH client transport for talking to minimald over the UDS bridge, shared by the min CLI and the TUI",
+   "id": "path+file:///workbench/minimal/crates/minimal-client#0.8.0",
+   "manifest_path": "<root>/crates/minimal-client/Cargo.toml",
+   "name": "minimal-client"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "boxes",
+     "path": "<root>/crates/boxes",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "chrono",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "constcat",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "rand",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "The client/daemon wire contract: minimald's oneshot SSH RPC request/response types, the tagged exec-channel vocabulary, and the task-env and trace propagation keys. Transport-free (no russh, no tokio); the one contract both min and minimald build against.",
+   "id": "path+file:///workbench/minimal/crates/minimald-rpc#0.0.1",
+   "manifest_path": "<root>/crates/minimald-rpc/Cargo.toml",
+   "name": "minimald-rpc"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "boxes",
+     "path": "<root>/crates/boxes",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "clap",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "clap_complete",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "fd-lock",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hickory-proto",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc",
+     "path": "<root>/crates/minimald-rpc",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mlog",
+     "path": "<root>/crates/mlog",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "russh",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "switch",
+     "path": "<root>/crates/switch",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "sysinfo",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-appender",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "uuid",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "version",
+     "path": "<root>/crates/version",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "camino",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry_sdk",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "russh-sftp",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "serial_test",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "sha2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "switch",
+     "path": "<root>/crates/switch",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tracing-opentelemetry",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock.",
+   "id": "path+file:///workbench/minimal/crates/minvmd#0.8.0",
+   "manifest_path": "<root>/crates/minvmd/Cargo.toml",
+   "name": "minvmd"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "smoltcp",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "switch",
+     "path": "<root>/crates/switch",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "gvproxy-switch primitives: subnet arithmetic, MAC derivation, vsock constants, config rendering.",
+   "id": "path+file:///workbench/minimal/crates/switch#0.0.1",
+   "manifest_path": "<root>/crates/switch/Cargo.toml",
+   "name": "switch"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "args",
+     "path": "<root>/crates/args",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "async-compression",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "async-dialog",
+     "path": "<root>/crates/async-dialog",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "async-tar",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "base64",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "blake3",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "boringtun",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "boxes",
+     "path": "<root>/crates/boxes",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "bytes",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "camino",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "check",
+     "path": "<root>/crates/check",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "chrono",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "clap",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "clap_complete",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "common",
+     "path": "<root>/crates/common",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "constcat",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "diagnostics",
+     "path": "<root>/crates/diagnostics",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "fd-lock",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "futures",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "graph",
+     "path": "<root>/crates/graph",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "hakoniwa",
+     "source": "git+https://github.com/souk4711/hakoniwa.git?rev=0810ffa37620ef5c57de263c8eaa1f4d7633c14a"
+    },
+    {
+     "kind": null,
+     "name": "hex",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "hickory-proto",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "mctx",
+     "path": "<root>/crates/mctx",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mfile",
+     "path": "<root>/crates/mfile",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc",
+     "path": "<root>/crates/minimald-rpc",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "mlog",
+     "path": "<root>/crates/mlog",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "nix",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "op",
+     "path": "<root>/crates/op",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "orchestrator",
+     "path": "<root>/crates/orchestrator",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "ot",
+     "path": "<root>/crates/ot",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "paths",
+     "path": "<root>/crates/paths",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "rand_core",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "russh",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "russh-sftp",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "sandbox",
+     "path": "<root>/crates/sandbox",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "sha2",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "size",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "stdlib",
+     "path": "<root>/crates/stdlib",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "switch",
+     "path": "<root>/crates/switch",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "sysinfo",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tar",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-appender",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "uuid",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "version",
+     "path": "<root>/crates/version",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "vt100",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "walkdir",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "zstd",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "decode",
+     "path": "<root>/crates/decode",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "lcache",
+     "path": "<root>/crates/lcache",
+     "source": null
+    },
+    {
+     "kind": "dev",
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry_sdk",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "proptest",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "serial_test",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tracing-opentelemetry",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tokio-vsock",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "vsock",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "The session daemon: a russh SSH server that dispatches to per-subsystem mailbox actors (session manager, one actor per session, the session host, maintenance), owns the gvproxy switch, DNS and hostname proxy for own-address boxes, and runs as pid-1 inside the minvmd microVM.",
+   "id": "path+file:///workbench/minimal/crates/minimald#0.8.0",
+   "manifest_path": "<root>/crates/minimald/Cargo.toml",
+   "name": "minimald"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "clap",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "minvmd",
+     "path": "<root>/crates/minvmd",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "switch",
+     "path": "<root>/crates/switch",
+     "source": null
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "version",
+     "path": "<root>/crates/version",
+     "source": null
+    }
+   ],
+   "description": "The host's box-name service (DNS and addresses for boxes), linked without libkrun, that the privileged step installs.",
+   "id": "path+file:///workbench/minimal/crates/minzoned#0.8.0",
+   "manifest_path": "<root>/crates/minzoned/Cargo.toml",
+   "name": "minzoned"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "The client's config.toml: its schema, the session keys, and the secret-store rules with their deny checks. Shared by min, boxes and bep, with no build-plane dependencies.",
+   "id": "path+file:///workbench/minimal/crates/client-config#0.0.1",
+   "manifest_path": "<root>/crates/client-config/Cargo.toml",
+   "name": "client-config"
+  }
+ ],
+ "workspace_members": [
+  "path+file:///workbench/minimal/crates/args#0.0.1",
+  "path+file:///workbench/minimal/crates/bep#0.0.1",
+  "path+file:///workbench/minimal/crates/async-dialog#0.0.1",
+  "path+file:///workbench/minimal/crates/lcache#0.0.1",
+  "path+file:///workbench/minimal/crates/common#0.0.1",
+  "path+file:///workbench/minimal/crates/ot#0.0.1",
+  "path+file:///workbench/minimal/crates/graph#0.0.1",
+  "path+file:///workbench/minimal/crates/checkouts#0.0.1",
+  "path+file:///workbench/minimal/crates/mfile#0.0.1",
+  "path+file:///workbench/minimal/crates/boxes#0.0.1",
+  "path+file:///workbench/minimal/crates/paths#0.0.1",
+  "path+file:///workbench/minimal/crates/decode#0.0.1",
+  "path+file:///workbench/minimal/crates/stdlib#0.0.22",
+  "path+file:///workbench/minimal/crates/rcache#0.0.1",
+  "path+file:///workbench/minimal/crates/check#0.0.1",
+  "path+file:///workbench/minimal/crates/mlog#0.0.1",
+  "path+file:///workbench/minimal/crates/version#0.8.0",
+  "path+file:///workbench/minimal/crates/op#0.0.1",
+  "path+file:///workbench/minimal/crates/sandbox#0.0.1",
+  "path+file:///workbench/minimal/crates/diagnostics#0.0.1",
+  "path+file:///workbench/minimal/crates/mctx#0.0.1",
+  "path+file:///workbench/minimal/crates/orchestrator#0.0.1",
+  "path+file:///workbench/minimal/crates/mip#0.8.0",
+  "path+file:///workbench/minimal/crates/remote-client#0.0.1",
+  "path+file:///workbench/minimal/crates/remote-proto#0.0.1",
+  "path+file:///workbench/minimal/crates/minimal#0.8.0",
+  "path+file:///workbench/minimal/crates/minimal-client#0.8.0",
+  "path+file:///workbench/minimal/crates/minimald-rpc#0.0.1",
+  "path+file:///workbench/minimal/crates/minvmd#0.8.0",
+  "path+file:///workbench/minimal/crates/switch#0.0.1",
+  "path+file:///workbench/minimal/crates/minimald#0.8.0",
+  "path+file:///workbench/minimal/crates/minzoned#0.8.0",
+  "path+file:///workbench/minimal/crates/client-config#0.0.1"
+ ]
+}

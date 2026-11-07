@@ -46,7 +46,7 @@ package.license = "Apache-2.0"
 # (`cargo hack check --rust-version`). Every crate inherits this via
 # `rust-version.workspace = true`; bump here, in one place, when the floor moves.
 # 1.95 is the dependency-driven floor (sysinfo 0.39 requires rustc 1.95); no
-# resolved dependency requires newer. The build toolchain pin is 1.97.0.
+# resolved dependency requires newer. The build toolchain pin is 1.99.0.
 package.rust-version = "1.95"
 # The DECLARED next release. The `version` crate builds every dev version on
 # it (`0.6.0-dev.<N>.g<sha>`, N commits past the last v* tag), a release build

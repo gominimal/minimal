@@ -1,0 +1,45 @@
+{
+ "summary": {
+  "errors": 2,
+  "warnings": 0,
+  "fixed": 0
+ },
+ "findings": [
+  {
+   "code": "shear/unused_dependency",
+   "severity": "error",
+   "message": "unused dependency `serde`",
+   "file": "crates/graph/Cargo.toml",
+   "location": {
+    "offset": 1,
+    "length": 5
+   },
+   "help": "remove this dependency",
+   "fixable": true
+  },
+  {
+   "code": "shear/unused_workspace_dependency",
+   "severity": "error",
+   "message": "unused workspace dependency `rustc-hash`",
+   "file": "Cargo.toml",
+   "location": {
+    "offset": 1,
+    "length": 5
+   },
+   "help": "remove this dependency",
+   "fixable": true
+  },
+  {
+   "code": "shear/redundant_ignore",
+   "severity": "warning",
+   "message": "redundant ignore `x`",
+   "file": "crates/remote-proto/Cargo.toml",
+   "location": {
+    "offset": 1,
+    "length": 1
+   },
+   "help": "",
+   "fixable": false
+  }
+ ]
+}

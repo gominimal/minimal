@@ -323,7 +323,7 @@ jobs:
     # the declared floor is a promise — so it feeds `notify`.
     runs-on: ubuntu-latest
     # cargo-hack --rust-version does a full cold workspace check under the 1.95
-    # toolchain (separate from the 1.97 build cache), which is slow on a first
+    # toolchain (separate from the 1.99 build cache), which is slow on a first
     # run; give it room so it isn't killed mid-compile.
     timeout-minutes: 60
     steps:
@@ -446,6 +446,17 @@ jobs:
       # withheld, so grant it here too. Unused on this non-PR call.
       pull-requests: read
     uses: ./.github/workflows/ci-macos.yml
+
+  metrics:
+    # Architectural-health snapshot, defined in metrics.yml so it can also be
+    # dispatched alone. Non-blocking: its jobs are continue-on-error inside
+    # the called workflow, and `notify` does not need it.
+    permissions:
+      # For metrics.yml's `publish` job alone, which pushes to metrics-data;
+      # a called workflow cannot hold a permission its caller withheld. The
+      # collector job there narrows itself to `contents: read`.
+      contents: write
+    uses: ./.github/workflows/metrics.yml
 
   notify:
     # File (or update) a tracking issue when a BLOCKING nightly job fails, so

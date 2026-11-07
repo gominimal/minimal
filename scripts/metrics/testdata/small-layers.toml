@@ -1,0 +1,9 @@
+schema = 1
+[layers]
+leaf = ["common"]
+build = ["decode", "graph"]
+product = ["mip"]
+[allowed]
+leaf = []
+build = ["leaf", "build"]
+product = ["leaf", "build"]

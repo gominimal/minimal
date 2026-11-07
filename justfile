@@ -362,6 +362,68 @@ clippy:
 clippy-strict BASE="":
     scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
+# Architectural-health measurement (spec 31, metrics/README.md). The snapshot
+# lands in .scratch/metrics/<mode>/; `full` compiles (clippy, coverage, module
+# graphs), `static` does not. On macOS the compiling collectors take the darwin
+# crate pair and the snapshot is marked darwin. Exit 2 is a failed gate, 3 an
+# incomplete snapshot; neither reads as clean.
+# CI: metrics.yml, dispatched alone or called by nightly-tests.yml (see docs/ci-strategy.md §6).
+#
+# Install the metrics tools at their pinned versions (scripts/metrics/install-tools.sh).
+metrics-tools:
+    scripts/metrics/install-tools.sh
+
+# Write a quality snapshot (`just metrics` full, `just metrics static` without compiling).
+metrics MODE="full" *args:
+    scripts/metrics/run.sh {{MODE}} {{strict-scope}} {{args}}
+
+# Clippy over the crates the branch touched (scoped like `just clippy-strict`),
+# the static collectors, then the report in .scratch/metrics/diff/ against the
+# newest snapshot of the base ref. `just metrics-diff "" --coverage` adds
+# llvm-cov over the same crates. The no-compiler form is the `quality-gate` task
+# in .minimal/minimal.toml (`scripts/metrics/run.sh gate`). Exit 2 is a failing
+# verdict, 3 an incomplete snapshot; neither reads as clean.
+#
+# Grade this branch's change against its base ref; BASE defaults to the merge-base with origin/main.
+metrics-diff BASE="" *args:
+    scripts/metrics/run.sh diff "{{BASE}}" {{strict-scope}} {{args}}
+
+# Seconds, no compile: the table in metrics/layers.toml against cargo metadata.
+# Part of `just ci`. Exit 2 names the forbidden edge or the unassigned crate.
+#
+# Check crate dependency directions against metrics/layers.toml.
+metrics-layers:
+    python3 scripts/metrics/layers.py --rules metrics/layers.toml
+
+# HISTORY is a checkout of the `metrics-data` branch: one <date>-<sha7>.json per
+# nightly snapshot. The nightly job fetches origin/metrics-data into
+# .scratch/metrics/history (a later change adds that script); point HISTORY at
+# any other checkout. The page is one self-contained index.html, inline SVG,
+# no script, nothing fetched; every chart has a table of its values below it.
+#
+# Render the quality dashboard from a snapshot history into .scratch/metrics/dashboard/.
+metrics-dashboard HISTORY=".scratch/metrics/history":
+    python3 scripts/metrics/dashboard.py {{HISTORY}} .scratch/metrics/dashboard
+
+# Keeps every snapshot of the last ninety days and the earliest of each month
+# beyond that, decided from the file names alone (QM-015). `--dry-run` lists
+# without deleting; `--today YYYY-MM-DD` sets the reference date (default: the
+# newest snapshot's).
+#
+# Prune a snapshot history to daily for ninety days, then monthly.
+metrics-prune HISTORY=".scratch/metrics/history" *args:
+    python3 scripts/metrics/prune.py {{HISTORY}} {{args}}
+# cargo-mutants over the lines this branch changed since BASE (default
+# origin/main), nextest as the runner; the snapshot lands in
+# .scratch/metrics/mutants/. Linux only: cargo-mutants runs the baseline
+# suite first, and it is green only here. A brand-new, untracked file is
+# outside the diff and listed as such. Minutes for a small change.
+#
+# Mutation-test this branch's changed lines (metrics/README.md, "Test quality").
+[linux]
+metrics-mutants BASE="":
+    scripts/metrics/run.sh mutants "{{BASE}}"
+
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
 #
@@ -509,12 +571,12 @@ hooks:
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored zoned-link-check
+ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest test-ignored zoned-link-check
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy clippy-strict deny test doctest zoned-link-check
+ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest zoned-link-check
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.

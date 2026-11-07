@@ -1,0 +1,195 @@
+name: metrics
+
+# Architectural-health snapshot (docs/specs/31-spec-quality-metrics), in a
+# workflow of its own so it runs on demand as well as nightly: dispatch it
+# alone, or nightly-tests.yml calls it via workflow_call. Only a run on main
+# publishes to `metrics-data`; a run on another branch still uploads the
+# `metrics` artifact.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# One snapshot per ref at a time; a nightly call waits behind a manual run.
+concurrency:
+  group: metrics-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Same R2 mirror routing as nightly-tests.yml: workflow-level env does not
+  # reach a called workflow, so it is restated here.
+  MINIMAL_REMOTE_CACHE_URL: https://cache.minimal.dev/
+
+jobs:
+  metrics:
+    # `just metrics` runs every collector, the dashboard renders from the
+    # history, both ship as the `metrics` artifact, and the snapshot's
+    # summary.md lands on the run's summary page. This job builds and tests
+    # the checked-out tree and runs tools from crates.io, so it holds a
+    # read-only token and keeps none in .git/config; `publish` below pushes.
+    # Non-blocking while it beds in: read it in the run, promote into
+    # nightly-tests' `notify` once a week of snapshots says it is quiet.
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.snapshot.outputs.status }}
+    # Coverage is a cold instrumented workspace build plus the suite; the
+    # module graphs load every crate through rust-analyzer; mutants test one
+    # shard. The spec's bound (QM-N02) is this value.
+    timeout-minutes: 120
+    # Here rather than on the caller: a job that calls a reusable workflow
+    # cannot set continue-on-error, so this keeps nightly-tests green.
+    continue-on-error: true
+    permissions:
+      # Read only: the checkout and the history checkout.
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The mutation run's share of the job: coverage is a cold instrumented
+      # build of the workspace and the module graphs load every crate, so
+      # the rest of the budget is theirs.
+      MINIMAL_METRICS_MUTANTS_BUDGET_SECS: "1500"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Hotspots walk the history and the mutants reference orders
+          # snapshots by commit time, so no shallow clone.
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Setup Rust (protoc + cache)
+        uses: ./.github/actions/setup-rust
+        with:
+          # Clippy here runs with lint flags `just clippy` never passes and
+          # coverage builds instrumented, so nothing in this job shares an
+          # artifact with another job class.
+          shared-key: metrics
+      - name: Install just
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          # No cargo-binstall: without it install-tools.sh builds every tool
+          # with `cargo install --locked`, from crates.io sources checked
+          # against the index, rather than running release-page binaries
+          # that nothing checks a digest of.
+          tool: just@1.58.0
+      - name: Restore the metrics tools
+        # The binaries built at these pins, so a run compiles only what a
+        # pin change moved. Keyed on the pins and the toolchain; written by
+        # main alone (the save step below).
+        id: tools-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-llvm-cov
+            ~/.cargo/bin/cargo-modules
+            ~/.cargo/bin/cargo-shear
+            ~/.cargo/bin/cargo-nextest
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/bin/cargo-crap
+            ~/.cargo/bin/tokei
+            ~/.cargo/bin/rustqual
+            ~/.cargo/bin/cargo-anatomy
+          key: ${{ runner.os }}-metrics-tools-${{ hashFiles('scripts/metrics/install-tools.sh', 'rust-toolchain.toml') }}
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+      - name: Install the pinned metrics tools
+        run: just metrics-tools
+      - name: Install the experimental tools (best effort)
+        # rustqual and cargo-anatomy compile from crates.io (no prebuilt
+        # binaries); a failed install leaves their blocks not measured, which
+        # the snapshot says, rather than failing the run.
+        run: scripts/metrics/install-tools.sh --experimental || echo "experimental tools not installed; recorded as not measured"
+      - name: Save the metrics tools
+        # Main only, so a branch's build never becomes what main restores.
+        if: github.ref == 'refs/heads/main' && steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-llvm-cov
+            ~/.cargo/bin/cargo-modules
+            ~/.cargo/bin/cargo-shear
+            ~/.cargo/bin/cargo-nextest
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/bin/cargo-crap
+            ~/.cargo/bin/tokei
+            ~/.cargo/bin/rustqual
+            ~/.cargo/bin/cargo-anatomy
+          key: ${{ steps.tools-cache.outputs.cache-primary-key }}
+      - name: Check out the snapshot history
+        # The checkout fetches with the token but keeps none; the branch is
+        # missing on the first run, and the dashboard then renders this run
+        # alone.
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: metrics-data
+          path: .scratch/metrics-data
+          persist-credentials: false
+      - name: Stage the snapshot history
+        run: |
+          set -euo pipefail
+          mkdir -p .scratch/metrics/history
+          if [ -d .scratch/metrics-data/history ]; then
+            cp .scratch/metrics-data/history/*.json .scratch/metrics/history/ 2>/dev/null || true
+          fi
+          rm -rf .scratch/metrics-data
+      - name: Snapshot
+        # Exit 2 is a failed gate and 3 an incomplete snapshot; both still
+        # write the file, and both are worth the artifact. Anything else is
+        # the job failing.
+        run: |
+          set -euo pipefail
+          status=0
+          just metrics full || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          case "$status" in 0|2|3) ;; *) exit "$status" ;; esac
+        id: snapshot
+      - name: Dashboard
+        if: always()
+        run: |
+          set -euo pipefail
+          cp .scratch/metrics/full/snapshot.json ".scratch/metrics/history/$(date -u +%Y-%m-%d)-$(git rev-parse --short=7 HEAD).json"
+          just metrics-dashboard
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: metrics
+          path: |
+            .scratch/metrics/full/
+            .scratch/metrics/dashboard/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    # Pushes the snapshot to the orphan `metrics-data` branch, never to main
+    # (AGENTS.md: nothing commits to main outside a reviewed PR; the gate
+    # reads its baseline from that ref). The only job with a write token: it
+    # builds nothing and installs nothing, and runs main's own
+    # publish-snapshot.sh over the artifact the collector uploaded.
+    # Scheduled and manual runs on main only (called from nightly-tests,
+    # github.ref is the caller's), and a complete snapshot only: exit 3 says
+    # a collector did not run, and a history with holes in it ratchets
+    # against nothing. `metrics` is continue-on-error, so its result reads
+    # success whatever happened; its snapshot status is the real test.
+    needs: metrics
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (needs.metrics.outputs.status == '0' || needs.metrics.outputs.status == '2')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      # The publish script's refspec names metrics-data on both sides, so
+      # this cannot reach main.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The push below uses the job token from .git/config.
+          persist-credentials: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: metrics
+          path: .scratch/metrics
+      - name: Publish the snapshot to metrics-data
+        run: scripts/metrics/publish-snapshot.sh .scratch/metrics/full/snapshot.json

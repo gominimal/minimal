@@ -1,0 +1,18 @@
+schema = 1
+[floors]
+"coverage.lines_pct" = 50.0
+"mutants.score_pct" = 0.0
+[ceilings]
+"layers.unexcepted" = 0
+"layers.unassigned" = 0
+"modules.cycles" = 0
+"clippy.workspace_lints" = 0
+[ratchet]
+"clippy.strict.total" = { direction = "down", tolerance = 0 }
+"coverage.lines_pct" = { direction = "up", tolerance = 0.25 }
+"crap.over_threshold" = { direction = "down", tolerance = 0 }
+[crap]
+threshold = 30
+[hotspots]
+window_days = 3650
+top = 10

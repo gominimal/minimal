@@ -1,0 +1,88 @@
+# Crate layers and the dependency directions between them.
+#
+# `scripts/metrics/layers.py` reads this table and `cargo metadata`, and
+# reports every normal dependency edge between workspace crates that the
+# table forbids. Development and build dependencies are not edges: a test
+# may reach anywhere. The table is derived from docs/architecture.md §0
+# (core crates versus the product surface) and §3 (planes); when a crate
+# moves plane, change both.
+#
+# Every workspace member must appear in exactly one layer, or the
+# `layers.unassigned` gate fails (QM-008). A forbidden edge that the tree
+# carries today is listed under [[exception]] with the issue that tracks
+# its removal; exceptions count toward the `layers.exceptions` ratchet,
+# which may not grow, and never toward `layers.unexcepted`, which must be
+# zero (QM-007).
+
+schema = 1
+
+[layers]
+# Utilities with no internal dependencies.
+leaf = [
+    "args",
+    "async-dialog",
+    "client-config",
+    "diagnostics",
+    "ot",
+    "paths",
+    "remote-proto",
+    "stdlib",
+    "switch",
+    "version",
+]
+# Shared by both planes; may reach only leaves and each other.
+shared = ["common", "mlog"]
+# The build plane: config evaluation, the graph, caches, build execution.
+build = [
+    "check",
+    "checkouts",
+    "decode",
+    "graph",
+    "lcache",
+    "mfile",
+    "op",
+    "orchestrator",
+    "rcache",
+    "remote-client",
+    "sandbox",
+]
+# The session plane's library crates.
+session = ["bep", "boxes", "minimal-client", "minimald-rpc"]
+# The build-plane facade the product crates embed.
+facade = ["mctx"]
+# The product surface: the binaries users run.
+product = ["minimal", "minimald", "minvmd", "minzoned", "mip"]
+
+# from-layer -> the layers it may depend on. A layer that may depend on
+# itself names itself; `product` does not, so a binary embedding another
+# binary's crate is an exception with a reason.
+[allowed]
+leaf = []
+shared = ["leaf", "shared"]
+build = ["leaf", "shared", "build"]
+session = ["leaf", "shared", "session"]
+facade = ["leaf", "shared", "build"]
+product = ["leaf", "shared", "build", "session", "facade"]
+
+# Edges the tree carries today. Remove the entry when the edge goes.
+
+[[exception]]
+from = "mfile"
+to = "boxes"
+reason = "the [session] and [tasks] tables of minimal.toml are typed in `boxes`; splitting the types out is tracked"
+since = "2026-10-14"
+issue = "unassigned"
+
+[[exception]]
+from = "minimal"
+to = "minvmd"
+reason = "autospawn embeds the VM host daemon; the libkrun feature is the opt-out"
+since = "2026-10-14"
+issue = "unassigned"
+
+[[exception]]
+from = "minzoned"
+to = "minvmd"
+reason = "the box-name answerer reuses minvmd's networking module (see `just zoned-link-check`)"
+since = "2026-10-14"
+issue = "unassigned"
