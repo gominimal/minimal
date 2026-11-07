@@ -618,8 +618,12 @@ these things as the `gominimal-aw-bot` App:
 3. It opens a PR that moves `main` to the next minor. Merge this PR before the
    promotion creates `vX.Y.0`, or the version check fails on `main`.
 
-Run it again after a failure. It carries on if the line already exists at the same
-commit, and it refuses a line at any other commit.
+Run it again after a failure, with the same `commit`. If you left `commit` out
+and `main` has moved since, the rerun refuses and prints the commit the line is
+at: pass that as `commit`. It carries on if the line already exists at the same
+commit, and it refuses a line at any other commit. If the bump branch exists
+with no PR, it opens the PR. It opens no bump PR when the branch already has an
+open or merged one, or when `main` no longer declares the version at the commit.
 
 **Admin step for each new line.** The workflow cannot do this: an organization
 owner adds `gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.x`

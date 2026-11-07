@@ -67,12 +67,13 @@ jobs:
                     existing="$found"
                   fi
                   if [ -n "$existing" ] && [ "$existing" != "$sha" ]; then
-                    echo "::error::$line already exists at $existing"
+                    echo "::error::$line already exists at $existing. If an earlier cut-minor run created it, rerun with $existing as the commit input"
                     exit 1
                   fi
                   echo "cutting $line from $sha; main moves to $next"
                   {
                     echo "sha=$sha"
+                    echo "version=$version"
                     echo "line=$line"
                     echo "next=$next"
                     echo "exists=${existing:+true}"
@@ -128,23 +129,46 @@ jobs:
               env:
                   GH_TOKEN: ${{ steps.token.outputs.token }}
                   APP_SLUG: ${{ steps.token.outputs.app-slug }}
+                  VERSION: ${{ steps.plan.outputs.version }}
                   LINE: ${{ steps.plan.outputs.line }}
                   NEXT: ${{ steps.plan.outputs.next }}
               run: |
                   set -euo pipefail
-                  branch="chore/bump-main-$NEXT"
-                  remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-                  if git ls-remote --exit-code "$remote" "refs/heads/$branch" >/dev/null; then
-                    echo "::notice::$branch already exists; leaving it as it is"
+                  # Main has moved on already (the bump merged, or someone else
+                  # moved it): a bump from it would do nothing or go backwards.
+                  current="$(git show origin/main:Cargo.toml | sed -n 's/^package\.version[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' | head -n 1)"
+                  if [ "$current" != "$VERSION" ]; then
+                    echo "::notice::main declares $current, not $VERSION; leaving it as it is"
                     exit 0
                   fi
-                  git switch -c "$branch" origin/main
-                  scripts/set-package-version.sh "$NEXT"
-                  bot="${APP_SLUG}[bot]"
-                  bot_id="$(gh api "users/$bot" --jq .id)"
+                  branch="chore/bump-main-$NEXT"
+                  remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
                   title="chore(release): bump main to $NEXT"
-                  git -c user.name="$bot" -c user.email="$bot_id+$bot@users.noreply.github.com" commit -am "$title"
-                  git push "$remote" "HEAD:refs/heads/$branch"
+                  # ls-remote exits 2 when the branch is missing; anything else
+                  # nonzero (128 on an auth failure) is an error, not "missing".
+                  if git ls-remote --exit-code "$remote" "refs/heads/$branch" >/dev/null; then
+                    # A rerun after `gh pr create` failed finds the branch with
+                    # no PR, and opens the PR from it.
+                    prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --base main --state all \
+                      --json state --jq '[.[] | select(.state != "CLOSED")] | length')"
+                    if [ "$prs" -gt 0 ]; then
+                      echo "::notice::$branch already has a PR; leaving it as it is"
+                      exit 0
+                    fi
+                    echo "::notice::$branch exists with no PR; opening one"
+                  else
+                    rc=$?
+                    if [ "$rc" -ne 2 ]; then
+                      echo "::error::git ls-remote failed (exit $rc) looking for $branch"
+                      exit 1
+                    fi
+                    git switch -c "$branch" origin/main
+                    scripts/set-package-version.sh "$NEXT"
+                    bot="${APP_SLUG}[bot]"
+                    bot_id="$(gh api "users/$bot" --jq .id)"
+                    git -c user.name="$bot" -c user.email="$bot_id+$bot@users.noreply.github.com" commit -am "$title"
+                    git push "$remote" "HEAD:refs/heads/$branch"
+                  fi
                   gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --title "$title" \
                     --body "$LINE now carries the current minor, so main moves to $NEXT. Merge this before that minor is promoted, or the version check fails on main. Opened by cut-minor.yml."
             - name: Summarize
