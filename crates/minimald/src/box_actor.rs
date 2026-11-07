@@ -149,6 +149,10 @@ pub(super) struct PendingResume {
     before: Record,
     span: tracing::Span,
     restarted_from_stored_spec: bool,
+    /// The resume launched the host itself, to run `on_activate` again
+    /// (BOX-028). A launch that fails after it stops that host, so the box
+    /// does not stay running on the hook host alone.
+    minted_host: bool,
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -1228,6 +1232,7 @@ impl BoxActor {
             activate_hooks = tracing::field::Empty,
         );
         let before = record.clone();
+        let had_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
         let resumed =
             tracing::Instrument::instrument(self.resume_ended(record, from), span.clone()).await;
         match resumed {
@@ -1236,6 +1241,8 @@ impl BoxActor {
                 before,
                 span,
                 restarted_from_stored_spec,
+                minted_host: !had_host
+                    && matches!(self.inner, BoxInner::Active { host: Some(_), .. }),
             })),
             Err(error) => {
                 span.record("outcome", "refused");
@@ -1252,7 +1259,9 @@ impl BoxActor {
     /// the `resumed` event. A launch that failed and left no host writes
     /// back the whole record the resume read, so the box does not read as
     /// running with no processes and keeps the settings it had, and marks
-    /// its name stopped again.
+    /// its name stopped again. A launch that failed beside a host the resume
+    /// launched for `on_activate` stops that host first, and then does the
+    /// same.
     pub(super) async fn finish_resume(
         &mut self,
         pending: PendingResume,
@@ -1263,12 +1272,24 @@ impl BoxActor {
             before,
             span,
             restarted_from_stored_spec,
+            minted_host,
         } = pending;
         let outcome_span = span.clone();
         let finish = async {
             let has_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
-            if let (Err(error), false) = (launched, has_host) {
+            if let Err(error) = launched
+                && (!has_host || minted_host)
+            {
                 span.record("outcome", "launch failed");
+                // The host is the one the resume launched for `on_activate`.
+                // The attach did not take it, so it stops with the resume.
+                if has_host {
+                    tracing::info!(
+                        %error,
+                        "resume: the launch failed, and the host started for on_activate is stopping"
+                    );
+                    self.stop_running(false).await;
+                }
                 let restored = self.record.write(before).await;
                 match restored {
                     Ok(()) => tracing::info!(
