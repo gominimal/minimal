@@ -7,8 +7,7 @@ name: cut-minor
 #
 # Needs a bypass actor on the `release branches` ruleset, because that ruleset
 # stops anyone else creating a branch under release/. The signing runner group
-# and the bucket grants are per branch too. See
-# docs/internal/release-pipeline.md.
+# is per branch too. See docs/internal/release-pipeline.md.
 on:
     workflow_dispatch:
         inputs:

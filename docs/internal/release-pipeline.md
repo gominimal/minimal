@@ -621,16 +621,13 @@ these things as the `gominimal-aw-bot` App:
 Run it again after a failure. It carries on if the line already exists at the same
 commit, and it refuses a line at any other commit.
 
-**Admin steps for each new line.** The workflow cannot do these, and a dry run of
-`release.yml` does not test the second one, because it skips the uploads.
+**Admin step for each new line.** The workflow cannot do this: an organization
+owner adds `gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.x`
+to the `signing` runner group. See [step 2](#2-give-the-commit-a-branch).
 
-1. An organization owner adds
-   `gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.x` to
-   the `signing` runner group. See [step 2](#2-give-the-commit-a-branch).
-2. A Google Cloud admin gives the identity
-   `repo:gominimal/minimal:ref:refs/heads/release/X.Y.x` write access to
-   `gs://minimal-shim`. Without it, the `release` job fails at the archive upload.
-   Check that the identity can also write to `gs://minimal-one`.
+The buckets need no change. Both Workload Identity providers map any
+`release/X.Y.x` branch to `attribute.minimal_release`, which has write access to
+`gs://minimal-shim` and `gs://minimal-one`.
 
 The workflow itself needs one admin step, once: add `gominimal-aw-bot` as a bypass
 actor on the `release branches` repository rules. Those rules stop anyone else
