@@ -3239,6 +3239,186 @@ impl Drop for PlannedLaunch {
     }
 }
 
+/// A network namespace on a [`Network`](network::Network), held open with no
+/// program in it. A process of this daemon can create sockets in the
+/// namespace, so they leave on that network and under its rules. Dropping it
+/// ends the namespace and releases the network.
+pub struct HeldNetwork {
+    pid: u32,
+    nameservers: Vec<std::net::Ipv4Addr>,
+    #[cfg(target_os = "linux")]
+    _held: std::sync::Mutex<Held>,
+}
+
+impl std::fmt::Debug for HeldNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldNetwork")
+            .field("pid", &self.pid)
+            .field("nameservers", &self.nameservers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HeldNetwork {
+    /// The process whose `/proc/<pid>/ns` holds the namespace.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// The name servers the network's plan names, which answer inside the
+    /// namespace.
+    #[must_use]
+    pub fn nameservers(&self) -> &[std::net::Ipv4Addr] {
+        &self.nameservers
+    }
+}
+
+/// What keeps a [`HeldNetwork`] up. The sandbox's process waits at the start
+/// gate and never runs a program, so its rootfs holds nothing to run.
+#[cfg(target_os = "linux")]
+struct Held {
+    child: hakoniwa::Child,
+    guard: Option<Box<dyn NetGuard>>,
+    _gate: StartGate,
+    _sandbox: Sandbox<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Held {
+    fn drop(&mut self) {
+        // Killed before the gate goes, so no program ever starts.
+        end_held(&mut self.child);
+        // `Drop` cannot `await`; with no runtime there is nothing to release to.
+        if let (Some(guard), Ok(handle)) =
+            (self.guard.take(), tokio::runtime::Handle::try_current())
+        {
+            handle.spawn(guard.teardown());
+        }
+    }
+}
+
+/// Ends a held process and reaps it. A process that already exited refuses
+/// the kill, and the wait still reaps it.
+#[cfg(target_os = "linux")]
+fn end_held(child: &mut hakoniwa::Child) {
+    if let Err(e) = child.kill() {
+        tracing::debug!(error = %e, "a held process refused the kill");
+    }
+    if let Err(e) = child.wait() {
+        tracing::warn!(error = %e, "could not reap a held process");
+    }
+}
+
+/// The sandbox a [`HeldNetwork`] runs in. Its rootfs is the bare `usr/` that
+/// [`Sandbox::new`] links `usr/lib64` in.
+#[cfg(target_os = "linux")]
+async fn held_sandbox(
+    base_dir: &Path,
+    network: std::sync::Arc<dyn network::Network>,
+) -> Result<Sandbox<()>, Error> {
+    let rootfs = tempfile::tempdir()
+        .map_err(|e| Error::IO("create held rootfs", base_dir.to_path_buf(), e))?;
+    let usr = rootfs.path().join("usr");
+    fs::create_dir(&usr).map_err(|e| Error::IO("create held rootfs usr", usr, e))?;
+    Config::new("held-network")
+        .with_add_rootfs(config::SandboxMapped::TempDir(rootfs))
+        .with_network(network)
+        .build(base_dir, ())
+        .await
+}
+
+/// Starts a sandbox under `base_dir` that holds `network` up with no program
+/// in it.
+///
+/// # Errors
+///
+/// Propagates a failure to plan, spawn or attach. Nothing stays held.
+#[cfg(target_os = "linux")]
+pub async fn hold_network(
+    base_dir: &Path,
+    network: std::sync::Arc<dyn network::Network>,
+) -> Result<HeldNetwork, Error> {
+    let mut sandbox = held_sandbox(base_dir, network).await?;
+    let planned = sandbox.plan_launch().await?;
+    let nameservers = match planned.plan().resolver() {
+        network::Resolver::Nameservers(nameservers) => nameservers.clone(),
+        _ => Vec::new(),
+    };
+    let mut container = sandbox.new_container(planned.plan())?;
+    let gate = sandbox.hold_start(&mut container)?;
+    let mut cmd = sandbox.command(&container, "/held-network", [""; 0], [("", ""); 0])?;
+    // A held process reads and writes nothing, so its stdio is /dev/null. It
+    // must not take the daemon's terminal: hakoniwa binds a terminal stdout
+    // as the box's console, and a daemon whose stdout is a microVM guest's
+    // console has none it can bind there.
+    let null = || {
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .map(hakoniwa::Stdio::from)
+            .map_err(|e| Error::IO("open the held network's stdio", "/dev/null".into(), e))
+    };
+    cmd.stdin(null()?);
+    cmd.stdout(null()?);
+    cmd.stderr(null()?);
+    let mut child = forker::on_fork_thread(move || cmd.spawn())
+        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+    let pid = child.id();
+    let spawned = network::Spawned::from_child(&mut child);
+    let guard = match planned.attach(spawned).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            // A held process that ended before its attach ended for a reason
+            // of its own, which the attach's error does not carry.
+            let ended = child.try_wait().ok().flatten();
+            end_held(&mut child);
+            return Err(match ended {
+                Some(status) => Error::Execution(ExecutionError::InvocationFailed {
+                    idx: 0,
+                    code: status.code,
+                    reason: format!(
+                        "the held network's process ended before its attach: {}",
+                        status.reason
+                    ),
+                    stderr: String::new(),
+                    stdout: String::new(),
+                }),
+                None => e,
+            });
+        }
+    };
+    Ok(HeldNetwork {
+        pid,
+        nameservers,
+        _held: std::sync::Mutex::new(Held {
+            child,
+            guard: Some(guard),
+            _gate: gate,
+            _sandbox: sandbox,
+        }),
+    })
+}
+
+/// Sandboxes run only on Linux, so no network is held anywhere else.
+///
+/// # Errors
+///
+/// Always.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
+pub async fn hold_network(
+    base_dir: &Path,
+    _network: std::sync::Arc<dyn network::Network>,
+) -> Result<HeldNetwork, Error> {
+    Err(Error::IO(
+        "holding a network",
+        base_dir.to_path_buf(),
+        std::io::Error::from(std::io::ErrorKind::Unsupported),
+    ))
+}
+
 /// The network plan a sandbox's built-in configuration implies. See
 /// [`Sandbox::built_in_plan`].
 fn plan_from_config(config: &config::Config) -> network::NetPlan {
@@ -6540,6 +6720,48 @@ int main(int argc, char **argv) {
             first_mark.exists(),
             "the released program never ran: no mark at {}",
             first_mark.display()
+        );
+    }
+
+    /// A held network builds with no package in its rootfs, holds a namespace
+    /// of its own while it lives, and takes its process with it when dropped.
+    /// Building needs no user namespace, so that part holds on every host.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_network_holds_its_namespace_until_dropped() {
+        let name = "held-network";
+        let base_dir = box_base_dir(name);
+        let home = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let rec = std::sync::Arc::new(Recorder::default());
+        held_sandbox(home.path(), rec.clone())
+            .await
+            .expect("building the held sandbox");
+
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping the rest of a_held_network_holds_its_namespace_until_dropped: \
+                 this host denies the unprivileged user namespace every \
+                 sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+
+        let held = hold_network(home.path(), rec.clone())
+            .await
+            .expect("holding the network");
+        let proc_dir = PathBuf::from(format!("/proc/{}", held.pid()));
+        assert_ne!(
+            fs::read_link(proc_dir.join("ns/net")).expect("reading the held namespace"),
+            fs::read_link("/proc/self/ns/net").expect("reading this process's namespace"),
+            "the held process shares this process's network namespace"
+        );
+
+        drop(held);
+        assert!(
+            !proc_dir.exists(),
+            "the held process outlived its handle: {}",
+            proc_dir.display()
         );
     }
 

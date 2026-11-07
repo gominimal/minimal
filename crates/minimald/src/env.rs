@@ -534,7 +534,7 @@ impl Env {
             }
             ctx.build_graph(&graph, false, None).await.map_err(|e| {
                 let failure = e.to_string();
-                std::io::Error::other(unreachable_source(&failure).unwrap_or(failure))
+                std::io::Error::other(unreachable_source(&failure, &args.name).unwrap_or(failure))
             })?;
         }
 
@@ -1827,7 +1827,7 @@ impl BoxChannel {
             });
         let (build_err, ()) = tokio::join!(build, render);
         if let Some(e) = build_err {
-            let e = unreachable_source(&e).unwrap_or(e);
+            let e = unreachable_source(&e, &self.name).unwrap_or(e);
             let _ = writeln!(stream, "error: {e}");
             return;
         }
@@ -1942,9 +1942,6 @@ impl BoxChannel {
                 &self.ctx.daemon_context().config().remote_cache_url(),
             ),
             objects,
-            // NET-155: the install's web sources are fetched in the box's
-            // leaf when it has one, so they are the box's traffic.
-            sources_placed: self.ctx.classifier_leaf().is_some(),
         }
     }
 
@@ -2128,13 +2125,19 @@ impl BoxChannel {
             let lines = tapped
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(refusal) = patched_build_refusal(
+            let failure = e.to_string();
+            let refusal = patched_build_refusal(
                 build_denies_all(self.classifier_leaf.as_ref(), box_network.as_ref()),
                 pkg_name,
                 &self.name,
-                &e.to_string(),
+                &failure,
                 lines.iter().map(String::as_str),
-            ) {
+            )
+            .or_else(|| {
+                let text = failure.strip_prefix("other: ")?;
+                source_failure(pkg_name, &self.name, text)
+            });
+            if let Some(refusal) = refusal {
                 let _ = writeln!(stream, "error: {refusal}");
             }
             let _ = writeln!(stream, "error: {e}");
@@ -3778,18 +3781,38 @@ const WEB_SOURCE_FAILURE: &str = "could not fetch the source ";
 /// followed by the host and the port.
 const WEB_SOURCE_CONNECT_FAILURE: &str = "could not connect to ";
 
-/// The error line for a package build whose source download could not
-/// connect (NET-155), or `None` for any other failure. `failure` is the
-/// build's own error: its package, then the download's text, whose reason
-/// the line keeps.
-pub(crate) fn unreachable_source(failure: &str) -> Option<String> {
+/// The error line for a package build of the box `box_name` that could not
+/// connect to a source, or that needs a network the box does not have
+/// (NET-155), or `None` for any other failure. `failure` is the build's own
+/// error: its package, then the download's text, whose reason the line keeps.
+pub(crate) fn unreachable_source(failure: &str, box_name: &str) -> Option<String> {
     let (head, rest) = failure.split_once("` failed to build: ")?;
     let (_, package) = head.rsplit_once('`')?;
-    let connect = rest
-        .strip_prefix("other: ")?
-        .strip_prefix(WEB_SOURCE_CONNECT_FAILURE)?;
+    source_failure(package, box_name, rest.strip_prefix("other: ")?)
+}
+
+/// [`unreachable_source`], for a package already named. `text` is the error
+/// of the build, after its kind. A refusal by the box's rules, or by its
+/// having no network, gives the next step. Any other reason is the
+/// download's own.
+pub(crate) fn source_failure(package: &str, box_name: &str, text: &str) -> Option<String> {
+    if text.lines().next() == Some(op::NEEDS_NETWORK) {
+        return Some(format!(
+            "the build of {package} needs the network, and box {box_name} has none. \
+             To build it, activate a new session with --network host_ip"
+        ));
+    }
+    let connect = text.strip_prefix(WEB_SOURCE_CONNECT_FAILURE)?;
     let host = connect_host(connect)?;
     let (_, why) = connect.lines().next()?.split_once(": ")?;
+    let why = match why {
+        common::RULES_REFUSE => egress_rules_refuse(box_name, Some(&host)),
+        common::NO_NETWORK => match egress_remedy(&host) {
+            Some(remedy) => format!("box {box_name} has no network. {remedy}"),
+            None => format!("box {box_name} has no network"),
+        },
+        why => why.to_string(),
+    };
     Some(format!(
         "the build of {package} could not reach {host}: {why}"
     ))
@@ -3864,14 +3887,6 @@ fn destination_host(destination: &str) -> &str {
         .map_or(destination, |(h, _)| h)
 }
 
-/// The host a refusal's next step can name for `destination`, which `line`
-/// of the build's output named. `None` for a web source: an own-address box
-/// has no classifier leaf, so its build fetches the source as the daemon's
-/// own traffic, and in a VM no rule of the box lets that out.
-fn remedy_host<'a>(destination: &'a str, line: &str) -> Option<&'a str> {
-    (!line.starts_with(WEB_SOURCE_FAILURE)).then(|| destination_host(destination))
-}
-
 /// The next step that lets a box's builds reach `host`, or `None` when `host`
 /// is no name `--allow-dns-hosts` can admit. The step names `--network
 /// own_ip` because a box on the default network refuses that flag at create
@@ -3928,7 +3943,7 @@ pub(crate) fn egress_refusal<'a>(
     if host == zone_apex || host.ends_with(&format!(".{zone_apex}")) {
         return None;
     }
-    let reason = egress_rules_refuse(box_name, remedy_host(&destination, line));
+    let reason = egress_rules_refuse(box_name, Some(destination_host(&destination)));
     Some(format!(
         "the build of {package} could not reach {destination}: {reason}"
     ))
@@ -3946,7 +3961,8 @@ mod tests {
         assert_eq!(
             unreachable_source(
                 "session spawn: `claude-code` failed to build: other: could not connect to \
-                     storage.googleapis.com:443: no answer after 15s"
+                     storage.googleapis.com:443: no answer after 15s",
+                "x"
             )
             .as_deref(),
             Some(
@@ -3956,7 +3972,8 @@ mod tests {
         assert_eq!(
             unreachable_source(
                 "`zsh` failed to build: other: could not connect to objects.example.net:443: \
-                     Connection refused (os error 111)\nsecond line"
+                     Connection refused (os error 111)\nsecond line",
+                "x"
             )
             .as_deref(),
             Some(
@@ -3967,12 +3984,40 @@ mod tests {
         assert_eq!(
             unreachable_source(
                 "`foo` failed to build: other: could not connect to sources.example.com:443: \
-                     the egress rules admit no destination"
+                     the egress rules do not allow this host",
+                "x"
             )
             .as_deref(),
             Some(
                 "the build of foo could not reach sources.example.com: \
-                     the egress rules admit no destination"
+                     the egress rules of box x do not allow it. \
+                     To allow it, activate a new session with \
+                     --network own_ip --allow-dns-hosts sources.example.com"
+            )
+        );
+        assert_eq!(
+            unreachable_source(
+                "`foo` failed to build: other: could not connect to sources.example.com:443: \
+                     the box has no network",
+                "x"
+            )
+            .as_deref(),
+            Some(
+                "the build of foo could not reach sources.example.com: \
+                     box x has no network. \
+                     To allow it, activate a new session with \
+                     --network own_ip --allow-dns-hosts sources.example.com"
+            )
+        );
+        assert_eq!(
+            unreachable_source(
+                "`foo` failed to build: other: the build needs the network and the box has none",
+                "x"
+            )
+            .as_deref(),
+            Some(
+                "the build of foo needs the network, and box x has none. \
+                     To build it, activate a new session with --network host_ip"
             )
         );
         for other in [
@@ -3980,13 +4025,13 @@ mod tests {
             "`foo` failed to build: exit status 1: could not connect to a.example:443: no",
             "could not connect to a.example:443: no",
         ] {
-            assert_eq!(unreachable_source(other), None, "{other}");
+            assert_eq!(unreachable_source(other, "x"), None, "{other}");
         }
     }
 
     /// A refusal gives a next step only where the step would work: a host
-    /// name a build's own connection named, without its port, and not a
-    /// literal address or a web source.
+    /// name that a build's own connection or its source fetch named, without
+    /// its port, and not a literal address.
     #[test]
     fn a_refusal_gives_a_next_step_only_where_it_works() {
         let refused = |line: &str| egress_refusal(true, "foo", "x", [line]).unwrap();
@@ -4024,12 +4069,12 @@ mod tests {
             (
                 "could not fetch the source https://example.com/a.tar.gz: \
                  could not connect to example.com:443: refused",
-                without_step("example.com"),
+                with_step("example.com", "example.com"),
             ),
             (
-                "could not fetch the source http://example.com/a.tar.gz: \
-                 could not connect to example.com:80: refused",
-                without_step("example.com"),
+                "could not fetch the source gs://a-bucket/a.tar.gz: \
+                 could not connect to storage.googleapis.com:443: refused",
+                with_step("storage.googleapis.com", "storage.googleapis.com"),
             ),
         ] {
             assert_eq!(refused(line), want, "{line}");
