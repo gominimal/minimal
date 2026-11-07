@@ -5413,7 +5413,7 @@ exit $rc
     /// exported nowhere, nor is a span under it; the same request without
     /// the prefix is exported. The task gets `MINIMAL_OTEL=off` and no
     /// `TRACEPARENT`, from the request alone: a Line-form request has no
-    /// environment to carry the marker in. Scenario 712c.
+    /// environment to carry the marker in. Scenario 712e.
     #[test]
     fn an_opted_out_helper_request_records_no_span_and_opts_its_task_out() {
         use opentelemetry::trace::TracerProvider as _;

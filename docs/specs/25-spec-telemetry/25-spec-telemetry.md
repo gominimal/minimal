@@ -435,7 +435,8 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   verify:   cargo nextest run -p minimald a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix
   test:     crates/minimald/src/env.rs::a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix
             (the shipped in-box helper under bash, then the span the daemon
-            serves its line in)
+            serves its line in; its opted-out cases send `otel%off%` and no
+            `TRACEPARENT`)
   lab:      717, 717b
   - A `min` inside a box is the in-box helper, a shell function with no
     exporter. It sends the value as the request line's `traceparent%`
@@ -743,9 +744,10 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   tier:     T0
   verify:   cargo nextest run -p minimald an_opted_out_request_leaves_no_daemon_span
   test:     crates/minimald/src/exec.rs::an_opted_out_request_leaves_no_daemon_span;
-            crates/minimal-client/src/lib.rs::do_not_track_sends_the_opt_out_and_no_traceparent
-            (both come with the code round)
-  lab:      785
+            crates/minimal-client/src/lib.rs::do_not_track_sends_the_opt_out_and_no_traceparent;
+            crates/minimald/src/env.rs::an_opted_out_helper_request_records_no_span_and_opts_its_task_out
+            (the in-box helper's `otel%off%` request)
+  lab:      785, 712e
 - **TEL-046** IF the host receiver on vsock port 7353 is unreachable THEN THE
   SYSTEM SHALL keep the guest daemon spooling, SHALL retry the connection
   every 5 s, SHALL log one warning per guest process, and SHALL drop
