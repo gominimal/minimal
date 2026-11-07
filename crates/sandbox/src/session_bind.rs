@@ -505,7 +505,7 @@ pub(crate) fn bind_all(binds: &[SessionBind]) -> Result<(), (String, io::Error)>
             Source::Tree { mount, name, rel } => {
                 let root = open_dir(Path::new(mount));
                 let root = root.map_err(|e| (format!("opening `{mount}`"), e))?;
-                let view = TreeView::of(mount, *name);
+                let view = TreeView::of(mount, name);
                 let source = resolve(root.as_fd(), view, rel);
                 source.map_err(|e| (bind.failure(Step::Source), e))?
             }
@@ -1424,7 +1424,8 @@ mod tests {
         std::os::unix::fs::symlink(&outside, home.join("abs")).unwrap();
         std::os::unix::fs::symlink("m/../loop-b", home.join("loop-a")).unwrap();
         std::os::unix::fs::symlink("m/../loop-a", home.join("loop-b")).unwrap();
-        let cases: [(&str, &str, fn(&Why) -> bool); 5] = [
+        type Case = (&'static str, &'static str, fn(&Why) -> bool);
+        let cases: [Case; 5] = [
             ("climbs/new", "n", |w| matches!(w, Why::LinkClimbs { .. })),
             ("x/new/../../..", "x/new", |w| *w == Why::Climbs),
             ("new2/../abs/new", "new2", |w| {
