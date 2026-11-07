@@ -365,8 +365,8 @@ mod placed {
         /// the cgroup. `None` takes the `nameserver` lines of
         /// `/etc/resolv.conf`.
         nameservers: Option<Vec<SocketAddr>>,
-        /// How long the relay waits for one connection, across every
-        /// address its host answers.
+        /// How long the relay waits for one connection, across the lookup
+        /// of its host and every address the host answers.
         connect_timeout: std::time::Duration,
         /// How long the relay waits for the head of a request, so a client
         /// that connects and sends nothing does not hold a handler task.
@@ -534,6 +534,7 @@ mod placed {
                     "the egress rules admit no destination",
                 ));
             }
+            let deadline = tokio::time::Instant::now() + self.connect_timeout;
             let addrs = match host.parse::<std::net::IpAddr>() {
                 Ok(ip) => vec![ip],
                 Err(_) => {
@@ -546,19 +547,30 @@ mod placed {
                             Some(nameservers) => nameservers.clone(),
                             None => system_nameservers()?,
                         };
-                        lookup_in_cgroup(&self.procs, &nameservers, host).await?
+                        let lookup = lookup_in_cgroup(&self.procs, &nameservers, host);
+                        tokio::time::timeout_at(deadline, lookup)
+                            .await
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    format!("no answer after {:?}", self.connect_timeout),
+                                )
+                            })??
                     } else {
                         listed
                     }
                 }
             };
-            // A share of the bound each, so a host that answers many
-            // addresses behind rules that drop packets fails within the
-            // bound and not once per address.
-            let share =
-                self.connect_timeout / u32::try_from(addrs.len()).unwrap_or(u32::MAX).max(1);
             let mut last = None;
+            let mut left = addrs.len();
             for ip in addrs {
+                // A share of the time left each, so a host that answers many
+                // addresses behind rules that drop packets fails within the
+                // bound and not once per address, and an address that fails
+                // at once leaves its time to the ones after it.
+                let share = deadline.saturating_duration_since(tokio::time::Instant::now())
+                    / u32::try_from(left).unwrap_or(u32::MAX);
+                left -= 1;
                 let addr = SocketAddr::new(ip, port);
                 let procs = self.procs.clone();
                 let socket = tokio::task::spawn_blocking(move || {
@@ -1474,6 +1486,72 @@ mod placed {
             let took = started.elapsed();
             assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
             assert!(took < bound * 2, "it waited {took:?}");
+        }
+
+        /// An address that fails at once leaves its time to the next: the
+        /// last address connects after a wait longer than an equal share.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_carries_unused_time_to_the_next_address() {
+            // The port is closed on the first four, which refuse at once.
+            // The last one drops the first SYN, and answers the kernel's
+            // retry about a second later, once the queue has room.
+            let (addr, _held, listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            std::fs::write(
+                procs.with_file_name("hosts"),
+                format!(
+                    "127.0.0.2 many.test\n127.0.0.3 many.test\n127.0.0.4 many.test\n\
+                     127.0.0.5 many.test\n{} many.test\n",
+                    addr.ip()
+                ),
+            )
+            .unwrap();
+            let bound = std::time::Duration::from_millis(3000);
+            let relay = test_relay(&procs, bound);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let accepted = listener.accept().await;
+                std::future::pending::<()>().await;
+                drop((accepted, listener));
+            });
+
+            let started = std::time::Instant::now();
+            relay
+                .connect("many.test", addr.port())
+                .await
+                .expect("the last address answers within the time left");
+            let took = started.elapsed();
+            assert!(
+                took > bound / 5,
+                "an equal share would not have sufficed: {took:?}"
+            );
+        }
+
+        /// The lookup of a host counts against the bound: name servers that
+        /// never answer end the connection at its deadline, not at theirs.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_counts_its_lookup_against_the_bound() {
+            let silent = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let bound = std::time::Duration::from_millis(300);
+            let mut relay = test_relay(&procs, bound);
+            relay.nameservers = Some(vec![silent.local_addr().unwrap()]);
+
+            let started = std::time::Instant::now();
+            let e = relay
+                .connect("sources.example.com", 443)
+                .await
+                .expect_err("no name server answers");
+            let took = started.elapsed();
+            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert_eq!(e.to_string(), "no answer after 300ms");
+            assert!(took < bound * 4, "it waited {took:?}");
         }
 
         /// Sends one CONNECT to `target` through the relay at `relay`, and
