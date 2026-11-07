@@ -646,9 +646,11 @@ job sets `package.version` to the next patch with
 [`scripts/set-package-version.sh`](../../scripts/set-package-version.sh). It opens
 a PR from `chore/bump-X.Y.Z+1` to `release/X.Y.x`, as the `gominimal-aw-bot` App, so
 CI runs on the PR. The job does nothing unless the line still declares the version
-it just promoted, so a rollback changes nothing. A rerun also changes nothing,
-because the branch is already there. The job does nothing for a nightly commit
-hash, or when the line does not exist.
+it just promoted, so a rollback changes nothing. A rerun changes nothing when
+the branch already has an open or merged PR. If the branch exists with no PR,
+because an earlier run pushed it and then failed to open the PR, a rerun opens
+the PR. The job does nothing for a nightly commit hash, or when the line does
+not exist.
 
 To start the next version with a candidate, change the PR to `X.Y.Z-rc1` before
 you merge it.

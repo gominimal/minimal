@@ -395,18 +395,33 @@ jobs:
                   fi
                   branch="chore/bump-$NEXT"
                   remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-                  if git ls-remote --exit-code "$remote" "refs/heads/$branch" >/dev/null; then
-                    echo "::notice::$branch already exists; leaving it as it is"
-                    exit 0
-                  fi
-                  scripts/set-package-version.sh --repo line "$NEXT"
-                  bot="${APP_SLUG}[bot]"
-                  bot_id="$(gh api "users/$bot" --jq .id)"
                   title="chore(release): bump $LINE to $NEXT"
-                  git -C line switch -c "$branch"
-                  git -C line -c user.name="$bot" -c user.email="$bot_id+$bot@users.noreply.github.com" \
-                    commit -am "$title"
-                  git -C line push "$remote" "HEAD:refs/heads/$branch"
+                  # ls-remote exits 2 when the branch is missing; anything else
+                  # nonzero (128 on an auth failure) is an error, not "missing".
+                  if git ls-remote --exit-code "$remote" "refs/heads/$branch" >/dev/null; then
+                    # A rerun after `gh pr create` failed finds the branch with
+                    # no PR, and opens the PR from it.
+                    prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --base "$LINE" --state all \
+                      --json state --jq '[.[] | select(.state != "CLOSED")] | length')"
+                    if [ "$prs" -gt 0 ]; then
+                      echo "::notice::$branch already has a PR; leaving it as it is"
+                      exit 0
+                    fi
+                    echo "::notice::$branch exists with no PR; opening one"
+                  else
+                    rc=$?
+                    if [ "$rc" -ne 2 ]; then
+                      echo "::error::git ls-remote failed (exit $rc) looking for $branch"
+                      exit 1
+                    fi
+                    scripts/set-package-version.sh --repo line "$NEXT"
+                    bot="${APP_SLUG}[bot]"
+                    bot_id="$(gh api "users/$bot" --jq .id)"
+                    git -C line switch -c "$branch"
+                    git -C line -c user.name="$bot" -c user.email="$bot_id+$bot@users.noreply.github.com" \
+                      commit -am "$title"
+                    git -C line push "$remote" "HEAD:refs/heads/$branch"
+                  fi
                   gh pr create --repo "$GITHUB_REPOSITORY" --base "$LINE" --head "$branch" --title "$title" \
                     --body "Moves $LINE to the next patch after $VERSION reached stable, so the next stage-release run needs no version PR. Opened by promote.yml."
 
