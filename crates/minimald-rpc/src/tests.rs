@@ -662,6 +662,58 @@ fn create_sends_expanded_spec_and_stores_it() {
     assert_eq!(req.spec, None);
 }
 
+/// BOX-080: the `[network] egress`, `[network] ingress`, `[network.bep]`
+/// and `[secrets]` sections of a spec reach the daemon unchanged, every
+/// key and value as the client wrote it.
+#[test]
+fn network_bep_secrets_passed_unchanged() {
+    let network = serde_json_lenient::json!({
+        "mode": "own_ip",
+        "egress": {
+            "allow_dns_hosts": ["b.example", "a.example"],
+            "allow_subnets": ["10.0.0.0/8"],
+            "deny_subnets": ["10.1.0.0/16"],
+        },
+        "ingress": [{"proto": "tcp", "port": 8080}],
+        "bep": {"upstreams": [{"host": "api.example", "secret": "token"}]},
+    });
+    let secrets = serde_json_lenient::json!({
+        "source": "broker",
+        "names": ["token"],
+    });
+    let spec = serde_json_lenient::json!({
+        "v": 0,
+        "box": {"type": "session"},
+        "network": network,
+        "secrets": secrets,
+    });
+    let mut req = CreateSessionRequest::new(
+        "net-box",
+        paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+        NetworkMode::OwnIp,
+        BoxPolicy::default(),
+    );
+    req.spec = Some(spec.clone());
+
+    let wire = serde_json_lenient::to_string(&req).unwrap();
+    let sent: serde_json_lenient::Value = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(sent["spec"]["network"], network, "[network] on the wire");
+    assert_eq!(sent["spec"]["secrets"], secrets, "[secrets] on the wire");
+
+    let received = round_trip(&req).spec.expect("the daemon receives the spec");
+    for section in ["egress", "ingress", "bep"] {
+        assert_eq!(
+            received["network"][section], network[section],
+            "[network] {section} reaches the daemon unchanged"
+        );
+    }
+    assert_eq!(
+        received["secrets"], secrets,
+        "[secrets] reaches the daemon unchanged"
+    );
+    assert_eq!(received, spec);
+}
+
 /// A client that predates `must_match_version` sends no such field, and
 /// the daemon must read that as "assert nothing" rather than fail to
 /// decode the request. `CreateSessionRequest` is deliberately *not*

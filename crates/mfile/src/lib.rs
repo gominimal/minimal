@@ -16,6 +16,7 @@ mod error;
 pub use error::{EntryNameRule, Error, SpecKeyProblem};
 pub mod expand;
 pub mod legacy;
+pub mod network;
 mod package_composable;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
