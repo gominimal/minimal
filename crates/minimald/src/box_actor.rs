@@ -1224,6 +1224,8 @@ impl BoxActor {
             box_id = %self.record.id(),
             from = from.name(),
             outcome = tracing::field::Empty,
+            hooks_on_resume = tracing::field::Empty,
+            activate_hooks = tracing::field::Empty,
         );
         let before = record.clone();
         let resumed =
@@ -1439,6 +1441,7 @@ impl BoxActor {
         // BOX-025: the box restarts from the spec stored at its creation
         // (BOX-068), refused as a create of that spec would be refused.
         let mut resumed = record.clone();
+        let mut hooks_on_resume = false;
         if let Some(bytes) = &stored {
             let unsatisfiable = |error: std::io::Error| {
                 tracing::info!(refusal = "spec", %error, "resume: the stored spec cannot be satisfied");
@@ -1453,6 +1456,7 @@ impl BoxActor {
             };
             let spec = box_runtime::stored_spec(bytes).map_err(unsatisfiable)?;
             box_runtime::restart_from_stored_spec(&mut resumed, &spec);
+            hooks_on_resume = spec.hooks_on_resume;
             // The restart's launches start the box from this spec.
             self.held_spec = Some(Some(Arc::new(spec)));
             resumed.validate_policy().map_err(|error| {
@@ -1509,6 +1513,25 @@ impl BoxActor {
                 .expect("hostname registry lock poisoned")
                 .mark_running(id);
         }
+        // BOX-028: a spec that sets `hooks_on_resume` runs `on_activate`
+        // again, before the attach's launch runs `on_attach`. A hook that
+        // fails refuses the resume as a failed activation does, and the
+        // box goes back to the state it resumed from.
+        tracing::Span::current().record("hooks_on_resume", hooks_on_resume);
+        if hooks_on_resume
+            && let Err(why) = self.rerun_activate_hooks().await
+        {
+            self.stop_running(false).await;
+            if let Err(restore_error) = self.record.write(record.clone()).await {
+                tracing::warn!(
+                    %restore_error,
+                    to = from.name(),
+                    "resume: on_activate failed, and the record could not be put back"
+                );
+            }
+            self.mark_name_stopped().await;
+            return Err(refused(std::io::ErrorKind::InvalidInput, 1, why));
+        }
         Ok(stored.is_some())
         }
         .await;
@@ -1516,6 +1539,46 @@ impl BoxActor {
         // record holds the name from here, or nothing does.
         manager.release_name_claim(id).await;
         outcome
+    }
+
+    /// Runs the box's `on_activate` hooks again for a resume whose spec sets
+    /// `hooks_on_resume` (BOX-028), on a host launched for them. The attach
+    /// that follows reuses that host. Each run and its outcome is logged,
+    /// and the `box.resume` span records how many ran. Answers the refusal
+    /// text when the launch or a hook fails.
+    async fn rerun_activate_hooks(&mut self) -> Result<(), String> {
+        let event = crate::hooks::HookEvent::Activate;
+        if !self.has_hooks_for(event) {
+            tracing::Span::current().record("activate_hooks", 0);
+            tracing::info!("resume: hooks_on_resume is set, and the box has no on_activate hook");
+            return Ok(());
+        }
+        if let Err(error) = self.launch_host_for_hooks(LaunchPhase::Attached).await {
+            tracing::info!(%error, "resume: launching the box for its on_activate hooks failed");
+            return Err(format!("It could not start to run its activation hooks: {error}."));
+        }
+        let outcomes = run_session_hooks(&self.inner, &self.record, event).await;
+        tracing::Span::current().record("activate_hooks", outcomes.len());
+        for outcome in &outcomes {
+            tracing::info!(
+                declared_by = %outcome.declared_by,
+                status = %outcome.status,
+                "resume: ran on_activate again"
+            );
+        }
+        match outcomes.iter().find(|o| o.failed()) {
+            Some(failed) => Err(format!(
+                "Its activation hook from {} {}.{}",
+                failed.declared_by,
+                failed.status,
+                if failed.output.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", failed.output)
+                },
+            )),
+            None => Ok(()),
+        }
     }
 
     /// The exit the watch holds before a message runs, as
