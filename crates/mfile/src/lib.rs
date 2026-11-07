@@ -1200,7 +1200,7 @@ impl File {
         // BOX-049: an entry's `timeout` takes the duration grammar. A bad
         // value is refused here, before a spec is built from the entry.
         if let Some(session) = &self.session {
-            check_entry_timeout("`[session]` in minimal.toml", &session.extra)?;
+            check_entry_timeout("`[defaults.session]` in minimal.toml", &session.extra)?;
         }
         for (task_name, task) in &self.tasks {
             let layer = format!(
@@ -3231,8 +3231,12 @@ mod tests {
                      Fix the value.";
         let cases = [
             (
+                "[defaults.session]\ntimeout = \"2 days\"\n",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a string that is not a duration",
+            ),
+            (
                 "[session]\ntimeout = \"2 days\"\n",
-                "`[session]` in minimal.toml sets `timeout` to a string that is not a duration",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a string that is not a duration",
             ),
             (
                 "[tasks.lint]\nexec = [\"true\"]\ntimeout = -5\n",
@@ -3244,7 +3248,7 @@ mod tests {
             ),
             (
                 "[session]\ntimeout = \"9223372036854775808\"\n",
-                "`[session]` in minimal.toml sets `timeout` to a duration that is too long",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a duration that is too long",
             ),
         ];
         for (file, start) in cases {
