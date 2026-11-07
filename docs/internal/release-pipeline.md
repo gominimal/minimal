@@ -631,7 +631,9 @@ workflow stops.
 **Version guards.** Before a promotion to `stable` moves anything, the `promote`
 job runs [`scripts/check-promotion.sh`](../../scripts/check-promotion.sh)
 against the current `stable`. The job runs after the approval, because `stable`
-can move while the approval waits. A dry run makes the same checks.
+can move while the approval waits. A dry run makes the same checks. The
+`promote` job runs one at a time for each channel, so two approved runs cannot
+both pass the check and then write out of order.
 
 - It refuses a candidate, such as `0.7.3-rc2`. No input turns this off. A
   candidate is for soak only, so stage the final version.

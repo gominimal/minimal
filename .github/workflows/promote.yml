@@ -203,6 +203,14 @@ jobs:
 
     promote:
         needs: gate
+        # One promotion per channel at a time, so two approved runs cannot
+        # both read the same `stable`, pass the check, and write out of order.
+        # Job-level, not workflow-level, so a run waiting at the gate holds
+        # nothing. GitHub keeps one waiting run per group: a third run cancels
+        # the waiting one before it writes anything.
+        concurrency:
+            group: promote-cli-${{ inputs.target }}
+            cancel-in-progress: false
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:
