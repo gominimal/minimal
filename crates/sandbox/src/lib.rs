@@ -856,10 +856,10 @@ pub mod classifier {
             return None;
         }
         Some(
-            "the kernel refused the move: the process was not in a cgroup of the daemon's \
-             tree, and only a writer of the cgroup.procs of the closest cgroup the two share \
-             may move it (/proc/<pid>/cgroup of the daemon and of the sandbox say where each \
-             sits)",
+            "the kernel refused the move; most likely the process was not in a cgroup of the \
+             daemon's tree, and only a writer of the cgroup.procs of the closest cgroup the two \
+             share may move it (/proc/<pid>/cgroup of the daemon and of the sandbox say where \
+             each sits); otherwise the leaf's own cgroup.procs is not writable by the daemon",
         )
     }
 
@@ -2420,7 +2420,7 @@ impl<C: Channel> Sandbox<C> {
         if let Some(leaf) = &self.config.classifier_leaf
             && let Some(weight) = self.config.cpu_weight
         {
-            tracing::info!(
+            tracing::debug!(
                 leaf = %leaf.dir().display(),
                 cpu_weight = weight,
                 "sandbox launch: the build's CPU weight is not applied: it runs in the box's \
