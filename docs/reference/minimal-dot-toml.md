@@ -194,6 +194,12 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
   the developer to allow-list the project in their
   [user policy](./user-policy.md) before they will run — a hook is arbitrary
   code, so the developer must opt in.
+- **`hooks_on_resume`**: Set `hooks_on_resume = true` to run the
+  `on_activate` hooks again each time a stopped or exited session resumes.
+  They run before the `on_attach` hooks of the attach that resumes it. If an
+  `on_activate` hook fails, the session does not resume and stays stopped or
+  exited. The error names the hook's source and its exit status. Without the
+  key, a resume runs only the `on_attach` hooks.
 
 The field shapes and composition semantics (conflicts, policy gating) are the
 same as loadouts; see the [loadout reference](./loadouts.md) for the exact
@@ -230,6 +236,10 @@ See: [tasks](./tasks.md).
 A task cannot set `interactive = true`. A file with such a task fails to load
 with exit code 3, and the error names the `[sessions.<name>]` entry to
 declare instead. Interactive work belongs in a session.
+
+A task entry takes `hooks_on_resume = true` too, with the same meaning as
+[the `[defaults.session]` key](#session). Only a box with a terminal
+resumes, so the key changes nothing for a task that runs without one.
 
 ### Entry tables {#entries}
 
