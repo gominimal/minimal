@@ -1134,7 +1134,11 @@ async fn serve_answerer_control(
                 | BoxControlRequest::MintBoxId(_)
                 | BoxControlRequest::ReportExposeDecision(_)
                 | BoxControlRequest::ReportRefusedEgress(_)
-                | BoxControlRequest::ListenNotice(_) => BoxControlReply::Error {
+                | BoxControlRequest::ListenNotice(_)
+                | BoxControlRequest::FileBuildTable(_)
+                | BoxControlRequest::OpenBuildGrant(_)
+                | BoxControlRequest::CloseBuildGrant(_)
+                | BoxControlRequest::DropBuildTable(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
@@ -1269,6 +1273,36 @@ async fn serve_configure_loadout(
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },
+            })
+        })
+        .await
+}
+
+/// `PrepareBuildBoxes`: takes what `min` prepared for a box's builds
+/// (NET-165).
+async fn serve_prepare_build_boxes(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::PrepareBuildBoxes
+        .handle_channel(c, async |req: minimald_rpc::PrepareBuildBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            let handle = mngr
+                .get_session(BoxKeyPredicate::Id(req.session_id))
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let Some(h) = handle else {
+                return Ok(Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
+                });
+            };
+            Ok(match h.prepare_build_boxes(req).await {
+                Ok(prepared) => Errorable::Ok(prepared),
+                Err(error) => Errorable::Err { error },
             })
         })
         .await
@@ -3540,6 +3574,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionRecord::NAME
         | CreateSession::NAME
         | minimald_rpc::ConfigureLoadout::NAME
+        | minimald_rpc::PrepareBuildBoxes::NAME
         | SubmitVerdict::NAME
         | FinalizeSession::NAME
         | RenameSession::NAME
@@ -3628,6 +3663,7 @@ pub async fn handle_ssh_rpc(
         GetSessionRecord::NAME => serve!(serve_get_session_record(s, channel)),
         CreateSession::NAME => serve!(serve_create_session(s, c.clone(), channel, ssh_username)),
         minimald_rpc::ConfigureLoadout::NAME => serve!(serve_configure_loadout(s, channel)),
+        minimald_rpc::PrepareBuildBoxes::NAME => serve!(serve_prepare_build_boxes(s, channel)),
         SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),

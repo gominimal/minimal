@@ -12,7 +12,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use crate::net::classifier::{record_node_plane_fetch, url_host, url_object};
+use crate::net::classifier::record_node_plane_fetch;
 use futures::{Stream, StreamExt as _};
 use ot::{OpId, OpSnapshot, OpStartHook, OpTracker, Operation, Progress};
 
@@ -187,13 +187,13 @@ impl SandboxProgress {
 /// [`FetchRecord`] an install was started with: the box the fetch was made
 /// for, and — per operation, the same division the meter shows — the host it
 /// leaves for and the object it brings back. A package or the index is
-/// fetched from the configured remote cache. A source a package declares is
-/// a package build's traffic (NET-155), never the node plane's, so it is not
-/// recorded. Scoping is the meter's own: a package outside the install's
-/// `scope` is not this install's fetch, while the index names no package to
-/// scope by and is attributed to whatever is building, the same caveat the
-/// meter's row carries. Run from the tracker's op-start hook, once per op as
-/// it starts.
+/// fetched from the configured remote cache. A source is fetched in the build
+/// box of the package that declares it, as that box's traffic (NET-155), so it
+/// is not recorded. Scoping is the meter's own: a package outside
+/// the install's `scope` is not this install's fetch, while a source or the
+/// index names no package to scope by and is attributed to whatever is
+/// building, the same caveat the meter's row carries. Run from the tracker's
+/// op-start hook, once per op as it starts.
 fn record_fetch(record: &FetchRecord, scope: Option<&HashSet<String>>, op: &Operation) {
     let (host, object) = match op {
         Operation::FetchPkg { name } if scope.is_none_or(|s| s.contains(name)) => (
@@ -204,20 +204,9 @@ fn record_fetch(record: &FetchRecord, scope: Option<&HashSet<String>>, op: &Oper
                 .cloned()
                 .unwrap_or_else(|| name.clone()),
         ),
-        // A source with no scheme is a tarball read off the operator's
-        // own disk: it crosses no network, so it is no node-plane fetch.
-        Operation::FetchSource { url } if !url.contains("://") => return,
-        // A source is a package build's traffic, under the box's rules
-        // (NET-155), and never the node plane's.
-        Operation::FetchSource { url } => {
-            tracing::debug!(
-                box_id = %record.box_id,
-                host = %url_host(url),
-                object = %url_object(url),
-                "a source is the box's own fetch, so the node plane keeps no record of it",
-            );
-            return;
-        }
+        // A source a box's build needs is fetched in its build box, as the
+        // build box's traffic (NET-155), so the node plane keeps no record.
+        Operation::FetchSource { .. } => return,
         Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
         _ => return,
     };
@@ -914,15 +903,14 @@ mod tests {
         );
     }
 
-    /// NET-155: a source is a package build's traffic, never the node
-    /// plane's, wherever it is fetched. No `http`, `https` or `gs://` source
-    /// is recorded, so neither a URL nor a credential in it reaches the log
+    /// NET-155: a source a box's build needs is fetched in its build box, so
+    /// no source, `http`, `https` or `gs://`, is recorded as node-plane
+    /// traffic, and neither its URL nor a credential in it reaches the log
     /// through the record.
     #[test]
-    fn no_source_is_recorded_as_node_plane_traffic() {
+    fn a_source_fetch_is_not_recorded_as_node_plane_traffic() {
         for url in [
             "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz?X-Amz-Signature=deadbeef",
-            "http://downloads.example.org/pkg-1.0.tar.gz",
             "gs://sources-bucket/pkg-1.0.tar.gz",
         ] {
             let root = OpTracker::new_root();
@@ -936,7 +924,7 @@ mod tests {
             let recorded = log.contents();
             assert!(
                 !recorded.contains("node-plane traffic"),
-                "a source is the box's fetch: {recorded}"
+                "a source is the build box's fetch: {recorded}"
             );
             assert!(
                 !recorded.contains("ghp_deadbeef") && !recorded.contains("X-Amz-Signature"),

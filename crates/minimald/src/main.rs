@@ -395,6 +395,17 @@ fn main() -> Result<(), MainError> {
         std::process::exit(code);
     }
 
+    // A build box's fetch process: one download, in the namespace the sandbox
+    // gave it (NET-155). Nothing of the daemon starts.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == op::build_box::BUILD_FETCH_SUBCOMMAND)
+    {
+        let args = std::env::args_os().skip(2).collect();
+        minimald::build_boxes::fetch_main(args).map_err(MainError::Other)?;
+        return Ok(());
+    }
+
     // As the microVM's init, fork the daemon off before anything else, while
     // this process is still single-threaded: pid 1 stays behind and reaps
     // the orphans every process in the guest is reparented to, which the

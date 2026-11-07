@@ -445,6 +445,16 @@ pub async fn cmd_session_policy(
                 native_host,
             )?;
             write_live_ingress(&mut out, &live)?;
+            // NET-171: a read that fails shows no build box. The box's own
+            // policy above stands either way.
+            if let Ok(minimald_rpc::Errorable::Ok(shown)) = client
+                .oneshot_rpc::<minimald_rpc::ShowBox>(minimald_rpc::ShowBoxRequest {
+                    id: record.id,
+                })
+                .await
+            {
+                write_build_boxes(&mut out, &shown.record.build_boxes)?;
+            }
             if let Some(facts) = &facts {
                 write_unaudited_listen_ports(
                     &mut out,

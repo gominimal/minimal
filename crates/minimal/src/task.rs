@@ -1680,6 +1680,32 @@ pub(crate) async fn run_entry(
     }
     let _ = initial_policy;
 
+    // NET-165: the task box's table goes to the host side before it runs, as
+    // an activation's does.
+    let control_sock = crate::vm_host_control_sock(
+        crate::daemon_host_kind(global),
+        global.minimal_dir.as_deref(),
+    );
+    let task_addresses = crate::hold_requester_build_row(
+        control_sock.as_deref(),
+        id,
+        request.config.network,
+        request.config.policy.egress.as_ref(),
+        false,
+    )
+    .await;
+    crate::prepare_build_boxes(
+        &mut client,
+        crate::BuildBoxActivation {
+            global,
+            session_id: id,
+            project_dir: abs_path.as_utf8_path().as_std_path().to_path_buf(),
+            control_sock,
+            task_addresses,
+        },
+    )
+    .await;
+
     minimal_client::dedup_patch_uploads(&mut collected_patches);
     if let Err(e) = crate::upload_and_finalize(
         &mut client,

@@ -495,6 +495,10 @@ pub struct BoxRecord {
 struct RowLiveness {
     carriers: usize,
     detached_since: Option<Instant>,
+    /// The row is a host-address box's build row (NET-169): no box attaches
+    /// to it between builds, so no detach grace ends it. The box's retirement
+    /// does ([`BoxRegistry::withdraw_build_row`]).
+    stays_detached: bool,
     /// When its creator reinstated the row, while no relay has carried it
     /// since ([`RESUME_ATTACH_BOUND`]). Never set on a row that stood when
     /// it was resumed.
@@ -607,6 +611,9 @@ impl BoxRecord {
             return None;
         }
         let liveness = self.liveness();
+        if liveness.stays_detached {
+            return None;
+        }
         let past = |since: Option<Instant>, bound| {
             since.filter(|since| now.saturating_duration_since(*since) >= bound)
         };
@@ -1172,7 +1179,7 @@ struct HostIpIdsFile {
 /// and sessions, which is no other user's to read — synced, then renamed
 /// over `path`, and the directory synced, so a crash at any point leaves
 /// either the old file or the new one, whole, and never a partial one.
-fn write_registry_file(
+pub(crate) fn write_registry_file(
     path: &std::path::Path,
     file: &impl serde::Serialize,
 ) -> std::io::Result<()> {
@@ -3113,6 +3120,8 @@ pub struct BoxRegistry {
     /// this registry persists at all: the supervisor's does, in its VM's
     /// state dir; a test's need not.
     persisted_at: Option<Arc<std::path::PathBuf>>,
+    /// The box tables and the open grants of build boxes (NET-165).
+    build_grants: crate::build_grants::BuildGrants,
     /// Serializes the persisted file's writes, so the last write to land
     /// is of the newest creations, whichever handle wrote it.
     persist_turn: Arc<Mutex<()>>,
@@ -3568,6 +3577,7 @@ impl Clone for BoxRegistry {
             egress_deny_all_opt_out: self.egress_deny_all_opt_out,
             creations: Arc::clone(&self.creations),
             persisted_at: self.persisted_at.clone(),
+            build_grants: self.build_grants.clone(),
             persist_turn: Arc::clone(&self.persist_turn),
             row_epoch: Arc::clone(&self.row_epoch),
             proxy_control: self.proxy_control.clone(),
@@ -3616,6 +3626,7 @@ impl BoxRegistry {
             egress_deny_all_opt_out: false,
             creations: Arc::new(Mutex::new(Creations::default())),
             persisted_at: None,
+            build_grants: crate::build_grants::BuildGrants::default(),
             persist_turn: Arc::new(Mutex::new(())),
             row_epoch: Arc::new(AtomicU64::new(0)),
             proxy_control: None,
@@ -3826,6 +3837,9 @@ impl BoxRegistry {
     /// its release does not keep its name answering NODATA for good.
     #[must_use]
     pub fn persisting_to(mut self, path: std::path::PathBuf) -> Self {
+        self.build_grants = self
+            .build_grants
+            .persisting_to(path.with_file_name(crate::build_grants::BUILD_TABLES_FILE));
         let Some(loaded) = read_registry_file(&path) else {
             return self;
         };
@@ -5219,6 +5233,40 @@ impl BoxRegistry {
             .values()
             .find(|record| canonical_box_name(record.name()) == asked)
             .map(|record| record.name().to_string())
+    }
+
+    /// The box tables and the open grants of build boxes (NET-165).
+    pub fn build_grants(&self) -> &crate::build_grants::BuildGrants {
+        &self.build_grants
+    }
+
+    /// Marks the row at `switch_addr` as one no detach grace ends (NET-169).
+    pub fn keep_when_detached(&self, switch_addr: Ipv4Addr) {
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        if let Some(record) = rows.get(&switch_addr.octets()) {
+            record.liveness().stays_detached = true;
+        }
+    }
+
+    /// Withdraws the row a host-address box's builds attach under, with its
+    /// task rows, when the box retires (NET-169). A box with no such row is
+    /// left alone.
+    pub fn withdraw_build_row(&self, name: &str) {
+        let Some(record) = self.row_by_name(name) else {
+            return;
+        };
+        let withdrawn = self.withdraw_client_box(
+            name,
+            record.switch_addr,
+            record.loopback_addr,
+            Some(record.box_id),
+        );
+        if let Err(error) = withdrawn {
+            tracing::warn!(box = %name, ?error, "could not withdraw a box's build row");
+        }
     }
 
     /// Withdraws the client box's row when the pair `(name, switch_addr,
@@ -9697,6 +9745,29 @@ mod tests {
             vec![(web.switch_addr(), false)],
             "the switch address is back in the book, inside its quarantine"
         );
+    }
+
+    /// NET-169: a host-address box's build row outlives the relays that
+    /// carry its builds, so the box's next build still has it. The box's
+    /// retirement withdraws it, with its task rows.
+    #[test]
+    fn a_build_row_stays_detached_until_its_box_retires() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let row = registry
+            .register_client_box(client_spec("build-1"))
+            .expect("the plan has an address for the box");
+        registry.keep_when_detached(row.switch_addr());
+        relay_carried_and_ended(&registry, &[&row]);
+        wait_until(|| row.is_detached(), "the row detaches at its relay's end");
+
+        registry.advance_clock(DETACH_GRACE);
+        assert!(registry.withdraw_expired_detached().is_empty());
+        assert!(registry.row_by_name("build-1").is_some());
+
+        registry.withdraw_build_row("build-1");
+        assert!(registry.row_by_name("build-1").is_none());
+        registry.withdraw_build_row("build-1");
     }
 
     /// The registry a test persists at `dir`, under its default plan.

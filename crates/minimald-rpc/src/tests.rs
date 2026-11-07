@@ -2178,6 +2178,7 @@ fn reap_and_prune_requests_round_trip() {
         exit_code: None,
         signal: Some(15),
         pty_enabled: false,
+        build_boxes: Vec::new(),
     };
     let reap = ReapBoxResponse {
         reaped: entry.clone(),
@@ -2229,6 +2230,7 @@ fn preview_prune_and_show_disk_round_trip() {
         exit_code: Some(0),
         signal: None,
         pty_enabled: true,
+        build_boxes: Vec::new(),
     };
     let preview = PreviewPruneResponse {
         matched: vec![
@@ -2398,4 +2400,31 @@ fn retire_without_an_end_is_refused_at_decode() {
         }
         other => panic!("decoded as {other:?}"),
     }
+}
+
+/// NET-167: a build box's egress is its hosts and nothing else. NET-168: a
+/// build with the internet has it, and no host list.
+#[test]
+fn build_box_egress_is_its_hosts_or_the_internet() {
+    let declared = build_box_egress(&["example.org".to_string()].into(), false);
+    assert_eq!(
+        declared.allow_dns_hosts,
+        Some(vec!["example.org".to_string()])
+    );
+    assert_eq!(declared.allow_subnets, Some(Vec::new()));
+    let internet = build_box_egress(&std::collections::BTreeSet::new(), true);
+    assert_eq!(internet.allow_subnets, Some(vec!["0.0.0.0/0".to_string()]));
+    assert_eq!(internet.allow_dns_hosts, Some(Vec::new()));
+}
+
+/// A daemon's refusal of a box's table decodes as a refusal. The response
+/// has no fields, so `deny_unknown_fields` is what tells the two apart.
+#[test]
+fn a_prepare_error_does_not_decode_as_success() {
+    let refused: Errorable<PrepareBuildBoxesResponse> =
+        serde_json_lenient::from_str(r#"{"error":"no such box"}"#).expect("an error decodes");
+    assert!(matches!(refused, Errorable::Err { .. }));
+    let prepared: Errorable<PrepareBuildBoxesResponse> =
+        serde_json_lenient::from_str("{}").expect("a success decodes");
+    assert_eq!(prepared, Errorable::Ok(PrepareBuildBoxesResponse {}));
 }

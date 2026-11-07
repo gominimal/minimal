@@ -7,7 +7,7 @@ pub mod fuzzy_search;
 pub mod jq;
 mod remote_storage;
 pub use remote_storage::{
-    NO_NETWORK, NetNamespace, Placement, RULES_REFUSE, RemoteStorage, gcs_object_url,
+    GCS_HOST, NO_NETWORK, RULES_REFUSE, RemoteStorage, fetch_to_file, gcs_object_url, source_hosts,
 };
 
 #[cfg(target_os = "linux")]

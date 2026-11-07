@@ -137,6 +137,39 @@ pub(crate) fn render_box_show(
         let label = format!("{label}:");
         writeln!(out, "{label:<11} {value}")?;
     }
+    write_build_boxes(out, &record.build_boxes)
+}
+
+/// What one build box may reach, in a person's words (NET-171).
+fn build_box_reach(build: &minimald_rpc::RunningBuildBox) -> String {
+    if !build.granted {
+        return "follows this box's rules".to_string();
+    }
+    let Some(egress) = &build.egress else {
+        return "the internet".to_string();
+    };
+    let hosts = egress.allow_dns_hosts.clone().unwrap_or_default();
+    if hosts.is_empty() {
+        "the internet".to_string()
+    } else {
+        hosts.join(", ")
+    }
+}
+
+/// Writes the block of the build boxes running for a box, and nothing when
+/// none runs (NET-171). Their reach is theirs: the box's own rules do not
+/// change.
+pub(crate) fn write_build_boxes(
+    out: &mut impl std::io::Write,
+    builds: &[minimald_rpc::RunningBuildBox],
+) -> std::io::Result<()> {
+    if builds.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "build boxes (their own reach, not this box's)")?;
+    for build in builds {
+        writeln!(out, "  {}: {}", build.package, build_box_reach(build))?;
+    }
     Ok(())
 }
 
@@ -160,4 +193,53 @@ pub(crate) fn format_disk(bytes: u64) -> String {
         unit = next;
     }
     format!("{value:.1} {unit}")
+}
+
+#[cfg(test)]
+mod build_box_tests {
+    use super::*;
+
+    /// NET-171: the block says what each build box may reach, and that it
+    /// is the build box's reach. No build box, no block.
+    #[test]
+    fn policy_shows_build_box_egress() {
+        let declared = boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec!["storage.googleapis.com".to_string()]),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let internet = boxes::EgressPolicy {
+            allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            allow_dns_hosts: Some(Vec::new()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let running = |package: &str, egress, granted| minimald_rpc::RunningBuildBox {
+            package: package.to_string(),
+            egress,
+            granted,
+        };
+        let mut out = Vec::new();
+        write_build_boxes(
+            &mut out,
+            &[
+                running("bucket", Some(declared), true),
+                running("tooling", Some(internet), true),
+                running("mine", None, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "build boxes (their own reach, not this box's)\n  \
+             bucket: storage.googleapis.com\n  \
+             tooling: the internet\n  \
+             mine: follows this box's rules\n"
+        );
+
+        let mut none = Vec::new();
+        write_build_boxes(&mut none, &[]).unwrap();
+        assert!(none.is_empty());
+    }
 }

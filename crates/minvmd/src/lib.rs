@@ -12,6 +12,7 @@
 
 pub mod bep_attach;
 pub mod box_registry;
+pub mod build_grants;
 pub mod cmd;
 pub mod config;
 pub mod control;

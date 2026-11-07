@@ -1229,6 +1229,7 @@ fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc:
         exit_code,
         signal,
         pty_enabled,
+        build_boxes: crate::build_boxes::running_build_boxes(&record.id.to_string()),
     }
 }
 

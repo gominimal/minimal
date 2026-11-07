@@ -35,14 +35,9 @@ pub struct PatchedBuild<'a, SF: crate::SourceFetcher> {
     /// When `None`, dependency resolution stays purely local.
     pub remote_cache: Option<&'a RemoteCache<common::fetchers::AnyBackend>>,
 
-    /// The classifier leaf of the box this build runs for, if any (NET-155).
-    /// Carried to the spec build, so the box's egress verdict decides the
-    /// build's connections. `None` keeps the build as the caller's traffic.
-    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
-
-    /// The network of the own-address box this build runs for, if any
-    /// (NET-155). Carried to the spec build, the same as the leaf.
-    pub box_network: Option<crate::BuildNetwork>,
+    /// The build box this build runs in, if it runs for a box (NET-155). A
+    /// patched build always follows its requester's rules (NET-169).
+    pub build_box: Option<crate::BuildBox>,
 }
 
 impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
@@ -155,8 +150,8 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             stderr_writer: self.stderr_writer.take(),
             cancel: tokio_util::sync::CancellationToken::new(),
             cpu_weight: None,
-            classifier_leaf: self.classifier_leaf.clone(),
-            box_network: self.box_network.clone(),
+            build_box: self.build_box.clone(),
+            patched: true,
         }
         .run(opts)
         .await?;
@@ -205,9 +200,8 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
-            _place: Option<crate::SourcePlace<'_>>,
             _op: &ot::OpTracker,
-        ) -> anyhow::Result<(std::path::PathBuf, bool)> {
+        ) -> anyhow::Result<std::path::PathBuf> {
             unreachable!("source fetch must not happen on these build paths")
         }
 
@@ -238,8 +232,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: None,
-            classifier_leaf: None,
-            box_network: None,
+            build_box: None,
         }
     }
 
@@ -349,8 +342,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
-            classifier_leaf: None,
-            box_network: None,
+            build_box: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -409,8 +401,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
-            classifier_leaf: None,
-            box_network: None,
+            build_box: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -470,8 +461,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
-            classifier_leaf: None,
-            box_network: None,
+            build_box: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -523,8 +513,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
-            classifier_leaf: None,
-            box_network: None,
+            build_box: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -572,8 +561,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
-            classifier_leaf: None,
-            box_network: None,
+            build_box: None,
         };
         let opts = Options {
             cache: cache.clone(),

@@ -8697,6 +8697,7 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         exit_code: None,
         signal: None,
         pty_enabled: true,
+        build_boxes: Vec::new(),
     }
 }
 

@@ -137,12 +137,9 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
     pub(crate) ot: Option<OpTracker>,
     pub(crate) cancel: tokio_util::sync::CancellationToken,
-    /// The classifier leaf of the box these builds run for, if any
-    /// (NET-155). Every spec build this backend schedules runs in it.
-    pub(crate) classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
-    /// The network of the own-address box these builds run for, if any
-    /// (NET-155). Every spec build this backend schedules attaches to it.
-    pub(crate) box_network: Option<op::BuildNetwork>,
+    /// The build boxes of the box these builds run for, if any (NET-155).
+    /// Every spec build this backend schedules runs in one of them.
+    pub(crate) build_boxes: Option<std::sync::Arc<dyn op::BuildBoxes>>,
 }
 
 impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
@@ -227,10 +224,18 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 cpu_weight: Some(
                     ((3 * cost + 60 + depended_on_by * cost.max(1) * 25) as u64).min(10000),
                 ),
-                classifier_leaf: shared.backend.classifier_leaf.clone(),
-                box_network: shared.backend.box_network.clone(),
+                build_box: shared
+                    .backend
+                    .build_boxes
+                    .as_ref()
+                    .map(|boxes| boxes.build_box(&name, Some(&spec_hash))),
+                patched: false,
             };
 
+            let build_boxes = shared.backend.build_boxes.clone();
+            if let Some(boxes) = &build_boxes {
+                boxes.note_running(&name, &spec_hash, true);
+            }
             let res = b
                 .run(&op::Options {
                     cache: shared.cache.clone(),
@@ -240,6 +245,12 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     daemon_id: shared.daemon_id.clone(),
                 })
                 .await;
+            if let Some(build_box) = &b.build_box {
+                build_box.close().await;
+            }
+            if let Some(boxes) = &build_boxes {
+                boxes.note_running(&name, &spec_hash, false);
+            }
             log_sink.as_ref().iter().for_each(|s| {
                 s.unbounded_send(BuildEvent {
                     idx: dr.inner_idx(),
@@ -418,8 +429,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
         ot: Option<OpTracker>,
         cancel: tokio_util::sync::CancellationToken,
-        classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
-        box_network: Option<op::BuildNetwork>,
+        build_boxes: Option<std::sync::Arc<dyn op::BuildBoxes>>,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
             backend: LocalBackend::<SF> {
@@ -431,8 +441,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 num_concurrent_builds,
                 ot,
                 cancel,
-                classifier_leaf,
-                box_network,
+                build_boxes,
             },
             graph,
             cache,
@@ -440,16 +449,10 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         })
     }
 
-    /// The classifier leaf every spec build of this backend runs in, if the
+    /// The build boxes every spec build of this backend runs in, if the
     /// builds run for a box (NET-155).
-    pub fn classifier_leaf(&self) -> Option<&sandbox::config::ClassifierLeaf> {
-        self.classifier_leaf.as_ref()
-    }
-
-    /// The network every spec build of this backend attaches to, if the
-    /// builds run for an own-address box (NET-155).
-    pub fn box_network(&self) -> Option<&op::BuildNetwork> {
-        self.box_network.as_ref()
+    pub fn build_boxes(&self) -> Option<&std::sync::Arc<dyn op::BuildBoxes>> {
+        self.build_boxes.as_ref()
     }
 
     /// Executes a local build with the orchestrator.

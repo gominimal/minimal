@@ -587,6 +587,22 @@ impl BoxHandle {
         })
     }
 
+    /// Hands the box what `min` prepared for its builds (NET-165).
+    pub(crate) async fn prepare_build_boxes(
+        &self,
+        request: minimald_rpc::PrepareBuildBoxesRequest,
+    ) -> Result<minimald_rpc::PrepareBuildBoxesResponse, String> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        drop(
+            self.0
+                .send(BoxMessage::PrepareBuildBoxes(request, send))
+                .await,
+        );
+        recv.await
+            .unwrap_or_else(|_| Err("session actor is gone".to_string()))
+    }
+
     /// Submit the client's contribution verdict against a `Draft` session.
     /// On success the actor promotes its record from `Pending` to
     /// `Materializing` and replies with [`BoxStep::Materialized`]; the
