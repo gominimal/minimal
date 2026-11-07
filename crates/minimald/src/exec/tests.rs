@@ -109,6 +109,86 @@ fn task_start_dir_honours_inherit_cwd() {
     assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
 }
 
+/// A task run carrying the client's resolution of its `env_vars`.
+fn task_exec_with(env: &[(&str, &str)], drop_env: &[&str], client_resolved: bool) -> TaskExec {
+    TaskExec {
+        task: "t778".to_string(),
+        args: Vec::new(),
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        drop_env: drop_env.iter().map(|n| n.to_string()).collect(),
+        client_resolved,
+        cwd: String::new(),
+    }
+}
+
+/// A task's declared `env_vars`, as the session's copy of the project has
+/// them.
+fn declared_vars(
+    vars: &[(&str, Option<&str>)],
+) -> std::collections::BTreeMap<String, mfile::EnvVarValue> {
+    vars.iter()
+        .map(|(name, value)| {
+            let value = match value {
+                Some(v) => mfile::EnvVarValue::Value(v.to_string()),
+                None => mfile::EnvVarValue::Inherit,
+            };
+            (name.to_string(), value)
+        })
+        .collect()
+}
+
+/// The client's values replace the task's `inherit` declarations, and the
+/// names it dropped are gone, whether or not it marked the run resolved.
+#[test]
+fn the_client_env_answers_inherit_and_drops_names() {
+    use super::overlay_client_env;
+
+    for client_resolved in [false, true] {
+        let exec = task_exec_with(&[("X778", "from-client")], &["IGNORED"], client_resolved);
+        let mut vars =
+            declared_vars(&[("X778", None), ("IGNORED", None), ("LITERAL", Some("lit"))]);
+        overlay_client_env(&exec, &mut vars).expect("every inherit is answered");
+        assert_eq!(
+            vars,
+            declared_vars(&[("X778", Some("from-client")), ("LITERAL", Some("lit"))]),
+        );
+    }
+}
+
+/// inbox#778: a client that resolved the task itself (`min session run`)
+/// read the project on its own host. An `inherit` only the session's copy
+/// declares never passed the user's `[vars]` policy there, so the run is
+/// refused, naming the task and the variable, and the daemon's own
+/// environment is never read for it.
+#[test]
+fn a_resolved_run_refuses_an_inherit_the_client_did_not_answer() {
+    use super::overlay_client_env;
+
+    let exec = task_exec_with(&[("X778", "from-client")], &[], true);
+    let mut vars = declared_vars(&[("X778", None), ("ONLY_IN_SESSION", None)]);
+    let err = overlay_client_env(&exec, &mut vars)
+        .expect_err("an unanswered inherit must refuse the run");
+    assert!(err.contains("t778"), "names the task: {err}");
+    assert!(err.contains("ONLY_IN_SESSION"), "names the variable: {err}");
+    assert!(err.contains("re-activate"), "names the fix: {err}");
+}
+
+/// A client that did not mark the run resolved, as every caller but
+/// `min session run`, keeps the older behaviour: an inherit it did not
+/// answer stays for the sandbox to resolve.
+#[test]
+fn an_unmarked_run_leaves_an_unanswered_inherit_as_before() {
+    use super::overlay_client_env;
+
+    let exec = task_exec_with(&[], &[], false);
+    let mut vars = declared_vars(&[("ONLY_IN_SESSION", None)]);
+    overlay_client_env(&exec, &mut vars).expect("no refusal without the marker");
+    assert_eq!(vars, declared_vars(&[("ONLY_IN_SESSION", None)]));
+}
+
 /// A session record carrying `mode`, with everything else at its default.
 #[cfg(target_os = "linux")]
 fn record_with(mode: boxes::NetworkMode) -> boxes::Record {

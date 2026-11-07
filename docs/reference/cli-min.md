@@ -313,6 +313,10 @@ Because the task is named as a task rather than inferred from a command string,
 a task may share a name with a daemon subcommand or with a program on the
 session's `PATH`.
 
+The task's `env_vars` are resolved against your shell and checked against
+your `[vars]` policy before the task runs, as for `min task run`; see
+[Tasks](./tasks.md#env_vars).
+
 ### `session destroy`
 
 ```

@@ -388,6 +388,9 @@ pub(crate) async fn handle_exec(
                 trace_env.clone(),
             );
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
+            // `min session run` resolved them all, and says so (inbox#778).
+            let client_resolved =
+                minimald_rpc::taskenv::resolved_from_channel_env(&config.env_vars);
             let span = span.clone();
             session.channel_success(id)?;
             spawn(tracing::Instrument::instrument(
@@ -406,6 +409,7 @@ pub(crate) async fn handle_exec(
                             task: task.clone(),
                             env: task_env,
                             drop_env,
+                            client_resolved,
                             cwd,
                         },
                     };

@@ -216,9 +216,9 @@ disagree about everything else:
 
 Two things narrow the task row. An `echo` task never builds an environment,
 so it never reads — or fails over — an `env_vars` declaration. And
-`min run <task>` from inside a session, along with
-`min session run <session> <task>`, resolves `inherit` against the daemon's
-environment rather than your shell. Both are covered in
+`min run <task>` from inside a session resolves `inherit` against the
+daemon's environment rather than your shell; `min session run` resolves it
+against your shell, as `min task run` does. Both are covered in
 [Tasks](./tasks.md#env_vars).
 
 
