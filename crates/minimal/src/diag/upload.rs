@@ -213,11 +213,24 @@ pub async fn upload(
     })?;
     // A portal that does not say it held the report may have stored it where
     // anyone with the link can read it, so the bundle stays here and the
-    // receipt can never promise a privacy nobody confirmed.
+    // receipt can never promise a privacy nobody confirmed. The create has
+    // already carried the note, so it is deleted, and the reporter is told
+    // what reached the portal either way.
     if security && created["security"] != Value::Bool(true) {
+        let removed = match (created["id"].as_str(), created["delete_token"].as_str()) {
+            (Some(id), Some(token)) => delete(base, id, token).await.is_ok(),
+            _ => false,
+        };
+        let note_fate = match (note.is_empty(), removed) {
+            (true, _) => "",
+            (false, true) => " Your description reached it and has been deleted.",
+            (false, false) => {
+                " Your description reached it and could not be deleted, so treat it as exposed."
+            }
+        };
         bail!(
-            "{base} did not confirm it would keep this private, so the bundle was not sent. \
-             Email security@minimal.dev instead"
+            "{base} did not confirm it would keep this private, so the bundle was not sent.\
+             {note_fate} Email security@minimal.dev instead"
         );
     }
     let id = created["id"]
@@ -583,9 +596,9 @@ mod tests {
         );
     }
 
-    /// A portal that does not confirm the mark gets no bundle: only the create
-    /// reaches it, and the reporter is told where to go instead of being told
-    /// the report is private.
+    /// A portal that does not confirm the mark gets no bundle: the record the
+    /// create left is deleted, and the reporter is told what reached the
+    /// portal and where to go instead of being told the report is private.
     #[tokio::test]
     async fn a_security_upload_sends_no_bundle_unless_the_portal_confirms_the_mark() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -593,23 +606,34 @@ mod tests {
         tokio::fs::write(&path, b"\x28\xb5\x2f\xfdnot really zstd")
             .await
             .unwrap();
+        let unconfirmed = r#"{"id":"d-123","upload":"/diag/api/diagnoses/d-123/bundle","delete_token":"tok-xyz"}"#;
 
-        let (base, served) = portal(vec![(
-            201,
-            r#"{"id":"d-123","upload":"/diag/api/diagnoses/d-123/bundle","delete_token":"tok-xyz"}"#,
-        )])
-        .await;
+        for (answer, note, says) in [
+            (204, "the flaw", "has been deleted"),
+            (500, "the flaw", "treat it as exposed"),
+            (204, "", "the bundle was not sent."),
+        ] {
+            let (base, served) = portal(vec![(201, unconfirmed), (answer, "")]).await;
 
-        let refused = upload(&path, &base, "", true)
-            .await
-            .unwrap_err()
-            .to_string();
-        let seen = served.await.unwrap();
+            let refused = upload(&path, &base, note, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            let seen = served.await.unwrap();
 
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].method, "POST");
-        assert!(refused.contains("the bundle was not sent"), "{refused}");
-        assert!(refused.contains("security@minimal.dev"), "{refused}");
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].method, "POST");
+            assert_eq!(seen[1].method, "DELETE");
+            assert_eq!(seen[1].path, "/diag/api/diagnoses/d-123");
+            assert!(refused.contains("the bundle was not sent"), "{refused}");
+            assert!(refused.contains(says), "{refused}");
+            assert!(refused.contains("security@minimal.dev"), "{refused}");
+            assert_eq!(
+                refused.contains("description"),
+                !note.is_empty(),
+                "{refused}"
+            );
+        }
     }
 
     /// The delete sends the token in the body and nothing in a header, and
