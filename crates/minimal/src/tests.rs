@@ -10865,3 +10865,15 @@ async fn show_and_prune_dry_run_report_disk() {
     assert_eq!(format_disk(512), "512 B");
     assert_eq!(format_disk(3 * 1024 * 1024 * 1024 / 2), "1.5 GiB");
 }
+
+// BCLI-006: the unit follows the value as it prints, at every boundary.
+#[test]
+fn show_and_prune_dry_run_report_disk_unit_boundaries() {
+    assert_eq!(format_disk(1023), "1023 B");
+    assert_eq!(format_disk(1024), "1.0 KiB");
+    assert_eq!(format_disk(1_048_575), "1.0 MiB");
+    assert_eq!(format_disk(1_048_576), "1.0 MiB");
+    assert_eq!(format_disk(1_073_741_823), "1.0 GiB");
+    assert_eq!(format_disk(1_073_741_824), "1.0 GiB");
+    assert_eq!(format_disk(1023 * 1024 * 1024), "1023.0 MiB");
+}

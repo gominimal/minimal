@@ -146,7 +146,9 @@ pub(crate) fn format_disk(bytes: u64) -> String {
     let mut value = bytes as f64 / 1024.0;
     let mut unit = UNITS[0];
     for next in &UNITS[1..] {
-        if value < 1024.0 {
+        // Pick the unit from the value as it prints, rounded to one
+        // decimal, so 1048575 bytes prints `1.0 MiB`, not `1024.0 KiB`.
+        if (value * 10.0).round() / 10.0 < 1024.0 {
             break;
         }
         value /= 1024.0;
