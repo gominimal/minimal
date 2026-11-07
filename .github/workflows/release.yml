@@ -1314,7 +1314,12 @@ jobs:
                   # published, and a release-<sha> is this same commit's nightly,
                   # so both are replaced. GitHub can answer 502 to a publish that
                   # went through. A public v<semver> stays: create fails on it.
-                  is_draft="$(gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"
+                  # Only "release not found" means no release; any other lookup
+                  # failure (502, network) stops here rather than collide below.
+                  if ! is_draft="$(gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>view.err)"; then
+                    grep -q 'release not found' view.err || { cat view.err >&2; exit 1; }
+                    is_draft=""
+                  fi
                   if [ "$is_draft" = "true" ] || { [ -n "$is_draft" ] && [ -z "$RELEASE_VERSION" ]; }; then
                     echo "replacing $REL_TAG from an earlier attempt"
                     gh release delete "$REL_TAG" --repo "$GITHUB_REPOSITORY" --yes
