@@ -222,8 +222,13 @@ the task's declaration from the project's `minimal.toml` on your machine, the
 only copy it can read, and resolves and gates it the same way. The session
 runs its own copy of the project, taken when it was activated. If that copy
 declares an `inherit` the file on your machine does not, the run is refused
-rather than resolved against the daemon's environment; re-activate the
-session to run the project as it is now.
+rather than resolved against the daemon's environment. This happens when the
+file changed after the session was activated, and when a stack provides the
+task, since `min` reads only the project's own file. For a changed file,
+destroy the session with `min session destroy <session>` and activate the
+project again with `min session activate`: a second activation alone leaves
+the old session in place. A `minimal.toml` on your machine that does not
+parse refuses the run before it reaches the session.
 
 `min run <task>`, from *inside* a session, has no invoking client to read
 from, so it still resolves `inherit` against the daemon's environment. Prefer

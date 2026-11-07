@@ -165,15 +165,68 @@ fn the_client_env_answers_inherit_and_drops_names() {
 /// environment is never read for it.
 #[test]
 fn a_resolved_run_refuses_an_inherit_the_client_did_not_answer() {
-    use super::overlay_client_env;
+    use super::{UnansweredInherit, overlay_client_env};
 
     let exec = task_exec_with(&[("X778", "from-client")], &[], true);
     let mut vars = declared_vars(&[("X778", None), ("ONLY_IN_SESSION", None)]);
     let err = overlay_client_env(&exec, &mut vars)
         .expect_err("an unanswered inherit must refuse the run");
-    assert!(err.contains("t778"), "names the task: {err}");
-    assert!(err.contains("ONLY_IN_SESSION"), "names the variable: {err}");
-    assert!(err.contains("re-activate"), "names the fix: {err}");
+    assert_eq!(
+        err,
+        UnansweredInherit {
+            task: "t778".to_string(),
+            var: "ONLY_IN_SESSION".to_string(),
+        }
+    );
+}
+
+/// The refusal says what was refused and both causes, without asserting
+/// one, and names the commands that work: destroy this session, then
+/// activate the project again under the same name. It never offers a bare
+/// "re-activate", which would leave this session in place (PR #3128).
+#[test]
+fn the_unanswered_inherit_refusal_names_both_causes_and_the_commands() {
+    let refused = super::UnansweredInherit {
+        task: "t778".to_string(),
+        var: "ONLY_IN_SESSION".to_string(),
+    };
+
+    let msg = refused.refusal(Some("dev"), "0b5e", "/home/me/proj");
+    assert!(msg.starts_with("refused to run task 't778': "), "{msg}");
+    assert!(
+        msg.contains("`env_vars.ONLY_IN_SESSION = { inherit = true }`"),
+        "names the declaration: {msg}"
+    );
+    assert!(
+        msg.contains("the minimal.toml of /home/me/proj on the host"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("changed after the session was activated"),
+        "{msg}"
+    );
+    assert!(msg.contains("a stack provides the task"), "{msg}");
+    assert!(
+        msg.ends_with(
+            "run `min session destroy dev`, then `min session activate --name dev /home/me/proj`."
+        ),
+        "names the commands: {msg}"
+    );
+    assert!(!msg.contains("re-activate"), "{msg}");
+    assert!(!msg.contains("where `min` ran"), "{msg}");
+    assert_eq!(msg.lines().count(), 1, "one line: {msg:?}");
+
+    // An unnamed session is destroyed by id, and a path a shell would split
+    // is quoted so both commands paste as they are.
+    let msg = refused.refusal(None, "0b5e", "/home/me/it's mine");
+    assert!(
+        msg.contains("run `min session destroy 0b5e`, then "),
+        "{msg}"
+    );
+    assert!(
+        msg.ends_with(r#"`min session activate '/home/me/it'\''s mine'`."#),
+        "{msg}"
+    );
 }
 
 /// A client that did not mark the run resolved, as every caller but

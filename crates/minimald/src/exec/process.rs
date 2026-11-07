@@ -318,15 +318,15 @@ pub(crate) fn task_build_refusal(
 /// resolved are set.
 ///
 /// When the client said it resolved them ([`TaskExec::client_resolved`]),
-/// an `inherit` left over is refused, naming the task and the variable,
+/// an `inherit` left over refuses the run with [`UnansweredInherit`],
 /// where the task's sandbox would otherwise read the daemon's environment
-/// for it. The client read its declaration from the project where it ran,
-/// and the session's copy declares more, so the name never passed the
-/// user's `[vars]` policy (inbox#778).
+/// for it. The client read the task from the session's project on the
+/// host, and the session runs its own copy of the project, so the name
+/// never passed the user's `[vars]` policy (inbox#778).
 pub(super) fn overlay_client_env(
     exec: &TaskExec,
     vars: &mut BTreeMap<String, mfile::EnvVarValue>,
-) -> Result<(), String> {
+) -> Result<(), UnansweredInherit> {
     // Removals first. The two sets are disjoint, so the order is not
     // load-bearing, but reading it in policy order — drop, then apply —
     // matches how the client decided.
@@ -341,15 +341,64 @@ pub(super) fn overlay_client_env(
             .iter()
             .find(|(_, value)| matches!(value, mfile::EnvVarValue::Inherit))
     {
-        return Err(format!(
-            "task '{task}' declares `env_vars.{name} = {{ inherit = true }}` in the \
-             session's copy of the project, but the minimal.toml where `min` ran does \
-             not, so `min` did not resolve it; re-activate the session to run the \
-             project as it is now",
-            task = exec.task,
-        ));
+        return Err(UnansweredInherit {
+            task: exec.task.clone(),
+            var: name.clone(),
+        });
     }
     Ok(())
+}
+
+/// A resolved run's `inherit` that the client sent no value for: the
+/// session's copy of the project declares it, and the copy the client read
+/// on the host does not.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct UnansweredInherit {
+    pub task: String,
+    pub var: String,
+}
+
+impl UnansweredInherit {
+    /// The refusal the person running `min session run` sees, for the
+    /// session `id`, named `name` if it has one, of the project at
+    /// `project` on the host.
+    ///
+    /// It names what was refused, the two ways the client can miss a
+    /// variable the session's copy declares (that copy predates a change
+    /// on the host, or a stack provides the task, which the client cannot
+    /// read), and the commands that replace the session with one of the
+    /// project as it is now. A second `min session activate` alone would
+    /// leave this session in place and still out of date.
+    pub(super) fn refusal(&self, name: Option<&str>, id: &str, project: &str) -> String {
+        let Self { task, var } = self;
+        let project = shell_word(project);
+        let destroy = format!("min session destroy {}", shell_word(name.unwrap_or(id)));
+        let activate = match name.map(shell_word) {
+            Some(name) => format!("min session activate --name {name} {project}"),
+            None => format!("min session activate {project}"),
+        };
+        format!(
+            "refused to run task '{task}': the session's copy of the project declares \
+             `env_vars.{var} = {{ inherit = true }}` for it, and `min session run` sent \
+             no value for {var}. `min` reads the task from the minimal.toml of {project} \
+             on the host, which does not declare {var} for this task. Either that file \
+             changed after the session was activated, or a stack provides the task, and \
+             `min session run` cannot pass an inherited variable to a stack's task. If \
+             the file changed, run `{destroy}`, then `{activate}`."
+        )
+    }
+}
+
+/// `s` as one word a POSIX shell reads back unchanged: as it is when every
+/// character is plain, single-quoted otherwise.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r#"'\''"#))
+    }
 }
 
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
@@ -432,8 +481,14 @@ pub(super) async fn task_producer(
         // reaches (#585). An entry the client did not send keeps whatever
         // the task declared, so the daemon-side path still serves in-box
         // `min run` and older clients.
-        overlay_client_env(&exec, &mut task.vars).map_err(io::Error::other)?;
         let record = session.record().await?;
+        overlay_client_env(&exec, &mut task.vars).map_err(|unanswered| {
+            io::Error::other(unanswered.refusal(
+                record.name.as_deref(),
+                &record.id.to_string(),
+                &record.project_path.to_string(),
+            ))
+        })?;
         let switch = session.net_switch().await?;
         ensure_task_rows_stand(&record, &switch).await?;
         let network = task_network(
