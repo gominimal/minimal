@@ -1137,16 +1137,15 @@ where
             upstream.write_all(head).await?;
             let relayed =
                 relay_exchange(&mut client, &mut upstream, buffered, body, is_upgrade).await;
-            // Diagnostic (790d), to demote to debug or drop before this goes
-            // upstream. The exchange's end, beside the line that opened it:
-            // how many of the upstream's bytes reached the client, and the
-            // error that ended it, if one did. A client reading an empty reply
-            // then says which side was empty — an upstream that closed or
-            // reset before answering reads `to_client=0` with its error, not
-            // as silence.
+            // Debug-level diagnostics of the proxied exchange: its end, beside
+            // the line that opened it, with how many of the upstream's bytes
+            // reached the client and the error that ended it, if one did. A
+            // client reading an empty reply then says which side was empty —
+            // an upstream that closed or reset before answering reads
+            // `to_client=0` with its error, not as silence.
             match &relayed {
                 Ok(to_client) => {
-                    tracing::info!(
+                    tracing::debug!(
                         component = "dns-proxy",
                         host,
                         session = route.session(),
@@ -1156,7 +1155,7 @@ where
                     );
                 }
                 Err(error) => {
-                    tracing::info!(
+                    tracing::debug!(
                         component = "dns-proxy",
                         host,
                         session = route.session(),
