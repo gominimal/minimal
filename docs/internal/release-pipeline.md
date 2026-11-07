@@ -595,6 +595,44 @@ not keep an old result. For a nightly or plain build, `set-channel.sh` then
 moves `unstable` to the version, with no approval. A versioned build does not
 move `unstable`.
 
+### cut-minor.yml: start a minor release
+
+Only a minor release gets a new branch. Patches come from the line.
+[`.github/workflows/cut-minor.yml`](../../.github/workflows/cut-minor.yml) starts
+a minor. It runs only on dispatch, and it replaces step 2 above:
+
+```sh
+gh workflow run cut-minor.yml -f commit=<commit>
+```
+
+Leave out `commit` to cut from the tip of `main`. Use `-f dry_run=true` to make
+every check and create nothing.
+
+The workflow refuses a commit that is not on `main`, or that does not have the
+five required checks green. It also refuses one whose `package.version` is not
+`X.Y.0` or `X.Y.0-rcN`, and one that fails `next-version.sh --check`. Then it does
+these things as the `gominimal-aw-bot` App:
+
+1. It creates `release/X.Y.x` at the commit.
+2. It creates the `backport release/X.Y.x` label.
+3. It opens a PR that moves `main` to the next minor. Merge this PR before the
+   promotion creates `vX.Y.0`, or the version check fails on `main`.
+
+Run it again after a failure. It carries on if the line already exists at the same
+commit, and it refuses a line at any other commit.
+
+**Admin step for each new line.** The workflow cannot do this: an organization
+owner adds `gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.x`
+to the `signing` runner group. See [step 2](#2-give-the-commit-a-branch).
+
+The buckets need no change. Both Workload Identity providers map any
+`release/X.Y.x` branch to `attribute.minimal_release`, which has write access to
+`gs://minimal-shim` and `gs://minimal-one`.
+
+The workflow itself needs one admin step, once: add `gominimal-aw-bot` as a bypass
+actor on the `release branches` repository rules. Those rules stop anyone else
+from creating a branch under `release/`.
+
 ### nightly.yml: the daily build
 
 [`.github/workflows/nightly.yml`](../../.github/workflows/nightly.yml) starts
