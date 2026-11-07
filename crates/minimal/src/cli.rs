@@ -1384,18 +1384,39 @@ pub(crate) fn parse_network_mode(raw: &str) -> Result<CliNetworkMode, String> {
 
 /// The rename hint for a legacy `--network` spelling: one line naming the
 /// spelling typed and the current one. `None` for a current spelling, so
-/// only the old forms are announced.
+/// only the old forms are announced. The line is the one `[network] mode`
+/// prints for the same spelling in minimal.toml (BOX-079), so the flag and
+/// the table cannot drift.
 pub(crate) fn legacy_network_hint(raw: &str) -> Option<String> {
-    let current = match raw {
-        "no-net" => "none",
-        "host-net" => "host_ip",
-        "own-ip" => "own_ip",
-        _ => return None,
-    };
-    Some(format!(
-        "note: --network {raw} still works for one release; \
-         the current spelling is --network {current}"
-    ))
+    mfile::network::legacy_mode_hint(raw)
+}
+
+#[cfg(test)]
+mod network_hint_tests {
+    use super::legacy_network_hint;
+
+    // BOX-079 with NET-037: the `--network` flag and `[network] mode` print
+    // one hint, the same line for the same legacy spelling.
+    #[test]
+    fn network_flag_and_table_share_one_hint() {
+        for (legacy, current) in mfile::network::LEGACY_MODES {
+            let flag = legacy_network_hint(legacy).expect("a legacy spelling carries a hint");
+            let mut spec: toml::Table =
+                toml::from_str(&format!("[network]\nmode = \"{legacy}\"\n"))
+                    .expect("test TOML parses");
+            let table = mfile::network::canonicalize(&mut spec).expect("the table is accepted");
+            assert_eq!(
+                table,
+                std::slice::from_ref(&flag),
+                "one hint, the same line"
+            );
+            assert!(flag.contains(&format!("--network {current}")), "{flag}");
+            assert!(flag.contains(&format!("mode = \"{current}\"")), "{flag}");
+        }
+        for current in mfile::network::MODES {
+            assert_eq!(legacy_network_hint(current), None);
+        }
+    }
 }
 
 impl From<CliNetworkMode> for boxes::NetworkMode {
