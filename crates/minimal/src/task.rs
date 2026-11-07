@@ -406,7 +406,9 @@ pub(crate) fn gate_task_env(
 /// not answer rather than reading its own environment for it. A project
 /// with no `minimal.toml` here, or one that does not declare `task` (a task
 /// a stack provides), yields an empty set for the same reason: the run goes
-/// on, and only an `inherit` stops it.
+/// on, and only an `inherit` stops it. A `minimal.toml` that is there but
+/// does not load is refused here, as `declared_task` refuses it, so the
+/// daemon's refusal never stands in for the real cause.
 pub(crate) fn session_run_task_env(
     global: &GlobalArgs,
     project_path: &camino::Utf8Path,
@@ -417,14 +419,18 @@ pub(crate) fn session_run_task_env(
     let task = task.trim();
     let file = match mfile::File::from_dir_recursive(project_path.as_std_path()) {
         Ok(file) => file,
-        Err(e) => {
+        Err(mfile::Error::NotFound) => {
             tracing::debug!(
                 project = %project_path,
-                error = %e,
-                "no readable minimal.toml for the session's project on this host"
+                "no minimal.toml for the session's project on this host"
             );
             return Ok(minimald_rpc::taskenv::TaskEnv::default());
         }
+        Err(e) => bail!(
+            "found a broken {name} in the session's project at {project_path} \
+             while resolving tasks: {e}",
+            name = mfile::MFILE_NAME,
+        ),
     };
     let Some(declared) = file.task(task) else {
         return Ok(minimald_rpc::taskenv::TaskEnv::default());
@@ -451,21 +457,47 @@ pub(crate) fn session_run_task_env(
 /// Refuses a resolved variable the ssh transport of `min session run`
 /// cannot carry: ssh forwards a variable from its own environment, which
 /// holds no name with `=` or a NUL, and no value with a NUL. `min task run`
-/// sends its variables over the daemon's own channel and has no such limit.
+/// sends its variables over the daemon's own channel and has no such limit,
+/// but it runs the task in a new box, so the refusal says so.
 fn ensure_carried_by_ssh(
     task: &str,
     task_env: &minimald_rpc::taskenv::TaskEnv,
 ) -> Result<(), anyhow::Error> {
     for (name, value) in &task_env.set {
-        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
-            bail!(
-                "task '{task}' declares `env_vars.{name:?}`, which `min session run` \
-                 cannot carry into the session: an environment variable's name holds \
-                 no `=` or NUL, and its value no NUL; use `min task run {task}`"
-            );
-        }
+        let shown = printable_name(name);
+        let why = if name.is_empty() {
+            "One of its variables has an empty name".to_string()
+        } else if name.contains('=') {
+            format!("Its variable `{shown}` has `=` in its name")
+        } else if name.contains('\0') {
+            format!("Its variable `{shown}` has a NUL in its name")
+        } else if value.contains('\0') {
+            format!("Its variable `{shown}` has a NUL in its value")
+        } else {
+            continue;
+        };
+        bail!(
+            "refused to run task '{task}' with `min session run`. {why}, and \
+             `min session run` passes variables to the session in ssh's environment, \
+             which cannot hold it. `min task run {task}` can carry it, and runs the task \
+             in a new box instead of in the session."
+        );
     }
     Ok(())
+}
+
+/// `name` as the person wrote it, with control characters escaped so the
+/// refusal stays one readable line: no Debug quotes around it.
+fn printable_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The non-interactive lane's hook: records what the policy could not
@@ -2311,19 +2343,72 @@ mod tests {
         assert!(out.is_empty(), "{out:?}");
     }
 
-    /// A name or value ssh cannot carry is refused with the verb that can.
+    /// A `minimal.toml` for the session's project that is there but does
+    /// not parse is refused on the client, naming the file and its error,
+    /// as `min task run` refuses it. Read as "no file", it would surface
+    /// only as the daemon's refusal of an unanswered `inherit`.
+    #[test]
+    fn session_run_refuses_a_broken_minimal_toml() {
+        let (project, _config, global) = session_run_fixture("[tasks.t778\n", "[vars]\n");
+        let err = session_run_task_env(&global, utf8(&project), "t778", |_| {
+            panic!("nothing is read")
+        })
+        .expect_err("a file that does not parse must refuse the run");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with(&format!(
+                "found a broken {} in the session's project at {}",
+                mfile::MFILE_NAME,
+                utf8(&project),
+            )),
+            "names the file: {msg}"
+        );
+        assert!(
+            msg.contains("while resolving tasks: "),
+            "carries the cause: {msg}"
+        );
+    }
+
+    /// A name or value ssh cannot carry is refused in short sentences: what
+    /// was refused, why, and that `min task run` carries it, in a new box.
+    /// The name reads as written, without Debug quotes.
     #[test]
     fn session_run_refuses_a_var_ssh_cannot_carry() {
         let mut env = minimald_rpc::taskenv::TaskEnv::default();
         env.set.insert("OK".to_string(), "v".to_string());
         ensure_carried_by_ssh("t", &env).expect("a plain name is carried");
         env.set.insert("A=B".to_string(), "v".to_string());
-        let err = ensure_carried_by_ssh("t", &env).expect_err("`=` cannot be carried");
-        assert!(err.to_string().contains("min task run t"), "{err}");
+        let msg = ensure_carried_by_ssh("t", &env)
+            .expect_err("`=` cannot be carried")
+            .to_string();
+        assert_eq!(
+            msg,
+            "refused to run task 't' with `min session run`. Its variable `A=B` has `=` in \
+             its name, and `min session run` passes variables to the session in ssh's \
+             environment, which cannot hold it. `min task run t` can carry it, and runs \
+             the task in a new box instead of in the session."
+        );
 
         let mut env = minimald_rpc::taskenv::TaskEnv::default();
         env.set.insert("NUL".to_string(), "a\0b".to_string());
-        ensure_carried_by_ssh("t", &env).expect_err("a NUL cannot be carried");
+        let msg = ensure_carried_by_ssh("t", &env)
+            .expect_err("a NUL cannot be carried")
+            .to_string();
+        assert!(
+            msg.contains("Its variable `NUL` has a NUL in its value,"),
+            "{msg}"
+        );
+
+        let mut env = minimald_rpc::taskenv::TaskEnv::default();
+        env.set.insert("N\0L".to_string(), "v".to_string());
+        let msg = ensure_carried_by_ssh("t", &env)
+            .expect_err("a NUL in a name cannot be carried")
+            .to_string();
+        assert!(
+            msg.contains(r"Its variable `N\u{0}L` has a NUL in its name,"),
+            "{msg}"
+        );
+        assert!(!msg.contains('\0'), "the NUL is escaped: {msg:?}");
     }
 
     /// `cmd_task_run` resolves a task's `env_vars` against the invoking
