@@ -48,6 +48,68 @@ any valid signature on the bundle instead of minimal's Developer ID, and
 unsigned package on a double-click. `installer -pkg … -target /` as root
 accepts it, which is how the farm installs it in a fresh VM.
 
+## Deploying through an MDM
+
+The package is made for an MDM's push: root, no console user, no terminal,
+no network during install. The scripts use only `codesign`, `dscl`,
+`dseditgroup`, `launchctl` and `install` from the base system; nothing
+reads `$HOME`, `$USER` or `/dev/console`, nothing prompts, nothing opens a
+window. The Distribution limits the package to Apple Silicon and to the
+minimum macOS (`--min-os`), installs into the local system only, and pins
+the two app bundles to their payload paths, so Installer never follows an
+older copy of the same bundle elsewhere on the disk.
+
+What an MDM administrator should know:
+
+- **Removal** is `sudo /usr/local/share/minimal/uninstall.sh`, pushed as
+  a root script through the MDM agent, which holds Full Disk Access and so
+  can delete the role account. It also forgets the receipt. With no Full
+  Disk Access it removes everything but the account and exits 1; an MDM
+  reports that as a failed policy, so push it through the agent.
+- **Who may register box names** is the `_minimal` group. The first install
+  puts the Mac's administrators in it, which on a managed Mac is often the
+  management account alone; add standard users afterwards with
+  `dseditgroup -o edit -a USER -t user _minimal`, by MDM script. A managed
+  preference the postinstall reads is the open item below.
+- **Users who installed with curl before** keep `~/.local/bin/min` first on
+  their PATH. The postinstall names each such user in install.log with the
+  curl uninstall command. The release's uninstaller before 0.8 then prints
+  root commands about the host DNS setup, which must not be run: that setup
+  is the package's now. The postinstall's line says so.
+- **DNS**: box names resolve through a scoped resolver file,
+  `/etc/resolver/min.internal`, pointing at the service on 127.0.0.1. An
+  MDM DNS payload (encrypted DNS) or a full-tunnel VPN that claims all
+  domains can take precedence over scoped resolvers; test with the fleet's
+  VPN client before a wide rollout.
+- **Version**: the receipt's version is the payload's `min --version`. An
+  MDM compares versions as dotted numbers; a prerelease string
+  (`0.8.0-dev.428.g…`) sorts unpredictably, so a fleet pins releases, not
+  nightlies.
+
+## Signing and notarizing
+
+The binaries and the two app bundles inside already carry the project's
+Developer ID Application identity, hardened runtime and timestamps, and
+are notarized by the release workflow. The package needs the matching
+**Developer ID Installer** identity (same team), which the release holds
+when `--sign` names it:
+
+```
+packaging/macos/pkg/build-pkg.sh --version X.Y.Z \
+    --sign "Developer ID Installer: Minimal Software Research Ltd. (3G47C5HY64)" \
+    --notarize minimal-notary
+```
+
+`--sign` signs the product archive (timestamped) and checks the signature
+back; `--notarize` submits it with the named `notarytool` keychain profile,
+waits, staples the ticket, and runs the Gatekeeper assessment Installer
+runs on a double-click. A test build (`--with`) is refused a signature: its
+service program is ad-hoc signed, and a Developer ID on the package would
+say more than is true. Nothing in the postinstall changes signed code, so
+the bundles' seals survive the install; the postinstall requires the
+Developer ID on the service bundle before it copies it (team OU
+`3G47C5HY64`, in `postinstall` and `build-pkg.sh` alike).
+
 ## Still open
 
 These come from the proposal's open questions.
@@ -84,6 +146,11 @@ These come from the proposal's open questions.
   also adds role accounts across releases (`_oahd` at 441 came with
   Rosetta). A later macOS could take the id this install chose.
 - `install.toml` with `method = "pkg"` waits on inbox #1168.
+- A test build's bundles carry version `0.0.0` (`build-app-bundle.sh`
+  stamps the release's version only when told one), so Installer's
+  bundle-version comparison sees every test build as the same version. A
+  release stamps the real version; the farm's upgrade journeys run on test
+  builds and prove the scripts, not that comparison.
 - The pre-install script cannot stop a user's running sessions. An upgrade
   leaves their daemons on the old binaries until they restart.
 - `uninstall.sh` needs the Full Disk Access privacy permission to delete

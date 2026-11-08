@@ -253,7 +253,7 @@ test_build="$(sed -n 's/^test_build=//p' "$share/pkg-info" 2>/dev/null || true)"
 dscl . -list /Users NFSHomeDirectory 2>/dev/null | while read -r user home; do
     case "$home" in /Users/*) ;; *) continue ;; esac
     if [ -e "$home/.local/bin/min" ]; then
-        echo "minimal: $user has an older min at ~/.local/bin/min from the curl installer, which their shell finds before /usr/local/bin/min; they remove it with: curl --proto '=https' --tlsv1.2 -fsSL https://go.minimal.dev/$channel | sh -s -- --uninstall"
+        echo "minimal: $user has an older min at ~/.local/bin/min from the curl installer, which their shell finds before /usr/local/bin/min; they remove it with: curl --proto '=https' --tlsv1.2 -fsSL https://go.minimal.dev/$channel | sh -s -- --uninstall (an older uninstaller may then print root commands about the host DNS setup: those are not to be run, that setup is this package's now)"
     fi
 done
 if [ "$test_build" = 1 ]; then
