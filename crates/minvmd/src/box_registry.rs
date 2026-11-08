@@ -12093,15 +12093,14 @@ mod tests {
             "the dormant creation owns the new name"
         );
         assert!(
-            matches!(
-                registry.resumable(
+            registry
+                .resumable(
                     "front",
                     web.switch_addr(),
                     web.loopback_addr(),
                     Some(web.box_id())
-                ),
-                Ok(_)
-            ),
+                )
+                .is_ok(),
             "the box resumes under its new name"
         );
     }

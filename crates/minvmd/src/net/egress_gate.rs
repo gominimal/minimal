@@ -7400,7 +7400,7 @@ impl DropLimiter {
                     .map_or_else(|| "none".to_string(), |rtype| rtype.to_string());
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
-                    namespace = %refusal.record.name(),
+                    namespace = ?refusal.record.name(),
                     name = refusal.name.as_str(),
                     query_type,
                     rule_matched = DENY_ALL_DNS_RULE,
