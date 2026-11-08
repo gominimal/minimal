@@ -467,9 +467,12 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             );
             Ok(())
         }
-        Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}")),
+        // An `Other` error keeps its type, so `failure_exit_code` in
+        // `main.rs` finds an `InitRefusal` and exits with its code.
+        Some(Command::Init(args)) => cmd_init(&cli.global_args, args).await.map_err(|e| match e {
+            mctx::Error::Other(e) => e,
+            e => anyhow::anyhow!("{e}"),
+        }),
         Some(Command::Add(args)) => cmd_add(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
