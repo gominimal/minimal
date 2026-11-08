@@ -1350,6 +1350,21 @@ impl BoxActor {
             .record()
             .await
             .map_err(|e| format!("reading session record: {e}"))?;
+        // A task's durable state is keyed on the host project, not on the
+        // workspace tree this daemon parsed the mfile from: in a VM guest
+        // that tree is uploaded afresh under a new session id each time, so
+        // a key taken from it changes every session and every run starts
+        // empty, leaving an orphan behind (gominimal/minimal#1373,
+        // gominimal/minimal#1729). The host path does not change with the
+        // session, so a task's state is durable across sessions and bounded
+        // per project.
+        let ctx = ctx.with_state_root(
+            record
+                .project_path
+                .as_utf8_path()
+                .as_std_path()
+                .to_path_buf(),
+        );
         Ok(
             match own_address_build_network(&record, &self.net_switch, self.deny_all_opt_out) {
                 Some(network) => ctx.with_box_network(network),

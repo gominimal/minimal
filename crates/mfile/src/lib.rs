@@ -1883,6 +1883,22 @@ impl File {
         })
     }
 
+    /// Returns the path to the durable state directory for the given key,
+    /// keyed on `project_dir` instead of where this minimal file sits on disk.
+    ///
+    /// For a daemon that reads the project from a copy whose path changes
+    /// every session (the VM guest's uploaded tree), so the caller supplies
+    /// the stable host path. The `~` prefix is never used: the host's home
+    /// is not this machine's.
+    pub fn state_dir_under<P: AsRef<Path>>(
+        &self,
+        state_key: &str,
+        env_base_dir: P,
+        project_dir: &Path,
+    ) -> PathBuf {
+        Self::state_dir_from_path(state_key, env_base_dir, None, project_dir)
+    }
+
     /// Resolves how the remote-cache reader should locate its index:
     /// `[cache] index_source` (or `override_mode`, which wins when set —
     /// typically an environment variable) applied to the upstream pin.
@@ -2753,6 +2769,25 @@ mod tests {
             Path::new("/home/user/project"),
         );
         assert_eq!(result, Path::new("/tmp/state/~project/env"));
+    }
+
+    #[test]
+    fn state_dir_under_ignores_where_the_mfile_sits() {
+        let at = |p: &str| File {
+            mfile_path: Some(PathBuf::from(p)),
+            ..Default::default()
+        };
+        let project = Path::new("/home/user/src/my-project");
+        let a = at("/var/lib/minimal/sessions/aaaa/tree/minimal.toml");
+        let b = at("/var/lib/minimal/sessions/bbbb/tree/.minimal/minimal.toml");
+        let dir_a = a.state_dir_under("env", "/tmp/state", project);
+        let dir_b = b.state_dir_under("env", "/tmp/state", project);
+        assert_eq!(dir_a, dir_b);
+        // Never `~`: the project's home is another machine's.
+        assert_eq!(
+            dir_a,
+            Path::new("/tmp/state/-home-user-src-my--project/env")
+        );
     }
 
     #[test]
