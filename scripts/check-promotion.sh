@@ -7,8 +7,9 @@
 # moves users backwards: staged 0.7.3, emergency 0.7.4, then 0.7.3 again.
 # --rollback allows that second case on purpose. Nothing allows the first.
 #
-# A nightly sha has no order against a version, so it passes with a warning, as
-# does any version when `stable` holds a sha.
+# Only a staged release goes to `stable`, so a nightly sha is refused. If
+# `stable` already holds a sha, a release replaces it with a warning, since
+# there's no order to check.
 #
 # Usage: scripts/check-promotion.sh --version V --current STABLE [--rollback]
 
@@ -43,11 +44,8 @@ candidate="$core-[0-9A-Za-z.-]+"
 # Checked first, so nothing passes over an unreadable `stable`.
 [[ "$CURRENT" =~ ^($sha|$core|$candidate)$ ]] || die "cannot read the current stable: '$CURRENT'"
 
-if [[ "$VERSION" =~ ^$sha$ ]]; then
-    printf '::warning::%s is a nightly sha, which has no order against stable (%s)\n' "$VERSION" "$CURRENT"
-    exit 0
-fi
-[[ "$VERSION" =~ ^$core ]] || die "'$VERSION' is neither a version nor a nightly sha"
+[[ "$VERSION" =~ ^$sha$ ]] && die "$VERSION is a nightly sha; only a staged release goes to stable"
+[[ "$VERSION" =~ ^$core ]] || die "'$VERSION' is not a version"
 [[ "$VERSION" =~ ^$core$ ]] || die "$VERSION is a candidate; a candidate never goes to stable. Stage the final version"
 if [[ "$CURRENT" =~ ^$sha$ ]]; then
     printf '::warning::stable is the nightly sha %s, which has no order against %s\n' "$CURRENT" "$VERSION"

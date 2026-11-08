@@ -640,8 +640,10 @@ both pass the check and then write out of order.
 - It refuses a version below the current `stable`, unless you set `rollback`. For
   example, a run stages `0.7.3`, an emergency promotes `0.7.4`, and someone then
   promotes `0.7.3` on the planned day. The approval issue shows `rollback`.
-- A nightly commit hash has no order against a version, so it passes with a
-  warning.
+- It refuses a nightly commit hash. Only a staged release goes to `stable`;
+  promote nightlies to `unstable`. No input turns this off.
+- If `stable` already holds a nightly commit hash, a release replaces it with a
+  warning, because there is no order to check.
 
 **Smoke check.** The `promote` job runs
 [`scripts/verify-smoked.sh`](../../scripts/verify-smoked.sh). It compares the

@@ -8,7 +8,7 @@ on:
     workflow_dispatch:
         inputs:
             version:
-                description: "Staged version to promote: a semver (0.6.0, from a versioned release build) or a nightly short SHA. Leave empty for the latest staged nightly SHA."
+                description: "Staged version to promote: a semver (0.6.0, from a versioned release build) or a nightly short SHA (unstable only). Leave empty for the latest staged nightly SHA."
                 required: false
                 type: string
             target:

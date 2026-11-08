@@ -47,12 +47,13 @@ expect 1 "below stable" "0.7.3 can't replace 0.8.0" -- check 0.7.3 0.8.0
 expect 1 "below stable" "0.7.3 can't replace a 0.7.4 candidate" -- check 0.7.3 0.7.4-rc1
 expect 0 "rolling stable back from 0.7.4 to 0.7.3" "rollback allows it" -- check 0.7.3 0.7.4 --rollback
 
-# Nightly shas have no order.
-expect 0 "nightly sha" "a nightly sha warns and passes" -- check 014fa3eb 0.7.2
+# Only a staged release goes to stable.
+expect 1 "only a staged release" "a nightly sha is refused" -- check 014fa3eb 0.7.2
+expect 1 "only a staged release" "rollback doesn't let a nightly sha through" -- check 014fa3eb 0.7.4 --rollback
 expect 0 "nightly sha" "a sha in stable warns and passes" -- check 0.7.3 014fa3eb
 
 # Bad input.
-expect 1 "neither a version" "junk is refused" -- check latest 0.7.2
+expect 1 "not a version" "junk is refused" -- check latest 0.7.2
 expect 1 "cannot read" "a junk stable is refused" -- check 0.7.3 "<html>"
 expect 1 "cannot read" "a junk stable is refused for a nightly sha" -- check 014fa3eb "<html>"
 expect 1 "cannot read" "a stable with a junk tail is refused" -- check 0.7.5 0.7.4garbage
