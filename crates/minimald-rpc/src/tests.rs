@@ -527,12 +527,52 @@ fn create_session_request_round_trips() {
             // while it is left off the wire.
             creating_verb: CreatingVerb::Task,
             project_root: Some(paths::HostAbsPath::try_new("/home/u").unwrap()),
+            host_ip_registration: Some("dev~0123456789abcdef".into()),
         },
         must_match_version: Some("0.6.0".into()),
         spec: Some(serde_json_lenient::json!({"v": 0, "box": {"type": "task"}})),
         fresh_instance: true,
     };
     assert_eq!(round_trip(&req), req);
+}
+
+/// BEP-082: a fresh-instance `host_ip` grant box carries the creation key
+/// it registered under, so the in-VM daemon's id mint finds the
+/// registration after it names the box `<base>-<n>`. A config with no key
+/// leaves it off the wire, and an older client's config decodes with none.
+#[test]
+fn box_config_carries_the_host_ip_registration_name() {
+    let mut req = CreateSessionRequest::new(
+        "dev",
+        paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+        NetworkMode::HostNet,
+        BoxPolicy::default(),
+    );
+    req.config.host_ip_registration = Some("dev~0123456789abcdef".into());
+    let wire = serde_json_lenient::to_string(&req.config).unwrap();
+    let sent: serde_json_lenient::Value = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(
+        sent["host_ip_registration"], "dev~0123456789abcdef",
+        "the key reaches the wire"
+    );
+    assert_eq!(round_trip(&req), req);
+
+    req.config.host_ip_registration = None;
+    let wire = serde_json_lenient::to_string(&req.config).unwrap();
+    assert!(
+        !wire.contains("host_ip_registration"),
+        "no key, no field: {wire}"
+    );
+
+    let older = r#"{
+        "name": "dev",
+        "project_path": "/p",
+        "network": "host_net",
+        "attrs": {}
+    }"#;
+    let config: BoxConfig =
+        serde_json_lenient::from_str(older).expect("an older client's config must load");
+    assert_eq!(config.host_ip_registration, None);
 }
 
 /// The one constructor every daemon-side create goes through: it fills
@@ -564,6 +604,7 @@ fn create_request_constructor_round_trips() {
                 root_certificate: None,
                 creating_verb: CreatingVerb::Session,
                 project_root: None,
+                host_ip_registration: None,
             },
             must_match_version: None,
             spec: None,
@@ -619,6 +660,58 @@ fn create_sends_expanded_spec_and_stores_it() {
     let req: CreateSessionRequest =
         serde_json_lenient::from_str(legacy).expect("a request with no spec must load");
     assert_eq!(req.spec, None);
+}
+
+/// BOX-080: the `[network] egress`, `[network] ingress`, `[network.bep]`
+/// and `[secrets]` sections of a spec reach the daemon unchanged, every
+/// key and value as the client wrote it.
+#[test]
+fn network_bep_secrets_passed_unchanged() {
+    let network = serde_json_lenient::json!({
+        "mode": "own_ip",
+        "egress": {
+            "allow_dns_hosts": ["b.example", "a.example"],
+            "allow_subnets": ["10.0.0.0/8"],
+            "deny_subnets": ["10.1.0.0/16"],
+        },
+        "ingress": [{"proto": "tcp", "port": 8080}],
+        "bep": {"upstreams": [{"host": "api.example", "secret": "token"}]},
+    });
+    let secrets = serde_json_lenient::json!({
+        "source": "broker",
+        "names": ["token"],
+    });
+    let spec = serde_json_lenient::json!({
+        "v": 0,
+        "box": {"type": "session"},
+        "network": network,
+        "secrets": secrets,
+    });
+    let mut req = CreateSessionRequest::new(
+        "net-box",
+        paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+        NetworkMode::OwnIp,
+        BoxPolicy::default(),
+    );
+    req.spec = Some(spec.clone());
+
+    let wire = serde_json_lenient::to_string(&req).unwrap();
+    let sent: serde_json_lenient::Value = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(sent["spec"]["network"], network, "[network] on the wire");
+    assert_eq!(sent["spec"]["secrets"], secrets, "[secrets] on the wire");
+
+    let received = round_trip(&req).spec.expect("the daemon receives the spec");
+    for section in ["egress", "ingress", "bep"] {
+        assert_eq!(
+            received["network"][section], network[section],
+            "[network] {section} reaches the daemon unchanged"
+        );
+    }
+    assert_eq!(
+        received["secrets"], secrets,
+        "[secrets] reaches the daemon unchanged"
+    );
+    assert_eq!(received, spec);
 }
 
 /// A client that predates `must_match_version` sends no such field, and
@@ -2115,6 +2208,72 @@ fn reap_and_prune_requests_round_trip() {
     }
     assert_eq!(ReapBox::NAME, "minimald-v1-ReapBox");
     assert_eq!(PruneBoxes::NAME, "minimald-v1-PruneBoxes");
+}
+
+/// BOX-021, BOX-159: a prune preview carries each matched record with
+/// its disk figure, a show reply carries the disk figure of its box, and
+/// an absent figure stays absent, never zero. A show reply from a daemon
+/// that predates the field reads as one with no figure, and an error
+/// reply decodes as an error, not an empty preview.
+#[test]
+fn preview_prune_and_show_disk_round_trip() {
+    let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let entry = BoxListingEntry {
+        box_id: id,
+        name: Some("dev".to_string()),
+        box_type: Some("session".to_string()),
+        parent: None,
+        project_root: None,
+        state: "exited".to_string(),
+        reason: Some("exit".to_string()),
+        exit_code: Some(0),
+        signal: None,
+        pty_enabled: true,
+    };
+    let preview = PreviewPruneResponse {
+        matched: vec![
+            PrunePreviewEntry {
+                record: entry.clone(),
+                disk_bytes: Some(1_048_576),
+            },
+            PrunePreviewEntry {
+                record: entry.clone(),
+                disk_bytes: None,
+            },
+        ],
+    };
+    assert_eq!(round_trip(&preview), preview);
+    let json = serde_json_lenient::to_string(&preview).unwrap();
+    assert_eq!(
+        json.matches("disk_bytes").count(),
+        1,
+        "an unmeasured box sends no figure: {json}"
+    );
+    assert_eq!(
+        serde_json_lenient::from_str::<PreviewPruneResponse>("{}").unwrap(),
+        PreviewPruneResponse::default()
+    );
+
+    let show = ShowBoxResponse {
+        record: entry.clone(),
+        identity: BoxIdentity::None,
+        live_execs: Vec::new(),
+        disk_bytes: Some(8192),
+    };
+    assert_eq!(round_trip(&show), show);
+    let older: ShowBoxResponse = serde_json_lenient::from_str(&format!(
+        r#"{{"record":{}}}"#,
+        serde_json_lenient::to_string(&entry).unwrap()
+    ))
+    .unwrap();
+    assert_eq!(older.disk_bytes, None);
+
+    let error = r#"{"error":"no session with ID `x`"}"#;
+    assert!(matches!(
+        serde_json_lenient::from_str::<Errorable<PreviewPruneResponse>>(error).unwrap(),
+        Errorable::Err { .. }
+    ));
+    assert_eq!(PreviewPrune::NAME, "minimald-v1-PreviewPrune");
 }
 
 /// BEP-082, BEP-083: the admit of a `host_ip` box carries whether the box

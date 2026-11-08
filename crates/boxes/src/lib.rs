@@ -1500,15 +1500,17 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub bound_ports: BTreeSet<SocketAddrV4>,
 
-    /// Set on a box created for a single `min task run` without `--keep`,
-    /// so the box dies with its run even if the daemon that accepted it
-    /// does not (NET-131): a restart's resume destroys a marked box
-    /// instead of bringing it back, which is the same teardown a finished
-    /// run's own box-end takes. Written once, by the create that mints the
-    /// record (the client's `BoxConfig::ends_with_run`), and read only by
-    /// the resume (`resume_active_sessions`, which runs on Linux only, so
-    /// on other hosts the mark is written and never read). Defaults to
-    /// `false` for every record that predates the field.
+    /// Set on a box created for a single `min task run`, so the box dies
+    /// with its run even if the daemon that accepted it does not
+    /// (NET-131): a restart's resume destroys a marked box instead of
+    /// bringing it back, which is the same teardown a finished run's own
+    /// box-end takes. Set by the create that mints the record (the
+    /// client's `BoxConfig::ends_with_run`). The box's actor clears it
+    /// when a task run starts the box's entrypoint (T43), so from then on
+    /// a restart keeps the box's record (BOX-038). Read only by the resume
+    /// (`resume_active_sessions`, which runs on Linux only, so on other
+    /// hosts the mark is written and never read). Defaults to `false` for
+    /// every record that predates the field.
     ///
     /// The destroy of a run's `running` record at restart is an interim
     /// against architecture line 495: a restart sets an orphaned

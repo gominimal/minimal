@@ -11,8 +11,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod duration;
+pub mod entry;
 mod error;
-pub use error::Error;
+pub use error::{EntryNameRule, Error, SpecKeyProblem};
+pub mod expand;
+pub mod legacy;
+pub mod network;
 mod package_composable;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
@@ -974,6 +979,41 @@ pub struct File {
     layout: Option<Layout>,
 }
 
+/// The entry keys that `[session]` and a task keep among their unknown
+/// fields but that a box spec reads (BOX-049), so they are not reported
+/// as unknown.
+const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout"];
+
+/// An entry's unknown fields, in key order, less the ones a box spec reads.
+fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
+    let mut keys: Vec<&str> = extra
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !SPEC_READ_ENTRY_KEYS.contains(key))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Refuses an entry's `timeout` that is not a duration, naming the key and
+/// the entry's table as `layer`.
+fn check_entry_timeout(layer: &str, extra: &HashMap<String, toml::Value>) -> Result<(), Error> {
+    let Some(value) = extra.get("timeout") else {
+        return Ok(());
+    };
+    match duration::spec_timeout(value) {
+        Ok(_) => Ok(()),
+        Err(found) => Err(Error::InvalidSpecKey {
+            key: "timeout".to_owned(),
+            layer: layer.to_owned(),
+            problem: SpecKeyProblem::WrongShape {
+                expected: duration::TIMEOUT_TAKES,
+                found,
+            },
+        }),
+    }
+}
+
 /// Maps a key that is unknown at the top level of an mfile to the nesting
 /// path where it is actually valid, when there is one. `lifecycle_hooks` is
 /// top-level in a loadout but nests under `[session]` in a project mfile, so a
@@ -995,6 +1035,15 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Whether a load refuses a task that sets `interactive = true` (BOX-054).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskCheck {
+    /// Refuse it: the file is the project's own.
+    Refuse,
+    /// Read it: the package graph reads the file as a layer.
+    Skip,
+}
+
 impl File {
     /// Parses a `minimal.toml` from raw bytes — the pure, filesystem-free core
     /// of [`File::from_dir`], exposed for fuzzing (crates/mfile/fuzz) and tests.
@@ -1006,7 +1055,18 @@ impl File {
     /// `LinkConfig` failure to [`Error::LinkConfig`], which names the keys a
     /// link table must set and where the bad table is, instead of quoting
     /// serde's internal enum name.
+    ///
+    /// It then reads the legacy tables (BOX-050, BOX-051, BOX-052) and
+    /// prints one hint on stderr for each, on every read.
     fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
+        let mut file = Self::deserialize_bytes(bytes, path)?;
+        for legacy in legacy::settle(&mut file, legacy::this_release(), path)? {
+            eprintln!("{legacy}");
+        }
+        Ok(file)
+    }
+
+    fn deserialize_bytes(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
         toml::from_slice(bytes).map_err(|e| {
             if !e.message().contains("untagged enum LinkConfig") {
                 return Error::Format(e);
@@ -1064,6 +1124,7 @@ impl File {
         path: &PathBuf,
         layout: Layout,
         content_hash: u64,
+        tasks: TaskCheck,
     ) -> Result<Self, Error> {
         self.mfile_path = Some(path.to_path_buf());
         self.layout = Some(layout);
@@ -1074,7 +1135,7 @@ impl File {
                 sideload.link.fixup_relative(path);
             }
         }
-        self.validate()?;
+        self.check(tasks)?;
         Ok(self)
     }
 
@@ -1091,9 +1152,17 @@ impl File {
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
     /// no `default` field, [`Error::HarnessTable`] if the file names the
-    /// pre-v0.5.0 `harness` key, or [`Error::MultipleTaskActions`] if a task
-    /// sets more than one action key.
+    /// pre-v0.5.0 `harness` key, [`Error::MultipleTaskActions`] if a task
+    /// sets more than one action key, [`Error::InteractiveTask`] if a
+    /// task sets `interactive = true`, or [`Error::InvalidSpecKey`] if
+    /// `[session]` or a task sets a `timeout` that is not a duration.
     pub fn validate(&self) -> Result<(), Error> {
+        self.check(TaskCheck::Refuse)
+    }
+
+    /// [`Self::validate`], with the interactive-task refusal as `tasks`
+    /// says.
+    fn check(&self, tasks: TaskCheck) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
                 if s.default.is_none() {
@@ -1124,6 +1193,21 @@ impl File {
             if keys.len() > 1 {
                 return Err(Error::MultipleTaskActions(task_name.clone(), keys));
             }
+            if tasks == TaskCheck::Refuse {
+                task.refuse_interactive(task_name)?;
+            }
+        }
+        // BOX-049: an entry's `timeout` takes the duration grammar. A bad
+        // value is refused here, before a spec is built from the entry.
+        if let Some(session) = &self.session {
+            check_entry_timeout("`[defaults.session]` in minimal.toml", &session.extra)?;
+        }
+        for (task_name, task) in &self.tasks {
+            let layer = format!(
+                "`{}` in minimal.toml",
+                error::EntryHeader("tasks", task_name)
+            );
+            check_entry_timeout(&layer, &task.extra)?;
         }
         self.warn_unknown_fields();
         Ok(())
@@ -1132,11 +1216,26 @@ impl File {
     /// Loads the minimal file from the given directory path. The given
     /// directory must be a repository / minimalfile root.
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        Self::load_dir(dir.as_ref(), TaskCheck::Refuse)
+    }
+
+    /// Loads the minimal file from `dir` as the package graph reads a
+    /// layer: [`Self::from_dir`] without the interactive-task refusal
+    /// (BOX-054). The graph reads only a layer's `[upstream]`, `[params]`
+    /// and `[stdlib]`, and never runs its tasks. An upstream package
+    /// repository can still declare `interactive = true` tasks, and the
+    /// user cannot fix that file. The project's own file gets the refusal
+    /// when it loads through [`Self::from_dir`].
+    pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        Self::load_dir(dir.as_ref(), TaskCheck::Skip)
+    }
+
+    fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Error> {
         // Check for the minimal file at the directory root.
-        let path = dir.as_ref().join(MFILE_NAME);
+        let path = dir.join(MFILE_NAME);
         match std::fs::read(&path) {
             Ok(file_data) => {
-                let conflicting_path = dir.as_ref().join(".minimal").join(MFILE_NAME);
+                let conflicting_path = dir.join(".minimal").join(MFILE_NAME);
                 if std::fs::exists(&conflicting_path)
                     .map_err(|e| Error::IO("stat", conflicting_path.clone(), e))?
                 {
@@ -1148,6 +1247,7 @@ impl File {
                     &path,
                     Layout::Root,
                     hash_bytes(&file_data),
+                    tasks,
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1155,13 +1255,14 @@ impl File {
         };
 
         // Check for the minimal file at `./.minimal`.
-        let path = dir.as_ref().join(".minimal").join(MFILE_NAME);
+        let path = dir.join(".minimal").join(MFILE_NAME);
         match std::fs::read(&path) {
             Ok(file_data) => Self::init_toml(
                 Self::parse(&file_data, Some(&path))?,
                 &path,
                 Layout::DotMinimal,
                 hash_bytes(&file_data),
+                tasks,
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
@@ -1582,10 +1683,8 @@ impl File {
             && !session.extra.is_empty()
         {
             boxes::core::bep::warn_project_store_rules(session.extra.keys().map(String::as_str));
-            let unknown: Vec<&str> = session
-                .extra
-                .keys()
-                .map(String::as_str)
+            let unknown: Vec<&str> = unknown_entry_keys(&session.extra)
+                .into_iter()
                 .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
                 .collect();
             if !unknown.is_empty() {
@@ -1599,11 +1698,12 @@ impl File {
         }
 
         for (task_name, task) in &self.tasks {
-            if !task.extra.is_empty() {
+            let unknown = unknown_entry_keys(&task.extra);
+            if !unknown.is_empty() {
                 tracing::warn!(
                     "unknown fields in task {}: {}",
                     task_name,
-                    task.extra.keys().cloned().collect::<Vec<_>>().join(",")
+                    unknown.join(",")
                 );
                 was_unknown_fields = true;
             }
@@ -2985,11 +3085,12 @@ mod tests {
             "/../boxes/example_project/minimal.toml"
         );
         let src = std::fs::read_to_string(path).expect("example project is readable");
-        let file: File = toml::from_str(&src).expect("example project must parse as an mfile");
+        let file =
+            File::from_toml_bytes(src.as_bytes()).expect("example project must parse as an mfile");
 
         let session = file
             .session
-            .expect("the example declares a [session] block");
+            .expect("the example declares a [defaults.session] block");
         assert_eq!(session.lifecycle_hooks.len(), 1);
         let hook = &session.lifecycle_hooks[0];
         // All four transitions, so each can be exercised from the demo.
@@ -3120,6 +3221,81 @@ mod tests {
         let out = capture.contents();
         assert!(!out.contains("unknown fields in task"), "{out}");
         assert!(!out.contains("update to a newer version"), "{out}");
+    }
+
+    /// BOX-049: a `timeout` that is not a duration, in `[session]` or a
+    /// task, refuses the load with exit 3, naming the key and the entry.
+    #[test]
+    fn invalid_timeout_exit3_names_key_and_entry() {
+        let takes = "but `timeout` takes a whole number of seconds, or a string of a \
+                     whole number followed by s, m or h, such as \"30s\", \"5m\" or \"1h\". \
+                     Fix the value.";
+        let cases = [
+            (
+                "[defaults.session]\ntimeout = \"2 days\"\n",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a string that is not a duration",
+            ),
+            (
+                "[session]\ntimeout = \"2 days\"\n",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a string that is not a duration",
+            ),
+            (
+                "[tasks.lint]\nexec = [\"true\"]\ntimeout = -5\n",
+                "`[tasks.lint]` in minimal.toml sets `timeout` to a negative number",
+            ),
+            (
+                "[tasks.lint]\nexec = [\"true\"]\ntimeout = 1.5\n",
+                "`[tasks.lint]` in minimal.toml sets `timeout` to a decimal number",
+            ),
+            (
+                "[session]\ntimeout = \"9223372036854775808\"\n",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a duration that is too long",
+            ),
+        ];
+        for (file, start) in cases {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(MFILE_NAME), file).unwrap();
+            let err = File::from_dir(dir.path()).expect_err("a bad timeout is refused");
+            assert!(matches!(&err, Error::InvalidSpecKey { .. }), "{err:?}");
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            assert_eq!(err.to_string(), format!("{start}, {takes}"));
+        }
+
+        // Every value in the grammar loads, zero included.
+        for timeout in ["\"30s\"", "\"5m\"", "\"1h\"", "45", "0", "\"0s\""] {
+            let file = format!("[session]\ntimeout = {timeout}\n");
+            let parsed: File = toml::from_str(&file).unwrap();
+            parsed.validate().expect(&file);
+        }
+    }
+
+    /// BOX-049: `timeout` in `[session]` or a task is a box setting, so the
+    /// load does not report it as an unknown field.
+    #[test]
+    fn timeout_entry_key_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[session]\ntimeout = \"8h\"\n\n[tasks.lint]\nexec = [\"true\"]\ntimeout = 90\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("a timeout in the grammar loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+
+        // Another unknown key in the same entry is still reported, alone.
+        let task: Task = toml::from_str("exec = [\"true\"]\ntimeout = 90\ncolour = 1\n").unwrap();
+        assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
     }
 
     #[test]

@@ -268,6 +268,179 @@ async fn shutdown_rpc_returns_even_if_the_initiating_client_lingers() {
     drop(client);
 }
 
+/// The first `conn` span `log` saw, once it has closed: its task has then
+/// recorded the outcome and logged how the connection ended.
+async fn first_conn_once_closed(
+    log: &crate::test_harness::SpanLog,
+) -> crate::test_harness::LoggedSpan {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(first) = log.spans().into_iter().find(|s| s.name == "conn")
+                && first.closed
+            {
+                return first;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first conn span closes")
+}
+
+/// `min` probes the daemon's socket before every command by connecting
+/// and hanging up without an SSH id line; that is not a failed handshake
+/// and is not logged as one. The `conn` span says what became of the
+/// connection instead.
+#[tokio::test]
+async fn a_peer_that_hangs_up_before_the_ssh_id_is_not_a_handshake_failure() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let capture = crate::test_harness::CaptureWriter::default();
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(log.clone()).with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(capture.clone())
+                .with_ansi(false),
+        ),
+    );
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    let probe = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    drop(probe);
+    // The probe's `conn` span closes when its task has classified the
+    // hang-up and logged it, so the log is complete for the probe then.
+    let probe_conn = first_conn_once_closed(&log).await;
+    assert_eq!(
+        probe_conn.field("outcome"),
+        Some("closed_before_id"),
+        "{probe_conn:?}"
+    );
+    let mut client = connect_uds(&sock).await;
+    let resp = client.call::<GetVersion>(&()).await;
+    assert!(!resp.version.is_empty());
+
+    let logged = capture.contents();
+    assert!(
+        !logged.contains("SSH handshake failed"),
+        "a peer that hung up before the id exchange is not a failed handshake: {logged}"
+    );
+    assert!(
+        logged.contains("peer closed before the SSH id exchange"),
+        "the probe's hang-up is logged at debug: {logged}"
+    );
+    assert!(
+        logged.matches("accepted connection").count() >= 2,
+        "both the probe and the client were accepted: {logged}"
+    );
+
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+/// `run_stream` returns once the SSH ids are exchanged, with key exchange
+/// still to run in russh's task: a peer that sends its id and then fails key
+/// exchange is a failed handshake, not a session, while a real client that
+/// gets through is one. The `conn` span's outcome says which.
+#[tokio::test]
+async fn a_peer_that_fails_key_exchange_after_its_id_is_a_failed_handshake() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    let mut peer = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    peer.write_all(b"SSH-2.0-not-a-client\r\n").await.unwrap();
+    // A packet length no SSH implementation accepts. The daemon may close
+    // before all of it is written.
+    let _ = peer.write_all(&[0xff; 64]).await;
+    let mut sink = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut sink)).await;
+    drop(peer);
+
+    let mut client = connect_uds(&sock).await;
+    let resp = client.call::<GetVersion>(&()).await;
+    assert!(!resp.version.is_empty());
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+
+    let outcomes: Vec<Option<String>> = log
+        .spans()
+        .iter()
+        .filter(|s| s.name == "conn")
+        .map(|s| s.field("outcome").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Some("handshake_failed".to_owned()),
+            Some("session".to_owned())
+        ],
+        "{:#?}",
+        log.spans()
+    );
+}
+
+/// A peer that gets through key exchange and asks for ssh-userauth, but
+/// hangs up without authenticating, had no session: its `conn` outcome is
+/// `closed_before_auth`, and only the client that authenticates is a
+/// `session`.
+#[tokio::test]
+async fn a_peer_that_never_authenticates_is_not_a_session() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    let mut peer = russh::client::connect_stream(
+        std::sync::Arc::new(russh::client::Config::default()),
+        stream,
+        crate::test_harness::TestClientHandler,
+    )
+    .await
+    .unwrap();
+    // The daemon takes no passwords: the request is refused, after the
+    // ssh-userauth service was granted.
+    let auth = peer.authenticate_password("test", "wrong").await.unwrap();
+    assert!(!auth.success());
+    drop(peer);
+    first_conn_once_closed(&log).await;
+
+    let mut client = connect_uds(&sock).await;
+    let resp = client.call::<GetVersion>(&()).await;
+    assert!(!resp.version.is_empty());
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+
+    let outcomes: Vec<Option<String>> = log
+        .spans()
+        .iter()
+        .filter(|s| s.name == "conn")
+        .map(|s| s.field("outcome").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Some("closed_before_auth".to_owned()),
+            Some("session".to_owned())
+        ],
+        "{:#?}",
+        log.spans()
+    );
+}
+
 /// A connection that connects and never sends its SSH id line must not
 /// stall the accept loop: a second connection completes a full handshake
 /// and a `GetVersion` RPC while the silent one is still open.

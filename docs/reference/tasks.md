@@ -377,7 +377,7 @@ Usage: mip run greeter --name <name> --greeting <greeting>
 $> min task run greeter --name Alice --greeting hi
 ```
 
-`min task run` reads its own options (`--path`, `--keep`, `--help`) before the task's. To pass a
+`min task run` reads its own options (`--path`, `--help`) before the task's. To pass a
 task argument with one of those names, put it after `--`, as in
 `min task run deploy -- --path prod`. The project directory is the `--path` option, not a
 positional argument.

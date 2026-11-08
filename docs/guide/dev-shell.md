@@ -20,10 +20,10 @@ Activation uploads your project files into the session's workspace, so the shell
 
 ## What is in the session?
 
-A session's tools come from the project's `[session]` block in `minimal.toml`. List the packages every contributor needs when working on this codebase:
+A session's tools come from the project's `[defaults.session]` table in `minimal.toml`. List the packages every contributor needs when working on this codebase:
 
 ```toml
-[session]
+[defaults.session]
 packages = ["git", "curl", "ripgrep"]
 ```
 
@@ -33,10 +33,10 @@ Inside the session you have access to your project's source code and these decla
 
 ### Add more tools
 
-Add packages to the project's `[session]` block so everyone picks them up:
+Add packages to the project's `[defaults.session]` table so everyone picks them up:
 
 ```toml
-[session]
+[defaults.session]
 packages = ["git", "curl", "ripgrep", "jq", "nano"]
 ```
 
@@ -46,14 +46,14 @@ To add a package mid-session, run `min add` from inside the running session. You
 $ min add nano
 ```
 
-This installs the tool into the running session and records it in the project's `[session]` `packages` list, so the next activation gets it too. See the [`min` in-sandbox commands](../reference/sandbox-operations.md#add) for the full helper reference.
+This installs the tool into the running session and records it in `minimal.toml`, so the next activation gets it too. See the [`min` in-sandbox commands](../reference/sandbox-operations.md#add) for the full helper reference.
 
 ### Access host files
 
-By default, only your project directory is available inside the session. To bring specific host files or directories in, declare `patches` in the `[session]` block. Each patch names a `source` on the host and a `dest` under the session user's home directory:
+By default, only your project directory is available inside the session. To bring specific host files or directories in, declare `patches` in the `[defaults.session]` table. Each patch names a `source` on the host and a `dest` under the session user's home directory:
 
 ```toml
-[session]
+[defaults.session]
 packages = ["git"]
 patches = [
     { source = "~/.gitconfig", dest = "~/.gitconfig" },
@@ -65,10 +65,10 @@ A relative `source` resolves against the project directory, so `source = "config
 
 ### Set environment variables
 
-The session starts with a clean environment. By default, host environment variables do not pass through. Set variables explicitly, or inherit them from the host, under `[session.vars]`:
+The session starts with a clean environment. By default, host environment variables do not pass through. Set variables explicitly, or inherit them from the host, under `[defaults.session.vars]`:
 
 ```toml
-[session.vars]
+[defaults.session.vars]
 EDITOR = "nano"
 AWS_PROFILE = { inherit = true }
 ```
@@ -85,10 +85,10 @@ Since the project commits `minimal.toml`, that applies to everyone on the projec
 
 ### Run setup on activation
 
-To run setup steps when a session comes up, declare lifecycle hooks in the `[session]` block:
+To run setup steps when a session comes up, declare lifecycle hooks in the `[defaults.session]` table:
 
 ```toml
-[[session.lifecycle_hooks]]
+[[defaults.session.lifecycle_hooks]]
 on_activate = { type = "inline", value = "cargo fetch >/dev/null 2>&1 || true" }
 ```
 

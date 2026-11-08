@@ -166,6 +166,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-021** WHEN boxes are pruned, optionally narrowed by the `older-than <d>` and `parent <box>` selectors, THE SYSTEM SHALL reap every box in the `stopped` or `exited` state that matches all the given selectors, never a box in any other state, and print what it reaped.
   tier:     T0
   verify:   cargo nextest run -p minimald prune_selectors_reap_and_print
+  - WHERE a prune is previewed THE SYSTEM SHALL list every box in the `stopped` or `exited` state that a prune with the same selectors reaps, each with the bytes on disk a reap of it frees, and reap none of them.
+    tier:   T0
+    verify: cargo nextest run -p minimald prune_dry_run_lists_matches_with_disk
+    verify: cargo nextest run -p minimald prune_dry_run_reaps_none
+    verify: cargo nextest run -p minimald prune_dry_run_matches_what_prune_reaps
 
 - **BOX-024** THE SYSTEM SHALL run no automatic reaper of stopped or exited boxes.
   tier:     T0
@@ -241,6 +246,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-159** WHEN one box record is read THE SYSTEM SHALL return its `box_id`, name, `box_type`, `parent`, project root, state with the `reason`, `exit_code` and `signal` BOX-011 defines, its identity as BOX-140 reports it, and the exec id of each live exec in it (BOX-149).
   tier:     T0
   verify:   cargo nextest run -p minimald show_returns_record_state_identity_and_live_execs
+  - WHEN the record of a box in the `stopped` or `exited` state is read THE SYSTEM SHALL also return the bytes on disk a reap of the box frees, the same figure a prune preview lists for it, and return no figure, never zero, where it cannot measure them.
+    tier:   T0
+    verify: cargo nextest run -p minimald show_reports_disk_a_reap_frees
+    verify: cargo nextest run -p boxes box_dir_disk_counts_what_a_reap_frees
 
 
 ### O2 The Box Spec in minimal.toml
@@ -628,6 +637,8 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 **The daemon re-checks the built-in root's constraints at admission.** Decided on 2026-10-05: `minimald` checks the received expanded spec against the constraints of its type's built-in root and refuses a breach with exit 3, the code BOX-061 gives the client's check (BOX-160), so the invariant that a constraint only narrows holds on the host side whatever client or expander sent the spec, including on BOX-074's skew-and-continue path. The alternative, stating that expansion alone suffices while the client and daemon share same-machine trust, was rejected because the epic places a check at minimald admission and Gatehouse §6.3 check 6 places one on the receiving side. A second decision the same day limits the daemon's check to the built-in root: a project type is defined only in the client's `minimal.toml`, so its narrowing stays the client expander's job (BOX-061) until Gatehouse carries types (gominimal/inbox#579), and a project type can only narrow its root (BOX-156), so the root's constraints bound every spec of that type. The alternative, carrying the type chain's constraints in the spec so the daemon could check the leaf type, was rejected because it changes the spec and projection bytes and BOX-145's golden vectors.
 
 **The first slice has an observer.** Decided on 2026-10-05: listing records with their states (BOX-158) and reading one (BOX-159) are operations here, and the first slice pulls BCLI-001 and BCLI-003 forward to render them, so a person can see that a stopped session was retained. The alternative, relying on today's session listing, was rejected because it renders the old three-state session model and shows neither `stopped` nor `exited`.
+
+**A prune can be previewed, with the disk each box holds.** A prune deletes records and filesystems that nothing can restore, so a person needs to see what a prune takes before it runs (BOX-021). The preview uses the same match step as the prune, so it cannot list a box the prune skips or skip a box the prune reaps. The disk figure is the bytes the filesystem allocates under the box's directory, which a reap deletes whole: a sparse file counts its blocks, a file with a hard link outside the directory counts nothing, and a file linked twice inside counts once. A read of a stopped or exited box returns the same figure (BOX-159), so a person can find the large boxes before a prune. A running box has no figure, because its disk changes while it runs and a reap that is not forced refuses it. Where the daemon cannot measure a box, the figure is absent and the daemon log names the box with the error. A zero there tells a person that a reap frees nothing, which is not known. The alternative, a byte count from file lengths, was rejected because it overstates sparse files and counts files that a reap does not free.
 
 **Attribute rules and runtime changes have named owners rather than requirements here.** Decided on 2026-10-05: `lifetime = "until_stopped"` with `[execution] restart`, and the `loadout_mode` gate on loadouts, are stated as attribute rules and sent to the Agent Box epic gominimal/inbox#678 or its successor; changing a running box's spec (`min add`, with `package_added`, `port_exposed` and `file_exported`) goes to a follow-up spec, and a box here resumes from its creation-time spec (BOX-025); organization types go to the Gatehouse directory work, gominimal/inbox#579. The alternative was a requirement for each in this spec, rejected to keep this spec to the record, the spec and its expansion, which every one of those builds on. Stating the first two as attribute rules rather than type behaviour keeps their destination explicit under design principle 8. The next paragraph supersedes this decision for the `loadout_mode` gate.
 

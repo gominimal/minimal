@@ -168,6 +168,13 @@ pub enum Command {
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
+    /// Check now whether your channel has a newer release.
+    ///
+    /// min makes this check by itself once a day; see
+    /// https://docs.minimal.dev/reference/telemetry#update-check for what
+    /// it sends and how to turn it off.
+    #[command(name = "update-check", hide = true)]
+    UpdateCheck(UpdateCheckArgs),
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
@@ -667,38 +674,12 @@ pub struct BoxExecArgs {
     /// Stop the command when it runs for longer than this: a number of
     /// seconds, or a number followed by s, m or h, such as 30s, 5m or 1h.
     /// The command then ends with exit code 124
-    #[arg(long, value_name = "DURATION", value_parser = parse_exec_timeout)]
+    #[arg(long, value_name = "DURATION", value_parser = mfile::duration::parse_timeout_secs)]
     pub timeout: Option<u64>,
     /// The command and its arguments, after `--`. The command runs as these
     /// words, with no shell
     #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
     pub command: Vec<String>,
-}
-
-/// Reads a `min box exec --timeout` value as whole seconds: a number of
-/// seconds, or a number followed by `s`, `m` or `h`. Zero is refused, as the
-/// daemon refuses a timeout of zero seconds (BOX-149).
-pub(crate) fn parse_exec_timeout(raw: &str) -> Result<u64, String> {
-    let refused = || {
-        format!(
-            "'{raw}' is not a timeout. Give a whole number of seconds, minutes or hours \
-             that is more than zero, such as 30s, 5m or 1h."
-        )
-    };
-    let (digits, scale) = match raw.char_indices().last() {
-        Some((at, 's')) => (&raw[..at], 1),
-        Some((at, 'm')) => (&raw[..at], 60),
-        Some((at, 'h')) => (&raw[..at], 3600),
-        _ => (raw, 1),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(refused());
-    }
-    let count: u64 = digits.parse().map_err(|_| refused())?;
-    match count.checked_mul(scale) {
-        Some(secs) if secs > 0 => Ok(secs),
-        _ => Err(refused()),
-    }
 }
 
 /// Why `min box exec` ran no command in the box: `-t` without a terminal
@@ -960,17 +941,25 @@ pub struct TaskArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
-    /// Run a declared task in an ephemeral session
+    /// Run a declared task in a task box
     ///
-    /// Creates a session for the project (named `task-<task>-<hex>`),
-    /// uploads the project like `min session activate`, runs the task
-    /// inside it with output streamed to the terminal, exits with the
-    /// task's exit code, and destroys the session afterwards. `--keep`
-    /// retains the session as an attachable box instead. Ctrl-C tears the
-    /// session down (or keeps it with `--keep`) and exits 130 without
-    /// relaying the interrupt to the task itself. Tasks run
-    /// non-interactively: pipe stdin to feed input; use `min session
-    /// attach` for interactive work.
+    /// Creates a box for the project (named `<task>-<n>`), uploads the
+    /// project like `min session activate`, runs the task inside it, and
+    /// exits with the task's exit code.
+    ///
+    /// The task runs without a terminal. A piped or redirected stdin goes to
+    /// the task, and the task reads EOF when that input ends. The task's
+    /// stdout is this command's stdout, and this command prints its own
+    /// lines on stderr, beside the task's stderr. So
+    /// `cat q.sql | min task run query > out.csv` gives the task q.sql and
+    /// writes only the task's output to out.csv.
+    ///
+    /// When the task ends, the box stays with its exit code: see it with
+    /// `min box show <task>-<n>` and remove it with `min box rm <task>-<n>`.
+    /// Ctrl-C stops the box as `min box stop` does, the box stays, and this
+    /// command exits 130. For a task declared with `interactive = true`,
+    /// Ctrl-C destroys its box instead. Use `min session attach` for
+    /// interactive work.
     Run(TaskRunArgs),
 }
 
@@ -984,9 +973,6 @@ pub struct TaskRunArgs {
     /// task name is a task argument, never a project path.
     #[arg(long)]
     pub path: Option<String>,
-    /// Keep the session after the task exits instead of destroying it
-    #[arg(long)]
-    pub keep: bool,
     /// Arguments to the task, passed through to its declared `args`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
@@ -1379,18 +1365,39 @@ pub(crate) fn parse_network_mode(raw: &str) -> Result<CliNetworkMode, String> {
 
 /// The rename hint for a legacy `--network` spelling: one line naming the
 /// spelling typed and the current one. `None` for a current spelling, so
-/// only the old forms are announced.
+/// only the old forms are announced. The line is the one `[network] mode`
+/// prints for the same spelling in minimal.toml (BOX-079), so the flag and
+/// the table cannot drift.
 pub(crate) fn legacy_network_hint(raw: &str) -> Option<String> {
-    let current = match raw {
-        "no-net" => "none",
-        "host-net" => "host_ip",
-        "own-ip" => "own_ip",
-        _ => return None,
-    };
-    Some(format!(
-        "note: --network {raw} still works for one release; \
-         the current spelling is --network {current}"
-    ))
+    mfile::network::legacy_mode_hint(raw)
+}
+
+#[cfg(test)]
+mod network_hint_tests {
+    use super::legacy_network_hint;
+
+    // BOX-079 with NET-037: the `--network` flag and `[network] mode` print
+    // one hint, the same line for the same legacy spelling.
+    #[test]
+    fn network_flag_and_table_share_one_hint() {
+        for (legacy, current) in mfile::network::LEGACY_MODES {
+            let flag = legacy_network_hint(legacy).expect("a legacy spelling carries a hint");
+            let mut spec: toml::Table =
+                toml::from_str(&format!("[network]\nmode = \"{legacy}\"\n"))
+                    .expect("test TOML parses");
+            let table = mfile::network::canonicalize(&mut spec).expect("the table is accepted");
+            assert_eq!(
+                table,
+                std::slice::from_ref(&flag),
+                "one hint, the same line"
+            );
+            assert!(flag.contains(&format!("--network {current}")), "{flag}");
+            assert!(flag.contains(&format!("mode = \"{current}\"")), "{flag}");
+        }
+        for current in mfile::network::MODES {
+            assert_eq!(legacy_network_hint(current), None);
+        }
+    }
 }
 
 impl From<CliNetworkMode> for boxes::NetworkMode {
@@ -1686,6 +1693,19 @@ pub struct SpinArgs {
     /// Ctrl-C cuts it short.
     #[arg(long, default_value_t = 10)]
     pub seconds: u64,
+}
+
+/// `min update-check`: see [`crate::update_check`].
+#[derive(Debug, Default, Args)]
+pub struct UpdateCheckArgs {
+    /// Check without printing anything and keep the answer for the next
+    /// command, as the daily check does. Always exits 0.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub background: bool,
+    /// Print the request that would be made, and the switch that stops it
+    /// if one is set, without making it.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

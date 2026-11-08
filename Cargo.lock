@@ -4096,6 +4096,7 @@ dependencies = [
  "indoc",
  "libc",
  "paths",
+ "proptest",
  "serde",
  "sha2 0.11.1",
  "shlex",
@@ -4103,6 +4104,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "version",
 ]
 
 [[package]]
@@ -4204,6 +4206,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width 0.2.2",
  "url",
+ "uuid",
  "version",
  "zeroize",
 ]
@@ -4230,6 +4233,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "version",
 ]
 

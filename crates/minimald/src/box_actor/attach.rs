@@ -189,6 +189,7 @@ impl BoxActor {
             box_runtime::AttachEnv {
                 inherited,
                 connection,
+                entrypoint: Vec::new(),
             }
         };
 
