@@ -751,8 +751,8 @@ pub(crate) mod linux {
     /// the block echoes it in one.
     pub(crate) const DAEMON_RUNNING_NOTE: &str = "note: a Minimal daemon is running. If a box \
          you start next still says this machine cannot enforce its egress, restart the daemon: \
-         min stop --force, and your next min command starts it again (sessions survive the \
-         restart).";
+         min stop (it refuses while boxes are live: stop them first, or min stop --force ends \
+         them), and your next min command starts it again.";
 
     /// What the step's `--place-listener` prints when no process holds the
     /// daemon's socket, so no daemon is running: the classifier block prints
