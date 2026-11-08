@@ -1654,6 +1654,28 @@ pub struct InitArgs {
     /// already exists.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+    // BCLI-018: `<entry> --type <type>` appends one entry; each noun flag is
+    // the same append with that noun as the type. The flags are checked by
+    // hand in `cmd_init`, not with clap conflicts, so a conflict prints the
+    // one message the task fixes.
+    /// Name of the entry to append to minimal.toml (use with --type)
+    #[arg(value_name = "ENTRY")]
+    pub entry: Option<String>,
+    /// Type of the entry to append: session, task, or a type from [box_types]
+    #[arg(long = "type", value_name = "TYPE")]
+    pub box_type: Option<String>,
+    /// Append a session entry with this name (the same as <ENTRY> --type session)
+    #[arg(long, value_name = "NAME")]
+    pub session: Option<String>,
+    /// Append a task entry with this name (the same as <ENTRY> --type task)
+    #[arg(long, value_name = "NAME")]
+    pub task: Option<String>,
+    /// Append an agent entry with this name (the same as <ENTRY> --type agent)
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+    /// Append a service entry with this name (the same as <ENTRY> --type service)
+    #[arg(long, value_name = "NAME")]
+    pub service: Option<String>,
 }
 
 #[derive(Debug, Args)]
