@@ -162,6 +162,7 @@ impl CleanCache {
     /// Removes every subdirectory of `dir` whose trailing `-<owner>` names an
     /// owner that is gone, returning how many went.
     fn sweep_dir(&self, kind: StaleKind, dir: &Path) -> Result<usize, Error> {
+        let now = SystemTime::now();
         let mut removed = 0;
         for entry in
             std::fs::read_dir(dir).map_err(|e| anyhow!("reading {}: {e}", dir.display()))?
@@ -170,7 +171,14 @@ impl CleanCache {
             let name = entry.file_name();
             // A name that isn't utf-8 can't carry the `-<owner>` suffix either.
             let Some(name) = name.to_str() else { continue };
-            if !owner_is_gone(name, self.daemon_id.as_deref()) {
+            // Only a build sandbox is judged by age: its build ends within
+            // hours. A task directory holds a box's env, which can sit
+            // untouched for days while still in use, so its age says nothing.
+            let modified = match kind {
+                StaleKind::Sandbox => entry.metadata().and_then(|m| m.modified()).ok(),
+                StaleKind::Task | StaleKind::TempDir => None,
+            };
+            if !owner_is_gone(name, self.daemon_id.as_deref(), modified, now) {
                 continue;
             }
 
@@ -193,6 +201,12 @@ impl CleanCache {
     }
 }
 
+/// How long a directory stamped with another daemon's id must sit untouched
+/// before a daemon reclaims it. Another live daemon's build finishes within
+/// hours; a dead daemon's stamp never changes again, so a few days apart tells
+/// the two cases apart without any way to ask the other daemon.
+const FOREIGN_OWNER_IDLE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
 /// Whether `name`'s trailing `-<owner>` marks work nobody is doing any more.
 ///
 /// The stamp is a pid, or — when the work ran under a daemon — that daemon's
@@ -203,14 +217,35 @@ impl CleanCache {
 ///   plausible dead pid — without this check a daemon eventually reclaims a
 ///   sandbox out from under itself.
 /// - a pid with no `/proc` entry: gone, reclaim it.
-/// - anything else — a live pid, another daemon's id, a name nobody stamped:
+/// - another daemon's id, judged by a daemon (`daemon_id` is set), on a
+///   directory `sandbox` named (`<name>-<timestamp>-<attempt>-<id>`) whose
+///   `modified` time is [`FOREIGN_OWNER_IDLE`] or more before `now`: gone.
+///   Every daemon gets a fresh id, so a restart leaves the old one's finished
+///   sandboxes stamped with an id nobody will clear; left alone, they piled
+///   up without bound (gominimal/minimal#1373). The caller passes no
+///   `modified` for a directory it must not judge by age.
+/// - anything else — a live pid, a recent foreign id, a name nobody stamped:
 ///   left alone. Not ours to judge.
-fn owner_is_gone(name: &str, daemon_id: Option<&str>) -> bool {
+fn owner_is_gone(
+    name: &str,
+    daemon_id: Option<&str>,
+    modified: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
     let Some((_, owner)) = name.rsplit_once('-') else {
         return false;
     };
-    if Some(owner) == daemon_id || owner.parse::<u32>().is_err() {
+    if Some(owner) == daemon_id {
         return false;
+    }
+    if owner.parse::<u32>().is_err() {
+        let mut stamp = name.rsplitn(4, '-').skip(1);
+        let sandbox_named = stamp.next().is_some_and(|a| a.parse::<u32>().is_ok())
+            && stamp.next().is_some_and(|t| t.parse::<u64>().is_ok());
+        let idle = modified.and_then(|m| now.duration_since(m).ok());
+        return daemon_id.is_some()
+            && sandbox_named
+            && idle.is_some_and(|idle| idle >= FOREIGN_OWNER_IDLE);
     }
 
     matches!(std::fs::exists(format!("/proc/{owner}")), Ok(false))
@@ -399,6 +434,56 @@ mod tests {
         assert_eq!(event.render(), "Cleaning up stale sandbox build-0");
     }
 
+    /// A sandbox stamped with another daemon's id goes once it has sat
+    /// untouched past `FOREIGN_OWNER_IDLE`: a dead daemon's stamp never
+    /// changes again (gominimal/minimal#1373). The same sandbox fresh stays,
+    /// and so does our own, however old.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sweeps_another_daemons_sandboxes_once_idle() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let sandboxes = tmp.path().join("sandboxes");
+        let daemon_id = "zyxwv";
+
+        let foreign_old = sandboxes.join("build-1700000000-0-abcde");
+        let foreign_fresh = sandboxes.join("build-1700000001-0-abcde");
+        let ours_old = sandboxes.join(format!("build-1700000000-0-{daemon_id}"));
+        let four_days_ago = SystemTime::now() - Duration::from_secs(4 * 24 * 60 * 60);
+        for dir in [&foreign_old, &foreign_fresh, &ours_old] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("f"), b"x").unwrap();
+        }
+        // After the writes above, which would bump the directory's mtime.
+        for dir in [&foreign_old, &ours_old] {
+            std::fs::File::open(dir)
+                .unwrap()
+                .set_modified(four_days_ago)
+                .unwrap();
+        }
+
+        let report = CleanCache {
+            older_than: Duration::from_secs(1),
+            keep: HashSet::new(),
+            sweep: vec![(StaleKind::Sandbox, sandboxes.clone())],
+            daemon_id: Some(daemon_id.to_string()),
+            events: None,
+        }
+        .run(&cache)
+        .unwrap();
+
+        assert_eq!(
+            report,
+            CleanReport {
+                entries: 0,
+                dirs: 1
+            }
+        );
+        assert!(!foreign_old.exists(), "a dead daemon's idle sandbox goes");
+        assert!(foreign_fresh.exists(), "a fresh foreign sandbox stays");
+        assert!(ours_old.exists(), "our own sandbox stays, however old");
+    }
+
     /// A daemon never sweeps its own work, even though `sandbox` stamps its
     /// `daemon_id` where a pid would go — and even when that id is all digits
     /// and so reads as a perfectly plausible dead pid.
@@ -444,7 +529,7 @@ mod tests {
         assert!(ours.exists(), "our own live sandbox must survive");
         assert!(
             other_daemon.exists(),
-            "another daemon's id is not ours to judge",
+            "another daemon's fresh sandbox is not ours to judge",
         );
         assert!(!dead_pid.exists(), "a dead pid's sandbox still goes");
     }
