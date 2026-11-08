@@ -174,42 +174,6 @@ impl std::fmt::Display for RunNeedsTerminal {
 
 impl std::error::Error for RunNeedsTerminal {}
 
-/// The refusal of `--detach` on an interactive task (BCLI-010): the task
-/// runs over an exec that its box ends with, so it cannot run on without
-/// the command. The run refuses it before it creates anything, and
-/// `main.rs` ends the command with [`Self::EXIT_CODE`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunDetachRefusal {
-    entry: String,
-    command: &'static str,
-}
-
-impl RunDetachRefusal {
-    /// The usage-refusal code of the architecture's exit-code table.
-    pub const EXIT_CODE: u8 = 2;
-
-    #[must_use]
-    pub fn new(entry: &str, command: &'static str) -> Self {
-        Self {
-            entry: entry.to_string(),
-            command,
-        }
-    }
-}
-
-impl std::fmt::Display for RunDetachRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { entry, command } = self;
-        write!(
-            f,
-            "Task {entry} is interactive, so {command} --detach cannot start it. \
-             Run it without --detach: {command} {entry}"
-        )
-    }
-}
-
-impl std::error::Error for RunDetachRefusal {}
-
 /// The verb a run came from: `min task run` or `min box run`. Both share
 /// one run path ([`run_entry`]). The verb only names the command in the
 /// run's span and in its refusals.
@@ -866,12 +830,8 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
         Err(mfile::Error::NotFound) => refuse_terminal_entry(None, &args.entry)?,
         Err(_) => {}
     }
+    // A declared task is never interactive: the load refuses one (BOX-054).
     let declared = declared_task(&utf8_path, &args.entry)?;
-    // An interactive task has no spec and runs over an exec that its box
-    // ends with, so it cannot run on without this command.
-    if args.detach && declared.interactive {
-        return Err(RunDetachRefusal::new(&args.entry, args.verb.command()).into());
-    }
 
     // Read before `ensure_daemon` because the env resolution below is
     // gated on it: a malformed policy, or a variable the policy refuses,
