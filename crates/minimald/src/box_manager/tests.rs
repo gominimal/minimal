@@ -1774,6 +1774,37 @@ async fn configure_loadout_scaffolds_missing_mfile_into_composition() {
     );
 }
 
+/// The default `minimal.toml` the daemon scaffolds into an empty
+/// workspace writes its packages under `[defaults.session]`, not the
+/// legacy `[session]` table, so the session's own file prints no hint
+/// and still loads its packages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_scaffold_writes_entry_tables() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    session(&mngr, id)
+        .await
+        .configure_loadout(WireContribution::default())
+        .await
+        .expect("configuring against a missing mfile should still succeed");
+
+    let paths = session(&mngr, id).await.paths().await.unwrap();
+    let src = tokio::fs::read_to_string(paths.working.as_utf8_path().join(mfile::MFILE_NAME))
+        .await
+        .expect("the scaffold wrote a minimal.toml");
+    let headers: Vec<&str> = src
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('['))
+        .collect();
+    assert_eq!(headers, ["[defaults.session]"], "{src}");
+    let file = mfile::File::from_toml_bytes(src.as_bytes()).expect("the scaffold loads");
+    assert_eq!(
+        file.session.expect("[defaults.session] reads").packages,
+        ["base", "vim"]
+    );
+}
+
 /// A `[session]` block that contributes a package is picked up
 /// by [`ProjectComposable`] and lands in the composition. With
 /// the non-empty-composition guard gone, the record now

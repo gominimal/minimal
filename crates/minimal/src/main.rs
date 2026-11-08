@@ -151,6 +151,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
+    // The daily update check (inbox#589): reads its cache, spawns the
+    // detached check when one is due, prints a notice once per new release.
+    // Never waits, never fails the command.
+    minimal::update_check::before_command(&cli.global_args, &cli.command);
+
     let result = minimal::run(cli).await;
     // Flush exported telemetry (bounded; a no-op when export is off). What
     // the bound cuts off is in the spool already.
@@ -277,6 +282,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
         return minimald_rpc::HeldNameRefusal::EXIT_CODE;
+    }
+    // NET-060: a project `minimal.toml` whose session entry the start
+    // cannot pick refuses the activation with exit 2.
+    if e.downcast_ref::<minimal::SessionEntryUndecided>().is_some() {
+        return minimal::SessionEntryUndecided::EXIT_CODE;
     }
     // An invalid project `minimal.toml` refuses the activation with exit 3.
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {

@@ -8,7 +8,6 @@ echo 'env:' && env && echo "pwd: $(pwd)"
 """
 
 [tasks.task-interpolation-test]
-interactive = true
 args.input = "string"
 packages = ["uroot"]
 exec = """

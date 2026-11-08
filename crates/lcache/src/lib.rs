@@ -208,14 +208,10 @@ impl fmt::Display for CacheErr {
     }
 }
 
-impl std::error::Error for CacheErr {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            CacheErr::IO(e) => Some(e),
-            _ => None,
-        }
-    }
-}
+/// The i/o error is in `Display`, so it is not also the `source()`: a
+/// printer that walks the chain (`{:#}` on an `anyhow::Error`) would print
+/// it twice. `Display` keeps it because most callers print with `{}`.
+impl std::error::Error for CacheErr {}
 
 /// Storage for inter-build artifacts.
 ///
@@ -430,6 +426,21 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    /// The chain a printer walks (`Display`, then each `source()`) names the
+    /// i/o error once.
+    #[test]
+    fn an_io_error_prints_once_in_the_chain() {
+        let err = CacheErr::IO(std::io::Error::from_raw_os_error(13));
+        let mut printed = err.to_string();
+        let mut next = std::error::Error::source(&err);
+        while let Some(cause) = next {
+            printed.push_str(&format!(": {cause}"));
+            next = cause.source();
+        }
+        let io = std::io::Error::from_raw_os_error(13);
+        assert_eq!(printed, format!("i/o error: {io}"));
+    }
 
     #[test]
     fn smoketest_folder() {
