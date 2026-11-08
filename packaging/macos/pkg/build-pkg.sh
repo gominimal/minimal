@@ -44,14 +44,32 @@
 #                    replacements is a test build: pkg-info says so, and the
 #                    postinstall accepts any valid signature on the bundle
 #                    instead of requiring minimal's Developer ID.
-#   --sign IDENTITY  productsign the package with a Developer ID Installer
-#                    identity. Without it the package is unsigned: Gatekeeper
-#                    refuses it on a double-click, `installer -pkg` as root
-#                    takes it. Notarization (notarytool, stapler) is the
-#                    release workflow's step, after signing.
+#   --sign IDENTITY  Sign the product archive with a Developer ID Installer
+#                    identity (productbuild --sign, timestamped). Without it
+#                    the package is unsigned: Gatekeeper refuses it on a
+#                    double-click, `installer -pkg` as root takes it. Refused
+#                    on a test build: a signed package carries released code
+#                    or nothing.
+#   --notarize PROF  After signing, submit the package to Apple's notary
+#                    service with the notarytool keychain profile PROF
+#                    (`xcrun notarytool store-credentials PROF`), wait for the
+#                    verdict, staple the ticket, and assess the result as
+#                    Gatekeeper would (`spctl --assess --type install`). Needs
+#                    --sign.
+#   --min-os VER     The oldest macOS the package installs on (default 15.0,
+#                    the first with the hypervisor minvmd needs on Apple
+#                    Silicon). Installer refuses an older Mac before any
+#                    script runs.
 #   --out DIR        Where the package is written (default: target/pkg).
 #
-# Requires: curl, shasum, pkgbuild, productbuild, codesign (Xcode CLT).
+# The product archive carries its own Distribution: Apple Silicon only (the
+# payload is darwin/arm64), the minimum macOS, the local-system domain only
+# (never a home-directory install), and the two app bundles pinned in place
+# (a component plist with BundleIsRelocatable false), so Installer never
+# moves them to an older copy elsewhere on the disk.
+#
+# Requires: curl, shasum, pkgbuild, productbuild, codesign (Xcode CLT);
+# xcrun notarytool and stapler for --notarize.
 # Env: MINIMAL_OVERRIDE_INSTALLER_BUCKET overrides the bucket, as for the
 # installer.
 #
@@ -74,6 +92,8 @@ VERSION=""
 CHANNEL=""
 OUT="$ROOT/target/pkg"
 SIGN=""
+NOTARIZE=""
+MIN_OS="15.0"
 declare -a WITH=()
 
 while [ $# -gt 0 ]; do
@@ -82,6 +102,8 @@ while [ $# -gt 0 ]; do
         --channel) CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
         --with) WITH+=("${2:?--with needs dest=path}"); shift 2 ;;
         --sign) SIGN="${2:?--sign needs an identity}"; shift 2 ;;
+        --notarize) NOTARIZE="${2:?--notarize needs a notarytool keychain profile}"; shift 2 ;;
+        --min-os) MIN_OS="${2:?--min-os needs a version}"; shift 2 ;;
         --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
         -h|--help) usage 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
@@ -92,6 +114,11 @@ done
 for tool in curl shasum pkgbuild productbuild codesign xattr; do
     command -v "$tool" >/dev/null || die "$tool is not on PATH"
 done
+case "$MIN_OS" in
+    [0-9]*.[0-9]*) ;;
+    *) die "--min-os takes a version such as 15.0" ;;
+esac
+[ -z "$NOTARIZE" ] || [ -n "$SIGN" ] || die "--notarize needs --sign: Apple notarizes signed packages only"
 if [ -n "$CHANNEL" ]; then
     [ -z "$VERSION" ] || die "give --version or --channel, not both"
     case "$CHANNEL" in stable|unstable) ;; *) die "--channel takes stable or unstable" ;; esac
@@ -252,23 +279,71 @@ component="$work/minimal-component.pkg"
 pkg="$OUT/minimal-$version.pkg"
 if [ "$test_build" -eq 1 ]; then
     # Never the name a release has: a test build signed and passed on
-    # would otherwise be told apart from a release by nothing.
+    # would otherwise be told apart from a release by nothing. And never
+    # signed: a Developer ID on a package whose service program is ad-hoc
+    # signed would say more than is true.
     pkg="$OUT/minimal-$version-test.pkg"
-    [ -z "$SIGN" ] || echo "==> note: signing a TEST BUILD; its service program is ad-hoc signed" >&2
+    [ -z "$SIGN" ] || die "refusing to sign a TEST BUILD (its service program is ad-hoc signed); sign a release build"
 fi
-echo "==> pkgbuild $ID $version"
+# The bundles stay where the payload puts them. pkgbuild's own analysis
+# marks every bundle relocatable, and Installer would then follow an older
+# copy of the same bundle identifier elsewhere on the disk (a user's
+# ~/.local/bin/Minimal.app from the curl installer, the service's copy
+# under /Library/PrivilegedHelperTools) instead of writing /usr/local/bin.
+# The analysis is kept and the one key turned off, for each bundle found.
+components="$work/components.plist"
+pkgbuild --quiet --analyze --root "$root" "$components" 2> >(grep -v '^write: Permission denied$' >&2)
+i=0
+while /usr/libexec/PlistBuddy -c "Print :$i:RootRelativeBundlePath" "$components" >/dev/null 2>&1; do
+    # The analysis writes the key only when it is false already; absent
+    # means pkgbuild's default, true.
+    /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$components" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :$i:BundleIsRelocatable bool false" "$components"
+    i=$((i + 1))
+done
+[ "$i" -ge 1 ] || die "pkgbuild --analyze found no bundle in the payload (expected usr/local/bin/Minimal.app)"
+echo "==> pkgbuild $ID $version ($i bundle(s) pinned in place)"
 # pkgbuild prints "write: Permission denied" lines on macOS 27 and still exits
 # 0 with a good package (a one-file root reproduces it); dropped.
 pkgbuild --quiet --root "$root" --identifier "$ID" --version "$version" --install-location / \
+    --component-plist "$components" \
     --scripts "$scripts" "$component" 2> >(grep -v '^write: Permission denied$' >&2)
+# The Distribution: synthesized from the component, then given what the
+# synthesis leaves out. Apple Silicon only (the synthesis says
+# x86_64,arm64 for any payload), the oldest macOS, the local system as the
+# only install domain (no per-home install, which the scripts could not
+# serve), a title for Installer's window.
+distribution="$work/Distribution"
+productbuild --quiet --synthesize --package "$component" "$distribution"
+grep -q 'hostArchitectures="x86_64,arm64"' "$distribution" \
+    || die "the synthesized Distribution has no hostArchitectures to narrow (productbuild changed?)"
+sed -i '' \
+    -e 's/hostArchitectures="x86_64,arm64"/hostArchitectures="arm64" rootVolumeOnly="true"/' \
+    -e "s|<installer-gui-script minSpecVersion=\"1\">|&\\
+    <title>Minimal</title>\\
+    <domains enable_localSystem=\"true\"/>\\
+    <volume-check><allowed-os-versions><os-version min=\"$MIN_OS\"/></allowed-os-versions></volume-check>|" \
+    "$distribution"
 if [ -n "$SIGN" ]; then
     echo "==> productbuild, signed by $SIGN"
-    productbuild --quiet --package "$component" --sign "$SIGN" "$pkg"
+    productbuild --quiet --distribution "$distribution" --package-path "$work" --timestamp --sign "$SIGN" "$pkg"
+    echo "==> pkgutil --check-signature"
+    pkgutil --check-signature "$pkg" || die "the signed package does not check out"
 else
     echo "==> productbuild, unsigned"
-    productbuild --quiet --package "$component" "$pkg"
+    productbuild --quiet --distribution "$distribution" --package-path "$work" "$pkg"
+fi
+if [ -n "$NOTARIZE" ]; then
+    echo "==> notarytool submit (profile $NOTARIZE), waiting for Apple"
+    xcrun notarytool submit "$pkg" --keychain-profile "$NOTARIZE" --wait \
+        || die "notarization did not succeed; xcrun notarytool log <id> --keychain-profile $NOTARIZE says why"
+    echo "==> stapler staple"
+    xcrun stapler staple "$pkg" || die "stapling failed"
+    echo "==> spctl --assess --type install"
+    spctl --assess --type install -vv "$pkg" || die "Gatekeeper does not accept the notarized package"
 fi
 du -h "$pkg"
-echo "receipt $ID $version, release $VERSION, bundle $bundle_signing$( [ "$test_build" -eq 1 ] && echo ', TEST BUILD')"
+echo "distribution: arm64 only, macOS $MIN_OS or later, local system, $i bundle(s) pinned"
+echo "receipt $ID $version, release $VERSION, bundle $bundle_signing$( [ "$test_build" -eq 1 ] && echo ', TEST BUILD')$( [ -n "$NOTARIZE" ] && echo ', notarized and stapled')"
 echo "install: sudo installer -pkg $pkg -target /"
 echo "remove:  sudo /usr/local/share/minimal/uninstall.sh"
