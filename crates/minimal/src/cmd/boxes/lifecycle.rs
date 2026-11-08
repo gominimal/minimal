@@ -1116,13 +1116,24 @@ pub(crate) fn prune_question(
     }
 }
 
-/// `min box prune [--older-than <d>] [--parent <box>] [--yes]`: removes
-/// the stopped and exited boxes that match, as BOX-021 defines. With
-/// `--parent`, only the host that keeps that box is pruned. Without it,
-/// every local host that is running is pruned.
+/// `min box prune [--older-than <d>] [--parent <box>] [--yes] [--dry-run]`:
+/// removes the stopped and exited boxes that match, as BOX-021 defines.
+/// With `--parent`, only the host that keeps that box is pruned. Without
+/// it, every local host that is running is pruned. With `--dry-run`, it
+/// lists the boxes that match with the disk each holds, and removes none
+/// (BCLI-006). A dry run removes nothing, so it asks nothing.
 pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<(), anyhow::Error> {
-    let gate = prune_gate(args.yes, global.no_input, std::io::stdin().is_terminal())
-        .inspect_err(|_| tracing::info!(verb = "box prune", outcome = "refused", "no --yes"))?;
+    let mode = if args.dry_run {
+        PruneMode::DryRun
+    } else {
+        PruneMode::Remove
+    };
+    let gate = if mode == PruneMode::DryRun {
+        PruneGate::Proceed
+    } else {
+        prune_gate(args.yes, global.no_input, std::io::stdin().is_terminal())
+            .inspect_err(|_| tracing::info!(verb = "box prune", outcome = "refused", "no --yes"))?
+    };
     if gate == PruneGate::Confirm {
         let question = prune_question(args.older_than, args.parent.as_deref());
         if !confirm(&question, false)? {
@@ -1142,23 +1153,51 @@ pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<()
     };
     let request = box_prune_request(args.older_than, parent);
     let mut out = std::io::stdout().lock();
-    let tally = prune_hosts(hosts, parent.is_some(), request, &mut out).await?;
+    let tally = prune_hosts(hosts, parent.is_some(), request, mode, &mut out).await?;
+    let mut err = std::io::stderr().lock();
+    if mode == PruneMode::DryRun {
+        tracing::info!(
+            verb = "box prune",
+            parent = ?parent,
+            matched = tally.reaped,
+            disk_bytes = tally.disk_bytes,
+            unmeasured = tally.unmeasured,
+            failed_hosts = tally.failed_hosts.len(),
+            outcome = "dry run"
+        );
+        return finish_prune_dry_run(&tally, &mut out, &mut err);
+    }
     tracing::info!(
         verb = "box prune",
+        parent = ?parent,
         reaped = tally.reaped,
         failed = tally.failed,
         failed_hosts = tally.failed_hosts.len(),
         outcome = "pruned"
     );
-    finish_prune(&tally, &mut out, &mut std::io::stderr().lock())
+    finish_prune(&tally, &mut out, &mut err)
+}
+
+/// Whether `min box prune` removes the boxes that match or, under
+/// `--dry-run`, only lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PruneMode {
+    /// Remove the boxes that match.
+    Remove,
+    /// List the boxes that match with the disk each holds, and remove none.
+    DryRun,
 }
 
 /// What `min box prune` did across its hosts: how many boxes it removed and
 /// did not, how many hosts it pruned, and each host it could not prune with
-/// the reason.
+/// the reason. Under `--dry-run`, `reaped` counts the boxes that matched,
+/// `disk_bytes` sums the disk they hold, and `unmeasured` counts the ones
+/// whose disk the daemon did not measure.
 #[derive(Debug, Default)]
 pub(crate) struct PruneTally {
     pub reaped: usize,
+    pub disk_bytes: u64,
+    pub unmeasured: usize,
     pub failed: usize,
     pub pruned_hosts: usize,
     pub failed_hosts: Vec<(String, anyhow::Error)>,
@@ -1172,6 +1211,7 @@ pub(crate) async fn prune_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     by_parent: bool,
     request: minimald_rpc::PruneBoxesRequest,
+    mode: PruneMode,
     out: &mut impl std::io::Write,
 ) -> Result<PruneTally, anyhow::Error> {
     let mut tally = PruneTally::default();
@@ -1187,10 +1227,25 @@ pub(crate) async fn prune_hosts(
                 Err(client::ProbeRefusal::Unreachable(e)) => Err(e),
             }
         };
-        let pruned = match client {
-            Ok(None) => continue,
-            Ok(Some(mut client)) => prune_host(&mut client, &host, out, request.clone()).await,
-            Err(e) => Err(e),
+        let pruned = match (client, mode) {
+            (Ok(None), _) => continue,
+            (Ok(Some(mut client)), PruneMode::Remove) => {
+                prune_host(&mut client, &host, out, request.clone()).await
+            }
+            (Ok(Some(mut client)), PruneMode::DryRun) => {
+                preview_prune_host(&mut client, out, request.clone())
+                    .await
+                    .map(|matched| {
+                        for entry in &matched {
+                            match entry.disk_bytes {
+                                Some(bytes) => tally.disk_bytes += bytes,
+                                None => tally.unmeasured += 1,
+                            }
+                        }
+                        (matched.len(), 0)
+                    })
+            }
+            (Err(e), _) => Err(e),
         };
         match pruned {
             Ok((reaped, failed)) => {
@@ -1249,6 +1304,78 @@ pub(crate) fn finish_prune(
         )?;
     }
     Ok(())
+}
+
+/// Ends `min box prune --dry-run` from its `tally`: one line on `err` for
+/// each host it could not ask, the sum of the disk the matched boxes hold,
+/// and how many of them the sum leaves out. With nothing matched and no
+/// host failed, it says so. A host that failed ends it with an error.
+pub(crate) fn finish_prune_dry_run(
+    tally: &PruneTally,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> Result<(), anyhow::Error> {
+    for (host, e) in &tally.failed_hosts {
+        writeln!(err, "Could not check host {host}: {e:#}")?;
+    }
+    if tally.reaped == 0 {
+        // A host that failed was not checked and can hold boxes that
+        // match, so the no-match line prints only when every host answered.
+        if tally.failed_hosts.is_empty() {
+            writeln!(
+                out,
+                "No stopped or exited box matched, so prune would remove nothing."
+            )?;
+        }
+    } else {
+        writeln!(out, "Total: {}", format_disk(tally.disk_bytes))?;
+        match tally.unmeasured {
+            0 => {}
+            1 => writeln!(out, "The total leaves out 1 box whose disk is unknown.")?,
+            n => writeln!(out, "The total leaves out {n} boxes whose disk is unknown.")?,
+        }
+        writeln!(out, "Nothing was removed.")?;
+    }
+    if !tally.failed_hosts.is_empty() {
+        let hosts = tally.pruned_hosts + tally.failed_hosts.len();
+        bail!(
+            "The dry run failed on {} of {hosts} {}.",
+            tally.failed_hosts.len(),
+            if hosts == 1 { "host" } else { "hosts" }
+        );
+    }
+    Ok(())
+}
+
+/// Asks the host `client` serves which boxes a prune with `request`
+/// removes, and writes one line for each to `out` with the disk it holds.
+/// Removes nothing. Returns the boxes that matched.
+pub(crate) async fn preview_prune_host(
+    client: &mut client::Client,
+    out: &mut impl std::io::Write,
+    request: minimald_rpc::PruneBoxesRequest,
+) -> Result<Vec<minimald_rpc::PrunePreviewEntry>, anyhow::Error> {
+    use minimald_rpc::{Errorable, PreviewPrune};
+
+    let preview = match client
+        .oneshot_rpc::<PreviewPrune>(request)
+        .await
+        .context("PreviewPrune RPC failed")?
+    {
+        Errorable::Ok(preview) => preview,
+        Errorable::Err { error } => bail!("{error}"),
+    };
+    for entry in &preview.matched {
+        let disk = entry
+            .disk_bytes
+            .map_or_else(|| "disk unknown".to_owned(), format_disk);
+        let record = &entry.record;
+        match &record.name {
+            Some(name) => writeln!(out, "Would remove {name} ({}): {disk}", record.box_id)?,
+            None => writeln!(out, "Would remove {}: {disk}", record.box_id)?,
+        }
+    }
+    Ok(preview.matched)
 }
 
 /// Prunes the host `client` serves with `request`, writes one line for each
@@ -1761,9 +1888,15 @@ mod tests {
         ];
 
         let mut out = Vec::new();
-        let tally = prune_hosts(hosts, false, box_prune_request(None, None), &mut out)
-            .await
-            .expect("only a write to out can end the walk");
+        let tally = prune_hosts(
+            hosts,
+            false,
+            box_prune_request(None, None),
+            PruneMode::Remove,
+            &mut out,
+        )
+        .await
+        .expect("only a write to out can end the walk");
         assert_eq!((tally.reaped, tally.failed, tally.pruned_hosts), (1, 0, 1));
         assert_eq!(tally.failed_hosts.len(), 1);
         assert_eq!(tally.failed_hosts[0].0, "broken0");
