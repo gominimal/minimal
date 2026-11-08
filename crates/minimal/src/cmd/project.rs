@@ -94,7 +94,12 @@ pub(crate) fn offer_mfile_scaffold(
     // whose stdout is reserved for the bare session id that scripted callers
     // read (`id=$(min activate)`). A result line on stdout here would land
     // ahead of that id and corrupt the capture.
-    if let Some(line) = run_init_flow(config, false, false)?.result_line() {
+    // The legacy shape: session start reads packages from `[session]`, and
+    // box creation does not read `[defaults.<type>]` yet. #2418 (BOX T21)
+    // wires the expanded spec into box creation. When it lands, pass `true`
+    // here and in `cmd_init`, and then remove the `entry_shape` parameter of
+    // `run_init_flow`.
+    if let Some(line) = run_init_flow(config, false, false, INIT_ENTRY_SHAPE)?.result_line() {
         eprintln!("{line}");
     }
     Ok(())
@@ -511,20 +516,35 @@ impl InitOutcome {
     }
 }
 
+/// Whether `min init` and the `min activate` scaffold write the entry shape.
+/// `false` until #2418 (BOX T21): box creation still reads packages from
+/// `[session]`, so an entry-shaped scaffold loses them at session start.
+pub(crate) const INIT_ENTRY_SHAPE: bool = false;
+
 /// Run the init flow for a given config: detect the project's stack,
 /// generate a `minimal.toml`, show the plan, prompt for confirmation,
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
 /// missing-mfile prompt.
+///
+/// `entry_shape` writes the entry shape (BCLI-017) in place of the legacy
+/// `[session]` shape. Both callers pass [`INIT_ENTRY_SHAPE`], which is
+/// `false` until #2418 (BOX T21) makes box creation read
+/// `[defaults.<type>]`. Then both callers pass `true` and the parameter is
+/// removed.
 pub(crate) fn run_init_flow(
     config: mctx::Config,
     skip_confirm: bool,
     force: bool,
+    entry_shape: bool,
 ) -> Result<InitOutcome, anyhow::Error> {
     use op::ProjectOp as _;
     let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let plan = op::InitProject
+    let mut plan = op::InitProject
         .run(&mut env)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if entry_shape {
+        plan.content = to_entry_shape(&plan.content)?;
+    }
 
     // Overwriting an existing minimal.toml is destructive — no backup is
     // written — so require an explicit --force rather than let confirm() read
@@ -584,17 +604,474 @@ pub(crate) fn run_init_flow(
     })
 }
 
-/// Initialize a `minimal.toml` based on the source tree.
-pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
-    let config = build_config(global)?;
-    let outcome = run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)?;
-    // stdout: the result line is `min init`'s scriptable output, so it
-    // survives `min init > audit.log` while the preview and prompt above
-    // stay on stderr.
-    if let Some(line) = outcome.result_line() {
-        println!("{line}");
+/// The message `min init` prints when it gets more than one way to name the
+/// entry's type. The task fixes this text.
+pub const INIT_ONE_TYPE_FLAG: &str = "Pass one of --session, --task, --agent, --service or --type.";
+
+/// The built-in types that `min init` can append an entry of.
+const INIT_EXPANDED_TYPES: [&str; 2] = ["session", "task"];
+
+/// The built-in types that this release refuses an entry of (BOX-063).
+const INIT_REFUSED_TYPES: [&str; 4] = ["agent", "service", "build", "container-build"];
+
+/// A refusal from `min init`: the text for the user and the exit code the
+/// run ends with. Nothing is written when one is returned.
+///
+/// `cmd_init` returns it as the error, and `main.rs` `failure_exit_code`
+/// ends the run with [`InitRefusal::code`], so the `cmd` span closes and
+/// its outcome record reaches the spool first.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InitRefusal {
+    /// The exit code: 2 for a usage error, 3 for a type this release
+    /// refuses or for a name or type that makes `minimal.toml` invalid, 1
+    /// for anything else.
+    pub code: u8,
+    /// What was refused, why, and the next step.
+    pub message: String,
+}
+
+impl InitRefusal {
+    fn usage(message: impl Into<String>) -> Self {
+        Self {
+            code: 2,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InitRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for InitRefusal {}
+
+/// What one `min init` run does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InitRequest {
+    /// Write a new `minimal.toml` in the entry shape (BCLI-017).
+    Scaffold,
+    /// Append the entry `entry` of type `box_type` (BCLI-018).
+    Append { entry: String, box_type: String },
+}
+
+/// Read the request from the arguments. A noun flag is the same request as
+/// `<entry> --type <noun>`, and only one of the noun flags and `--type` can
+/// be given.
+pub(crate) fn init_request(args: &InitArgs) -> Result<InitRequest, InitRefusal> {
+    let nouns: Vec<(&str, &String)> = [
+        ("session", &args.session),
+        ("task", &args.task),
+        ("agent", &args.agent),
+        ("service", &args.service),
+    ]
+    .into_iter()
+    .filter_map(|(noun, name)| name.as_ref().map(|name| (noun, name)))
+    .collect();
+    if nouns.len() + usize::from(args.box_type.is_some()) > 1 {
+        return Err(InitRefusal::usage(INIT_ONE_TYPE_FLAG));
+    }
+    let (entry, box_type) = match (&args.entry, &args.box_type, nouns.first()) {
+        (None, None, None) => return Ok(InitRequest::Scaffold),
+        (Some(entry), Some(box_type), None) => (entry.clone(), box_type.clone()),
+        (None, None, Some((noun, name))) => ((*name).clone(), (*noun).to_owned()),
+        (Some(entry), None, Some((noun, _))) => {
+            return Err(InitRefusal::usage(format!(
+                "Name the entry once. Run min init {entry} --type {noun}."
+            )));
+        }
+        (Some(entry), None, None) => {
+            return Err(InitRefusal::usage(format!(
+                "Give the entry a type. Run min init {entry} --type <type>."
+            )));
+        }
+        (None, Some(box_type), None) => {
+            return Err(InitRefusal::usage(format!(
+                "Name the entry to append. Run min init <entry> --type {box_type}."
+            )));
+        }
+        (_, Some(_), Some(_)) => return Err(InitRefusal::usage(INIT_ONE_TYPE_FLAG)),
+    };
+    check_entry_name(&entry)?;
+    Ok(InitRequest::Append { entry, box_type })
+}
+
+/// Refuse an entry name that no entry can take: `self`, or a name that is
+/// not a DNS label (BOX-007, BOX-046). It runs before any file read, so a
+/// refused name leaves `minimal.toml` unread and unchanged.
+fn check_entry_name(entry: &str) -> Result<(), InitRefusal> {
+    if entry == mfile::entry::RESERVED_ENTRY_NAME {
+        return Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry {entry}: the name {entry} is reserved. \
+                 Choose another name."
+            ),
+        });
+    }
+    if !mfile::entry::is_dns_safe(entry) {
+        return Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry {entry:?}: an entry name must be 1 to 63 \
+                 characters of a-z, 0-9 and -, and must not start or end with -. \
+                 Choose another name."
+            ),
+        });
     }
     Ok(())
+}
+
+/// Rewrite the scaffold that the project initializer generates into the
+/// entry shape (BCLI-017): the legacy `[session]` table becomes
+/// `[defaults.session]`, the legacy `[defaults] state_key` becomes
+/// `[defaults.task] state_key` (BOX-050, BOX-051), and the file declares
+/// one session entry, `[boxes.dev]`.
+pub(crate) fn to_entry_shape(legacy: &str) -> Result<String, anyhow::Error> {
+    use toml_edit::{DocumentMut, Item, Table, value};
+    let mut doc: DocumentMut = legacy
+        .parse()
+        .context("reading the generated minimal.toml")?;
+    let state_key = doc
+        .get_mut("defaults")
+        .and_then(Item::as_table_mut)
+        .and_then(|defaults| defaults.remove("state_key"));
+    let session = doc.remove("session");
+
+    let defaults = doc
+        .entry("defaults")
+        .or_insert(toml_edit::table())
+        .as_table_mut()
+        .context("the generated [defaults] is not a table")?;
+    defaults.set_implicit(true);
+    if let Some(Item::Table(mut session)) = session {
+        session.decor_mut().clear();
+        defaults.insert("session", Item::Table(session));
+    }
+    if let Some(state_key) = state_key {
+        let mut task = Table::new();
+        task.insert("state_key", state_key);
+        defaults.insert("task", Item::Table(task));
+    }
+
+    let mut entry = Table::new();
+    entry.insert("type", value("session"));
+    let mut boxes = Table::new();
+    boxes.set_implicit(true);
+    boxes.insert("dev", Item::Table(entry));
+    doc.insert("boxes", Item::Table(boxes));
+    Ok(doc.to_string())
+}
+
+/// The built-in type that `box_type` resolves to, through the `extends`
+/// chain of the file's `[box_types]` (BOX-059).
+fn resolve_builtin_root(
+    doc: &toml_edit::DocumentMut,
+    entry: &str,
+    box_type: &str,
+) -> Result<String, InitRefusal> {
+    let is_builtin =
+        |name: &str| INIT_EXPANDED_TYPES.contains(&name) || INIT_REFUSED_TYPES.contains(&name);
+    let mut current = box_type.to_owned();
+    let mut seen: Vec<String> = Vec::new();
+    while !is_builtin(&current) {
+        if seen.contains(&current) {
+            return Err(InitRefusal {
+                code: 3,
+                message: format!(
+                    "min init did not add the entry {entry}: type {box_type} extends itself \
+                     through [box_types] in minimal.toml. Fix the extends keys there."
+                ),
+            });
+        }
+        let declared = doc.get("box_types").and_then(|types| types.get(&current));
+        let extends = declared
+            .and_then(|ty| ty.get("extends"))
+            .and_then(toml_edit::Item::as_str)
+            .map(str::to_owned);
+        match extends {
+            Some(parent) => {
+                seen.push(current);
+                current = parent;
+            }
+            // A declared type with no `extends` is invalid minimal.toml:
+            // exit 3, as for any other validation error.
+            None if declared.is_some() => {
+                return Err(InitRefusal {
+                    code: 3,
+                    message: format!(
+                        "min init did not add the entry {entry}: [box_types.{current}] in \
+                         minimal.toml has no extends key. Add extends = \"session\" or \
+                         extends = \"task\" there."
+                    ),
+                });
+            }
+            None if seen.is_empty() => {
+                return Err(InitRefusal::usage(format!(
+                    "min init did not add the entry {entry}: {box_type} is not a built-in \
+                     type or a [box_types] entry in minimal.toml. Use --type session or \
+                     --type task."
+                )));
+            }
+            None => {
+                return Err(InitRefusal {
+                    code: 3,
+                    message: format!(
+                        "min init did not add the entry {entry}: type {box_type} extends \
+                         {current}, which is not a built-in type or a [box_types] entry \
+                         in minimal.toml."
+                    ),
+                });
+            }
+        }
+    }
+    Ok(current)
+}
+
+/// Append the entry to the `minimal.toml` text, or refuse with the file
+/// unchanged.
+pub(crate) fn append_entry_text(
+    content: &str,
+    entry: &str,
+    box_type: &str,
+) -> Result<String, InitRefusal> {
+    use toml_edit::{DocumentMut, Item, Table, value};
+    let mut doc: DocumentMut = content.parse().map_err(|e| InitRefusal {
+        code: 3,
+        message: format!(
+            "min init did not add the entry {entry}: minimal.toml does not parse: {e}"
+        ),
+    })?;
+
+    // BOX-063: an entry whose type, or whose type's built-in root, is not
+    // session or task is refused with exit 3.
+    let root = resolve_builtin_root(&doc, entry, box_type)?;
+    if INIT_REFUSED_TYPES.contains(&root.as_str()) {
+        let what = if root == box_type {
+            format!("type {box_type} is not supported yet")
+        } else {
+            format!("type {box_type} extends {root}, which is not supported yet")
+        };
+        return Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry {entry}: {what}. Support for it is \
+                 tracked in gominimal/inbox#678. Use --type session or --type task."
+            ),
+        });
+    }
+
+    if mfile::entry::EntryTable::ALL
+        .iter()
+        .any(|table| doc.get(table.key()).and_then(|t| t.get(entry)).is_some())
+    {
+        return Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "minimal.toml already has an entry named {entry}. Choose another name."
+            ),
+        });
+    }
+
+    let boxes = doc
+        .entry("boxes")
+        .or_insert_with(|| {
+            let mut boxes = Table::new();
+            boxes.set_implicit(true);
+            Item::Table(boxes)
+        })
+        .as_table_mut()
+        .ok_or_else(|| InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry {entry}: boxes in minimal.toml is not a table."
+            ),
+        })?;
+    let mut table = Table::new();
+    table.insert("type", value(box_type));
+    boxes.insert(entry, Item::Table(table));
+    Ok(doc.to_string())
+}
+
+/// The project's `minimal.toml`, found the way the other commands find it:
+/// in `dir` and its ancestors when `search_ancestors` is set
+/// (`MFileSearchStrategy::CurrentDirRecursive`), or in `dir` only for
+/// `--repo-dir` (`MFileSearchStrategy::Override`). Both layouts in one
+/// directory are refused, as `mfile` refuses them.
+fn find_init_mfile(
+    dir: &std::path::Path,
+    search_ancestors: bool,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    let found = if search_ancestors {
+        mfile::File::from_dir_recursive(dir)
+    } else {
+        mfile::File::from_dir(dir)
+    };
+    match found {
+        Ok(file) => file.file_path().cloned().ok_or_else(|| {
+            anyhow::anyhow!("the minimal.toml found from {} has no path", dir.display())
+        }),
+        Err(mfile::Error::NotFound) => Err(InitRefusal {
+            code: 1,
+            message: format!(
+                "No minimal.toml in {}{}. Run min init to create one, then append the entry.",
+                dir.display(),
+                if search_ancestors {
+                    " or its parent directories"
+                } else {
+                    ""
+                }
+            ),
+        }
+        .into()),
+        Err(mfile::Error::ConflictingLayouts(paths)) => Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry: the project has two minimal.toml files, {}. \
+                 Remove one of them, then run the command again.",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+        }
+        .into()),
+        Err(e @ mfile::Error::IO(..)) => Err(anyhow::Error::new(e).context("reading minimal.toml")),
+        // A file that does not parse or validate is invalid configuration:
+        // exit 3, as the architecture's exit-code table fixes it.
+        Err(e) => {
+            let file = located_init_mfile(dir, search_ancestors)
+                .map_or_else(|| "minimal.toml".to_string(), |p| p.display().to_string());
+            Err(InitRefusal {
+                code: 3,
+                message: format!(
+                    "min init did not add the entry: {file} is not valid. \
+                     Fix the file, then run the command again.\n{}",
+                    e.to_string().trim_end()
+                ),
+            }
+            .into())
+        }
+    }
+}
+
+/// The `minimal.toml` path that [`find_init_mfile`] read, found by the
+/// same search as `mfile::File::from_dir` and `from_dir_recursive`, so a
+/// refusal can name a file whose parse error does not carry its path.
+fn located_init_mfile(dir: &std::path::Path, search_ancestors: bool) -> Option<std::path::PathBuf> {
+    let home = std::env::home_dir();
+    let mut dir = dir;
+    loop {
+        for path in [
+            dir.join(mfile::MFILE_NAME),
+            dir.join(".minimal").join(mfile::MFILE_NAME),
+        ] {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        let parent = dir.parent()?;
+        if !search_ancestors || home.as_deref() == Some(parent) {
+            return None;
+        }
+        dir = parent;
+    }
+}
+
+/// Append the entry to the project's `minimal.toml`, found from `dir` by
+/// [`find_init_mfile`], under the file's edit lock, and return the path
+/// written. A refusal comes back as an [`InitRefusal`] inside the error,
+/// and leaves the file unchanged.
+pub(crate) fn append_entry_in(
+    dir: &std::path::Path,
+    search_ancestors: bool,
+    entry: &str,
+    box_type: &str,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    let path = find_init_mfile(dir, search_ancestors)?;
+    mfile::File::edit_exclusively::<anyhow::Error>(&path, |content| {
+        let Some(content) = content else {
+            return Err(InitRefusal {
+                code: 1,
+                message: format!("{} was removed. Run min init to create it.", path.display()),
+            }
+            .into());
+        };
+        Ok(Some(append_entry_text(content, entry, box_type)?))
+    })?;
+    Ok(path)
+}
+
+/// `min init`: scaffold a `minimal.toml` in the entry shape, or append one
+/// entry to it.
+pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
+    let request = match init_request(&args) {
+        Ok(request) => request,
+        Err(refusal) => {
+            tracing::info!(verb = "init", outcome = "refused", code = refusal.code);
+            return Err(mctx::Error::Other(anyhow::Error::new(refusal)));
+        }
+    };
+    let (entry, box_type) = match request {
+        InitRequest::Scaffold => {
+            let config = build_config(global)?;
+            let outcome = run_init_flow(config, args.yes, args.force, INIT_ENTRY_SHAPE)
+                .map_err(mctx::Error::Other)?;
+            // The legacy shape has no `dev` entry, so `entry` is recorded only
+            // when the entry shape is written.
+            tracing::info!(
+                verb = "init",
+                shape = if INIT_ENTRY_SHAPE { "entry" } else { "legacy" },
+                entry = INIT_ENTRY_SHAPE.then_some("dev"),
+                outcome = if outcome.result_line().is_some() {
+                    "written"
+                } else {
+                    "declined"
+                },
+            );
+            // stdout: the result line is `min init`'s scriptable output, so it
+            // survives `min init > audit.log` while the preview and prompt above
+            // stay on stderr.
+            if let Some(line) = outcome.result_line() {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+        InitRequest::Append { entry, box_type } => (entry, box_type),
+    };
+    // `--repo-dir` names the project root, as `MFileSearchStrategy::Override`
+    // does. Without it the search walks up from the current directory.
+    let (dir, search_ancestors) = match &global.repo_dir {
+        Some(dir) => (dir.clone(), false),
+        None => (
+            std::env::current_dir()
+                .context("reading the current directory")
+                .map_err(mctx::Error::Other)?,
+            true,
+        ),
+    };
+    match append_entry_in(&dir, search_ancestors, &entry, &box_type) {
+        Ok(path) => {
+            tracing::info!(verb = "init", entry, box_type, outcome = "appended");
+            println!("Added the {box_type} entry {entry} to {}", path.display());
+            Ok(())
+        }
+        Err(e) => {
+            match e.downcast_ref::<InitRefusal>() {
+                Some(refusal) => tracing::info!(
+                    verb = "init",
+                    entry,
+                    box_type,
+                    outcome = "refused",
+                    code = refusal.code
+                ),
+                None => tracing::info!(verb = "init", entry, box_type, outcome = "failed"),
+            }
+            Err(mctx::Error::Other(e))
+        }
+    }
 }
 
 /// Whether `min update` / `min add` should warm the host artifact cache after
@@ -765,4 +1242,386 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    /// The scaffold the project initializer writes today, in the legacy
+    /// shape (`op::project::init::generate_mfile`).
+    const LEGACY_SCAFFOLD: &str = "# Generated by `min init`\n\n\
+        [upstream] # Source of software & tooling\n\
+        repo = \"https://github.com/gominimal/pkgs\"\n\
+        locked_commit = \"abc123\"\n\n\
+        [defaults]\n\
+        state_key = \"dev\"\n\n\
+        [session] # min session attach\n\
+        packages = [\"base\", \"vim\", \"git\"]\n";
+
+    fn init_args(argv: &[&str]) -> InitArgs {
+        let cli = crate::Cli::try_parse_from(std::iter::once("min").chain(argv.iter().copied()))
+            .expect("the arguments parse");
+        match cli.command {
+            Some(crate::Command::Init(args)) => args,
+            _ => panic!("not an init command"),
+        }
+    }
+
+    fn project(content: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), content).expect("write minimal.toml");
+        dir
+    }
+
+    fn read(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(dir.path().join(mfile::MFILE_NAME)).expect("read minimal.toml")
+    }
+
+    /// Run `min init <argv>` as far as the file: the request, then the append.
+    fn run(dir: &tempfile::TempDir, argv: &[&str]) -> Result<(), InitRefusal> {
+        match init_request(&init_args(argv))? {
+            InitRequest::Scaffold => panic!("expected an append"),
+            InitRequest::Append { entry, box_type } => {
+                append_entry_in(dir.path(), true, &entry, &box_type)
+                    .map(|_| ())
+                    .map_err(|e| e.downcast::<InitRefusal>().expect("a refusal"))
+            }
+        }
+    }
+
+    // BCLI-017
+    #[test]
+    fn init_scaffolds_entry_shape() {
+        assert_eq!(
+            init_request(&init_args(&["init"])),
+            Ok(InitRequest::Scaffold)
+        );
+        let shaped = to_entry_shape(LEGACY_SCAFFOLD).expect("the scaffold converts");
+        let doc: toml::Table = shaped.parse().expect("the scaffold parses");
+        assert!(
+            doc.get("session").is_none(),
+            "no legacy [session]:\n{shaped}"
+        );
+        assert!(
+            doc["defaults"].get("state_key").is_none(),
+            "no legacy state_key:\n{shaped}"
+        );
+        assert_eq!(
+            doc["boxes"]["dev"]["type"].as_str(),
+            Some("session"),
+            "{shaped}"
+        );
+        assert_eq!(
+            doc["defaults"]["task"]["state_key"].as_str(),
+            Some("dev"),
+            "{shaped}"
+        );
+        assert_eq!(
+            doc["defaults"]["session"]["packages"],
+            toml::Value::Array(vec!["base".into(), "vim".into(), "git".into()]),
+            "{shaped}"
+        );
+        assert_eq!(doc["upstream"]["locked_commit"].as_str(), Some("abc123"));
+        assert!(shaped.starts_with("# Generated by `min init`"), "{shaped}");
+        // The project loader still reads the scaffold.
+        let dir = project(&shaped);
+        mfile::File::from_dir(dir.path()).expect("the scaffold loads");
+    }
+
+    // Until #2418, `min init` with no flags writes the legacy `[session]`
+    // shape, and `mfile::File` reads its packages from there.
+    #[test]
+    fn init_no_flags_writes_legacy_shape() {
+        assert_eq!(
+            init_request(&init_args(&["init"])),
+            Ok(InitRequest::Scaffold)
+        );
+        const { assert!(!INIT_ENTRY_SHAPE, "min init writes the legacy shape") };
+        let dir = project(LEGACY_SCAFFOLD);
+        let file = mfile::File::from_dir(dir.path()).expect("the scaffold loads");
+        let session = file.session.as_ref().expect("a [session] table");
+        assert_eq!(session.packages, ["base", "vim", "git"]);
+    }
+
+    // BCLI-018
+    #[test]
+    fn init_entry_type_appends_one() {
+        let dir = project(&to_entry_shape(LEGACY_SCAFFOLD).unwrap());
+        let before: toml::Table = read(&dir).parse().unwrap();
+        run(&dir, &["init", "build", "--type", "task"]).expect("the entry is appended");
+        let after_text = read(&dir);
+        let after: toml::Table = after_text.parse().unwrap();
+        let boxes = after["boxes"].as_table().unwrap();
+        assert_eq!(boxes.len(), 2, "{after_text}");
+        assert_eq!(boxes["build"]["type"].as_str(), Some("task"));
+        assert_eq!(boxes["dev"], before["boxes"]["dev"]);
+        assert_eq!(
+            after["upstream"], before["upstream"],
+            "the rest of the file is kept"
+        );
+        assert!(
+            after_text.starts_with("# Generated by `min init`"),
+            "{after_text}"
+        );
+
+        // A project type rooted at session is accepted too.
+        let dir = project("[box_types.web]\nextends = \"session\"\n");
+        run(&dir, &["init", "site", "--type", "web"]).expect("the entry is appended");
+        let after: toml::Table = read(&dir).parse().unwrap();
+        assert_eq!(after["boxes"]["site"]["type"].as_str(), Some("web"));
+
+        // A name that is already an entry is refused.
+        let refusal = run(&dir, &["init", "site", "--type", "task"]).unwrap_err();
+        assert_eq!(refusal.code, 3);
+    }
+
+    // BCLI-018: a [box_types] entry with no extends is invalid minimal.toml.
+    #[test]
+    fn init_box_type_without_extends_exit3_appends_nothing() {
+        let original = "[box_types.web]\nimage = \"x\"\n\n[boxes.dev]\ntype = \"session\"\n";
+        let dir = project(original);
+        let refusal = run(&dir, &["init", "x", "--type", "web"]).unwrap_err();
+        assert_eq!(refusal.code, 3, "{}", refusal.message);
+        assert!(
+            refusal.message.contains("[box_types.web]"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains("extends"), "{}", refusal.message);
+        assert_eq!(read(&dir), original, "the file is unchanged");
+
+        // A type with no [box_types] entry at all stays a usage error.
+        let refusal = run(&dir, &["init", "x", "--type", "api"]).unwrap_err();
+        assert_eq!(refusal.code, 2, "{}", refusal.message);
+        assert!(
+            refusal
+                .message
+                .contains("is not a built-in type or a [box_types] entry"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(read(&dir), original, "the file is unchanged");
+    }
+
+    // BCLI-018, BOX-063
+    #[test]
+    fn init_refused_type_exit3_appends_nothing() {
+        let original =
+            "[box_types.reviewer]\nextends = \"agent\"\n\n[boxes.dev]\ntype = \"session\"\n";
+        let dir = project(original);
+        for ty in ["agent", "service", "build", "container-build", "reviewer"] {
+            let refusal = run(&dir, &["init", "bot", "--type", ty]).unwrap_err();
+            assert_eq!(refusal.code, 3, "{ty}: {}", refusal.message);
+            assert!(refusal.message.contains(ty), "{}", refusal.message);
+            assert!(
+                refusal.message.contains("gominimal/inbox#678"),
+                "{}",
+                refusal.message
+            );
+            assert_eq!(read(&dir), original, "{ty}: the file is unchanged");
+        }
+        let refusal = run(&dir, &["init", "--agent", "bot"]).unwrap_err();
+        assert_eq!(refusal.code, 3);
+        assert_eq!(read(&dir), original);
+    }
+
+    // BCLI-018
+    #[test]
+    fn init_noun_flag_is_type_alias() {
+        for noun in ["session", "task"] {
+            let by_flag = project(LEGACY_SCAFFOLD);
+            let by_type = project(LEGACY_SCAFFOLD);
+            let flag = format!("--{noun}");
+            run(&by_flag, &["init", flag.as_str(), "web"]).expect("appended by flag");
+            run(&by_type, &["init", "web", "--type", noun]).expect("appended by type");
+            assert_eq!(read(&by_flag), read(&by_type), "{noun}");
+            assert_eq!(
+                init_request(&init_args(&["init", flag.as_str(), "web"])),
+                init_request(&init_args(&["init", "web", "--type", noun])),
+            );
+        }
+        for noun in ["agent", "service"] {
+            let flag = format!("--{noun}");
+            assert_eq!(
+                init_request(&init_args(&["init", flag.as_str(), "web"])),
+                Ok(InitRequest::Append {
+                    entry: "web".into(),
+                    box_type: noun.into()
+                }),
+            );
+        }
+    }
+
+    // BCLI-018, BOX-007, BOX-046: the name check runs before any file read.
+    #[test]
+    fn init_entry_name_invalid_exit3_appends_nothing() {
+        let long = "a".repeat(64);
+        let dir = project(LEGACY_SCAFFOLD);
+        let empty = tempfile::tempdir().expect("a temp dir");
+        for name in ["self", "My_Box", "-dev", long.as_str(), ""] {
+            let task_flag = format!("--task={name}");
+            for argv in [
+                vec!["init", "--type", "session", "--", name],
+                vec!["init", task_flag.as_str()],
+            ] {
+                let refusal = run(&dir, &argv).unwrap_err();
+                assert_eq!(refusal.code, 3, "{argv:?}: {}", refusal.message);
+                assert!(
+                    refusal.message.contains(name),
+                    "{argv:?}: names the value: {}",
+                    refusal.message
+                );
+                assert_eq!(
+                    read(&dir),
+                    LEGACY_SCAFFOLD,
+                    "{argv:?}: the file is unchanged"
+                );
+                // No minimal.toml: the name is refused before the file is looked for.
+                assert_eq!(run(&empty, &argv).unwrap_err().code, 3, "{argv:?}");
+            }
+        }
+        let refusal = run(&dir, &["init", "My_Box", "--type", "session"]).unwrap_err();
+        assert!(
+            refusal
+                .message
+                .contains("1 to 63 characters of a-z, 0-9 and -"),
+            "states the rule: {}",
+            refusal.message
+        );
+        run(&dir, &["init", "web-2", "--type", "session"]).expect("a DNS label is accepted");
+    }
+
+    // BCLI-018
+    #[test]
+    fn init_noun_flags_exclusive_exit2_appends_nothing() {
+        let dir = project(LEGACY_SCAFFOLD);
+        for argv in [
+            &["init", "--session", "a", "--task", "b"][..],
+            &["init", "--agent", "a", "--service", "b"],
+            &[
+                "init",
+                "--session",
+                "a",
+                "--task",
+                "b",
+                "--agent",
+                "c",
+                "--service",
+                "d",
+            ],
+            &["init", "--session", "a", "--type", "task"],
+            &["init", "a", "--type", "task", "--service", "b"],
+        ] {
+            let refusal = run(&dir, argv).unwrap_err();
+            assert_eq!(
+                refusal,
+                InitRefusal {
+                    code: 2,
+                    message: INIT_ONE_TYPE_FLAG.to_owned()
+                },
+                "{argv:?}"
+            );
+            assert_eq!(
+                read(&dir),
+                LEGACY_SCAFFOLD,
+                "{argv:?}: the file is unchanged"
+            );
+        }
+        assert_eq!(
+            INIT_ONE_TYPE_FLAG,
+            "Pass one of --session, --task, --agent, --service or --type."
+        );
+    }
+
+    /// Run the append from `dir`, searching its ancestors as `min init` does
+    /// without `--repo-dir`.
+    fn append_from(dir: &std::path::Path, entry: &str) -> Result<std::path::PathBuf, InitRefusal> {
+        append_entry_in(dir, true, entry, "task")
+            .map_err(|e| e.downcast::<InitRefusal>().expect("a refusal"))
+    }
+
+    // BCLI-018: the append finds minimal.toml the way the other commands do.
+    #[test]
+    fn init_entry_type_appends_from_subdirectory() {
+        let root = project(LEGACY_SCAFFOLD);
+        let sub = root.path().join("src").join("bin");
+        std::fs::create_dir_all(&sub).expect("create the subdirectory");
+        let path = append_from(&sub, "worker").expect("the entry is appended");
+        assert_eq!(path, root.path().join(mfile::MFILE_NAME));
+        let after: toml::Table = read(&root).parse().unwrap();
+        assert_eq!(after["boxes"]["worker"]["type"].as_str(), Some("task"));
+        assert!(
+            !sub.join(mfile::MFILE_NAME).exists(),
+            "no file in the subdirectory"
+        );
+        assert!(
+            !sub.join(".minimal").exists(),
+            "no file in the subdirectory"
+        );
+        assert!(!root.path().join("src").join(mfile::MFILE_NAME).exists());
+    }
+
+    // BCLI-018: a minimal.toml that does not parse is invalid configuration,
+    // exit 3, and the refusal names the file.
+    #[test]
+    fn init_invalid_mfile_exit3_appends_nothing() {
+        const BROKEN: &str = "[boxes.dev\ntype = \"session\"\n";
+        let root = project(BROKEN);
+        let sub = root.path().join("src");
+        std::fs::create_dir(&sub).expect("create the subdirectory");
+        let file = root.path().join(mfile::MFILE_NAME);
+        for dir in [root.path(), sub.as_path()] {
+            let refusal = append_from(dir, "worker").unwrap_err();
+            assert_eq!(refusal.code, 3, "{}", refusal.message);
+            assert!(
+                refusal
+                    .message
+                    .starts_with("min init did not add the entry"),
+                "{}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(&file.display().to_string()),
+                "{}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains("invalid TOML"),
+                "{}",
+                refusal.message
+            );
+            assert_eq!(read(&root), BROKEN, "the file is unchanged");
+        }
+    }
+
+    // BCLI-018: both layouts in one directory are refused, as mfile refuses them.
+    #[test]
+    fn init_conflicting_layouts_exit3_appends_nothing() {
+        let root = project(LEGACY_SCAFFOLD);
+        let dot = root.path().join(".minimal");
+        std::fs::create_dir(&dot).expect("create .minimal");
+        let dot_file = dot.join(mfile::MFILE_NAME);
+        std::fs::write(&dot_file, LEGACY_SCAFFOLD).expect("write .minimal/minimal.toml");
+        let sub = root.path().join("src");
+        std::fs::create_dir(&sub).expect("create the subdirectory");
+        for dir in [root.path(), sub.as_path()] {
+            let refusal = append_from(dir, "worker").unwrap_err();
+            assert_eq!(refusal.code, 3, "{}", refusal.message);
+            let root_file = root.path().join(mfile::MFILE_NAME);
+            for path in [&root_file, &dot_file] {
+                assert!(
+                    refusal.message.contains(&path.display().to_string()),
+                    "{}",
+                    refusal.message
+                );
+            }
+            assert_eq!(read(&root), LEGACY_SCAFFOLD, "the root file is unchanged");
+            assert_eq!(
+                std::fs::read_to_string(&dot_file).unwrap(),
+                LEGACY_SCAFFOLD,
+                "the .minimal file is unchanged"
+            );
+        }
+    }
 }

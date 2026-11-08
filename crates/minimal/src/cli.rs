@@ -168,6 +168,13 @@ pub enum Command {
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
+    /// Check now whether your channel has a newer release.
+    ///
+    /// min makes this check by itself once a day; see
+    /// https://docs.minimal.dev/reference/telemetry#update-check for what
+    /// it sends and how to turn it off.
+    #[command(name = "update-check", hide = true)]
+    UpdateCheck(UpdateCheckArgs),
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
@@ -821,8 +828,8 @@ pub struct BoxRenameArgs {
     pub new_name: String,
 }
 
-// BOX-021 (BCLI-061, BCLI-005): `min box prune [--older-than <d>]
-// [--parent <box>] [--yes]`.
+// BOX-021 (BCLI-061, BCLI-005, BCLI-006): `min box prune [--older-than <d>]
+// [--parent <box>] [--yes] [--dry-run]`.
 #[derive(Debug, Args)]
 pub struct BoxPruneArgs {
     /// Remove only the boxes that stopped or exited at least this long ago.
@@ -837,6 +844,10 @@ pub struct BoxPruneArgs {
     /// Remove the boxes without asking first
     #[arg(long, short)]
     pub yes: bool,
+    /// List the boxes prune would remove and the disk each one holds, and
+    /// remove nothing
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Parses the `--older-than` age of `min box prune`: a whole number with a
@@ -1647,6 +1658,28 @@ pub struct InitArgs {
     /// already exists.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+    // BCLI-018: `<entry> --type <type>` appends one entry; each noun flag is
+    // the same append with that noun as the type. The flags are checked by
+    // hand in `cmd_init`, not with clap conflicts, so a conflict prints the
+    // one message the task fixes.
+    /// Name of the entry to append to minimal.toml (use with --type)
+    #[arg(value_name = "ENTRY")]
+    pub entry: Option<String>,
+    /// Type of the entry to append: session, task, or a type from [box_types]
+    #[arg(long = "type", value_name = "TYPE")]
+    pub box_type: Option<String>,
+    /// Append a session entry with this name (the same as <ENTRY> --type session)
+    #[arg(long, value_name = "NAME")]
+    pub session: Option<String>,
+    /// Append a task entry with this name (the same as <ENTRY> --type task)
+    #[arg(long, value_name = "NAME")]
+    pub task: Option<String>,
+    /// Append an agent entry with this name (the same as <ENTRY> --type agent)
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+    /// Append a service entry with this name (the same as <ENTRY> --type service)
+    #[arg(long, value_name = "NAME")]
+    pub service: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1686,6 +1719,19 @@ pub struct SpinArgs {
     /// Ctrl-C cuts it short.
     #[arg(long, default_value_t = 10)]
     pub seconds: u64,
+}
+
+/// `min update-check`: see [`crate::update_check`].
+#[derive(Debug, Default, Args)]
+pub struct UpdateCheckArgs {
+    /// Check without printing anything and keep the answer for the next
+    /// command, as the daily check does. Always exits 0.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub background: bool,
+    /// Print the request that would be made, and the switch that stops it
+    /// if one is set, without making it.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

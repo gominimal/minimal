@@ -106,6 +106,9 @@ mkdir -p "$mock/versions/v1"
 write_min_stub() {
     printf '#!/bin/sh\n# mock min (%s)\n' "${2:-previous release}" >"$1"
     cat >>"$1" <<'MOCKEOF'
+# Every call records whether it ran with the installer's update-check guard
+# (MINIMAL_UNDER_INSTALLER) and its verb, in $HOME/min.calls.
+printf '%s %s\n' "${MINIMAL_UNDER_INSTALLER:-unset}" "${1:-}" >>"$HOME/min.calls"
 comp_target() {
     case "$1" in
         bash) printf '%s/bash-completion/completions/min\n' "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
@@ -659,6 +662,23 @@ case_install() {
     want_ok "the card names the first command (R10.4)" \
         grep -qE "min +build the sandbox and step inside" "$OUT"
     want_card_last "the card closes a fresh install (R10.4)"
+    # The install's description for the update check (R6.1b): the target,
+    # the method and the pointer installed, recorded so uninstall removes it.
+    _im="$H1/xdg-state/minimal/install.toml"
+    want_ok "install.toml is written beside the record (R6.1b)" test -f "$_im"
+    want_ok "install.toml names the target channel (R6.1b)" grep -qx 'channel = "stable"' "$_im"
+    want_ok "install.toml names the installer as the method (R6.1b)" grep -qx 'method = "installer"' "$_im"
+    want_ok "install.toml carries the installed pointer (R6.1b)" grep -qx 'key = "v1"' "$_im"
+    want_ok "install.toml names the binary it describes (R6.1b)" grep -qxF "bin = '$H1/bin/min'" "$_im"
+    want_ok "the installer runs its own min calls (R6.1b)" test -s "$H1/min.calls"
+    want_err "every min call of the installer is kept out of the update check (R6.1b)" \
+        grep -qv '^1 ' "$H1/min.calls"
+    want_ok "install.toml is recorded for uninstall (R6.1b)" \
+        record_has install-metadata "$_im" "$H1/xdg-state/minimal/installed"
+    want_ok "the card points at the update check's docs (R6.1b)" grep -q "reference/telemetry#update-check" "$OUT"
+    want_ok "the card says what the check sends (R6.1b)" grep -q "install id to update.minimal.dev" "$OUT"
+    want_ok "the card names the install method among the fields (R6.1b)" grep -q "architecture, install method and" "$OUT"
+    want_ok "the card names the check's off switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
     # Nothing on a redirected stream may carry terminal escapes (R10.1): this
     # output is a file, so a stray SGR here would land in every CI log. `run` sets a
     # terminal-like TERM, so what this pins is the `[ -t 2 ]` half of the guard:
@@ -839,6 +859,7 @@ EOF
     run ns_run "$HNS" --uninstall
     FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with the host DNS setup present exits 0"
+    want_err "uninstall removes install.toml (R6.1b)" test -e "$HNS/xdg-state/minimal/install.toml"
     want_ok "uninstall advises the host DNS setup is still installed" \
         grep -q "still installed on this host.*host DNS setup" "$OUT"
     want_ok "advisory names min finalize-install --undo" grep -q "min finalize-install --undo" "$OUT"
@@ -1393,6 +1414,11 @@ case_target_validation() {
     check 0 "$rc" "--version installs without a pointer (R2.5)"
     check "$h_minimald" "$(hash_file "$HV/bin/minimald")" "--version installs that version's bytes (R2.5)"
     want_ok "--version names the version, not a target (R2.5)" grep -q "version.*v1" "$OUT"
+    want_ok "--version records a pinned install, never notified (R6.1b)" \
+        grep -qx 'channel = "pinned"' "$HV/xdg-state/minimal/install.toml"
+    want_ok "--version is told the install is counted (R6.1b)" grep -q "no release notices for --version" "$OUT"
+    want_ok "--version is told what is sent and the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
+    want_ok "--version is told the channel it sends (R6.1b)" grep -q "(pinned), version, OS, architecture, install method" "$OUT"
     HV2="$root/hv2"; mkdir -p "$HV2"
     run versioneq "$HV2" --force-stop --version=v1
     check 0 "$rc" "--version=VER with another flag installs (R2.5)"
