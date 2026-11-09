@@ -77,9 +77,8 @@ pub struct BoxSpec {
     /// (BOX-028). Serialized as `execution.hooks_on_resume`, and left out
     /// when `false`.
     ///
-    /// The spec stores and round-trips this value, but the daemon does not
-    /// read this key yet. See <https://github.com/gominimal/minimal/issues/3111>,
-    /// the task that makes the daemon read it (BOX-028).
+    /// `minimald` reads this key at resume (`BoxActor::resume_ended`), and
+    /// when it is `true` it runs the box's `on_activate` hooks again.
     pub hooks_on_resume: bool,
     /// How long the box may run, in whole seconds, when its entry sets a
     /// `timeout` other than zero (BOX-049). Serialized as
@@ -468,6 +467,277 @@ impl From<SpecDoc> for BoxSpec {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The Box Spec sections of an expanded spec (BOX-076).
+// ---------------------------------------------------------------------------
+
+/// The shape of a value inside a Box Spec section.
+#[derive(Debug, Clone, Copy)]
+enum KeyShape {
+    Str,
+    Bool,
+    Int,
+    StrOrInt,
+    StrList,
+    StrOrStrList,
+    /// A table whose keys are the ones listed.
+    Keys(&'static [SectionKey]),
+    /// Any value. Another check owns the value's shape, so this schema
+    /// checks only the key's name, and the names of the listed keys
+    /// inside it when it is a table.
+    Owned(&'static [SectionKey]),
+}
+
+/// One key of a Box Spec section and the shape its value takes.
+type SectionKey = (&'static str, KeyShape);
+
+impl KeyShape {
+    /// The shape as the error message names it, in the words of
+    /// [`crate::expand`]'s top-level check.
+    const fn words(self) -> &'static str {
+        match self {
+            KeyShape::Str => "a string",
+            KeyShape::Bool => "true or false",
+            KeyShape::Int => "a whole number",
+            KeyShape::StrOrInt => "a string or a whole number",
+            KeyShape::StrList => "a list of strings",
+            KeyShape::StrOrStrList => "a string or a list of strings",
+            KeyShape::Keys(_) => "a table",
+            KeyShape::Owned(_) => "any value",
+        }
+    }
+
+    /// `None` when `value` has this shape, else what the value is, as the
+    /// error message names it. Only the outer shape: the keys of a
+    /// [`KeyShape::Keys`] table are checked by [`check_table`].
+    fn mismatch(self, value: &toml::Value) -> Option<&'static str> {
+        use toml::Value as V;
+        let fits = match (self, value) {
+            (KeyShape::Str | KeyShape::StrOrInt, V::String(_))
+            | (KeyShape::Bool, V::Boolean(_))
+            | (KeyShape::Int | KeyShape::StrOrInt, V::Integer(_))
+            | (KeyShape::StrOrStrList, V::String(_))
+            | (KeyShape::Keys(_), V::Table(_))
+            | (KeyShape::Owned(_), _) => true,
+            (KeyShape::StrList | KeyShape::StrOrStrList, V::Array(items)) => {
+                if !items.iter().all(V::is_str) {
+                    return Some("a list with an item that is not a string");
+                }
+                true
+            }
+            _ => false,
+        };
+        (!fits).then(|| value_words(value))
+    }
+}
+
+/// What a value is, as the error message names it.
+const fn value_words(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "a string",
+        toml::Value::Integer(_) => "a whole number",
+        toml::Value::Float(_) => "a decimal number",
+        toml::Value::Boolean(_) => "a true or false value",
+        toml::Value::Datetime(_) => "a date or time",
+        toml::Value::Array(_) => "a list",
+        toml::Value::Table(_) => "a table",
+    }
+}
+
+/// `[box]`: the box's type, name, lifetime, loadout mode and volumes.
+const BOX_KEYS: &[SectionKey] = &[
+    ("lifetime", KeyShape::Str),
+    ("loadout_mode", KeyShape::Str),
+    ("name", KeyShape::Str),
+    ("type", KeyShape::Str),
+    ("volumes", KeyShape::StrList),
+];
+
+/// `[io]`: the terminal, the standard streams and `exec` into the box.
+const IO_KEYS: &[SectionKey] = &[
+    ("exec_enabled", KeyShape::Bool),
+    ("pty_enabled", KeyShape::Bool),
+    ("stderr_mimetype", KeyShape::Str),
+    ("stdin_mimetype", KeyShape::Str),
+    ("stdout_mimetype", KeyShape::Str),
+];
+
+/// `[execution]`: what the box runs and how its run ends. `on_oom` is as
+/// the resources spec (BRES) defines it, a string.
+const EXECUTION_KEYS: &[SectionKey] = &[
+    ("exec", KeyShape::StrOrStrList),
+    ("hooks_on_resume", KeyShape::Bool),
+    ("on_oom", KeyShape::Str),
+    ("restart", KeyShape::Str),
+    ("timeout", KeyShape::StrOrInt),
+];
+
+/// `[install]`: what the box gets installed.
+const INSTALL_KEYS: &[SectionKey] = &[
+    ("packages", KeyShape::StrList),
+    ("raw_packages", KeyShape::StrList),
+];
+
+/// `[network.egress]`: the nested egress keys that the networking and
+/// egress-proxy specs bind.
+const EGRESS_KEYS: &[SectionKey] = &[
+    ("allow_dns_hosts", KeyShape::StrList),
+    ("allow_protocols", KeyShape::StrList),
+    ("allow_subnets", KeyShape::StrList),
+    ("deny_subnets", KeyShape::StrList),
+];
+
+/// `[network.bep]`: the egress proxy's settings, the fields of
+/// [`boxes::core::bep::BepSettings`].
+const BEP_KEYS: &[SectionKey] = &[
+    ("no_proxy", KeyShape::StrList),
+    ("proxy_env", KeyShape::Bool),
+    ("steering", KeyShape::Str),
+];
+
+/// No keys inside it are named here.
+const ANY: KeyShape = KeyShape::Owned(&[]);
+
+/// `[network]`. The flat egress keys of BOX-157 are accepted here for one
+/// release. [`crate::network::canonicalize`] then moves each one to its
+/// nested `egress.*` key, and it checks the shape of `mode`, `egress`,
+/// `ingress`, `bep` and the flat keys, so this schema checks only their
+/// names, and the names and shapes of the keys inside `egress` and `bep`.
+const NETWORK_KEYS: &[SectionKey] = &[
+    ("bep", KeyShape::Owned(BEP_KEYS)),
+    ("dynamic_ingress", KeyShape::Str),
+    ("egress", KeyShape::Owned(EGRESS_KEYS)),
+    ("egress_allow_dns", ANY),
+    ("egress_allow_subnets", ANY),
+    ("egress_deny_subnets", ANY),
+    ("ingress", ANY),
+    ("mode", ANY),
+    ("quic443", KeyShape::Str),
+    ("vpn_network_names", KeyShape::StrList),
+];
+
+/// `[nesting]`: whether the box can create boxes, and which ones.
+const NESTING_KEYS: &[SectionKey] = &[
+    ("allowed", KeyShape::Bool),
+    ("dynamic_providers", KeyShape::Str),
+    ("max_depth", KeyShape::Int),
+    ("providers", KeyShape::StrList),
+    ("types", KeyShape::StrList),
+];
+
+/// The Box Spec sections whose keys this schema names, by top-level key.
+///
+/// The other sections are tables whose keys belong to the part of the
+/// product that reads them. `[machine]` and `on_oom` belong to the
+/// resources spec (BRES). `[params]`, `[vars]`, `[env_vars]` and `[args]`
+/// carry the project's own names. `[secrets]` and `[otel]` are read by
+/// their own components. No component reads `[nesting]` yet, so this
+/// schema is the only check of its keys.
+const SECTIONS: &[SectionKey] = &[
+    ("box", KeyShape::Keys(BOX_KEYS)),
+    ("execution", KeyShape::Keys(EXECUTION_KEYS)),
+    ("install", KeyShape::Keys(INSTALL_KEYS)),
+    ("io", KeyShape::Keys(IO_KEYS)),
+    ("nesting", KeyShape::Keys(NESTING_KEYS)),
+    ("network", KeyShape::Keys(NETWORK_KEYS)),
+];
+
+/// A key inside a Box Spec section that the spec cannot carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionProblem {
+    /// The key's dotted path from the top of the spec, such as
+    /// `network.egress.allow_hosts`.
+    pub key: String,
+    /// What is wrong with it.
+    pub problem: crate::SpecKeyProblem,
+}
+
+/// Checks the keys inside the top-level section `key` of an expanded spec
+/// (BOX-076), at every depth this schema names, in key order. A key that
+/// is not a section, or a section whose keys the schema leaves to another
+/// component, passes.
+///
+/// # Errors
+///
+/// A [`SectionProblem`] for the first key that is not a key of its
+/// section, or whose value has the wrong shape.
+pub fn check_section(key: &str, value: &toml::Value) -> Result<(), SectionProblem> {
+    let Some((_, KeyShape::Keys(keys))) = SECTIONS.iter().find(|(k, _)| *k == key) else {
+        return Ok(());
+    };
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+    check_table(key, table, keys)
+}
+
+fn check_table(
+    path: &str,
+    table: &toml::Table,
+    keys: &'static [SectionKey],
+) -> Result<(), SectionProblem> {
+    let mut names: Vec<&String> = table.keys().collect();
+    names.sort();
+    for name in names {
+        let key = format!("{path}.{name}");
+        let Some((_, shape)) = keys.iter().find(|(k, _)| k == name) else {
+            return Err(SectionProblem {
+                key,
+                problem: crate::SpecKeyProblem::Unknown,
+            });
+        };
+        let value = &table[name.as_str()];
+        if let Some(found) = shape.mismatch(value) {
+            return Err(SectionProblem {
+                key,
+                problem: crate::SpecKeyProblem::WrongShape {
+                    expected: shape.words(),
+                    found,
+                },
+            });
+        }
+        match (shape, value) {
+            (KeyShape::Keys(inner), toml::Value::Table(inner_table)) => {
+                check_table(&key, inner_table, inner)?;
+            }
+            (KeyShape::Owned(inner), toml::Value::Table(inner_table)) if !inner.is_empty() => {
+                check_table(&key, inner_table, inner)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The warning for a project section that the expansion leaves out of the
+/// spec ([`crate::expand::IGNORED_SECTIONS`]). Each of these sections is
+/// client configuration, which only the user's own `config.toml` sets.
+/// The `[secret-store-rules]` warning is the one BEP-037 gives.
+#[must_use]
+pub fn ignored_section_warning(section: &str) -> String {
+    if section == boxes::core::bep::STORE_RULES_TABLE {
+        return boxes::core::bep::PROJECT_STORE_RULES_IGNORED.to_owned();
+    }
+    format!(
+        "minimal.toml has a [{section}] table. A project cannot set {section}, \
+         so the table is ignored. Put the rules in your own config.toml instead. \
+         Run `min dirs` to find that file."
+    )
+}
+
+/// One warning for each project section that `expansion` left out of the
+/// spec, in the order the expansion found them, each section once.
+#[must_use]
+pub fn ignored_section_warnings(expansion: &crate::expand::Expansion) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    expansion
+        .ignored_sections
+        .iter()
+        .filter(|(section, _)| seen.insert(section.as_str()))
+        .map(|(section, _)| ignored_section_warning(section))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +1064,312 @@ mod tests {
         assert_eq!(value["box"]["name"].as_str(), Some("dev"), "{text}");
         assert_eq!(value["entry"].as_str(), Some("lint"), "{text}");
         assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), spec);
+    }
+
+    /// Expands the entry `name` of `file`, with the file's `[defaults]`.
+    fn expand_in(file: &str, name: &str) -> Result<crate::expand::Expansion, crate::Error> {
+        let entries = crate::entry::read_entries(file.as_bytes()).expect("entries read");
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let doc: toml::Table = toml::from_str(file).expect("test TOML parses");
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let layers = crate::expand::Layers::default().with_file_defaults(
+            &defaults,
+            entry.box_type.as_deref(),
+            &std::collections::BTreeSet::new(),
+        );
+        crate::expand::expand(entry, &layers)
+    }
+
+    // BOX-076: every Box Spec section expands with its keys, and
+    // `[network]` takes the nested `egress.*` shape. The flat egress keys
+    // of BOX-157 are accepted, and canonicalisation nests them.
+    #[test]
+    fn sections_follow_box_toml_with_nested_egress() {
+        let file = r#"
+            [sessions.dev]
+            hooks_on_resume = true
+            volumes = ["cache"]
+
+            [sessions.dev.box]
+            type = "session"
+            name = "dev"
+            lifetime = "until_stopped"
+            loadout_mode = "merge"
+            volumes = ["cache"]
+
+            [sessions.dev.io]
+            pty_enabled = true
+            exec_enabled = false
+            stdin_mimetype = "text/plain"
+            stdout_mimetype = "text/plain"
+            stderr_mimetype = "text/plain"
+
+            [sessions.dev.execution]
+            exec = ["bash", "-l"]
+            timeout = "30m"
+            on_oom = "kill"
+            hooks_on_resume = true
+
+            [sessions.dev.install]
+            packages = ["git"]
+            raw_packages = ["ripgrep"]
+
+            [sessions.dev.machine]
+            cpus = 2
+            memory = "4G"
+
+            [sessions.dev.network]
+            mode = "own_ip"
+            quic443 = "auto"
+            vpn_network_names = ["corp"]
+            ingress = [{ proto = "tcp", port = 8080 }]
+            dynamic_ingress = "allow"
+
+            [sessions.dev.network.egress]
+            allow_dns_hosts = ["example.com"]
+            allow_subnets = ["10.0.0.0/8"]
+            deny_subnets = ["10.1.0.0/16"]
+            allow_protocols = ["https"]
+
+            [sessions.dev.network.bep]
+            steering = "dns"
+            proxy_env = true
+            no_proxy = ["localhost"]
+
+            [sessions.dev.nesting]
+            allowed = true
+            max_depth = 2
+            providers = ["local"]
+            types = ["task"]
+            dynamic_providers = "deny"
+
+            [sessions.dev.secrets.gh]
+            source = "store"
+
+            [sessions.dev.otel]
+            endpoint = "http://localhost:4317"
+
+            [[sessions.dev.file_imports]]
+            src = "a"
+            dst = "/a"
+
+            [[sessions.dev.file_exports]]
+            src = "/b"
+            dst = "b"
+
+            [[sessions.dev.github_imports]]
+            repo = "gominimal/minimal"
+
+            [tasks.lint]
+            args = { fix = "false" }
+            exec = "cargo clippy"
+            [tasks.lint.network]
+            mode = "host_ip"
+            egress_allow_dns = ["crates.io"]
+        "#;
+        let dev = expand_in(file, "dev").expect("every section is accepted");
+        let net = &dev.spec["network"];
+        assert_eq!(
+            net["egress"]["allow_dns_hosts"].as_array().map(Vec::len),
+            Some(1)
+        );
+        for section in [
+            "box",
+            "io",
+            "execution",
+            "install",
+            "machine",
+            "network",
+            "nesting",
+            "secrets",
+            "otel",
+            "file_imports",
+            "file_exports",
+            "github_imports",
+        ] {
+            assert!(dev.spec.contains_key(section), "{section} is carried");
+        }
+
+        let mut lint = expand_in(file, "lint").expect("a flat egress key is accepted");
+        crate::network::canonicalize(&mut lint.spec).expect("canonicalises");
+        let net = lint.spec["network"].as_table().expect("a table");
+        assert!(!net.contains_key("egress_allow_dns"), "{net:?}");
+        assert_eq!(
+            net["egress"]["allow_dns_hosts"][0].as_str(),
+            Some("crates.io")
+        );
+    }
+
+    // BOX-076: an unknown key or a value of the wrong shape, at any depth
+    // of a section, fails with exit 3 and names the key.
+    #[test]
+    fn unknown_key_or_shape_exit3() {
+        let cases = [
+            (
+                "[sessions.dev.network.egress]\nallow_hosts = [\"x\"]\n",
+                "`[sessions.dev]` in minimal.toml sets `network.egress.allow_hosts`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.io]\npty = true\n",
+                "`[sessions.dev]` in minimal.toml sets `io.pty`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.box]\ntipe = \"session\"\n",
+                "`[sessions.dev]` in minimal.toml sets `box.tipe`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.execution]\ntimeout = true\n",
+                "`[sessions.dev]` in minimal.toml sets `execution.timeout` to a \
+                 true or false value, but `execution.timeout` takes a string or a \
+                 whole number. Fix the value.",
+            ),
+            (
+                "[sessions.dev.network]\nvpn_network_names = \"corp\"\n",
+                "`[sessions.dev]` in minimal.toml sets `network.vpn_network_names` \
+                 to a string, but `network.vpn_network_names` takes a list of \
+                 strings. Fix the value.",
+            ),
+            (
+                "[sessions.dev.io]\nstdin_mimetype = 0\n",
+                "`[sessions.dev]` in minimal.toml sets `io.stdin_mimetype` to a whole \
+                 number, but `io.stdin_mimetype` takes a string. Fix the value.",
+            ),
+            (
+                "[sessions.dev.io]\nstdin = \"null\"\n",
+                "`[sessions.dev]` in minimal.toml sets `io.stdin`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.nesting]\nalowed = true\n",
+                "`[sessions.dev]` in minimal.toml sets `nesting.alowed`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.nesting]\nmax_depth = \"2\"\n",
+                "`[sessions.dev]` in minimal.toml sets `nesting.max_depth` to a \
+                 string, but `nesting.max_depth` takes a whole number. Fix the value.",
+            ),
+            (
+                "[sessions.dev.network.bep]\nstering = \"dns\"\n",
+                "`[sessions.dev]` in minimal.toml sets `network.bep.stering`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.box]\ndescription = \"dev box\"\n",
+                "`[sessions.dev]` in minimal.toml sets `box.description`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.network]\nmode = \"own_ip\"\nvpn = [\"corp\"]\n",
+                "`[sessions.dev]` in minimal.toml sets `network.vpn`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.network]\nquic443 = true\n",
+                "`[sessions.dev]` in minimal.toml sets `network.quic443` to a true \
+                 or false value, but `network.quic443` takes a string. Fix the value.",
+            ),
+            (
+                "[sessions.dev.install]\npackages = [\"git\", 3]\n",
+                "`[sessions.dev]` in minimal.toml sets `install.packages` to a list \
+                 with an item that is not a string, but `install.packages` takes a \
+                 list of strings. Fix the value.",
+            ),
+            (
+                "[defaults.session.network.egress]\ndeny = [\"x\"]\n[sessions.dev]\n",
+                "`[defaults.session]` in minimal.toml sets `network.egress.deny`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev]\nstray = 1\n",
+                "`[sessions.dev]` in minimal.toml sets `stray`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+        ];
+        for (file, message) in cases {
+            let err = expand_in(file, "dev").expect_err(file);
+            assert_eq!(err.exit_code(), Some(3), "{file}");
+            assert_eq!(err.to_string(), message, "{file}");
+        }
+    }
+
+    // BOX-076, BEP-037: a project's client sections stay out of the
+    // expanded spec, and each one gets one warning that names it.
+    #[test]
+    fn project_secret_store_and_file_rules_left_out_of_spec_with_warning() {
+        let file = r#"
+            [defaults.package-file-rules]
+            keep = ["a"]
+            [sessions.dev]
+            packages = ["git"]
+            [sessions.dev.secret-store-rules.gh]
+            upstream = ["github.com"]
+            [sessions.dev.loadout-file-rules]
+            keep = ["b"]
+            [sessions.dev.package-file-rules]
+            keep = ["c"]
+        "#;
+        let e = expand_in(file, "dev").expect("client sections are left out, not refused");
+        let bytes = e.spec_bytes().expect("writes");
+        for section in crate::expand::IGNORED_SECTIONS {
+            assert!(!e.spec.contains_key(section), "{section}");
+            assert!(!bytes.contains(section), "{section} in {bytes}");
+        }
+        let warnings = ignored_section_warnings(&e);
+        assert_eq!(
+            warnings,
+            vec![
+                "minimal.toml has a [package-file-rules] table. A project cannot set \
+                 package-file-rules, so the table is ignored. Put the rules in your own \
+                 config.toml instead. Run `min dirs` to find that file."
+                    .to_owned(),
+                "minimal.toml has a [loadout-file-rules] table. A project cannot set \
+                 loadout-file-rules, so the table is ignored. Put the rules in your own \
+                 config.toml instead. Run `min dirs` to find that file."
+                    .to_owned(),
+                boxes::core::bep::PROJECT_STORE_RULES_IGNORED.to_owned(),
+            ],
+            "one warning per section, each naming it"
+        );
+    }
+
+    // BOX-085: `[params]` on an entry is accepted and carried in the
+    // expanded spec's bytes.
+    #[test]
+    fn params_accepted_and_rendered() {
+        let file = r#"
+            [defaults.session.params]
+            region = "eu"
+            [sessions.dev]
+            [sessions.dev.params]
+            model = "large"
+            retries = 3
+        "#;
+        let e = expand_in(file, "dev").expect("params are accepted");
+        let params = e.spec["params"].as_table().expect("a table");
+        assert_eq!(params["model"].as_str(), Some("large"));
+        assert_eq!(params["retries"].as_integer(), Some(3));
+        assert!(
+            !params.contains_key("region"),
+            "the entry's table replaces the defaults' table: {params:?}"
+        );
+        let bytes = e.spec_bytes().expect("writes");
+        assert!(bytes.contains("[params]"), "{bytes}");
+        assert!(bytes.contains("model = \"large\""), "{bytes}");
+        assert!(bytes.contains("retries = 3"), "{bytes}");
+
+        let err = expand_in("[sessions.dev]\nparams = \"x\"\n", "dev").expect_err("not a table");
+        assert_eq!(err.exit_code(), Some(3));
+        assert!(err.to_string().contains("`params` takes a table"), "{err}");
     }
 }

@@ -74,7 +74,7 @@ mod outputs;
 mod sources;
 mod stack;
 
-use outputs::{MissingRuntimeDeps, OutputTypesValid};
+use outputs::{MissingRuntimeDeps, OutputTypesValid, OutputsFreeOfDetbuild};
 
 /// The errors possible when running checkers.
 #[derive(Debug)]
@@ -95,7 +95,8 @@ impl fmt::Display for Error {
             }
             Error::Graph(e) => write!(f, "graph: {:?}", e),
             Error::Cancelled => write!(f, "cancelled"),
-            Error::Other(e) => write!(f, "{}", e),
+            // alternate: the whole chain, so a cache read that failed says why
+            Error::Other(e) => write!(f, "{:#}", e),
         }
     }
 }
@@ -236,7 +237,7 @@ pub type CheckFuture =
 /// Shared, single-flighted cache for expensive computations during checks.
 #[derive(Clone)]
 pub struct CheckCache {
-    /// Cache for [`common::match_files_for_glob`] results, keyed by `(dir, glob)`.
+    /// Cache for [`common::match_files_for_glob_no_follow`] results, keyed by `(dir, glob)`.
     glob_cache: moka::sync::Cache<(PathBuf, String), Arc<Vec<PathBuf>>>,
     /// Cache for library symbol sets, keyed by `(BuildSpecRef, lib_path)`.
     symbols_cache: moka::sync::Cache<(BuildSpecRef, PathBuf), Arc<HashSet<String>>>,
@@ -250,11 +251,16 @@ impl CheckCache {
         }
     }
 
-    /// Single-flighted, cached wrapper around [`common::match_files_for_glob`].
+    /// Single-flighted, cached wrapper around [`common::match_files_for_glob_no_follow`].
+    /// The walk does not descend into a symlinked directory, so a loop in a
+    /// build's output (`a -> .`) ends and each file is matched once. Collecting
+    /// a build's outputs copies files by their real paths and a symlinked
+    /// directory as a link, so every file in a cached build is at a path this
+    /// walk reaches.
     pub fn match_files_for_glob(&self, dir: &Path, glob: &str) -> Result<Arc<Vec<PathBuf>>, Error> {
         self.glob_cache
             .try_get_with((dir.to_path_buf(), glob.to_string()), || {
-                common::match_files_for_glob(dir, glob).map(Arc::new)
+                common::match_files_for_glob_no_follow(dir, glob).map(Arc::new)
             })
             .map_err(|e| Error::Other(anyhow!("{e}")))
     }
@@ -608,7 +614,7 @@ async fn check_package(
             };
         }
 
-        let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11) = tokio::join!(
+        let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12) = tokio::join!(
             run_checker!(naming::SpecNameMatchesDir),
             run_checker!(naming::SpecNameValid),
             run_checker!(naming::CycleBreakerNaming),
@@ -616,12 +622,13 @@ async fn check_package(
             run_checker!(naming::EnumerateBins),
             run_checker!(OutputTypesValid),
             run_checker!(MissingRuntimeDeps),
+            run_checker!(OutputsFreeOfDetbuild),
             run_checker!(BuildScriptIsExecutable),
             run_checker!(BuildScriptDisallowedPatterns),
             run_checker!(StandaloneTestCheck),
             run_checker!(sources::SourceUrlsValid),
         );
-        for r in [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11] {
+        for r in [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12] {
             // Checked first: a checker that was interrupted mid-flight reports
             // whatever it tripped over on the way out, which isn't the useful
             // error to hand back.

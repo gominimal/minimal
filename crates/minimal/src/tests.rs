@@ -396,6 +396,9 @@ fn every_daemon_connection_is_classified() {
             // Test-only: the NET-058 and NET-152 tests' client on the selected
             // harness daemon, which is this build.
             "tests.rs::selected_client = ungated",
+            // Not a client path: the run tests' stand-in for a box's
+            // entrypoint, which answers no version.
+            "tests.rs::stand_in_daemon = ungated",
         ]
     );
 }
@@ -435,7 +438,7 @@ fn every_create_session_asserts_the_daemon_build() {
             // Not a create the dashboard sends: the unit tests' own-address
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",
-            "task.rs::cmd_task_run = asserts",
+            "task.rs::run_entry = asserts",
             // A unit test's request, never sent: it checks the task box's
             // network and egress.
             "task.rs::task_box_network_flags_reach_the_create_request = asserts nothing",
@@ -448,6 +451,8 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
+            // A unit test's request, never sent: it checks the fresh instance.
+            "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
         ]
     );
 }
@@ -465,7 +470,7 @@ fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
         ("src/cmd/boxes/create.rs", "activate_box"),
-        ("src/task.rs", "cmd_task_run"),
+        ("src/task.rs", "run_entry"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
         let body =
@@ -1793,32 +1798,412 @@ fn task_run_parses_network_and_egress_flags() {
     );
 }
 
-/// The hidden top-level `run` swallows any spelling — flags included —
-/// so every muscle-memory invocation reaches the redirect error rather
-/// than a clap parse error; and it stays hidden from help.
+// BCLI-011: `min task run` is the task noun's run verb, `min box run` runs
+// an entry, and the hidden top-level `min run` that only errored is gone.
 #[test]
-fn hidden_run_swallows_any_spelling_and_stays_hidden() {
+fn task_run_provided_hidden_run_removed() {
     use clap::CommandFactory as _;
     use clap::Parser as _;
 
-    match Cli::try_parse_from(["min", "run", "build", "--keep"])
+    match Cli::try_parse_from(["min", "task", "run", "build", "--detach"])
         .unwrap()
         .command
     {
-        Some(Command::Run(a)) => assert_eq!(a.rest, ["build", "--keep"]),
-        _ => panic!("expected the hidden run catch"),
+        Some(Command::Task(TaskArgs {
+            command: TaskCommand::Run(a),
+        })) => {
+            assert_eq!(a.task, "build");
+            assert!(a.detach);
+        }
+        _ => panic!("expected `min task run`"),
     }
-    // A bare `min run` parses too; the redirect copy handles it.
-    match Cli::try_parse_from(["min", "run"]).unwrap().command {
-        Some(Command::Run(a)) => assert!(a.rest.is_empty()),
-        _ => panic!("expected the hidden run catch"),
+    match Cli::try_parse_from(["min", "box", "run", "build", "--", "--path", "prod"])
+        .unwrap()
+        .command
+    {
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Run(a),
+        })) => {
+            assert_eq!(a.entry, "build");
+            assert!(!a.detach);
+            assert_eq!(a.args, ["--path", "prod"]);
+        }
+        _ => panic!("expected `min box run`"),
     }
 
     let cmd = Cli::command();
-    let run = cmd
-        .find_subcommand("run")
-        .expect("the run subcommand must exist");
-    assert!(run.is_hide_set(), "`min run` must stay hidden from help");
+    assert!(
+        cmd.find_subcommand("run").is_none(),
+        "the hidden `min run` is removed"
+    );
+    let Err(err) = Cli::try_parse_from(["min", "run", "build"]) else {
+        panic!("`min run` is no command any more");
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    for noun in ["task", "box"] {
+        let run = cmd
+            .find_subcommand(noun)
+            .and_then(|noun| noun.find_subcommand("run"))
+            .unwrap_or_else(|| panic!("`min {noun} run` exists"));
+        assert!(!run.is_hide_set(), "`min {noun} run` shows in help");
+    }
+}
+
+/// What the stand-in entrypoint saw of a run: each step, in order.
+type RunLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A stand-in for a box's entrypoint, behind the daemon's exec channel.
+/// It acks the run's exec request as the daemon does, and keeps the run's
+/// stdin. When the stdin closes, it writes `got:<stdin>` on stdout and
+/// `diag` on stderr, and ends with `exit`. `minimald`'s mock launcher is
+/// `cfg(test)` inside `minimald`, so a test here cannot start a real
+/// entrypoint. `minimald`'s own T43 tests cover the daemon half of a run.
+struct StandInEntrypoint {
+    exit: u32,
+    stdin: Vec<u8>,
+    log: RunLog,
+}
+
+impl russh::server::Handler for StandInEntrypoint {
+    type Error = russh::Error;
+
+    async fn auth_none(&mut self, _user: &str) -> Result<russh::server::Auth, Self::Error> {
+        Ok(russh::server::Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: russh::Channel<russh::server::Msg>,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn env_request(
+        &mut self,
+        channel: russh::ChannelId,
+        _name: &str,
+        _value: &str,
+        session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        _data: &[u8],
+        session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        self.log.lock().unwrap().push("exec".into());
+        session.channel_success(channel)
+    }
+
+    async fn data(
+        &mut self,
+        _channel: russh::ChannelId,
+        data: &[u8],
+        _session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        self.stdin.extend_from_slice(data);
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: russh::ChannelId,
+        session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        let closed = format!("stdin closed after {} bytes", self.stdin.len());
+        self.log.lock().unwrap().push(closed);
+        let mut out = b"got:".to_vec();
+        out.extend_from_slice(&self.stdin);
+        // The run may have left already: what it misses goes nowhere.
+        let _ = session.data(channel, out);
+        let _ = session.extended_data(channel, 1, b"diag\n".to_vec());
+        let _ = session.exit_status_request(channel, self.exit);
+        let _ = session.eof(channel);
+        let _ = session.close(channel);
+        Ok(())
+    }
+}
+
+/// A `min` client connected to a [`StandInEntrypoint`] that ends with
+/// `exit`, and the log of what the stand-in saw.
+async fn stand_in_daemon(exit: u32) -> (tempfile::TempDir, client::Client, RunLog) {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("ssh.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    let key = russh::keys::PrivateKey::random(
+        &mut russh::keys::key::safe_rng(),
+        russh::keys::Algorithm::Ed25519,
+    )
+    .unwrap();
+    let config = std::sync::Arc::new(russh::server::Config {
+        keys: vec![key],
+        auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+        ..Default::default()
+    });
+    let log = RunLog::default();
+    let server_log = log.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let handler = StandInEntrypoint {
+                exit,
+                stdin: Vec::new(),
+                log: server_log.clone(),
+            };
+            if let Ok(running) = russh::server::run_stream(config.clone(), stream, handler).await {
+                tokio::spawn(running);
+            }
+        }
+    });
+    let client = client::Client::connect(&sock).await.expect("connect");
+    (dir, client, log)
+}
+
+/// Runs the stand-in's entrypoint as a run does, with `stdin` as this
+/// command's stdin, and returns the run's stdout, its stderr and the exit
+/// status the channel reported.
+async fn run_stand_in(
+    client: &mut client::Client,
+    stdin: &'static [u8],
+) -> (String, String, Option<u32>) {
+    let channel = task::open_task_box_run(
+        client,
+        boxes::SessionId::mint(),
+        "check",
+        "",
+        &minimald_rpc::taskenv::TaskEnv::default(),
+    )
+    .await
+    .expect("the daemon takes the run");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        task::bridge_channel(
+            channel,
+            Some(Box::new(std::io::Cursor::new(stdin))),
+            &mut out,
+            &mut err,
+        ),
+    )
+    .await
+    .expect("the run ends when the entrypoint returns")
+    .expect("the run bridges");
+    (
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+        status,
+    )
+}
+
+// BCLI-010: a run connects this command's stdin, stdout and stderr to the
+// entrypoint of its box, writes nothing else to stdout, and ends with the
+// entrypoint's exit code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_entry_wires_stdio_and_exit_code() {
+    let (_dir, mut client, log) = stand_in_daemon(7).await;
+    let (stdout, stderr, status) = run_stand_in(&mut client, b"q.sql\nrest\n").await;
+    assert_eq!(
+        stdout, "got:q.sql\nrest\n",
+        "stdin reaches the entrypoint, and stdout is the entrypoint's alone"
+    );
+    assert_eq!(stderr, "diag\n", "stderr is the entrypoint's stderr alone");
+    assert_eq!(status, Some(7));
+    let exit = task::exit_outcome(status).expect_err("a non-zero code fails the run");
+    assert_eq!(
+        exit.downcast_ref::<task::TaskExit>(),
+        Some(&task::TaskExit(7)),
+        "the command exits with the entrypoint's code"
+    );
+    assert_eq!(
+        log.lock().unwrap()[..2],
+        ["exec", "stdin closed after 11 bytes"]
+    );
+}
+
+// BCLI-010 `--detach`: a detached run prints only the box's id on stdout
+// and returns. The box's stdin is closed with no input, so an entrypoint
+// that reads its stdin to the end ends by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_detach_prints_id_closes_stdin() {
+    let (_dir, mut client, log) = stand_in_daemon(0).await;
+    let id = boxes::SessionId::mint();
+    let channel = task::open_task_box_run(
+        &mut client,
+        id,
+        "check",
+        "",
+        &minimald_rpc::taskenv::TaskEnv::default(),
+    )
+    .await
+    .expect("the daemon takes the run");
+    let mut out = Vec::new();
+    task::detach_run(channel, id, &mut out)
+        .await
+        .expect("the run detaches");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!("{id}\n"),
+        "stdout is the box id alone"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while log.lock().unwrap().len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the box's stdin never closed: {:?}",
+            log.lock().unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        log.lock().unwrap()[..],
+        ["exec", "stdin closed after 0 bytes"],
+        "the run closes the box's stdin as it starts the box, and sends nothing on it"
+    );
+}
+
+// BCLI-010: `min box run` and `min task run` of an entry with a terminal
+// fail with exit 2 and a hint naming `min box start --new`, before they
+// create anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_pty_entry_exit2_hints_start_new() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        b"[tasks.build]\necho = 'x'\n",
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        minimal_dir: Some(state.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+
+    let refusals = [
+        task::cmd_box_run(
+            &global,
+            BoxRunArgs {
+                entry: "default".into(),
+                path: None,
+                detach: false,
+                args: vec![],
+            },
+        )
+        .await
+        .expect_err("a run of an entry with a terminal is refused"),
+        task::cmd_task_run(
+            &global,
+            TaskRunArgs {
+                task: "default".into(),
+                path: None,
+                network: CliNetworkMode::HostNet,
+                egress: EgressArgs::default(),
+                detach: true,
+                args: vec![],
+            },
+        )
+        .await
+        .expect_err("a run of an entry with a terminal is refused"),
+    ];
+    for err in refusals {
+        assert!(
+            err.downcast_ref::<task::RunNeedsTerminal>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "default runs with a terminal. Start it with min box start --new default."
+        );
+    }
+    assert_eq!(task::RunNeedsTerminal::EXIT_CODE, 2);
+
+    let listed = server
+        .connect()
+        .await
+        .call::<minimald_rpc::ListSessions>(&())
+        .await;
+    assert!(
+        listed.sessions.is_empty(),
+        "the refused runs created no box"
+    );
+}
+
+// BCLI-035: a run-style command's exit code is its entrypoint's, a zero
+// code and a non-zero one alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_style_propagates_entrypoint_exit() {
+    for code in [0u8, 3, 125, 255] {
+        let (_dir, mut client, _log) = stand_in_daemon(u32::from(code)).await;
+        let (_, _, status) = run_stand_in(&mut client, b"").await;
+        assert_eq!(status, Some(u32::from(code)));
+        match task::exit_outcome(status) {
+            Ok(()) => assert_eq!(code, 0),
+            Err(e) => assert_eq!(
+                e.downcast_ref::<task::TaskExit>(),
+                Some(&task::TaskExit(code))
+            ),
+        }
+    }
+    // A run whose channel closed with no code fails, never reads as 0.
+    assert!(task::exit_outcome(None).is_err());
+}
+
+// BCLI-070: `min task run` and `min box run` share one run path, and its
+// create asks for a fresh instance under no name of the client's, so the
+// daemon names the box `<name>-<n>`. This branch has no `min box start` and
+// no `--new` on `min session start` yet, so only the runs request one.
+#[test]
+fn run_and_start_new_request_fresh_instance() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::from("web"),
+        paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = Some("web".into());
+    request_fresh_instance(&mut request);
+    assert!(request.fresh_instance);
+    assert_eq!(request.config.name, None, "the client invents no name");
+
+    // Both verbs reach the one run path.
+    let task_run = task::RunEntry::from(TaskRunArgs {
+        task: "build".into(),
+        path: None,
+        network: CliNetworkMode::HostNet,
+        egress: EgressArgs::default(),
+        detach: false,
+        args: vec![],
+    });
+    let box_run = task::RunEntry::from(BoxRunArgs {
+        entry: "build".into(),
+        path: None,
+        detach: false,
+        args: vec![],
+    });
+    assert_eq!(task_run.entry, box_run.entry);
+    assert_eq!(task_run.args, box_run.args);
+    // That path marks its create as a fresh instance, before it sends it.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(manifest.join("src/task.rs")).unwrap();
+    let body = function_body(&text, "run_entry").expect("task.rs defines run_entry");
+    let marked = body
+        .find("request_fresh_instance(&mut request)")
+        .expect("the run marks its create as a fresh instance");
+    let sent = body
+        .find("oneshot_rpc::<CreateSession>")
+        .expect("the run sends its create");
+    assert!(marked < sent, "the run marks its create before it sends it");
 }
 
 #[test]
@@ -2347,7 +2732,7 @@ fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
         ("src/cmd/boxes/create.rs", "activate_box", 2),
-        ("src/task.rs", "cmd_task_run", 2),
+        ("src/task.rs", "run_entry", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -2379,7 +2764,7 @@ fn daemon_refusals_print_without_rpc_names() {
     for (file, func) in [
         ("src/cmd/boxes/create.rs", "activate_box"),
         ("src/cmd/session.rs", "cmd_rename"),
-        ("src/task.rs", "cmd_task_run"),
+        ("src/task.rs", "run_entry"),
         ("src/cmd/mod.rs", "submit_verdict_and_wait"),
         ("src/cmd/mod.rs", "upload_and_finalize"),
     ] {
@@ -10905,4 +11290,213 @@ fn ls_warning_clears_on_recovery_with_no_guest_port() {
         rows[1].contains("other") && rows[1].contains("not serving"),
         "the held VM keeps its cause:\n{across}"
     );
+}
+
+// BOX-037: a task run whose box ran past its timeout exits 124, and says
+// why on stderr before the line about the kept box. The record decides
+// it, read only for a 124.
+#[tokio::test]
+async fn task_run_timeout_prints_why_and_exits_124() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let timed_out = crate::task::ended_at_timeout(Some(124), || {
+        std::future::ready(Some(RecordState::Exited(ExitEnding::Timeout)))
+    })
+    .await;
+    assert!(timed_out, "a 124 with a timeout record is the timeout's");
+
+    let why = crate::task::timeout_line("check", Some(90));
+    assert_eq!(
+        why,
+        "Task check ran past its timeout of 90s, and its processes were ended. \
+         The run exits with code 124."
+    );
+    assert_eq!(
+        crate::task::timeout_line("check", Some(2 * 3600)),
+        "Task check ran past its timeout of 2h, and its processes were ended. \
+         The run exits with code 124."
+    );
+    assert_eq!(
+        crate::task::timeout_line("check", None),
+        "Task check ran past its timeout, and its processes were ended. \
+         The run exits with code 124."
+    );
+    assert_eq!(
+        crate::task::kept_box_lines(Some(why.clone()), "check-1"),
+        vec![
+            why,
+            "Kept box check-1. Remove it with min box rm check-1.".to_string()
+        ],
+        "the timeout line comes before the kept-box line"
+    );
+
+    let err = crate::task::exit_outcome(Some(124)).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<crate::task::TaskExit>(),
+        Some(&crate::task::TaskExit(124))
+    );
+}
+
+// BOX-037: a task that exits 124 by itself, or with any other code, gets
+// no timeout line: its record says `reason = "exit"`. A code other than
+// 124 does not read the record.
+#[tokio::test]
+async fn task_run_own_exit_124_prints_no_timeout_line() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let timed_out = crate::task::ended_at_timeout(Some(124), || {
+        std::future::ready(Some(RecordState::Exited(ExitEnding::Exit {
+            exit_code: 124,
+        })))
+    })
+    .await;
+    assert!(!timed_out, "the task's own 124 is not a timeout");
+    assert!(
+        !crate::task::ended_at_timeout(Some(124), || std::future::ready(None)).await,
+        "an unreadable record says nothing about a timeout"
+    );
+
+    let mut read = false;
+    let timed_out = crate::task::ended_at_timeout(Some(7), || {
+        read = true;
+        std::future::ready(Some(RecordState::Exited(ExitEnding::Timeout)))
+    })
+    .await;
+    assert!(!timed_out);
+    assert!(!read, "a code other than 124 does not read the record");
+
+    assert_eq!(
+        crate::task::kept_box_lines(None, "check-1"),
+        vec!["Kept box check-1. Remove it with min box rm check-1.".to_string()]
+    );
+}
+
+// BCLI-006: `min box show` reports the disk a stopped box holds, and
+// `min box prune --dry-run` lists each box it would remove with the disk
+// it holds and the sum, and removes nothing.
+#[tokio::test]
+async fn show_and_prune_dry_run_report_disk() {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let web = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let live =
+        minimald::test_harness::create_configured_session(&mut daemon, "live", project).await;
+    stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "web", false)
+        .await
+        .expect("the box stops");
+
+    let show = async |id: boxes::SessionId| {
+        let hosts = local_hosts(&global).unwrap();
+        let host = hosts.into_iter().find(|host| host.selected).unwrap();
+        let mut client = box_host_client(&host).await.unwrap();
+        let shown = match client
+            .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
+            .await
+            .unwrap()
+        {
+            Errorable::Ok(shown) => shown,
+            Errorable::Err { error } => panic!("ShowBox failed: {error}"),
+        };
+        let mut out = Vec::new();
+        render_box_show(&mut out, &shown, host.provider, &host.host).unwrap();
+        (shown, String::from_utf8(out).unwrap())
+    };
+
+    // The stopped box shows the disk it holds, and the running one shows
+    // no disk line.
+    let (shown, text) = show(web).await;
+    let bytes = shown.disk_bytes.expect("the daemon measures a stopped box");
+    let disk = format!("Disk:       {}", format_disk(bytes));
+    assert!(text.lines().any(|line| line == disk), "{text}");
+    let (_, text) = show(live).await;
+    assert!(!text.contains("Disk:"), "{text}");
+
+    // The dry run lists the stopped box with its disk and the sum, and
+    // leaves the running box out.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let tally = prune_hosts(
+        local_hosts(&global).unwrap(),
+        false,
+        box_prune_request(None, None),
+        PruneMode::DryRun,
+        &mut out,
+    )
+    .await
+    .expect("the dry run");
+    finish_prune_dry_run(&tally, &mut out, &mut err).expect("the dry run ends cleanly");
+    let text = String::from_utf8(out).unwrap();
+    let size = format_disk(bytes);
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            format!("Would remove web ({web}): {size}"),
+            format!("Total: {size}"),
+            "Nothing was removed.".to_owned(),
+        ],
+        "{text}"
+    );
+    assert_eq!(String::from_utf8_lossy(&err), "");
+
+    // The dry run removed nothing: the stopped box still shows.
+    let (shown, _) = show(web).await;
+    assert_eq!(shown.record.state, "stopped");
+
+    // With nothing that matches, the dry run says so.
+    let mut out = Vec::new();
+    let none = PruneTally::default();
+    finish_prune_dry_run(&none, &mut out, &mut Vec::new()).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "No stopped or exited box matched, so prune would remove nothing.\n"
+    );
+
+    // A host that failed was not checked, so with nothing matched the dry
+    // run does not claim that nothing matched. It ends with an error.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let failed = PruneTally {
+        reaped: 0,
+        failed_hosts: vec![("remote0".to_owned(), anyhow::anyhow!("unreachable"))],
+        ..PruneTally::default()
+    };
+    let result = finish_prune_dry_run(&failed, &mut out, &mut err);
+    assert!(result.is_err(), "a failed host fails the dry run");
+    assert_eq!(String::from_utf8(out).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "Could not check host remote0: unreachable\n"
+    );
+
+    // A box whose disk is unknown is counted outside the sum.
+    let mut out = Vec::new();
+    let partial = PruneTally {
+        reaped: 2,
+        disk_bytes: 1536,
+        unmeasured: 1,
+        ..PruneTally::default()
+    };
+    finish_prune_dry_run(&partial, &mut out, &mut Vec::new()).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "Total: 1.5 KiB\nThe total leaves out 1 box whose disk is unknown.\nNothing was removed.\n"
+    );
+    assert_eq!(format_disk(512), "512 B");
+    assert_eq!(format_disk(3 * 1024 * 1024 * 1024 / 2), "1.5 GiB");
+}
+
+// BCLI-006: the unit follows the value as it prints, at every boundary.
+#[test]
+fn show_and_prune_dry_run_report_disk_unit_boundaries() {
+    assert_eq!(format_disk(1023), "1023 B");
+    assert_eq!(format_disk(1024), "1.0 KiB");
+    assert_eq!(format_disk(1_048_575), "1.0 MiB");
+    assert_eq!(format_disk(1_048_576), "1.0 MiB");
+    assert_eq!(format_disk(1_073_741_823), "1.0 GiB");
+    assert_eq!(format_disk(1_073_741_824), "1.0 GiB");
+    assert_eq!(format_disk(1023 * 1024 * 1024), "1023.0 MiB");
 }

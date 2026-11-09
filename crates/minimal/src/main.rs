@@ -151,6 +151,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
+    // The daily update check (inbox#589): reads its cache, spawns the
+    // detached check when one is due, prints a notice once per new release.
+    // Never waits, never fails the command.
+    minimal::update_check::before_command(&cli.global_args, &cli.command);
+
     let result = minimal::run(cli).await;
     // Flush exported telemetry (bounded; a no-op when export is off). What
     // the bound cuts off is in the spool already.
@@ -226,9 +231,9 @@ fn answer_failure(
 /// The exit code a failed run ends with, from the architecture's reserved
 /// codes ("Exit codes"): 2 when a running box holds the name a create
 /// asked for (`minimald_rpc::HeldNameRefusal`) or a removal without
-/// `--force` finds the box running (`minimal::BoxRunningRefusal`), 3 when
-/// the activation
-/// refused the box spec
+/// `--force` finds the box running (`minimal::BoxRunningRefusal`) or a run
+/// names an entry with a terminal (`minimal::task::RunNeedsTerminal`), 3
+/// when the activation refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
 /// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
 /// grant undeliverable (`minimal::GrantNotDelivered`), 7 when the VM host could not
@@ -251,6 +256,12 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-004: `min box rm` of a running box without `--force`.
     if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
         return minimal::BoxRunningRefusal::EXIT_CODE;
+    }
+    // BCLI-010: `min task run` or `min box run` of an entry with a terminal.
+    if e.downcast_ref::<minimal::task::RunNeedsTerminal>()
+        .is_some()
+    {
+        return minimal::task::RunNeedsTerminal::EXIT_CODE;
     }
     // BCLI-058: `min box rename` to a name BOX-010 refuses.
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
@@ -303,6 +314,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-053: an exec that its own timeout ended.
     if e.downcast_ref::<minimal::BoxExecTimedOut>().is_some() {
         return minimal::BoxExecTimedOut::EXIT_CODE;
+    }
+    // BCLI-018: `min init` refused a request (2) or a type (3).
+    if let Some(refusal) = e.downcast_ref::<minimal::InitRefusal>() {
+        return refusal.code;
     }
     // BCLI-034, BCLI-062: `min box cp` of a file the box does not have, or
     // does not allow reading.
@@ -461,7 +476,7 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                     command: minimal::TaskCommand::Run(_),
                 })
                 | minimal::Command::Box(minimal::BoxArgs {
-                    command: minimal::BoxCommand::Exec(_),
+                    command: minimal::BoxCommand::Exec(_) | minimal::BoxCommand::Run(_),
                 })
         )
     )
@@ -629,6 +644,7 @@ mod tests {
                 path: None,
                 network: minimal::CliNetworkMode::HostNet,
                 egress: minimal::EgressArgs::default(),
+                detach: false,
                 args: vec![],
             }),
         }));
@@ -1145,6 +1161,32 @@ mod tests {
                 5,
             ),
             (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+        ] {
+            assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
+        }
+    }
+
+    /// BCLI-018: `min init` ends with 2 when it gets more than one type
+    /// flag, and with 3 for a type this release refuses.
+    #[test]
+    fn init_refusals_exit_with_their_codes() {
+        for (refusal, code) in [
+            (
+                minimal::InitRefusal {
+                    code: 2,
+                    message: minimal::INIT_ONE_TYPE_FLAG.to_owned(),
+                },
+                2,
+            ),
+            (
+                minimal::InitRefusal {
+                    code: 3,
+                    message: "min init did not add the entry worker: type agent is not \
+                              supported yet."
+                        .to_owned(),
+                },
+                3,
+            ),
         ] {
             assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
         }
