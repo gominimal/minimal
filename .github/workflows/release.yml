@@ -1336,14 +1336,24 @@ jobs:
                     # publish two builds under one tag. --clobber below replaces
                     # only an asset whose upload never finished.
                     published="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$REL_TAG" \
-                      --jq '.assets[] | select(.state == "uploaded") | "\(.name)\t\(.digest)"')"
+                      --jq '.assets[] | select(.state == "uploaded") | "\(.name)\t\(.id)\t\(.digest // "")"')"
                     missing=()
                     differ=0
                     while IFS= read -r f; do
-                      have="$(printf '%s\n' "$published" | awk -F'\t' -v n="$f" '$1 == n {print $2}')"
-                      if [ -z "$have" ]; then
+                      row="$(printf '%s\n' "$published" | awk -F'\t' -v n="$f" '$1 == n')"
+                      if [ -z "$row" ]; then
                         missing+=("$f")
-                      elif [ "$have" != "sha256:$(sha256sum "$f" | cut -d' ' -f1)" ]; then
+                        continue
+                      fi
+                      have="$(printf '%s\n' "$row" | cut -f3)"
+                      if [ -z "$have" ]; then
+                        # GitHub gave no digest (an asset from before it kept
+                        # them): hash the published bytes rather than guess.
+                        id="$(printf '%s\n' "$row" | cut -f2)"
+                        have="sha256:$(gh api -H 'Accept: application/octet-stream' \
+                          "repos/$GITHUB_REPOSITORY/releases/assets/$id" | sha256sum | cut -d' ' -f1)"
+                      fi
+                      if [ "$have" != "sha256:$(sha256sum "$f" | cut -d' ' -f1)" ]; then
                         echo "::error::$REL_TAG already has $f, with other bytes than this build"
                         differ=1
                       fi
