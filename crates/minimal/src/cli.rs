@@ -974,6 +974,10 @@ pub enum TaskCommand {
     Run(TaskRunArgs),
 }
 
+// BCLI-069 gives `--name` to `min task run` too. It is not here yet: the
+// run path's `RunEntry` takes no box name, and the daemon names every run's
+// box `<entry>-<n>`. The start half is gominimal/minimal#3196. Add the flag
+// here and on `BoxRunArgs` when `RunEntry` takes a name.
 #[derive(Debug, Args)]
 pub struct TaskRunArgs {
     /// Name of a task declared in the project's minimal.toml
@@ -993,6 +997,7 @@ pub struct TaskRunArgs {
 }
 
 // BCLI-010, BCLI-035, BCLI-070: `min box run <entry> [--detach] [-- <args>…]`.
+// BCLI-069's `--name` is not here yet. See the comment on `TaskRunArgs`.
 #[derive(Debug, Args)]
 pub struct BoxRunArgs {
     /// Name of an entry declared in the project's minimal.toml: a task
