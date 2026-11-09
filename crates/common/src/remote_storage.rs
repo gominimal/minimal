@@ -128,6 +128,14 @@ impl RemoteStorage {
         // Rules that drop packets, not reject them, leave a connect waiting
         // for the kernel's retry limit, once per address the name answered.
         // This bound covers every address of one connection.
+        //
+        // reqwest applies the bound twice. It wraps the whole connect, name
+        // lookup and TLS included, which is what holds the overall bound.
+        // It also passes the bound to hyper-util's connector, which divides
+        // it evenly by the number of addresses the name answered
+        // (`ConnectingTcpRemote::new`, hyper-util 0.1.20). Unlike the placed
+        // relay, the connector carries no unused time forward, so an address
+        // after one that refused at once still gets only its even share.
         let client = reqwest::Client::builder().connect_timeout(bound).build()?;
         let backend = (&client, &self.cache);
         backend
