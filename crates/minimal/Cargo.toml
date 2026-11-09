@@ -99,6 +99,7 @@ tracing-subscriber.workspace = true
 # Parsing the diag portal's endpoint to check its scheme before an
 # upload or delete puts a bundle or delete token on the wire.
 url.workspace = true
+uuid.workspace = true
 version.workspace = true
 # Wipes the raw token reply `min auth login` reads from GitHub.
 zeroize.workspace = true

@@ -8,10 +8,10 @@ Minimal can sandbox AI coding agents the same way it sandboxes your dev tools: a
 
 ## Example: Claude Code
 
-This documentation site is itself built and maintained using Claude Code inside a Minimal session. Add the agent's package to the project's `[session]` block:
+This documentation site is itself built and maintained using Claude Code inside a Minimal session. Add the agent's package to the project's `[defaults.session]` table:
 
 ```toml
-[session]
+[defaults.session]
 packages = ["claude-code", "base"]
 ```
 
@@ -28,10 +28,10 @@ Note that sessions are driven interactively: attaching needs a terminal. Launch 
 
 ## Adding more tools
 
-Agents often need additional tools to be effective. Add packages to the `[session]` block just like any other:
+Agents often need additional tools to be effective. Add packages to the `[defaults.session]` table just like any other:
 
 ```toml
-[session]
+[defaults.session]
 packages = ["claude-code", "base", "git", "curl"]
 ```
 
@@ -40,7 +40,7 @@ packages = ["claude-code", "base", "git", "curl"]
 Use `patches` to give the agent access to host files it needs, like authentication state. Each patch maps a host `source` to a `dest` under the session user's home directory:
 
 ```toml
-[session]
+[defaults.session]
 packages = ["claude-code", "base", "git"]
 patches = [
     { source = "~/.gitconfig", dest = "~/.gitconfig" },
@@ -48,10 +48,10 @@ patches = [
 ]
 ```
 
-Environment variables can be inherited from the host as well, under `[session.vars]`:
+Environment variables can be inherited from the host as well, under `[defaults.session.vars]`:
 
 ```toml
-[session.vars]
+[defaults.session.vars]
 ANTHROPIC_API_KEY = { inherit = true }
 ```
 

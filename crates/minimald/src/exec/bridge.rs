@@ -212,6 +212,10 @@ impl<P: Process> Process for StoppedOnDestroy<P> {
     fn start_kill(&mut self) -> io::Result<()> {
         self.inner.start_kill()
     }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        self.inner.exit_notice()
+    }
 }
 
 /// Runs [`bridge`] and writes the notice for why the command ended to `e`
@@ -1528,6 +1532,22 @@ where
             }
         }
     };
+    // A task whose sandbox failed may have written nothing, so the reason
+    // goes on stderr ahead of the status. A client that stops reading holds
+    // the write, so the wait for it is bounded and the status still returns.
+    if let Some(notice) = process.exit_notice() {
+        match tokio::time::timeout(EXIT_NOTICE_BOUND, e.write_all(notice.as_bytes())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::debug!(%channel_id, "exec: the exit notice was not written; the client is gone");
+            }
+            Err(_) => tracing::debug!(
+                %channel_id,
+                bound = ?EXIT_NOTICE_BOUND,
+                "exec: the exit notice was not written; the client did not take it in time",
+            ),
+        }
+    }
     match status {
         Ok(code) => code.unwrap_or(1) as u32,
         Err(err) => {
@@ -1539,6 +1559,10 @@ where
         }
     }
 }
+
+/// How long [`bridge_one`] waits to write a process's exit notice to a
+/// client that is not reading, before it returns the status without it.
+pub(super) const EXIT_NOTICE_BOUND: Duration = Duration::from_secs(5);
 
 /// How long [`drain_ready`] waits for a pipe to produce something after
 /// the child has been reaped, before concluding that whatever still

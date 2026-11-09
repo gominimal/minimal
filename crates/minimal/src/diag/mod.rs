@@ -89,6 +89,14 @@ pub struct PortalArgs {
     /// you were doing when it stopped working.
     #[arg(long)]
     pub context: Option<String>,
+    /// Send this as a security report, for a suspected vulnerability
+    ///
+    /// Only portal owners can read the report. Its description is never
+    /// public, it is never filed to public GitHub, and the results go to a
+    /// private channel. The report page only confirms receipt. `min bug` and
+    /// `min diag collect` refuse this flag without `--upload`.
+    #[arg(long)]
+    pub security: bool,
     /// The portal's base URL
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
@@ -174,6 +182,14 @@ const PROCESS_MARKERS: &[&str] = &[
 use diagnostics::collect_step;
 
 pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::Error> {
+    // Refused rather than ignored: without `--upload` nothing is sent, and a
+    // reporter who asked for `--security` must not read that as a report made.
+    // Not a clap `requires`, because `min diag upload` shares the flag and has
+    // no `--upload` to require.
+    if args.portal.security && !args.upload {
+        anyhow::bail!("--security marks an upload, so it needs --upload; nothing was collected");
+    }
+
     let created_at = chrono::Utc::now();
     let started = std::time::Instant::now();
 
@@ -366,6 +382,7 @@ async fn send(
         path,
         &portal.endpoint,
         portal.context.as_deref().unwrap_or_default(),
+        portal.security,
     )
     .await
 }
@@ -548,7 +565,25 @@ mod tests {
         assert!(!plain.upload);
         assert_eq!(plain.portal.endpoint, DEFAULT_ENDPOINT);
         assert_eq!(plain.portal.context, None);
+        assert!(!plain.portal.security);
         assert!(parse(&["--upload"]).unwrap().upload);
+    }
+
+    /// Both commands that upload take `--security`, because it lives on the
+    /// arguments they share.
+    #[test]
+    fn both_commands_that_upload_take_security() {
+        use crate::cli::{Cli, Command};
+        assert!(parse(&["--upload", "--security"]).unwrap().portal.security);
+        let Some(Command::Diag(DiagArgs {
+            command: DiagCommand::Upload(args),
+        })) = Cli::try_parse_from(["min", "diag", "upload", "b.tar.zst", "--security"])
+            .unwrap()
+            .command
+        else {
+            panic!("`min diag upload` must take --security");
+        };
+        assert!(args.portal.security);
     }
 
     #[test]
@@ -701,6 +736,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -759,6 +795,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -808,6 +845,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -852,6 +890,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -908,6 +947,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -947,6 +987,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -988,6 +1029,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1036,6 +1078,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1101,6 +1144,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1143,6 +1187,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1182,6 +1227,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1222,6 +1268,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1274,6 +1321,7 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
+                security: false,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };

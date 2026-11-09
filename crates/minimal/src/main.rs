@@ -151,6 +151,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
+    // The daily update check (inbox#589): reads its cache, spawns the
+    // detached check when one is due, prints a notice once per new release.
+    // Never waits, never fails the command.
+    minimal::update_check::before_command(&cli.global_args, &cli.command);
+
     let result = minimal::run(cli).await;
     // Flush exported telemetry (bounded; a no-op when export is off). What
     // the bound cuts off is in the spool already.
@@ -264,6 +269,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
         return minimald_rpc::HeldNameRefusal::EXIT_CODE;
     }
+    // NET-060: a project `minimal.toml` whose session entry the start
+    // cannot pick refuses the activation with exit 2.
+    if e.downcast_ref::<minimal::SessionEntryUndecided>().is_some() {
+        return minimal::SessionEntryUndecided::EXIT_CODE;
+    }
     // An invalid project `minimal.toml` refuses the activation with exit 3.
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
         return 3;
@@ -298,6 +308,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-053: an exec that its own timeout ended.
     if e.downcast_ref::<minimal::BoxExecTimedOut>().is_some() {
         return minimal::BoxExecTimedOut::EXIT_CODE;
+    }
+    // BCLI-018: `min init` refused a request (2) or a type (3).
+    if let Some(refusal) = e.downcast_ref::<minimal::InitRefusal>() {
+        return refusal.code;
     }
     // BCLI-034, BCLI-062: `min box cp` of a file the box does not have, or
     // does not allow reading.
@@ -1138,6 +1152,32 @@ mod tests {
                 5,
             ),
             (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+        ] {
+            assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
+        }
+    }
+
+    /// BCLI-018: `min init` ends with 2 when it gets more than one type
+    /// flag, and with 3 for a type this release refuses.
+    #[test]
+    fn init_refusals_exit_with_their_codes() {
+        for (refusal, code) in [
+            (
+                minimal::InitRefusal {
+                    code: 2,
+                    message: minimal::INIT_ONE_TYPE_FLAG.to_owned(),
+                },
+                2,
+            ),
+            (
+                minimal::InitRefusal {
+                    code: 3,
+                    message: "min init did not add the entry worker: type agent is not \
+                              supported yet."
+                        .to_owned(),
+                },
+                3,
+            ),
         ] {
             assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
         }

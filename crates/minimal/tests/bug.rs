@@ -101,9 +101,29 @@ fn bug_args(out: &Path) -> BugArgs {
         upload: false,
         portal: PortalArgs {
             context: None,
+            security: false,
             endpoint: DEFAULT_ENDPOINT.to_string(),
         },
     }
+}
+
+/// `--security` only means something on an upload. Refused before collecting,
+/// so a reporter never reads a local bundle as a report made in private.
+#[tokio::test]
+async fn security_without_upload_is_refused_and_collects_nothing() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    let args = global_args(state.path(), config.path());
+
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    let mut bug = bug_args(&out);
+    bug.portal.security = true;
+
+    // Boxed: `cmd_bug` is a large future (clippy::large_futures).
+    let err = Box::pin(cmd_bug(&args, bug)).await.unwrap_err().to_string();
+    assert!(err.contains("needs --upload"), "{err}");
+    assert!(!out.exists(), "a refused run must write no bundle");
 }
 
 #[tokio::test]

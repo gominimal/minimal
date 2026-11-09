@@ -17,6 +17,11 @@
 //! The create hands back a delete token beside the diagnosis id. That token
 //! is how the uploader takes the bundle back before it expires: see
 //! [`delete`].
+//!
+//! A security report is marked on the create, so it is never public, not even
+//! briefly. The portal honours only a literal JSON `true`. Its report page
+//! shows the uploader nothing but receipt, so [`Uploaded::receipt`] says that
+//! instead of the ordinary lines.
 
 use std::path::Path;
 use std::time::Duration;
@@ -50,6 +55,8 @@ pub struct Uploaded {
     pub delete_token: String,
     /// When the portal deletes the bundle on its own, as the portal said it.
     pub expires_at: Option<String>,
+    /// Whether this went up as a security report.
+    pub security: bool,
 }
 
 impl Uploaded {
@@ -58,13 +65,25 @@ impl Uploaded {
     /// Plain about where the bundle went, what happens to it next, and how
     /// to take it back.
     pub fn receipt(&self) -> Vec<String> {
-        let mut lines = vec![
-            format!("Report:  {}", self.report_url),
-            format!(
-                "The bundle is stored for the minimal team for {RETENTION_DAYS} days. It is not \
-                 diagnosed until someone signs in at the report URL and starts the diagnosis."
-            ),
-        ];
+        let mut lines = if self.security {
+            vec![
+                "Received privately as a security report. Only the minimal team's portal owners \
+                 can read it."
+                    .to_owned(),
+                format!("Receipt: {}", self.report_url),
+                "That page only confirms receipt. It shows nothing else and will not change."
+                    .to_owned(),
+            ]
+        } else {
+            vec![
+                format!("Report:  {}", self.report_url),
+                format!(
+                    "The bundle is stored for the minimal team for {RETENTION_DAYS} days. It is \
+                     not diagnosed until someone signs in at the report URL and starts the \
+                     diagnosis."
+                ),
+            ]
+        };
         if let Some(expires_at) = &self.expires_at {
             lines.push(format!("Expires: {}", expiry(expires_at)));
         }
@@ -128,7 +147,12 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// checked against the file's length first. A stream would buy nothing after
 /// that: the create request declares the exact byte count and sha256 up front,
 /// and computing those means reading every byte regardless.
-pub async fn upload(path: &Path, endpoint: &str, note: &str) -> Result<Uploaded, anyhow::Error> {
+pub async fn upload(
+    path: &Path,
+    endpoint: &str,
+    note: &str,
+    security: bool,
+) -> Result<Uploaded, anyhow::Error> {
     let (base, local_only) = checked_base(endpoint)?;
     let base = &base;
     let size = tokio::fs::metadata(path)
@@ -156,31 +180,55 @@ pub async fn upload(path: &Path, endpoint: &str, note: &str) -> Result<Uploaded,
 
     let client = client(local_only)?;
 
-    let created = client
-        .post(format!("{base}/diag/api/diagnoses"))
-        .timeout(CREATE_TIMEOUT)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(
-            json!({ "name": name, "bytes": bytes.len(), "sha256": sha256, "context": note })
-                .to_string(),
-        )
-        .send()
-        .await
-        .with_context(|| format!("asking {base} to take a bundle"))?;
-    let status = created.status();
-    let body = created.text().await.unwrap_or_default();
-    if !status.is_success() {
+    let declared = |context: &str| {
+        json!({
+            "name": name,
+            "bytes": bytes.len(),
+            "sha256": sha256,
+            "context": context,
+            "security": security,
+        })
+    };
+
+    // The note is the disclosure, so it leaves only for a portal that has
+    // already said it will hold the report: a record with no note asks first,
+    // and has done its job once answered.
+    if security && !note.is_empty() {
+        let asked = create(&client, base, declared("")).await?;
+        if let (Some(id), Some(token)) = (asked["id"].as_str(), asked["delete_token"].as_str()) {
+            delete(base, id, token).await.ok();
+        }
+        if asked["security"] != Value::Bool(true) {
+            bail!(
+                "{base} did not confirm it would keep this private, so neither the bundle nor \
+                 your description was sent. Email security@minimal.dev instead"
+            );
+        }
+    }
+
+    let created = create(&client, base, declared(note)).await?;
+    // A portal that does not say it held the report may have stored it where
+    // anyone with the link can read it, so the bundle stays here and the
+    // receipt can never promise a privacy nobody confirmed. With a note, this
+    // is a portal that changed its answer after the first ask: the note has
+    // gone, so the record is deleted and the reporter told how that went.
+    if security && created["security"] != Value::Bool(true) {
+        let removed = match (created["id"].as_str(), created["delete_token"].as_str()) {
+            (Some(id), Some(token)) => delete(base, id, token).await.is_ok(),
+            _ => false,
+        };
+        let note_fate = match (note.is_empty(), removed) {
+            (true, _) => "",
+            (false, true) => " Your description reached it and has been deleted.",
+            (false, false) => {
+                " Your description reached it and could not be deleted, so treat it as exposed."
+            }
+        };
         bail!(
-            "{base} would not take the bundle ({status}): {}",
-            refusal(&body)
+            "{base} did not confirm it would keep this private, so the bundle was not sent.\
+             {note_fate} Email security@minimal.dev instead"
         );
     }
-    let created: Value = serde_json_lenient::from_str(&body).with_context(|| {
-        format!(
-            "{base} answered with something that is not JSON: {}",
-            refusal(&body)
-        )
-    })?;
     let id = created["id"]
         .as_str()
         .context("the portal took the bundle but did not say what it called the diagnosis")?
@@ -227,6 +275,37 @@ pub async fn upload(path: &Path, endpoint: &str, note: &str) -> Result<Uploaded,
         id,
         delete_token,
         expires_at,
+        security,
+    })
+}
+
+/// Asks the portal to make a record, and reads back what it said.
+async fn create(
+    client: &reqwest::Client,
+    base: &str,
+    declared: Value,
+) -> Result<Value, anyhow::Error> {
+    let created = client
+        .post(format!("{base}/diag/api/diagnoses"))
+        .timeout(CREATE_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(declared.to_string())
+        .send()
+        .await
+        .with_context(|| format!("asking {base} to take a bundle"))?;
+    let status = created.status();
+    let body = created.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "{base} would not take the bundle ({status}): {}",
+            refusal(&body)
+        );
+    }
+    serde_json_lenient::from_str(&body).with_context(|| {
+        format!(
+            "{base} answered with something that is not JSON: {}",
+            refusal(&body)
+        )
     })
 }
 
@@ -450,7 +529,7 @@ mod tests {
         ])
         .await;
 
-        let uploaded = upload(&path, &base, "min up hangs").await.unwrap();
+        let uploaded = upload(&path, &base, "min up hangs", false).await.unwrap();
         let seen = served.await.unwrap();
         let base = base.trim_end_matches('/');
 
@@ -474,6 +553,7 @@ mod tests {
         assert_eq!(declared["bytes"], bundle.len());
         assert_eq!(declared["sha256"], hex::encode(Sha256::digest(&bundle)));
         assert_eq!(declared["context"], "min up hangs");
+        assert_eq!(declared["security"], false);
 
         let put = &seen[1];
         assert_eq!(
@@ -495,6 +575,127 @@ mod tests {
         // The delete token is printed once, in the command, and kept out of
         // the URL that gets shared.
         assert!(!receipt[0].contains("tok-xyz"));
+    }
+
+    /// The mark goes on the create as a JSON `true`, the only value the portal
+    /// honours, and the receipt says what a security reporter can expect: it
+    /// was received privately, and the page only confirms that.
+    #[tokio::test]
+    async fn a_security_upload_is_marked_on_the_create_and_its_receipt_is_private() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("minimal-diag-x.tar.zst");
+        tokio::fs::write(&path, b"\x28\xb5\x2f\xfdnot really zstd")
+            .await
+            .unwrap();
+
+        let confirmed = r#"{"id":"d-123","upload":"/diag/api/diagnoses/d-123/bundle","delete_token":"tok-xyz","expires_at":"2026-10-16T12:00:00Z","security":true}"#;
+        let (base, served) = portal(vec![
+            (201, confirmed),
+            (204, ""),
+            (201, confirmed),
+            (202, r#"{"id":"d-123","state":"stored"}"#),
+        ])
+        .await;
+
+        let uploaded = upload(&path, &base, "a sandbox escape", true)
+            .await
+            .unwrap();
+        let seen = served.await.unwrap();
+        let base = base.trim_end_matches('/');
+
+        let asked: Value = serde_json_lenient::from_slice(&seen[0].body).unwrap();
+        assert_eq!(asked["security"], Value::Bool(true));
+        assert_eq!(asked["context"], "");
+        assert_eq!(seen[1].method, "DELETE");
+        let declared: Value = serde_json_lenient::from_slice(&seen[2].body).unwrap();
+        assert_eq!(declared["security"], Value::Bool(true));
+        assert_eq!(declared["context"], "a sandbox escape");
+
+        assert_eq!(
+            uploaded.receipt(),
+            [
+                "Received privately as a security report. Only the minimal team's portal owners \
+                 can read it."
+                    .to_owned(),
+                format!("Receipt: {base}/diag/d-123"),
+                "That page only confirms receipt. It shows nothing else and will not change."
+                    .to_owned(),
+                "Expires: 2026-10-16 12:00 UTC".to_owned(),
+                "Delete:  min diag delete d-123 tok-xyz".to_owned(),
+            ]
+        );
+    }
+
+    /// A portal that does not confirm the mark gets neither the bundle nor
+    /// the note: only a record with no note reaches it, and that is deleted.
+    #[tokio::test]
+    async fn a_security_upload_sends_nothing_private_unless_the_portal_confirms_the_mark() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("minimal-diag-x.tar.zst");
+        tokio::fs::write(&path, b"\x28\xb5\x2f\xfdnot really zstd")
+            .await
+            .unwrap();
+        let unconfirmed = r#"{"id":"d-123","upload":"/diag/api/diagnoses/d-123/bundle","delete_token":"tok-xyz"}"#;
+
+        for (note, says) in [
+            (
+                "the flaw",
+                "neither the bundle nor your description was sent",
+            ),
+            ("", "so the bundle was not sent."),
+        ] {
+            let (base, served) = portal(vec![(201, unconfirmed), (204, "")]).await;
+
+            let refused = upload(&path, &base, note, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            let seen = served.await.unwrap();
+
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].method, "POST");
+            let asked: Value = serde_json_lenient::from_slice(&seen[0].body).unwrap();
+            assert_eq!(asked["context"], "");
+            assert_eq!(seen[1].method, "DELETE");
+            assert_eq!(seen[1].path, "/diag/api/diagnoses/d-123");
+            assert!(refused.contains(says), "{refused}");
+            assert!(refused.contains("security@minimal.dev"), "{refused}");
+        }
+    }
+
+    /// A portal that confirms and then changes its answer has the note, so
+    /// the reporter is told whether it could be deleted.
+    #[tokio::test]
+    async fn a_portal_that_stops_confirming_after_the_note_left_is_reported_as_it_went() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("minimal-diag-x.tar.zst");
+        tokio::fs::write(&path, b"\x28\xb5\x2f\xfdnot really zstd")
+            .await
+            .unwrap();
+        let confirmed = r#"{"id":"d-1","upload":"/diag/api/diagnoses/d-1/bundle","delete_token":"t","security":true}"#;
+        let unconfirmed =
+            r#"{"id":"d-2","upload":"/diag/api/diagnoses/d-2/bundle","delete_token":"t"}"#;
+
+        for (answer, says) in [(204, "has been deleted"), (500, "treat it as exposed")] {
+            let (base, served) = portal(vec![
+                (201, confirmed),
+                (204, ""),
+                (201, unconfirmed),
+                (answer, ""),
+            ])
+            .await;
+
+            let refused = upload(&path, &base, "the flaw", true)
+                .await
+                .unwrap_err()
+                .to_string();
+            let seen = served.await.unwrap();
+
+            assert_eq!(seen.len(), 4);
+            assert_eq!(seen[3].path, "/diag/api/diagnoses/d-2");
+            assert!(refused.contains("the bundle was not sent"), "{refused}");
+            assert!(refused.contains(says), "{refused}");
+        }
     }
 
     /// The delete sends the token in the body and nothing in a header, and
@@ -624,7 +825,7 @@ mod tests {
 
         let empty = dir.path().join("empty.tar.zst");
         tokio::fs::File::create(&empty).await.unwrap();
-        let err = upload(&empty, "http://127.0.0.1:1", "")
+        let err = upload(&empty, "http://127.0.0.1:1", "", false)
             .await
             .unwrap_err()
             .to_string();
@@ -639,7 +840,7 @@ mod tests {
             .set_len(MAX_BUNDLE_BYTES + 1)
             .await
             .unwrap();
-        let err = upload(&huge, "http://127.0.0.1:1", "")
+        let err = upload(&huge, "http://127.0.0.1:1", "", false)
             .await
             .unwrap_err()
             .to_string();
