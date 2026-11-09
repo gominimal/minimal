@@ -13155,7 +13155,9 @@ fn box_package_build_under_box_egress_verdict() {
         run("sealed", Some(sealed.clone())).as_deref(),
         Some(
             "the build of fetcher could not reach downloads.example.org: \
-             the egress rules of box sealed do not allow it"
+             the egress rules of box sealed do not allow it. \
+             To allow it, activate a new session with \
+             --network own_ip --allow-dns-hosts downloads.example.org"
         )
     );
     assert_eq!(run("open", Some(open)), None);
@@ -13445,7 +13447,9 @@ fn box_package_build_refusal_names_destination_and_box_for_materialize() {
         tap.failure(&placement, failed.clone()),
         format!(
             "the build of fetcher could not reach downloads.example.org: \
-             the egress rules of box sealed do not allow it\n{failed}"
+             the egress rules of box sealed do not allow it. \
+             To allow it, activate a new session with \
+             --network own_ip --allow-dns-hosts downloads.example.org\n{failed}"
         )
     );
 }
@@ -13514,6 +13518,14 @@ fn box_package_build_refusal_names_destination_and_box() {
         ),
     ];
     for (line, destination) in cases {
+        // A literal address has no flag that helps. A flag takes no port.
+        let step = match destination.split(':').next().unwrap() {
+            "93.184.215.14" => String::new(),
+            host => format!(
+                ". To allow it, activate a new session with \
+                --network own_ip --allow-dns-hosts {host}"
+            ),
+        };
         assert_eq!(
             refused_destination(["make: entering", line]).as_deref(),
             Some(destination),
@@ -13528,7 +13540,7 @@ fn box_package_build_refusal_names_destination_and_box() {
             ),
             Some(format!(
                 "the build of hello could not reach {destination}: \
-                 the egress rules of box my-box do not allow it"
+                 the egress rules of box my-box do not allow it{step}"
             )),
         );
         // An allowed box's failure is the destination's, not the rules'.
@@ -13622,7 +13634,9 @@ fn box_package_build_refusal_names_destination_and_box_only_for_the_error() {
         ),
         Some(
             "the build of hello could not reach example.com:443: \
-             the egress rules of box my-box do not allow it"
+             the egress rules of box my-box do not allow it. \
+             To allow it, activate a new session with \
+             --network own_ip --allow-dns-hosts example.com"
                 .to_string()
         )
     );
@@ -13909,7 +13923,9 @@ async fn box_package_build_under_box_egress_verdict_runs_own_address_box_on_its_
         run(network.clone()).as_deref(),
         Some(
             "the build of fetcher could not reach downloads.example.org: \
-             the egress rules of box sealed do not allow it"
+             the egress rules of box sealed do not allow it. \
+             To allow it, activate a new session with \
+             --network own_ip --allow-dns-hosts downloads.example.org"
         )
     );
     assert_eq!(run(open_network), None);
