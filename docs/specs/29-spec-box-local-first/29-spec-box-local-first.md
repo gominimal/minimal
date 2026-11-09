@@ -207,7 +207,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   - IF a restart targets a box whose spec does not set `lifetime = "until_stopped"` THEN THE SYSTEM SHALL refuse the restart with exit 2 and leave the box's state unchanged.
     tier:   T0
     verify: cargo nextest run -p minimald restart_refuses_box_not_until_stopped_keeps_state
-  - IF a restart meets one of the refusals BOX-025 states for a resume (the name check, which a running box's own name does not trip, the unsatisfiable-spec check, or BVOL-013's volume-hold check) THEN THE SYSTEM SHALL refuse the restart with that refusal's exit code and leave the box's state unchanged, a running box still running, evaluating the lifetime check above first and then those three refusals in BOX-025's order, all before the restart stops any process, and never applying BOX-030's PTY check, which a restart of a box without `pty_enabled` exists to pass.
+  - IF a restart meets one of the refusals BOX-025 states for a resume (the name check, which a running box's own name does not trip, the unsatisfiable-spec check, or BVOL-013's volume-hold check, which the box's own volume holds do not trip) THEN THE SYSTEM SHALL refuse the restart with that refusal's exit code and leave the box's state unchanged, a running box still running, evaluating the lifetime check above first and then those three refusals in BOX-025's order, all before the restart stops any process, and never applying BOX-030's PTY check, which a restart of a box without `pty_enabled` exists to pass.
     tier:   T0
     verify: cargo nextest run -p minimald restart_takes_resume_refusals_before_it_stops_anything
 
