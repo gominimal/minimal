@@ -26,8 +26,10 @@ mod box_spec;
 mod box_verbs;
 mod doctor;
 mod finalize_install;
+pub mod hosts;
 mod list;
 mod net;
+pub mod output;
 mod project;
 mod secret;
 mod session;
@@ -48,12 +50,23 @@ pub use project::*;
 pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
 
-pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
+pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
+    // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
+    // prints after the command ends, never before an attached shell.
+    let alias_hint = hosts::read_provider_alias(&mut cli.global_args);
+    // The verb and the outcome go on the root span (BCLI-033
+    // observability), so one span tells what ran. `box_id` stays empty
+    // until a command records the id it resolved, through
+    // `output::record_box_id`.
     let root = tracing::info_span!(
         "cmd",
+        verb = command_verb(cli.command.as_ref()),
+        box_id = tracing::field::Empty,
+        outcome = tracing::field::Empty,
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -82,9 +95,103 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     }
     // Boxed: inlined, this dispatch match's deepest arm overruns rustc's
     // query depth (128) when computing the future's layout.
-    match run_in_root(root, Box::pin(run_command(cli))).await? {
+    let result = run_in_root(root, Box::pin(run_command(cli))).await;
+    // A failed run hands the hint to the error path, which puts it in the
+    // `min/v1/error` object's `hint` field in a machine output mode, so
+    // stderr carries one object only (BCLI-042).
+    if let Some(hint) = alias_hint {
+        if result.is_ok() {
+            let _ = writeln!(std::io::stderr(), "{hint}");
+        } else {
+            hosts::defer_alias_hint_to_failure(hint);
+        }
+    }
+    match result? {
         None => Ok(()),
         Some(handoff) => Err(handoff.finish()),
+    }
+}
+
+/// The verb a run dispatches, as the user typed it (`box show`,
+/// `session policy`), for the root span's `verb` field.
+fn command_verb(command: Option<&Command>) -> &'static str {
+    match command {
+        None => "min",
+        Some(Command::Ls(_)) => "ls",
+        Some(Command::Stop(_)) => "stop",
+        Some(Command::Session(SessionArgs { command })) => match command {
+            SessionCommand::List(_) => "session list",
+            SessionCommand::Activate(_) => "session activate",
+            SessionCommand::Attach(_) => "session attach",
+            SessionCommand::Exec(_) => "session exec",
+            SessionCommand::Run(_) => "session run",
+            SessionCommand::Destroy(_) => "session destroy",
+            SessionCommand::Rename(_) => "session rename",
+            SessionCommand::Policy(_) => "session policy",
+            SessionCommand::SetupZed(_) => "session setup-zed",
+            SessionCommand::Hooks(_) => "session hooks",
+        },
+        Some(Command::Loadout(_)) => "loadout list",
+        Some(Command::Task(_)) => "task run",
+        Some(Command::Run(_)) => "run",
+        Some(Command::Box(BoxArgs { command })) => match command {
+            BoxCommand::Spec(_) => "box spec",
+            BoxCommand::Audit(_) => "box audit",
+            BoxCommand::List(_) => "box list",
+            BoxCommand::Show(_) => "box show",
+            BoxCommand::Stop(_) => "box stop",
+            BoxCommand::Rm(_) => "box rm",
+            BoxCommand::Attach(_) => "box attach",
+            BoxCommand::Exec(_) => "box exec",
+            BoxCommand::Events(_) => "box events",
+            BoxCommand::Cp(_) => "box cp",
+            BoxCommand::Rename(_) => "box rename",
+            BoxCommand::Prune(_) => "box prune",
+        },
+        Some(Command::Host(HostArgs { command })) => match command {
+            HostCommand::List => "host list",
+            HostCommand::Show(_) => "host show",
+            HostCommand::Stop(_) => "host stop",
+        },
+        Some(Command::Provider(ProviderArgs { command })) => match command {
+            ProviderCommand::List(_) => "provider list",
+        },
+        Some(Command::Net(_)) => "net forward",
+        Some(Command::FinalizeInstall(_)) => "finalize-install",
+        Some(Command::Dirs) => "dirs",
+        Some(Command::Doctor) => "doctor",
+        Some(Command::Bug(_)) => "bug",
+        Some(Command::Diag(diag::DiagArgs { command })) => match command {
+            diag::DiagCommand::Collect(_) => "diag collect",
+            diag::DiagCommand::Upload(_) => "diag upload",
+            diag::DiagCommand::Delete(_) => "diag delete",
+        },
+        #[cfg(feature = "remote-access")]
+        Some(Command::Mesh(_)) => "mesh",
+        Some(Command::Proxy(_)) => "proxy",
+        Some(Command::Auth(AuthArgs { command })) => match command {
+            AuthCommand::Login(_) => "auth login",
+            AuthCommand::Status => "auth status",
+            AuthCommand::Logout => "auth logout",
+        },
+        Some(Command::Secret(SecretArgs { command })) => match command {
+            SecretCommand::Set(_) => "secret set",
+            SecretCommand::List(_) => "secret list",
+            SecretCommand::Rm(_) => "secret rm",
+        },
+        Some(Command::Login(_)) => "login",
+        Some(Command::Version) => "version",
+        Some(Command::UpdateCheck(_)) => "update-check",
+        #[cfg(debug_assertions)]
+        Some(Command::Spin(_)) => "spin",
+        #[cfg(debug_assertions)]
+        Some(Command::DebugAnswererCommand) => "debug-answerer-command",
+        Some(Command::Init(_)) => "init",
+        Some(Command::Add(_)) => "add",
+        Some(Command::Update(_)) => "update",
+        Some(Command::CompleteSessionStr(_)) => "complete-session-str",
+        Some(Command::Completions(_)) => "completions",
+        Some(Command::Dash) => "dash",
     }
 }
 
@@ -169,18 +276,54 @@ fn die_of(signal: nix::sys::signal::Signal) -> ! {
     std::process::exit(128_i32.saturating_add(signal as i32))
 }
 
+/// Holds the root span in [`output::set_root_span`]'s slot, and empties
+/// the slot on drop, on every exit path.
+struct RootSpanSlot;
+
+impl RootSpanSlot {
+    fn hold(root: &tracing::Span) -> Self {
+        output::set_root_span(Some(root));
+        Self
+    }
+}
+
+impl Drop for RootSpanSlot {
+    fn drop(&mut self) {
+        output::set_root_span(None);
+    }
+}
+
 /// Run `command` inside `root`, end `root`, and return the command's
 /// [`Handoff`], if it made one. Any other error is returned as is.
 ///
-/// `root` ends when the instrumented future is dropped, at the end of the
-/// `await`, so it has closed (and its exporter has it) by the time a caller
+/// `root` ends before this function returns, when the last handle on it
+/// drops, so it has closed (and its exporter has it) by the time a caller
 /// finishes the hand-off.
 async fn run_in_root<F>(root: tracing::Span, command: F) -> Result<Option<Handoff>, anyhow::Error>
 where
     F: std::future::Future<Output = Result<(), anyhow::Error>>,
 {
     use tracing::Instrument as _;
-    match command.instrument(root).await {
+    let span = root.clone();
+    // The guard empties the root-span slot when it drops, so a panic or a
+    // cancelled future does not keep the span open.
+    let slot = RootSpanSlot::hold(&span);
+    let result = command.instrument(root).await;
+    let outcome = match &result {
+        Ok(()) => "ok",
+        Err(e) if e.is::<Handoff>() => "handoff",
+        Err(_) => "error",
+    };
+    span.record("outcome", outcome);
+    // A failed command marks its root span as an error, whether or not the
+    // failure was expected. A hand-off is not a failure.
+    if outcome == "error" {
+        span.record("otel.status_code", "ERROR");
+    }
+    // Release every handle on the span, so it closes here.
+    drop(slot);
+    drop(span);
+    match result {
         Ok(()) => Ok(None),
         Err(e) => match e.downcast::<Handoff>() {
             Ok(handoff) => Ok(Some(handoff)),
@@ -213,6 +356,12 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     // once per invocation, before any command resolves a host dir, so an
     // upgraded CLI finds an existing instance rather than orphaning it.
     client::migrate_legacy_host_dirs(cli.global_args.minimal_dir.as_deref());
+    // NET-109: delete the retired proxy's certificate files once after an
+    // upgrade. The log records each deletion. Nothing prints.
+    let config_dir = crate::config::resolve_minimal_config_dir(&cli.global_args);
+    for path in paths::remove_retired_proxy_credentials(&config_dir) {
+        tracing::info!(path = %path.display(), "removed retired proxy certificate file");
+    }
 
     match cli.command {
         // A bare `min` (no subcommand) resolves-or-creates a session in a
@@ -245,6 +394,30 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
+            BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
+            BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
+            BoxCommand::Attach(args) => cmd_box_attach(&cli.global_args, args).await,
+            BoxCommand::Exec(args) => cmd_box_exec(&cli.global_args, args).await,
+            BoxCommand::Events(args) => cmd_box_events(&cli.global_args, args).await,
+            BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
+            BoxCommand::Rename(args) => cmd_box_rename(&cli.global_args, args).await,
+            BoxCommand::Prune(args) => cmd_box_prune(&cli.global_args, args).await,
+        },
+        Some(Command::Host(HostArgs { command })) => match command {
+            HostCommand::List => {
+                hosts::cmd_host_list(&cli.global_args, &mut std::io::stdout()).await
+            }
+            HostCommand::Show(args) => {
+                hosts::cmd_host_show(&cli.global_args, &args, &mut std::io::stdout()).await
+            }
+            HostCommand::Stop(args) => {
+                hosts::cmd_host_stop(&cli.global_args, &args, &mut std::io::stdout()).await
+            }
+        },
+        Some(Command::Provider(ProviderArgs { command })) => match command {
+            ProviderCommand::List(args) => {
+                hosts::cmd_provider_list(&cli.global_args, &args, &mut std::io::stdout())
+            }
         },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
@@ -281,6 +454,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // not held across the daemon handshake, where a spawned task's
         // logging may need stdout too.
         Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
+        Some(Command::UpdateCheck(args)) => {
+            crate::update_check::cmd_update_check(&cli.global_args, args).await
+        }
         #[cfg(debug_assertions)]
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         #[cfg(debug_assertions)]
@@ -291,9 +467,12 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             );
             Ok(())
         }
-        Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}")),
+        // An `Other` error keeps its type, so `failure_exit_code` in
+        // `main.rs` finds an `InitRefusal` and exits with its code.
+        Some(Command::Init(args)) => cmd_init(&cli.global_args, args).await.map_err(|e| match e {
+            mctx::Error::Other(e) => e,
+            e => anyhow::anyhow!("{e}"),
+        }),
         Some(Command::Add(args)) => cmd_add(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
@@ -1226,6 +1405,47 @@ pub(crate) async fn upload_and_finalize(
 /// tears it down.
 pub(crate) struct ActivationInterrupt {
     task: tokio::task::JoinHandle<()>,
+    /// The id a `host_ip` registration handed back, which the handler's
+    /// withdrawal carries ([`Self::withdraw_host_ip_name_as`]).
+    host_ip_box_id: std::sync::Arc<std::sync::OnceLock<minimald_rpc::BoxId>>,
+}
+
+impl ActivationInterrupt {
+    /// Gives the handler the id a `host_ip` registration handed back. A
+    /// `host_ip` record carries no address pair, so without the id a
+    /// Ctrl-C withdraws nothing, and the host keeps the box's name until
+    /// its bound expires. With it, the handler withdraws the name as the
+    /// activation's own failure paths do (BEP-082).
+    pub(crate) fn withdraw_host_ip_name_as(&self, box_id: minimald_rpc::BoxId) {
+        let _ = self.host_ip_box_id.set(box_id);
+    }
+}
+
+/// The Ctrl-C handler's withdrawal for the aborted box's `record`: its row
+/// by the pair off the record, or a `host_ip` box's name by the id its
+/// registration handed back (`slot`). A `host_ip` record has no pair, so
+/// the id is what withdraws its name (BEP-082).
+///
+/// A `host_ip` box is retired first. The handler exits the process, so
+/// the activation's `HostIpResidency` never drops. Without this retire,
+/// the box's rules and its lane declaration stay in the host gate's
+/// union (NET-085, BEP-083).
+async fn withdraw_interrupted_box(
+    control_sock: Option<PathBuf>,
+    record: &boxes::Record,
+    slot: &std::sync::OnceLock<minimald_rpc::BoxId>,
+) {
+    if record.network == boxes::NetworkMode::HostNet {
+        retire_host_ip_box_with_vm_host(control_sock.clone(), record.id, HostIpBoxEnd::Destroyed)
+            .await;
+    }
+    withdraw_box_row(
+        control_sock,
+        record.name.as_deref(),
+        record.box_addresses,
+        slot.get().copied(),
+    )
+    .await;
 }
 
 impl Drop for ActivationInterrupt {
@@ -1248,6 +1468,8 @@ pub(crate) fn arm_activation_interrupt(
     // flag would leave exactly that host's box row published.
     let control_sock =
         vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+    let host_ip_box_id = std::sync::Arc::new(std::sync::OnceLock::new());
+    let withdrawal_id = std::sync::Arc::clone(&host_ip_box_id);
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.
@@ -1276,18 +1498,15 @@ pub(crate) fn arm_activation_interrupt(
                 .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
                 .await;
             if let Some(record) = row {
-                withdraw_box_row(
-                    control_sock,
-                    record.name.as_deref(),
-                    record.box_addresses,
-                    None,
-                )
-                .await;
+                withdraw_interrupted_box(control_sock, &record, &withdrawal_id).await;
             }
         }
         std::process::exit(130);
     });
-    ActivationInterrupt { task }
+    ActivationInterrupt {
+        task,
+        host_ip_box_id,
+    }
 }
 
 /// The user-facing text for a session that could not be composed, by
@@ -1417,6 +1636,115 @@ impl SessionRpc {
 #[cfg(test)]
 mod tests {
     use crate::{SessionRpc, session_rpc_failed};
+
+    /// BEP-082: a Ctrl-C during a `host_ip` activation withdraws the box's
+    /// name with the id its registration handed back, as the activation's
+    /// failure paths do. The record has no address pair, so without the id
+    /// the handler withdraws nothing and the host keeps the name. The box
+    /// is retired first: the handler exits the process, so nothing else
+    /// takes its rules and its lane declaration out of the host gate.
+    #[tokio::test]
+    async fn interrupted_host_ip_activation_withdraws_its_name_by_id() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let control_sock = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&control_sock).unwrap();
+        // Accepts each exchange and answers it by its verb, until the
+        // withdrawal, which is the handler's last exchange.
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: minimald_rpc::BoxControlRequest =
+                    serde_json_lenient::from_str(line.trim())
+                        .expect("the request is the wire type");
+                let (answer, last) = match &request {
+                    minimald_rpc::BoxControlRequest::RetireHostIpBox(retire) => (
+                        serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::HostIpBox {
+                            session_id: retire.session_id,
+                            resident: false,
+                        })
+                        .unwrap(),
+                        false,
+                    ),
+                    _ => (
+                        "{\"switch_address\":\"0.0.0.0\",\"loopback_address\":\"0.0.0.0\"}"
+                            .to_string(),
+                        true,
+                    ),
+                };
+                reader
+                    .get_mut()
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .unwrap();
+                requests.push(request);
+                if last {
+                    return requests;
+                }
+            }
+        });
+        let minted = minimald_rpc::BoxId::from_bytes(*b"0123456789abcdef");
+        let guard = super::ActivationInterrupt {
+            task: tokio::spawn(async {}),
+            host_ip_box_id: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+        guard.withdraw_host_ip_name_as(minted);
+        let record = boxes::Record {
+            id: boxes::SessionId::from_bytes(minted.to_bytes()),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: boxes::NetworkMode::HostNet,
+            policy: boxes::BoxPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+                quic443: None,
+            },
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            box_addresses: None,
+            task_addresses: Vec::new(),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
+            attrs: Default::default(),
+        };
+        super::withdraw_interrupted_box(Some(control_sock), &record, &guard.host_ip_box_id).await;
+        let requests = server.join().unwrap();
+        let [retire, withdraw] =
+            <[_; 2]>::try_from(requests).expect("the handler sends a retire, then a withdrawal");
+        let minimald_rpc::BoxControlRequest::RetireHostIpBox(retire) = retire else {
+            panic!("the box is retired before its name is withdrawn: {retire:?}");
+        };
+        assert_eq!(
+            retire.session_id, record.id,
+            "the retire is for the aborted box"
+        );
+        let minimald_rpc::BoxControlRequest::Withdraw(request) = withdraw else {
+            panic!("the name goes by the withdraw verb: {withdraw:?}");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(
+            request.box_id,
+            Some(minted),
+            "the withdrawal carries the id"
+        );
+        assert_eq!(request.switch_address, std::net::Ipv4Addr::UNSPECIFIED);
+    }
 
     /// An RPC refused because the daemon was shutting down — the `min stop`
     /// race — surfaces as plain language, not the raw RPC chain. The
@@ -1607,6 +1935,64 @@ mod handoff_tests {
         closed.0.lock().unwrap().clone()
     }
 
+    /// Records each span's `otel.status_code`, if it gets one, in the order
+    /// the spans are created.
+    #[derive(Clone, Default)]
+    struct Statuses(Arc<Mutex<StatusLog>>);
+
+    #[derive(Default)]
+    struct StatusLog {
+        statuses: Vec<Option<String>>,
+        /// The index in `statuses` of each open span, by span id.
+        by_id: std::collections::HashMap<u64, usize>,
+    }
+
+    struct StatusField(Option<String>);
+
+    impl tracing::field::Visit for StatusField {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "otel.status_code" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statuses {
+        fn on_new_span(
+            &self,
+            _: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: Context<'_, S>,
+        ) {
+            let mut log = self.0.lock().unwrap();
+            let at = log.statuses.len();
+            log.statuses.push(None);
+            log.by_id.insert(id.into_u64(), at);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: Context<'_, S>,
+        ) {
+            let mut field = StatusField(None);
+            values.record(&mut field);
+            let mut log = self.0.lock().unwrap();
+            if let (Some(status), Some(&at)) = (field.0, log.by_id.get(&id.into_u64())) {
+                log.statuses[at] = Some(status);
+            }
+        }
+    }
+
+    impl Statuses {
+        fn all(&self) -> Vec<Option<String>> {
+            self.0.lock().unwrap().statuses.clone()
+        }
+    }
+
     /// The TEL-031 contract: by the time `run` holds a hand-off (and so before
     /// it flushes and exits or raises), the `cmd` span and the spans under it
     /// have closed, which is what puts them in the exporter and the spool.
@@ -1709,20 +2095,29 @@ mod handoff_tests {
     }
 
     /// A command that returns, or fails, hands nothing off: its error comes
-    /// back as it was, and the span still ends.
+    /// back as it was, and the span still ends. Only the failed command's
+    /// span carries the ERROR status; a hand-off is not a failure.
     #[tokio::test]
     async fn ordinary_outcomes_pass_through() {
         let closed = Closed::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
-        let ok = run_in_root(tracing::info_span!("cmd"), async { Ok(()) }).await;
+        let statuses = Statuses::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(closed.clone())
+                .with(statuses.clone()),
+        );
+        let cmd = || tracing::info_span!("cmd", otel.status_code = tracing::field::Empty);
+        let ok = run_in_root(cmd(), async { Ok(()) }).await;
         assert!(matches!(ok, Ok(None)));
-        let err = run_in_root(tracing::info_span!("cmd"), async {
-            Err(anyhow::anyhow!("no session found"))
-        })
-        .await
-        .unwrap_err();
+        let err = run_in_root(cmd(), async { Err(anyhow::anyhow!("no session found")) })
+            .await
+            .unwrap_err();
         assert_eq!(format!("{err:#}"), "no session found");
-        assert_eq!(closed_names(&closed), ["cmd", "cmd"]);
+        let handoff = run_in_root(cmd(), async { Err(Handoff::Exit(1).into()) })
+            .await
+            .unwrap();
+        assert!(matches!(handoff, Some(Handoff::Exit(1))), "{handoff:?}");
+        assert_eq!(closed_names(&closed), ["cmd", "cmd", "cmd"]);
+        assert_eq!(statuses.all(), [None, Some("ERROR".to_owned()), None]);
     }
 }

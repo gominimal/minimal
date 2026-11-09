@@ -114,6 +114,13 @@ pub trait Process: Send + 'static {
     /// Request termination. Idempotent. Returns immediately — the
     /// caller is expected to follow up with `wait` for the actual exit.
     fn start_kill(&mut self) -> io::Result<()>;
+
+    /// A line for the client's stderr about why the process ended, once
+    /// `wait` has returned. `None` (the default) when the process's own
+    /// output says all there is: it ran and exited, or was signalled.
+    fn exit_notice(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Handles a request to run a program on an SSH channel.
@@ -297,6 +304,42 @@ pub(crate) async fn handle_exec(
             });
             return Ok(());
         }
+        // BOX-153: a box whose stored spec sets `[io] exec_enabled = false`
+        // takes no command, in any mode.
+        let gate = match ExecBox::of(&session_handle).instrument(span.clone()).await {
+            Ok(exec_box) => exec_box.exec_gate(),
+            Err(e) => {
+                tracing::warn!(%session_id, error = %e, "execution request rejected: the box is gone");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+        };
+        if gate != ExecGate::Enabled {
+            let label = record
+                .name
+                .clone()
+                .unwrap_or_else(|| session_id.to_string());
+            let message = if gate == ExecGate::Disabled {
+                tracing::warn!(
+                    parent: &span,
+                    %session_id,
+                    "execution request refused: the box's spec sets io.exec_enabled = false"
+                );
+                exec_disabled_message(&label)
+            } else {
+                tracing::warn!(
+                    parent: &span,
+                    %session_id,
+                    "execution request refused: the box's stored spec cannot be read"
+                );
+                exec_spec_unreadable_message(&label)
+            };
+            session.channel_success(id)?;
+            spawn(async move {
+                answer_exec(channel, b"", message.as_bytes(), EXEC_DISABLED_STATUS).await;
+            });
+            return Ok(());
+        }
         let exec_id = mint_exec_id();
         span.record("exec_id", exec_id.as_str());
         span.record("exec_mode", mode.name());
@@ -449,7 +492,7 @@ pub(crate) async fn handle_exec(
         }
         ExecRequest::ExecAttach(exec_id) => {
             session.channel_success(id)?;
-            spawn(serve_exec_attach(channel, session_id, exec_id).instrument(span));
+            spawn(serve_exec_attach(channel, session_handle, session_id, exec_id).instrument(span));
         }
         ExecRequest::ExecOutput(exec_id) => {
             session.channel_success(id)?;
@@ -462,6 +505,22 @@ pub(crate) async fn handle_exec(
     }
 
     Ok(())
+}
+
+/// The exit status of an exec that the box's spec refuses (BOX-153).
+pub(crate) const EXEC_DISABLED_STATUS: u32 = 5;
+
+/// The refusal of an exec into a box whose spec turns exec off (BOX-153).
+pub(crate) fn exec_disabled_message(box_label: &str) -> String {
+    format!("box {box_label} does not run commands: its spec sets [io] exec_enabled = false.\n")
+}
+
+/// The refusal of an exec into a box whose stored spec cannot be read or
+/// parsed, so the exec gate fails closed (BOX-153).
+pub(crate) fn exec_spec_unreadable_message(box_label: &str) -> String {
+    format!(
+        "box {box_label} does not run commands: its stored spec cannot be read, so the daemon cannot check [io] exec_enabled.\n"
+    )
 }
 
 /// Runs an attached `min://exec`: an argv in the box with no shell, its stdio
@@ -490,11 +549,40 @@ async fn run_attached_exec(
             None
         }
     };
+    let facts = ExecFacts {
+        principal: conn_username.clone(),
+        argv: argv.clone(),
+    };
+    // BOX-151: an attached exec is known by its id while it runs, so a stop
+    // or a wait by that id finds it. It has no transcript. The path only
+    // ties the entry to the box's directory, which a reap removes.
+    // The stop is registered before the entry, and both before
+    // `exec_started`. A stop of the id that a follower of the events sees
+    // first then finds the exec and ends it (BOX-151).
+    let stop = register_stop(&exec_id);
+    let entry = exec_box.as_ref().map(|exec_box| {
+        let transcript = boxes::store::exec_transcript_path(&exec_box.dir, exec_id.as_str());
+        if let Some(dir) = transcript.parent()
+            && let Err(error) = std::fs::create_dir_all(dir)
+        {
+            tracing::warn!(%exec_id, %error, "exec: could not create the box's execs directory");
+        }
+        let entry = Arc::new(ExecEntry::new(
+            exec_id.clone(),
+            exec_box.record.id,
+            ExecMode::Attached,
+            transcript,
+            None,
+        ));
+        register_exec(Arc::clone(&entry));
+        entry
+    });
     if let Some(exec_box) = &exec_box {
         exec_box.write_event(
             boxes::events::BoxEventType::ExecStarted,
             &exec_id,
             ExecMode::Attached,
+            &facts,
             None,
         );
     }
@@ -512,9 +600,11 @@ async fn run_attached_exec(
             },
             timeout,
             timed_out: Arc::clone(&timed_out),
+            stop,
         },
     };
     let status = task.run(channel).await;
+    forget_stop(&exec_id);
     let reason = if timed_out.load(Ordering::SeqCst) {
         ExecExitReason::Timeout
     } else {
@@ -529,8 +619,12 @@ async fn run_attached_exec(
             boxes::events::BoxEventType::ExecExited,
             &exec_id,
             ExecMode::Attached,
+            &facts,
             Some(exit),
         );
+    }
+    if let Some(entry) = &entry {
+        entry.finish(exit);
     }
     tracing::info!(
         %exec_id,
@@ -564,6 +658,10 @@ async fn start_and_answer(session: BoxHandle, channel: Channel<Msg>, request: Ma
         conn_username,
         extra_env,
     } = request;
+    let facts = ExecFacts {
+        principal: conn_username.clone(),
+        argv: argv.clone(),
+    };
     let started = async {
         let exec_box = ExecBox::of(&session).await?;
         let host = session
@@ -581,6 +679,7 @@ async fn start_and_answer(session: BoxHandle, channel: Channel<Msg>, request: Ma
                 exec_box,
                 timeout,
                 winsize,
+                facts,
             },
             command,
             true,

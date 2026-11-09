@@ -18,6 +18,7 @@ regex.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
+memchr.workspace = true
 moka.workspace = true
 tracing.workspace = true
 mlog.workspace = true

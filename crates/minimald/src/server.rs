@@ -845,6 +845,12 @@ impl ServerStateHandle {
     /// compile from it, not the configured port the daemon may have moved off.
     #[cfg(target_os = "linux")]
     pub(crate) async fn set_switch_hostname_proxy_port(&self, port: u16) {
+        // NET-162: from the bind on, no host exposure reaches this port.
+        crate::net::switch::MinimalListeners::daemon().hold(crate::net::switch::MinimalListener {
+            port,
+            protocol: None,
+            name: crate::net::switch::HOSTNAME_PROXY_LISTENER,
+        });
         let switch = Arc::clone(&self.0.lock().await.net_switch);
         let stranded = switch.lock().await.set_hostname_proxy_port(Some(port));
         if stranded > 0 {
@@ -884,6 +890,12 @@ impl ServerStateHandle {
     /// Records the port the box-zone answerer actually listens on (UDP),
     /// once its startup has bound (and, in a microVM, published) it.
     pub(crate) async fn set_zone_answerer_port(&self, port: u16) {
+        // NET-162: from the bind on, no host exposure reaches this port.
+        crate::net::switch::MinimalListeners::daemon().hold(crate::net::switch::MinimalListener {
+            port,
+            protocol: None,
+            name: crate::net::switch::ANSWERER_LISTENER,
+        });
         self.0.lock().await.zone_answerer_port = Some(port);
     }
 
@@ -1303,7 +1315,12 @@ impl Server {
             // bindings, and close correlate across the log with a grep
             // instead of manual id fields on each line.
             let conn = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let span = tracing::info_span!("conn", conn, transport = L::TRANSPORT);
+            let span = tracing::info_span!(
+                "conn",
+                conn,
+                transport = L::TRANSPORT,
+                outcome = tracing::field::Empty
+            );
             span.in_scope(|| tracing::info!(?peer, "accepted connection"));
             // The handshake runs in the spawned task, not here: awaiting it in
             // the loop would serialize accepts behind each client's id line,
@@ -1325,26 +1342,66 @@ impl Server {
                                 // A handshake failure must not take the daemon
                                 // down — in the guest minimald is pid-1. Drop
                                 // this connection and keep accepting.
-                                handshake_span.in_scope(|| {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "SSH handshake failed; dropping connection"
-                                    )
-                                });
+                                //
+                                // A peer that hung up before the id exchange is
+                                // the common case, not a failure: `min` probes
+                                // the socket that way before every command
+                                // (autospawn's liveness check), and a client
+                                // that gave up on a stalled daemon looks the
+                                // same. At WARN they would hide the
+                                // handshakes that did fail.
+                                if closed_by_peer(&e) {
+                                    handshake_span.record("outcome", "closed_before_id");
+                                    handshake_span.in_scope(|| {
+                                        tracing::debug!(
+                                            error = %e,
+                                            "peer closed before the SSH id exchange; dropping connection"
+                                        )
+                                    });
+                                } else {
+                                    handshake_span.record("outcome", "handshake_failed");
+                                    handshake_span.in_scope(|| {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "SSH handshake failed; dropping connection"
+                                        )
+                                    });
+                                }
                                 return;
                             }
                             Err(_) => {
+                                handshake_span.record("outcome", "handshake_timeout");
                                 handshake_span.in_scope(|| {
                                     tracing::warn!("SSH handshake timed out; dropping connection")
                                 });
                                 return;
                             }
                         };
+                    // `run_stream` returns once the SSH ids are exchanged; key
+                    // exchange still runs inside `session_fut`. The outcome
+                    // says only that much until the session ends.
+                    handshake_span.record("outcome", "id_exchanged");
                     // Log session errors instead of silently dropping the
                     // spawned future, so a failed handshake is visible on any
                     // transport.
-                    match session_fut.await {
+                    let ended = session_fut.await;
+                    let past_kex = conn_hnd.past_kex().await;
+                    let outcome = if conn_hnd.authenticated().await {
+                        "session"
+                    } else if !past_kex && ended.as_ref().is_err_and(|e| !closed_by_peer(e)) {
+                        "handshake_failed"
+                    } else {
+                        "closed_before_auth"
+                    };
+                    handshake_span.record("outcome", outcome);
+                    match ended {
                         Ok(()) => tracing::info!("connection closed"),
+                        // A peer that sent its id and then failed key exchange
+                        // failed its handshake, as one that failed before the
+                        // id did.
+                        Err(e) if !past_kex && !closed_by_peer(&e) => {
+                            tracing::warn!(error = %e, "SSH handshake failed; dropping connection");
+                        }
                         Err(e) => {
                             // Abrupt hangups are how the CLI's oneshot RPC
                             // connections and Ctrl-C'd attaches normally end;
@@ -1458,7 +1515,12 @@ async fn close_connection(state: &ServerStateHandle, conn: &ConnectionHandle) {
     let created = conn.take_created_sessions().await;
     #[cfg(test)]
     reap_seam::park(&created).await;
-    reap_unfinalized_sessions(state, created).await;
+    // Only a connection that created a session has anything to reap; the
+    // span is not worth opening for the rest (every probe and every plain
+    // RPC connection).
+    if !created.is_empty() {
+        reap_unfinalized_sessions(state, created).await;
+    }
     conn.release_liveness().await;
 }
 
@@ -2517,9 +2579,9 @@ pub(crate) async fn drive_proxy_until_serving(
                 // answer for, not this daemon's to out-wait. The VM host
                 // holds the reservation and owns the retry (a redraw hands
                 // a fresh port, or the start fails naming this one), and
-                // the report is how it hears the failure; a backoff loop
-                // here would leave the VM up with no hostname proxy, which
-                // the host forbids. `publish_on_host` is the in-VM flag, so
+                // the report is how it hears the failure. The VM host
+                // daemon then starts the VM with its proxy down and retries
+                // the port itself. `publish_on_host` is the in-VM flag, so
                 // the report has a listener exactly when it is sent; a
                 // native daemon never reaches this arm at all.
                 if publish_on_host && failure.port_taken && !choice.reselects_when_publish_refused()
@@ -2532,10 +2594,12 @@ pub(crate) async fn drive_proxy_until_serving(
                         %failure.report,
                         "the host holds the hostname proxy's port; reporting the terminal publish failure to the VM host daemon"
                     );
-                    // Recorded first, reported in the background: the drive
-                    // ends here and never waits on the report's vsock dial,
-                    // which can take seconds per try.
-                    proxy.record_unavailable(&state, failure.report).await;
+                    // The VM host daemon records the cause, naming the
+                    // holder it can see, and its held-port watcher owns the
+                    // retry (NET-021). The guest records none, so its note
+                    // never stands in for that cause. Reported in the
+                    // background: the drive ends here and never waits on the
+                    // report's vsock dial, which can take seconds per try.
                     crate::traced::spawn(report_proxy_port_held(host_port));
                     return;
                 }

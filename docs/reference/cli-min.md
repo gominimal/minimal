@@ -180,6 +180,11 @@ allow-all addresses: the box reaches every address directly, and the names
 bound nothing. Activation does not warn about it. Add `--allow-subnets` to
 bound the addresses there.
 
+Known issue: own-address boxes take their addresses from 100.64.0.0/16,
+a block inside 100.64.0.0/10. Some VPNs, such as Tailscale, use addresses in
+100.64.0.0/10. While such a VPN is up, a box's connections to addresses the
+VPN routes in 100.64.0.0/16 can fail. No setting changes the range a box uses.
+
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
 path, resolving that directory to a session is ambiguous, so a bare `min` there
@@ -383,9 +388,10 @@ the lane's whole reach. The gate still refuses everything else the box
 sends to the proxy's address. A box without the lane omits the row, so
 the missing row means the box runs without a lane.
 
-The gate that admits the lane sits only in front of own-address boxes. A
-box in any other mode still prints the row it declared, marked as not in
-effect, with the box's mode named:
+The lane takes effect with `--network own_ip`, and with `--network
+host_ip` on a host that runs boxes in a VM. Every other box still prints
+the row it declared, with the `(not in effect: <mode> box)` mark. This
+example is a `host_ip` box on a host that runs boxes natively:
 
 ```
 egress
@@ -469,7 +475,8 @@ shape. A client written against the earlier document ignores them. A
 client that reads them finds a value in every `ingress` object. The
 document also carries `credentialed_upstream`, an object, when the box
 declared a lane, in any network mode. Its `effective` field is `true`
-for an own-address box and `false` for any other, the text row's
+for an `own_ip` box, and for a `host_ip` box on a host that runs boxes in
+a VM. It is `false` for any other box, the text row's
 `(not in effect: …)` mark. The document leaves the key out when the box
 did not declare a lane, so a missing key means the box runs without one.
 
@@ -646,8 +653,9 @@ The script holds only what this host is missing from:
   range on macOS
 - the classifier tree that enforces a host-address box's egress declaration.
   The step keeps a root-owned copy of itself under `/usr/local/lib/minimal`.
-  A systemd boot unit re-installs the tree after a reboot. A path unit places
-  the daemon's listener in its leaf on every daemon start. An un-enrolled
+  A systemd boot unit re-installs the tree after a reboot. On every start the
+  daemon connects to a systemd socket unit at `/run/minimald-place.sock`, and
+  the service it starts places the daemon in its leaf. An un-enrolled
   host does not need a source identity for it. The classifier translates
   nothing until an association adds the reserved addresses
 - membership of the `kvm` group, only when the configured provider is the
@@ -793,7 +801,7 @@ Prints important directories and file paths for debugging.
 ### `bug`
 
 ```
-min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--endpoint <URL>]]
+min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--security] [--endpoint <URL>]]
 ```
 
 Collects a diagnostic bundle (logs, state, config) to send to the minimal
@@ -862,11 +870,25 @@ starts it there. The report URL does not contain the delete token, so
 you can share the URL. To remove the bundle sooner, run the `Delete:`
 line. See [`diag`](#diag).
 
+`--security` sends the bundle as a security report, for a suspected
+vulnerability. It needs `--upload`. Only portal owners can read the
+report. Its description is never public, it is never filed to public
+GitHub, and the results go to a private channel. `bug` prints these
+lines instead:
+
+```
+Received privately as a security report. Only the minimal team's portal owners can read it.
+Receipt: https://agents.minimal.farm/diag/<id>
+That page only confirms receipt. It shows nothing else and will not change.
+Expires: <date>
+Delete:  min diag delete <id> <token>
+```
+
 ### `diag`
 
 ```
 min diag collect [<bug options>]
-min diag upload <PATH> [--context <TEXT>] [--endpoint <URL>]
+min diag upload <PATH> [--context <TEXT>] [--security] [--endpoint <URL>]
 min diag delete <ID> <TOKEN> [--endpoint <URL>]
 ```
 
@@ -875,7 +897,8 @@ options.
 
 `diag upload` sends a bundle that you collected earlier. Use it for a
 bundle someone gave you, or for one you collected while the portal was
-unreachable. It prints the same lines as `bug --upload`.
+unreachable. It prints the same lines as `bug --upload`, and takes
+`--security` the same way.
 
 `diag delete` deletes an uploaded bundle before it expires. Give it the
 id and the delete token that the upload printed. The portal deletes the

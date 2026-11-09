@@ -217,6 +217,13 @@ wordmark() {
         "$b" "$rst" "$dim" "$sep" "$rst" >&2
 }
 
+# The installed min's daily update check (inbox#589) stays out of every `min`
+# this script runs: the probe, finalize-install and the daemon stops run
+# before the closing card discloses the check, so they mint no install id,
+# send nothing and print nothing.
+MINIMAL_UNDER_INSTALLER=1
+export MINIMAL_UNDER_INSTALLER
+
 # --- Mode dispatch: install (default) vs uninstall -------------------------
 
 # `--uninstall` as the FIRST argument switches to uninstall mode; it is parsed
@@ -530,19 +537,31 @@ maybe_remove_finalize_install() {
         # The classifier's units, the boot unit first: it re-runs the step at
         # every boot, so left enabled it lays the tree and the table out again.
         # They are disabled before their files go, and before the tree's line.
+        # Only the units whose files are there are named: systemctl refuses a
+        # whole call that names a unit this host does not have, and an install
+        # carries either the placement socket pair or the earlier path pair.
         _cls_rm=
         _cls_found=
-        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
+        _cls_units=
+        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.socket /etc/systemd/system/minimald-place@.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
             _cls_rm="$_cls_rm $(shq "$_fi_root$_cls_p")"
             if [ -z "$_cls_found" ] && [ -e "$_fi_root$_cls_p" ]; then
                 _cls_found="$_cls_p"
             fi
+            case "$_cls_p" in
+                /etc/systemd/system/*@.service) ;;
+                /etc/systemd/system/*)
+                    if [ -e "$_fi_root$_cls_p" ]; then
+                        _cls_units="$_cls_units ${_cls_p##*/}"
+                    fi
+                    ;;
+            esac
         done
         if [ -n "$_cls_found" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the classifier units ($_cls_found)"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service; sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
+}      ${_cls_units:+sudo systemctl disable --now$_cls_units; }sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
         fi
         # The QUIC block helper and its sudoers rule, an item of their own.
         # `min finalize-install --undo` does not remove them, so a yes
@@ -1519,6 +1538,25 @@ remove_moved_minzoned
 # platform, replacing the prior record read during the loop. Enables a future
 # uninstall and surfaces prefix drift across XDG changes.
 mkdir -p "$state_dir"
+# The install's own description, for the installed min's daily update check
+# (inbox#589): the channel this run resolved, how it was installed, and the
+# pointer it installed, which is what "up to date" compares against.
+# Written whole then renamed, and recorded so --uninstall removes it.
+# A --version install followed no channel: it is `pinned`, which the check
+# answers with nothing, so it is never told a channel moved on. `bin` names
+# the binary the file describes: another min on this machine (a development
+# build, a copy in another prefix) is not this install and ignores it. A
+# literal string, so a backslash in the path is kept; a path with a `'` makes
+# the file unreadable, and that min then reports as a `source` build.
+if [ "$version_set" -eq 1 ]; then
+    install_channel=pinned
+else
+    install_channel="$target"
+fi
+printf 'channel = "%s"\nmethod = "installer"\nkey = "%s"\nbin = '"'"'%s'"'"'\n' \
+    "$install_channel" "$VERSION" "$bindir/min" >"$state_dir/install.toml.tmp"
+mv -f "$state_dir/install.toml.tmp" "$state_dir/install.toml"
+record_generated install-metadata "$state_dir/install.toml"
 mv -f "$records" "$prev_record"
 
 # --- Hook the current shell's rc file --------------------------------------
@@ -1719,6 +1757,21 @@ say "  $mark ${b}min init$rst                          ${dim}declare this projec
 say "  $mark ${b}min$rst                               ${dim}build the sandbox and step inside$rst"
 say ""
 say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
+# The update check's disclosure (inbox#589), for every install: this card is
+# the only one an install without a terminal (an agent's, a script's) reads,
+# so it lists every field the request sends, as the CLI's own disclosure
+# does, and names the switch. A channel install is told when its channel
+# moves on; a pinned (--version) one is counted but never told, since no
+# channel pointer applies to it.
+if [ "$version_set" -eq 1 ]; then
+    say "  ${dim}min reports this install once a day (no release notices for --version), sending its channel$rst"
+    say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
+else
+    say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
+    say "  ${dim}architecture, install method and a random install id to update.minimal.dev.$rst"
+fi
+say "  ${dim}Off: MINIMAL_TELEMETRY=0$rst"
+say "  ${dim}docs.minimal.dev/reference/telemetry#update-check$rst"
 say ""
 }
 

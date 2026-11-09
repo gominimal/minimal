@@ -22,6 +22,7 @@
 #         [--ct-mark-mask 0x30000000]
 #         [--cohort-address ADDR --node-plane-address ADDR]
 #         [--cohort-dscp 1-63]                          # VM guest only
+#         [--proxy-lane ADDR:PORT]                      # VM guest only
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --user NAME --place-listener SOCK
 #   sudo scripts/install-host-classifier.sh --uninstall
@@ -36,9 +37,9 @@
 # because the common ancestor of the cgroup the daemon starts in and the
 # slice is the root-owned hierarchy root. --place-listener makes the same
 # placement for every process of the delegated account that holds the unix
-# socket at SOCK — the daemon's own listener — so a manager-held path unit
-# watching that socket (`min finalize-install` installs one) places each
-# daemon the account starts, and no restart needs a root step of its own.
+# socket at SOCK — the daemon's own listener — so a manager-held socket unit
+# the daemon connects to at start (`min finalize-install` installs one)
+# places each daemon the account starts, with no root step per restart.
 #
 # The install also lays out the cohort's two subtrees, boxes/deny and
 # boxes/allow — a box's declaration, not its session name, decides which
@@ -118,6 +119,13 @@ readonly QUIC443_LEAF_SET=quic443_blocked_leaves
 readonly QUIC443_HELPER=${MINIMAL_OVERRIDE_QUIC443_HELPER:-/usr/local/lib/minimal/quic443-leaf}
 readonly QUIC443_SUDOERS=${MINIMAL_OVERRIDE_QUIC443_SUDOERS:-/etc/sudoers.d/minimal-quic443-leaf}
 readonly quic443_helper_overridden=${MINIMAL_OVERRIDE_QUIC443_HELPER:+1}
+# The set of box leaves whose sockets may open a TCP connection to the Box
+# Egress Proxy's address (BEP-083): the own leaf of each resident
+# host-address box that declares a credentialed upstream. Only a VM guest's
+# render, with --proxy-lane, declares it. The daemon adds and removes a leaf
+# through the same helper, with its `lane-add` and `lane-remove` verbs
+# (PROXY_LANE_SET in crates/minimald/src/net/classifier.rs).
+readonly PROXY_LANE_SET=bep_lane_leaves
 # The name the loaded table and its presence marker share: the daemon probes
 # $tree_root/$TABLE_MARKER (read-only, no CAP_NET_ADMIN) because listing the
 # table itself needs the very capability that loaded it.
@@ -201,6 +209,12 @@ node_plane_address=
 # from the guest's one address. Only the guest's own render passes it. A
 # native host renders no DSCP rule and leaves the field alone.
 cohort_dscp=
+# The Box Egress Proxy's listener, as ADDR and PORT (BEP-083). Only the VM
+# guest's render passes it. A box in the boxes subtree whose own leaf is not
+# in $PROXY_LANE_SET is then refused a new TCP connection to ADDR at PORT or
+# at 443. A native host renders no such rule.
+proxy_lane_address=
+proxy_lane_port=
 # The unix socket --place-listener reads the daemon's pid from: every
 # process of the delegated account holding it is placed in the daemon leaf.
 listener=
@@ -261,6 +275,24 @@ while [ $# -gt 0 ]; do
             cohort_dscp=$2
             shift 2
             ;;
+        --proxy-lane)
+            [ $# -ge 2 ] || die "--proxy-lane needs an address and a port, as ADDR:PORT"
+            proxy_lane_address=${2%:*}
+            proxy_lane_port=${2##*:}
+            case "$proxy_lane_address" in
+                ''|*[!0-9.]*|*..*|.*|*.)
+                    die "--proxy-lane needs an IPv4 address and a port, as ADDR:PORT, got: $2" ;;
+            esac
+            [ "$(printf '%s' "$proxy_lane_address" | awk -F. '{ ok = NF == 4; for (i = 1; i <= NF; i++) if ($i > 255) ok = 0; print ok }')" = 1 ] ||
+                die "--proxy-lane needs an IPv4 address and a port, as ADDR:PORT, got: $2"
+            case "$proxy_lane_port" in ''|*[!0-9]*)
+                die "--proxy-lane needs a numeric port, as ADDR:PORT, got: $2" ;;
+            esac
+            if [ "$proxy_lane_port" -lt 1 ] || [ "$proxy_lane_port" -gt 65535 ]; then
+                die "--proxy-lane needs a port from 1 to 65535, got: $2"
+            fi
+            shift 2
+            ;;
         --ct-mark-mask)
             [ $# -ge 2 ] || die "--ct-mark-mask needs a mask"
             ct_mark_mask=$2
@@ -288,7 +320,7 @@ while [ $# -gt 0 ]; do
         # The header above this line is the usage. Two explicit strips, not
         # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
         # script's own tests run on macOS's /bin/sh too.
-        -h|--help)   sed -n '2,87p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+        -h|--help)   sed -n '2,88p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -529,8 +561,8 @@ readonly PROC=${MINIMAL_OVERRIDE_PROC:-/proc}
 # place_listener — the --pid placement for every process of the delegated
 # account that holds the unix socket at $listener: the daemon's own
 # listener names the daemon without anyone having to read its pid, so the
-# manager-held path unit `min finalize-install` installs can make the
-# placement at every start the socket announces. The holders are read the
+# manager-held socket unit `min finalize-install` installs can make the
+# placement at every start the daemon asks for. The holders are read the
 # way the kernel states them — the socket's inode from net/unix, then every
 # process whose fd table carries it — never from a pidfile the account
 # could write any pid into. Only the delegated account's own processes are
@@ -542,8 +574,8 @@ readonly PROC=${MINIMAL_OVERRIDE_PROC:-/proc}
 # all — is left where it is, because moving it into the daemon's leaf would
 # lift it out of its verdict (design §4.1: a box's placement is
 # inescapable, by root's hand as much as its own). A socket nobody holds is
-# nothing to place and exits 0: the unit fires on the socket's removal too,
-# and that is not a failure.
+# nothing to place and exits 0: a request can outlive the daemon that sent
+# it, and that is not a failure.
 place_listener() {
     verify_mount
     resolve_owner
@@ -564,8 +596,8 @@ place_listener() {
     # The holders, one pass over every fd table per inode (find walks it
     # without a fork per descriptor; the unit runs this as root on every
     # start, so the scan must be cheap). A daemon that restarts while the
-    # scan runs is a holder that vanishes under it, and the manager does
-    # not watch the path while the oneshot is active, so a vanished holder
+    # scan runs is a holder that vanishes under it, and the restarted daemon
+    # asks again with a request of its own, so a vanished holder
     # is noted, never fatal, and a socket whose holder was not found is
     # looked for once more after a moment before it reads as unheld.
     holders="$(listener_holders)"
@@ -673,6 +705,9 @@ box_leaf_level() {
 # render_quic443_helper — the root-owned helper, on stdout. It takes `add`
 # or `remove` and one path, and it changes the $QUIC443_LEAF_SET set only
 # when that path is one box leaf directly under this tree's allow subtree.
+# `lane-add` and `lane-remove` change the $PROXY_LANE_SET set the same way,
+# under the same check. A table rendered without --proxy-lane has no such
+# set, and nft refuses the change.
 # It refuses every other path, so the account that may run it as root can
 # put no other cgroup in the set and run nothing else. The tree's paths and
 # the nft binary are written in at install: under sudo nothing in the
@@ -685,7 +720,9 @@ render_quic443_helper() {
 #!/bin/bash
 # Written by install-host-classifier.sh. Adds a box's own leaf to the set of
 # leaves that are refused UDP to port 443, or removes it. minimald runs this
-# with `sudo -n` while the host-address boxes block QUIC.
+# with `sudo -n` while the host-address boxes block QUIC. On a VM guest,
+# lane-add and lane-remove change the set of leaves that can connect to
+# the Box Egress Proxy's address instead.
 set -eu
 export LC_ALL=C
 HEAD
@@ -699,14 +736,18 @@ HEAD
 ' "$TABLE_NAME"
     printf 'readonly SET=%q
 ' "$QUIC443_LEAF_SET"
+    printf 'readonly LANE_SET=%q
+' "$PROXY_LANE_SET"
     cat <<'BODY'
 refuse() { printf 'error: %s
 ' "$*" >&2; exit 2; }
-[ "$#" -eq 2 ] || refuse "usage: $0 add|remove <box leaf directory>"
+[ "$#" -eq 2 ] || refuse "usage: $0 add|remove|lane-add|lane-remove <box leaf directory>"
 case "$1" in
-    add) verb=add ;;
-    remove) verb=delete ;;
-    *) refuse "refused: the first argument must be add or remove, not: $1" ;;
+    add) verb=add; set=$SET ;;
+    remove) verb=delete; set=$SET ;;
+    lane-add) verb=add; set=$LANE_SET ;;
+    lane-remove) verb=delete; set=$LANE_SET ;;
+    *) refuse "refused: the first argument must be add, remove, lane-add or lane-remove, not: $1" ;;
 esac
 leaf=$2
 name=${leaf#"$ALLOW_ROOT/"}
@@ -718,7 +759,7 @@ esac
 if [ "$verb" = add ] && { [ -L "$leaf" ] || [ ! -d "$leaf" ]; }; then
     refuse "refused: $leaf is not a directory"
 fi
-exec "$NFT" "$verb" element inet "$TABLE" "$SET" "{ \"$ALLOW_REL/$name\" }"
+exec "$NFT" "$verb" element inet "$TABLE" "$set" "{ \"$ALLOW_REL/$name\" }"
 BODY
 }
 
@@ -941,6 +982,18 @@ install_quic443_helper() {
 # VM host's gate reads the value to decide a frame from the guest's one
 # address by the box's rules, and an unmarked frame by the node plane's.
 #
+# With --proxy-lane ADDR:PORT, a VM guest's render adds the
+# $PROXY_LANE_SET set and the proxy_lane chain (BEP-083). The output chain
+# sends a new TCP connection from the boxes subtree to ADDR, at PORT or at
+# 443, to proxy_lane. That chain returns for a socket created in a box leaf
+# that is in the set, and refuses every other one with the deny chain's
+# counter, log prefix and reject. The daemon puts the own leaf of each
+# resident host-address box that declares a credentialed upstream in the
+# set, through the helper's lane-add verb. A member that declares none is
+# never in the set, and nor is the cohort's blocked leaf, so the proxy's
+# address is refused to both. The set is declared empty: only a guest
+# renders it, and a guest renders its table once, at boot.
+#
 # The ipv6_out chain refuses every IPv6 connection a box in the boxes
 # subtree opens to anything but loopback, whatever the box declares. A
 # host-address box's allow list is decided by IPv4 address rules only, and
@@ -971,6 +1024,26 @@ render_ruleset() {
         ct mark and $mask_hex == $cohort_hex oifname != \"lo\" snat ip to $cohort_address
         ct mark and $mask_hex == $node_hex oifname != \"lo\" snat ip to $node_plane_address"
     fi
+    lane_set=
+    lane_rule=
+    lane_chain=
+    if [ -n "$proxy_lane_address" ]; then
+        lane_ports="{ $proxy_lane_port, 443 }"
+        [ "$proxy_lane_port" != 443 ] || lane_ports=443
+        lane_set="
+    set $PROXY_LANE_SET {
+        typeof socket cgroupv2 level $(box_leaf_level)
+    }"
+        lane_rule="
+        ct state new ip daddr $proxy_lane_address tcp dport $lane_ports socket cgroupv2 level $(cgroup_level "$boxes_path") \"$boxes_path\" jump proxy_lane"
+        lane_chain="
+    chain proxy_lane {
+        socket cgroupv2 level $(box_leaf_level) @$PROXY_LANE_SET return
+        counter name \"$REFUSED_COUNTER\"
+        limit rate 1/second burst 4 packets log prefix \"minimal-classifier: refused \" level warn
+        reject with icmpx admin-prohibited
+    }"
+    fi
     dscp_chain=
     if [ -n "$cohort_dscp" ]; then
         dscp_chain="
@@ -997,13 +1070,13 @@ table inet $TABLE_NAME {
     }
     set $QUIC443_LEAF_SET {
         typeof socket cgroupv2 level $(box_leaf_level)$leaf_elements
-    }
+    }$lane_set
     chain output {
         type filter hook output priority filter; policy accept;
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
         socket cgroupv2 level $(cgroup_level "$quic443_blocked_path") "$quic443_blocked_path" udp dport 443 reject with icmpx port-unreachable
-        socket cgroupv2 level $(box_leaf_level) @$QUIC443_LEAF_SET udp dport 443 reject with icmpx port-unreachable
-    }
+        socket cgroupv2 level $(box_leaf_level) @$QUIC443_LEAF_SET udp dport 443 reject with icmpx port-unreachable$lane_rule
+    }$lane_chain
     chain deny_out {
         ct state established,related ct direction reply accept$carve_out_rule
         counter name "$REFUSED_COUNTER"
@@ -1193,6 +1266,10 @@ $WELL_KNOWN_MARK_RANGES
 EOF
 }
 
+# The note a conflict line carries for an iptables-nft CONNMARK whose
+# masks no iptables-save listing showed.
+readonly UNLISTED_CONNMARK="an iptables rule whose masks iptables-save did not list"
+
 # ct_mark_conflicts_in — the lines of an nftables or iptables-save listing,
 # read on stdin, whose ct-mark use touches either of the mask's two bits —
 # this step's own table's rules excepted, because a re-install replaces
@@ -1205,7 +1282,7 @@ EOF
 # value/mask pair — a mask naming a bit is a use of it, never mind which
 # side of the pair it is on.
 ct_mark_conflicts_in() {
-    awk -v a="$cohort_bit" -v b="$node_bit" -v own="$TABLE_NAME" '
+    awk -v a="$cohort_bit" -v b="$node_bit" -v own="$TABLE_NAME" -v saver="${1:-iptables}" -v unlisted="$UNLISTED_CONNMARK" '
         function bit(v, x) { return int(v / x) % 2 == 1 }
         function hex(s,  i, d, v) {
             v = 0
@@ -1216,29 +1293,160 @@ ct_mark_conflicts_in() {
             }
             return v
         }
+        # A number as either listing spells one: 0x hexadecimal or decimal.
+        # -1 for anything else.
+        function num(s) {
+            if (s ~ /^0[xX][0-9a-fA-F]+$/) return hex(substr(s, 3))
+            if (s ~ /^[0-9]+$/) return s + 0
+            return -1
+        }
+        # ct_set_writes — which of the two bits a `ct mark set` statement
+        # can change, decoded from its value: the tokens t[1..n] after "ct
+        # mark set". It sets wa and wb for the two bits, wall when it
+        # writes every bit (no mask avoids it), and stop to the index of
+        # the first token past the value. Only what a write can change is
+        # counted, so a value that keeps a bit is no use of it:
+        #   - a value read from the ct mark itself keeps every bit, then
+        #     "and K" (or "&") can change the bits outside K, and "or V",
+        #     "xor V" ("|", "^") the bits of V, where V is a constant or a
+        #     packet mark under a mask ("meta mark & M"; with no mask, every
+        #     bit);
+        #   - "mark and 0xM", the bare "mark" spelled with a word, is how
+        #     nft prints an iptables-nft CONNMARK --save-mark --nfmask 0xM
+        #     --ctmask 0xM through libxtables: libxt_CONNMARK prints that
+        #     spelling only when the two masks are equal, and the kernel
+        #     keeps every connection-mark bit outside --ctmask, so it changes
+        #     the bits of M alone. nft prints a native packet-mark read as
+        #     "meta mark" and an AND as "&", so this spelling is never one;
+        #   - any other value (a constant, "meta mark", "meta mark & M",
+        #     the bare "mark" CONNMARK --save-mark with no masks) replaces
+        #     the whole connection mark, every bit of it;
+        #   - a shift or a parenthesis is not decoded, and counts as a use
+        #     of both bits.
+        function ct_set_writes(t, n,   i, j, v) {
+            wa = 0; wb = 0; wall = 0; stop = n + 1
+            if (t[1] == "mark" && t[2] == "and" && t[3] ~ /^0[xX][0-9a-fA-F]+$/ &&
+                t[4] !~ /^(and|or|xor|&|\||\^|<<|>>)$/) {
+                v = hex(substr(t[3], 3))
+                wa = bit(v, a); wb = bit(v, b); stop = 4
+                return
+            }
+            if (!(t[1] == "ct" && t[2] == "mark")) { wall = 1; return }
+            i = 3
+            while (i <= n) {
+                if (t[i] == "and" || t[i] == "&") {
+                    v = num(t[i + 1])
+                    if (v < 0) { wa = 1; wb = 1; return }
+                    if (!bit(v, a)) wa = 1
+                    if (!bit(v, b)) wb = 1
+                    i += 2
+                } else if (t[i] == "or" || t[i] == "|" || t[i] == "xor" || t[i] == "^") {
+                    j = 0
+                    if (t[i + 1] == "meta" && t[i + 2] == "mark") j = i + 3
+                    else if (t[i + 1] == "mark") j = i + 2
+                    if (j) {
+                        v = (t[j] == "and" || t[j] == "&") ? num(t[j + 1]) : -1
+                        if (v < 0) { wall = 1; return }
+                        i = j + 2
+                    } else {
+                        v = num(t[i + 1])
+                        if (v < 0) { wa = 1; wb = 1; return }
+                        i += 2
+                    }
+                    if (bit(v, a)) wa = 1
+                    if (bit(v, b)) wb = 1
+                } else if (t[i] ~ /^(<<|>>|\(|\))$/) {
+                    wa = 1; wb = 1; return
+                } else break
+            }
+            stop = i
+        }
+        # XT_RULES names the rules whose kernel form is an xt compat target,
+        # one "family table chain handle target" per line (xt_target_rules_in),
+        # and COVERED the "family table" pairs an nf_tables iptables-save
+        # listing was read for (nft_save_tables_in).
+        BEGIN {
+            n = split(ENVIRON["XT_RULES"], rows, "\n")
+            for (r = 1; r <= n; r++) {
+                if (split(rows[r], f, " ") == 5) xt[f[1] " " f[2] " " f[3] " " f[4]] = f[5]
+            }
+            n = split(ENVIRON["COVERED"], rows, "\n")
+            for (r = 1; r <= n; r++) if (rows[r] != "") covered[rows[r]] = 1
+        }
+        # The netlink lines `nft --debug=netlink` adds: a rule header and its
+        # bracketed expressions. They are read by xt_target_rules_in, not here.
+        /^[ \t]*\[ / { next }
+        /^(ip|ip6|inet|arp|bridge|netdev) [^ ]+ [^ ]+ [0-9]+( [0-9]+)*[ \t]*$/ { next }
         # A table header names whose rules follow: everything until the next
         # header belongs to it, and this step replacing its own table is not
         # a host it must refuse to install over.
-        $1 == "table" { own_table = ($3 == own); where = "table " $2 " " $3; chain = ""; next }
+        $1 == "table" { own_table = ($3 == own); family = $2; tname = $3; where = "table " $2 " " $3; chain = ""; next }
         own_table { next }
         $1 == "chain" { chain = $2; next }
         # iptables-save: "*mangle" opens a table, "-A CHAIN" names a rule.
-        /^\*/ { where = "iptables table " substr($1, 2); chain = ""; next }
+        /^\*/ { where = saver " table " substr($1, 2); chain = ""; next }
+        # A rule whose kernel form is an xt compat target: nft prints it
+        # through libxtables, and that text is not what the kernel runs (it
+        # drops a CONNMARK --ctmask, or names no bits at all for a target
+        # libxtables cannot translate). Its masks are read from the
+        # iptables-save listing of its family instead, which spells them
+        # out, so the nft line is skipped where that listing covers its
+        # table. Where none does, a CONNMARK is refused whatever its nft
+        # text says: this step cannot see which bits it keeps, so it fails
+        # closed, as if the rule wrote every bit.
+        # The netlink form names the target by the handle of the rule. Without
+        # it, the nft text still names a CONNMARK libxtables could not
+        # translate ("xt target CONNMARK"); one it could translate is
+        # decoded from that text below, which is exact for it because
+        # libxtables prints a masked save only when its two masks agree.
+        family != "" && (/ # handle [0-9]+$/ || /xt target "?CONNMARK/) {
+            target = ""
+            if ($0 ~ / # handle [0-9]+$/) {
+                key = family " " tname " " chain " " $NF
+                if (key in xt) target = xt[key]
+            }
+            if (target == "" && $0 ~ /xt target "?CONNMARK/) target = "CONNMARK"
+            if (target != "") {
+                if ((family " " tname) in covered) next
+                if (target == "CONNMARK") {
+                    line = $0
+                    sub(/^[ \t]+/, "", line)
+                    sub(/ # handle [0-9]+$/, "", line)
+                    printf "  %s, chain %s: %s (%s)\n", where, chain, line, unlisted
+                    next
+                }
+            }
+        }
         /ct mark|CONNMARK|connmark/ {
             line = $0
             sub(/^[ \t]+/, "", line)
+            sub(/ # handle [0-9]+$/, "", line)
             hit = 0
             whole = 0
             if ($1 == "-A") chain = $2
             # A write with no explicit mask sets every bit of the connection
             # mark, whatever value it writes, so it overlaps every mask: an
-            # nft `ct mark set` whose value is not a read of the ct mark
-            # itself (`ct mark set meta mark`, `ct mark set 0x1`), a CONNMARK
+            # nft `ct mark set` whose value replaces the mark (`ct mark set
+            # meta mark`, `ct mark set 0x1`; see ct_set_writes), a CONNMARK
             # --set-mark or --set-xmark with no "/mask", and a CONNMARK
-            # --save-mark with no --mask or --ctmask.
-            if (match(line, /ct mark set /)) {
-                if (substr(line, RSTART + RLENGTH) !~ /^ct mark( |$)/) whole = 1
+            # --save-mark with no --mask or --ctmask. An nft `ct mark set`
+            # is decoded whole by ct_set_writes, so the 0x values its value
+            # names are not scanned again below: the mask of an "and" names
+            # the bits the write keeps, not the ones it uses. A rule can
+            # carry more than one statement, so every `ct mark set` on the
+            # line is decoded, each from where the last value ended.
+            scan = ""
+            rest = line
+            while (match(rest, /ct mark set /)) {
+                scan = scan " " substr(rest, 1, RSTART - 1)
+                nt = split(substr(rest, RSTART + RLENGTH), toks, /[ \t]+/)
+                ct_set_writes(toks, nt)
+                if (wall) whole = 1
+                if (wa || wb) hit = 1
+                rest = ""
+                for (k = stop; k <= nt; k++) rest = rest " " toks[k]
             }
+            scan = scan " " rest
             if (line ~ /CONNMARK/) {
                 for (i = 1; i < NF; i++) {
                     if ($i == "--set-mark" || $i == "--set-xmark") {
@@ -1252,7 +1460,7 @@ ct_mark_conflicts_in() {
                 }
             }
             if (whole) hit = 1
-            rest = line
+            rest = scan
             while (match(rest, /0[xX][0-9a-fA-F]+/)) {
                 v = hex(substr(rest, RSTART + 2, RLENGTH - 2))
                 if (v >= 0 && (bit(v, a) || bit(v, b))) hit = 1
@@ -1276,6 +1484,69 @@ ct_mark_conflicts_in() {
     '
 }
 
+# xt_target_rules_in — the rules of a `nft -a --debug=netlink list ruleset`
+# listing, read on stdin, whose kernel form carries an xt compat target
+# (the `[ target name CONNMARK rev 2 ]` iptables-nft writes), one "family
+# table chain handle target" per line. The netlink header names the rule
+# by family, table, chain and handle, the same four the -a text carries
+# beside the rule.
+xt_target_rules_in() {
+    awk '
+        /^(ip|ip6|inet|arp|bridge|netdev) [^ ]+ [^ ]+ [0-9]+( [0-9]+)*[ \t]*$/ { key = $1 " " $2 " " $3 " " $4; next }
+        /^[ \t]*\[ target name [^ ]+ / { if (key != "") print key, $4; next }
+        /^[ \t]*\[ / { next }
+        { key = "" }
+    '
+}
+
+# nft_save_tables_in <family> — the tables an nf_tables iptables-save
+# listing, read on stdin, lists rules for, one "family table" per line. A
+# table iptables-nft cannot read is printed as a comment instead of a
+# "*table" header, so it is not counted.
+nft_save_tables_in() {
+    awk -v family="$1" '/^\*/ { print family, substr($1, 2) }'
+}
+
+# nft_backed_save <ip|ip6> — the iptables-save listing of one family as the
+# nf_tables backend prints it: ip(6)tables-nft-save where it exists, or
+# ip(6)tables-save when it reports the nf_tables backend. Fails when
+# neither can be read. These are the rules nft holds as xt compat targets,
+# with every mask spelled out.
+nft_backed_save() {
+    local stem=iptables
+    [ "$1" = ip6 ] && stem=ip6tables
+    if command -v "$stem-nft-save" >/dev/null 2>&1; then
+        "$stem-nft-save" 2>/dev/null
+        return
+    fi
+    command -v "$stem-save" >/dev/null 2>&1 || return 1
+    case "$("$stem-save" --version 2>/dev/null)" in
+        *nf_tables*) "$stem-save" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+# legacy_save <ip|ip6> — the iptables-save listing of one family from the
+# legacy backend, whose rules bypass nft's own view: ip(6)tables-save when
+# it does not report the nf_tables backend. Fails when there is none.
+legacy_save() {
+    local stem=iptables
+    [ "$1" = ip6 ] && stem=ip6tables
+    command -v "$stem-save" >/dev/null 2>&1 || return 1
+    case "$("$stem-save" --version 2>/dev/null)" in
+        *nf_tables*) return 1 ;;
+    esac
+    "$stem-save" 2>/dev/null
+}
+
+# join_lines <lines> <more> — two lists of lines as one. Command
+# substitution strips the trailing newline, so they are joined with one,
+# or two rules print as one line.
+join_lines() {
+    printf '%s' "$1${1:+${2:+
+}}$2"
+}
+
 # scan_ct_mark_conflicts — before loading, the ruleset this host already
 # carries is read for any ct-mark use that touches the bits this install
 # classifies with. The connection mark is a shared namespace: a component
@@ -1285,31 +1556,70 @@ ct_mark_conflicts_in() {
 # override, rather than loading a table over a conflict its own scan
 # shows. `nft list ruleset` must succeed: a ruleset this step cannot read
 # is a host it refuses to guess about, and that listing also carries every
-# rule the nft backend of iptables holds. iptables-save is read where it
-# exists, for legacy rules that bypass nft's own view, and skipped where it
-# cannot be read, because a failure to read a *second* listing is no
-# conflict — the first one already had to be legible.
+# rule the nft backend of iptables holds.
+#
+# nft's text is trusted only for native expressions. A rule iptables-nft
+# wrote is an xt compat target in the kernel, and nft prints it through
+# libxtables, which can drop its masks (a CONNMARK --save-mark loses its
+# --ctmask), so the scan finds those rules in the netlink form and reads
+# them from the nf_tables iptables-save and ip6tables-save listings, which
+# spell every mask. The legacy iptables-save and ip6tables-save are read
+# where they exist, for rules that bypass nft's view. A listing other than
+# nft's own is skipped where it cannot be read: a CONNMARK it would have
+# covered is then refused as one that may write every bit
+# (ct_mark_conflicts_in), and any other rule it would have listed is not in
+# nft's view at all.
 scan_ct_mark_conflicts() {
     if ! listing="$(nft list ruleset 2>/dev/null)"; then
         die "cannot read this host's ruleset with \`nft list ruleset\` to check the ct-mark bits $mask_hex: refusing to load a classification over a ruleset this step cannot see"
     fi
     # kept_quic443_leaves reads the same listing, so nft lists it once.
     host_ruleset="$listing"
-    conflicting="$(printf '%s\n' "$listing" | ct_mark_conflicts_in)"
-    if command -v iptables-save >/dev/null 2>&1 &&
-        legacy="$(iptables-save 2>/dev/null)" && [ -n "$legacy" ]
-    then
-        legacy_hits="$(printf '%s\n' "$legacy" | ct_mark_conflicts_in)"
-        # Command substitution strips the trailing newline, so the two
-        # listings' hits are joined with one, or two rules print as one line.
-        conflicting="$conflicting${conflicting:+${legacy_hits:+
-}}$legacy_hits"
+    # The same listing with each rule's handle and its netlink form. nft
+    # may write the netlink lines and the text to different streams, so
+    # both are read; a line of neither kind matches no rule of the scan.
+    # An nft that cannot print the netlink form leaves the scan the plain
+    # listing: an xt CONNMARK is then found by its text alone
+    # (ct_mark_conflicts_in), as the scan did before it read netlink. So
+    # does an annotated listing that carries no table the plain one does:
+    # the scan never reads less than the plain listing shows.
+    if ! annotated="$(nft -a --debug=netlink list ruleset 2>&1)"; then
+        annotated="$listing"
     fi
+    case "$listing" in
+        *"table "*)
+            case "$annotated" in
+                *"table "*) ;;
+                *) annotated="$listing" ;;
+            esac ;;
+    esac
+    local xt_rules covered="" family saver saved hits
+    xt_rules="$(printf '%s\n' "$annotated" | xt_target_rules_in)"
+    conflicting=""
+    for family in ip ip6; do
+        saver=iptables
+        [ "$family" = ip6 ] && saver=ip6tables
+        if saved="$(nft_backed_save "$family")" && [ -n "$saved" ]; then
+            covered="$(join_lines "$covered" "$(printf '%s\n' "$saved" | nft_save_tables_in "$family")")"
+            hits="$(printf '%s\n' "$saved" | ct_mark_conflicts_in "$saver")"
+            conflicting="$(join_lines "$conflicting" "$hits")"
+        fi
+        if saved="$(legacy_save "$family")" && [ -n "$saved" ]; then
+            hits="$(printf '%s\n' "$saved" | ct_mark_conflicts_in "$saver")"
+            conflicting="$(join_lines "$conflicting" "$hits")"
+        fi
+    done
+    hits="$(printf '%s\n' "$annotated" | XT_RULES="$xt_rules" COVERED="$covered" ct_mark_conflicts_in)"
+    conflicting="$(join_lines "$hits" "$conflicting")"
     if [ -n "$conflicting" ]; then
         printf 'error: this host already uses the ct-mark bits %s this install classifies with:\n%s\n' "$mask_hex" "$conflicting" >&2
         # A rule that writes every bit overlaps every mask, so no other
-        # mask avoids it: the remedy is the rule, not the flag.
+        # mask avoids it: the remedy is the rule, not the flag. A CONNMARK
+        # whose masks no listing showed may be such a rule, and its remedy
+        # is the listing.
         case "$conflicting" in
+            *"$UNLISTED_CONNMARK"*)
+                die "refusing to install over an iptables CONNMARK rule whose masks this step cannot read, so it may write the bits this install uses. Install iptables with its nf_tables backend, so that iptables-save and ip6tables-save list the rule, then run min finalize-install again." ;;
             *"(writes every bit of the connection mark)"*)
                 die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run min finalize-install again." ;;
         esac
@@ -1388,6 +1698,14 @@ if [ "$mode" = uninstall ]; then
     for record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT_RECORD_PREFIX"*; do
         [ -d "$record" ] || continue
         rmdir "$record" 2>/dev/null || true
+    done
+    # The effect probe's throwaway leaves, filter-probe-<pid>: a daemon
+    # stopped in the middle of its probe leaves one behind, empty. rmdir
+    # removes only an empty one, and a box's own leaf is never swept here:
+    # it still stops the uninstall below.
+    for probe_leaf in "$tree_root/$BOXES_DIR/$DENY_DIR"/filter-probe-*; do
+        [ -d "$probe_leaf" ] || continue
+        rmdir "$probe_leaf" 2>/dev/null || true
     done
     rmdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null || true

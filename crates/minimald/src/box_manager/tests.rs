@@ -138,6 +138,7 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         root_certificate: None,
         creating_verb: minimald_rpc::CreatingVerb::Session,
         project_root: None,
+        host_ip_registration: None,
     }
 }
 
@@ -362,8 +363,8 @@ async fn destroying_an_idle_session_goes_through_its_actor() {
     );
 }
 
-/// `sample_config` for a box created for a `min task run` without
-/// `--keep`: marked to end with its run from its create.
+/// `sample_config` for a box created for a `min task run`: marked to end
+/// with its run from its create.
 fn run_owned_config() -> minimald_rpc::BoxConfig {
     let mut config = sample_config();
     config.ends_with_run = true;
@@ -1770,6 +1771,37 @@ async fn configure_loadout_scaffolds_missing_mfile_into_composition() {
         package_names.contains("vim"),
         "the scaffolded mfile's packages should reach the composition, \
          got {package_names:?}"
+    );
+}
+
+/// The default `minimal.toml` the daemon scaffolds into an empty
+/// workspace writes its packages under `[defaults.session]`, not the
+/// legacy `[session]` table, so the session's own file prints no hint
+/// and still loads its packages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_scaffold_writes_entry_tables() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    session(&mngr, id)
+        .await
+        .configure_loadout(WireContribution::default())
+        .await
+        .expect("configuring against a missing mfile should still succeed");
+
+    let paths = session(&mngr, id).await.paths().await.unwrap();
+    let src = tokio::fs::read_to_string(paths.working.as_utf8_path().join(mfile::MFILE_NAME))
+        .await
+        .expect("the scaffold wrote a minimal.toml");
+    let headers: Vec<&str> = src
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('['))
+        .collect();
+    assert_eq!(headers, ["[defaults.session]"], "{src}");
+    let file = mfile::File::from_toml_bytes(src.as_bytes()).expect("the scaffold loads");
+    assert_eq!(
+        file.session.expect("[defaults.session] reads").packages,
+        ["base", "vim"]
     );
 }
 
@@ -3224,6 +3256,8 @@ async fn show_returns_record_state_identity_and_live_execs() {
             reason: Some("stopped".to_string()),
             exit_code: Some(3),
             signal: None,
+            // A session filed with no spec has a terminal.
+            pty_enabled: true,
         }
     );
     assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
@@ -3278,6 +3312,71 @@ async fn show_box_finds_a_box_by_the_id_list_prints() {
         .unwrap()
         .expect("the record id still finds the box");
     assert_eq!(by_record_id.record.box_id, box_id);
+}
+
+/// BCLI-068: the listing and the read carry whether the box's stored spec
+/// sets `io.pty_enabled`. A spec that sets it is a terminal box, one that
+/// clears it is not, and a session filed with no spec has a terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_listing_and_show_carry_pty_enabled() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = |pty: bool| serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": pty}});
+    let terminal = mngr
+        .create_box_with_spec(
+            rooted_config("terminal", "/home/dev/proj"),
+            Some(spec(true)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let headless = mngr
+        .create_box_with_spec(
+            rooted_config("headless", "/home/dev/proj"),
+            Some(spec(false)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let unspecced = mngr
+        .create_session(rooted_config("unspecced", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    // A session whose stored spec cannot be read: a directory stands where
+    // the file goes. It lists on its Box Type, so with a terminal.
+    let unreadable = mngr
+        .create_session(rooted_config("unreadable", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    let spec_path = mngr
+        .box_events(unreadable)
+        .await
+        .unwrap()
+        .object
+        .spec_path();
+    std::fs::create_dir(spec_path.as_utf8_path()).unwrap();
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    for (id, pty) in [
+        (terminal, true),
+        (headless, false),
+        (unspecced, true),
+        (unreadable, true),
+    ] {
+        let listed = listing
+            .iter()
+            .find(|entry| entry.box_id == id)
+            .unwrap_or_else(|| panic!("the listing holds {id}"));
+        assert_eq!(listed.pty_enabled, pty, "listing: {listed:?}");
+        let shown = mngr
+            .show_box(id)
+            .await
+            .unwrap()
+            .expect("the box is retained");
+        assert_eq!(shown.record.pty_enabled, pty, "read: {:?}", shown.record);
+        assert_eq!(&shown.record, listed, "the read and the listing agree");
+    }
 }
 
 /// Creates an `Active` box through the whole create flow a client drives,
@@ -4025,6 +4124,69 @@ async fn guest_create_ignores_a_client_supplied_box_id() {
          at 100.64.0.9. Run the command again."
     );
     assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 2);
+
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task.abort();
+}
+
+/// BEP-082: a fresh-instance `host_ip` grant box registered under a
+/// creation key, and this daemon names it `<base>-<n>` only after. The
+/// mint asks by the key the config carries, never by the `<base>-<n>`
+/// name, so it finds the registration. Two fresh instances of one entry
+/// ask by their own keys and take their own ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_instance_mint_finds_its_registration_after_the_rename() {
+    let (state, _cache, mngr) = manager().await;
+    let control = manager_switch_control(state.path());
+    let door = state.path().join("vm-host-door.sock");
+    let first = SessionId::mint();
+    let second = SessionId::mint();
+    let (door_task, mut asks) = mint_door(
+        &door,
+        vec![
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: first,
+            },
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: second,
+            },
+        ],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    let grant_config = |key: &str| {
+        let mut config = unnamed_config();
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        config.host_ip_registration = Some(key.to_string());
+        config
+    };
+    let mut created = Vec::new();
+    for key in [
+        "dev~00112233445566778899aabbccddeeff",
+        "dev~ffeeddccbbaa99887766554433221100",
+    ] {
+        let id = mngr
+            .create_fresh_box_with_spec(grant_config(key), Some(task_spec("dev", None)), None, None)
+            .await
+            .unwrap();
+        let ask = mint_ask(asks.recv().await.unwrap());
+        assert_eq!(
+            ask.host_ip_name.as_deref(),
+            Some(key),
+            "the mint asks by the key"
+        );
+        assert_eq!(ask.switch_address, None);
+        created.push((id, record_name(&mngr, id).await));
+    }
+    assert_eq!(
+        created,
+        vec![
+            (first, Some("dev-1".to_string())),
+            (second, Some("dev-2".to_string())),
+        ],
+        "each fresh instance takes its own id under its `<base>-<n>` name"
+    );
 
     crate::net::listeners::clear_vm_report_door_for_tests(&control);
     door_task.abort();
@@ -5071,4 +5233,489 @@ async fn stop_racing_natural_end_answers_already_exited() {
         logged.contains("stop: the box already exited before the stop reached it"),
         "the daemon log names the race outcome:\n{logged}"
     );
+}
+
+/// A classifier tree laid out the way the privileged step installs it, with
+/// a mount table that covers it with `nsdelegate`: every fact the decision
+/// reads off the tree, so the probe's reading (a stand-in) is the one input
+/// it still needs. The guard keeps the tree alive.
+fn stand_in_classifier_tree() -> (TempDir, std::path::PathBuf, String) {
+    let tree = TempDir::new().expect("a temp dir standing in for the classifier tree");
+    let root = tree.path().to_path_buf();
+    for verdict in [
+        sandbox::config::Verdict::Deny,
+        sandbox::config::Verdict::Allow,
+    ] {
+        let subtree = root
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(verdict.dir_name());
+        std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
+        for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
+            std::fs::write(subtree.join(file), "").expect("the step makes the subtree's files");
+        }
+    }
+    std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
+        .expect("the step writes the table's marker");
+    std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
+        .expect("the step records the ct-mark mask beside the marker");
+    let mountinfo = format!(
+        "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
+        root.display()
+    );
+    (tree, root, mountinfo)
+}
+
+/// NET-079: a host-address create re-reads the host's classifier fact when
+/// the stored one says the probe could not read the table — the read a
+/// daemon takes before it stands in its own leaf — so the create answers
+/// over the host as it is now. A deny-all box is then created over
+/// `per_box`, and a narrowing declaration is refused naming only the rule
+/// it declared. Any other stored cause, and any other mode's create, is
+/// answered from the stored fact with no re-read.
+// The guard spans the awaited creates on purpose: the fact, the reading
+// stand-in and the tree stand-in are process-global.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the fact is process-global, so the guard must span the awaited \
+              creates it is set for"
+)]
+#[tokio::test]
+async fn host_ip_create_rereads_a_stale_unreadable_fact() {
+    use crate::net::classifier::{Cause, Decision, Reading};
+    let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (_state, _cache, mngr) = manager().await;
+    let capture = crate::test_harness::captured_log();
+    let (tree, root, mountinfo) = stand_in_classifier_tree();
+    // Resets the process-global stand-ins and the fact on every exit, a
+    // failed assert included, before the fact window's lock is released.
+    // The tree drops after the reset, so no stand-in names a removed path.
+    struct ResetStandins(Option<TempDir>);
+    impl Drop for ResetStandins {
+        fn drop(&mut self) {
+            *CREATE_CLASSIFIER_TREE_STANDIN
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+            crate::box_runtime::clear_classifier_reading_standin();
+            crate::box_runtime::clear_host_ip_enforcement_fact();
+            drop(self.0.take());
+        }
+    }
+    let _reset = ResetStandins(Some(tree));
+    *CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((root, mountinfo));
+    // The table refuses, as a loaded table does once the daemon is placed.
+    crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    let host_ip = |name: &str, egress: boxes::EgressPolicy| {
+        let mut config = sample_config();
+        config.name = Some(name.to_string());
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy = boxes::BoxPolicy::new(Some(egress), None);
+        config
+    };
+
+    // The stale start-up read: the probe could not read the table.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    mngr.create_session(
+        host_ip("stale-deny-all", boxes::EgressPolicy::deny_all()),
+        None,
+    )
+    .await
+    .expect("a deny-all host-address box is created over the re-read fact");
+    let fact = crate::box_runtime::host_ip_enforcement_fact();
+    assert!(
+        fact.can_decide_per_box() && fact.cause.is_none(),
+        "the create re-read the host and found it decides per box"
+    );
+
+    // The same stale fact, and a box started with `--allow-subnets` alone:
+    // the re-read says the host decides per box, so the create refuses the
+    // narrowing, and names only the rule the box declared.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    let refused = mngr
+        .create_session(
+            host_ip(
+                "stale-allow-subnets",
+                boxes::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    ..Default::default()
+                },
+            ),
+            None,
+        )
+        .await
+        .expect_err("a per-box host refuses a narrowing it cannot enforce");
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    let words = refused.to_string();
+    assert!(
+        words.contains("allow_subnets") && !words.contains("allow_dns_hosts"),
+        "the refusal names only the declared rule: {words}"
+    );
+
+    // Any other stored cause is answered as stored: no re-read.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::TableNotEffective,
+    ));
+    mngr.create_session(
+        host_ip("stored-cause", boxes::EgressPolicy::deny_all()),
+        None,
+    )
+    .await
+    .expect("a create over a stored cause is not refused at create");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::TableNotEffective),
+        "a create over any other cause does not re-read the host"
+    );
+
+    // An own-address create never re-reads the host-address fact.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    let mut own = sample_config();
+    own.name = Some("own-address".to_string());
+    own.network = boxes::NetworkMode::OwnIp;
+    mngr.create_session(own, None)
+        .await
+        .expect("an own-address box is created");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::ProbeUnreadable),
+        "an own-address create does not re-read the host"
+    );
+
+    let logged = capture.contents();
+    assert!(
+        logged.contains("reread=true") && logged.contains("reread=false"),
+        "each host-address create logs whether it re-read the fact:\n{logged}"
+    );
+}
+
+/// The directory of box `id` and its workspace, through a store over
+/// `state_dir`, with the workspace made when the box has none yet.
+async fn box_dir_and_tree(
+    state_dir: &std::path::Path,
+    id: SessionId,
+) -> (boxes::store::BoxDir, std::path::PathBuf) {
+    use boxes::store::BoxObject as _;
+
+    let store = crate::store::Store::init(daemon_abs(state_dir))
+        .await
+        .unwrap();
+    let handle = store
+        .find(RecordPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained");
+    let object = handle.object().await.unwrap();
+    let tree = object
+        .workspace_path()
+        .as_utf8_path()
+        .as_std_path()
+        .to_path_buf();
+    std::fs::create_dir_all(&tree).unwrap();
+    (object.dir(), tree)
+}
+
+/// Writes `len` bytes of data to `name` in the workspace of box `id`.
+async fn write_box_file(state_dir: &std::path::Path, id: SessionId, name: &str, len: usize) {
+    let (_, tree) = box_dir_and_tree(state_dir, id).await;
+    std::fs::write(tree.join(name), vec![7u8; len]).unwrap();
+}
+
+/// BOX-021: a prune preview lists every stopped or exited box the
+/// selectors match, in box id order, each with the disk a reap of it
+/// frees. A running or pending box is not listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_dry_run_lists_matches_with_disk() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let stopped = create_active_session_with(&mngr, rooted_config("stopped", "/p")).await;
+    let exited = create_active_session_with(&mngr, rooted_config("exited", "/p")).await;
+    let pending = mngr
+        .create_session(rooted_config("pending", "/p"), None)
+        .await
+        .unwrap();
+    set_record_state(
+        state.path(),
+        stopped,
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+    )
+    .await;
+    set_record_state(state.path(), exited, RecordState::Exited(ExitEnding::Oom)).await;
+    let mib = 1024 * 1024;
+    write_box_file(state.path(), stopped, "big.bin", 4 * mib).await;
+    write_box_file(state.path(), exited, "small.bin", 64 * 1024).await;
+
+    let preview = mngr.preview_prune(None, None).await.unwrap();
+    let mut expected = vec![stopped, exited];
+    expected.sort();
+    let listed: Vec<_> = preview
+        .matched
+        .iter()
+        .map(|entry| entry.record.box_id)
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "the ended boxes, never {running} or {pending}"
+    );
+    for entry in &preview.matched {
+        let (dir, _) = box_dir_and_tree(state.path(), entry.record.box_id).await;
+        assert_eq!(
+            entry.disk_bytes,
+            Some(dir.disk_bytes().unwrap()),
+            "the figure is what a reap of the box directory frees"
+        );
+    }
+    let disk_of = |id| {
+        preview
+            .matched
+            .iter()
+            .find(|entry| entry.record.box_id == id)
+            .and_then(|entry| entry.disk_bytes)
+            .unwrap()
+    };
+    assert!(disk_of(stopped) >= 4 * mib as u64, "{}", disk_of(stopped));
+    assert!(disk_of(exited) >= 64 * 1024, "{}", disk_of(exited));
+    assert!(disk_of(exited) < disk_of(stopped));
+    let state_of = |id| {
+        preview
+            .matched
+            .iter()
+            .find(|entry| entry.record.box_id == id)
+            .map(|entry| entry.record.state.clone())
+    };
+    assert_eq!(state_of(stopped).as_deref(), Some("stopped"));
+    assert_eq!(state_of(exited).as_deref(), Some("exited"));
+
+    // The parent selector narrows the preview as it narrows a prune.
+    let preview = mngr.preview_prune(None, Some(running)).await.unwrap();
+    assert!(preview.matched.is_empty(), "{preview:?}");
+
+    let logged = log.contents();
+    assert!(
+        logged.contains("previewed a prune: no box was reaped"),
+        "{logged}"
+    );
+}
+
+/// BOX-021: a prune preview reaps none of the boxes it lists. Each
+/// record and its directory stay, and a later prune reaps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_dry_run_reaps_none() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let stopped = create_active_session_with(&mngr, rooted_config("stopped", "/p")).await;
+    set_record_state(
+        state.path(),
+        stopped,
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+    )
+    .await;
+    write_box_file(state.path(), stopped, "kept.bin", 64 * 1024).await;
+    let (dir, tree) = box_dir_and_tree(state.path(), stopped).await;
+    let before = dir.disk_bytes().unwrap();
+
+    let mut listed_before: Vec<_> = mngr
+        .list_boxes(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.box_id, entry.state))
+        .collect();
+    listed_before.sort();
+    for _ in 0..2 {
+        let preview = mngr.preview_prune(None, None).await.unwrap();
+        assert_eq!(preview.matched.len(), 1, "{preview:?}");
+    }
+    let mut listed_after: Vec<_> = mngr
+        .list_boxes(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.box_id, entry.state))
+        .collect();
+    listed_after.sort();
+    assert_eq!(listed_after, listed_before, "the preview changes no record");
+    assert!(dir.is_retained(), "the previewed box is retained");
+    assert!(tree.join("kept.bin").exists(), "its files are on disk");
+    assert_eq!(dir.disk_bytes().unwrap(), before);
+    let logged = log.contents();
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line.contains("reaped a box") && line.contains(&stopped.to_string())),
+        "no reap ran:\n{logged}"
+    );
+
+    let reply = mngr.prune_boxes(None, None).await.unwrap();
+    let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+    assert_eq!(reaped, vec![stopped]);
+    assert!(!dir.is_retained());
+    assert_eq!(
+        mngr.show_box(running).await.unwrap().unwrap().record.state,
+        "running"
+    );
+}
+
+/// BOX-021: for each set of selectors, a prune preview lists exactly the
+/// boxes a prune with the same selectors then reaps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_dry_run_matches_what_prune_reaps() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let (state, _cache, mngr) = manager().await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let child_stopped = create_active_session_with(&mngr, rooted_config("child-a", "/p")).await;
+    let child_exited = create_active_session_with(&mngr, rooted_config("child-b", "/p")).await;
+    let running_child = create_active_session_with(&mngr, rooted_config("child-c", "/p")).await;
+    let orphan = create_active_session_with(&mngr, rooted_config("orphan", "/p")).await;
+    let recent = create_active_session_with(&mngr, rooted_config("recent", "/p")).await;
+    let no_exit = create_active_session_with(&mngr, rooted_config("no-exit", "/p")).await;
+    for id in [child_stopped, child_exited, running_child] {
+        edit_record(state.path(), id, |record| record.parent = Some(running)).await;
+    }
+    let stopped = RecordState::Stopped(StopEnding::AtDaemonStart);
+    for id in [child_stopped, orphan, recent, no_exit] {
+        set_record_state(state.path(), id, stopped).await;
+    }
+    set_record_state(
+        state.path(),
+        child_exited,
+        RecordState::Exited(ExitEnding::Oom),
+    )
+    .await;
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let now = std::time::SystemTime::now();
+    write_exited_event(state.path(), orphan, now).await;
+    write_exited_event(state.path(), recent, now + day + day / 2).await;
+    write_exited_event(state.path(), child_stopped, now).await;
+
+    let later = now + 2 * day;
+    // Each step previews and then prunes with the same selectors, over
+    // what the steps before it left.
+    let steps: [(
+        Option<std::time::Duration>,
+        Option<SessionId>,
+        std::time::SystemTime,
+    ); 4] = [
+        (Some(day), None, now),
+        (Some(day), Some(running), later),
+        (None, Some(running), later),
+        (Some(day), None, later),
+    ];
+    let mut reaped_any = 0;
+    for (older_than, parent, at) in steps {
+        let preview = mngr.preview_prune_at(older_than, parent, at).await.unwrap();
+        let listed: Vec<_> = preview
+            .matched
+            .iter()
+            .map(|entry| entry.record.clone())
+            .collect();
+        let reply = mngr.prune_boxes_at(older_than, parent, at).await.unwrap();
+        assert!(reply.failed.is_empty(), "{:?}", reply.failed);
+        assert_eq!(
+            listed, reply.reaped,
+            "the preview with {older_than:?} {parent:?} lists what the prune reaps"
+        );
+        reaped_any += reply.reaped.len();
+    }
+    assert_eq!(reaped_any, 3, "the steps reap child-a, child-b and orphan");
+
+    let preview = mngr.preview_prune(None, None).await.unwrap();
+    let mut listed: Vec<_> = preview
+        .matched
+        .iter()
+        .map(|entry| entry.record.box_id)
+        .collect();
+    listed.sort();
+    let mut expected = vec![recent, no_exit];
+    expected.sort();
+    assert_eq!(listed, expected);
+    let reply = mngr.prune_boxes(None, None).await.unwrap();
+    let mut reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+    reaped.sort();
+    assert_eq!(reaped, expected);
+}
+
+/// BOX-159: a read of a stopped or exited box returns the disk a reap of
+/// it frees, the same figure a prune preview lists. A running box has no
+/// figure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_reports_disk_a_reap_frees() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, cache, mngr) = manager().await;
+    let stopped = create_active_session_with(&mngr, rooted_config("stopped", "/p")).await;
+    let exited = create_active_session_with(&mngr, rooted_config("exited", "/p")).await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let shown = mngr.show_box(running).await.unwrap().unwrap();
+    assert_eq!(shown.record.state, "running");
+    assert_eq!(shown.disk_bytes, None, "a running box has no figure");
+    drop(mngr);
+
+    set_record_state(
+        state.path(),
+        stopped,
+        RecordState::Stopped(StopEnding::ExitedFirst { exit_code: 0 }),
+    )
+    .await;
+    set_record_state(
+        state.path(),
+        exited,
+        RecordState::Exited(ExitEnding::Exit { exit_code: 1 }),
+    )
+    .await;
+    write_box_file(state.path(), stopped, "data.bin", 1024 * 1024).await;
+    let mngr = manager_over(state.path(), cache.path()).await;
+
+    let preview = mngr.preview_prune(None, None).await.unwrap();
+    for id in [stopped, exited] {
+        let shown = mngr.show_box(id).await.unwrap().unwrap();
+        let (dir, _) = box_dir_and_tree(state.path(), id).await;
+        assert_eq!(shown.disk_bytes, Some(dir.disk_bytes().unwrap()));
+        let listed = preview
+            .matched
+            .iter()
+            .find(|entry| entry.record.box_id == id)
+            .expect("the preview lists the box");
+        assert_eq!(
+            shown.disk_bytes, listed.disk_bytes,
+            "show and the preview give the same figure"
+        );
+    }
+    let stopped_disk = mngr
+        .show_box(stopped)
+        .await
+        .unwrap()
+        .unwrap()
+        .disk_bytes
+        .unwrap();
+    assert!(stopped_disk >= 1024 * 1024, "{stopped_disk}");
+
+    // The reap frees the whole directory the figure counts.
+    let (dir, _) = box_dir_and_tree(state.path(), stopped).await;
+    mngr.reap_box(stopped, false).await.unwrap();
+    assert_eq!(
+        dir.disk_bytes().unwrap_err().kind(),
+        ErrorKind::NotFound,
+        "nothing the figure counted is left"
+    );
+    assert_eq!(mngr.show_box(stopped).await.unwrap(), None);
+
+    let logged = log.contents();
+    assert!(logged.contains("read a box record"), "{logged}");
 }

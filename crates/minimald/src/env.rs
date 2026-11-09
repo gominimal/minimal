@@ -1411,6 +1411,9 @@ mod trust_store {
 struct ChannelRequest {
     /// The single request line read by the listener (`method%data`).
     line: String,
+    /// The line as the box sent it, when it was not valid UTF-8 and `line`
+    /// is its lossy decode. `None` for a valid line.
+    raw: Option<Vec<u8>>,
     /// An owned clone of the client connection, written to by the handler.
     stream: UnixStream,
 }
@@ -1426,6 +1429,16 @@ struct BridgeChannel {
 
 impl sandbox::Channel for BridgeChannel {
     fn handle(&mut self, stream: &mut UnixStream, line: &str, _rootfs: &Path) {
+        self.forward(stream, line, None);
+    }
+
+    fn handle_lossy(&mut self, stream: &mut UnixStream, line: &str, raw: &[u8], _rootfs: &Path) {
+        self.forward(stream, line, Some(raw.to_vec()));
+    }
+}
+
+impl BridgeChannel {
+    fn forward(&mut self, stream: &mut UnixStream, line: &str, raw: Option<Vec<u8>>) {
         let stream = match stream.try_clone() {
             Ok(s) => s,
             Err(e) => {
@@ -1438,6 +1451,7 @@ impl sandbox::Channel for BridgeChannel {
         // commands behind, which doesn't happen for interactive `min` use.
         if let Err(e) = self.tx.blocking_send(ChannelRequest {
             line: line.to_string(),
+            raw,
             stream,
         }) {
             let mut stream = e.0.stream;
@@ -1571,22 +1585,48 @@ fn channel_method(request: &str) -> &'static str {
         .unwrap_or("other")
 }
 
+/// A request line safe to log: a `run` request carries the caller's
+/// exported environment, secrets included, as its last group, so that group
+/// is cut.
+fn loggable_request(line: &str) -> std::borrow::Cow<'_, str> {
+    match line.match_indices(RUN_GROUP_SEP).nth(1) {
+        Some((at, _)) => format!("{}<environment redacted>", &line[..=at]).into(),
+        None => line.into(),
+    }
+}
+
 impl BoxChannel {
     /// Drives the actor until the bridge (and thus all senders) is dropped.
     async fn run(mut self) {
-        while let Some(ChannelRequest { line, mut stream }) = self.rx.recv().await {
-            tracing::trace!("session channel handling: {line}");
+        while let Some(ChannelRequest {
+            line,
+            raw,
+            mut stream,
+        }) = self.rx.recv().await
+        {
+            tracing::trace!("session channel handling: {}", loggable_request(&line));
             let (span, line) = channel_request_span(&line, &self.box_id, self.session_id);
             // Boxed: the handler's future is large (every subcommand's state in
             // one `async fn`) and it is awaited once per request, not per byte.
-            tracing::Instrument::instrument(Box::pin(self.handle(line, &mut stream)), span).await;
+            tracing::Instrument::instrument(
+                Box::pin(self.handle_raw(line, raw.as_deref(), &mut stream)),
+                span,
+            )
+            .await;
             // `stream` is dropped here, closing the connection so the client's
             // `socat` reads EOF and the `min` helper's read loop terminates.
         }
     }
 
-    /// Dispatches a single `method%data` request line.
+    /// Dispatches a single valid `method%data` request line.
+    #[cfg(test)]
     async fn handle(&mut self, line: &str, stream: &mut UnixStream) {
+        self.handle_raw(line, None, stream).await;
+    }
+
+    /// Dispatches a single `method%data` request line. `raw` is the line as
+    /// the box sent it when `line` is its lossy decode.
+    async fn handle_raw(&mut self, line: &str, raw: Option<&[u8]>, stream: &mut UnixStream) {
         let add_dep = match line.split_once('%') {
             Some(("add-transient", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
@@ -1640,9 +1680,12 @@ impl BoxChannel {
                 self.run_patched_pkg(stream, name).await;
                 None
             }
-            Some(("run", args)) => {
-                let (name, rest) = args.split_once(' ').unwrap_or((args, ""));
-                self.run_task(stream, name, rest).await;
+            Some(("run", request)) => {
+                let mut request = TaskRunRequest::parse(request);
+                if let Some(data) = raw.and_then(run_data_bytes) {
+                    request.mark_invalid_bytes(data);
+                }
+                self.run_task(stream, request).await;
                 None
             }
             Some(("build", args)) => {
@@ -2106,31 +2149,55 @@ impl BoxChannel {
         self.has_packages = new_has_packages;
     }
 
-    /// Implements `min run <task>`.
-    async fn run_task(&mut self, stream: &mut UnixStream, task_name: &str, args: &str) {
-        let (mut ctx, graph, _) = if let Ok(v) = self.refresh(stream).await {
-            v
-        } else {
-            return;
+    /// Implements `min task run <task> [args...]`: runs the task and, for a
+    /// helper that sends its argv, relays the task's exit code as `exit:<n>`
+    /// so the helper exits with it. A task box's entrypoint is that helper.
+    async fn run_task(&mut self, stream: &mut UnixStream, request: TaskRunRequest) {
+        let task_name = request.task.as_str();
+        let relays = request.relays_exit();
+        // BCLI-010 (T62): a relaying helper prints `err:` lines on stderr,
+        // and an older one prints only `msg:` lines.
+        let note_tag = if relays { "err" } else { "msg" };
+        let (mut ctx, graph, _) = match self.refresh_tagged(stream, note_tag).await {
+            Ok(v) => v,
+            Err(e) => {
+                return relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
+            }
         };
 
-        let (task, mut graph) = match ctx.task(graph, task_name) {
-            Err(e) => return Self::write_error(&e, stream),
+        let (mut task, mut graph) = match ctx.task(graph, task_name) {
+            Err(e) => {
+                Self::write_error_tagged(&e, stream, note_tag);
+                return relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
+            }
             Ok(None) => {
-                let _ = writeln!(stream, "error: no such task '{task_name}'");
-                return;
+                let _ = writeln!(stream, "error: no such task '{}'", one_line(task_name));
+                return relay_refusal_exit(stream, relays, task_name, EXIT_NOT_FOUND);
             }
             Ok(Some(v)) => v,
         };
 
+        // BCLI-010 (T62): the laptop refuses an argument that is not valid
+        // UTF-8 before the task runs, so the in-box run does as well.
+        if relays && request.invalid_arg {
+            let _ = writeln!(stream, "{}", invalid_arg_refusal(task_name));
+            return relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
+        }
+
         let parsed_args = if !task.args.is_empty() {
-            match task.args.parse(args) {
+            let parsed = match &request.args {
+                TaskRunArgs::Line(line) => task.args.parse(line),
+                TaskRunArgs::Argv(argv) => task
+                    .args
+                    .parse_argv_named(&format!("min task run {task_name}"), argv.iter()),
+            };
+            match parsed {
                 Err(e) => {
                     for line in format!("{}", e.render().ansi()).lines() {
-                        let _ = writeln!(stream, "msg:{line}");
+                        let _ = writeln!(stream, "{note_tag}:{line}");
                     }
                     let _ = writeln!(stream, "error: failed parsing arguments for task");
-                    return;
+                    return relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
                 }
                 Ok(args) => Some(args),
             }
@@ -2138,12 +2205,47 @@ impl BoxChannel {
             None
         };
 
-        let Some(session) = self.session.upgrade() else {
-            let _ = writeln!(stream, "error: session is gone");
-            return;
+        // The caller's own values for the task's `inherit` variables, after
+        // the names the client's `[vars] ignore` matched are gone. The
+        // daemon's environment is not the caller's, so it never fills one.
+        // A variable the caller does not set, or sets to a value that is not
+        // valid UTF-8, refuses the run with the text the laptop's `min task
+        // run` prints for both.
+        if let Err(name) = run_task_vars(&mut task.vars, self.session_id.as_ref(), relays, &request)
+        {
+            let _ = writeln!(stream, "{}", inherit_refusal(task_name, &name));
+            return relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
+        }
+        let start_dir = match start_dir_in_box(
+            task.inherit_cwd,
+            request.cwd.as_deref(),
+            self.working.as_utf8_path().as_std_path(),
+        ) {
+            Ok(dir) => dir,
+            Err(notice) => {
+                let _ = writeln!(stream, "{note_tag}:{notice}");
+                None
+            }
         };
 
-        let result: Result<(), Error> = async {
+        let Some(session) = self.session.upgrade() else {
+            let _ = writeln!(stream, "error: session is gone");
+            return relay_refusal_exit(stream, relays, task_name, EXIT_MIN_FAILURE);
+        };
+
+        // T123: a helper whose stdin is a pipe or a file forwards it. The
+        // task gets it on its stdin pipe, through `run_invocations_in`.
+        let forward_stdin = relays && request.stdin;
+        tracing::info!(
+            task = %task_name,
+            stdin_forwarded = forward_stdin,
+            "in-box task run starts",
+        );
+        let mut forwarded: Option<crate::exec::ForwardedStdin> = None;
+
+        // `Ok(false)`: the run was refused and the refusal, with its exit
+        // code for a relaying helper, is already sent.
+        let result: Result<bool, Error> = async {
             // A task started from inside the session is a PTask of that
             // session's mode too (017-005).
             let gone = |e: std::io::Error| Error::IO("reading the session", Default::default(), e);
@@ -2158,8 +2260,9 @@ impl BoxChannel {
                 .make_env_with_network(
                     task_name,
                     &mut graph,
-                    task.inherit_cwd
-                        .then(|| self.working.as_utf8_path().as_std_path().to_path_buf()),
+                    // The session layout ignores this. `start_dir` places
+                    // an `inherit_cwd` task.
+                    None,
                     task.state_key.as_ref(),
                     Some(&task.patch),
                     Some(&task.vars),
@@ -2185,18 +2288,85 @@ impl BoxChannel {
                     stream,
                     "error: cannot run interactive tasks from within an environment"
                 );
-                return Ok(());
+                relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
+                return Ok(false);
             }
 
-            let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)
-                .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
-            env.run(invocations, Some(stdout_writer), Some(stderr_writer))
-                .await
+            match &start_dir {
+                dir if dir.is_some() || forward_stdin => {
+                    run_invocations_in(
+                        &mut env,
+                        invocations,
+                        dir.as_deref(),
+                        stream,
+                        note_tag,
+                        forward_stdin.then_some(&mut forwarded),
+                    )
+                    .await?
+                }
+                _ => {
+                    let (stdout_writer, stderr_writer) =
+                        StreamWriter::pair_tagged(stream, note_tag)
+                            .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
+                    env.run(invocations, Some(stdout_writer), Some(stderr_writer))
+                        .await?
+                }
+            }
+            Ok(true)
         }
         .await;
 
+        Self::end_task_run(
+            stream,
+            relays,
+            note_tag,
+            task_name,
+            result,
+            forwarded.as_mut(),
+        );
+        if let Some(forwarded) = forwarded {
+            let _ = spawn_blocking(move || forwarded.finish(FORWARDED_STDIN_CLOSE_WAIT)).await;
+        }
+    }
+
+    /// Sends the end of a task run: its exit code for a relaying helper,
+    /// or the error that ended it. `Ok(false)` is a run whose refusal is
+    /// already sent.
+    fn end_task_run(
+        stream: &mut UnixStream,
+        relays: bool,
+        note_tag: &str,
+        task_name: &str,
+        result: Result<bool, Error>,
+        forwarded: Option<&mut crate::exec::ForwardedStdin>,
+    ) {
+        if matches!(result, Ok(false)) {
+            return;
+        }
+        let mut result = result.map(|_| ());
+        // A stdin that stopped before its end, while the task read it, fails
+        // a run that passed: the task did not get all of its input. A run
+        // that failed keeps its own error, so the task's exit code stays.
+        if let Some(error) = forwarded.and_then(|f| f.failure()) {
+            tracing::warn!(task = %task_name, %error, "the forwarded stdin stopped before its end");
+            if result.is_ok() {
+                result = Err(forwarded_stdin_error(&error));
+            }
+        }
+        if relays && let Some(code) = relayed_exit_code(&result) {
+            // BCLI-010 (T62): the helper exits with this code, so a task
+            // box's entrypoint ends with the task's own status.
+            tracing::info!(
+                task = %task_name,
+                exit_code = code,
+                "relaying a task's exit code to the in-box min helper",
+            );
+            let _ = writeln!(stream, "exit:{code}");
+            return;
+        }
         if let Err(e) = result {
-            Self::write_error(&e, stream);
+            Self::write_error_tagged(&e, stream, note_tag);
+            relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
         }
     }
 
@@ -2527,8 +2697,14 @@ impl BoxChannel {
     /// Writes an [`mctx::Error`] to the client as `msg:` lines (preserving its
     /// multi-line, richly-formatted report) followed by an `error:` terminator.
     fn write_error(e: &Error, stream: &mut UnixStream) {
+        Self::write_error_tagged(e, stream, "msg");
+    }
+
+    /// [`Self::write_error`] with its report lines sent under `tag`: `err:`
+    /// for a helper that prints them on stderr.
+    fn write_error_tagged(e: &Error, stream: &mut UnixStream, tag: &str) {
         for line in e.to_string().split('\n') {
-            let _ = writeln!(stream, "msg:{line}");
+            let _ = writeln!(stream, "{tag}:{line}");
         }
         let _ = writeln!(stream, "error: sandbox command failed.");
     }
@@ -2544,17 +2720,27 @@ impl BoxChannel {
         &mut self,
         stream: &mut UnixStream,
     ) -> Result<(Context, Graph, HashSet<BuildSpecRef>), ()> {
-        let error = |e: &Error, stream: &mut UnixStream| {
-            Self::write_error(e, stream);
-            Err(())
+        self.refresh_tagged(stream, "msg").await.map_err(|_| ())
+    }
+
+    /// [`Self::refresh`] with a failure's report lines sent under `tag`. A
+    /// failure comes back as the `Error` it reported.
+    async fn refresh_tagged(
+        &mut self,
+        stream: &mut UnixStream,
+        tag: &str,
+    ) -> Result<(Context, Graph, HashSet<BuildSpecRef>), Error> {
+        let error = |e: Error, stream: &mut UnixStream| {
+            Self::write_error_tagged(&e, stream, tag);
+            Err(e)
         };
 
         let mut ctx = match self.ctx.cloned_reinit() {
-            Err(e) => return error(&e, stream),
+            Err(e) => return error(e, stream),
             Ok(ctx) => ctx,
         };
         let mut graph = match ctx.graph_from_all_packages() {
-            Err(e) => return error(&e, stream),
+            Err(e) => return error(e, stream),
             Ok(g) => g,
         };
 
@@ -2562,12 +2748,12 @@ impl BoxChannel {
         let no_such = |name: String| Error::Graph(Box::new(graph::Error::NoSuchPkg { name }));
         let new_top_levels: Vec<BuildSpecRef> =
             match Self::remap_refs(&self.graph, &graph, &self.graph.top_levels) {
-                Err(name) => return error(&no_such(name), stream),
+                Err(name) => return error(no_such(name), stream),
                 Ok(v) => v,
             };
         let new_has_packages: HashSet<BuildSpecRef> =
             match Self::remap_refs(&self.graph, &graph, &self.has_packages) {
-                Err(name) => return error(&no_such(name), stream),
+                Err(name) => return error(no_such(name), stream),
                 Ok(v) => v,
             };
         graph.top_levels = new_top_levels;
@@ -2830,8 +3016,503 @@ fn canonicalize_utf8(path: &Utf8Path) -> std::io::Result<Utf8PathBuf> {
         .map_err(|p| std::io::Error::other(format!("path is not utf-8: {}", p.display())))
 }
 
+/// Separates the groups of a `run` request: the caller's directory, the
+/// task with its argv, and the caller's environment. `env_min_helper.sh`
+/// (`__min_run_request`) writes it.
+const RUN_GROUP_SEP: char = '\u{1e}';
+/// Separates the items inside one group of a `run` request.
+const RUN_ITEM_SEP: char = '\u{1f}';
+/// The flag in a `run` request's fourth group that says the helper
+/// forwards its stdin to the task (T123).
+const RUN_STDIN_FLAG: &str = "stdin";
+/// How long a run that forwarded its stdin waits, after its last line,
+/// for the helper to close the connection. The channel answers one request
+/// at a time, so a helper that never closes must not hold it.
+const FORWARDED_STDIN_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The task arguments of a `run` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskRunArgs {
+    /// A helper from before the argv form: the rest of the line after the
+    /// task name, split by shell rules. Such a helper reads no `exit:` line.
+    Line(String),
+    /// The caller's argv after the task name, one item per argument.
+    Argv(Vec<String>),
+}
+
+/// What the in-box `min task run` asks of the channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskRunRequest {
+    task: String,
+    args: TaskRunArgs,
+    /// The caller's `$PWD` inside the box. `None` from an older helper.
+    cwd: Option<String>,
+    /// The caller's exported environment.
+    env: BTreeMap<String, String>,
+    /// The names in `env` whose value held a byte that is not valid UTF-8.
+    invalid_env: BTreeSet<String>,
+    /// Whether an argument after the task name held such a byte.
+    invalid_arg: bool,
+    /// Whether the helper forwards its stdin to the task: a fourth group
+    /// that names `stdin` (T123). It sends that stdin on the connection
+    /// after the channel's `stdin:` line, up to its EOF.
+    stdin: bool,
+}
+
+impl TaskRunRequest {
+    /// Parses the data after `run%`. A request with no group separator is
+    /// the older `<task> <args>` form.
+    fn parse(request: &str) -> Self {
+        let Some((cwd, rest)) = request.split_once(RUN_GROUP_SEP) else {
+            let (task, args) = request.split_once(' ').unwrap_or((request, ""));
+            return Self {
+                task: task.to_string(),
+                args: TaskRunArgs::Line(args.to_string()),
+                cwd: None,
+                env: BTreeMap::new(),
+                invalid_env: BTreeSet::new(),
+                invalid_arg: false,
+                stdin: false,
+            };
+        };
+        let (argv, env) = rest.split_once(RUN_GROUP_SEP).unwrap_or((rest, ""));
+        let (env, flags) = env.split_once(RUN_GROUP_SEP).unwrap_or((env, ""));
+        let stdin = flags.split(RUN_ITEM_SEP).any(|flag| flag == RUN_STDIN_FLAG);
+        let mut argv = argv.split(RUN_ITEM_SEP).map(unescape_run_item);
+        let task = argv.next().unwrap_or_default();
+        let env = env
+            .split(RUN_ITEM_SEP)
+            .filter(|item| !item.is_empty())
+            .filter_map(|item| {
+                let item = unescape_run_item(item);
+                let (name, value) = item.split_once('=')?;
+                Some((name.to_string(), value.to_string()))
+            })
+            .collect();
+        Self {
+            task,
+            args: TaskRunArgs::Argv(argv.collect()),
+            cwd: Some(unescape_run_item(cwd)),
+            env,
+            invalid_env: BTreeSet::new(),
+            invalid_arg: false,
+            stdin,
+        }
+    }
+
+    /// Records which args and env values held a byte that is not valid
+    /// UTF-8. `data` is the raw form of the data [`TaskRunRequest::parse`]
+    /// read. The separators and escapes are ASCII, so an item is invalid
+    /// exactly when its raw bytes are.
+    fn mark_invalid_bytes(&mut self, data: &[u8]) {
+        if !self.relays_exit() {
+            return;
+        }
+        let group_sep = RUN_GROUP_SEP as u8;
+        let item_sep = RUN_ITEM_SEP as u8;
+        let mut groups = data.splitn(4, |b| *b == group_sep);
+        let _cwd = groups.next();
+        let argv = groups.next().unwrap_or_default();
+        let env = groups.next().unwrap_or_default();
+        self.invalid_arg = argv
+            .split(|b| *b == item_sep)
+            .skip(1)
+            .any(|item| std::str::from_utf8(item).is_err());
+        for item in env.split(|b| *b == item_sep) {
+            if std::str::from_utf8(item).is_ok() {
+                continue;
+            }
+            let item = unescape_run_item(&String::from_utf8_lossy(item));
+            if let Some((name, _)) = item.split_once('=') {
+                self.invalid_env.insert(name.to_string());
+            }
+        }
+    }
+
+    /// Whether the helper that sent this reads an `exit:` line.
+    fn relays_exit(&self) -> bool {
+        matches!(self.args, TaskRunArgs::Argv(_))
+    }
+}
+
+/// The data after `run%` in a raw request line, past an optional
+/// `traceparent%<id>%` prefix. `None` when the line is not a `run` request.
+fn run_data_bytes(raw: &[u8]) -> Option<&[u8]> {
+    fn split_pct(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+        let at = bytes.iter().position(|b| *b == b'%')?;
+        Some((&bytes[..at], &bytes[at + 1..]))
+    }
+    let (mut method, mut rest) = split_pct(raw)?;
+    if method == b"traceparent" {
+        (_, rest) = split_pct(rest)?;
+        (method, rest) = split_pct(rest)?;
+    }
+    (method == b"run").then_some(rest)
+}
+
+/// The refusal for an `inherit` variable the caller does not set, or sets
+/// to a value that is not valid UTF-8. The laptop's `min task run` prints
+/// the same text for both (`crates/minimal/src/task.rs`).
+fn inherit_refusal(task: &str, name: &str) -> String {
+    let task = one_line(task);
+    let name = one_line(name);
+    format!(
+        "error: task '{task}' declares `env_vars.{name} = {{ inherit = true }}`, \
+         but {name} is not set in this shell; export it before running the task"
+    )
+}
+
+/// The refusal for an argument that is not valid UTF-8.
+fn invalid_arg_refusal(task: &str) -> String {
+    format!(
+        "error: an argument for task '{}' is not valid UTF-8, so the task did not run",
+        one_line(task)
+    )
+}
+
+/// Reverses the helper's escapes: `\\`, `\n` (newline), `\c` (carriage
+/// return), `\u` and `\r` (the two separators).
+fn unescape_run_item(item: &str) -> String {
+    let mut out = String::with_capacity(item.len());
+    let mut chars = item.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('c') => out.push('\r'),
+            Some('u') => out.push(RUN_ITEM_SEP),
+            Some('r') => out.push(RUN_GROUP_SEP),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// `text` with each control character escaped (`\n`, `\r`, `\u{1b}`), for
+/// a name or a path that the channel echoes. A newline in it would start a
+/// protocol line of its own, such as `exit:0`.
+pub(crate) fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
+}
+
+/// Settles an in-box run's task variables. First each name the client's
+/// `[vars] ignore` matched for box `box_id`'s entrypoint run goes (see
+/// [`crate::box_actor::entrypoint_env`]), so a dropped name never reaches
+/// the task, whatever the uploaded `minimal.toml` declares for it. Then a
+/// relaying helper's caller fills the `inherit` ones
+/// ([`inherit_from_caller`]).
+fn run_task_vars(
+    vars: &mut BTreeMap<String, EnvVarValue>,
+    box_id: Option<&boxes::SessionId>,
+    relays: bool,
+    request: &TaskRunRequest,
+) -> Result<(), String> {
+    if let Some(id) = box_id {
+        let drops = crate::box_actor::entrypoint_env::drops(id);
+        vars.retain(|name, _| !drops.contains(name));
+    }
+    if relays {
+        inherit_from_caller(vars, &request.env, &request.invalid_env)?;
+    }
+    Ok(())
+}
+
+/// Gives each `inherit` variable of a task the caller's value. The daemon's
+/// own environment never fills one (#585). `Err(name)` names the first
+/// `inherit` variable the caller does not set, or sets to a value in
+/// `invalid` (one that held a byte that is not valid UTF-8), as the laptop
+/// refuses both. A name in `invalid` that the task does not declare is
+/// ignored.
+fn inherit_from_caller(
+    vars: &mut BTreeMap<String, EnvVarValue>,
+    caller: &BTreeMap<String, String>,
+    invalid: &BTreeSet<String>,
+) -> Result<(), String> {
+    for (name, value) in vars.iter_mut() {
+        if !matches!(value, EnvVarValue::Inherit) {
+            continue;
+        }
+        match caller.get(name) {
+            Some(caller_value) if !invalid.contains(name) => {
+                *value = EnvVarValue::Value(caller_value.clone());
+            }
+            _ => return Err(name.clone()),
+        }
+    }
+    Ok(())
+}
+
+/// Where an `inherit_cwd` task starts in its sandbox: the caller's `$PWD`
+/// when it is a directory under `/workbench` in the session's tree at
+/// `working`.
+///
+/// `Ok(None)` keeps the default `/workbench`. `Err(notice)` also keeps it,
+/// with a line for the caller that says why.
+fn start_dir_in_box(
+    inherit_cwd: bool,
+    cwd: Option<&str>,
+    working: &Path,
+) -> Result<Option<String>, String> {
+    let root = format!("/{}", sandbox::SESSION_DEFAULT_WD);
+    let Some(cwd) = cwd.filter(|_| inherit_cwd) else {
+        return Ok(None);
+    };
+    let cwd_trimmed = cwd.trim_end_matches('/');
+    if cwd_trimmed == root {
+        return Ok(None);
+    }
+    let notice = || {
+        format!(
+            "{} is not a directory under {root}, so the task runs in {root}.",
+            one_line(cwd)
+        )
+    };
+    let Some(rel) = cwd_trimmed.strip_prefix(&format!("{root}/")) else {
+        return Err(notice());
+    };
+    let rel_path = Path::new(rel);
+    let plain = rel_path
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !plain {
+        return Err(notice());
+    }
+    // A symlink the box made can point out of its tree, so resolve it and
+    // accept only a directory under the resolved tree.
+    let inside = match (
+        working.canonicalize(),
+        working.join(rel_path).canonicalize(),
+    ) {
+        (Ok(root_dir), Ok(dir)) => dir.starts_with(&root_dir) && dir.is_dir(),
+        _ => false,
+    };
+    if !inside {
+        return Err(notice());
+    }
+    Ok(Some(format!("{root}/{rel}")))
+}
+
+/// The code `min task run` exits with when the task does not exist.
+const EXIT_NOT_FOUND: u8 = 4;
+/// The code `min task run` exits with when it refuses the task's arguments
+/// or an interactive task.
+const EXIT_USAGE: u8 = 2;
+/// The code `min task run` exits with when `min` itself fails, before or
+/// around the task.
+const EXIT_MIN_FAILURE: u8 = 125;
+/// The code `min task run` exits with when the project configuration
+/// (`minimal.toml` or a package file) is not valid.
+const EXIT_CONFIG: u8 = 3;
+
+/// The code a refused run exits with for the error that refused it: a
+/// configuration error (a package layer included) is [`EXIT_CONFIG`], a
+/// missing package, profile or stack is [`EXIT_NOT_FOUND`], and any other
+/// error is a failure of `min` itself.
+fn refusal_exit_code(e: &Error) -> u8 {
+    match e {
+        Error::Config(_) | Error::Format(_) | Error::MFile(_) => EXIT_CONFIG,
+        Error::Graph(g) => match **g {
+            graph::Error::Decode(_)
+            | graph::Error::ConflictingPackage { .. }
+            | graph::Error::ConflictingProfile { .. }
+            | graph::Error::ConflictingStack { .. }
+            | graph::Error::ConflictingContainer { .. }
+            | graph::Error::UpstreamNotPinned { .. }
+            | graph::Error::NoSuchOutput { .. } => EXIT_CONFIG,
+            graph::Error::NoSuchPkg { .. }
+            | graph::Error::NoSuchProfile { .. }
+            | graph::Error::NoSuchStack { .. } => EXIT_NOT_FOUND,
+            graph::Error::Fetch(_) => EXIT_MIN_FAILURE,
+        },
+        _ => EXIT_MIN_FAILURE,
+    }
+}
+
+/// Ends a refused run with `exit:<code>` for a helper that relays exit
+/// codes. An older helper stops at the `error:` line and gets nothing more.
+fn relay_refusal_exit(stream: &mut UnixStream, relays: bool, task: &str, code: u8) {
+    if relays {
+        tracing::info!(
+            task = %task,
+            exit_code = code,
+            "relaying a refused task run's exit code to the in-box min helper",
+        );
+        let _ = writeln!(stream, "exit:{code}");
+    }
+}
+
+/// The code `min task run` exits with for a run's result: 0 for a run that
+/// passed, and the failing invocation's code for one that failed. A code
+/// outside 1 to 255 becomes 1. `None` for an error that is not the task's
+/// own exit, which the channel reports as an error.
+fn relayed_exit_code(result: &Result<(), Error>) -> Option<u8> {
+    match result {
+        Ok(()) => Some(0),
+        Err(Error::Execution { code, .. }) => {
+            Some(u8::try_from(*code).ok().filter(|c| *c != 0).unwrap_or(1))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Runs each invocation in `dir`, streams its stdout to `stream` as `msg:`
+/// lines and its stderr as `err_tag` lines, and stops at the first one that fails, as `Env::run` does.
+/// `Env::run` has no working directory of its own, so an `inherit_cwd` task
+/// runs here.
+///
+/// `Env::run` gives a task no stdin either, so a run whose helper forwards
+/// its stdin runs here too (T123). With `stdin`, the first invocation gets
+/// a stdin pipe, the channel sends the helper `stdin:`, and the copy of the
+/// forwarded stdin to the pipe goes into `stdin`. Only the first invocation
+/// of a multi-invocation task gets the forwarded stdin. The later
+/// invocations get none. https://github.com/gominimal/minimal/issues/3094
+/// tracks this gap.
+async fn run_invocations_in(
+    env: &mut mctx::Env<'_>,
+    invocations: Vec<sandbox::config::Invocation>,
+    dir: Option<&str>,
+    stream: &UnixStream,
+    err_tag: &'static str,
+    mut stdin: Option<&mut Option<crate::exec::ForwardedStdin>>,
+) -> Result<(), Error> {
+    let io = |what: &'static str| move |e: std::io::Error| Error::IO(what, Default::default(), e);
+    let shared = Arc::new(Mutex::new(
+        stream.try_clone().map_err(io("creating writers"))?,
+    ));
+    for (idx, invocation) in invocations.iter().enumerate() {
+        // One plan, container and attach per invocation: hakoniwa unshares
+        // per spawn, so each one needs its own network.
+        let planned = env.plan_launch().await?;
+        let container = env.container(planned.plan())?;
+        let mut cmd = env.invocation_command(&container, invocation)?;
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
+        let mut stdin = stdin.as_deref_mut().filter(|_| idx == 0);
+        if stdin.is_some() {
+            cmd.stdin(hakoniwa::Stdio::piped());
+        }
+        cmd.stdout(hakoniwa::Stdio::MakePipe);
+        cmd.stderr(hakoniwa::Stdio::MakePipe);
+        let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
+            .map_err(|e| Error::Other(anyhow::anyhow!("spawn failed: {e}")))?;
+        let guard = match planned
+            .attach(sandbox::Spawned::from_child(&mut child))
+            .await
+        {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.into());
+            }
+        };
+        if let Some(slot) = stdin.as_deref_mut() {
+            let started = match child.stdin.take() {
+                Some(pipe) => crate::exec::ForwardedStdin::start(
+                    stream,
+                    std::fs::File::from(std::os::fd::OwnedFd::from(pipe)),
+                ),
+                None => Err(std::io::Error::other("the task has no stdin pipe")),
+            };
+            match started {
+                Ok(forwarded) => {
+                    *slot = Some(forwarded);
+                    // The helper sends its stdin only after this line, so
+                    // the request line the listener read is all it read.
+                    let mut stream = shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = writeln!(stream, "stdin:");
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    guard.teardown().await;
+                    return Err(forwarded_stdin_error(&e));
+                }
+            }
+        }
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let (out, err) = (shared.clone(), shared.clone());
+        let status = crate::traced::spawn_blocking(move || {
+            let out = std::thread::spawn(move || stdout.map(|p| forward_lines(p, &out, "msg")));
+            let err = std::thread::spawn(move || stderr.map(|p| forward_lines(p, &err, err_tag)));
+            let _ = out.join();
+            let _ = err.join();
+            child.wait()
+        })
+        .await;
+        // The task ended, so a read of the forwarded stdin that fails now
+        // does not fail the run.
+        if let Some(Some(forwarded)) = stdin.as_deref() {
+            forwarded.task_ended();
+        }
+        guard.teardown().await;
+        drop(container);
+        let status = status
+            .map_err(|e| Error::Other(anyhow::anyhow!("waiting for the task failed: {e}")))?
+            .map_err(|e| Error::Other(anyhow::anyhow!("waiting for the task failed: {e}")))?;
+        if !status.success() {
+            return Err(Error::Execution {
+                idx,
+                code: status.code,
+                reason: status.reason.clone(),
+                stderr: String::new(),
+                stdout: String::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The failure of a run whose stdin could not reach its task.
+fn forwarded_stdin_error(e: &std::io::Error) -> Error {
+    Error::Other(anyhow::anyhow!(
+        "min task run could not pass its stdin to the task: {e}"
+    ))
+}
+
+/// Copies `pipe` to `stream` as one `<tag>:` line per line, until EOF.
+fn forward_lines(pipe: impl std::io::Read, stream: &Mutex<UnixStream>, tag: &str) {
+    use std::io::BufRead as _;
+    let mut reader = std::io::BufReader::new(pipe);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&line);
+                let text = text.strip_suffix('\n').unwrap_or(&text);
+                let mut stream = stream
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = writeln!(stream, "{tag}:{text}");
+            }
+        }
+    }
+}
+
 /// An [`tokio::io::AsyncWrite`] that frames whatever is written to it into
-/// newline-delimited `msg:` lines on a shared [`UnixStream`].
+/// newline-delimited `<tag>:` lines on a shared [`UnixStream`], `msg:` by
+/// default.
 ///
 /// Used to stream a sandboxed build's stdout/stderr back to the `min` client.
 /// Two writers can share one connection (via `Arc<Mutex<_>>`) so stdout and
@@ -2839,19 +3520,31 @@ fn canonicalize_utf8(path: &Utf8Path) -> std::io::Result<Utf8PathBuf> {
 struct StreamWriter {
     stream: Arc<Mutex<UnixStream>>,
     buf: Vec<u8>,
+    tag: &'static str,
 }
 
 impl StreamWriter {
     fn pair(stream: &UnixStream) -> Result<(Self, Self), std::io::Error> {
+        Self::pair_tagged(stream, "msg")
+    }
+
+    /// A stdout writer that emits `msg:` and a stderr writer that emits
+    /// `err_tag`.
+    fn pair_tagged(
+        stream: &UnixStream,
+        err_tag: &'static str,
+    ) -> Result<(Self, Self), std::io::Error> {
         let shared = Arc::new(Mutex::new(stream.try_clone()?));
         Ok((
             Self {
                 stream: shared.clone(),
                 buf: Vec::new(),
+                tag: "msg",
             },
             Self {
                 stream: shared,
                 buf: Vec::new(),
+                tag: err_tag,
             },
         ))
     }
@@ -2859,7 +3552,7 @@ impl StreamWriter {
     fn emit_lines(&mut self) {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.buf[..pos]);
-            let _ = writeln!(self.stream.lock().unwrap(), "msg:{line}");
+            let _ = writeln!(self.stream.lock().unwrap(), "{}:{line}", self.tag);
             self.buf.drain(..=pos);
         }
     }
@@ -3884,6 +4577,879 @@ exit $rc
         }
     }
 
+    /// Runs the installed `min` helper as a script in `cwd`, with a `socat`
+    /// stand-in that saves the request it reads to a file and answers with
+    /// `reply`. Returns stdout, stderr, the exit code and the saved request,
+    /// or `None` when the host has no bash.
+    fn run_min_against(
+        rootfs: &Path,
+        cwd: &Path,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        reply: &str,
+    ) -> Option<(String, String, i32, String)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bin = rootfs.join("replybin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let socat = bin.join("socat");
+        let capture = rootfs.join("request");
+        std::fs::write(
+            &socat,
+            format!(
+                // One line: a `run` helper keeps its side open until the
+                // channel answers, as the channel answers before EOF.
+                "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' \"$line\" > '{}'\nprintf '%s' '{reply}'\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = rootfs.join("usr/bin/min");
+        let out = std::process::Command::new("bash")
+            .arg(script.to_str().unwrap())
+            .args(args)
+            .current_dir(cwd)
+            .env_remove("TRACEPARENT")
+            .env("PWD", cwd)
+            .envs(envs.iter().copied())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
+            .ok()?;
+        Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+            std::fs::read_to_string(&capture).unwrap_or_default(),
+        ))
+    }
+
+    /// The real `socat` on this host's `PATH`, or `None` when it has none.
+    fn host_socat() -> Option<PathBuf> {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|dir| dir.join("socat"))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// Runs the installed `min` helper with `args` and `stdin` on its
+    /// stdin, through the host's real `socat`, against a socket that
+    /// `serve` answers in place of `/run/minenv_sock`. The listener reads
+    /// the request line as the session listener does, with a buffered read
+    /// that it then drops. Returns stdout, stderr and the exit code, or
+    /// `None` when the host has no bash or no socat.
+    fn run_min_against_channel(
+        rootfs: &Path,
+        args: &[&str],
+        stdin: Vec<u8>,
+        serve: impl FnOnce(UnixStream, String) + Send + 'static,
+    ) -> Option<(String, String, i32)> {
+        use std::io::{BufRead as _, BufReader};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(socat) = host_socat() else {
+            eprintln!("no socat to run the min helper with — skipping");
+            return None;
+        };
+        let sock = rootfs.join("minenv_sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let bin = rootfs.join("channelbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let wrapper = bin.join("socat");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/bash\nargs=()\nfor a in \"$@\"; do args+=(\"${{a/UNIX-CONNECT:\\/run\\/minenv_sock/UNIX-CONNECT:{}}}\"); done\nexec '{}' \"${{args[@]}}\"\n",
+                sock.display(),
+                socat.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Bytes that arrive before the channel asks for them would sit
+            // in the kernel buffer now, and the buffered read below would
+            // take them with the line.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let mut raw = Vec::new();
+            BufReader::new(&stream).read_until(b'\n', &mut raw).unwrap();
+            let line = String::from_utf8(raw).unwrap();
+            serve(stream, line.trim_end_matches('\n').to_string());
+        });
+
+        let script = rootfs.join("usr/bin/min");
+        let mut child = std::process::Command::new("bash")
+            .arg(script.to_str().unwrap())
+            .args(args)
+            .current_dir(rootfs)
+            .env_remove("TRACEPARENT")
+            .env("PWD", rootfs)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
+            .ok()?;
+        let mut pipe = child.stdin.take().unwrap();
+        let feeder = std::thread::spawn(move || {
+            // A task that ends before it reads all of its stdin closes the
+            // pipe, so this write can fail.
+            let _ = pipe.write_all(&stdin);
+        });
+        let out = child.wait_with_output().unwrap();
+        let _ = feeder.join();
+        server.join().expect("the channel side passes its checks");
+        Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        ))
+    }
+
+    /// The data of a `run` request line, past `run%`.
+    fn run_request_data(line: &str) -> TaskRunRequest {
+        let data = line
+            .strip_prefix("run%")
+            .unwrap_or_else(|| panic!("not a run request: {line:?}"));
+        TaskRunRequest::parse(data)
+    }
+
+    // T123, BOX-038: the in-box `min task run` is a task box's entrypoint,
+    // so the run's stdin is its stdin. It says in the request that it
+    // forwards that stdin, sends it only after the channel's `stdin:` line,
+    // and closes it at its EOF. A run the channel refuses never sends it.
+    #[test]
+    fn minenv_run_forwards_stdin_to_the_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        let input = b"select 1;\nselect 2;\n".to_vec();
+        let expected = input.clone();
+        let Some((stdout, stderr, code)) = run_min_against_channel(
+            rootfs,
+            &["task", "run", "query", "--limit", "5"],
+            input,
+            move |mut stream, line| {
+                use std::io::Read as _;
+                let request = run_request_data(&line);
+                assert!(
+                    request.stdin,
+                    "the request says it forwards stdin: {line:?}"
+                );
+                assert_eq!(request.task, "query");
+                assert_eq!(
+                    request.args,
+                    TaskRunArgs::Argv(vec!["--limit".to_string(), "5".to_string()])
+                );
+                writeln!(stream, "stdin:").unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).unwrap();
+                assert_eq!(got, expected, "all of the stdin, after the line, then EOF");
+                writeln!(stream, "msg:read {} bytes", got.len()).unwrap();
+                writeln!(stream, "exit:0").unwrap();
+            },
+        ) else {
+            return;
+        };
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        assert_eq!(stdout, "read 20 bytes\n");
+
+        // A refusal sends no `stdin:` line, so the helper sends none of
+        // its stdin, and it exits with the refusal's code.
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let Some((stdout, stderr, code)) = run_min_against_channel(
+            rootfs,
+            &["task", "run", "nope"],
+            b"never sent\n".to_vec(),
+            |mut stream, line| {
+                use std::io::Read as _;
+                assert!(run_request_data(&line).stdin);
+                write!(stream, "error: no such task 'nope'\nexit:4\n").unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).unwrap();
+                assert!(got.is_empty(), "no stdin without `stdin:`: {got:?}");
+            },
+        ) else {
+            return;
+        };
+        assert_eq!(code, 4, "{stdout} {stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("no such task 'nope'"), "{stderr}");
+
+        // The flag is a fourth group, after the environment, and an older
+        // request without it forwards nothing.
+        let parsed = TaskRunRequest::parse("/w\u{1e}lint\u{1e}A=1\u{1f}B=2\u{1e}stdin");
+        assert!(parsed.stdin);
+        assert_eq!(parsed.env.get("B").map(String::as_str), Some("2"));
+        let parsed = TaskRunRequest::parse("/w\u{1e}lint\u{1e}A=1");
+        assert!(!parsed.stdin);
+        let mut marked = TaskRunRequest::parse("/w\u{1e}lint\u{1e}A=1\u{1e}stdin");
+        marked.mark_invalid_bytes(b"/w\x1elint\x1eA=\xff\x1estdin");
+        assert!(marked.invalid_env.contains("A"));
+    }
+
+    /// The channel side of a forwarded `run`, built from the pieces the
+    /// channel's `run_task` uses: a `stdin:` line, the task's stdin fed by
+    /// [`crate::exec::ForwardedStdin`], its stdout as `msg:` lines and its
+    /// stderr as `err:` lines, then its exit code and the close.
+    fn serve_task(script: &'static str) -> impl FnOnce(UnixStream, String) + Send + 'static {
+        move |stream, line| {
+            assert!(run_request_data(&line).stdin, "{line:?}");
+            let mut task = std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut forwarded =
+                crate::exec::ForwardedStdin::start(&stream, task.stdin.take().unwrap()).unwrap();
+            let shared = Arc::new(Mutex::new(stream.try_clone().unwrap()));
+            writeln!(shared.lock().unwrap(), "stdin:").unwrap();
+            let (stdout, stderr) = (task.stdout.take().unwrap(), task.stderr.take().unwrap());
+            let (out, err) = (shared.clone(), shared.clone());
+            let out = std::thread::spawn(move || forward_lines(stdout, &out, "msg"));
+            let err = std::thread::spawn(move || forward_lines(stderr, &err, "err"));
+            out.join().unwrap();
+            err.join().unwrap();
+            let status = task.wait().unwrap();
+            forwarded.task_ended();
+            let result = match status.code() {
+                Some(0) => Ok(true),
+                code => Err(Error::Execution {
+                    idx: 0,
+                    code: code.unwrap_or(1),
+                    reason: String::new(),
+                    stderr: String::new(),
+                    stdout: String::new(),
+                }),
+            };
+            let mut stream = stream;
+            BoxChannel::end_task_run(
+                &mut stream,
+                true,
+                "err",
+                "query",
+                result,
+                Some(&mut forwarded),
+            );
+            forwarded.finish(std::time::Duration::from_secs(10));
+        }
+    }
+
+    // T123, BOX-038: `cat q.sql | min task run query > out.csv` in a task
+    // box. The run's stdin goes through the in-box helper to the task's
+    // stdin pipe and closes at its end. The helper's stdout is the task's
+    // stdout alone, and it exits with the task's code. A task that ends
+    // before it reads all of its stdin still reports its code.
+    #[test]
+    fn task_run_pipes_stdin_through_the_in_box_helper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let Some((stdout, stderr, code)) = run_min_against_channel(
+            rootfs,
+            &["task", "run", "query"],
+            b"select 1;\nselect 2;\n".to_vec(),
+            serve_task("read first; echo \"first:$first\"; echo diag >&2; cat; exit 7"),
+        ) else {
+            return;
+        };
+        assert_eq!(code, 7, "{stdout} {stderr}");
+        assert_eq!(stdout, "first:select 1;\nselect 2;\n");
+        assert_eq!(stderr, "diag\n");
+
+        // Far more input than any pipe holds, and a task that reads one
+        // byte: the channel drops the rest, and the run still ends with
+        // the task's code.
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let Some((stdout, stderr, code)) = run_min_against_channel(
+            rootfs,
+            &["task", "run", "query"],
+            vec![b'y'; 4 * 1024 * 1024],
+            serve_task("head -c 1; echo; exit 0"),
+        ) else {
+            return;
+        };
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        assert_eq!(stdout, "y\n");
+        assert!(stderr.is_empty(), "{stderr}");
+    }
+
+    /// Ends a run with `result` while its forwarded stdin fails with a
+    /// reset connection, before or after the task ended, and returns what
+    /// the channel sends the helper.
+    fn end_run_after_a_stdin_reset(result: Result<bool, Error>, after_task_ended: bool) -> String {
+        use std::io::Read as _;
+        let (connection, helper) = UnixStream::pair().unwrap();
+        let mut forwarded =
+            crate::exec::ForwardedStdin::start(&connection, std::io::sink()).unwrap();
+        if after_task_ended {
+            forwarded.task_ended();
+        }
+        // A peer that closes with unread data resets the connection, so the
+        // copy's next read fails.
+        (&connection).write_all(b"unread").unwrap();
+        drop(helper);
+        forwarded.wait_for_copy_end();
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        BoxChannel::end_task_run(
+            &mut ours,
+            true,
+            "err",
+            "query",
+            result,
+            Some(&mut forwarded),
+        );
+        drop(ours);
+        let mut sent = String::new();
+        theirs.read_to_string(&mut sent).unwrap();
+        sent
+    }
+
+    // T123, BOX-038: a task that fails with its own code while its
+    // forwarded stdin fails still ends with its own code.
+    #[test]
+    fn task_run_pipes_stdin_through_the_in_box_helper_keeps_a_failed_task_code() {
+        let failed = Err(Error::Execution {
+            idx: 0,
+            code: 4,
+            reason: String::new(),
+            stderr: String::new(),
+            stdout: String::new(),
+        });
+        let sent = end_run_after_a_stdin_reset(failed, false);
+        assert!(sent.ends_with("exit:4\n"), "{sent:?}");
+        // The same reset while the task read its stdin fails a run that
+        // passed, so the reset above did reach the run.
+        let sent = end_run_after_a_stdin_reset(Ok(true), false);
+        assert!(!sent.contains("exit:0"), "{sent:?}");
+        assert!(sent.contains("could not pass its stdin"), "{sent:?}");
+    }
+
+    // T123, BOX-038: a forwarded stdin that fails after the task ended
+    // with 0 leaves the run's code 0.
+    #[test]
+    fn task_run_pipes_stdin_through_the_in_box_helper_keeps_a_pass_after_the_task_ended() {
+        let sent = end_run_after_a_stdin_reset(Ok(true), true);
+        assert_eq!(sent, "exit:0\n");
+    }
+
+    /// BCLI-010 (T62): a refusal for a project configuration error exits 3,
+    /// a missing package exits 4, and any other refusal exits 125.
+    #[test]
+    fn refusal_exit_code_gives_a_config_error_exit_3() {
+        let config = Error::Config(mctx::ConfigError::InvalidRemoteCacheUrl(String::new()));
+        assert_eq!(refusal_exit_code(&config), 3);
+        let other = Error::Other(anyhow::anyhow!("no sandbox"));
+        assert_eq!(refusal_exit_code(&other), 125);
+        let conflict = Error::Graph(Box::new(graph::Error::ConflictingStack {
+            name: "dev".into(),
+        }));
+        assert_eq!(refusal_exit_code(&conflict), 3);
+        let missing = Error::Graph(Box::new(graph::Error::NoSuchPkg {
+            name: "nope".into(),
+        }));
+        assert_eq!(refusal_exit_code(&missing), 4);
+        let fetch = Error::Graph(Box::new(graph::Error::Fetch("offline".into())));
+        assert_eq!(refusal_exit_code(&fetch), 125);
+    }
+
+    /// The channel's trace log never carries a `run` request's environment.
+    #[test]
+    fn loggable_request_cuts_the_run_environment() {
+        let line = "run%/w\u{1e}lint\u{1f}a\u{1e}TOKEN=secret\u{1f}HOME=/h";
+        let logged = loggable_request(line);
+        assert_eq!(
+            logged,
+            "run%/w\u{1e}lint\u{1f}a\u{1e}<environment redacted>"
+        );
+        assert_eq!(loggable_request("run%lint a b"), "run%lint a b");
+    }
+
+    /// BCLI-010 (T62): `min task run`, a task box's entrypoint, exits with
+    /// the code the channel relays for the task, and the channel relays the
+    /// task's own code.
+    #[test]
+    fn task_entrypoint_relays_the_task_exit_code() {
+        // The channel side: the code that ends a run.
+        let failed = |code| {
+            Err(Error::Execution {
+                idx: 0,
+                code,
+                reason: String::new(),
+                stderr: String::new(),
+                stdout: String::new(),
+            })
+        };
+        assert_eq!(relayed_exit_code(&Ok(())), Some(0));
+        assert_eq!(relayed_exit_code(&failed(3)), Some(3));
+        assert_eq!(relayed_exit_code(&failed(137)), Some(137));
+        assert_eq!(relayed_exit_code(&failed(0)), Some(1));
+        assert_eq!(relayed_exit_code(&failed(300)), Some(1));
+        assert_eq!(relayed_exit_code(&failed(-1)), Some(1));
+        assert_eq!(
+            relayed_exit_code(&Err(Error::Other(anyhow::anyhow!("no sandbox")))),
+            None
+        );
+
+        // The helper side: it exits with the relayed code, after the
+        // task's output.
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        for (args, code) in [
+            (&["task", "run", "lint"][..], 3),
+            (&["task", "run", "lint"][..], 0),
+            (&["run", "lint"][..], 42),
+            (&["task", "run", "lint"][..], 137),
+        ] {
+            let reply = format!("msg:task output\nexit:{code}\n");
+            let Some((stdout, stderr, got, _)) = run_min_against(rootfs, rootfs, args, &[], &reply)
+            else {
+                return;
+            };
+            assert_eq!(got, code, "{args:?}: {stdout} {stderr}");
+            assert!(stdout.contains("task output"), "{args:?}: {stdout}");
+        }
+
+        // A refusal exits with the code the channel sends after it.
+        for (reply, code) in [
+            ("error: no such task nope\nexit:4\n", 4),
+            (
+                "err:usage line\nerror: failed parsing arguments for task\nexit:2\n",
+                2,
+            ),
+            (
+                "err:report\nerror: sandbox command failed.\nexit:125\n",
+                125,
+            ),
+            ("err:report\nerror: sandbox command failed.\nexit:3\n", 3),
+            // A refusal with no `exit:` line, as an older daemon sends.
+            ("error: no such task nope\n", 125),
+        ] {
+            let Some((stdout, stderr, got, _)) =
+                run_min_against(rootfs, rootfs, &["task", "run", "nope"], &[], reply)
+            else {
+                return;
+            };
+            assert_eq!(got, code, "{reply:?}: {stderr}");
+            assert!(stderr.contains("error:"), "{reply:?}: {stderr}");
+            assert!(stdout.is_empty(), "{reply:?}: {stdout}");
+            assert!(
+                !stderr.contains("the connection closed"),
+                "{reply:?}: {stderr}"
+            );
+        }
+
+        // A stream that ends with no `exit:` line, as when the connection
+        // drops mid-task, is a failure of min, not a success.
+        for reply in ["msg:task output\n", "msg:task output\ndone:\n", ""] {
+            let Some((_, stderr, got, _)) =
+                run_min_against(rootfs, rootfs, &["task", "run", "lint"], &[], reply)
+            else {
+                return;
+            };
+            assert_eq!(got, 125, "{reply:?}: {stderr}");
+            assert!(
+                stderr.contains("the connection closed before the task reported its exit status"),
+                "{reply:?}: {stderr}"
+            );
+        }
+
+        // A line that `echo` reads as a flag prints as it is.
+        let Some((stdout, stderr, got, _)) = run_min_against(
+            rootfs,
+            rootfs,
+            &["task", "run", "lint"],
+            &[],
+            "msg:-n\nerr:-E\nexit:0\n",
+        ) else {
+            return;
+        };
+        assert_eq!(got, 0, "{stderr}");
+        assert_eq!(stdout, "-n\n");
+        assert_eq!(stderr, "-E\n");
+
+        // A name the channel echoes stays on one line, so a newline in it
+        // cannot end the run with an `exit:` line of its own.
+        assert_eq!(one_line("nope\nexit:0"), "nope\\nexit:0");
+        assert_eq!(one_line("nope\r\x1b"), "nope\\r\\u{1b}");
+        assert_eq!(one_line("lint"), "lint");
+
+        // A task that writes only to stderr leaves the helper's stdout empty.
+        let Some((stdout, stderr, got, _)) = run_min_against(
+            rootfs,
+            rootfs,
+            &["task", "run", "lint"],
+            &[],
+            "err:task stderr\nexit:1\n",
+        ) else {
+            return;
+        };
+        assert_eq!(got, 1, "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("task stderr"), "{stderr}");
+
+        // The channel side of a refusal and of the task's stderr.
+        use std::io::Read as _;
+        let read_all = |mut rx: UnixStream| {
+            let mut got = String::new();
+            rx.read_to_string(&mut got).unwrap();
+            got
+        };
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        relay_refusal_exit(&mut tx, true, "nope", EXIT_NOT_FOUND);
+        relay_refusal_exit(&mut tx, false, "nope", EXIT_NOT_FOUND);
+        drop(tx);
+        assert_eq!(read_all(rx), "exit:4\n");
+
+        let (tx, rx) = UnixStream::pair().unwrap();
+        forward_lines(&b"one\ntwo\n"[..], &Mutex::new(tx), "err");
+        assert_eq!(read_all(rx), "err:one\nerr:two\n");
+
+        let (tx, rx) = UnixStream::pair().unwrap();
+        let (mut out, mut err) = StreamWriter::pair_tagged(&tx, "err").unwrap();
+        drop(tx);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use tokio::io::AsyncWriteExt as _;
+            out.write_all(b"to stdout\n").await.unwrap();
+            err.write_all(b"to stderr\n").await.unwrap();
+        });
+        drop((out, err));
+        assert_eq!(read_all(rx), "msg:to stdout\nerr:to stderr\n");
+    }
+
+    /// T43: a name the client's `[vars] ignore` matched never reaches the
+    /// task on the entrypoint path. The run stages it, the launch takes it,
+    /// and the in-box run drops it before it fills `inherit` variables. That
+    /// holds for a name the uploaded `minimal.toml` gives a value, and for
+    /// an `inherit` one whose value the helper's caller still has.
+    #[test]
+    fn task_entrypoint_drops_ignored_vars() {
+        use crate::box_actor::entrypoint_env;
+
+        let id = boxes::SessionId::mint();
+        entrypoint_env::stage(
+            id,
+            vec![
+                ("KEPT".to_string(), "k".to_string()),
+                ("IGNORED_TOKEN".to_string(), "leak".to_string()),
+            ],
+            None,
+            BTreeSet::from(["IGNORED_TOKEN".to_string(), "IGNORED_FIXED".to_string()]),
+        );
+        // The launch: the dropped name is not among its variables, and the
+        // launch records the names for the in-box run.
+        let (launch_vars, dropped) = entrypoint_env::take(&id).expect("the run staged");
+        assert_eq!(launch_vars, vec![("KEPT".to_string(), "k".to_string())]);
+        entrypoint_env::record(id, dropped);
+
+        // The in-box run, as the helper sends it with the caller's value.
+        let request = TaskRunRequest::parse(&format!(
+            "/workbench{RUN_GROUP_SEP}lint{RUN_GROUP_SEP}IGNORED_TOKEN=caller{RUN_ITEM_SEP}KEPT=k"
+        ));
+        let mut vars = BTreeMap::from([
+            ("IGNORED_TOKEN".to_string(), EnvVarValue::Inherit),
+            (
+                "IGNORED_FIXED".to_string(),
+                EnvVarValue::Value("from-toml".to_string()),
+            ),
+            ("KEPT".to_string(), EnvVarValue::Inherit),
+        ]);
+        assert_eq!(run_task_vars(&mut vars, Some(&id), true, &request), Ok(()));
+        assert_eq!(
+            vars,
+            BTreeMap::from([("KEPT".to_string(), EnvVarValue::Value("k".to_string()))]),
+            "only the kept variable reaches the task"
+        );
+
+        // A box no task run launched drops nothing.
+        let mut vars = BTreeMap::from([(
+            "IGNORED_FIXED".to_string(),
+            EnvVarValue::Value("v".to_string()),
+        )]);
+        let other = boxes::SessionId::mint();
+        assert_eq!(
+            run_task_vars(&mut vars, Some(&other), false, &request),
+            Ok(())
+        );
+        assert_eq!(vars.len(), 1);
+    }
+
+    /// BCLI-010 (T62): the request `min task run` sends carries the caller's
+    /// args with their spaces, its `$PWD` and its exported variables. The
+    /// channel fills the task's `inherit` variables from them and starts an
+    /// `inherit_cwd` task in that directory.
+    #[test]
+    fn task_entrypoint_carries_env_cwd_and_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let cwd = rootfs.join("some dir");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let Some((stdout, stderr, code, request)) = run_min_against(
+            rootfs,
+            &cwd,
+            &[
+                "task",
+                "run",
+                "lint",
+                "--name",
+                "two words",
+                "back\\slash",
+                "",
+            ],
+            &[("CALLER_TOKEN", "a=b\nline two\x1fx\\y")],
+            "exit:0\n",
+        ) else {
+            return;
+        };
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        let data = request
+            .trim_end_matches('\n')
+            .strip_prefix("run%")
+            .unwrap_or_else(|| panic!("not a run request: {request:?}"));
+        let parsed = TaskRunRequest::parse(data);
+        assert!(parsed.relays_exit());
+        assert_eq!(parsed.task, "lint");
+        assert_eq!(
+            parsed.args,
+            TaskRunArgs::Argv(vec![
+                "--name".to_string(),
+                "two words".to_string(),
+                "back\\slash".to_string(),
+                String::new(),
+            ])
+        );
+        assert_eq!(parsed.cwd.as_deref(), cwd.to_str());
+        assert_eq!(
+            parsed.env.get("CALLER_TOKEN").map(String::as_str),
+            Some("a=b\nline two\x1fx\\y")
+        );
+
+        // An older helper's `<task> <args>` line still parses, and reads
+        // no `exit:` line.
+        let legacy = TaskRunRequest::parse("lint --name x");
+        assert_eq!(legacy.task, "lint");
+        assert_eq!(legacy.args, TaskRunArgs::Line("--name x".to_string()));
+        assert!(!legacy.relays_exit());
+
+        // Env: the caller's value fills an `inherit` variable, and one the
+        // caller does not set refuses the run, not read from the daemon.
+        let mut vars = BTreeMap::from([
+            ("CALLER_TOKEN".to_string(), EnvVarValue::Inherit),
+            ("NOT_SET_BY_CALLER".to_string(), EnvVarValue::Inherit),
+        ]);
+        assert_eq!(
+            inherit_from_caller(&mut vars, &parsed.env, &parsed.invalid_env),
+            Err("NOT_SET_BY_CALLER".to_string())
+        );
+        let mut vars = BTreeMap::from([
+            ("CALLER_TOKEN".to_string(), EnvVarValue::Inherit),
+            ("FIXED".to_string(), EnvVarValue::Value("v".to_string())),
+        ]);
+        assert_eq!(
+            inherit_from_caller(&mut vars, &parsed.env, &parsed.invalid_env),
+            Ok(())
+        );
+        assert_eq!(
+            vars,
+            BTreeMap::from([
+                (
+                    "CALLER_TOKEN".to_string(),
+                    EnvVarValue::Value("a=b\nline two\x1fx\\y".to_string())
+                ),
+                ("FIXED".to_string(), EnvVarValue::Value("v".to_string())),
+            ])
+        );
+
+        // Cwd: an `inherit_cwd` task starts in the caller's directory under
+        // `/workbench` when the session's tree has it.
+        let working = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(working.path().join("sub/deeper")).unwrap();
+        let w = working.path();
+        assert_eq!(
+            start_dir_in_box(true, Some("/workbench/sub/deeper"), w),
+            Ok(Some("/workbench/sub/deeper".to_string()))
+        );
+        assert_eq!(start_dir_in_box(true, Some("/workbench"), w), Ok(None));
+        assert_eq!(start_dir_in_box(false, Some("/workbench/sub"), w), Ok(None));
+        assert_eq!(start_dir_in_box(true, None, w), Ok(None));
+        // A symlink in the box's tree that points out of it is not a
+        // directory under `/workbench`.
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), w.join("escape")).unwrap();
+        for outside in [
+            "/workbench/missing",
+            "/home",
+            "/workbench/../etc",
+            "/workbench/escape",
+        ] {
+            let notice = start_dir_in_box(true, Some(outside), w).unwrap_err();
+            assert_eq!(
+                notice,
+                format!(
+                    "{outside} is not a directory under /workbench, so the task runs in /workbench."
+                )
+            );
+        }
+        // A `$PWD` with a newline in it stays on one line in the notice.
+        let notice = start_dir_in_box(true, Some("/home\nexit:0"), w).unwrap_err();
+        assert!(!notice.contains('\n'), "{notice:?}");
+        assert!(notice.starts_with("/home\\nexit:0 is not"), "{notice:?}");
+
+        // Bytes that are not valid UTF-8: a declared `inherit` value that
+        // held one refuses the run with the laptop's text, as does an
+        // argument. An undeclared variable that held one is ignored.
+        let raw = b"traceparent%00-ab-cd-01%run%/workbench\x1elint\x1fok\x1fbad\xff\x1e\
+                    TOKEN=caf\xe9\x1fOTHER=\xfe\x1fFINE=v";
+        let data = run_data_bytes(raw).unwrap();
+        let mut parsed = TaskRunRequest::parse(&String::from_utf8_lossy(data));
+        parsed.mark_invalid_bytes(data);
+        assert!(parsed.invalid_arg);
+        assert_eq!(
+            parsed.invalid_env,
+            BTreeSet::from(["TOKEN".to_string(), "OTHER".to_string()])
+        );
+        assert_eq!(run_data_bytes(b"search%x\xff"), None);
+        let mut vars = BTreeMap::from([
+            ("TOKEN".to_string(), EnvVarValue::Inherit),
+            ("FINE".to_string(), EnvVarValue::Inherit),
+        ]);
+        assert_eq!(
+            inherit_from_caller(&mut vars, &parsed.env, &parsed.invalid_env),
+            Err("TOKEN".to_string())
+        );
+        let mut vars = BTreeMap::from([("FINE".to_string(), EnvVarValue::Inherit)]);
+        assert_eq!(
+            inherit_from_caller(&mut vars, &parsed.env, &parsed.invalid_env),
+            Ok(())
+        );
+        assert_eq!(
+            inherit_refusal("lint", "TOKEN"),
+            "error: task 'lint' declares `env_vars.TOKEN = { inherit = true }`, \
+             but TOKEN is not set in this shell; export it before running the task"
+        );
+        assert_eq!(
+            invalid_arg_refusal("lint"),
+            "error: an argument for task 'lint' is not valid UTF-8, so the task did not run"
+        );
+        let mut valid_args = TaskRunRequest::parse("/workbench\x1elint\x1fok\x1eFINE=v");
+        valid_args.mark_invalid_bytes(b"/workbench\x1elint\x1fok\x1eFINE=v");
+        assert!(!valid_args.invalid_arg);
+        assert!(valid_args.invalid_env.is_empty());
+    }
+
+    /// A project whose `needs-token` task inherits `TOKEN` from the caller.
+    fn inherit_task_repo() -> TempDir {
+        let repo = tempdir().unwrap();
+        let pkgs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mctx/testdata/fakepkgs");
+        std::fs::write(
+            repo.path().join("minimal.toml"),
+            format!(
+                "[upstream]\ndir = {:?}\n\n\
+                 [tasks.needs-token]\npackages = [\"uroot\"]\nexec = \"/bbin/true\"\n\
+                 env_vars.TOKEN = {{ inherit = true }}\n",
+                pkgs.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        repo
+    }
+
+    /// Hands `raw` to a channel over the project at `repo`, as the listener
+    /// does for a line that was not valid UTF-8, and returns its reply.
+    async fn handle_lossy_line(repo: &Path, raw: &[u8]) -> String {
+        let (_state, _rootfs, _cwd, mut chan) =
+            setup_channel_in(crate::box_actor::WeakBoxHandle::dangling(), "web", repo);
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        let line = String::from_utf8_lossy(raw).into_owned();
+        chan.handle_raw(&line, Some(raw), &mut ours).await;
+        drop(ours);
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut theirs, &mut reply).unwrap();
+        reply
+    }
+
+    // BCLI-010 (T62): a declared `inherit` value with a byte that is not
+    // valid UTF-8 refuses the run with exit 2, as the laptop does.
+    #[tokio::test]
+    async fn task_run_refuses_an_inherit_value_that_is_not_utf8() {
+        let repo = inherit_task_repo();
+        let reply = handle_lossy_line(
+            repo.path(),
+            b"run%/workbench\x1eneeds-token\x1eTOKEN=caf\xe9",
+        )
+        .await;
+        assert_eq!(
+            reply,
+            "error: task 'needs-token' declares `env_vars.TOKEN = { inherit = true }`, \
+             but TOKEN is not set in this shell; export it before running the task\nexit:2\n"
+        );
+    }
+
+    // BCLI-010 (T62): an argument with a byte that is not valid UTF-8
+    // refuses the run with exit 2.
+    #[tokio::test]
+    async fn task_run_refuses_an_argument_that_is_not_utf8() {
+        let repo = inherit_task_repo();
+        let reply = handle_lossy_line(
+            repo.path(),
+            b"run%/workbench\x1eneeds-token\x1fcaf\xe9\x1eTOKEN=v",
+        )
+        .await;
+        assert_eq!(
+            reply,
+            "error: an argument for task 'needs-token' is not valid UTF-8, \
+             so the task did not run\nexit:2\n"
+        );
+    }
+
+    // BCLI-010 (T62): an exported variable that the task does not declare
+    // neither refuses nor drops the run, whatever bytes it holds.
+    #[tokio::test]
+    async fn task_run_ignores_an_undeclared_value_that_is_not_utf8() {
+        let repo = inherit_task_repo();
+        let reply = handle_lossy_line(
+            repo.path(),
+            b"run%/workbench\x1eneeds-token\x1eTOKEN=v\x1fOTHER=caf\xe9",
+        )
+        .await;
+        assert!(!reply.contains("not valid UTF-8"), "{reply}");
+        assert!(!reply.contains("is not set in this shell"), "{reply}");
+        // The run reaches the box: the test's box is gone, so it ends there.
+        assert_eq!(reply, "error: session is gone\nexit:125\n");
+    }
+
     /// In an argument slot a bare `help` is a package name, search term, or
     /// task name, not a help request, so it still reaches the daemon. So
     /// does a help flag after a task name: it is the task's argument. So
@@ -3932,6 +5498,20 @@ exit $rc
         session: crate::box_actor::WeakBoxHandle,
         name: &str,
     ) -> (TempDir, TempDir, TempDir, BoxChannel) {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        setup_channel_in(
+            session,
+            name,
+            &manifest_dir.join("../mctx/testdata/fakerepo"),
+        )
+    }
+
+    /// [`setup_channel_with`] for the project at `repo`.
+    fn setup_channel_in(
+        session: crate::box_actor::WeakBoxHandle,
+        name: &str,
+        repo: &Path,
+    ) -> (TempDir, TempDir, TempDir, BoxChannel) {
         let cwd = tempdir().unwrap();
         let state = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -3939,7 +5519,7 @@ exit $rc
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let config = ConfigBuilder::new()
             .with_state_dir(state.path().to_path_buf())
-            .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
+            .with_repo_dir(repo.to_path_buf())
             .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
             .with_no_fetch(true)
             .build()

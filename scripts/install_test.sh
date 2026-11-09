@@ -106,6 +106,9 @@ mkdir -p "$mock/versions/v1"
 write_min_stub() {
     printf '#!/bin/sh\n# mock min (%s)\n' "${2:-previous release}" >"$1"
     cat >>"$1" <<'MOCKEOF'
+# Every call records whether it ran with the installer's update-check guard
+# (MINIMAL_UNDER_INSTALLER) and its verb, in $HOME/min.calls.
+printf '%s %s\n' "${MINIMAL_UNDER_INSTALLER:-unset}" "${1:-}" >>"$HOME/min.calls"
 comp_target() {
     case "$1" in
         bash) printf '%s/bash-completion/completions/min\n' "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
@@ -659,6 +662,23 @@ case_install() {
     want_ok "the card names the first command (R10.4)" \
         grep -qE "min +build the sandbox and step inside" "$OUT"
     want_card_last "the card closes a fresh install (R10.4)"
+    # The install's description for the update check (R6.1b): the target,
+    # the method and the pointer installed, recorded so uninstall removes it.
+    _im="$H1/xdg-state/minimal/install.toml"
+    want_ok "install.toml is written beside the record (R6.1b)" test -f "$_im"
+    want_ok "install.toml names the target channel (R6.1b)" grep -qx 'channel = "stable"' "$_im"
+    want_ok "install.toml names the installer as the method (R6.1b)" grep -qx 'method = "installer"' "$_im"
+    want_ok "install.toml carries the installed pointer (R6.1b)" grep -qx 'key = "v1"' "$_im"
+    want_ok "install.toml names the binary it describes (R6.1b)" grep -qxF "bin = '$H1/bin/min'" "$_im"
+    want_ok "the installer runs its own min calls (R6.1b)" test -s "$H1/min.calls"
+    want_err "every min call of the installer is kept out of the update check (R6.1b)" \
+        grep -qv '^1 ' "$H1/min.calls"
+    want_ok "install.toml is recorded for uninstall (R6.1b)" \
+        record_has install-metadata "$_im" "$H1/xdg-state/minimal/installed"
+    want_ok "the card points at the update check's docs (R6.1b)" grep -q "reference/telemetry#update-check" "$OUT"
+    want_ok "the card says what the check sends (R6.1b)" grep -q "install id to update.minimal.dev" "$OUT"
+    want_ok "the card names the install method among the fields (R6.1b)" grep -q "architecture, install method and" "$OUT"
+    want_ok "the card names the check's off switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
     # Nothing on a redirected stream may carry terminal escapes (R10.1): this
     # output is a file, so a stray SGR here would land in every CI log. `run` sets a
     # terminal-like TERM, so what this pins is the `[ -t 2 ]` half of the guard:
@@ -839,6 +859,7 @@ EOF
     run ns_run "$HNS" --uninstall
     FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with the host DNS setup present exits 0"
+    want_err "uninstall removes install.toml (R6.1b)" test -e "$HNS/xdg-state/minimal/install.toml"
     want_ok "uninstall advises the host DNS setup is still installed" \
         grep -q "still installed on this host.*host DNS setup" "$OUT"
     want_ok "advisory names min finalize-install --undo" grep -q "min finalize-install --undo" "$OUT"
@@ -969,6 +990,33 @@ EOF
         "$(head -n 1 "$remedy_calls")" "the boot unit is disabled before anything is removed"
     want_ok "the remedy removes the classifier table" \
         grep -qx "nft delete table inet minimal_class" "$remedy_calls"
+
+    # The placement socket pair a current install leaves (gominimal/inbox#1206):
+    # the remedy disables the units whose files are there, never the earlier
+    # path pair this host does not carry, because systemctl refuses a whole
+    # call that names a unit it does not have.
+    HNS4S="$root/hns4s"; mkdir -p "$HNS4S"
+    run ns4s_seed "$HNS4S"
+    fake_ns4s="$root/fake net root-4s \$HOME"
+    cls_files_s="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.socket etc/systemd/system/minimald-place@.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
+    mkdir -p "$fake_ns4s/$cls_tree/classifier-table" "$fake_ns4s/$cls_tree/daemon" \
+        "$fake_ns4s/$cls_tree/boxes/allow" "$fake_ns4s/$cls_tree/boxes/deny"
+    for f in $cls_files_s; do
+        mkdir -p "$fake_ns4s/$(dirname "$f")"
+        printf 'unit\n' >"$fake_ns4s/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_ns4s"
+    run ns4s_run "$HNS4S" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the placement socket pair exits 0"
+    want_ok "the socket pair's units are advised" \
+        grep -q "still installed on this host.*classifier units" "$OUT"
+    apply_remedies 3
+    for f in $cls_files_s "$cls_tree" usr/local/lib/minimal; do
+        want_err "the printed remedies remove $f" test -e "$fake_ns4s/$f"
+    done
+    check "systemctl disable --now minimald-classifier.service minimald-place.socket" \
+        "$(head -n 1 "$remedy_calls")" "the remedy disables the units this host carries, and only those"
 
     # A tree without the step's record was installed another way: it is not
     # the step's to remove, so nothing advises removing it.
@@ -1366,6 +1414,11 @@ case_target_validation() {
     check 0 "$rc" "--version installs without a pointer (R2.5)"
     check "$h_minimald" "$(hash_file "$HV/bin/minimald")" "--version installs that version's bytes (R2.5)"
     want_ok "--version names the version, not a target (R2.5)" grep -q "version.*v1" "$OUT"
+    want_ok "--version records a pinned install, never notified (R6.1b)" \
+        grep -qx 'channel = "pinned"' "$HV/xdg-state/minimal/install.toml"
+    want_ok "--version is told the install is counted (R6.1b)" grep -q "no release notices for --version" "$OUT"
+    want_ok "--version is told what is sent and the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
+    want_ok "--version is told the channel it sends (R6.1b)" grep -q "(pinned), version, OS, architecture, install method" "$OUT"
     HV2="$root/hv2"; mkdir -p "$HV2"
     run versioneq "$HV2" --force-stop --version=v1
     check 0 "$rc" "--version=VER with another flag installs (R2.5)"
@@ -2633,6 +2686,10 @@ if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
     cat "${NFT_RULESET:-/dev/null}"
     exit 0
 fi
+if [ "$*" = "-a --debug=netlink list ruleset" ]; then
+    cat "${NFT_RULESET:-/dev/null}"
+    exit 0
+fi
 if [ "$1" = "-j" ] && [ "$2" = "list" ] && [ "$3" = "set" ]; then
     [ -n "${NFT_LEAF_SET:-}" ] || exit 1
     cat "$NFT_LEAF_SET"
@@ -3239,6 +3296,10 @@ STUB
     drop_cgroup_files "$tree/boxes/deny"
     drop_cgroup_files "$tree/boxes/allow"
     drop_cgroup_files "$tree/boxes/quic443-blocked"
+    # The probe leaf a daemon stopped mid-probe leaves behind
+    # (gominimal/inbox#1206) is the probe's own, so it does not stop the
+    # uninstall.
+    mkdir "$tree/boxes/deny/filter-probe-4242"
     run_hc uninstall "$root/mi-on" --uninstall
     check 0 "$rc" "uninstall removes the installed tree"
     want_err "uninstall leaves no tree behind" test -e "$tree"
@@ -3272,8 +3333,8 @@ STUB
         grep -q "numeric process id" "$OUT"
 
     # --- --place-listener: the same placement, found from the daemon's own
-    # listener so a manager-held path unit can make it at every start the
-    # socket announces (no per-restart --pid). Over a stand-in process table:
+    # listener so the manager-held placement unit can make it at every start
+    # the daemon asks for (no per-restart --pid). Over a stand-in process table:
     # the holder of the socket that runs as the delegated account outside
     # the slice is placed; a holder of another uid, a holder of another
     # socket, a same-uid holder already inside the slice (a box in

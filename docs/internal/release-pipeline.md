@@ -79,6 +79,29 @@ push it. The branch name must start with `release/`. CI runs the required checks
 pushes and PRs to `main` and `release/**` only. Without those checks, step 4
 refuses each fix that merges into the branch.
 
+The draft release and the tag point at the commit. The branch name also
+decides whether the signing jobs can run:
+
+- The `release` environment holds `KC_PW` and admits `main` and `release/*`.
+  A signed run needs one of those branches.
+- The `signing` runner group lists each branch by its exact name, because it
+  takes no wildcard. Add the new branch before step 3, or the signing jobs
+  wait in the queue. This needs an organization owner:
+
+```sh
+gh api orgs/gominimal/actions/runner-groups/3 --jq '{name, visibility, allows_public_repositories, restricted_to_workflows, selected_workflows: (.selected_workflows + ["gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.x"])}' \
+  | gh api -X PATCH orgs/gominimal/actions/runner-groups/3 --input -
+```
+
+That update can empty the group's repository list. With an empty list, the
+signing jobs wait in the queue and the runner stays idle. Add the repository
+again, then check that the second command prints `gominimal/minimal`:
+
+```sh
+gh api -X PUT orgs/gominimal/actions/runner-groups/3/repositories/$(gh api repos/gominimal/minimal --jq .id)
+gh api orgs/gominimal/actions/runner-groups/3/repositories --jq '.repositories[].full_name'
+```
+
 Keep the branch after the release. It carries the fixes that go into the
 release while `main` moves on, and each patch on the line goes out from it.
 Step 8 brings its fixes back to `main`.
@@ -628,7 +651,8 @@ The step needs two things that the workflow cannot set up:
   ~/Library/Keychains/minimal-signing.keychain-db`. Give it an App Store
   Connect API key (`--key`, `--key-id`, `--issuer`), or an Apple ID with an
   app-specific password and team `3G47C5HY64`. The step unlocks the keychain
-  with the `KC_PW` secret, as the signing steps do.
+  with the `KC_PW` secret from the `release` environment, as the signing
+  steps do. The last step of each signing job locks it again.
 - The repository variable `MACOS_NOTARY_PROFILE`, set to the profile name.
   If the variable is empty, the step fails before it submits anything.
 

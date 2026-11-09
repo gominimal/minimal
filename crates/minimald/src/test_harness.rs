@@ -714,7 +714,7 @@ pub struct ExecOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExecRejected;
 
-struct TestClientHandler;
+pub(crate) struct TestClientHandler;
 
 impl russh::client::Handler for TestClientHandler {
     type Error = russh::Error;

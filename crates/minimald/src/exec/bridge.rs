@@ -212,6 +212,10 @@ impl<P: Process> Process for StoppedOnDestroy<P> {
     fn start_kill(&mut self) -> io::Result<()> {
         self.inner.start_kill()
     }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        self.inner.exit_notice()
+    }
 }
 
 /// Runs [`bridge`] and writes the notice for why the command ended to `e`
@@ -1528,6 +1532,22 @@ where
             }
         }
     };
+    // A task whose sandbox failed may have written nothing, so the reason
+    // goes on stderr ahead of the status. A client that stops reading holds
+    // the write, so the wait for it is bounded and the status still returns.
+    if let Some(notice) = process.exit_notice() {
+        match tokio::time::timeout(EXIT_NOTICE_BOUND, e.write_all(notice.as_bytes())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::debug!(%channel_id, "exec: the exit notice was not written; the client is gone");
+            }
+            Err(_) => tracing::debug!(
+                %channel_id,
+                bound = ?EXIT_NOTICE_BOUND,
+                "exec: the exit notice was not written; the client did not take it in time",
+            ),
+        }
+    }
     match status {
         Ok(code) => code.unwrap_or(1) as u32,
         Err(err) => {
@@ -1539,6 +1559,10 @@ where
         }
     }
 }
+
+/// How long [`bridge_one`] waits to write a process's exit notice to a
+/// client that is not reading, before it returns the status without it.
+pub(super) const EXIT_NOTICE_BOUND: Duration = Duration::from_secs(5);
 
 /// How long [`drain_ready`] waits for a pipe to produce something after
 /// the child has been reaped, before concluding that whatever still
@@ -2290,8 +2314,69 @@ pub(crate) async fn serve_exec_wait(channel: Channel<Msg>, session: BoxHandle, i
     }
 }
 
+/// The exit status of an attach to a tty exec that the box's end ended: a
+/// stop, a removal, or the end of its entrypoint. It is the status a bare
+/// box attach gets when the daemon ends it, so `min box attach --exec` reads
+/// the box again and says why.
+pub(crate) const BOX_ENDED_ATTACH_STATUS: u32 = 254;
+
+/// Whether the box `session` is ending: a removal started, or a stop or the
+/// end of the entrypoint took its host. Both happen before the box's
+/// processes end, so an exec that this ends sees it.
+pub(crate) fn box_is_ending(session: &BoxHandle) -> bool {
+    session.is_destroying() || !session.has_host()
+}
+
+/// The status an attach to a tty exec ends with when the exec ended with
+/// `exit`. The exec's own end gives its status. An exec that ended in a box
+/// that is ending gives [`BOX_ENDED_ATTACH_STATUS`]. The exec's records
+/// keep its own status either way.
+pub(crate) fn attach_end_status(exit: ExecExit, box_ending: bool) -> u32 {
+    if box_ending {
+        BOX_ENDED_ATTACH_STATUS
+    } else {
+        exit.status()
+    }
+}
+
+/// Resumes a tty exec's terminal for one client, as [`relay_terminal`]
+/// does, and returns the exit status for the client's channel. `None` when
+/// the client went away.
+pub(crate) async fn attach_terminal<M, W>(
+    entry: &ExecEntry,
+    session: &BoxHandle,
+    msgs: M,
+    out: &mut W,
+) -> io::Result<Option<u32>>
+where
+    M: Stream<Item = russh::ChannelMsg> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match relay_terminal(entry, msgs, out).await? {
+        AttachEnd::Exited(exit) => {
+            let ending = box_is_ending(session);
+            let status = attach_end_status(exit, ending);
+            if ending {
+                tracing::info!(
+                    exec_id = %entry.id,
+                    exec_status = exit.status(),
+                    status,
+                    "exec: the box's end ended the attached exec"
+                );
+            }
+            Ok(Some(status))
+        }
+        AttachEnd::ClientGone => Ok(None),
+    }
+}
+
 /// Serves `min://exec/attach`: resumes a tty exec's terminal on the channel.
-pub(crate) async fn serve_exec_attach(channel: Channel<Msg>, box_id: SessionId, id: ExecId) {
+pub(crate) async fn serve_exec_attach(
+    channel: Channel<Msg>,
+    session: BoxHandle,
+    box_id: SessionId,
+    id: ExecId,
+) {
     let Some(entry) = find_exec(box_id, &id) else {
         answer_exec(channel, b"", unknown_exit_message(&id).as_bytes(), 1).await;
         return;
@@ -2309,14 +2394,14 @@ pub(crate) async fn serve_exec_attach(channel: Channel<Msg>, box_id: SessionId, 
     }));
     let mut w = ws.make_writer();
     tracing::info!(exec_id = %id, "exec: a client attached to the exec's terminal");
-    match relay_terminal(&entry, msgs, &mut w).await {
-        Ok(AttachEnd::Exited(exit)) => {
+    match attach_terminal(&entry, &session, msgs, &mut w).await {
+        Ok(Some(status)) => {
             let _ = w.flush().await;
             let _ = ws.eof().await;
-            let _ = ws.exit_status(exit.status()).await;
+            let _ = ws.exit_status(status).await;
             let _ = ws.close().await;
         }
-        Ok(AttachEnd::ClientGone) => {
+        Ok(None) => {
             tracing::info!(exec_id = %id, "exec: the attached client went away; the exec runs on");
         }
         Err(error) => {

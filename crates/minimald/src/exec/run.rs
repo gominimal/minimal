@@ -36,7 +36,15 @@ pub(super) async fn run_in_session(
 }
 
 /// Ends the box a task run owns, from the daemon's side of the exec's exit
-/// (NET-131). The destroy used to be the client's, issued after a normal
+/// (NET-131).
+///
+/// `min task run` sets `owns_box` for a task that has no spec, an
+/// interactive task, which runs over the exec channel. A `min` from before
+/// T43 sets it on every task run. A task that has a spec runs as its box's
+/// entrypoint, and that run owns no box: the box ends when the task
+/// returns and keeps its record (BOX-038).
+///
+/// The destroy used to be the client's, issued after a normal
 /// run; left there, a client killed mid-run would strand its session — the
 /// abandoned-launch reap covers only un-finalized sessions and there is no
 /// idle stop to catch one. The teardown is the `DestroySession` RPC's own

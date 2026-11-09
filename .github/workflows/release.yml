@@ -222,7 +222,7 @@ jobs:
               # shrinking the entry so it survives; save-if keeps branch/dry-run
               # dispatches read-only so they don't churn the budget and evict
               # main's warm cache. Registry + git caches come for free.
-              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
+              uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
               with:
                   shared-key: release-amd64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -366,7 +366,7 @@ jobs:
               # keeps branch/dry-run dispatches read-only. writes target/ and
               # reads ~/.cargo on the host, so rust-cache caches them the same as a
               # native build.
-              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
+              uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
               with:
                   shared-key: release-arm64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -462,8 +462,10 @@ jobs:
         #
         # minimal-signing: the codesign step needs the Developer ID keychain,
         # which only the signing Mac holds; the other fleet Macs carry the base
-        # labels only (docs/internal/macos-runner-setup.md).
+        # labels only (docs/internal/macos-runner-setup.md). The `release`
+        # environment holds KC_PW and admits only main and release/* branches.
         runs-on: [self-hosted, macOS, ARM64, minimal-signing]
+        environment: release
         # 75, not 45: the build takes about 15 minutes plus the bep build,
         # and the notarization step below waits on Apple's notary service
         # for four submissions (minvmd, min, and the app bundles bep and
@@ -620,7 +622,8 @@ jobs:
 
                   # Unlock the signing keychain and put it on the search list so
                   # codesign can resolve the identity by name.
-                  security unlock-keychain -p "$KC_PW" "$KC"
+                  set -o pipefail
+                  printf '%s\n' "$KC_PW" | security unlock-keychain "$KC"
                   security list-keychains -d user -s "$KC" login.keychain-db
 
                   codesign --force --timestamp --options runtime \
@@ -704,7 +707,8 @@ jobs:
                     exit 1
                   fi
                   KC=minimal-signing.keychain-db
-                  security unlock-keychain -p "$KC_PW" "$KC"
+                  set -o pipefail
+                  printf '%s\n' "$KC_PW" | security unlock-keychain "$KC"
 
                   work="$RUNNER_TEMP/notarize"
                   rm -rf "$work"
@@ -863,6 +867,11 @@ jobs:
                   path: target/release/minzoned-flat/
                   if-no-files-found: error
                   retention-days: 7
+            - name: Lock the signing keychain
+              # Last step of a job that unlocks it, on any outcome, so the
+              # keychain is not left open for the next job on this runner.
+              if: always()
+              run: security lock-keychain minimal-signing.keychain-db
 
     build-libkrun-macos-arm64:
         # Build the TRIMMED libkrun.dylib to SHIP in the release, so macOS users
@@ -911,6 +920,7 @@ jobs:
         # then are re-uploaded under their final names. minimal-signing routes
         # it to that runner (docs/internal/macos-runner-setup.md).
         runs-on: [self-hosted, macOS, ARM64, minimal-signing]
+        environment: release
         timeout-minutes: 15
         if: vars.RUN_MACOS_CI != 'false'
         needs: [build-libkrun-macos-arm64, fetch-release-guest-artifacts]
@@ -936,7 +946,8 @@ jobs:
                   KC=minimal-signing.keychain-db
                   IDENTITY="Developer ID Application: Minimal Software Research Ltd. (3G47C5HY64)"
 
-                  security unlock-keychain -p "$KC_PW" "$KC"
+                  set -o pipefail
+                  printf '%s\n' "$KC_PW" | security unlock-keychain "$KC"
                   security list-keychains -d user -s "$KC" login.keychain-db
 
                   in="$RUNNER_TEMP/unsigned"
@@ -963,6 +974,11 @@ jobs:
                   path: ${{ runner.temp }}/signed/gvproxy-darwin-arm64
                   if-no-files-found: error
                   retention-days: 7
+            - name: Lock the signing keychain
+              # Last step of a job that unlocks it, on any outcome, so the
+              # keychain is not left open for the next job on this runner.
+              if: always()
+              run: security lock-keychain minimal-signing.keychain-db
 
     fetch-release-guest-artifacts:
         # Fetched guest microVM artifacts shipped in the release: the raw guest

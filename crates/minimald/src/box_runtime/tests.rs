@@ -401,13 +401,20 @@ impl FloodedAttach {
     /// that stops reading then stops the server within a few tens of KiB,
     /// where the defaults would let megabytes through first.
     async fn start(output_stall_timeout: Duration) -> Self {
+        Self::start_with(output_stall_timeout, DEFAULT_SIZE, &[]).await
+    }
+
+    /// [`Self::start`] at terminal size `sz`, with `screen` fed to the host's
+    /// screen model before the loop starts, so the attach's redraw renders
+    /// that screen.
+    async fn start_with(output_stall_timeout: Duration, sz: WinSize, screen: &[u8]) -> Self {
         let (mut host, handle) = Host::build(
             MockLauncher::default(),
             HostParams {
                 name: "test-session".to_string(),
                 username: "user".to_string(),
                 paths: test_paths(),
-                sz: DEFAULT_SIZE,
+                sz,
                 channel: None,
                 control: None,
                 delta: None,
@@ -424,6 +431,7 @@ impl FloodedAttach {
         .await
         .expect("failed to build host");
         host.output_stall_timeout = output_stall_timeout;
+        host.parser.process(screen);
         let stdin = host.remote_tx.clone();
         let task = crate::traced::spawn(host.mainloop());
 
@@ -461,7 +469,7 @@ impl FloodedAttach {
             handle
                 .attach(
                     server_channel,
-                    DEFAULT_SIZE,
+                    sz,
                     ConnectionEnv::new(),
                     SessionKeys::default(),
                 )
@@ -553,6 +561,219 @@ async fn shedding_a_stalled_binding_closes_the_client_channel() {
         .expect("the host is still running");
 
     attach.stop().await;
+}
+
+/// A big terminal, for a redraw far past what the test client's window and
+/// buffers hold unread.
+const BIG_SIZE: WinSize = WinSize {
+    rows: 200,
+    cols: 400,
+    xpixel: 0,
+    ypixel: 0,
+};
+
+/// Paints every cell of a `sz` screen with its own truecolor foreground and
+/// background, so the screen's redraw carries an SGR per cell.
+fn truecolor_screen(sz: WinSize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in 0..sz.rows {
+        out.extend_from_slice(format!("\x1b[{};1H", r + 1).as_bytes());
+        for c in 0..sz.cols {
+            let (r8, c8) = (r % 256, c % 256);
+            out.extend_from_slice(
+                format!(
+                    "\x1b[38;2;{r8};{c8};{};48;2;{c8};{r8};{}m#",
+                    (r + c) % 256,
+                    (r * 7 + c) % 256,
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    out.extend_from_slice(b"\x1b[0m\x1b[H");
+    out
+}
+
+/// scenario 643b: the attach redraw must not be written on the host loop.
+/// The host rendered the screen for a new client and awaited its write to
+/// the channel right there. russh parks a write while the client's window is
+/// spent, so a client whose terminal made the redraw bigger than its unread
+/// window, and that never read, stopped the host loop for good: no probes
+/// answered, no output pumped, every other client of the session frozen.
+/// The redraw now goes to the new binding as its first message, written on
+/// the binding's own task and raced against the shed like any stdout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_redraw_the_client_never_reads_does_not_wedge_the_host_loop() {
+    let screen = truecolor_screen(BIG_SIZE);
+    let mut model = vt100::Parser::new(BIG_SIZE.rows, BIG_SIZE.cols, 0);
+    model.process(&screen);
+    let redraw = model.screen().state_formatted().len();
+    assert!(
+        redraw > 1024 * 1024,
+        "the redraw must dwarf the client's 16 KiB window and buffers: {redraw} bytes",
+    );
+
+    // The client never reads: the redraw alone exhausts its window, and the
+    // flood behind it backs the binding's mailbox up into the host.
+    let mut attach = FloodedAttach::start_with(Duration::from_millis(200), BIG_SIZE, &screen).await;
+
+    // The probe queues behind the attach in the host's mailbox, so it is
+    // answered only once the attach has returned. A redraw written on the
+    // host loop never returns, and this times out.
+    tokio::time::timeout(Duration::from_secs(10), attach.handle.get_attrs())
+        .await
+        .expect("an unread attach redraw wedged the host loop")
+        .expect("the host is still running");
+
+    // Keep probing past the stall bound: the host goes on serving while the
+    // binding is parked on the redraw, and sheds it.
+    for _ in 0..10 {
+        tokio::time::timeout(
+            crate::box_actor::HOST_PROBE_TIMEOUT * 2,
+            attach.handle.get_attrs(),
+        )
+        .await
+        .expect("a binding parked on its redraw must not stop the host answering probes")
+        .expect("the host is still running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The parked binding is shed, not left holding the session: reading at
+    // last, the client finds the attach over.
+    let (mut eof, mut exit_status, mut closed) = (false, None, false);
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = attach.channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Eof => eof = true,
+                russh::ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
+                russh::ChannelMsg::Close => {
+                    closed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok() && closed,
+        "the binding parked on its redraw was never shed (eof: {eof}, exit status: {exit_status:?})",
+    );
+    assert_eq!(
+        exit_status,
+        Some(SHED_EXIT_STATUS),
+        "the attach ends as a shed",
+    );
+    assert!(
+        !attach.task.is_finished(),
+        "a shed must not end the session"
+    );
+
+    attach.stop().await;
+}
+
+/// scenario 643b's control arm: a client that reads its redraw at full speed
+/// and types while it is still arriving must get the rest of the redraw and
+/// see the shell answer. The binding wrote the redraw with one `write_all`
+/// and read nothing from the channel meanwhile; russh queues every window
+/// adjust the client sends into that channel's bounded inbound queue and,
+/// once it is full, blocks its session loop on the keystroke. A blocked loop
+/// applies no more window adjusts, so the write starves on credit the
+/// client already granted: the duplex deadlock of #2197, on the attach path.
+/// The binding now drains the read half while a write is in flight, and
+/// forwards what it read as the host's stdin queue takes it, never parking on
+/// that queue with its own mailbox unread (with the shell blocked on output
+/// behind a full mailbox, that queue only empties once output moves).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_keystroke_typed_mid_redraw_does_not_wedge_the_binding() {
+    let screen = truecolor_screen(BIG_SIZE);
+    let mut model = vt100::Parser::new(BIG_SIZE.rows, BIG_SIZE.cols, 0);
+    model.process(&screen);
+    let redraw = model.screen().state_formatted().len();
+    // The server's inbound queue holds 100 messages (russh's default) and the
+    // client's 16 KiB window sends an adjust per 16 KiB at most, so the queue
+    // is full after 1.6 MiB; the keystroke goes in at nine tenths of the
+    // redraw, which must be well past that.
+    let type_at = redraw * 9 / 10;
+    assert!(
+        type_at > 100 * 16 * 1024 * 5 / 4,
+        "the keystroke must land after the server's inbound queue has filled with window adjusts: {redraw}-byte redraw",
+    );
+
+    // The shell keeps printing throughout (the feeder stays on). That is the
+    // harder case: with the binding busy on the redraw, its mailbox fills
+    // and the host stops reading the pty, so the shell blocks on output and
+    // stops reading its input, and the host's stdin queue fills behind the
+    // pty. The keystroke must still get through once the client reads.
+    let mut attach = FloodedAttach::start_with(Duration::from_secs(30), BIG_SIZE, &screen).await;
+
+    // Read at full speed; type once at nine tenths of the redraw, as the
+    // scenario does, when the inbound queue is already full of window adjusts.
+    // Waited for: the full redraw, then the shell's own line carrying the
+    // keystroke (`got:…ping-643b`).
+    let needle = b"ping-643b";
+    let (mut got, mut typed, mut tail) = (0usize, false, Vec::new());
+    let mut seen = Seen::default();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(msg) = attach.channel.wait().await {
+            if let russh::ChannelMsg::Data { data } = msg {
+                got += data.len();
+                let answered = saw_answer(&mut tail, needle, &data, &mut seen);
+                if !typed && got >= type_at {
+                    typed = true;
+                    attach.channel.data(&b"ping-643b\n"[..]).await.unwrap();
+                }
+                if got >= redraw && answered {
+                    return;
+                }
+            }
+        }
+        panic!("the channel closed after {got} of {redraw} redraw bytes (typed: {typed})");
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "a keystroke typed mid-redraw wedged the binding: {got} of {redraw} redraw bytes arrived (typed: {typed}), and the shell never answered ({seen:?})",
+    );
+    assert!(
+        !attach.task.is_finished(),
+        "the session must outlive a keystroke typed mid-redraw"
+    );
+
+    attach.stop().await;
+}
+
+/// Scans output as it streams in for the keystroke coming back, line by
+/// line (`tail` holds the unfinished last line between chunks, so nothing is
+/// re-read). The keystroke comes back twice, as the tty's echo and in the
+/// shell's `got:` line, but with the shell printing throughout the two
+/// interleave: the echo lands wherever the shell's output was at that
+/// moment, and its newline can cut the shell's own line in two. So the
+/// shell is taken to have answered when a line carries `got:` before the
+/// keystroke, or when the keystroke has come back twice in any form.
+fn saw_answer(tail: &mut Vec<u8>, needle: &[u8], data: &[u8], seen: &mut Seen) -> bool {
+    tail.extend_from_slice(data);
+    while let Some(nl) = tail.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = tail.drain(..=nl).collect();
+        seen.lines += 1;
+        let at = line.windows(needle.len()).position(|w| w == needle);
+        if let Some(at) = at {
+            seen.carrying += 1;
+            if line[..at].windows(4).any(|w| w == b"got:") {
+                seen.answered = true;
+            }
+        }
+    }
+    seen.answered || seen.carrying >= 2
+}
+
+/// What the client saw while waiting for the shell's answer: how many lines,
+/// how many carried the keystroke, and whether one was the shell's.
+#[derive(Default, Debug)]
+struct Seen {
+    lines: usize,
+    carrying: usize,
+    answered: bool,
 }
 
 /// An attach the daemon ended exits non-zero, so a script can tell it from
@@ -1764,6 +1985,7 @@ impl BoxLauncher for SealingMockLauncher {
             listen_plan: None,
             // A plain host child: no pre-exec closure to hold.
             start_gate: None,
+            pipes: None,
         })
     }
 }
@@ -5779,14 +6001,16 @@ async fn expose_unenrolled_decision_audited() {
         host_reports,
         vec![
             minimald_rpc::ExposeDecisionReport {
-                switch_address: web_row,
+                switch_address: Some(web_row),
+                box_id: None,
                 port: 3000,
                 decision: boxes::DynamicIngress::Allow,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
                 outcome: minimald_rpc::ExposeDecisionOutcome::Published,
             },
             minimald_rpc::ExposeDecisionReport {
-                switch_address: db_row,
+                switch_address: Some(db_row),
+                box_id: None,
                 port: 3000,
                 decision: boxes::DynamicIngress::Deny,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
@@ -7065,6 +7289,7 @@ async fn sealed_value_is_placed_in_its_grant_variable_only() {
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("GH_TOKEN".to_string(), PLAINTEXT.to_string()),
         ],
+        entrypoint: vec![],
     };
     let connection_env = place_launch_deliveries(
         &mut attach_env,
@@ -7152,6 +7377,7 @@ fn sealed_value_reaches_the_shell_launch_environment() {
     let mut attach_env = AttachEnv {
         inherited: vec![("LANG".to_string(), "C.UTF-8".to_string())],
         connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+        entrypoint: vec![],
     };
     let kept = place_launch_deliveries(
         &mut attach_env,
@@ -7184,6 +7410,7 @@ fn sealed_value_reaches_the_shell_launch_environment() {
     let mut plain = AttachEnv {
         inherited: vec![],
         connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+        entrypoint: vec![],
     };
     let kept = place_launch_deliveries(&mut plain, boxes::SessionId::nil(), &[]);
     assert_eq!(kept.len(), 1, "{kept:?}");
@@ -7527,9 +7754,9 @@ fn launcher_starts_session_and_task_entrypoints_from_spec_without_logging_args()
     assert_eq!(LaunchEntrypoint::Shell.arg_count(), 0);
 }
 
-// T42: one launcher reads the box's first process from its spec. A
+// T42, T43: one launcher reads the box's first process from its spec. A
 // session's spec starts its login shell. A task's spec starts its argv,
-// unless an exec carries the box's run, because that exec runs the task.
+// except on a launch minted only for hooks, which holds the shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launcher_starts_session_and_task_entrypoints_from_spec() {
     use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
@@ -7541,7 +7768,7 @@ async fn launcher_starts_session_and_task_entrypoints_from_spec() {
         BoxSpec::for_task("lint", &task, SpecFlags::default())
             .expect("a task that is not interactive has a spec"),
     );
-    let launch = |spec: Option<Arc<BoxSpec>>, run_by_exec: bool| LaunchSpec { spec, run_by_exec };
+    let launch = |spec: Option<Arc<BoxSpec>>, for_hooks: bool| LaunchSpec { spec, for_hooks };
 
     // The decision, for every kind of launch.
     assert_eq!(
@@ -7559,7 +7786,7 @@ async fn launcher_starts_session_and_task_entrypoints_from_spec() {
     assert_eq!(
         launch(Some(task.clone()), true).entrypoint().unwrap(),
         LaunchEntrypoint::Shell,
-        "an exec carries the task's run, so the box holds its shell"
+        "a hook launch holds the shell, so the task does not run before its hooks"
     );
     assert_eq!(
         launch(None, false).entrypoint().unwrap(),
@@ -8118,7 +8345,7 @@ async fn box_output_logged_from_start_complete_after_disconnect_past_cap_keeps_n
     spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
     let launcher = MockLauncher::default().and_spec(LaunchSpec {
         spec: Some(Arc::new(spec)),
-        run_by_exec: false,
+        for_hooks: false,
     });
     let (host, handle) = Host::build(launcher, stored.params())
         .await
@@ -8157,6 +8384,130 @@ async fn box_output_logged_from_start_complete_after_disconnect_past_cap_keeps_n
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
 
+/// T43: an entrypoint on pipes that ends before its run takes the streams
+/// keeps its output for the run. The host reaps it, then still answers the
+/// run's take with what the entrypoint wrote, and its exit follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fast_entrypoint_on_pipes_keeps_its_output_for_a_late_run() {
+    use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
+
+    let stored = StoredBox::new();
+    let mut spec = BoxSpec::for_session(None, SpecFlags::default());
+    spec.pty_enabled = false;
+    spec.entrypoint = Entrypoint::Exec(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "echo fast-out; echo fast-err >&2; exit 3".to_string(),
+    ]);
+    let launcher = MockLauncher::default().and_spec(LaunchSpec {
+        spec: Some(Arc::new(spec)),
+        for_hooks: false,
+    });
+    let (host, handle) = Host::build(launcher, stored.params())
+        .await
+        .expect("failed to build host");
+    let task = crate::traced::spawn(host.run());
+
+    // Several exit polls go by, so the host has reaped the entrypoint before
+    // the run asks for its streams.
+    tokio::time::sleep(pipes::PIPE_EXIT_POLL * 5).await;
+    assert!(
+        !task.is_finished(),
+        "the host holds the ended entrypoint's output for its run"
+    );
+
+    let io = match handle.take_entrypoint_io().await {
+        EntrypointIoTake::Taken(io) => io,
+        EntrypointIoTake::OnTerminal => panic!("an entrypoint on pipes read as on a terminal"),
+        EntrypointIoTake::Relayed => panic!("no other run took the streams"),
+        EntrypointIoTake::HostGone => panic!("the host ended before the run took the streams"),
+    };
+    let collect = |mut rx: mpsc::Receiver<Vec<u8>>| async move {
+        let mut out = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            out.extend_from_slice(&chunk);
+        }
+        String::from_utf8(out).unwrap()
+    };
+    let (stdout, stderr) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::join(collect(io.stdout), collect(io.stderr)),
+    )
+    .await
+    .expect("the streams end with the host");
+    assert_eq!(stdout, "fast-out\n", "the run gets the entrypoint's stdout");
+    assert_eq!(stderr, "fast-err\n", "the run gets the entrypoint's stderr");
+
+    let exit = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the host ends once the run took the streams");
+    let exit = exit
+        .expect("host task should not panic")
+        .expect("the host reaps the entrypoint");
+    assert_eq!(exit.code, 3, "the entrypoint's own exit code");
+    assert!(!exit.requested, "nobody asked for the end");
+}
+
+/// T43: the host hands its entrypoint's streams to one run at a time. A
+/// second take while the first run still reads them is refused, and the
+/// first run keeps every byte. Once the first run's streams close, a later
+/// run takes them in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_take_of_entrypoint_streams_is_refused_while_the_first_reads() {
+    use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
+
+    let stored = StoredBox::new();
+    let mark = stored._tmp.path().join("go");
+    let script = format!(
+        r#"while [ ! -e '{}' ]; do sleep 0.05; done; echo first-out; echo first-err >&2; sleep 60"#,
+        mark.display()
+    );
+    let mut spec = BoxSpec::for_session(None, SpecFlags::default());
+    spec.pty_enabled = false;
+    spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
+    let launcher = MockLauncher::default().and_spec(LaunchSpec {
+        spec: Some(Arc::new(spec)),
+        for_hooks: false,
+    });
+    let (host, handle) = Host::build(launcher, stored.params())
+        .await
+        .expect("failed to build host");
+    let task = crate::traced::spawn(host.run());
+
+    let EntrypointIoTake::Taken(mut first) = handle.take_entrypoint_io().await else {
+        panic!("the first run takes the streams");
+    };
+    assert!(first.stdin.is_some(), "the first run gets the stdin");
+    assert!(
+        matches!(handle.take_entrypoint_io().await, EntrypointIoTake::Relayed),
+        "a second run is refused while the first reads"
+    );
+
+    std::fs::write(&mark, b"").unwrap();
+    async fn recv(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the output reaches the first run")
+            .expect("the first run's stream is still open")
+    }
+    assert_eq!(recv(&mut first.stdout).await, b"first-out\n");
+    assert_eq!(recv(&mut first.stderr).await, b"first-err\n");
+
+    drop(first);
+    let EntrypointIoTake::Taken(later) = handle.take_entrypoint_io().await else {
+        panic!("a run takes the streams once the first run's streams closed");
+    };
+    assert!(
+        later.stdin.is_none(),
+        "only the first run gets the entrypoint's stdin"
+    );
+
+    handle.kill(true).await.expect("kill should reach the host");
+    let _ended = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the host ends after the kill");
+}
+
 /// BOX-155: the box's output is in its log from the start, with no client
 /// attached. An attached client reads the same output as a second reader,
 /// and after the client drops, the log holds what came before, during and
@@ -8176,7 +8527,7 @@ async fn box_output_logged_from_start_complete_after_disconnect() {
     spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
     let launcher = MockLauncher::default().and_spec(LaunchSpec {
         spec: Some(Arc::new(spec)),
-        run_by_exec: false,
+        for_hooks: false,
     });
     let (host, handle) = Host::build(launcher, stored.params())
         .await
@@ -8240,4 +8591,354 @@ async fn box_output_logged_from_start_complete_after_disconnect() {
     );
     handle.kill(true).await.expect("kill should reach the host");
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+}
+
+/// NET-046: a box with no switch address, on a VM host, asks to publish a
+/// port, is refused, and the VM host daemon still hears the decision. On a
+/// microVM the box with no switch is a `none` box: an `own_ip` box with no
+/// handed addresses is refused at create. No audit route names a box with no
+/// switch, so the report carries the box's id in place of a switch address,
+/// over the box's own control channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_switch_box_reports_expose_decision_by_id() {
+    use crate::test_harness::unwrap_ready;
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // A `none` box that declares no `dynamic_ingress`: the deny-all default
+    // decides its request.
+    let request = minimald_rpc::CreateSessionRequest::new(
+        "web",
+        paths::HostAbsPath::try_new("/uwu").unwrap(),
+        boxes::NetworkMode::NoNet,
+        boxes::BoxPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        },
+    );
+    assert!(request.config.box_addresses.is_none());
+    let id = client.call::<CreateSession>(&request).await.unwrap().id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    let handle = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the web box should resolve");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The switch's control channel is VM-shaped: its door is the stand-in.
+    let door_sock = sock.with_file_name("no-switch-door.sock");
+    let (door, mut reports, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+
+    match handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+        )) => {}
+        other => panic!("a box that declares no dynamic ingress is refused: {other:?}"),
+    }
+
+    let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
+        .await
+        .expect("the refusal is reported to the VM host daemon")
+        .expect("the report door stand-in lives");
+    replies
+        .send(minimald_rpc::BoxControlReply::Audited { audited: true })
+        .expect("the report door stand-in lives");
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    assert_eq!(
+        report,
+        minimald_rpc::BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+            switch_address: None,
+            box_id: Some(id),
+            port: 3000,
+            decision: boxes::DynamicIngress::Deny,
+            decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+            outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
+        }),
+        "a box with no switch is named to the host by its id"
+    );
+
+    // The local record lands as it always did.
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    assert_eq!(records.len(), 1, "one request is one decision: {records:?}");
+    assert_eq!(records[0]["box"], "web");
+    assert_eq!(records[0]["outcome"], "refused");
+}
+
+/// BEP-085: a `host_ip` box with `proxy_env` or `both` steering gets the four
+/// proxy variables on a VM host, where the host-side gate admits its cohort
+/// to the proxy's listener. On a native host it shares the host's network,
+/// no gate admits it, and it gets none.
+#[test]
+fn host_ip_box_on_vm_host_gets_the_proxy_variables() {
+    use super::proxy_env_tests::{record, steering};
+    use boxes::NetworkMode;
+    use boxes::core::bep::Steering;
+
+    for mode in [Steering::ProxyEnv, Steering::Both] {
+        let laned = record(NetworkMode::HostNet, Some(steering(mode)));
+        let vars = launch_proxy_env(&laned, switch::DEFAULT_SUBNET, paths::HostKind::Minvmd);
+        let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "NO_PROXY",
+                "NODE_USE_ENV_PROXY"
+            ],
+            "{mode:?}: {vars:?}"
+        );
+        assert_eq!(vars[0].1, "http://100.64.255.252:8118", "{mode:?}");
+
+        let native = launch_proxy_env(&laned, switch::DEFAULT_SUBNET, paths::HostKind::Minimald);
+        assert!(native.is_empty(), "{mode:?} on a native host: {native:?}");
+    }
+    // The launch reads the host kind from the switch's transport.
+    assert_eq!(
+        host_kind_of(crate::net::SwitchTransport::HostShuttle { cid: 2, port: 1024 }),
+        paths::HostKind::Minvmd
+    );
+    assert_eq!(
+        host_kind_of(crate::net::SwitchTransport::LocalSpawn),
+        paths::HostKind::Minimald
+    );
+}
+
+/// Creates and finalizes a task box for task `check` whose entrypoint is
+/// `argv`, as `min task run` creates one, and returns its id.
+async fn create_task_box_for_run(
+    client: &mut crate::test_harness::TestClient,
+    argv: &[&str],
+) -> boxes::SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let mut spec = mfile::spec::BoxSpec::for_task(
+        "check",
+        &mfile::Task::default(),
+        mfile::spec::SpecFlags::default(),
+    )
+    .expect("a task that is not interactive has a spec");
+    spec.entrypoint = mfile::spec::Entrypoint::Exec(argv.iter().map(ToString::to_string).collect());
+    let mut req = crate::test_harness::create_session_req("check", "/tmp");
+    req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    req.config.ends_with_run = true;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    id
+}
+
+/// Reads a box's whole output log over the `ReadLog` subsystem, without
+/// following, and returns its bytes as text.
+async fn read_box_output(
+    client: &mut crate::test_harness::TestClient,
+    id: boxes::SessionId,
+) -> String {
+    use minimald_rpc::{ReadLogRequest, ReadLogUpdate};
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut channel = client
+        .open_subsystem(minimald_rpc::READ_LOG_SUBSYSTEM, &[])
+        .await;
+    let req = ReadLogRequest {
+        id,
+        offset: 0,
+        follow: false,
+    };
+    let mut writer = channel.make_writer();
+    writer
+        .write_all(&serde_json_lenient::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    drop(writer);
+    channel.eof().await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the log read answers in time");
+    let mut output = Vec::new();
+    let mut done = false;
+    for line in String::from_utf8(out).unwrap().lines() {
+        match serde_json_lenient::from_str::<ReadLogUpdate>(line).expect("each line is an update") {
+            ReadLogUpdate::Output { data, .. } => output.extend_from_slice(&data),
+            ReadLogUpdate::Done { .. } => done = true,
+            other => panic!("the log read ended with {other:?}"),
+        }
+    }
+    assert!(done, "the log read reaches the end of the log");
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+// T11, end to end: a task run starts a task box, and its client goes away
+// while the task still runs. The task then writes more and exits 3. The box
+// ends by itself as `exited` with code 3. Its record, its `exited` event and
+// its whole output stay readable by a new client, and the daemon log names
+// the box's end and its code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_box_exits_with_code_and_output_after_client_drop() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let log = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mark = tempfile::tempdir().unwrap();
+    let mark = mark.path().join("client-gone");
+    let script = format!(
+        "echo before-drop; while [ ! -e '{}' ]; do sleep 0.05; done; \
+         echo after-drop; echo task-err >&2; sleep 1; exit 3",
+        mark.display()
+    );
+    let id = create_task_box_for_run(&mut client, &["/bin/sh", "-c", &script]).await;
+
+    let run = crate::traced::spawn(async move {
+        let outcome = client
+            .exec(
+                &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+                false,
+                &minimald_rpc::exec::ExecRequest::TaskRun {
+                    task: "check".to_string(),
+                    owns_box: false,
+                    args: vec![],
+                    cwd: String::new(),
+                }
+                .encode(),
+                b"",
+            )
+            .await;
+        drop(client);
+        outcome
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !log
+            .contents()
+            .contains("task box: the run relays the box's entrypoint")
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the run relays the box's entrypoint");
+
+    // The client goes away mid-run: its channel and connection drop.
+    run.abort();
+    let _ = run.await;
+    std::fs::write(&mark, b"").unwrap();
+
+    let manager = server.state.sessions_manager().await;
+    let record = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let record = manager
+                .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .expect("an ended task box keeps its record");
+            if record.status == boxes::BoxState::Exited {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the task box never exited: {}", log.contents()));
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 3 }),
+        "the box is exited with the task's own code"
+    );
+    assert_eq!(record.exit_code, Some(3));
+
+    let mut events = manager.box_events(id).await.unwrap();
+    let events = events.read_new().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .unwrap_or_else(|| panic!("the end records an exited event: {events:?}"));
+    assert_eq!(exited.data["reason"], "exit");
+    assert_eq!(exited.data["exit_code"], 3);
+
+    // A new client reads the box's whole output after its end.
+    let mut reader = server.connect().await;
+    let output = read_box_output(&mut reader, id).await;
+    for line in ["before-drop", "after-drop", "task-err"] {
+        assert!(
+            output.contains(line),
+            "the box's output keeps {line:?} after the client drop: {output:?}"
+        );
+    }
+
+    let log = log.contents();
+    let ended = log
+        .lines()
+        .find(|line| line.contains("task box ended") && line.contains(&id.to_string()))
+        .unwrap_or_else(|| panic!("the daemon log names the task box's end: {log}"));
+    assert!(
+        ended.contains("exit_code=3"),
+        "the daemon log names the task's exit code: {ended}"
+    );
+    assert!(
+        log.contains("reading a box's log") && log.contains(&id.to_string()),
+        "the daemon log names the read of the box's output: {log}"
+    );
 }

@@ -8,7 +8,7 @@
 //! with the task's exit code, and leave the session's end to the daemon —
 //! it owns the box the run created, so it destroys it once the task's exit
 //! status is on the wire (NET-131), whether or not this client is still
-//! here — unless `--keep` retains it as an attachable session.
+//! here.
 //!
 //! Deliberately composed from the same client/RPC primitives `cmd_activate`
 //! uses (`BoxConfig`, `CreateSession`, the upload gates,
@@ -20,6 +20,7 @@ use std::io::{IsTerminal as _, Read as _};
 
 use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
+use tracing::Instrument as _;
 
 use crate::{GlobalArgs, RunArgs, TaskRunArgs};
 
@@ -55,26 +56,73 @@ fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
     }
 }
 
-/// The exec request a task run sends: the task, its declared arguments, plus
-/// the owns-box flag — set unless `--keep` retains the session (NET-131). The
-/// flag is what moves the destroy off this client: with it set, the daemon
-/// ends the session once the task's exit status is on the wire, whether or
-/// not this process is still there. `--keep` withholds it, because a kept
-/// session is meant to outlive the run — its end stays with whoever holds it.
+/// The exec request a task run with no spec sends: the task, its declared
+/// arguments, plus the owns-box flag (NET-131). The flag is what moves the
+/// destroy off this client: the daemon ends the session once the task's
+/// exit status is on the wire, whether or not this process is still there.
 /// `cwd` is the invocation directory relative to the uploaded tree (see
 /// [`task_run_cwd`]), where a task declaring `inherit_cwd` starts.
-fn task_run_request(
-    task: &str,
-    args: &[String],
-    keep: bool,
-    cwd: String,
-) -> minimald_rpc::exec::ExecRequest {
+fn task_run_request(task: &str, args: &[String], cwd: String) -> minimald_rpc::exec::ExecRequest {
     minimald_rpc::exec::ExecRequest::TaskRun {
         task: task.to_string(),
-        owns_box: !keep,
+        owns_box: true,
         args: args.to_vec(),
         cwd,
     }
+}
+
+/// The exec request of a task run whose task is its box's entrypoint (T43).
+/// The daemon starts the entrypoint, relays its output and returns its exit
+/// code. The task's arguments ride the entrypoint's argv, not the request,
+/// and the run owns no box: the box ends when its entrypoint returns, and
+/// keeps its record (BOX-038). `cwd` is as for [`task_run_request`]: the
+/// entrypoint starts there, for a task that declares `inherit_cwd`.
+fn entrypoint_run_request(task: &str, cwd: &str) -> minimald_rpc::exec::ExecRequest {
+    minimald_rpc::exec::ExecRequest::TaskRun {
+        task: task.to_string(),
+        owns_box: false,
+        args: Vec::new(),
+        cwd: cwd.to_string(),
+    }
+}
+
+/// The spec of the task box a run creates (BOX-068): the declared task's
+/// spec, with the arguments the user typed after the task name appended to
+/// its entrypoint, `min task run <task> <args...>`. `None` for an
+/// interactive task, whose type denies a terminal.
+fn task_box_spec(
+    task: &str,
+    declared: &mfile::Task,
+    flags: mfile::spec::SpecFlags,
+    args: &[String],
+) -> Option<mfile::spec::BoxSpec> {
+    let mut spec = mfile::spec::BoxSpec::for_task(task, declared, flags)?;
+    // `--` ends the in-box run's own options, so an argument such as
+    // `--path` reaches the task and not the in-box parser.
+    if let mfile::spec::Entrypoint::Exec(argv) = &mut spec.entrypoint
+        && !args.is_empty()
+    {
+        argv.push("--".to_string());
+        argv.extend(args.iter().cloned());
+    }
+    Some(spec)
+}
+
+/// Asks the daemon to run the entrypoint of task box `id`, and returns the
+/// channel that relays it: the task's output, then its exit code.
+/// `task_env` holds the task's variables, resolved against this shell, for
+/// the in-box `min task run` to read. `cwd` is where the entrypoint starts,
+/// relative to the uploaded tree (see [`task_run_cwd`]). Empty is the root.
+pub(crate) async fn open_task_box_run(
+    client: &mut crate::client::Client,
+    id: boxes::SessionId,
+    task: &str,
+    cwd: &str,
+    task_env: &minimald_rpc::taskenv::TaskEnv,
+) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+    client
+        .open_session_exec_channel(id, &entrypoint_run_request(task, cwd).encode(), task_env)
+        .await
 }
 
 /// The invocation directory relative to the upload root, `/`-separated:
@@ -370,26 +418,58 @@ fn unknown_task_message(file: &mfile::File, task: &str) -> String {
     }
 }
 
-/// Guard that resolves the ephemeral session if the user interrupts the run
-/// phase, modeled on [`crate::arm_activation_interrupt`]: the primary
-/// connection is parked in the exec bridge, so the handler works over a
-/// fresh connection. Without `--keep` the first Ctrl-C best-effort
-/// `DestroySession`s the box and releases the name hold an attach or exec
-/// may have re-made for it ([`release_task_name_hold`]); with it the
-/// session is left alive and the
-/// handler says how to reach it. Either way the process exits 130. The
-/// destroy leg is bounded: the connect-and-destroy runs under the same
-/// 10-second cleanup ceiling as [`crate::best_effort_destroy`], and a
-/// second Ctrl-C during it abandons the cleanup and exits 130 immediately —
-/// an unresponsive daemon can delay the exit, never prevent it. Dropping
-/// the guard cancels the handler once the normal destroy/keep path has run.
+/// What the first Ctrl-C of a task run does to its box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptEnds {
+    /// A task box whose entrypoint is the task: the box is stopped as
+    /// `min box stop` stops it (BOX-013), and keeps its record (BOX-038).
+    Stop,
+    /// An interactive task, which has no spec: the run owns its box, and
+    /// the box is destroyed.
+    Destroy,
+}
+
+/// The line the first Ctrl-C prints, before the box is stopped or
+/// destroyed.
+fn interrupt_line(ends: InterruptEnds, box_name: &str) -> String {
+    match ends {
+        InterruptEnds::Stop => format!("\nInterrupted. Stopping box {box_name}…"),
+        InterruptEnds::Destroy => format!("\nInterrupted; destroying session {box_name}…"),
+    }
+}
+
+/// Guard that ends the run's box if the user interrupts the run phase,
+/// modeled on [`crate::arm_activation_interrupt`]: the primary connection
+/// is parked in the exec bridge, so the handler works over a fresh
+/// connection. The first Ctrl-C ends the box as `ends` says, releases the
+/// name hold an attach or exec may have re-made for it
+/// ([`release_task_name_hold`]), and the process exits 130.
 ///
-/// Note the SIGINT is consumed on the host: it is NOT relayed into the box,
-/// so — unlike interrupting a local command — the task itself gets no
-/// chance to trap it and clean up; the box is torn down (or, with `--keep`,
-/// abandoned) around it.
+/// A stop is the daemon's graceful stop: SIGTERM, the grace period, then
+/// SIGKILL to what still runs. Its leg is bounded by the grace period plus
+/// the 10-second cleanup ceiling of [`crate::best_effort_destroy`], which
+/// bounds a destroy alone. A second Ctrl-C during either abandons the
+/// cleanup and exits 130 at once: an unresponsive daemon can delay the
+/// exit, never prevent it. Dropping the guard cancels the handler once the
+/// normal end path has run.
+///
+/// The SIGINT is consumed on the host. It is not relayed into the box as
+/// a SIGINT; a stop sends the box SIGTERM first.
 struct TaskRunInterrupt {
     task: tokio::task::JoinHandle<()>,
+    /// Set once the first Ctrl-C arrived. The handler then owns the exit.
+    interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TaskRunInterrupt {
+    /// Waits forever once a Ctrl-C arrived, so the handler's exit 130 is
+    /// the run's exit. A stop ends the box, and the run's channel then
+    /// reports that end, which the run must not exit with.
+    async fn yield_to_handler(&self) {
+        if self.interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 impl Drop for TaskRunInterrupt {
@@ -402,7 +482,7 @@ fn arm_task_run_interrupt(
     global: &GlobalArgs,
     box_id: boxes::SessionId,
     box_name: String,
-    keep: bool,
+    ends: InterruptEnds,
 ) -> TaskRunInterrupt {
     let sock =
         crate::client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
@@ -410,59 +490,81 @@ fn arm_task_run_interrupt(
         crate::daemon_host_kind(global),
         global.minimal_dir.as_deref(),
     );
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = interrupted.clone();
     let task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_err() {
             return;
         }
-        if keep {
-            eprintln!(
-                "\nInterrupted; session {box_name} kept — attach with: \
-                 min session attach {box_name}"
-            );
-            std::process::exit(130);
-        }
-        eprintln!("\nInterrupted; destroying session {box_name}…");
-        // The whole connect-and-destroy is bounded by the same 10-second
-        // cleanup ceiling as `best_effort_destroy` — the interrupt may well
-        // mean the daemon is already wedged — and raced against a second
-        // Ctrl-C, which abandons the cleanup and exits immediately.
-        // `ctrl_c()` keeps the process-wide SIGINT handler installed, so
-        // without that race a second interrupt would be silently swallowed.
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("{}", interrupt_line(ends, &box_name));
+        // The interrupt may well mean the daemon is already wedged, so the
+        // leg is bounded, and raced against a second Ctrl-C, which abandons
+        // it and exits immediately. `ctrl_c()` keeps the process-wide
+        // SIGINT handler installed, so without that race a second interrupt
+        // would be silently swallowed.
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let destroy = async {
+        let bound = match ends {
+            InterruptEnds::Stop => minimald_rpc::STOP_GRACE + CLEANUP_TIMEOUT,
+            InterruptEnds::Destroy => CLEANUP_TIMEOUT,
+        };
+        let end_box = async {
             // Deliberately not version-gated: this is the recovery half of a
             // task run, and a cleanup blocked by a skew is exactly the orphaned
             // session the gate exists to prevent.
             if let Ok(sock) = sock
                 && let Ok(mut client) = crate::client::Client::connect(&sock).await
             {
-                use minimald_rpc::{DestroySession, DestroySessionRequest};
-                let _ = client
-                    .oneshot_rpc::<DestroySession>(DestroySessionRequest {
-                        id: box_id,
-                        only_if_unfinalized: false,
-                    })
-                    .await;
+                match ends {
+                    InterruptEnds::Stop => {
+                        let _ = client
+                            .oneshot_rpc::<minimald_rpc::StopBox>(minimald_rpc::StopBoxRequest {
+                                id: box_id,
+                                force: false,
+                            })
+                            .await;
+                    }
+                    InterruptEnds::Destroy => {
+                        use minimald_rpc::{DestroySession, DestroySessionRequest};
+                        let _ = client
+                            .oneshot_rpc::<DestroySession>(DestroySessionRequest {
+                                id: box_id,
+                                only_if_unfinalized: false,
+                            })
+                            .await;
+                    }
+                }
             }
             // The run's own return never comes on this path, so the release
-            // it owes is made here, inside the same bound.
-            release_task_name_hold(control_sock, box_id, &box_name, false).await;
+            // it owes is made here, inside the same bound. A stopped box
+            // keeps its record until it is reaped (BOX-018), and a stop
+            // that did not land leaves it running, so only a destroy
+            // releases: the stopped box's reap releases its hold.
+            if ends == InterruptEnds::Destroy {
+                release_task_name_hold(control_sock, box_id, &box_name).await;
+            }
         };
         tokio::select! {
-            res = tokio::time::timeout(CLEANUP_TIMEOUT, destroy) => {
+            res = tokio::time::timeout(bound, end_box) => {
                 if res.is_err() {
-                    eprintln!(
-                        "DestroySession timed out after {CLEANUP_TIMEOUT:?}; the session may \
-                         still be present (run `min session destroy {box_name}` to clean \
-                         up manually)"
-                    );
+                    match ends {
+                        InterruptEnds::Stop => eprintln!(
+                            "Box {box_name} did not stop within {bound:?}. Run \
+                             `min box stop {box_name}` to stop it."
+                        ),
+                        InterruptEnds::Destroy => eprintln!(
+                            "DestroySession timed out after {bound:?}; the session may \
+                             still be present (run `min session destroy {box_name}` to clean \
+                             up manually)"
+                        ),
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {}
         }
         std::process::exit(130);
     });
-    TaskRunInterrupt { task }
+    TaskRunInterrupt { task, interrupted }
 }
 
 /// Bridge an acked exec channel to the caller's stdio, mirroring the
@@ -558,7 +660,7 @@ fn interactive_task_box_name(task: &str) -> String {
 
 /// Run a declared task in an ephemeral session: create, upload, exec the
 /// canonical in-box `min task run <task>`, relay its exit code, and let the
-/// daemon end the session with the run (NET-131) — or keep it with `--keep`.
+/// daemon end the session with the run (NET-131).
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
     // Same project-path resolution as `cmd_activate`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
@@ -657,9 +759,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     crate::ensure_daemon(global)?;
 
     // Same default as an activate with no flags, matching the loadout
-    // handling below: `min task run` has no `--no-hooks` of its own, and a
-    // `--keep` session is attachable later, so its hooks behave like any
-    // other session's. The constructor turns them on.
+    // handling below: `min task run` has no `--no-hooks` of its own, so its
+    // hooks behave like any other session's. The constructor turns them on.
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         abs_path.clone(),
@@ -671,10 +772,20 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // box uses. The client invents no name.
     request.config.name = None;
     request.fresh_instance = true;
-    // The box ends with this run unless `--keep` retains it: marked at
-    // create, so a daemon restart before or during the run destroys it
-    // rather than resuming it (NET-131).
-    request.config.ends_with_run = !args.keep;
+    // The task box runs its task as its entrypoint and keeps its record
+    // when the task returns (BOX-038). Every created box stores its spec
+    // (BOX-068). An interactive task, which has no spec, takes the exec
+    // channel. The box is marked at create, so a daemon restart before its
+    // task starts destroys it rather than resuming it (NET-131). The daemon
+    // clears the mark when the task box's entrypoint starts.
+    let spec = task_box_spec(
+        &args.task,
+        &declared,
+        crate::spec_flags(&request),
+        &args.args,
+    );
+    let entrypoint_runs = spec.is_some();
+    request.config.ends_with_run = true;
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
     request.must_match_version = minimal_client::version_assertion();
@@ -682,10 +793,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
     // BOX-068: the declared task's spec, with this command's settings. An
     // interactive task sends none: the task type denies a terminal.
-    if let Some(spec) =
-        mfile::spec::BoxSpec::for_task(&args.task, &declared, crate::spec_flags(&request))
-    {
-        crate::put_spec(&mut request, &spec)?;
+    if let Some(spec) = &spec {
+        crate::put_spec(&mut request, spec)?;
     } else {
         // With no spec to name it, the request carries the entry's name,
         // cleaned as the daemon cleans a spec's entry.
@@ -903,17 +1012,91 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         return Err(e);
     }
 
-    // Active: from here an interrupt destroys (or, under `--keep`, keeps)
-    // the session rather than aborting a draft.
+    // Active: from here an interrupt destroys the session rather than
+    // aborting a draft.
     drop(interrupt_guard);
-    let run_guard = arm_task_run_interrupt(global, id, session_name.clone(), args.keep);
+    let run_guard = arm_task_run_interrupt(
+        global,
+        id,
+        session_name.clone(),
+        if entrypoint_runs {
+            InterruptEnds::Stop
+        } else {
+            InterruptEnds::Destroy
+        },
+    );
+
+    if entrypoint_runs {
+        eprintln!("Running task {} in box {session_name}...", args.task);
+        // One span for the run, from the request to the exit code.
+        let span = tracing::info_span!(
+            "task_run",
+            box_id = %id,
+            box_name = %session_name,
+            task = %args.task,
+        );
+        // What the run did with its box: only a box it removed gives up
+        // its name hold and its egress ([`release_task_box_holds`]).
+        let (outcome, end) = async {
+            match open_task_box_run(&mut client, id, &args.task, &task_cwd, &task_env).await {
+                Ok(channel) => {
+                    let outcome = bridge_exec(channel).await;
+                    run_guard.yield_to_handler().await;
+                    let mut end = TaskBoxEnd::Keep;
+                    if let Ok(exit) = outcome {
+                        end = task_box_end(exit, || entrypoint_started(&mut client, id)).await;
+                        match end {
+                            TaskBoxEnd::Keep => {
+                                eprintln!("{}", crate::kept_box_line(&session_name));
+                            }
+                            TaskBoxEnd::Remove => {
+                                tracing::info!(
+                                    box_id = %id,
+                                    "the daemon did not start the task box's entrypoint; \
+                                     removing the box"
+                                );
+                                crate::best_effort_destroy(&mut client, id, false).await;
+                            }
+                        }
+                    }
+                    (outcome, end)
+                }
+                // The exec never started, so no entrypoint ran: the box is
+                // removed, as the client always removed it.
+                Err(e) => {
+                    crate::best_effort_destroy(&mut client, id, false).await;
+                    (Err(e), TaskBoxEnd::Remove)
+                }
+            }
+        }
+        .instrument(span.clone())
+        .await;
+        span.in_scope(|| {
+            tracing::info!(exit = ?outcome.as_ref().ok().copied().flatten(), "task run ended");
+        });
+        if let Some(residency) = host_ip_residency.as_mut() {
+            residency.keep();
+        }
+        release_task_box_holds(
+            end,
+            crate::vm_host_control_sock(
+                crate::daemon_host_kind(global),
+                global.minimal_dir.as_deref(),
+            ),
+            id,
+            &session_name,
+        )
+        .await;
+        drop(run_guard);
+        return exit_outcome(outcome?);
+    }
 
     eprintln!("Running task {} in session {session_name}...", args.task);
 
     let outcome = match client
         .open_session_exec_channel(
             id,
-            &task_run_request(&args.task, &args.args, args.keep, task_cwd).encode(),
+            &task_run_request(&args.task, &args.args, task_cwd).encode(),
             &task_env,
         )
         .await
@@ -924,10 +1107,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         // exits, and there is no run): resolve the box here, as the client
         // always did. A run that bridged leaves its box to the daemon.
         Err(e) => {
-            if !args.keep {
-                // Finished (the exec never started): unconditional.
-                crate::best_effort_destroy(&mut client, id, false).await;
-            }
+            // Finished (the exec never started): unconditional.
+            crate::best_effort_destroy(&mut client, id, false).await;
             Err(e)
         }
     };
@@ -935,10 +1116,6 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // A run that bridged ends its own box from the daemon's side of the
     // exec's exit (NET-131) — destroying here too would race it and undo
     // the point of the flag: a client killed mid-run must strand nothing.
-    // `--keep` retains the session as an attachable box instead.
-    if args.keep {
-        eprintln!("Session {session_name} kept — attach with: min session attach {session_name}");
-    }
     if let Some(residency) = host_ip_residency.as_mut() {
         residency.keep();
     }
@@ -949,7 +1126,6 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         ),
         id,
         &session_name,
-        args.keep,
     )
     .await;
     drop(run_guard);
@@ -957,32 +1133,180 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     exit_outcome(outcome?)
 }
 
-/// Releases the name hold a finished run's session may carry on the VM
-/// host daemon, best-effort. A task run holds no name of its own, but a
-/// `min session attach` or `min exec` into its running session re-makes
-/// one (`rehold_held_name_before_attach` cannot tell a task session
-/// apart), and the daemon ends the session with the run, where no client
-/// destroy releases it; an interrupted run's raw `DestroySession` releases
-/// nothing either, so its handler calls this too. The release is by the
-/// session's `id`, so it frees
-/// only this session's hold, and a name nothing held is the goal state
-/// already holding. `keep` withholds it: a kept session lives on, and its
-/// destroy releases its hold.
+/// What a task run does with its box once the run's channel closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskBoxEnd {
+    /// The box stays, with its record (BOX-038), or runs on (BOX-015).
+    Keep,
+    /// The daemon refused to start the entrypoint, so the box is removed.
+    Remove,
+}
+
+/// Decides [`TaskBoxEnd`] from the exit status the run's channel reported.
+///
+/// The daemon reports a code only once the box's record keeps it, so a box
+/// whose record still reads not started after a reported code never started
+/// its entrypoint: the daemon refused the start, and the box is removed.
+/// `started` reads the record, and only then. A channel that closed with no
+/// status (a daemon or transport drop mid-run) says nothing about the
+/// entrypoint, which can still run, so the box is kept and the record is
+/// not read: a client that loses its run never ends the box (BOX-015).
+async fn task_box_end<F, Fut>(exit: Option<u32>, started: F) -> TaskBoxEnd
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    match exit {
+        None => TaskBoxEnd::Keep,
+        Some(_) if started().await => TaskBoxEnd::Keep,
+        Some(_) => TaskBoxEnd::Remove,
+    }
+}
+
+/// Whether the task box's entrypoint ran: the box's record shows it ended,
+/// as a box ends when its entrypoint returns (BOX-038). A box that is still
+/// running, or still activating, never started it. A record the daemon
+/// cannot read back counts as started, so the box is kept rather than
+/// removed on a guess.
+async fn entrypoint_started(client: &mut crate::client::Client, id: boxes::SessionId) -> bool {
+    use boxes::core::record::RecordState;
+    let reply = client
+        .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Id(
+            id,
+        ))
+        .await;
+    match reply {
+        Ok(reply) => !matches!(
+            reply.record.map(|record| record.state()),
+            Some(Ok(RecordState::Pending
+                | RecordState::Materializing
+                | RecordState::Running))
+        ),
+        Err(error) => {
+            tracing::warn!(box_id = %id, %error, "could not read the task box's state");
+            true
+        }
+    }
+}
+
+/// Releases what a task box held on the VM host daemon once its run
+/// ended, as `end` says: a removed box releases its name hold and its
+/// `host_ip` egress ([`release_task_name_hold`]). A kept box releases
+/// nothing. It may still run, because a run that lost its channel never
+/// ends the box (BOX-015), or it ended and keeps its record until it is
+/// reaped (BOX-018). Its reap releases both.
+pub(crate) async fn release_task_box_holds(
+    end: TaskBoxEnd,
+    control_sock: Option<std::path::PathBuf>,
+    id: boxes::SessionId,
+    name: &str,
+) {
+    if end == TaskBoxEnd::Remove {
+        release_task_name_hold(control_sock, id, name).await;
+    }
+}
+
+/// Releases what a removed task run's box held on the VM host daemon,
+/// best-effort: its name hold and its `host_ip` egress. A
+/// `min session attach` or `min exec` into the running box re-makes a name
+/// hold (`rehold_held_name_before_attach` cannot tell a task box apart),
+/// and a destroy through the raw `DestroySession` RPC releases neither.
+/// So a task box's run calls this after it destroyed its box itself
+/// ([`release_task_box_holds`]), an interrupt that destroys the box calls
+/// it, and so does a run whose box the daemon ends with the run (NET-131).
+/// A task box the run keeps, running or ended, keeps both until its reap
+/// releases them. The release is by the box's
+/// `id`, so it frees only this box's hold, and a name nothing held is the
+/// goal state already holding.
 pub(crate) async fn release_task_name_hold(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
     name: &str,
-    keep: bool,
 ) {
-    if keep {
-        return;
-    }
     crate::release_held_box_name(control_sock, id, Some(name), None).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // BOX-038, T43: `min task run` creates a task box whose entrypoint is
+    // the task, with the typed arguments on its argv. The run asks the
+    // daemon for that entrypoint, owns no box, and returns the code the
+    // daemon relays as its own. The box is kept, and the run says how to
+    // remove it. The daemon half, which runs the entrypoint and relays its
+    // code, needs the mock launcher of `minimald`'s own tests:
+    // `until_complete_ends_on_entrypoint_return_without_client_*` there.
+    #[test]
+    fn task_run_returns_the_entrypoint_exit_code() {
+        // An interactive task has no spec, so it keeps the exec path.
+        let interactive = mfile::Task {
+            interactive: true,
+            ..mfile::Task::default()
+        };
+        assert!(task_box_spec("sh", &interactive, Default::default(), &[]).is_none());
+
+        // The arguments ride the entrypoint's argv.
+        let spec = task_box_spec(
+            "check",
+            &mfile::Task::default(),
+            mfile::spec::SpecFlags::default(),
+            &["--path".to_string(), "prod".to_string()],
+        )
+        .expect("a task that is not interactive has a spec");
+        let argv = ["min", "task", "run", "check", "--", "--path", "prod"];
+        assert_eq!(
+            spec.entrypoint,
+            mfile::spec::Entrypoint::Exec(argv.map(String::from).to_vec())
+        );
+        // The in-box run reads `--path` as the task's, not as its own flag.
+        let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(argv).expect("the argv parses");
+        let Some(crate::cli::Command::Task(crate::cli::TaskArgs {
+            command: crate::cli::TaskCommand::Run(run),
+        })) = cli.command
+        else {
+            panic!("the argv is a task run");
+        };
+        assert_eq!(run.path, None);
+        assert_eq!(run.args, ["--path", "prod"]);
+        // A run with no arguments adds no separator.
+        let spec = task_box_spec(
+            "check",
+            &mfile::Task::default(),
+            mfile::spec::SpecFlags::default(),
+            &[],
+        )
+        .expect("a task that is not interactive has a spec");
+        assert_eq!(spec.entrypoint, mfile::spec::Entrypoint::for_task("check"));
+        // The run sends no arguments and owns no box.
+        assert_eq!(
+            entrypoint_run_request("check", ""),
+            minimald_rpc::exec::ExecRequest::TaskRun {
+                task: "check".to_string(),
+                owns_box: false,
+                args: vec![],
+                cwd: String::new(),
+            }
+        );
+        // An `inherit_cwd` task's directory rides the request, where the
+        // daemon starts the entrypoint.
+        let minimald_rpc::exec::ExecRequest::TaskRun { cwd, .. } =
+            entrypoint_run_request("check", "sub/inner")
+        else {
+            panic!("a task run request");
+        };
+        assert_eq!(cwd, "sub/inner");
+
+        // The code the daemon relays is the run's: 0 is success, and any
+        // other code is the process's exit code.
+        assert!(exit_outcome(Some(0)).is_ok());
+        let err = exit_outcome(Some(7)).unwrap_err();
+        assert_eq!(err.downcast_ref::<TaskExit>(), Some(&TaskExit(7)));
+        assert_eq!(
+            crate::kept_box_line("check-1"),
+            "Kept box check-1. Remove it with min box rm check-1."
+        );
+    }
 
     /// The hidden `min run` redirect names both canonical forms — the host
     /// `min task run <task>` and the in-box
@@ -1079,12 +1403,52 @@ mod tests {
         assert!(err.downcast_ref::<TaskExit>().is_none());
     }
 
-    /// NET-131 from the client side: a `min task run` that does not `--keep`
-    /// sends the owns-box flag, which is what moves the destroy to the
+    /// BOX-013, BOX-038: the first Ctrl-C of an entrypoint run says it stops
+    /// the box. An interactive task's run still destroys its box, and says
+    /// so.
+    #[test]
+    fn an_interrupted_entrypoint_run_says_it_stops_the_box() {
+        assert_eq!(
+            interrupt_line(InterruptEnds::Stop, "lint-1"),
+            "\nInterrupted. Stopping box lint-1…"
+        );
+        assert_eq!(
+            interrupt_line(InterruptEnds::Destroy, "lint-1"),
+            "\nInterrupted; destroying session lint-1…"
+        );
+    }
+
+    /// BOX-015: a run whose channel dropped mid-run, with no exit status,
+    /// keeps its box even while the record reads running, and does not read
+    /// the record to decide. A reported code with a record that never left
+    /// running is the daemon's refusal, and only that removes the box.
+    #[tokio::test]
+    async fn a_task_box_run_that_loses_its_channel_keeps_the_box() {
+        let mut read = false;
+        let end = task_box_end(None, || {
+            read = true;
+            std::future::ready(false)
+        })
+        .await;
+        assert_eq!(end, TaskBoxEnd::Keep, "a dropped channel keeps the box");
+        assert!(!read, "a dropped channel does not read the record");
+
+        assert_eq!(
+            task_box_end(Some(3), || std::future::ready(true)).await,
+            TaskBoxEnd::Keep,
+            "an entrypoint that ended keeps its box"
+        );
+        assert_eq!(
+            task_box_end(Some(125), || std::future::ready(false)).await,
+            TaskBoxEnd::Remove,
+            "a refused start removes the box"
+        );
+    }
+
+    /// NET-131 from the client side: a `min task run` of a task with no
+    /// spec sends the owns-box flag, which is what moves the destroy to the
     /// daemon — it ends the session once the task's exit status is on the
-    /// wire, whether or not this client is still there. `--keep` withholds
-    /// the flag, because a kept session is meant to outlive the run; its end
-    /// stays with whoever holds it. The daemon-backed half — the box actually
+    /// wire, whether or not this client is still there. The daemon-backed half — the box actually
     /// ending — needs a live daemon and is covered by the `minimald` exec
     /// tests and the session e2e, not a unit test.
     #[test]
@@ -1092,7 +1456,7 @@ mod tests {
         use minimald_rpc::exec::ExecRequest;
 
         // A normal run: the request names the box as the run's own.
-        let req = task_run_request("build", &[], false, String::new());
+        let req = task_run_request("build", &[], String::new());
         assert_eq!(
             req,
             ExecRequest::TaskRun {
@@ -1103,20 +1467,7 @@ mod tests {
             }
         );
         // The flag is carried, not inferred: it survives the wire.
-        assert_eq!(ExecRequest::parse(&req.encode()), Ok(req.clone()));
-
-        // `--keep` keeps the box: no owns-box flag, nothing ends it here.
-        let kept = task_run_request("build", &[], true, String::new());
-        assert_eq!(
-            kept,
-            ExecRequest::TaskRun {
-                task: "build".to_string(),
-                owns_box: false,
-                args: vec![],
-                cwd: String::new(),
-            }
-        );
-        assert_eq!(ExecRequest::parse(&kept.encode()), Ok(kept));
+        assert_eq!(ExecRequest::parse(&req.encode()), Ok(req));
     }
 
     /// `inherit_cwd` from the client side: the invocation directory is sent
@@ -1137,7 +1488,6 @@ mod tests {
         let req = task_run_request(
             "ic",
             &[],
-            false,
             task_run_cwd(root, Utf8Path::new("/home/dev/project/sub")),
         );
         let minimald_rpc::exec::ExecRequest::TaskRun { cwd, .. } =
@@ -1681,7 +2031,6 @@ mod tests {
         let args = TaskRunArgs {
             task: "deploy".into(),
             path: None,
-            keep: false,
             args: vec![],
         };
 
@@ -1728,7 +2077,6 @@ mod tests {
         let args = TaskRunArgs {
             task: "build".into(),
             path: None,
-            keep: false,
             args: vec![],
         };
 
@@ -1783,7 +2131,6 @@ mod tests {
         let args = TaskRunArgs {
             task: "build".into(),
             path: None,
-            keep: false,
             args: vec![],
         };
 

@@ -166,6 +166,14 @@ pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
 pub const MINVMD_LOCK_FILE: &str = "minvmd.lock";
+/// The socket the placement unit `min finalize-install` installs listens on
+/// (`minimald-place.socket`), which native minimald connects to once its
+/// listener is bound. systemd holds it in `/run`, owned by the delegated
+/// account with mode 0600, so only that account and root connect. systemd
+/// starts the root-owned placer for each connection. The placer finds the
+/// daemon from the holders of its listening socket, never from the
+/// connection, so a connection asks for a placement and names nothing.
+pub const PLACE_REQUEST_SOCKET: &str = "/run/minimald-place.sock";
 
 /// Which local daemon backend (box host) an instance directory belongs to.
 ///
@@ -493,6 +501,40 @@ pub fn minimal_config_dir_with_override(over: Option<&Path>) -> std::path::PathB
             .as_std_path()
             .to_path_buf(),
     }
+}
+
+/// [`minimal_config_dir_with_override`] without the panics: `None` when no
+/// override is given and neither `$XDG_CONFIG_HOME` nor a home directory
+/// resolves, or the default path is not valid UTF-8 or not absolute. For a
+/// caller that runs before every command and can do without the directory.
+#[must_use]
+pub fn try_minimal_config_dir_with_override(over: Option<&Path>) -> Option<std::path::PathBuf> {
+    match over {
+        Some(dir) => Some(dir.join("minimal")),
+        None => try_default_dir(xdg_config_home, ".config")
+            .map(|p| p.as_utf8_path().as_std_path().to_path_buf()),
+    }
+}
+
+/// The certificate files the retired HTTPS reverse proxy left in the config
+/// directory: the daemon-issued client certificate, its key, and the CA.
+pub const RETIRED_PROXY_CREDENTIAL_FILES: [&str; 3] = ["client.pem", "client.key", "ca.pem"];
+
+/// Deletes the retired HTTPS reverse proxy's certificate files
+/// ([`RETIRED_PROXY_CREDENTIAL_FILES`]) from `config_dir`, and returns the
+/// path of each file it removed.
+///
+/// Best-effort and idempotent: a file that is absent is skipped, and a file
+/// it cannot remove is left for the next run. It prints nothing. This crate
+/// has no logger, so the caller logs one line for each returned path.
+// NET-109: the proxy that issued these files is gone, so nothing reads them.
+#[must_use]
+pub fn remove_retired_proxy_credentials(config_dir: &Path) -> Vec<std::path::PathBuf> {
+    RETIRED_PROXY_CREDENTIAL_FILES
+        .iter()
+        .map(|name| config_dir.join(name))
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .collect()
 }
 
 /// Return `$XDG_CONFIG_HOME` if it's set to an absolute path. Matches the
@@ -1533,6 +1575,40 @@ pub trait Translator<Src: Realm, Dst: Realm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_proxy_credentials_removed_from_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path();
+        for name in RETIRED_PROXY_CREDENTIAL_FILES {
+            std::fs::write(config.join(name), "pem").unwrap();
+        }
+        std::fs::write(config.join("config.toml"), "").unwrap();
+
+        let mut removed = remove_retired_proxy_credentials(config);
+        removed.sort();
+        let mut expected: Vec<_> = RETIRED_PROXY_CREDENTIAL_FILES
+            .iter()
+            .map(|name| config.join(name))
+            .collect();
+        expected.sort();
+        assert_eq!(removed, expected);
+        for name in RETIRED_PROXY_CREDENTIAL_FILES {
+            assert!(!config.join(name).exists(), "{name} is still present");
+        }
+        assert!(config.join("config.toml").exists(), "other config is kept");
+
+        // A second run finds nothing left to remove.
+        assert_eq!(
+            remove_retired_proxy_credentials(config),
+            Vec::<std::path::PathBuf>::new()
+        );
+        // A config dir that does not exist is not an error.
+        assert_eq!(
+            remove_retired_proxy_credentials(&config.join("absent")),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
 
     #[test]
     fn abs_path_rejects_relative_input() {

@@ -119,6 +119,7 @@ __min_rpc() {
     local data="$@"
 
     local error="false"
+    local relayed=""
     local env_pairs=()
     local bar_open=0
     # The exec that runs this helper hands the box its TRACEPARENT (the exec
@@ -131,6 +132,27 @@ __min_rpc() {
     local prefix=""
     if [[ "${TRACEPARENT:-}" =~ ^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$ ]]; then
         prefix="traceparent%${TRACEPARENT}%"
+    fi
+    local request="${prefix}${method}%${data}"
+
+    # A `run` whose stdin is a pipe or a file forwards that stdin to the
+    # task. A last `stdin` group in the request says so. The daemon answers
+    # with a `stdin:` line when the task starts, and only then does the stdin
+    # follow the request on the connection, up to its EOF. A terminal stays
+    # with this shell. `-t` keeps socat reading the daemon's answer after
+    # the stdin ends. The daemon reads and drops what the task leaves
+    # unread until this side closes, so a write here never fails.
+    local forward=0 sock_out sock_in="" sock_pid="" stdin_fd="" feeder=""
+    if [[ "$method" == "run" && ! -t 0 ]]; then
+        forward=1
+        request+=$'\x1e'stdin
+        coproc __MIN_SOCK { exec socat -t 2000000000 - UNIX-CONNECT:/run/minenv_sock; }
+        sock_pid="$__MIN_SOCK_PID"
+        exec {sock_out}<&"${__MIN_SOCK[0]}" {sock_in}>&"${__MIN_SOCK[1]}" {stdin_fd}<&0
+        eval "exec ${__MIN_SOCK[0]}<&- ${__MIN_SOCK[1]}>&-"
+        printf '%s\n' "$request" >&"$sock_in"
+    else
+        exec {sock_out}< <(printf '%s\n' "$request" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
     fi
 
     while IFS= read -r line; do
@@ -162,7 +184,16 @@ __min_rpc() {
                     printf '\r\033[K'
                     bar_open=0
                 fi
-                echo "$rest"
+                printf '%s\n' "$rest"
+                ;;
+            err)
+                # A line for stderr: the task's own stderr and min's notes
+                # about the run, so stdout carries only the task's output.
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\r\033[K'
+                    bar_open=0
+                fi
+                printf '%s\n' "$rest" >&2
                 ;;
             set_env)
                 local varname="${rest%%:*}"
@@ -170,7 +201,23 @@ __min_rpc() {
                 declare -gx "$varname=$varval"
                 env_pairs+=("${varname}=${varval}")
                 ;;
+            stdin)
+                # The task starts: copy this command's stdin to it. The
+                # copy's end closes the connection's sending side, so the
+                # task reads EOF.
+                if [[ "$forward" -eq 1 && -z "$feeder" ]]; then
+                    cat <&"$stdin_fd" >&"$sock_in" &
+                    feeder=$!
+                    exec {sock_in}>&-
+                    sock_in=""
+                fi
+                ;;
             done)
+                break
+                ;;
+            exit)
+                # The task's own exit code, which this command exits with.
+                relayed="$rest"
                 break
                 ;;
             error)
@@ -178,12 +225,31 @@ __min_rpc() {
                     printf '\r\033[K'
                     bar_open=0
                 fi
-                echo "error:$rest" >&2
+                printf 'error:%s\n' "$rest" >&2
                 error="true"
-                break
+                # A `run` refusal is followed by the `exit:` line that gives
+                # its exit code. Read on to it.
+                if [[ "$method" != "run" ]]; then
+                    break
+                fi
                 ;;
         esac
-    done < <(echo "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+    done <&"$sock_out"
+
+    if [[ "$forward" -eq 1 ]]; then
+        # The run ended: stop the copy of a stdin the task did not read to
+        # its end, and close the connection.
+        if [[ -n "$feeder" ]]; then
+            { kill "$feeder"; wait "$feeder"; } 2>/dev/null
+        fi
+        if [[ -n "$sock_in" ]]; then
+            exec {sock_in}>&-
+        fi
+        exec {stdin_fd}<&- {sock_out}<&-
+        wait "$sock_pid" 2>/dev/null
+    else
+        exec {sock_out}<&-
+    fi
 
     if [[ "$bar_open" -eq 1 ]]; then
         printf '\r\033[K'
@@ -195,9 +261,58 @@ __min_rpc() {
         echo "  export ${env_pairs[*]}"
     fi
 
+    if [[ "$relayed" =~ ^[0-9]{1,3}$ ]] && (( 10#$relayed <= 255 )); then
+        return "$((10#$relayed))"
+    fi
+    # A `run` always ends with an `exit:` line. A stream that ends without
+    # one is a failure of min, not of the task, so it exits 125.
+    if [[ "$method" == "run" ]]; then
+        if [[ "$error" != "true" ]]; then
+            echo "error: the connection closed before the task reported its exit status" >&2
+        fi
+        return 125
+    fi
     if [[ "$error" == "true" ]]; then
         return 1
     fi
+}
+
+# Escapes one item of a `run` request into `__min_item`: a backslash, a
+# newline, a carriage return and the two separators each become a backslash
+# pair, so the request stays on one line. The daemon's `unescape_run_item`
+# reverses it.
+__min_run_item() {
+    local bs='\'
+    local v="$1"
+    v="${v//"$bs"/"$bs$bs"}"
+    v="${v//$'\n'/"${bs}n"}"
+    v="${v//$'\r'/"${bs}c"}"
+    v="${v//$'\x1f'/"${bs}u"}"
+    v="${v//$'\x1e'/"${bs}r"}"
+    __min_item="$v"
+}
+
+# Writes the data of a `run` request: `$PWD`, then the task name and each
+# argument, then each exported variable as NAME=value. A 0x1e byte separates
+# the three groups and a 0x1f byte separates the items in a group.
+__min_run_request() {
+    local us=$'\x1f' rs=$'\x1e'
+    local __min_item out sep="" arg name
+    __min_run_item "$PWD"
+    out="$__min_item$rs"
+    for arg in "$@"; do
+        __min_run_item "$arg"
+        out+="$sep$__min_item"
+        sep="$us"
+    done
+    out+="$rs"
+    sep=""
+    while IFS= read -r name; do
+        __min_run_item "$name=${!name}"
+        out+="$sep$__min_item"
+        sep="$us"
+    done < <(compgen -e 2>/dev/null)
+    printf '%s' "$out"
 }
 
 min_search() {
@@ -279,7 +394,7 @@ min_run() {
         __min_usage task
         return 0
     fi
-    __min_rpc "run" "$@"
+    __min_rpc "run" "$(__min_run_request "$@")"
 }
 
 min_task() {
