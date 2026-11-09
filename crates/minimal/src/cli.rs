@@ -987,7 +987,7 @@ pub enum TaskCommand {
     /// interactive work.
     Run(TaskRunArgs),
     /// List the task boxes of the current project, in any state. A task
-    /// that ended shows its exit code, as `exited (3)`, until
+    /// that ended shows its exit code, as `exited (exit 3)`, until
     /// `min box prune` removes it. `--all` lists the tasks of every project
     List(TaskListArgs),
     /// Show what a task printed, from its start. `-f` keeps showing new

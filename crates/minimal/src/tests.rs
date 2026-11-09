@@ -11334,78 +11334,118 @@ async fn type_noun_logs_follow() {
     let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
     let project = tempfile::tempdir().expect("a temp project dir");
     let mut daemon = server.connect().await;
-    let id = minimald::test_harness::create_configured_session(
-        &mut daemon,
-        "web",
-        project.path().to_str().expect("a UTF-8 project path"),
-    )
-    .await;
-    let dir = box_store_dir(&state_path, id);
-    append_box_output(&dir, b"first line\r\n");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let web = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let job = create_configured_task(&mut daemon, "job", project).await;
+    let dirs = [
+        box_store_dir(&state_path, web),
+        box_store_dir(&state_path, job),
+    ];
+    for dir in &dirs {
+        append_box_output(dir, b"first line\r\n");
+    }
 
+    // Each type noun reads a box of its own type. `min box logs` reads any.
     let mut follows = Vec::new();
-    for noun in ["session", "task", "box"] {
-        let cli = Cli::try_parse_from(["min", noun, "logs", "web", "-f"])
-            .unwrap_or_else(|e| panic!("`min {noun} logs web -f` parses: {e}"));
-        let (args, verb) = match cli.command {
+    for (noun, target) in [("session", "web"), ("task", "job"), ("box", "web")] {
+        let cli = Cli::try_parse_from(["min", noun, "logs", target, "-f"])
+            .unwrap_or_else(|e| panic!("`min {noun} logs {target} -f` parses: {e}"));
+        let (args, box_type, verb) = match cli.command {
             Some(Command::Session(SessionArgs {
                 command: SessionCommand::Logs(args),
-            })) => (args, "session logs"),
+            })) => (args, Some(boxes::SESSION_BOX_TYPE), "session logs"),
             Some(Command::Task(TaskArgs {
                 command: TaskCommand::Logs(args),
-            })) => (args, "task logs"),
+            })) => (args, Some(boxes::TASK_BOX_TYPE), "task logs"),
             Some(Command::Box(BoxArgs {
                 command: BoxCommand::Logs(args),
-            })) => (args, "box logs"),
+            })) => (args, None, "box logs"),
             _ => panic!("expected `min {noun} logs`"),
         };
-        assert_eq!(args.target, "web");
+        assert_eq!(args.target, target);
         assert!(args.follow, "`-f` follows");
 
         // Without `-f`, the read ends at the end of the output so far.
         let once = BoxLogsArgs {
-            target: "web".to_owned(),
+            target: target.to_owned(),
             follow: false,
         };
         let mut out = Vec::new();
-        box_logs_on_hosts(local_hosts(&global).unwrap(), &once, verb, &mut out)
-            .await
-            .unwrap_or_else(|e| panic!("`min {noun} logs web` reads the output: {e:#}"));
+        box_logs_on_hosts(
+            local_hosts(&global).unwrap(),
+            &once,
+            box_type,
+            verb,
+            &mut out,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("`min {noun} logs {target}` reads the output: {e:#}"));
         assert_eq!(String::from_utf8_lossy(&out), "first line\r\n");
-        follows.push((args, verb, SharedOut::default()));
+        follows.push((args, box_type, verb, SharedOut::default()));
+    }
+
+    // A type noun refuses a box of another type, and writes nothing.
+    for (target, box_type, verb) in [
+        ("web", boxes::TASK_BOX_TYPE, "task logs"),
+        ("job", boxes::SESSION_BOX_TYPE, "session logs"),
+    ] {
+        let mut out = Vec::new();
+        let other = BoxLogsArgs {
+            target: target.to_owned(),
+            follow: false,
+        };
+        box_logs_on_hosts(
+            local_hosts(&global).unwrap(),
+            &other,
+            Some(box_type),
+            verb,
+            &mut out,
+        )
+        .await
+        .expect_err("a type noun does not read a box of another type");
+        assert!(out.is_empty(), "`min {verb} {target}` writes nothing");
     }
 
     let followed =
-        futures::future::join_all(
-            follows.iter().map(|(args, verb, shared)| {
-                let mut out = shared.clone();
-                let global = &global;
-                async move {
-                    box_logs_on_hosts(local_hosts(global).unwrap(), args, verb, &mut out).await
-                }
-            }),
-        );
+        futures::future::join_all(follows.iter().map(|(args, box_type, verb, shared)| {
+            let mut out = shared.clone();
+            let global = &global;
+            async move {
+                box_logs_on_hosts(
+                    local_hosts(global).unwrap(),
+                    args,
+                    *box_type,
+                    verb,
+                    &mut out,
+                )
+                .await
+            }
+        }));
     let drive = async {
-        for (_, _, shared) in &follows {
+        for (_, _, _, shared) in &follows {
             shared.until_contains("first line\r\n").await;
         }
-        append_box_output(&dir, b"second line\r\n");
-        for (_, _, shared) in &follows {
+        for dir in &dirs {
+            append_box_output(dir, b"second line\r\n");
+        }
+        for (_, _, _, shared) in &follows {
             shared.until_contains("second line\r\n").await;
         }
-        stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "web", false)
-            .await
-            .expect("the box stops");
-        rm_box_on_hosts(local_hosts(&global).unwrap(), "web", false)
-            .await
-            .expect("the stopped box is removed");
+        for name in ["web", "job"] {
+            stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), name, false)
+                .await
+                .expect("the box stops");
+            rm_box_on_hosts(local_hosts(&global).unwrap(), name, false)
+                .await
+                .expect("the stopped box is removed");
+        }
     };
     let (results, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         tokio::join!(followed, drive)
     })
     .await
     .expect("each follow ends when the box is removed");
-    for ((_, verb, shared), result) in follows.iter().zip(results) {
+    for ((_, _, verb, shared), result) in follows.iter().zip(results) {
         result.unwrap_or_else(|e| panic!("`min {verb} -f` ends cleanly: {e:#}"));
         assert!(
             shared.text().starts_with("first line\r\nsecond line\r\n"),
@@ -11420,15 +11460,57 @@ async fn type_noun_logs_follow() {
         target: "web".to_owned(),
         follow: false,
     };
-    box_logs_on_hosts(local_hosts(&global).unwrap(), &gone, "box logs", &mut out)
-        .await
-        .expect_err("the removed box has no output to read");
+    box_logs_on_hosts(
+        local_hosts(&global).unwrap(),
+        &gone,
+        None,
+        "box logs",
+        &mut out,
+    )
+    .await
+    .expect_err("the removed box has no output to read");
     assert!(out.is_empty());
 }
 
+/// Drives the create flow of `create_configured_session` with the task
+/// verb, so the daemon files a box of the task type. Returns its id.
+async fn create_configured_task(
+    client: &mut minimald::test_harness::TestClient,
+    name: &str,
+    project: &str,
+) -> boxes::SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let mut request = minimald::test_harness::create_session_req(name, project);
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    let id = client.call::<CreateSession>(&request).await.unwrap().id;
+    minimald::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => id,
+        Errorable::Err { error } => panic!("FinalizeSession failed for the task box: {error}"),
+    }
+}
+
 // BCLI-015: `min task list` shows a task that ended with its exit code, as
-// `exited (3)`, and keeps it until `min box prune` removes it. A box of
-// another type is not a task, so it is not listed.
+// `exited (exit 3)`, in the `min box list` table and wording. It keeps the
+// task until `min box prune` removes it. A box of another type is not a
+// task, so it is not listed.
 #[tokio::test]
 async fn task_list_shows_exited_until_pruned() {
     use clap::Parser as _;
@@ -11490,19 +11572,22 @@ async fn task_list_shows_exited_until_pruned() {
     assert!(lines[0].contains("STATE"), "{text}");
     assert!(lines[1].starts_with(&build.to_string()), "{text}");
     assert!(lines[1].contains("  build  "), "{text}");
-    assert!(lines[1].contains("  exited (3)  "), "{text}");
+    assert!(lines[1].contains("  exited (exit 3)  "), "{text}");
+    assert!(lines[1].contains("  task  "), "{text}");
     assert!(lines[1].ends_with("local0"), "{text}");
-    assert!(!text.contains("web"), "a session is not a task:\n{text}");
+    assert!(
+        !text.contains("  web  "),
+        "a session is not a task:\n{text}"
+    );
 
     // A listing of another project does not show the task.
     assert_eq!(
         list(Some("/another/project")).await,
-        "This project has no tasks. \
-         Run `min task list --all` to list the tasks of every project.\n"
+        format!("{}\n", crate::cmd::EMPTY_PROJECT_LIST)
     );
 
     // The exited task stays until a prune removes it.
-    assert!(list(None).await.contains("exited (3)"));
+    assert!(list(None).await.contains("exited (exit 3)"));
     prune_hosts(
         local_hosts(&global).unwrap(),
         false,
@@ -11512,5 +11597,8 @@ async fn task_list_shows_exited_until_pruned() {
     )
     .await
     .expect("the prune");
-    assert_eq!(list(None).await, "No tasks on this machine.\n");
+    assert_eq!(
+        list(None).await,
+        format!("{}\n", crate::cmd::EMPTY_HOST_LIST)
+    );
 }

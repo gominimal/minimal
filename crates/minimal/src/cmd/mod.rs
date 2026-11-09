@@ -388,7 +388,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::SetupZed(args) => cmd_session_setup_zed(&cli.global_args, args).await,
             SessionCommand::Hooks(args) => cmd_session_hooks(&cli.global_args, args).await,
             SessionCommand::Logs(args) => {
-                cmd_box_logs(&cli.global_args, args, "session logs").await
+                let session = Some(boxes::SESSION_BOX_TYPE);
+                cmd_box_logs(&cli.global_args, args, session, "session logs").await
             }
         },
         Some(Command::Loadout(LoadoutArgs {
@@ -397,7 +398,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Task(TaskArgs { command })) => match command {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
             TaskCommand::List(args) => task::cmd_task_list(&cli.global_args, args).await,
-            TaskCommand::Logs(args) => cmd_box_logs(&cli.global_args, args, "task logs").await,
+            TaskCommand::Logs(args) => {
+                let task = Some(boxes::TASK_BOX_TYPE);
+                cmd_box_logs(&cli.global_args, args, task, "task logs").await
+            }
         },
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
@@ -413,7 +417,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
             BoxCommand::Rename(args) => cmd_box_rename(&cli.global_args, args).await,
             BoxCommand::Prune(args) => cmd_box_prune(&cli.global_args, args).await,
-            BoxCommand::Logs(args) => cmd_box_logs(&cli.global_args, args, "box logs").await,
+            BoxCommand::Logs(args) => cmd_box_logs(&cli.global_args, args, None, "box logs").await,
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => {
