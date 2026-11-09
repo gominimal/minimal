@@ -27,7 +27,7 @@ jobs:
             github.event.pull_request.merged == true &&
             contains(toJSON(github.event.pull_request.labels.*.name), '"backport release/') &&
             (github.event.action == 'closed' || startsWith(github.event.label.name, 'backport release/'))
-        # The minimal-shipper key lives in the `release` environment, which
+        # The minimal-backporter key lives in the `release` environment, which
         # only main and release/* can deploy to.
         environment: release
         runs-on: ubuntu-latest
@@ -36,12 +36,12 @@ jobs:
             # An App token, because a PR opened with GITHUB_TOKEN starts no CI.
             # No `workflows` permission: GitHub refuses the push of a pick that
             # changes .github/workflows, so a person backports those by hand.
-            - name: Mint token (minimal-shipper)
+            - name: Mint token (minimal-backporter)
               id: app-token
               uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
               with:
-                  app-id: ${{ vars.MINIMAL_SHIPPER_APP_ID }}
-                  private-key: ${{ secrets.MINIMAL_SHIPPER_PRIVATE_KEY }}
+                  app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
                   owner: gominimal
                   repositories: minimal
                   permission-contents: write
@@ -89,8 +89,8 @@ jobs:
               uses: korthout/backport-action@0ebd44f9c79a4a0a171200dcdcceec3ed9ca732f # v4.7.1
               with:
                   github_token: ${{ steps.app-token.outputs.token }}
-                  git_committer_name: minimal-shipper[bot]
-                  git_committer_email: 354583747+minimal-shipper[bot]@users.noreply.github.com
+                  git_committer_name: minimal-backporter[bot]
+                  git_committer_email: 354636675+minimal-backporter[bot]@users.noreply.github.com
                   label_pattern: '^backport (release/[0-9]+\.[0-9]+\.x)$'
                   branch_name: backport/${pull_number}-to-${target_branch}
                   pull_title: ${pull_title}

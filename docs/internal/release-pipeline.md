@@ -650,7 +650,7 @@ that is not marked Latest.
 
 > Not enabled. The workflow does nothing until the repository variable
 > `MERGE_BACK_ENABLED` is `true`, and it stays unset until the design is agreed.
-> The `minimal-shipper` App is already a bypass actor on the `main` ruleset, so
+> The `minimal-release-ops` App is already a bypass actor on the `main` ruleset, so
 > the variable is the only switch. Until then, use the manual merge in the
 > release steps. The job runs only when dispatched from `main`.
 
@@ -723,7 +723,7 @@ the line, retitle the source PR as `fix`, then remove the label and add it
 again. A retitle does not remove a footer, so backport that change by hand.
 
 **The backport PR.** The action cherry-picks the squash commit to the branch
-`backport/<number>-to-release/X.Y.x`. It opens the PR as `minimal-shipper`,
+`backport/<number>-to-release/X.Y.x`. It opens the PR as `minimal-backporter`,
 with the title of the source PR. The body names the source PR. It does not copy
 the source body, because agent-runtime reads `Closes #n` in a PR body as a link
 to an epic.
