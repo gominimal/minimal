@@ -110,6 +110,22 @@ the bundles' seals survive the install; the postinstall requires the
 Developer ID on the service bundle before it copies it (team OU
 `3G47C5HY64`, in `postinstall` and `build-pkg.sh` alike).
 
+## The disk image
+
+`--dmg` writes `minimal-X.Y.Z.dmg` beside the package: a read-only,
+compressed volume named "Minimal" with the package alone at its top, for a
+download page. A person opens the image and double-clicks the package;
+Gatekeeper judges the package, so the image itself needs no signature.
+With `--sign-dmg "Developer ID Application: …"` (the identity the binaries
+carry; the Installer identity is for packages only) the image is signed as
+well, and with `--notarize` it is notarized and stapled too, so Finder
+shows no warning on the image and a Mac offline at first open still finds
+the ticket. An MDM takes the package, never the image.
+
+The acceptance farm installs from the image in `vm-pkg-from-dmg`: attached
+read-only as Finder would, the package at its top installed, detached, the
+whole machine judged afterwards.
+
 ## Still open
 
 These come from the proposal's open questions.
