@@ -543,3 +543,43 @@ jobs:
                   # The tag now exists at the draft's target; say where.
                   tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
                   echo "published $tag at $tagged (draft targeted $target)"
+
+    report-release:
+        # Tell release-ops a version reached stable, so rotation.yaml `releases`
+        # updates itself. Runs last: the release is out by now, so a red job
+        # here means rerun this job, not roll back. release-ops ignores a
+        # version it has already logged, so a rerun or a rollback changes nothing.
+        needs: [promote, publish]
+        if: ${{ inputs.target == 'stable' && !inputs.dry_run }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions: {}
+        steps:
+            # Same pattern as the webapp token above: contents:write is what
+            # POST /repos/{owner}/{repo}/dispatches needs, and nothing else.
+            - name: Mint release-ops token (gominimal-aw-bot)
+              id: ops-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              with:
+                  app-id: ${{ vars.AW_BOT_APP_ID }}
+                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: release-ops
+                  permission-contents: write
+
+            - name: Report the release
+              env:
+                  GH_TOKEN: ${{ steps.ops-token.outputs.token }}
+                  VERSION: ${{ needs.promote.outputs.version }}
+                  ACTOR: ${{ github.triggering_actor }}
+              run: |
+                  set -euo pipefail
+                  if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    echo "::notice::'$VERSION' is not a final version (a nightly sha or a prerelease); not reported"
+                    exit 0
+                  fi
+                  gh api repos/gominimal/release-ops/dispatches \
+                    -f event_type=release-promoted \
+                    -f "client_payload[version]=$VERSION" \
+                    -f "client_payload[actor]=$ACTOR"
+                  echo "reported $VERSION to gominimal/release-ops"

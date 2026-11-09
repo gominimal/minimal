@@ -152,9 +152,11 @@ on it. Then the workflow does these things, in this order:
 3. It tells the docs site to rebuild from the release commit.
 4. It publishes the draft GitHub Release, which creates the `vX.Y.Z` tag and
    marks the release Latest.
+5. It reports the version to `gominimal/release-ops`, which appends it to
+   `releases` in `rotation.yaml`.
 
-If the release publish job fails, fix the cause and use **Re-run failed jobs**
-on the same run.
+If the release publish job or the report fails, fix the cause and use
+**Re-run failed jobs** on the same run.
 
 The promotion also opens a PR that moves `release/X.Y.x` to the next patch.
 Someone on the team reviews and merges it before the next stage. If that job
@@ -739,6 +741,14 @@ release does not exist. If the release is already public, the job changes
 nothing, but it fails if the `vX.Y.Z` tag is missing or is not on the
 release commit. For a nightly commit hash, it prints a notice and does
 nothing.
+
+**Report to release-ops.** After a real `stable` promotion, the `report-release`
+job sends a `release-promoted` `repository_dispatch` to `gominimal/release-ops`
+with the version and the person who started the run. The `record-release.yml`
+workflow there appends the version to `releases` in `rotation.yaml`, with a
+commit to `main`. It skips a version that it already logged, so a rerun or a
+rollback changes nothing. A nightly commit hash is not reported. Do not edit
+`releases` by hand.
 
 ### prune-releases.yml: delete old nightly releases
 
