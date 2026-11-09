@@ -1595,6 +1595,10 @@ impl File {
     }
 
     fn warn_unknown_fields(&self) {
+        // BOX-028: an entry's `hooks_on_resume` stays in its `extra`, where
+        // the spec reads it, and is not an unknown key.
+        const HOOKS_ON_RESUME_KEY: &str = "hooks_on_resume";
+
         // One command decodes the same file several times; without this a
         // single load prints each warning once per decode. Surface them only
         // the first time a given path is validated in this process.
@@ -1686,6 +1690,7 @@ impl File {
             let unknown: Vec<&str> = unknown_entry_keys(&session.extra)
                 .into_iter()
                 .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
+                .filter(|key| *key != HOOKS_ON_RESUME_KEY)
                 .collect();
             if !unknown.is_empty() {
                 tracing::warn!(
@@ -1698,7 +1703,10 @@ impl File {
         }
 
         for (task_name, task) in &self.tasks {
-            let unknown = unknown_entry_keys(&task.extra);
+            let unknown: Vec<&str> = unknown_entry_keys(&task.extra)
+                .into_iter()
+                .filter(|key| *key != HOOKS_ON_RESUME_KEY)
+                .collect();
             if !unknown.is_empty() {
                 tracing::warn!(
                     "unknown fields in task {}: {}",
@@ -3366,6 +3374,48 @@ mod tests {
             "{out}"
         );
         assert_eq!(count_unknown_warnings(&capture), 0, "{out}");
+    }
+
+    /// BOX-028: `hooks_on_resume` under `[session]` or a `[tasks.*]` entry
+    /// is read into the spec, and no unknown-field warning names it.
+    #[test]
+    fn hooks_on_resume_entry_key_is_not_reported_unknown() {
+        for body in [
+            "[session]\nhooks_on_resume = true\n",
+            "[tasks.lint]\nbash = \"true\"\nhooks_on_resume = true\n",
+        ] {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
+            let capture = CaptureWriter::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            File::from_dir(dir.path()).expect("the file reads");
+            drop(guard);
+            let out = capture.contents();
+            assert_eq!(count_unknown_warnings(&capture), 0, "{body}: {out}");
+        }
+        // A key that is not known still warns beside it.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[session]\nhooks_on_resume = true\nbogus = 1\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("the file reads");
+        drop(guard);
+        let out = capture.contents();
+        assert!(out.contains("unknown fields in [session] section"), "{out}");
+        assert!(out.contains("bogus"), "{out}");
+        assert!(!out.contains("hooks_on_resume"), "{out}");
     }
 
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {

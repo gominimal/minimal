@@ -149,6 +149,10 @@ pub(super) struct PendingResume {
     before: Record,
     span: tracing::Span,
     restarted_from_stored_spec: bool,
+    /// The resume launched the host itself, to run `on_activate` again
+    /// (BOX-028). A launch that fails after it stops that host, so the box
+    /// does not stay running on the hook host alone.
+    minted_host: bool,
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -1261,8 +1265,11 @@ impl BoxActor {
             box_id = %self.record.id(),
             from = from.name(),
             outcome = tracing::field::Empty,
+            hooks_on_resume = tracing::field::Empty,
+            activate_hooks = tracing::field::Empty,
         );
         let before = record.clone();
+        let had_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
         let resumed =
             tracing::Instrument::instrument(self.resume_ended(record, from), span.clone()).await;
         match resumed {
@@ -1271,6 +1278,8 @@ impl BoxActor {
                 before,
                 span,
                 restarted_from_stored_spec,
+                minted_host: !had_host
+                    && matches!(self.inner, BoxInner::Active { host: Some(_), .. }),
             })),
             Err(error) => {
                 span.record("outcome", "refused");
@@ -1287,7 +1296,9 @@ impl BoxActor {
     /// the `resumed` event. A launch that failed and left no host writes
     /// back the whole record the resume read, so the box does not read as
     /// running with no processes and keeps the settings it had, and marks
-    /// its name stopped again.
+    /// its name stopped again. A launch that failed beside a host the resume
+    /// launched for `on_activate` stops that host first, and then does the
+    /// same.
     pub(super) async fn finish_resume(
         &mut self,
         pending: PendingResume,
@@ -1298,12 +1309,24 @@ impl BoxActor {
             before,
             span,
             restarted_from_stored_spec,
+            minted_host,
         } = pending;
         let outcome_span = span.clone();
         let finish = async {
             let has_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
-            if let (Err(error), false) = (launched, has_host) {
+            if let Err(error) = launched
+                && (!has_host || minted_host)
+            {
                 span.record("outcome", "launch failed");
+                // The host is the one the resume launched for `on_activate`.
+                // The attach did not take it, so it stops with the resume.
+                if has_host {
+                    tracing::info!(
+                        %error,
+                        "resume: the launch failed, and the host started for on_activate is stopping"
+                    );
+                    self.stop_running(false).await;
+                }
                 let restored = self.record.write(before).await;
                 match restored {
                     Ok(()) => tracing::info!(
@@ -1476,6 +1499,7 @@ impl BoxActor {
         // BOX-025: the box restarts from the spec stored at its creation
         // (BOX-068), refused as a create of that spec would be refused.
         let mut resumed = record.clone();
+        let mut hooks_on_resume = false;
         if let Some(bytes) = &stored {
             let unsatisfiable = |error: std::io::Error| {
                 tracing::info!(refusal = "spec", %error, "resume: the stored spec cannot be satisfied");
@@ -1490,6 +1514,7 @@ impl BoxActor {
             };
             let spec = box_runtime::stored_spec(bytes).map_err(unsatisfiable)?;
             box_runtime::restart_from_stored_spec(&mut resumed, &spec);
+            hooks_on_resume = spec.hooks_on_resume;
             // The restart's launches start the box from this spec.
             self.held_spec = Some(Some(Arc::new(spec)));
             resumed.validate_policy().map_err(|error| {
@@ -1546,6 +1571,25 @@ impl BoxActor {
                 .expect("hostname registry lock poisoned")
                 .mark_running(id);
         }
+        // BOX-028: a spec that sets `hooks_on_resume` runs `on_activate`
+        // again, before the attach's launch runs `on_attach`. A hook that
+        // fails refuses the resume as a failed activation does, and the
+        // box goes back to the state it resumed from.
+        tracing::Span::current().record("hooks_on_resume", hooks_on_resume);
+        if hooks_on_resume
+            && let Err(why) = self.rerun_activate_hooks(&name).await
+        {
+            self.stop_running(false).await;
+            if let Err(restore_error) = self.record.write(record.clone()).await {
+                tracing::warn!(
+                    %restore_error,
+                    to = from.name(),
+                    "resume: on_activate failed, and the record could not be put back"
+                );
+            }
+            self.mark_name_stopped().await;
+            return Err(refused(std::io::ErrorKind::InvalidInput, 1, why));
+        }
         Ok(stored.is_some())
         }
         .await;
@@ -1553,6 +1597,94 @@ impl BoxActor {
         // record holds the name from here, or nothing does.
         manager.release_name_claim(id).await;
         outcome
+    }
+
+    /// Runs the box's `on_activate` hooks again for a resume whose spec sets
+    /// `hooks_on_resume` (BOX-028), on a host launched for them. The attach
+    /// that follows reuses that host. Each run and its outcome is logged,
+    /// and the `box.resume` span records how many ran. Answers the refusal
+    /// text when the launch or a hook fails, and when the box has no
+    /// composition to read its hooks from.
+    async fn rerun_activate_hooks(&mut self, name: &str) -> Result<(), String> {
+        let event = crate::hooks::HookEvent::Activate;
+        // A box with no composition (its sidecar is missing or unreadable)
+        // can declare an `on_activate` the daemon cannot see. A resume
+        // without it breaks the spec's promise, so it is refused.
+        if let BoxInner::Active {
+            composition: None, ..
+        } = &self.inner
+        {
+            tracing::info!(
+                refusal = "hooks",
+                "resume: hooks_on_resume is set, and the box has no composition to read its hooks from"
+            );
+            return Err(format!(
+                "The daemon cannot read its hook settings. Destroy it with \
+                 `min session destroy {name}`, then start a new one with \
+                 `min session activate`."
+            ));
+        }
+        if !self.has_hooks_for(event) {
+            tracing::Span::current().record("activate_hooks", 0);
+            tracing::info!("resume: hooks_on_resume is set, and the box has no on_activate hook");
+            return Ok(());
+        }
+        // Bounded as the destroy's hook launches are: a wedged sandbox build
+        // must not stall the actor and the resume forever. A launch cut off
+        // here is reaped by the launcher's drop guard.
+        let box_id = *self.record.id();
+        let limit = HOOK_LAUNCH_TIMEOUT;
+        #[cfg(test)]
+        let limit = resume_launch_seam::timeout(&box_id).unwrap_or(limit);
+        let launch = async {
+            #[cfg(test)]
+            if let Some(hold) = resume_launch_seam::held(&box_id) {
+                tokio::time::sleep(hold).await;
+            }
+            self.launch_host_for_hooks(LaunchPhase::Attached).await
+        };
+        match tokio::time::timeout(limit, launch).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::info!(%error, "resume: launching the box for its on_activate hooks failed");
+                return Err(format!(
+                    "It could not start to run its activation hooks: {error}."
+                ));
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %box_id,
+                    timeout_secs = limit.as_secs_f64(),
+                    "resume: launching the box for its on_activate hooks timed out"
+                );
+                return Err(format!(
+                    "Its activation hooks did not start in time. \
+                     Run `min session attach {name}` to try the resume again."
+                ));
+            }
+        }
+        let outcomes = run_session_hooks(&self.inner, &self.record, event).await;
+        tracing::Span::current().record("activate_hooks", outcomes.len());
+        for outcome in &outcomes {
+            tracing::info!(
+                declared_by = %outcome.declared_by,
+                status = %outcome.status,
+                "resume: ran on_activate again"
+            );
+        }
+        match outcomes.iter().find(|o| o.failed()) {
+            Some(failed) => Err(format!(
+                "Its activation hook from {} {}.{}",
+                failed.declared_by,
+                failed.status,
+                if failed.output.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", failed.output)
+                },
+            )),
+            None => Ok(()),
+        }
     }
 
     /// The exit the watch holds before a message runs, as
@@ -2535,6 +2667,50 @@ pub(crate) mod exit_settle_seam {
     /// How long the actor of box `id` waits for a closed host's exit.
     pub(super) fn settle_timeout(id: &SessionId) -> Option<Duration> {
         get(id).map(|(_, settle)| settle)
+    }
+}
+
+/// The test seam for a resume whose `on_activate` launch does not start in
+/// time (BOX-028): a test names a box whose hook launch on resume waits
+/// `hold` first, and whose actor waits only `timeout` for that launch.
+/// Keyed by box id, so tests running beside each other never slow each
+/// other's launches.
+#[cfg(test)]
+pub(crate) mod resume_launch_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use boxes::SessionId;
+
+    /// For each box: how long its launch waits, and how long its actor
+    /// waits for the launch.
+    static HELD: Mutex<Option<HashMap<SessionId, (Duration, Duration)>>> = Mutex::new(None);
+
+    /// Makes the resume's hook launch of box `id` wait `hold`, and makes
+    /// its actor give up on it after `timeout`.
+    pub(crate) fn stall(id: SessionId, hold: Duration, timeout: Duration) {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (hold, timeout));
+    }
+
+    fn get(id: &SessionId) -> Option<(Duration, Duration)> {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|held| held.get(id).copied())
+    }
+
+    /// How long the resume's hook launch of box `id` waits.
+    pub(super) fn held(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(hold, _)| hold)
+    }
+
+    /// How long the actor of box `id` waits for the resume's hook launch.
+    pub(super) fn timeout(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(_, timeout)| timeout)
     }
 }
 

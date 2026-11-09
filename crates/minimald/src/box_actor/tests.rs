@@ -16303,6 +16303,195 @@ async fn resume_runs_only_on_attach_hook() {
     );
 }
 
+/// A session spec with a terminal that sets `hooks_on_resume` (BOX-028).
+fn hooks_on_resume_spec() -> serde_json_lenient::Value {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = true;
+    spec.hooks_on_resume = true;
+    serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// BOX-028: a box whose spec sets `hooks_on_resume` runs `on_activate`
+/// again when an attach resumes it, and the resume goes on to the shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hooks_on_resume_reruns_on_activate() {
+    let dir = tempfile::tempdir().unwrap();
+    let activated = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = session_with_hook(
+        &mut client,
+        "resume-rerun",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(format!("echo ran >> {}", activated.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&activated).unwrap(), "ran\n");
+    let spec = hooks_on_resume_spec();
+    assert_eq!(spec["execution"]["hooks_on_resume"].as_bool(), Some(true));
+    rewrite_spec(&server, id, &spec).await;
+
+    stop_through_daemon(&server, id).await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the stopped box resumes");
+    assert_eq!(
+        std::fs::read_to_string(&activated).unwrap(),
+        "ran\nran\n",
+        "on_activate did not run again on resume"
+    );
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        boxes::core::record::RecordState::Running
+    );
+    assert!(
+        event_kinds(&server, id)
+            .await
+            .iter()
+            .any(|e| e.kind == boxes::events::BoxEventType::Resumed),
+        "the resume writes a resumed event"
+    );
+}
+
+/// BOX-028: an `on_activate` that fails when the resume runs it again
+/// refuses the resume. The refusal names the hook's source and status, and
+/// the box stays in the state it resumed from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hooks_on_resume_failing_on_activate_refuses_resume_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // Succeeds at activation, and exits 7 on every later run.
+    let id = session_with_hook(
+        &mut client,
+        "resume-fails",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(format!(
+                "if [ -e {m} ]; then exit 7; fi; touch {m}",
+                m = marker.display()
+            ))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(marker.exists());
+    rewrite_spec(&server, id, &hooks_on_resume_spec()).await;
+    let ending = stop_through_daemon(&server, id).await;
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &[
+            "session `resume-fails`",
+            "user loadout `test`",
+            "exited with status 7",
+        ],
+        1,
+    )
+    .await;
+}
+
+/// BOX-028: a `hooks_on_resume` resume whose hook launch does not start
+/// in time is refused. The refusal says why and names the retry, the box
+/// stays stopped, and `on_activate` does not run again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hooks_on_resume_launch_timeout_refuses_resume_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let activated = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = session_with_hook(
+        &mut client,
+        "resume-slow",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(format!("echo ran >> {}", activated.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+    rewrite_spec(&server, id, &hooks_on_resume_spec()).await;
+    let ending = stop_through_daemon(&server, id).await;
+    crate::box_actor::resume_launch_seam::stall(
+        id,
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+    );
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &[
+            "session `resume-slow` cannot resume, and it stays stopped. \
+           Its activation hooks did not start in time. \
+           Run `min session attach resume-slow` to try the resume again.",
+        ],
+        1,
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(&activated).unwrap(),
+        "ran\n",
+        "on_activate did not run on the refused resume"
+    );
+}
+
+/// BOX-028: a `hooks_on_resume` box whose composition sidecar is gone
+/// cannot show the daemon its `on_activate` hooks. The resume is refused,
+/// names the commands that start over, and the box stays stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hooks_on_resume_missing_composition_refuses_resume_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let activated = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = session_with_hook(
+        &mut client,
+        "resume-blind",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(format!("echo ran >> {}", activated.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+    rewrite_spec(&server, id, &hooks_on_resume_spec()).await;
+    let ending = stop_through_daemon(&server, id).await;
+    std::fs::remove_file(record_dir(&server, id).await.join("composition.json"))
+        .expect("the composition sidecar exists to delete");
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &[
+            "session `resume-blind` cannot resume, and it stays stopped. \
+           The daemon cannot read its hook settings. Destroy it with \
+           `min session destroy resume-blind`, then start a new one with \
+           `min session activate`.",
+        ],
+        1,
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(&activated).unwrap(),
+        "ran\n",
+        "on_activate did not run on the refused resume"
+    );
+}
+
 /// Reads the box's record until its state is `exited`, or panics after ten
 /// seconds.
 async fn record_once_exited(
