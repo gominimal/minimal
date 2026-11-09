@@ -2722,6 +2722,48 @@ fn session_start_without_entry_blocked_default_exit2_names_fix() {
         }
     }
     assert_eq!(SessionEntryUndecided::EXIT_CODE, 2);
+
+    // The refusal applies only when the pick must count the entries. An
+    // explicit `default` entry, or a typed entry, needs no unresolved type.
+    let entries = start_entries("[sessions.default]\n\n[boxes.dev]\ntype = \"mydev\"\n");
+    assert_eq!(
+        pick_box_start_entry(&entries, None)
+            .expect("the explicit default")
+            .name,
+        "default"
+    );
+    assert_eq!(
+        pick_session_start_entry(&entries, None)
+            .expect("the explicit default session")
+            .name,
+        "default"
+    );
+    let entries = start_entries("[tasks.build]\necho = 'x'\n\n[boxes.dev]\ntype = \"mydev\"\n");
+    assert_eq!(
+        pick_box_start_entry(&entries, Some("build"))
+            .expect("the typed entry")
+            .name,
+        "build"
+    );
+    // A typed name that names no project entry is unknown, exit 4.
+    let error = pick_session_start_entry(&entries, Some("nope")).expect_err("no such entry");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("an unknown entry");
+    assert!(
+        matches!(refusal, StartEntryRefusal::Unknown { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.exit_code(), 4);
+    // A typed entry whose own type is unresolved still refuses, exit 2.
+    let error = pick_session_start_entry(&entries, Some("dev")).expect_err("type unresolved");
+    assert!(
+        matches!(
+            error.downcast_ref::<SessionEntryUndecided>(),
+            Some(SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "dev"
+        ),
+        "{error:#}"
+    );
 }
 
 // BCLI-072: a bare `min box start` starts the `default` entry of any type,

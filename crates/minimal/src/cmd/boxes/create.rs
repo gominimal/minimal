@@ -314,8 +314,32 @@ fn builtin_root(box_type: &str) -> Option<&'static str> {
         .find(|builtin| *builtin == box_type)
 }
 
+/// Whether the client cannot resolve `entry`'s type to a built-in root. Such
+/// an entry can be a session.
+/// <https://github.com/gominimal/minimal/issues/3140> tracks resolving a
+/// project Box Type's root here.
+pub(crate) fn type_unresolved(entry: &mfile::entry::BoxEntry) -> bool {
+    entry.box_type.as_deref().and_then(builtin_root).is_none()
+}
+
+/// The refusal for `entry`, whose type the client cannot resolve.
+pub(crate) fn type_unresolved_refusal(entry: &mfile::entry::BoxEntry) -> SessionEntryUndecided {
+    SessionEntryUndecided::TypeUnresolved {
+        name: entry.name.clone(),
+        box_type: entry.box_type.clone(),
+    }
+}
+
+/// The entries a refusal lists: the [`start_candidates`], else the
+/// project's own entries when a type is unresolved.
+pub(crate) fn listed_entries(entries: &[mfile::entry::BoxEntry]) -> Vec<mfile::entry::BoxEntry> {
+    start_candidates(entries).unwrap_or_else(|_| entries.to_vec())
+}
+
 /// The entries a start counts: the project's entries, and the implicit
-/// `default` session entry when the project needs one (BOX-165).
+/// `default` session entry when the project needs one (BOX-165). A picker
+/// calls this only after its lookups of an explicit entry, when the pick
+/// depends on the implicit `default` or on the count.
 ///
 /// # Errors
 ///
@@ -328,14 +352,8 @@ fn builtin_root(box_type: &str) -> Option<&'static str> {
 pub(crate) fn start_candidates(
     entries: &[mfile::entry::BoxEntry],
 ) -> Result<Vec<mfile::entry::BoxEntry>, SessionEntryUndecided> {
-    if let Some(entry) = entries
-        .iter()
-        .find(|entry| entry.box_type.as_deref().and_then(builtin_root).is_none())
-    {
-        return Err(SessionEntryUndecided::TypeUnresolved {
-            name: entry.name.clone(),
-            box_type: entry.box_type.clone(),
-        });
+    if let Some(entry) = entries.iter().find(|entry| type_unresolved(entry)) {
+        return Err(type_unresolved_refusal(entry));
     }
     let mut candidates = entries.to_vec();
     if let Some(implicit) = mfile::entry::implicit_default_entry(entries, builtin_root) {
@@ -353,35 +371,45 @@ pub(crate) fn is_session_entry(entry: &mfile::entry::BoxEntry) -> bool {
 /// entry named `default` of any type, else the project's only entry. The
 /// count includes the implicit `default` entry.
 ///
+/// A typed project entry, and with no entry typed a project entry named
+/// `default`, is picked whatever its type. [`plan_start`] refuses a type
+/// that the start cannot serve.
+///
 /// # Errors
 ///
-/// [`SessionEntryUndecided`] from [`start_candidates`], or a
-/// [`StartEntryRefusal`] when no entry can be picked.
+/// [`SessionEntryUndecided::TypeUnresolved`] from [`start_candidates`],
+/// only when the pick depends on the implicit `default` or on the count.
+/// Else a [`StartEntryRefusal`] when no entry can be picked.
 pub(crate) fn pick_box_start_entry(
     entries: &[mfile::entry::BoxEntry],
     typed: Option<&str>,
 ) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    let wanted = typed.unwrap_or(mfile::entry::DEFAULT_ENTRY_NAME);
+    if let Some(entry) = entries.iter().find(|entry| entry.name == wanted) {
+        return Ok(entry.clone());
+    }
+    let unknown = |typed: &str| StartEntryRefusal::Unknown {
+        verb: StartVerb::Box,
+        entry: typed.to_string(),
+        entries: listed_entries(entries)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
+    };
+    if let Some(typed) = typed.filter(|typed| *typed != mfile::entry::DEFAULT_ENTRY_NAME) {
+        return Err(unknown(typed).into());
+    }
+    // Only the implicit `default` or the count is left to decide the pick.
     let candidates = start_candidates(entries)?;
     let names = || candidates.iter().map(|entry| entry.name.clone()).collect();
-    if let Some(typed) = typed {
-        return candidates
-            .iter()
-            .find(|entry| entry.name == typed)
-            .cloned()
-            .ok_or_else(|| {
-                StartEntryRefusal::Unknown {
-                    verb: StartVerb::Box,
-                    entry: typed.to_string(),
-                    entries: names(),
-                }
-                .into()
-            });
-    }
     if let Some(default) = candidates
         .iter()
         .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
     {
         return Ok(default.clone());
+    }
+    if let Some(typed) = typed {
+        return Err(unknown(typed).into());
     }
     match candidates.as_slice() {
         [only] => Ok(only.clone()),

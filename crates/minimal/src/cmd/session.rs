@@ -48,15 +48,54 @@ pub async fn cmd_session_start(
 /// entry, else the session entry named `default`, else the project's only
 /// session entry. The count includes the implicit `default` session entry.
 ///
+/// The lookups of an explicit entry come first, in the order of
+/// `pick_session_entry` (`boxes/create.rs`): a typed project entry, then
+/// with no entry typed a project session entry named `default`.
+///
 /// # Errors
 ///
-/// [`SessionEntryUndecided`] from [`start_candidates`], before the session
-/// filter: an entry of a project Box Type can be a session. Else a
-/// [`StartEntryRefusal`] when no session entry can be picked.
+/// [`SessionEntryUndecided::TypeUnresolved`] when the typed entry's own
+/// type is unresolved, or from [`start_candidates`] when the pick depends
+/// on the implicit `default` or on the session count: an entry of a project
+/// Box Type can be a session. Else a [`StartEntryRefusal`] when no session
+/// entry can be picked.
 pub(crate) fn pick_session_start_entry(
     entries: &[mfile::entry::BoxEntry],
     typed: Option<&str>,
 ) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    if let Some(typed) = typed {
+        if let Some(entry) = entries.iter().find(|entry| entry.name == typed) {
+            return if is_session_entry(entry) {
+                Ok(entry.clone())
+            } else if type_unresolved(entry) {
+                Err(type_unresolved_refusal(entry).into())
+            } else {
+                Err(StartEntryRefusal::NotSession {
+                    entry: entry.name.clone(),
+                    box_type: entry.box_type.clone(),
+                }
+                .into())
+            };
+        }
+        if typed != mfile::entry::DEFAULT_ENTRY_NAME {
+            return Err(StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: typed.to_string(),
+                entries: listed_entries(entries)
+                    .into_iter()
+                    .filter(is_session_entry)
+                    .map(|entry| entry.name)
+                    .collect(),
+            }
+            .into());
+        }
+    } else if let Some(default) = entries
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME && is_session_entry(entry))
+    {
+        return Ok(default.clone());
+    }
+    // Only the implicit `default` or the session count is left to decide.
     let candidates = start_candidates(entries)?;
     pick_session_candidate(entries, &candidates, typed).map_err(Into::into)
 }

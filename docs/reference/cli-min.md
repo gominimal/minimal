@@ -233,7 +233,7 @@ The command refuses these starts before it creates a box:
 | `ENTRY` names an entry that is not a session entry | 4 |
 | Without `ENTRY`: several session entries, and none of them is named `default` | 2 |
 | Without `ENTRY`: no session entry, and an entry of another type is named `default` | 2 |
-| An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type` | 2 |
+| An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |
 | No terminal, and no `--detach` | 2 |
 | A running box holds the box's name. Pass `--new` or `--name` to create the box | 2 |
 
