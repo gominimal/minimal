@@ -22,7 +22,7 @@ use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
 use tracing::Instrument as _;
 
-use crate::{BoxRunArgs, GlobalArgs, TaskRunArgs};
+use crate::{BoxRunArgs, GlobalArgs, TaskListArgs, TaskRunArgs};
 
 /// A task's non-zero exit status, carried as a typed error so `main.rs` can
 /// downcast it and terminate with the task's own code instead of printing an
@@ -790,6 +790,147 @@ fn interactive_task_box_name(task: &str) -> String {
 /// daemon end the session with the run (NET-131).
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
     run_entry(global, args.into()).await
+}
+
+/// `min task list [--all]` (BCLI-015): the task boxes of the current
+/// project, or of every project, in any state. The daemon keeps a task's
+/// record after the task ends, so an exited task stays in the list until
+/// `min box prune` or `min box rm` removes it.
+pub async fn cmd_task_list(global: &GlobalArgs, args: TaskListArgs) -> Result<(), anyhow::Error> {
+    let scope = if args.all {
+        None
+    } else {
+        let cwd = crate::attach::cwd_host_path(global)?;
+        Some(crate::cmd::box_list_scope(cwd.as_ref())?)
+    };
+    crate::cmd::ensure_daemon(global)?;
+    let hosts = crate::cmd::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    task_list_on_hosts(hosts, scope, &mut out, &mut err).await
+}
+
+/// `min task list` over the local `hosts`: the task boxes of
+/// `project_root`, or of every project when it is `None`, as a table on
+/// `out`. A host that does not answer is named on `err`, and the list goes
+/// on without it. The selected host that does not answer ends the command.
+pub(crate) async fn task_list_on_hosts(
+    hosts: Vec<crate::cmd::LocalHost>,
+    project_root: Option<paths::HostAbsPath>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Result<(), anyhow::Error> {
+    let mut tasks = Vec::new();
+    for host in hosts {
+        let records = match crate::cmd::read_host_boxes(&host).await? {
+            Ok(records) => records,
+            Err(why) if host.selected => {
+                tracing::info!(verb = "task list", outcome = "error", host = %host.host, "{why}");
+                bail!(
+                    "Could not reach host {}, so no task is listed. \
+                     Run `min doctor` to check the daemon.",
+                    host.host
+                );
+            }
+            Err(why) => {
+                tracing::info!(
+                    verb = "task list",
+                    outcome = "host unreachable",
+                    host = %host.host,
+                    "{why}"
+                );
+                writeln!(err, "{}", crate::cmd::unreachable_host_line(&host.host))?;
+                continue;
+            }
+        };
+        tasks.extend(
+            records
+                .into_iter()
+                .filter(|entry| entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE))
+                .filter(|entry| {
+                    project_root
+                        .as_ref()
+                        .is_none_or(|root| entry.project_root.as_ref() == Some(root))
+                })
+                .map(|entry| (host.host.clone(), entry)),
+        );
+    }
+    tracing::info!(verb = "task list", outcome = "ok", tasks = tasks.len());
+    render_task_list(out, &tasks, project_root.is_some())?;
+    Ok(())
+}
+
+/// The line `min task list` prints when the current project has no task.
+pub(crate) const EMPTY_PROJECT_TASKS: &str = "This project has no tasks. \
+     Run `min task list --all` to list the tasks of every project.";
+
+/// The line `min task list --all` prints when no local host has a task.
+pub(crate) const EMPTY_HOST_TASKS: &str = "No tasks on this machine.";
+
+/// A task's state: `exited (3)` for a task that ended with its own exit
+/// code, else the state as `min box list` prints it.
+pub(crate) fn task_state_label(entry: &minimald_rpc::BoxListingEntry) -> String {
+    match (
+        entry.state.as_str(),
+        entry.reason.as_deref(),
+        entry.exit_code,
+        entry.signal,
+    ) {
+        ("exited", None | Some("exit"), Some(code), None) => format!("exited ({code})"),
+        _ => crate::cmd::box_state_label(entry),
+    }
+}
+
+/// Writes the tasks as a table: a header row, then one row for each task
+/// with its id, name, state and host. With no task, one line says so: for
+/// the current project when `scoped`, else for the machine.
+pub(crate) fn render_task_list(
+    out: &mut dyn std::io::Write,
+    tasks: &[(String, minimald_rpc::BoxListingEntry)],
+    scoped: bool,
+) -> std::io::Result<()> {
+    if tasks.is_empty() {
+        let line = if scoped {
+            EMPTY_PROJECT_TASKS
+        } else {
+            EMPTY_HOST_TASKS
+        };
+        return writeln!(out, "{line}");
+    }
+    let header = ["ID", "NAME", "STATE", "HOST"];
+    let rows: Vec<[String; 4]> = tasks
+        .iter()
+        .map(|(host, entry)| {
+            [
+                entry.box_id.to_string(),
+                entry.name.clone().unwrap_or_else(|| "-".to_owned()),
+                task_state_label(entry),
+                host.clone(),
+            ]
+        })
+        .collect();
+    let mut widths = header.map(str::len);
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let line = |cells: [&str; 4]| {
+        let mut text = String::new();
+        for (index, (cell, width)) in cells.iter().zip(widths).enumerate() {
+            if index + 1 == cells.len() {
+                text.push_str(cell);
+            } else {
+                text.push_str(&format!("{cell:<width$}  "));
+            }
+        }
+        text
+    };
+    writeln!(out, "{}", line(header))?;
+    for row in &rows {
+        writeln!(out, "{}", line(row.each_ref().map(String::as_str)))?;
+    }
+    Ok(())
 }
 
 /// `min box run <entry>`: the run of [`cmd_task_run`], from an entry the
