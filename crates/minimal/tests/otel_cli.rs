@@ -609,6 +609,9 @@ async fn run_min_tty(
     let mut command = tokio::process::Command::new("script");
     command
         .args(["-qec", &line.join(" "), "/dev/null"])
+        // `script -c` runs the line with `$SHELL -c`. A runner whose
+        // account has a nologin shell would run /usr/bin/nologin instead.
+        .env("SHELL", "/bin/sh")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
