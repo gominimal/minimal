@@ -277,8 +277,10 @@ git merge -s ours origin/release/X.Y.x -m "Merge branch 'release/X.Y.x' into mai
 
 Push the branch and open a PR. The PR must go in as a merge commit, because
 the other merge buttons drop the link to the branch and its tag. The merge
-queue squashes every PR, so this PR cannot go through it. Until this step is
-automated, someone on the bypass list of the `main` ruleset does these things:
+queue squashes every PR, so this PR cannot go through it.
+[`merge-back.yml`](#merge-backyml-merge-a-line-into-main) automates this step
+once it is enabled. Until then, someone on the bypass list of the `main` ruleset
+does these things:
 
 1. Turns on **Create a merge commit** in the repository settings.
 2. Merges the PR outside the queue, with a merge commit.
@@ -304,7 +306,8 @@ the newest `v*` tag, so a line stops when the next minor is promoted.
 Do these steps:
 
 1. Land each fix on `main` first, then cherry-pick it to `release/X.Y.x` by
-   PR. Title the PR `fix:`, because a `feat:` or breaking subject on the line
+   PR. Once [`backport.yml`](#backportyml-open-a-pr-on-a-release-line) is
+   enabled, the `backport release/X.Y.x` label opens that PR for you. Title the PR `fix:`, because a `feat:` or breaking subject on the line
    requires a minor and fails the version check. Land the `package.version`
    bump by PR if the line is not already on the next patch.
 2. Check that the five required checks from step 1 are green on the branch
