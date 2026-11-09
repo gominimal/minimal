@@ -2,8 +2,9 @@ name: cut-minor
 
 # Start a minor release: create release/X.Y.x from a green main commit, create
 # its backport label, and open the PR that moves main to the next minor. Main
-# has to move before vX.Y.0 exists, or its version check fails. Patches never
-# come here: they are staged from the line.
+# has to move before the version at the commit (vX.Y.0, or vX.Y.0-rcN) is
+# tagged, or its version check fails. Patches never come here: they are staged
+# from the line.
 #
 # Needs a bypass actor on the `release branches` ruleset, because that ruleset
 # stops anyone else creating a branch under release/. The signing runner group
@@ -28,6 +29,10 @@ permissions: {}
 
 jobs:
     cut:
+        # The checkout and scripts come from the dispatch ref, and the job
+        # mints a token that can bypass the release branch rules: run only
+        # what main carries.
+        if: github.ref == 'refs/heads/main'
         runs-on: ubuntu-latest
         timeout-minutes: 15
         permissions:
@@ -172,7 +177,7 @@ jobs:
                     git push "$remote" "HEAD:refs/heads/$branch"
                   fi
                   gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --title "$title" \
-                    --body "$LINE now carries the current minor, so main moves to $NEXT. Merge this before that minor is promoted, or the version check fails on main. Opened by cut-minor.yml."
+                    --body "$LINE now carries the current minor, so main moves to $NEXT. Merge this before any version of that minor, an rc included, is promoted, or the version check fails on main. Opened by cut-minor.yml."
             - name: Summarize
               env:
                   SHA: ${{ steps.plan.outputs.sha }}
