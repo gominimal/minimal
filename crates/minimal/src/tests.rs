@@ -2135,6 +2135,11 @@ fn picked(verb: StartVerb, toml: &str) -> Result<String, StartEntryRefusal> {
         StartVerb::Session => pick_session_start_entry(&entries, None),
     }
     .map(|entry| entry.name)
+    .map_err(|error| {
+        error
+            .downcast::<StartEntryRefusal>()
+            .expect("a start refusal")
+    })
 }
 
 // BCLI-029: a start creates the box. A session box has a terminal, so the
@@ -2213,6 +2218,7 @@ fn start_attaches_pty_box_unless_detached() {
 // BCLI-029: off a terminal and without `--detach`, the start of an entry
 // whose box has a terminal fails with exit 2, names `--detach`, and creates
 // nothing.
+// On a terminal, this test checks only the plan-level half.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_off_tty_exit2_names_detach() {
     for verb in [StartVerb::Box, StartVerb::Session] {
@@ -2344,12 +2350,28 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
     }
     assert_eq!(log.lock().unwrap()[1], "stdin closed after 0 bytes");
 
-    let hint = unattached_start_hint("build");
+    let hint = unattached_start_hint("build", id);
+    // The start takes the id of the box from the run, records it on the
+    // command's span and names it in the hint.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
+    let body = function_body(&text, "start_entry").expect("create.rs defines start_entry");
+    for step in [
+        "let id = crate::task::run_entry(global, run).await?;",
+        "crate::output::record_box_id(&id.to_string());",
+        "unattached_start_hint(&entry, id)",
+    ] {
+        assert!(body.contains(step), "start_entry does not do {step}");
+    }
+
+    // The hint names the box the start created, by its id.
     assert_eq!(
         hint,
-        "build started with no input. Run min box run build to connect this \
-         terminal's input and output to a new box. Run min box logs <box> for its \
-         output, and min box wait <box> for its exit code."
+        format!(
+            "build started with no input. Run min box run build to connect this \
+             terminal's input and output to a new box. Run min box logs {id} for its \
+             output, and min box wait {id} for its exit code."
+        )
     );
     assert_eq!(hint.lines().count(), 1, "one hint line");
 
@@ -2422,7 +2444,40 @@ fn create_verbs_name_flag_overrides_box_name() {
         let spec: mfile::spec::BoxSpec =
             serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
         assert_eq!(spec.name.as_deref(), Some("api"));
+
+        // A planned start with `--new` asks the activation for a fresh
+        // instance. A start without it does not.
+        assert!(!options.fresh_instance);
+        let fresh = StartEntry { new: true, ..start };
+        let StartPlan::Session { options, .. } =
+            plan_start(&fresh, &[], true).expect("the start is planned")
+        else {
+            panic!("the implicit default entry is a session");
+        };
+        assert!(
+            options.fresh_instance,
+            "{verb:?}: --new asks for a fresh instance"
+        );
     }
+    // The activation marks its create request as a fresh instance when its
+    // options ask for one, before it sends the request.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
+    let body = function_body(&text, "activate_box").expect("create.rs defines activate_box");
+    let asked = body
+        .find("if options.fresh_instance {")
+        .expect("the activation reads the fresh-instance option");
+    let marked = body[asked..]
+        .find("request_fresh_instance(&mut request)")
+        .map(|at| asked + at)
+        .expect("the activation marks its create as a fresh instance");
+    let sent = body
+        .find("oneshot_rpc::<CreateSession>")
+        .expect("the activation sends its create");
+    assert!(
+        marked < sent,
+        "the activation marks its create before it sends it"
+    );
 
     // Without `--name`, a named session entry names the box.
     let entries = start_entries("[sessions.dev]\n");
@@ -2617,7 +2672,7 @@ fn session_start_without_entry_ambiguous_exit2_lists_entries() {
             entries: vec!["api".into(), "web".into()],
         }
     );
-    assert_eq!(StartEntryRefusal::EXIT_CODE, 2);
+    assert_eq!(refusal.exit_code(), 2);
     assert_eq!(
         refusal.to_string(),
         "Cannot pick an entry to start. The project's minimal.toml declares the session \
@@ -2646,6 +2701,26 @@ fn session_start_without_entry_blocked_default_exit2_names_fix() {
          and its entry \"default\" has the type \"task\". Add a [sessions.<name>] entry \
          to minimal.toml, or rename the entry \"default\"."
     );
+
+    // An entry of a project Box Type can be a session, so it can block the
+    // implicit default too. The client cannot tell, so both verbs refuse
+    // with exit 2, and neither starts `default`.
+    let entries = start_entries("[boxes.dev]\ntype = \"mydev\"\n");
+    for verb in [StartVerb::Session, StartVerb::Box] {
+        for typed in [None, Some("default")] {
+            let error = plan_start(&typed_start(verb, typed), &entries, true)
+                .expect_err("a project Box Type is refused");
+            assert_eq!(
+                error.downcast_ref::<SessionEntryUndecided>(),
+                Some(&SessionEntryUndecided::TypeUnresolved {
+                    name: "dev".into(),
+                    box_type: Some("mydev".into()),
+                }),
+                "{verb:?} {typed:?}: {error:#}"
+            );
+        }
+    }
+    assert_eq!(SessionEntryUndecided::EXIT_CODE, 2);
 }
 
 // BCLI-072: a bare `min box start` starts the `default` entry of any type,
@@ -2676,6 +2751,29 @@ fn box_start_without_entry_picks_default_else_sole() {
         plan_start(&typed_start(verb, None), &entries, false),
         Ok(StartPlan::Detached { ref entry, .. }) if entry == "default"
     ));
+
+    // A task entry declared under `[boxes]` is refused with exit 2, before
+    // anything is created: the run finds its task in `[tasks]` only.
+    let entries = start_entries("[boxes.build]\ntype = \"task\"\necho = 'x'\n");
+    let error = plan_start(&typed_start(verb, Some("build")), &entries, false)
+        .expect_err("a [boxes] task entry is refused");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("a start refusal");
+    assert_eq!(
+        refusal,
+        &StartEntryRefusal::TaskNotInTasks {
+            entry: "build".into()
+        }
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot start build. min box start runs only the tasks declared as [tasks.<name>] \
+         in minimal.toml, and build is declared as [boxes.build]. Declare it as \
+         [tasks.build] to start it."
+    );
+    assert_eq!(refusal.to_string().lines().count(), 1, "one line");
 }
 
 // BCLI-072: several entries and none named `default`: exit 2, listing
@@ -2694,13 +2792,29 @@ fn box_start_without_entry_ambiguous_exit2_lists_entries() {
             entries: vec!["dev".into(), "build".into()],
         }
     );
-    assert_eq!(StartEntryRefusal::EXIT_CODE, 2);
+    assert_eq!(refusal.exit_code(), 2);
     assert_eq!(
         refusal.to_string(),
         "Cannot pick an entry to start. The project's minimal.toml declares the entries \
          dev, build, and none of them is named \"default\". Run min box start <entry> \
          with one of them."
     );
+
+    // An entry the start does not find exits 4, not found. For `min
+    // session start`, an entry that is not a session is not found too.
+    let entries = start_entries("[sessions.dev]\n[tasks.build]\necho = 'x'\n");
+    for (verb, typed) in [
+        (StartVerb::Box, "web"),
+        (StartVerb::Session, "web"),
+        (StartVerb::Session, "build"),
+    ] {
+        let error = plan_start(&typed_start(verb, Some(typed)), &entries, true)
+            .expect_err("the entry is not found");
+        let refusal = error
+            .downcast_ref::<StartEntryRefusal>()
+            .expect("a start refusal");
+        assert_eq!(refusal.exit_code(), 4, "{verb:?} {typed}: {refusal}");
+    }
 }
 
 #[test]

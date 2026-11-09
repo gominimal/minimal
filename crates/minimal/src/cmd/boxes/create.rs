@@ -316,12 +316,32 @@ fn builtin_root(box_type: &str) -> Option<&'static str> {
 
 /// The entries a start counts: the project's entries, and the implicit
 /// `default` session entry when the project needs one (BOX-165).
-pub(crate) fn start_candidates(entries: &[mfile::entry::BoxEntry]) -> Vec<mfile::entry::BoxEntry> {
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided::TypeUnresolved`] when an entry's type does not
+/// resolve to a built-in root. Such an entry can be a session, so the start
+/// can tell neither which entries are sessions nor whether the implicit
+/// `default` applies. <https://github.com/gominimal/minimal/issues/3140>
+/// tracks resolving a project Box Type's root here. Remove this refusal
+/// when the client resolves that root.
+pub(crate) fn start_candidates(
+    entries: &[mfile::entry::BoxEntry],
+) -> Result<Vec<mfile::entry::BoxEntry>, SessionEntryUndecided> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.box_type.as_deref().and_then(builtin_root).is_none())
+    {
+        return Err(SessionEntryUndecided::TypeUnresolved {
+            name: entry.name.clone(),
+            box_type: entry.box_type.clone(),
+        });
+    }
     let mut candidates = entries.to_vec();
     if let Some(implicit) = mfile::entry::implicit_default_entry(entries, builtin_root) {
         candidates.push(implicit);
     }
-    candidates
+    Ok(candidates)
 }
 
 /// Whether `entry` is a session entry.
@@ -332,21 +352,29 @@ pub(crate) fn is_session_entry(entry: &mfile::entry::BoxEntry) -> bool {
 /// The entry `min box start` starts (BCLI-072): the typed entry, else the
 /// entry named `default` of any type, else the project's only entry. The
 /// count includes the implicit `default` entry.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided`] from [`start_candidates`], or a
+/// [`StartEntryRefusal`] when no entry can be picked.
 pub(crate) fn pick_box_start_entry(
     entries: &[mfile::entry::BoxEntry],
     typed: Option<&str>,
-) -> Result<mfile::entry::BoxEntry, StartEntryRefusal> {
-    let candidates = start_candidates(entries);
+) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    let candidates = start_candidates(entries)?;
     let names = || candidates.iter().map(|entry| entry.name.clone()).collect();
     if let Some(typed) = typed {
         return candidates
             .iter()
             .find(|entry| entry.name == typed)
             .cloned()
-            .ok_or_else(|| StartEntryRefusal::Unknown {
-                verb: StartVerb::Box,
-                entry: typed.to_string(),
-                entries: names(),
+            .ok_or_else(|| {
+                StartEntryRefusal::Unknown {
+                    verb: StartVerb::Box,
+                    entry: typed.to_string(),
+                    entries: names(),
+                }
+                .into()
             });
     }
     if let Some(default) = candidates
@@ -360,13 +388,15 @@ pub(crate) fn pick_box_start_entry(
         _ => Err(StartEntryRefusal::Several {
             verb: StartVerb::Box,
             entries: names(),
-        }),
+        }
+        .into()),
     }
 }
 
 /// A start the project's `minimal.toml` cannot serve: the start cannot pick
 /// an entry, or the entry it names cannot start this way. The start refuses
-/// it before it creates anything, and the run ends with exit 2 (`main.rs`).
+/// it before it creates anything, and the run ends with
+/// [`StartEntryRefusal::exit_code`] (`main.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartEntryRefusal {
     /// No entry was typed, several entries count, and none is `default`.
@@ -399,6 +429,12 @@ pub enum StartEntryRefusal {
     /// box name for `RunEntry`. Remove this refusal when `RunEntry` takes a
     /// name.
     NameUnsupported { entry: String },
+    /// A task entry declared as `[boxes.<name>]` with `type = "task"`: the
+    /// run path finds its task in `[tasks]` only. This refusal is an
+    /// interim. <https://github.com/gominimal/minimal/issues/3213> tracks
+    /// those entries. Remove this refusal when `declared_task` reads the
+    /// task entries of `[boxes]`.
+    TaskNotInTasks { entry: String },
     /// `min box start` named an entry of a type it cannot start yet: an
     /// agent, service or user-defined type. This refusal is an interim.
     /// <https://github.com/gominimal/minimal/issues/3197> tracks the start
@@ -410,8 +446,22 @@ pub enum StartEntryRefusal {
 }
 
 impl StartEntryRefusal {
-    /// The usage-refusal code of the architecture's exit-code table.
-    pub const EXIT_CODE: u8 = 2;
+    /// The exit code of the refused start, from the architecture's
+    /// exit-code table: 4, not found, for an entry the start does not find.
+    /// `min session start` searches only the session entries, so an entry
+    /// that is not a session is not found too. Every other refusal is a
+    /// usage refusal, 2.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Unknown { .. } | Self::NotSession { .. } => 4,
+            Self::Several { .. }
+            | Self::DefaultBlocked { .. }
+            | Self::NameUnsupported { .. }
+            | Self::TaskNotInTasks { .. }
+            | Self::UnsupportedType { .. } => 2,
+        }
+    }
 }
 
 /// The type of an entry, as a refusal names it.
@@ -488,6 +538,13 @@ impl std::fmt::Display for StartEntryRefusal {
                 f,
                 "Cannot start {entry} with --name. A box from a task entry gets a \
                  generated name. Run min box start {entry} without --name.",
+                entry = printable(entry),
+            ),
+            Self::TaskNotInTasks { entry } => write!(
+                f,
+                "Cannot start {entry}. min box start runs only the tasks declared as \
+                 [tasks.<name>] in {file}, and {entry} is declared as [boxes.{entry}]. \
+                 Declare it as [tasks.{entry}] to start it.",
                 entry = printable(entry),
             ),
             Self::UnsupportedType { entry, box_type } => write!(
@@ -587,12 +644,13 @@ impl std::error::Error for StartNameHeld {}
 // the hint names commands that run as written.
 /// The one stderr hint of a start that returns without attaching to a box
 /// that has no terminal (BCLI-029). The box's stdin is already closed.
+/// `box_id` is the id of the box the start created.
 #[must_use]
-pub fn unattached_start_hint(entry: &str) -> String {
+pub fn unattached_start_hint(entry: &str, box_id: impl std::fmt::Display) -> String {
     format!(
         "{entry} started with no input. Run min box run {entry} to connect this \
-         terminal's input and output to a new box. Run min box logs <box> for its \
-         output, and min box wait <box> for its exit code."
+         terminal's input and output to a new box. Run min box logs {box_id} for its \
+         output, and min box wait {box_id} for its exit code."
     )
 }
 
@@ -672,6 +730,13 @@ pub(crate) fn plan_start(
         // The run path takes no `--name`, so the start refuses that flag
         // rather than drop it. That refusal is the #3196 interim: remove it
         // when `RunEntry` takes a name.
+        //
+        // The run path finds its task in `[tasks]` only, so a `[boxes]`
+        // task entry is refused first. That refusal is the #3213 interim:
+        // remove it when `declared_task` reads the task entries of `[boxes]`.
+        Some(boxes::TASK_BOX_TYPE) if entry.table != mfile::entry::EntryTable::Tasks => {
+            Err(StartEntryRefusal::TaskNotInTasks { entry: entry.name }.into())
+        }
         Some(boxes::TASK_BOX_TYPE) if start.name.is_some() => {
             Err(StartEntryRefusal::NameUnsupported { entry: entry.name }.into())
         }
@@ -780,8 +845,9 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
             .await
             .map_err(|error| start_refusal(error, start.verb, &entry)),
         StartPlan::Detached { entry, run } => {
-            crate::task::run_entry(global, run).await?;
-            eprintln!("{}", unattached_start_hint(&entry));
+            let id = crate::task::run_entry(global, run).await?;
+            crate::output::record_box_id(&id.to_string());
+            eprintln!("{}", unattached_start_hint(&entry, id));
             Ok(())
         }
     }

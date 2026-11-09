@@ -47,11 +47,27 @@ pub async fn cmd_session_start(
 /// The entry `min session start` starts (BCLI-071): the typed session
 /// entry, else the session entry named `default`, else the project's only
 /// session entry. The count includes the implicit `default` session entry.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided`] from [`start_candidates`], before the session
+/// filter: an entry of a project Box Type can be a session. Else a
+/// [`StartEntryRefusal`] when no session entry can be picked.
 pub(crate) fn pick_session_start_entry(
     entries: &[mfile::entry::BoxEntry],
     typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    let candidates = start_candidates(entries)?;
+    pick_session_candidate(entries, &candidates, typed).map_err(Into::into)
+}
+
+/// The pick of [`pick_session_start_entry`] from the `candidates` that
+/// [`start_candidates`] gives for `entries`.
+fn pick_session_candidate(
+    entries: &[mfile::entry::BoxEntry],
+    candidates: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
 ) -> Result<mfile::entry::BoxEntry, StartEntryRefusal> {
-    let candidates = start_candidates(entries);
     let sessions: Vec<&mfile::entry::BoxEntry> =
         candidates.iter().filter(|e| is_session_entry(e)).collect();
     let names = || sessions.iter().map(|entry| entry.name.clone()).collect();
