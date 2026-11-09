@@ -2562,6 +2562,20 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     let other = start_refusal(anyhow::anyhow!("boom"), StartVerb::Box, "dev");
     assert!(other.downcast_ref::<StartNameHeld>().is_none());
     assert_eq!(format!("{other:#}"), "boom");
+
+    // NET-144: both verbs print a host port in use as the port and its
+    // holder, not the raw error chain.
+    let port = minimald_rpc::PortInUseRefusal {
+        port: 8080,
+        box_port: 80,
+        holder: minimald_rpc::PortHolder::Box("web".to_string()),
+    };
+    for verb in [StartVerb::Box, StartVerb::Session] {
+        let from_daemon = anyhow::anyhow!("could not finish activating the session: {port}")
+            .context("Finalize failed");
+        let printed = format!("{:#}", start_refusal(from_daemon, verb, "dev"));
+        assert_eq!(printed, port.to_string(), "{verb:?}");
+    }
 }
 
 // BCLI-071: a bare `min session start` starts the `default` session entry,

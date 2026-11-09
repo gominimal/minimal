@@ -783,8 +783,10 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
     }
 }
 
-/// The error a start ends with: a held name becomes [`StartNameHeld`], with
-/// its hint to `--new` and `--name`. Any other error passes through.
+/// The error a start ends with, the same for `min box start` and `min
+/// session start`: a held name becomes [`StartNameHeld`], with its hint to
+/// `--new` and `--name`. A host port in use becomes the refusal's own text,
+/// with the port and its holder (NET-144). Any other error passes through.
 pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) -> anyhow::Error {
     match error.downcast::<minimald_rpc::HeldNameRefusal>() {
         Ok(refusal) => anyhow::Error::new(StartNameHeld {
@@ -792,7 +794,7 @@ pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) 
             entry: entry.to_string(),
             refusal,
         }),
-        Err(error) => error,
+        Err(error) => crate::cmd::session::activate_refusal(error),
     }
 }
 

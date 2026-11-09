@@ -41,9 +41,7 @@ pub async fn cmd_session_start(
     global: &GlobalArgs,
     args: SessionStartArgs,
 ) -> Result<(), anyhow::Error> {
-    start_entry(global, args.into())
-        .await
-        .map_err(activate_refusal)
+    start_entry(global, args.into()).await
 }
 
 /// The entry `min session start` starts (BCLI-071): the typed session
@@ -100,7 +98,7 @@ pub(crate) fn pick_session_start_entry(
 /// holder and the next step, and the stage and RPC context around it add
 /// nothing a person can act on. The activate cleanup has already destroyed
 /// the box by then. Any other error passes through as it is.
-fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
     let refusal = error
         .chain()
         .find_map(|cause| minimald_rpc::PortInUseRefusal::find_in(&cause.to_string()));
