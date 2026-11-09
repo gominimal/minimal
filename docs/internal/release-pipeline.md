@@ -571,7 +571,7 @@ for `mip`, `min`, and `minimald`. Then it does two things:
   `release-<sha>`. A versioned run gets a draft `vX.Y.Z` that points at the
   commit. A version with a `-` suffix is a prerelease. On a rerun, the job
   replaces a draft that an earlier attempt left. It keeps a `release-<sha>`,
-  since people may have downloaded it already, and uploads only the assets it
+  because people can already have its files, and uploads only the assets it
   lacks. If an asset it has differs from this build, the job fails. It never
   replaces a public `vX.Y.Z`, so a rerun fails on one.
 
