@@ -1664,7 +1664,7 @@ mod tests {
         let root = Path::new("/home/user/src/my-project");
         assert_eq!(
             durable_state_dir(&mfile, "env", base.clone(), Some(root)),
-            Some(PathBuf::from("/state/-home-user-src-my--project/env"))
+            Some(PathBuf::from("/state/-home-user-src-my%2Dproject/env"))
         );
     }
 
