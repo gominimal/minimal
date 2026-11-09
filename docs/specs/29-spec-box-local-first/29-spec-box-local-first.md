@@ -349,10 +349,22 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p mfile other_builtin_type_entry_refused_exit3_other_entries_usable
 
-- **BOX-064** THE SYSTEM SHALL expand an entry in the order `[upstream]`, type defaults, `[defaults]`, `[defaults.<type>]`, entry, selected loadouts, then command-line overrides where BCLI provides them, unioning lists in that order and replacing scalars and tables wholesale.
+- **BOX-064** THE SYSTEM SHALL expand an entry in the order `[upstream]`, type defaults, `[defaults]`, `[defaults.<type>]`, entry, selected loadouts, then command-line overrides where BCLI provides them, unioning lists in that order and replacing scalars and tables wholesale, except that the command-line override layer merges as the sub-bullets below state.
   tier:     T1
   verify:   cargo nextest run -p mfile expansion_order_and_merge_rules
-  property: For every set of layers, expansion equals the fold of the merge rule over the layers in the stated order.
+  property: For every set of layers, expansion equals the fold of the merge rule over the layers before the command-line overrides in the stated order, followed by the command-line override rules below.
+  - WHERE the command-line override layer sets a `[network]` key THE SYSTEM SHALL change only that key of the expanded `[network]` table, adding the override's values to a list key and replacing a scalar key's value, and leave every other `[network]` key as the earlier layers set it.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_network_override_changes_only_its_key
+  - WHERE the command-line override layer sets `egress.allow_protocols` THE SYSTEM SHALL replace that list with the override's values.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_allow_protocols_override_replaces_list
+  - WHERE the command-line override layer denies all egress THE SYSTEM SHALL empty `egress.allow_dns_hosts` and `egress.allow_subnets` in the expanded spec.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_deny_all_egress_empties_allow_lists
+  - WHERE the command-line override layer turns hooks off THE SYSTEM SHALL empty the expanded spec's composed `lifecycle_hooks`.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_no_hooks_empties_lifecycle_hooks
 
 - **BOX-065** THE SYSTEM SHALL produce an expanded spec whose serialization is byte-identical across two runs over one file, one set of command-line overrides and one client `[secret-store-rules]` set.
   tier:     T1
@@ -585,6 +597,8 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 **An `until_stopped` box restarts from its stored spec, as a resume does.** Decided on 2026-11-09 (gominimal/minimal#2761): BCLI-074's `min box restart` needs a daemon operation for a box whose spec sets `lifetime = "until_stopped"`, which BOX-030 does not resume unless it sets `pty_enabled`. A restart stops the box's processes as a stop does if they run, then starts them from the creation-time spec and the retained filesystem under the same id and name (BOX-176). It takes a resume's refusals in a resume's order, runs a resume's hooks (BOX-177), and records the existing `exited` and `started` events (BOX-178), so a restart and a resume cannot drift apart and a reader of the events needs no new case. A box with any other lifetime is refused with exit 2, because a box that runs to completion gets a new run instead. The alternatives were a `restarted` event, rejected because the `exited` and `started` pair already records both halves, and running `on_activate` on every restart, rejected because `hooks_on_resume` already lets an entry ask for that. A restart is an operation a client asks for. The `[execution] restart` policy, which restarts a box by itself, stays with the Agent Box epic under Non-goals.
 
 **Each stored hook keeps who declared it.** Decided on 2026-11-09 (gominimal/minimal#2877): `min session hooks` names the loadout or project that declared each hook (`docs/specs/11-spec-lifecycle-hooks`), and BCLI-022's `min box spec` can show that column only if the stored spec carries it. BOX-064 merges every layer's `lifecycle_hooks` into one list, and BOX-161's provenance sits beside the spec and names a layer, not a loadout, so neither keeps the declarer. BOX-179 writes a `declared_by` table into each hook, under the name the client's hook code already uses. A project hook names no host path, so the same `minimal.toml` still expands to the same bytes on every host (BOX-065, BOX-145). A loadout hook names the loadout, which is what the hooks listing shows today. The field changes no projection field, because `lifecycle_hooks` is outside the §6.3.2 field set (BOX-071). The alternative, keeping the declarer beside the spec as BOX-161 does, was rejected because the record stores the spec (BOX-068), so a read after a daemon restart can show only what the spec carries.
+
+**The command-line layer changes only what it names.** The architecture at gominimal/arch@9495216 (#166) gives the command-line override layer its own merge rule (gominimal/minimal#3200). Each create-time network flag changes only the key it names, so the rest of the expanded `[network]` table stays in place. Under BOX-064's wholesale table replacement, a flag that sets one key would drop the others. A flag for a list key adds to the list, as the layers merge, but `--allow-protocols` replaces its list, because that key restricts protocols. `--deny-all-egress` has no key of its own. It empties `allow_dns_hosts` and `allow_subnets`, and it can only narrow. `--no-hooks` empties the composed hook list, so the stored spec carries no hook and a resume runs none. BOX-064's sub-bullets state these rules in terms of the spec's keys, so a client other than the CLI gets the same result. BCLI names the flags. Type constraints are still checked after this layer (BOX-061), so no override reaches past one.
 
 **Expander version skew reports and continues.** The projection digest comparison (BOX-072) and the daemon's admission check (BOX-160) are the checks that refuse; a version difference is reported so an operator can act, but compatible skews across an upgrade are not blocked. BOX-074 states the reported version rather than how the expander is built, so a second implementation meets it without sharing code.
 
