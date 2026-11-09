@@ -174,11 +174,16 @@ impl CleanCache {
             // Only a build sandbox is judged by age: its build ends within
             // hours. A task directory holds a box's env, which can sit
             // untouched for days while still in use, so its age says nothing.
-            let modified = match kind {
-                StaleKind::Sandbox => entry.metadata().and_then(|m| m.modified()).ok(),
+            // A sandbox's age is the newest time anywhere in it, not its own
+            // directory's: a long build writes deep inside and leaves the top
+            // level's time alone. The walk runs only for a name that could
+            // otherwise go, and stops at the first recent entry.
+            let path = entry.path();
+            let last_touched = || match kind {
+                StaleKind::Sandbox => newest_modified(&path, now.checked_sub(FOREIGN_OWNER_IDLE)?),
                 StaleKind::Task | StaleKind::TempDir => None,
             };
-            if !owner_is_gone(name, self.daemon_id.as_deref(), modified, now) {
+            if !owner_is_gone(name, self.daemon_id.as_deref(), last_touched, now) {
                 continue;
             }
 
@@ -207,6 +212,45 @@ impl CleanCache {
 /// the two cases apart without any way to ask the other daemon.
 const FOREIGN_OWNER_IDLE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
+/// The newest modification time of `root` or anything under it, or `None`
+/// when that can't be told: `root` itself or an entry under it can't be read
+/// (one that vanished mid-walk is a sign of life). A directory the caller
+/// may not list is skipped, its own time still counted. The walk stops at the
+/// first time at or after `stop_at` and returns it; it never follows a
+/// symlink or crosses onto another filesystem.
+fn newest_modified(root: &Path, stop_at: SystemTime) -> Option<SystemTime> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = std::fs::symlink_metadata(root).ok()?;
+    let dev = meta.dev();
+    let mut newest = meta.modified().ok()?;
+    let mut dirs = if meta.is_dir() {
+        vec![root.to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    while let Some(dir) = dirs.pop() {
+        if newest >= stop_at {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(_) => return None,
+        };
+        for entry in entries {
+            let entry = entry.ok()?;
+            // `DirEntry::metadata` does not follow a symlink.
+            let meta = entry.metadata().ok()?;
+            newest = newest.max(meta.modified().ok()?);
+            if meta.is_dir() && meta.dev() == dev {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    Some(newest)
+}
+
 /// Whether `name`'s trailing `-<owner>` marks work nobody is doing any more.
 ///
 /// The stamp is a pid, or — when the work ran under a daemon — that daemon's
@@ -219,17 +263,20 @@ const FOREIGN_OWNER_IDLE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// - a pid with no `/proc` entry: gone, reclaim it.
 /// - another daemon's id, judged by a daemon (`daemon_id` is set), on a
 ///   directory `sandbox` named (`<name>-<timestamp>-<attempt>-<id>`) whose
-///   `modified` time is [`FOREIGN_OWNER_IDLE`] or more before `now`: gone.
+///   `last_touched` time is [`FOREIGN_OWNER_IDLE`] or more before `now`: gone.
 ///   Every daemon gets a fresh id, so a restart leaves the old one's finished
 ///   sandboxes stamped with an id nobody will clear; left alone, they piled
-///   up without bound (gominimal/minimal#1373). The caller passes no
-///   `modified` for a directory it must not judge by age.
+///   up without bound (gominimal/minimal#1373). No file says whether another
+///   daemon id is still running, so the newest time anywhere in the sandbox
+///   stands in: a live build writes inside it. `last_touched` is asked only
+///   here, as it may walk the whole sandbox; it answers `None` for a
+///   directory that must not be judged by age, or whose age can't be told.
 /// - anything else — a live pid, a recent foreign id, a name nobody stamped:
 ///   left alone. Not ours to judge.
 fn owner_is_gone(
     name: &str,
     daemon_id: Option<&str>,
-    modified: Option<SystemTime>,
+    last_touched: impl FnOnce() -> Option<SystemTime>,
     now: SystemTime,
 ) -> bool {
     let Some((_, owner)) = name.rsplit_once('-') else {
@@ -242,10 +289,11 @@ fn owner_is_gone(
         let mut stamp = name.rsplitn(4, '-').skip(1);
         let sandbox_named = stamp.next().is_some_and(|a| a.parse::<u32>().is_ok())
             && stamp.next().is_some_and(|t| t.parse::<u64>().is_ok());
-        let idle = modified.and_then(|m| now.duration_since(m).ok());
         return daemon_id.is_some()
             && sandbox_named
-            && idle.is_some_and(|idle| idle >= FOREIGN_OWNER_IDLE);
+            && last_touched()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|idle| idle >= FOREIGN_OWNER_IDLE);
     }
 
     matches!(std::fs::exists(format!("/proc/{owner}")), Ok(false))
@@ -455,11 +503,14 @@ mod tests {
             std::fs::write(dir.join("f"), b"x").unwrap();
         }
         // After the writes above, which would bump the directory's mtime.
+        // The file inside too: a sandbox's age is its newest entry's.
         for dir in [&foreign_old, &ours_old] {
-            std::fs::File::open(dir)
-                .unwrap()
-                .set_modified(four_days_ago)
-                .unwrap();
+            for path in [dir.join("f"), dir.to_path_buf()] {
+                std::fs::File::open(path)
+                    .unwrap()
+                    .set_modified(four_days_ago)
+                    .unwrap();
+            }
         }
 
         let report = CleanCache {
@@ -482,6 +533,93 @@ mod tests {
         assert!(!foreign_old.exists(), "a dead daemon's idle sandbox goes");
         assert!(foreign_fresh.exists(), "a fresh foreign sandbox stays");
         assert!(ours_old.exists(), "our own sandbox stays, however old");
+    }
+
+    /// A foreign sandbox whose own directory is days old but which holds a
+    /// recent write deep inside stays: another daemon's long build writes
+    /// there without touching the top level's time.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn keeps_a_foreign_sandbox_written_deep_inside() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let sandboxes = tmp.path().join("sandboxes");
+
+        let live = sandboxes.join("build-1700000000-0-abcde");
+        let deep = live.join("work").join("target").join("debug");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("out.o"), b"x").unwrap();
+        let four_days_ago = SystemTime::now() - Duration::from_secs(4 * 24 * 60 * 60);
+        // Every directory is old; only the file the build just wrote is new.
+        for dir in [
+            deep.clone(),
+            live.join("work").join("target"),
+            live.join("work"),
+            live.clone(),
+        ] {
+            std::fs::File::open(dir)
+                .unwrap()
+                .set_modified(four_days_ago)
+                .unwrap();
+        }
+
+        let report = CleanCache {
+            older_than: Duration::from_secs(1),
+            keep: HashSet::new(),
+            sweep: vec![(StaleKind::Sandbox, sandboxes.clone())],
+            daemon_id: Some("zyxwv".to_string()),
+            events: None,
+        }
+        .run(&cache)
+        .unwrap();
+
+        assert_eq!(
+            report,
+            CleanReport {
+                entries: 0,
+                dirs: 0
+            }
+        );
+        assert!(live.exists(), "a sandbox written inside recently stays");
+    }
+
+    /// `newest_modified` finds the newest time anywhere under a directory, and
+    /// stops at the first one at or past where it was told to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn newest_modified_looks_inside() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("sb");
+        let deep = root.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f"), b"x").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60);
+        // Whole seconds, so a filesystem with coarse times stores it exactly.
+        let day_ago = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+        let newer = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(
+                day_ago
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+        for path in [deep.join("f"), deep.clone(), root.join("a"), root.clone()] {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        std::fs::File::open(deep.join("f"))
+            .unwrap()
+            .set_modified(newer)
+            .unwrap();
+
+        let far_future = SystemTime::now() + Duration::from_secs(3600);
+        assert_eq!(newest_modified(&root, far_future), Some(newer));
+        assert_eq!(
+            newest_modified(&tmp.path().join("missing"), far_future),
+            None
+        );
     }
 
     /// A daemon never sweeps its own work, even though `sandbox` stamps its
