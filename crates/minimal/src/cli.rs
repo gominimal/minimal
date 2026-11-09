@@ -1257,30 +1257,19 @@ pub struct ActivateArgs {
     pub attach: bool,
 }
 
-// The egress flags of a box-creating command: `min session activate` and
-// `min task run` take them from this one definition.
+// The egress flags of a box-creating command: `min session activate`,
+// `min task run` and `min box run` take them from this one definition.
+// `effective_egress` applies them to the egress minimal.toml declares
+// (arch#166, #3143): a list flag adds, `--allow-protocols` replaces, and
+// `--deny-all-egress` applies first and combines with every other flag.
 //
 // Deliberately NOT a doc comment: clap propagates a flattened struct's doc
 // comment into the parent command's long_about.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
-#[command(
-    // The egress rule flags as one named set, so a declaration that admits
-    // no exceptions can conflict with them as a family: `--deny-all-egress`
-    // names this group in `conflicts_with`, which is how it comes to
-    // conflict with every `--allow-*`/`--deny-*` rule flag at parse without
-    // the four rules becoming mutually exclusive with each other — they
-    // still combine freely (`multiple`), the way the section they build
-    // combines its dimensions.
-    group(
-        ArgGroup::new("egress-rules")
-            .args(["allow_subnets", "allow_dns_hosts", "allow_protocols", "deny_subnets"])
-            .required(false)
-            .multiple(true)
-    )
-)]
 pub struct EgressArgs {
     /// Allow outbound traffic to this destination subnet, in CIDR form,
-    /// e.g. `10.0.0.0/8`. Repeatable. Once any egress flag is given, an
+    /// e.g. `10.0.0.0/8`. Repeatable. Adds to the `allow_subnets` that
+    /// minimal.toml declares for the box. Once any egress flag is given, an
     /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
     /// allows nothing, unless the host opts out: `--allow-dns-hosts
     /// github.com` alone reaches no address directly, and `--allow-subnets
@@ -1293,26 +1282,33 @@ pub struct EgressArgs {
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
     /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
-    /// Repeatable. Given without `--allow-subnets`, the box reaches the
+    /// Repeatable. Adds to the `allow_dns_hosts` that minimal.toml declares
+    /// for the box. Given without `--allow-subnets`, the box reaches the
     /// named hosts by name and no address directly; see `--allow-subnets`.
     #[arg(long = "allow-dns-hosts", value_name = "HOST")]
     pub allow_dns_hosts: Vec<String>,
     /// Allow this outbound transport protocol: tcp, udp, or icmp.
-    /// Repeatable; unset allows every protocol. Narrows what the other
-    /// allow flags admit and admits nothing on its own.
+    /// Repeatable; unset allows every protocol. Replaces the
+    /// `allow_protocols` that minimal.toml declares for the box. Narrows
+    /// what the other allow flags admit and admits nothing on its own.
     #[arg(long = "allow-protocols", value_name = "PROTO")]
     pub allow_protocols: Vec<String>,
     /// Deny outbound traffic to this destination subnet, in CIDR form,
     /// subtracted from what the allow flags admit. Repeatable; unset
-    /// denies nothing.
+    /// denies nothing. Adds to the `deny_subnets` that minimal.toml
+    /// declares for the box, so it never drops a range the file denies.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
-    /// Declare deny-all egress: the box reaches no external address.
-    /// Cannot be combined with the `--allow-*` or `--deny-subnets` flags.
-    /// Unless the host opts out, a `--network own_ip` box with no egress
-    /// rules already gets this by default. With `--network host_ip` it is
-    /// enforced only on a host that can filter each box.
-    #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
+    /// Declare deny-all egress: drop every `allow_subnets` and
+    /// `allow_dns_hosts` value minimal.toml declares for the box. Applied
+    /// before the other egress flags, so `--deny-all-egress
+    /// --allow-dns-hosts api.example` allows exactly `api.example`, and
+    /// alone it leaves the box no external address. The file's
+    /// `deny_subnets` stay. Unless the host opts out, a `--network own_ip`
+    /// box with no egress rules already reaches no external address. With
+    /// `--network host_ip` it is enforced only on a host that can filter
+    /// each box.
+    #[arg(long = "deny-all-egress")]
     pub deny_all_egress: bool,
 }
 

@@ -2637,12 +2637,11 @@ mod tests {
         );
     }
 
-    /// NET-060: an egress flag replaces the project file's value for the
-    /// field it names and leaves the file's other fields, and
-    /// `--deny-all-egress` keeps the file's `deny_subnets`, as for an
-    /// activation.
+    /// NET-060, arch#166: a list egress flag adds to the project file's
+    /// list and leaves the file's other fields, and `--deny-all-egress`
+    /// keeps the file's `deny_subnets`, as for an activation.
     #[test]
-    fn task_box_network_flag_replaces_the_file_field() {
+    fn task_box_network_flag_adds_to_the_file_field() {
         let (_dir, project) = project_with(
             "[tasks.build]\nexec = 'true'\n\n\
              [tasks.build.network.egress]\n\
@@ -2667,7 +2666,7 @@ mod tests {
                 ..crate::EgressArgs::default()
             }),
             Some(boxes::EgressPolicy {
-                allow_dns_hosts: Some(vec!["flag.example".into()]),
+                allow_dns_hosts: Some(vec!["file.example".into(), "flag.example".into()]),
                 deny_subnets: Some(vec!["169.254.169.254/32".into()]),
                 ..boxes::EgressPolicy::default()
             })
