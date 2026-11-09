@@ -31,7 +31,10 @@ permissions: {}
 jobs:
     preflight:
         # Fails in minutes on what release.yml would only reject late, or on a
-        # number that can't be staged at all.
+        # number that can't be staged at all. The scripts come from the
+        # dispatch ref and run after the Google Cloud auth, so run only what
+        # main carries; every later job needs this one.
+        if: github.ref == 'refs/heads/main'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         permissions:
