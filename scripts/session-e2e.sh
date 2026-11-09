@@ -7166,6 +7166,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # answering passes (a host that fails all three is a warning, not a fail —
   # the other host proves the box's egress).
   tn_egress_ok=0
+  tn_com_reached=""
   for tn_h in com org; do
     tn_status=1
     for tn_t in 1 2 3; do
@@ -7180,6 +7181,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     done
     if [ "$tn_status" -eq 0 ]; then
       tn_egress_ok=$((tn_egress_ok + 1))
+      [ "$tn_h" = com ] && tn_com_reached=1
     else
       echo "::warning::outbound from the own-IP session's task to example.$tn_h failed all 3 attempts; not fatal while the other host still proves egress"
       cat "$WORK/tn-egress.err" 2>/dev/null || true
@@ -7301,10 +7303,13 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # the run prints the deny-all note. A task whose entry declares
   # `mode = "own_ip"` and `allow_dns_hosts = ["example.com"]`, run with no
   # flag, reaches example.com and not example.org, whose name its relay
-  # refuses (exit 6). The allowed run is the control: it goes first, with
-  # the outbound proofs' three attempts, and only once it completes do the
-  # refusals prove the rules rather than a dead network.
+  # refuses (exit 6). The allowed run goes first, with the outbound proofs'
+  # three attempts, and only once it completes do the refusals prove the
+  # rules rather than a dead network. Its own control is the own-IP session
+  # leg above: when that reached example.com, an allowed run that never does
+  # is the rules' fault, not the weather's.
   tn_dns_ok=""
+  tn_egress_proven=""
   for tn_t in 1 2 3; do
     (cd "$TN_SEED_DIR" && mnl task run e2e-tn-dns-com >/dev/null 2>"$WORK/tn-taskrun-dns-com.err")
     rc=$?
@@ -7316,8 +7321,14 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fi
     [ "$tn_t" -lt 3 ] && sleep "$((tn_t * 3))"
   done
-  if [ -z "$tn_dns_ok" ]; then
-    echo "::warning::'min task run e2e-tn-dns-com' could not reach https://example.com in 3 attempts; the task-run egress refusals are skipped as a weather warning"
+  if [ -z "$tn_dns_ok" ] && [ -n "$tn_com_reached" ]; then
+    echo "::error::'min task run e2e-tn-dns-com' could not reach https://example.com, which its allow_dns_hosts names, while the own-IP session above reached it on this run — the task's declared egress is not applied"
+    echo "--- task stderr ---"; cat "$WORK/tn-taskrun-dns-com.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  elif [ -z "$tn_dns_ok" ]; then
+    echo "::warning::'min task run e2e-tn-dns-com' could not reach https://example.com in 3 attempts, and neither did the own-IP session above; the task-run egress refusals are skipped as a weather warning"
     cat "$WORK/tn-taskrun-dns-com.err" 2>/dev/null || true
   else
     echo "own-IP task run from the entry's network table: https://example.com reachable (exit 0)"
@@ -7366,6 +7377,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
       fail
     fi
     echo "own-IP task run with no egress rules: https://example.com refused at resolution (exit 6), with the deny-all note"
+    tn_egress_proven=1
   fi
   tn_own_proven=1
   else
@@ -7406,7 +7418,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   TN_LISTENER_PID=""
   rm -rf "$TN_SEED_DIR"; TN_SEED_DIR=""
   if [ -n "$tn_own_proven" ]; then
-    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable, in a session and from 'min task run --network own_ip'; task-run egress rules enforced from the flags and the entry; host_ip: host loopback reachable; none: no network)"
+    tn_taskrun_egress="task-run egress skipped as weather"
+    [ -n "$tn_egress_proven" ] && tn_taskrun_egress="a task run takes its entry's own_ip mode and allow_dns_hosts, and an own_ip task run with no rules gets the deny-all default"
+    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable, in a session and from 'min task run --network own_ip'; $tn_taskrun_egress; host_ip: host loopback reachable; none: no network)"
   else
     echo "task network proof OK (none: no network; own-IP and host_ip legs known_gap on this VM lane)"
   fi
