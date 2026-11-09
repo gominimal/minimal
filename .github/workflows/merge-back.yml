@@ -6,7 +6,9 @@ name: merge-back
 #
 # NOT READY TO ENABLE. Karl has not agreed the design, and the push needs a
 # bypass actor on the `main` ruleset. Without that actor the push is refused.
-# Follow the manual merge in the release steps until both are done.
+# The App key must also move into a protected environment that only `main` can
+# deploy to: as a repository secret, a workflow on any branch can mint a token.
+# Follow the manual merge in the release steps until all three are done.
 
 on:
     workflow_dispatch:
@@ -29,6 +31,9 @@ concurrency:
 
 jobs:
     merge-back:
+        # Only main's copy of this workflow and of merge-back.sh may push to
+        # main, so a dispatch from any other branch does nothing.
+        if: github.ref == 'refs/heads/main'
         runs-on: ubuntu-latest
         timeout-minutes: 15
         permissions:

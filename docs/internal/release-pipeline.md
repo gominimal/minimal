@@ -648,9 +648,10 @@ that is not marked Latest.
 
 ### merge-back.yml: merge a line into main
 
-> Not ready to enable. The design needs agreement, and the `main` ruleset needs
-> a bypass actor for the App. Until then, use the manual merge in the release
-> steps.
+> Not ready to enable. The design needs agreement. The `main` ruleset needs a
+> bypass actor for the App. The App key needs a protected environment that only
+> `main` can deploy to. Until then, use the manual merge in the release
+> steps. The job runs only when dispatched from `main`.
 
 [`.github/workflows/merge-back.yml`](../../.github/workflows/merge-back.yml)
 does the manual merge-back as one run, outside the merge queue. The queue
