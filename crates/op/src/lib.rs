@@ -46,9 +46,9 @@ pub use cache_clean::{CleanCache, CleanEvent, CleanReport, StaleKind};
 pub mod notices;
 pub use notices::{NoticeFile, SourceNotices};
 mod sources;
-pub use sources::{SourceFetcher, SourceLoad};
+pub use sources::{SourceFetcher, SourceLoad, SourcePlace};
 mod specs;
-pub use specs::{BuildNetwork, SpecBuild, SpecBuildResult};
+pub use specs::{BuildNetwork, NEEDS_NETWORK, SpecBuild, SpecBuildResult};
 
 mod oci_image;
 

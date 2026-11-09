@@ -437,6 +437,20 @@ fn normalized(name: &str) -> String {
     lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
 }
 
+/// Whether the `allow_dns_hosts` of a box that admits something lets it look
+/// up `host` (NET-141): the answer [`DnsGate::refuses`] gives the box's own
+/// query. A box that declared no names, or the empty list, is refused nothing.
+pub(crate) fn admits_name(policy: Option<&sessions::EgressPolicy>, host: &str) -> bool {
+    let Some(names) = policy
+        .and_then(|policy| policy.allow_dns_hosts.as_ref())
+        .filter(|names| !names.is_empty())
+    else {
+        return true;
+    };
+    let host = normalized(host);
+    names.iter().any(|name| normalized(name) == host) || super::dns::is_zone_name(&host)
+}
+
 /// Whether a deny-all box's question names something the switch's resolver
 /// answers itself rather than sending on to the host's resolvers: a name
 /// strictly below the zone apex whose last labels are the zone's, byte for
@@ -3688,5 +3702,24 @@ pub(crate) mod tests {
             unmatched_refused_key("example.com"),
             unmatched_refused_key("example.com")
         );
+    }
+
+    /// A box's fetch asks [`admits_name`] for each host, and it answers as the
+    /// gate does for the box's own query (NET-141).
+    #[test]
+    fn admits_name_answers_as_the_gate_does() {
+        let policy = |hosts: Option<&[&str]>| sessions::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: hosts.map(|hosts| hosts.iter().map(ToString::to_string).collect()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let listed = policy(Some(&["storage.googleapis.com."]));
+        assert!(admits_name(Some(&listed), "Storage.GoogleApis.com"));
+        assert!(!admits_name(Some(&listed), "example.com"));
+        assert!(admits_name(Some(&listed), "web.min.internal"));
+        assert!(admits_name(None, "example.com"));
+        assert!(admits_name(Some(&policy(None)), "example.com"));
+        assert!(admits_name(Some(&policy(Some(&[]))), "example.com"));
     }
 }
