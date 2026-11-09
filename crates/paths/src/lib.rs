@@ -503,6 +503,19 @@ pub fn minimal_config_dir_with_override(over: Option<&Path>) -> std::path::PathB
     }
 }
 
+/// [`minimal_config_dir_with_override`] without the panics: `None` when no
+/// override is given and neither `$XDG_CONFIG_HOME` nor a home directory
+/// resolves, or the default path is not valid UTF-8 or not absolute. For a
+/// caller that runs before every command and can do without the directory.
+#[must_use]
+pub fn try_minimal_config_dir_with_override(over: Option<&Path>) -> Option<std::path::PathBuf> {
+    match over {
+        Some(dir) => Some(dir.join("minimal")),
+        None => try_default_dir(xdg_config_home, ".config")
+            .map(|p| p.as_utf8_path().as_std_path().to_path_buf()),
+    }
+}
+
 /// The certificate files the retired HTTPS reverse proxy left in the config
 /// directory: the daemon-issued client certificate, its key, and the CA.
 pub const RETIRED_PROXY_CREDENTIAL_FILES: [&str; 3] = ["client.pem", "client.key", "ca.pem"];

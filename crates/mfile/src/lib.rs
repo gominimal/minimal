@@ -29,6 +29,9 @@ pub use tasks::{Task, TaskAction};
 
 pub const MFILE_NAME: &str = "minimal.toml";
 
+/// The top-level table that declares the project's Box Types (BOX-059).
+const BOX_TYPES_TABLE: &str = "box_types";
+
 /// Overrides how many seconds an edit of `minimal.toml` waits for another
 /// command's lock before it fails.
 const MFILE_LOCK_TIMEOUT_ENV: &str = "MINIMAL_MFILE_LOCK_TIMEOUT_SECS";
@@ -1035,6 +1038,26 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Whether to print the legacy-table hints for this read of a file.
+///
+/// One command parses the same file many times, so without this a single
+/// `min session activate` prints each hint once per parse. A file's hints
+/// print the first time this process reads a given (path, content). The
+/// key holds the content as well as the path, as in
+/// [`File::warn_unknown_fields`], so the long-lived `minimald` prints them
+/// again after the file is edited. A read with no path always prints.
+fn legacy_hints_due(path: Option<&Path>, bytes: &[u8]) -> bool {
+    static HINTED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let Some(path) = path else {
+        return true;
+    };
+    HINTED_FILES
+        .lock()
+        .unwrap()
+        .insert((path.to_path_buf(), hash_bytes(bytes)))
+}
+
 /// Whether a load refuses a task that sets `interactive = true` (BOX-054).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskCheck {
@@ -1057,11 +1080,27 @@ impl File {
     /// serde's internal enum name.
     ///
     /// It then reads the legacy tables (BOX-050, BOX-051, BOX-052) and
-    /// prints one hint on stderr for each, on every read.
+    /// prints one hint on stderr for each, the first time this process reads
+    /// the file (see [`legacy_hints_due`]).
     fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
+        Self::parse_to(bytes, path, &mut std::io::stderr())
+    }
+
+    /// [`File::parse`], writing the legacy hints to `hints_out` rather than
+    /// stderr, so a test can read what a parse prints.
+    fn parse_to(
+        bytes: &[u8],
+        path: Option<&Path>,
+        hints_out: &mut dyn std::io::Write,
+    ) -> Result<Self, Error> {
         let mut file = Self::deserialize_bytes(bytes, path)?;
-        for legacy in legacy::settle(&mut file, legacy::this_release(), path)? {
-            eprintln!("{legacy}");
+        let hints = legacy::settle(&mut file, legacy::this_release(), path)?;
+        if !hints.is_empty() && legacy_hints_due(path, bytes) {
+            for legacy in hints {
+                // A hint that cannot be written (a closed stderr) is not a
+                // reason to fail the read.
+                let _ = writeln!(hints_out, "{legacy}");
+            }
         }
         Ok(file)
     }
@@ -1595,6 +1634,10 @@ impl File {
     }
 
     fn warn_unknown_fields(&self) {
+        // BOX-028: an entry's `hooks_on_resume` stays in its `extra`, where
+        // the spec reads it, and is not an unknown key.
+        const HOOKS_ON_RESUME_KEY: &str = "hooks_on_resume";
+
         // One command decodes the same file several times; without this a
         // single load prints each warning once per decode. Surface them only
         // the first time a given path is validated in this process.
@@ -1623,6 +1666,14 @@ impl File {
             }
         }
 
+        // A warning names the file it is about. A command can load a file
+        // the user did not write (`min init` reads a fetched checkout), so a
+        // bare `minimal.toml` would point at the wrong file.
+        let shown = self
+            .mfile_path
+            .as_ref()
+            .map_or_else(|| MFILE_NAME.to_owned(), |p| p.display().to_string());
+
         let mut was_unknown_fields = false;
         if !self.extra.is_empty() {
             // A key that is valid at another nesting level is not really
@@ -1638,29 +1689,50 @@ impl File {
             for key in self.extra.keys().filter(|key| {
                 *key != boxes::core::bep::STORE_RULES_TABLE
                     && *key != boxes::core::egress::HOST_EXPOSURES_TABLE
+                    // The entry tables and the project's Box Types are read
+                    // by `entry` and `expand`, not by this struct.
+                    && !entry::EntryTable::ALL.iter().any(|t| t.key() == key.as_str())
+                    && *key != BOX_TYPES_TABLE
             }) {
                 match misplaced_top_level_key(key) {
                     Some(correct) => tracing::warn!(
-                        "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
+                        "{key} is unknown at the top level of {shown}; did you mean {correct}?"
                     ),
                     None => unknown.push(key.clone()),
                 }
             }
             if !unknown.is_empty() {
-                tracing::warn!("unknown fields in {}: {}", MFILE_NAME, unknown.join(","));
+                tracing::warn!("unknown fields in {}: {}", shown, unknown.join(","));
                 was_unknown_fields = true;
             }
         }
-        if !self.defaults.extra.is_empty() {
+        // BOX-048: `[defaults]` also holds box settings for every entry, and
+        // a `[defaults.<type>]` table for a built-in or project Box Type.
+        // Expansion reads both and refuses a bad one (BOX-066).
+        let project_types: HashSet<&str> = self
+            .extra
+            .get(BOX_TYPES_TABLE)
+            .and_then(toml::Value::as_table)
+            .map(|t| t.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut unknown_defaults: Vec<&str> = self
+            .defaults
+            .extra
+            .iter()
+            .filter(|(key, value)| {
+                let type_defaults = value.is_table()
+                    && (expand::BUILTIN_BOX_TYPES.contains(&key.as_str())
+                        || project_types.contains(key.as_str()));
+                !type_defaults && !expand::is_spec_key(key)
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        unknown_defaults.sort_unstable();
+        if !unknown_defaults.is_empty() {
             tracing::warn!(
                 "unknown fields in [defaults] section of {}: {}",
-                MFILE_NAME,
-                self.defaults
-                    .extra
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",")
+                shown,
+                unknown_defaults.join(",")
             );
             was_unknown_fields = true;
         }
@@ -1674,7 +1746,7 @@ impl File {
         {
             tracing::warn!(
                 "unknown fields in [stack] section of {}: {}",
-                MFILE_NAME,
+                shown,
                 stack.extra.keys().cloned().collect::<Vec<_>>().join(",")
             );
             was_unknown_fields = true;
@@ -1686,11 +1758,12 @@ impl File {
             let unknown: Vec<&str> = unknown_entry_keys(&session.extra)
                 .into_iter()
                 .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
+                .filter(|key| *key != HOOKS_ON_RESUME_KEY)
                 .collect();
             if !unknown.is_empty() {
                 tracing::warn!(
                     "unknown fields in [session] section of {}: {}",
-                    MFILE_NAME,
+                    shown,
                     unknown.join(",")
                 );
                 was_unknown_fields = true;
@@ -1698,7 +1771,10 @@ impl File {
         }
 
         for (task_name, task) in &self.tasks {
-            let unknown = unknown_entry_keys(&task.extra);
+            let unknown: Vec<&str> = unknown_entry_keys(&task.extra)
+                .into_iter()
+                .filter(|key| *key != HOOKS_ON_RESUME_KEY)
+                .collect();
             if !unknown.is_empty() {
                 tracing::warn!(
                     "unknown fields in task {}: {}",
@@ -3366,6 +3442,174 @@ mod tests {
             "{out}"
         );
         assert_eq!(count_unknown_warnings(&capture), 0, "{out}");
+    }
+
+    /// BOX-028: `hooks_on_resume` under `[session]` or a `[tasks.*]` entry
+    /// is read into the spec, and no unknown-field warning names it.
+    #[test]
+    fn hooks_on_resume_entry_key_is_not_reported_unknown() {
+        for body in [
+            "[session]\nhooks_on_resume = true\n",
+            "[tasks.lint]\nbash = \"true\"\nhooks_on_resume = true\n",
+        ] {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
+            let capture = CaptureWriter::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            File::from_dir(dir.path()).expect("the file reads");
+            drop(guard);
+            let out = capture.contents();
+            assert_eq!(count_unknown_warnings(&capture), 0, "{body}: {out}");
+        }
+        // A key that is not known still warns beside it.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[session]\nhooks_on_resume = true\nbogus = 1\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("the file reads");
+        drop(guard);
+        let out = capture.contents();
+        assert!(out.contains("unknown fields in [session] section"), "{out}");
+        assert!(out.contains("bogus"), "{out}");
+        assert!(!out.contains("hooks_on_resume"), "{out}");
+    }
+
+    /// #3190: a file's legacy-table hints print on the first read of a
+    /// given (path, content) in this process, not on every read. An edit
+    /// prints them again, and a read with no path always prints.
+    #[test]
+    fn legacy_hints_print_once_per_path_and_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        let old = b"[session]\npackages = [\"git\"]\n";
+        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
+        assert!(legacy_hints_due(Some(&path), old), "first read prints");
+        assert!(
+            !legacy_hints_due(Some(&path), old),
+            "second read of the same file is quiet"
+        );
+        assert!(legacy_hints_due(Some(&path), new), "an edit prints again");
+        assert!(!legacy_hints_due(Some(&path), new), "and only once");
+        assert!(legacy_hints_due(None, old), "a read with no path prints");
+        assert!(legacy_hints_due(None, old), "every time");
+    }
+
+    /// #3190, end to end through the parse: reading the same legacy file
+    /// twice prints its hint once, an edit prints it again, and a read with
+    /// no path prints it on every read.
+    #[test]
+    fn parse_prints_a_files_legacy_hint_once_until_it_changes() {
+        // A `[session]` table is the one legacy table here, so a read that
+        // prints prints exactly one `hint:` line.
+        let printed = |bytes: &[u8], path: Option<&Path>| {
+            let mut out = Vec::new();
+            File::parse_to(bytes, path, &mut out).expect("the file parses");
+            let out = String::from_utf8(out).unwrap();
+            out.lines().filter(|l| l.starts_with("hint: ")).count()
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        let old = b"[session]\npackages = [\"git\"]\n";
+        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
+
+        assert_eq!(
+            printed(old, Some(&path)),
+            1,
+            "the first read prints the hint"
+        );
+        assert_eq!(
+            printed(old, Some(&path)),
+            0,
+            "a second read of the same file is quiet"
+        );
+        assert_eq!(printed(new, Some(&path)), 1, "an edit prints it again");
+        assert_eq!(printed(new, Some(&path)), 0, "and only once");
+        assert_eq!(printed(old, None), 1, "a read with no path prints");
+        assert_eq!(printed(old, None), 1, "on every read");
+    }
+
+    /// Reads `body` as a project's `minimal.toml` and returns the warnings
+    /// it prints and the file's path.
+    fn load_warnings(body: &str) -> (String, PathBuf, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, body).unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("the file reads");
+        drop(guard);
+        (capture.contents(), path, dir)
+    }
+
+    /// #3188: the entry tables, `[box_types]`, the box settings in
+    /// `[defaults]` and a `[defaults.<type>]` table are read by `entry` and
+    /// `expand`, so no unknown-field warning names them.
+    #[test]
+    fn entry_shape_tables_are_not_reported_unknown() {
+        let body = "\
+[defaults]
+timeout = \"30s\"
+
+[defaults.session]
+packages = [\"git\"]
+
+[defaults.devbox]
+pty_enabled = true
+
+[box_types.devbox]
+extends = \"session\"
+
+[sessions.shell]
+
+[boxes.dev]
+type = \"devbox\"
+
+[tasks.lint]
+bash = \"true\"
+";
+        let (out, _path, _dir) = load_warnings(body);
+        assert!(!out.contains("unknown fields in"), "{out}");
+        assert!(!out.contains("newer version of minimal"), "{out}");
+    }
+
+    /// #3188: a key nothing reads still warns, and the warning names the
+    /// file's path rather than a bare `minimal.toml`.
+    #[test]
+    fn unknown_keys_still_warn_and_name_the_files_path() {
+        let (out, path, _dir) = load_warnings(
+            "bogus = 1\n\n[defaults]\nnot_a_setting = 1\n\n[defaults.nosuchtype]\nx = 1\n",
+        );
+        let shown = path.display();
+        assert!(
+            out.contains(&format!("unknown fields in {shown}: bogus")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "unknown fields in [defaults] section of {shown}: nosuchtype,not_a_setting"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("help: do you need to update to a newer version of minimal?"),
+            "{out}"
+        );
     }
 
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {

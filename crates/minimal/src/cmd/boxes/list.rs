@@ -468,6 +468,7 @@ State:      stopped
 Reason:     stopped
 Exit code:  -
 Signal:     15
+Disk:       -
 Identity:   none
 Provider:   local
 Host:       local0
@@ -495,6 +496,7 @@ State:      exited
 Reason:     exit
 Exit code:  0
 Signal:     -
+Disk:       -
 Identity:   unknown
 Provider:   local
 Host:       local0

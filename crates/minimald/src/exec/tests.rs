@@ -109,6 +109,139 @@ fn task_start_dir_honours_inherit_cwd() {
     assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
 }
 
+/// A task run carrying the client's resolution of its `env_vars`.
+fn task_exec_with(env: &[(&str, &str)], drop_env: &[&str], client_resolved: bool) -> TaskExec {
+    TaskExec {
+        task: "t778".to_string(),
+        args: Vec::new(),
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        drop_env: drop_env.iter().map(|n| n.to_string()).collect(),
+        client_resolved,
+        cwd: String::new(),
+    }
+}
+
+/// A task's declared `env_vars`, as the session's copy of the project has
+/// them.
+fn declared_vars(
+    vars: &[(&str, Option<&str>)],
+) -> std::collections::BTreeMap<String, mfile::EnvVarValue> {
+    vars.iter()
+        .map(|(name, value)| {
+            let value = match value {
+                Some(v) => mfile::EnvVarValue::Value(v.to_string()),
+                None => mfile::EnvVarValue::Inherit,
+            };
+            (name.to_string(), value)
+        })
+        .collect()
+}
+
+/// The client's values replace the task's `inherit` declarations, and the
+/// names it dropped are gone, whether or not it marked the run resolved.
+#[test]
+fn the_client_env_answers_inherit_and_drops_names() {
+    use super::overlay_client_env;
+
+    for client_resolved in [false, true] {
+        let exec = task_exec_with(&[("X778", "from-client")], &["IGNORED"], client_resolved);
+        let mut vars =
+            declared_vars(&[("X778", None), ("IGNORED", None), ("LITERAL", Some("lit"))]);
+        overlay_client_env(&exec, &mut vars).expect("every inherit is answered");
+        assert_eq!(
+            vars,
+            declared_vars(&[("X778", Some("from-client")), ("LITERAL", Some("lit"))]),
+        );
+    }
+}
+
+/// inbox#778: a client that resolved the task itself (`min session run`)
+/// read the project on its own host. An `inherit` only the session's copy
+/// declares never passed the user's `[vars]` policy there, so the run is
+/// refused, naming the task and the variable, and the daemon's own
+/// environment is never read for it.
+#[test]
+fn a_resolved_run_refuses_an_inherit_the_client_did_not_answer() {
+    use super::{UnansweredInherit, overlay_client_env};
+
+    let exec = task_exec_with(&[("X778", "from-client")], &[], true);
+    let mut vars = declared_vars(&[("X778", None), ("ONLY_IN_SESSION", None)]);
+    let err = overlay_client_env(&exec, &mut vars)
+        .expect_err("an unanswered inherit must refuse the run");
+    assert_eq!(
+        err,
+        UnansweredInherit {
+            task: "t778".to_string(),
+            var: "ONLY_IN_SESSION".to_string(),
+        }
+    );
+}
+
+/// The refusal says what was refused and both causes, without asserting
+/// one, and names the commands that work: destroy this session, then
+/// activate the project again under the same name. It never offers a bare
+/// "re-activate", which would leave this session in place (PR #3128).
+#[test]
+fn the_unanswered_inherit_refusal_names_both_causes_and_the_commands() {
+    let refused = super::UnansweredInherit {
+        task: "t778".to_string(),
+        var: "ONLY_IN_SESSION".to_string(),
+    };
+
+    let msg = refused.refusal(Some("dev"), "0b5e", "/home/me/proj");
+    assert!(msg.starts_with("refused to run task 't778': "), "{msg}");
+    assert!(
+        msg.contains("`env_vars.ONLY_IN_SESSION = { inherit = true }`"),
+        "names the declaration: {msg}"
+    );
+    assert!(
+        msg.contains("the minimal.toml of /home/me/proj on the host"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("changed after the session was activated"),
+        "{msg}"
+    );
+    assert!(msg.contains("a stack provides the task"), "{msg}");
+    assert!(
+        msg.ends_with(
+            "run `min session destroy dev`, then `min session activate --name dev /home/me/proj`."
+        ),
+        "names the commands: {msg}"
+    );
+    assert!(!msg.contains("re-activate"), "{msg}");
+    assert!(!msg.contains("where `min` ran"), "{msg}");
+    assert_eq!(msg.lines().count(), 1, "one line: {msg:?}");
+
+    // An unnamed session is destroyed by id, and a path a shell would split
+    // is quoted so both commands paste as they are.
+    let msg = refused.refusal(None, "0b5e", "/home/me/it's mine");
+    assert!(
+        msg.contains("run `min session destroy 0b5e`, then "),
+        "{msg}"
+    );
+    assert!(
+        msg.ends_with(r#"`min session activate '/home/me/it'\''s mine'`."#),
+        "{msg}"
+    );
+}
+
+/// A client that did not mark the run resolved, as every caller but
+/// `min session run`, keeps the older behaviour: an inherit it did not
+/// answer stays for the sandbox to resolve.
+#[test]
+fn an_unmarked_run_leaves_an_unanswered_inherit_as_before() {
+    use super::overlay_client_env;
+
+    let exec = task_exec_with(&[], &[], false);
+    let mut vars = declared_vars(&[("ONLY_IN_SESSION", None)]);
+    overlay_client_env(&exec, &mut vars).expect("no refusal without the marker");
+    assert_eq!(vars, declared_vars(&[("ONLY_IN_SESSION", None)]));
+}
+
 /// A session record carrying `mode`, with everything else at its default.
 #[cfg(target_os = "linux")]
 fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
@@ -5400,4 +5533,139 @@ mod end_to_end {
         // The exec outcome is not the point of this test.
         let _ = out;
     }
+}
+
+/// A task whose sandbox failed before its command started: nothing on its
+/// stdio, hakoniwa's 125, and the reason kept for the client.
+struct FailedSandbox;
+
+impl super::Process for FailedSandbox {
+    type Stdin = tokio::io::Sink;
+    type Stdout = tokio::io::Empty;
+    type Stderr = tokio::io::Empty;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        Some((tokio::io::sink(), tokio::io::empty(), tokio::io::empty()))
+    }
+
+    async fn wait(&mut self) -> std::io::Result<Option<i32>> {
+        Ok(Some(super::SANDBOX_FAILURE_CODE))
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        Some(super::sandbox_failure_notice("mount /home/h810: ENOENT"))
+    }
+}
+
+/// A task whose sandbox failed ends with hakoniwa's 125 and nothing of its
+/// own on stdout or stderr; the reason reaches the client's stderr
+/// (inbox#1129). The process goes through [`bridge_noting_reason`], which
+/// wraps it in `StoppedOnDestroy` as production does, so the wrapper must
+/// pass the notice on.
+#[tokio::test]
+async fn a_sandbox_failure_reaches_the_client_stderr() {
+    let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+    let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+    let (client_stdin, mut stdin) = duplex(64);
+    drop(client_stdin);
+    let (status, _late) = bridge_noting_reason(
+        "test",
+        futures::stream::iter(vec![Ok(FailedSandbox)]),
+        &mut stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Keep,
+        None,
+        || false,
+    )
+    .await;
+    drop(bridge_stdout);
+    drop(bridge_stderr);
+    assert_eq!(status, 125);
+    let mut err = String::new();
+    client_stderr.read_to_string(&mut err).await.unwrap();
+    assert_eq!(err, "the task's sandbox failed: mount /home/h810: ENOENT\n");
+    let mut out = Vec::new();
+    client_stdout.read_to_end(&mut out).await.unwrap();
+    assert!(out.is_empty());
+}
+
+/// Only hakoniwa's own container failure counts: a command that exits 125
+/// itself, one that was signalled, a container that a SIGKILL ended, and a
+/// task the daemon killed are not reported as a sandbox failure.
+#[test]
+fn only_a_container_failure_is_a_sandbox_failure() {
+    let status = |code, exit_code: Option<i32>, reason: &str| hakoniwa::ExitStatus {
+        code,
+        reason: reason.to_string(),
+        exit_code,
+        rusage: None,
+        proc_pid_smaps_rollup: None,
+        proc_pid_status: None,
+    };
+    assert_eq!(
+        super::sandbox_failure(&status(125, None, "mount /home/h810: ENOENT"), false),
+        Some("mount /home/h810: ENOENT".to_string())
+    );
+    assert_eq!(
+        super::sandbox_failure(
+            &status(125, Some(125), "process(bash) exited with code 125"),
+            false
+        ),
+        None
+    );
+    assert_eq!(
+        super::sandbox_failure(
+            &status(137, None, "process(bash) received signal SIGKILL"),
+            false
+        ),
+        None
+    );
+    assert_eq!(
+        super::sandbox_failure(&status(125, None, super::CONTAINER_SIGKILL_REASON), false),
+        None,
+        "a container that a SIGKILL ended may have run its command"
+    );
+    assert_eq!(
+        super::sandbox_failure(&status(125, None, "mount /home/h810: ENOENT"), true),
+        None,
+        "a task the daemon killed is not a sandbox failure"
+    );
+}
+
+/// The notice quotes hakoniwa's reason, which can name a path the box
+/// chose; a control character in it is escaped, so the notice stays one line.
+#[test]
+fn the_sandbox_failure_notice_escapes_control_characters() {
+    assert_eq!(
+        super::sandbox_failure_notice("mount /home/x\n\u{1b}[2J: ENOENT"),
+        "the task's sandbox failed: mount /home/x\\n\\u{1b}[2J: ENOENT\n"
+    );
+}
+
+/// A client that stops reading does not hold the status back: the exit
+/// notice write gives up after [`super::EXIT_NOTICE_BOUND`].
+#[tokio::test(start_paused = true)]
+async fn an_unread_exit_notice_does_not_hold_the_status() {
+    let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+    // One byte of room and nobody reading: the notice write never completes.
+    let (mut bridge_stderr, _client_stderr) = duplex(1);
+    let (client_stdin, mut stdin) = duplex(64);
+    drop(client_stdin);
+    let status = bridge(
+        "test",
+        futures::stream::iter(vec![Ok(FailedSandbox)]),
+        &mut stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Keep,
+    )
+    .await;
+    assert_eq!(status, 125);
 }

@@ -2501,10 +2501,7 @@ impl<C: Channel> Sandbox<C> {
 
             // Step 3: wire this invocation's netns. Torn down explicitly once
             // the invocation completes (both arms).
-            let net_guard = match planned
-                .attach(network::Spawned::from_child(&mut child))
-                .await
-            {
+            let net_guard = match planned.attach_child(&mut child).await {
                 Ok(guard) => guard,
                 Err(e) => {
                     // Attach failed after spawn: kill+reap the child so it
@@ -2649,7 +2646,9 @@ impl<C: Channel> Sandbox<C> {
 
                     // Reap the child process, then tear down its network.
                     let _ = child.wait();
-                    net_guard.teardown().await;
+                    if let Some(net_guard) = net_guard {
+                        net_guard.teardown().await;
+                    }
                     return Err(Error::Execution(ExecutionError::Cancelled));
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
@@ -2694,7 +2693,9 @@ impl<C: Channel> Sandbox<C> {
 
                     // The invocation's process has exited; tear down its network
                     // before propagating any error.
-                    net_guard.teardown().await;
+                    if let Some(net_guard) = net_guard {
+                        net_guard.teardown().await;
+                    }
                     outcome?;
                 }
             }
@@ -3173,6 +3174,49 @@ impl PlannedLaunch {
         let guard = self.network.attach(spawned).await.map_err(Error::Network)?;
         self.owed = false;
         Ok(guard)
+    }
+
+    /// [`attach`](Self::attach) for a process that runs while its namespace
+    /// is wired, as a short build step does: the process can end before the
+    /// wiring does, and its namespace goes with it. Nothing is left to wire
+    /// then, and the process's own exit status is the result, so `None`
+    /// stands for that outcome. The plan's release has run by then, because
+    /// a next step's plan can replace what the release gives back.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's attach failure while the process still runs.
+    #[cfg(target_os = "linux")]
+    pub async fn attach_child(
+        self,
+        child: &mut hakoniwa::Child,
+    ) -> Result<Option<Box<dyn NetGuard>>, Error> {
+        let spawned = network::Spawned::from_child(child);
+        self.attach_unless_ended(spawned, || matches!(child.try_wait(), Ok(Some(_))))
+            .await
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    async fn attach_unless_ended(
+        mut self,
+        spawned: network::Spawned,
+        ended: impl FnOnce() -> bool,
+    ) -> Result<Option<Box<dyn NetGuard>>, Error> {
+        match self.network.attach(spawned).await {
+            Ok(guard) => {
+                self.owed = false;
+                Ok(Some(guard))
+            }
+            Err(error) => {
+                let error = Error::Network(error);
+                if !ended() {
+                    return Err(error);
+                }
+                tracing::debug!(%error, "the process ended before its network attach did");
+                self.abandon().await;
+                Ok(None)
+            }
+        }
     }
 
     /// Give up before the process exists, releasing the plan.
@@ -4072,6 +4116,40 @@ mod tests {
             vec!["plan", "attach", "abandon"],
             "a failed attach must still release the plan"
         );
+    }
+
+    /// A process that ended while its namespace was being wired leaves its
+    /// own exit status as the result, and the plan's release has run when the
+    /// attach returns, so the next step's plan cannot overtake it. A failed
+    /// attach of a process that still runs stays a failure.
+    #[tokio::test]
+    async fn a_process_that_ended_during_attach_is_no_attach_failure() {
+        let failing = || {
+            std::sync::Arc::new(Recorder {
+                events: std::sync::Mutex::new(vec!["plan"]),
+                attach_fails: true,
+            })
+        };
+        let rec = failing();
+        let attached = planned_with(&rec)
+            .attach_unless_ended(network::Spawned::new(1), || true)
+            .await;
+        assert!(matches!(attached, Ok(None)));
+        assert_eq!(rec.events(), vec!["plan", "attach", "abandon"]);
+
+        let rec = failing();
+        let attached = planned_with(&rec)
+            .attach_unless_ended(network::Spawned::new(1), || false)
+            .await;
+        assert!(attached.is_err(), "the process still runs");
+
+        let rec = std::sync::Arc::new(Recorder::default());
+        let attached = planned_with(&rec)
+            .attach_unless_ended(network::Spawned::new(1), || {
+                panic!("a good attach never asks")
+            })
+            .await;
+        assert!(matches!(attached, Ok(Some(_))));
     }
 
     /// 017-002 sub-requirement: the launch future going away is the one exit a

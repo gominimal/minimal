@@ -46,6 +46,13 @@ pub struct Config {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub secret_store_rules: StoreRules,
+    /// `[telemetry]` section: the daily update check's switch
+    /// (gominimal/inbox#589), `enabled` alone. The export keys of spec 25
+    /// get a typed table when gominimal/arch#101 defines them; until then
+    /// any other key is refused, as everywhere in this file. Read from the
+    /// user file and from the organization's, either turning the check off.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     /// `[host-exposures]` section: the host ports `minvmd` opens at
     /// `host.min.internal`. `minvmd` reads and checks the entries. The
     /// client keeps them as written, so a file that has the table parses.
@@ -55,6 +62,26 @@ pub struct Config {
         skip_serializing_if = "HostExposuresTable::is_empty"
     )]
     pub host_exposures: HostExposuresTable,
+}
+
+/// The `[telemetry]` section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// The daily update check and the install count it carries. On by
+    /// default until 1.0; `false` makes no request and prints no notice.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// The `[host-exposures]` table as written, one entry per name. `minvmd`
@@ -423,6 +450,23 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         path
+    }
+
+    /// `[telemetry]` is on by default and switches off with `enabled = false`;
+    /// a key it does not know is refused like any other (the export settings
+    /// of spec 25 get their typed section when gominimal/arch#101 defines them).
+    #[test]
+    fn telemetry_section_defaults_on_and_switches_off() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(dir.path(), "config.toml", "[loadouts]\n");
+        assert!(read_config_file(&path).unwrap().telemetry.enabled);
+        let path = write_file(dir.path(), "off.toml", "[telemetry]\nenabled = false\n");
+        assert!(!read_config_file(&path).unwrap().telemetry.enabled);
+        let path = write_file(dir.path(), "bad.toml", "[telemetry]\nenabld = false\n");
+        assert!(
+            read_config_file(&path).is_err(),
+            "a misspelt key is refused, as everywhere in this file"
+        );
     }
 
     /// A well-formed config with a populated `default_loadouts`

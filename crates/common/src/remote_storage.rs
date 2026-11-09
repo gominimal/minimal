@@ -1,4 +1,4 @@
-use crate::fetchers::{GcsUrl, ReqwestUrl};
+use crate::fetchers::{FetchBackend, GcsUrl, ReqwestUrl};
 use crate::file_cache;
 use crate::file_cache::CachingDownloader;
 use anyhow::Result;
@@ -7,6 +7,42 @@ use ot::OpTracker;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+
+/// How long a download waits for one connection to open.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The host every `gs://` source is read from: the Google Cloud Storage
+/// client's endpoint. The source's URL names a bucket, not a host.
+const GCS_HOST: &str = "storage.googleapis.com";
+
+/// [`Storage`], with a bound on the wait for the first answer to a read. The
+/// client has no connect bound of its own. Rules that drop packets leave each
+/// attempt waiting for the kernel's retry limit, and it retries for minutes.
+/// The bound ends with the first answer, so it does not limit a long download.
+#[derive(Debug)]
+struct BoundedStorage<'a> {
+    storage: &'a Storage,
+    bound: std::time::Duration,
+}
+
+impl FetchBackend for BoundedStorage<'_> {
+    type Url = GcsUrl;
+    type Request = <Storage as FetchBackend>::Request;
+    type Response = <Storage as FetchBackend>::Response;
+
+    fn get(&self, url: GcsUrl) -> Result<Self::Request, google_cloud_storage::Error> {
+        self.storage.get(url)
+    }
+
+    async fn execute(
+        &self,
+        req: Self::Request,
+    ) -> Result<Self::Response, google_cloud_storage::Error> {
+        tokio::time::timeout(self.bound, self.storage.execute(req))
+            .await
+            .unwrap_or_else(|elapsed| Err(google_cloud_storage::Error::timeout(elapsed)))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteStorage {
@@ -75,14 +111,39 @@ impl RemoteStorage {
                 .await
                 .map(|(path, _connected)| path);
         }
-        let client = reqwest::Client::new();
+        self.download_web_within(CONNECT_TIMEOUT, url, sha256, op)
+            .await
+    }
+
+    /// [`download_web_with_verification_and_caching`](Self::download_web_with_verification_and_caching)
+    /// without a placement, failing when a connection does not open within
+    /// `bound`.
+    async fn download_web_within(
+        &self,
+        bound: std::time::Duration,
+        url: &str,
+        sha256: &str,
+        op: &OpTracker,
+    ) -> Result<PathBuf> {
+        // Rules that drop packets, not reject them, leave a connect waiting
+        // for the kernel's retry limit, once per address the name answered.
+        // This bound covers every address of one connection.
+        //
+        // reqwest applies the bound twice. It wraps the whole connect, name
+        // lookup and TLS included, which is what holds the overall bound.
+        // It also passes the bound to hyper-util's connector, which divides
+        // it evenly by the number of addresses the name answered
+        // (`ConnectingTcpRemote::new`, hyper-util 0.1.20). Unlike the placed
+        // relay, the connector carries no unused time forward, so an address
+        // after one that refused at once still gets only its even share.
+        let client = reqwest::Client::builder().connect_timeout(bound).build()?;
         let backend = (&client, &self.cache);
         backend
             .download(ReqwestUrl::try_from(url)?, sha256, op)
             .await
             .map_err(|e| match e {
                 either::Either::Left(e) => anyhow::Error::from(e),
-                either::Either::Right(e) => anyhow::Error::from(e),
+                either::Either::Right(e) => connect_failure(e, bound),
             })
     }
 
@@ -118,7 +179,25 @@ impl RemoteStorage {
         sha256: &str,
         op: &OpTracker,
     ) -> Result<PathBuf> {
-        let backend = (&self.client, &self.cache);
+        self.download_gcs_within(CONNECT_TIMEOUT, bucket_id, file, sha256, op)
+            .await
+    }
+
+    /// [`download_with_verification_and_caching`](Self::download_with_verification_and_caching),
+    /// failing when no first answer comes within `bound`.
+    async fn download_gcs_within(
+        &self,
+        bound: std::time::Duration,
+        bucket_id: String,
+        file: &str,
+        sha256: &str,
+        op: &OpTracker,
+    ) -> Result<PathBuf> {
+        let storage = BoundedStorage {
+            storage: &self.client,
+            bound,
+        };
+        let backend = (&storage, &self.cache);
         backend
             .download(
                 GcsUrl {
@@ -131,7 +210,7 @@ impl RemoteStorage {
             .await
             .map_err(|e| match e {
                 either::Either::Left(e) => anyhow::Error::from(e),
-                either::Either::Right(e) => anyhow::Error::from(e),
+                either::Either::Right(e) => gcs_failure(e, bound),
             })
     }
 
@@ -148,6 +227,48 @@ impl RemoteStorage {
             .await?;
 
         Ok(())
+    }
+}
+
+/// A `gs://` download's error. When [`BoundedStorage`] ended the wait at
+/// `bound`, the error names the host and the bound the way a web download's
+/// does. The storage client's own timeouts carry a different source and are
+/// unchanged, as is any other error.
+fn gcs_failure(e: google_cloud_storage::Error, bound: std::time::Duration) -> anyhow::Error {
+    let unanswered = std::error::Error::source(&e)
+        .is_some_and(|source| source.is::<tokio::time::error::Elapsed>());
+    if unanswered {
+        anyhow::Error::from(e).context(format!(
+            "could not connect to {GCS_HOST}:443: no answer after {bound:?}"
+        ))
+    } else {
+        anyhow::Error::from(e)
+    }
+}
+
+/// A web download's error, naming the host it could not connect to the way a
+/// placed download's does (NET-155). The URL on the error is the request's
+/// last, so a redirect names the host it sent the download to. `bound` is
+/// the connect timeout the client was built with. Any other error is
+/// unchanged.
+fn connect_failure(e: reqwest::Error, bound: std::time::Duration) -> anyhow::Error {
+    let target = e
+        .url()
+        .and_then(|url| Some((url.host_str()?.to_string(), url.port_or_known_default()?)));
+    match target {
+        Some((host, port)) if e.is_connect() => {
+            let why = if e.is_timeout() {
+                format!("no answer after {bound:?}")
+            } else {
+                let mut cause: &dyn std::error::Error = &e;
+                while let Some(next) = cause.source() {
+                    cause = next;
+                }
+                cause.to_string()
+            };
+            anyhow::Error::from(e).context(format!("could not connect to {host}:{port}: {why}"))
+        }
+        _ => anyhow::Error::from(e),
     }
 }
 
@@ -278,7 +399,8 @@ mod placed {
         /// the cgroup. `None` takes the `nameserver` lines of
         /// `/etc/resolv.conf`.
         nameservers: Option<Vec<SocketAddr>>,
-        /// How long the relay waits for one connection to one address.
+        /// How long the relay waits for one connection, across the lookup
+        /// of its host and every address the host answers.
         connect_timeout: std::time::Duration,
         /// How long the relay waits for the head of a request, so a client
         /// that connects and sends nothing does not hold a handler task.
@@ -446,6 +568,7 @@ mod placed {
                     "the egress rules admit no destination",
                 ));
             }
+            let deadline = tokio::time::Instant::now() + self.connect_timeout;
             let addrs = match host.parse::<std::net::IpAddr>() {
                 Ok(ip) => vec![ip],
                 Err(_) => {
@@ -458,14 +581,36 @@ mod placed {
                             Some(nameservers) => nameservers.clone(),
                             None => system_nameservers()?,
                         };
-                        lookup_in_cgroup(&self.procs, &nameservers, host).await?
+                        let lookup = lookup_in_cgroup(&self.procs, &nameservers, host);
+                        match tokio::time::timeout_at(deadline, lookup).await {
+                            Ok(found) => found?,
+                            Err(_) => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    format!("no answer after {:?}", self.connect_timeout),
+                                ));
+                            }
+                        }
                     } else {
                         listed
                     }
                 }
             };
+            // The last error an address returned, the number of addresses
+            // that gave no answer, and whether the last address tried was
+            // one of them.
             let mut last = None;
+            let mut unanswered = 0;
+            let mut last_unanswered = false;
+            let mut left = addrs.len();
             for ip in addrs {
+                // A share of the time left each, so a host that answers many
+                // addresses behind rules that drop packets fails within the
+                // bound and not once per address, and an address that fails
+                // at once leaves its time to the ones after it.
+                let share = deadline.saturating_duration_since(tokio::time::Instant::now())
+                    / u32::try_from(left).unwrap_or(u32::MAX);
+                left -= 1;
                 let addr = SocketAddr::new(ip, port);
                 let procs = self.procs.clone();
                 let socket = tokio::task::spawn_blocking(move || {
@@ -478,25 +623,50 @@ mod placed {
                 // Rules that drop packets, not reject them, leave a connect
                 // waiting for the kernel's retry limit. The deadline bounds it.
                 let connecting = tokio::net::TcpSocket::from_std_stream(socket).connect(addr);
-                match tokio::time::timeout(self.connect_timeout, connecting).await {
+                match tokio::time::timeout(share, connecting).await {
                     Ok(Ok(stream)) => return Ok(stream),
-                    Ok(Err(e)) => last = Some(e),
+                    Ok(Err(e)) => {
+                        tracing::debug!("could not connect to {addr}: {e}");
+                        last = Some(e);
+                        last_unanswered = false;
+                    }
                     Err(_) => {
-                        last = Some(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("no answer from {addr} after {:?}", self.connect_timeout),
-                        ))
+                        tracing::debug!("no answer from {addr} after {share:?}");
+                        unanswered += 1;
+                        last_unanswered = true;
                     }
                 }
             }
-            Err(last.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address"))
-            }))
+            if last_unanswered {
+                // The last address waited out the time left, so the whole
+                // bound has passed with no answer.
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no answer after {:?}", self.connect_timeout),
+                ));
+            }
+            match last {
+                // The last address failed with an error of its own, after
+                // earlier ones gave no answer: report both.
+                Some(e) if unanswered > 0 => {
+                    let others = if unanswered == 1 {
+                        "address"
+                    } else {
+                        "addresses"
+                    };
+                    Err(io::Error::new(
+                        e.kind(),
+                        format!("{e}, after no answer from {unanswered} other {others}"),
+                    ))
+                }
+                Some(e) => Err(e),
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{host} has no address"),
+                )),
+            }
         }
     }
-
-    /// How long the relay waits for one connection to one address.
-    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
     /// How long the relay waits for one answer from the name server.
     const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1335,6 +1505,38 @@ mod placed {
             (addr, held, listener)
         }
 
+        /// A download without a placement whose connect gets no answer
+        /// fails at its bound, not at the kernel's retry limit, and names
+        /// the address and the bound.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn an_unplaced_connect_to_a_dropping_address_times_out() {
+            let (addr, _held, _listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
+                .await
+                .unwrap();
+            let bound = std::time::Duration::from_millis(300);
+
+            let started = std::time::Instant::now();
+            let e = storage
+                .download_web_within(
+                    bound,
+                    &format!("http://{addr}/pkg.tar.gz"),
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                    &OpTracker::new_root(),
+                )
+                .await
+                .expect_err("the address drops every packet");
+            let took = started.elapsed();
+
+            assert_eq!(
+                e.to_string(),
+                format!("could not connect to {addr}: no answer after 300ms")
+            );
+            assert!(took < bound * 2, "took {took:?}");
+        }
+
         /// A connect to an address that drops packets ends with `TimedOut`
         /// at the relay's deadline, not at the kernel's retry limit.
         #[cfg(target_os = "linux")]
@@ -1354,7 +1556,137 @@ mod placed {
                 .expect_err("the address drops every packet");
             let took = started.elapsed();
             assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert_eq!(e.to_string(), "no answer after 500ms");
             assert!(took >= bound, "it waited {took:?}");
+            assert!(took < bound * 4, "it waited {took:?}");
+        }
+
+        /// A host with many addresses behind rules that drop packets fails
+        /// within one connect bound, not one bound per address.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_shares_its_bound_across_a_hosts_addresses() {
+            let (addr, _held, _listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let ip = addr.ip();
+            std::fs::write(
+                procs.with_file_name("hosts"),
+                format!("{ip} many.test\n").repeat(4),
+            )
+            .unwrap();
+            let bound = std::time::Duration::from_millis(800);
+            let relay = test_relay(&procs, bound);
+
+            let started = std::time::Instant::now();
+            let e = relay
+                .connect("many.test", addr.port())
+                .await
+                .expect_err("every address drops every packet");
+            let took = started.elapsed();
+            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert_eq!(e.to_string(), "no answer after 800ms");
+            assert!(took < bound * 2, "it waited {took:?}");
+        }
+
+        /// A host whose last address refuses, after earlier ones gave no
+        /// answer, reports the refusal and how many gave no answer.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_refused_last_counts_the_unanswered() {
+            // The first three drop every packet. Nothing listens on the
+            // port at 127.0.0.2, so the last refuses at once.
+            let (addr, _held, _listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let ip = addr.ip();
+            std::fs::write(
+                procs.with_file_name("hosts"),
+                format!("{ip} many.test\n").repeat(3) + "127.0.0.2 many.test\n",
+            )
+            .unwrap();
+            let bound = std::time::Duration::from_millis(600);
+            let relay = test_relay(&procs, bound);
+
+            let started = std::time::Instant::now();
+            let e = relay
+                .connect("many.test", addr.port())
+                .await
+                .expect_err("no address takes the connection");
+            let took = started.elapsed();
+            assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused, "{e}");
+            assert_eq!(
+                e.to_string(),
+                "Connection refused (os error 111), after no answer from 3 other addresses"
+            );
+            assert!(took < bound, "it waited {took:?}");
+        }
+
+        /// An address that fails at once leaves its time to the next: the
+        /// last address connects after a wait longer than an equal share.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_carries_unused_time_to_the_next_address() {
+            // The port is closed on the first four, which refuse at once.
+            // The last one drops the first SYN, and answers the kernel's
+            // retry about a second later, once the queue has room.
+            let (addr, _held, listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            std::fs::write(
+                procs.with_file_name("hosts"),
+                format!(
+                    "127.0.0.2 many.test\n127.0.0.3 many.test\n127.0.0.4 many.test\n\
+                     127.0.0.5 many.test\n{} many.test\n",
+                    addr.ip()
+                ),
+            )
+            .unwrap();
+            let bound = std::time::Duration::from_millis(3000);
+            let relay = test_relay(&procs, bound);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let accepted = listener.accept().await;
+                std::future::pending::<()>().await;
+                drop((accepted, listener));
+            });
+
+            let started = std::time::Instant::now();
+            relay
+                .connect("many.test", addr.port())
+                .await
+                .expect("the last address answers within the time left");
+            let took = started.elapsed();
+            assert!(
+                took > bound / 5,
+                "an equal share would not have sufficed: {took:?}"
+            );
+        }
+
+        /// The lookup of a host counts against the bound: name servers that
+        /// never answer end the connection at its deadline, not at theirs.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_counts_its_lookup_against_the_bound() {
+            let silent = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let bound = std::time::Duration::from_millis(300);
+            let mut relay = test_relay(&procs, bound);
+            relay.nameservers = Some(vec![silent.local_addr().unwrap()]);
+
+            let started = std::time::Instant::now();
+            let e = relay
+                .connect("sources.example.com", 443)
+                .await
+                .expect_err("no name server answers");
+            let took = started.elapsed();
+            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert_eq!(e.to_string(), "no answer after 300ms");
             assert!(took < bound * 4, "it waited {took:?}");
         }
 
@@ -1553,5 +1885,100 @@ mod placed {
             assert!(took >= bound, "it waited {took:?}");
             assert!(took < bound * 10, "it waited {took:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    const SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// A download that could not connect names the host and the socket's
+    /// reason, in the text the daemon reads the host from.
+    #[tokio::test]
+    async fn a_failed_connect_names_the_host() {
+        let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
+            .await
+            .unwrap();
+
+        let e = storage
+            .download_web_with_verification_and_caching(
+                &format!("http://{addr}/pkg.tar.gz"),
+                SHA,
+                None,
+                false,
+                &OpTracker::new_root(),
+            )
+            .await
+            .expect_err("the port is closed");
+        let text = e.to_string();
+        assert!(
+            text.starts_with(&format!("could not connect to {addr}: ")),
+            "{text}"
+        );
+    }
+
+    /// A `gs://` source whose host gives no answer fails at the bound, and
+    /// names the host. The listener takes the connection and never answers.
+    #[tokio::test]
+    async fn a_gs_source_fails_when_no_answer_comes() {
+        let silent = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = silent.local_addr().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = RemoteStorage {
+            client: Storage::builder()
+                .with_endpoint(format!("http://{addr}"))
+                .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
+                .build()
+                .await
+                .unwrap(),
+            cache: file_cache::FileCache::new_with_offline(tmp.path().to_path_buf(), false)
+                .unwrap(),
+        };
+
+        let bound = std::time::Duration::from_millis(200);
+        let e = storage
+            .download_gcs_within(
+                bound,
+                "bucket".to_string(),
+                "pkg.tar.gz",
+                SHA,
+                &OpTracker::new_root(),
+            )
+            .await
+            .expect_err("no answer comes");
+        assert_eq!(
+            e.to_string(),
+            "could not connect to storage.googleapis.com:443: no answer after 200ms"
+        );
+    }
+
+    /// Only the bound's own timeout reads as no answer. A timeout the storage
+    /// client reports keeps its own text.
+    #[tokio::test]
+    async fn only_the_bounds_timeout_reads_as_no_answer() {
+        let bound = std::time::Duration::from_millis(200);
+        let elapsed = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .expect_err("the future never completes");
+
+        let ours = gcs_failure(google_cloud_storage::Error::timeout(elapsed), bound);
+        assert_eq!(
+            ours.to_string(),
+            "could not connect to storage.googleapis.com:443: no answer after 200ms"
+        );
+
+        let clients = google_cloud_storage::Error::timeout("the client's own deadline");
+        let text = clients.to_string();
+        assert_eq!(gcs_failure(clients, bound).to_string(), text);
     }
 }
