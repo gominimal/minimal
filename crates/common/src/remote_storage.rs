@@ -596,7 +596,12 @@ mod placed {
                     }
                 }
             };
+            // The last error an address returned, the number of addresses
+            // that gave no answer, and whether the last address tried was
+            // one of them.
             let mut last = None;
+            let mut unanswered = 0;
+            let mut last_unanswered = false;
             let mut left = addrs.len();
             for ip in addrs {
                 // A share of the time left each, so a host that answers many
@@ -620,18 +625,46 @@ mod placed {
                 let connecting = tokio::net::TcpSocket::from_std_stream(socket).connect(addr);
                 match tokio::time::timeout(share, connecting).await {
                     Ok(Ok(stream)) => return Ok(stream),
-                    Ok(Err(e)) => last = Some(e),
+                    Ok(Err(e)) => {
+                        tracing::debug!("could not connect to {addr}: {e}");
+                        last = Some(e);
+                        last_unanswered = false;
+                    }
                     Err(_) => {
-                        last = Some(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("no answer from {addr} after {share:?}"),
-                        ))
+                        tracing::debug!("no answer from {addr} after {share:?}");
+                        unanswered += 1;
+                        last_unanswered = true;
                     }
                 }
             }
-            Err(last.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address"))
-            }))
+            if last_unanswered {
+                // The last address waited out the time left, so the whole
+                // bound has passed with no answer.
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no answer after {:?}", self.connect_timeout),
+                ));
+            }
+            match last {
+                // The last address failed with an error of its own, after
+                // earlier ones gave no answer: report both.
+                Some(e) if unanswered > 0 => {
+                    let others = if unanswered == 1 {
+                        "address"
+                    } else {
+                        "addresses"
+                    };
+                    Err(io::Error::new(
+                        e.kind(),
+                        format!("{e}, after no answer from {unanswered} other {others}"),
+                    ))
+                }
+                Some(e) => Err(e),
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{host} has no address"),
+                )),
+            }
         }
     }
 
@@ -1523,6 +1556,7 @@ mod placed {
                 .expect_err("the address drops every packet");
             let took = started.elapsed();
             assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert_eq!(e.to_string(), "no answer after 500ms");
             assert!(took >= bound, "it waited {took:?}");
             assert!(took < bound * 4, "it waited {took:?}");
         }
@@ -1552,7 +1586,42 @@ mod placed {
                 .expect_err("every address drops every packet");
             let took = started.elapsed();
             assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert_eq!(e.to_string(), "no answer after 800ms");
             assert!(took < bound * 2, "it waited {took:?}");
+        }
+
+        /// A host whose last address refuses, after earlier ones gave no
+        /// answer, reports the refusal and how many gave no answer.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_refused_last_counts_the_unanswered() {
+            // The first three drop every packet. Nothing listens on the
+            // port at 127.0.0.2, so the last refuses at once.
+            let (addr, _held, _listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let ip = addr.ip();
+            std::fs::write(
+                procs.with_file_name("hosts"),
+                format!("{ip} many.test\n").repeat(3) + "127.0.0.2 many.test\n",
+            )
+            .unwrap();
+            let bound = std::time::Duration::from_millis(600);
+            let relay = test_relay(&procs, bound);
+
+            let started = std::time::Instant::now();
+            let e = relay
+                .connect("many.test", addr.port())
+                .await
+                .expect_err("no address takes the connection");
+            let took = started.elapsed();
+            assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused, "{e}");
+            assert_eq!(
+                e.to_string(),
+                "Connection refused (os error 111), after no answer from 3 other addresses"
+            );
+            assert!(took < bound, "it waited {took:?}");
         }
 
         /// An address that fails at once leaves its time to the next: the
