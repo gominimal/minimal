@@ -723,6 +723,7 @@ box that holds it returns to `running`. These terms follow the decision in
   - IF the download of a package's source cannot connect within 15 seconds THEN THE SYSTEM SHALL fail the build and name the package, the host and the reason.
     tier:   T0
     verify: cargo nextest run -p common a_failed_connect_names_the_host
+    verify: cargo nextest run -p common an_unplaced_connect_to_a_dropping_address_times_out
     verify: cargo nextest run -p common a_gs_source_fails_when_no_answer_comes
     verify: cargo nextest run -p common a_placed_connect_shares_its_bound_across_a_hosts_addresses
     verify: cargo nextest run -p common a_placed_connect_carries_unused_time_to_the_next_address

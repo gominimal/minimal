@@ -111,19 +111,31 @@ impl RemoteStorage {
                 .await
                 .map(|(path, _connected)| path);
         }
+        self.download_web_within(CONNECT_TIMEOUT, url, sha256, op)
+            .await
+    }
+
+    /// [`download_web_with_verification_and_caching`](Self::download_web_with_verification_and_caching)
+    /// without a placement, failing when a connection does not open within
+    /// `bound`.
+    async fn download_web_within(
+        &self,
+        bound: std::time::Duration,
+        url: &str,
+        sha256: &str,
+        op: &OpTracker,
+    ) -> Result<PathBuf> {
         // Rules that drop packets, not reject them, leave a connect waiting
         // for the kernel's retry limit, once per address the name answered.
         // This bound covers every address of one connection.
-        let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()?;
+        let client = reqwest::Client::builder().connect_timeout(bound).build()?;
         let backend = (&client, &self.cache);
         backend
             .download(ReqwestUrl::try_from(url)?, sha256, op)
             .await
             .map_err(|e| match e {
                 either::Either::Left(e) => anyhow::Error::from(e),
-                either::Either::Right(e) => connect_failure(e),
+                either::Either::Right(e) => connect_failure(e, bound),
             })
     }
 
@@ -215,16 +227,17 @@ impl RemoteStorage {
 
 /// A web download's error, naming the host it could not connect to the way a
 /// placed download's does (NET-155). The URL on the error is the request's
-/// last, so a redirect names the host it sent the download to. Any other
-/// error is unchanged.
-fn connect_failure(e: reqwest::Error) -> anyhow::Error {
+/// last, so a redirect names the host it sent the download to. `bound` is
+/// the connect timeout the client was built with. Any other error is
+/// unchanged.
+fn connect_failure(e: reqwest::Error, bound: std::time::Duration) -> anyhow::Error {
     let target = e
         .url()
         .and_then(|url| Some((url.host_str()?.to_string(), url.port_or_known_default()?)));
     match target {
         Some((host, port)) if e.is_connect() => {
             let why = if e.is_timeout() {
-                format!("no answer after {CONNECT_TIMEOUT:?}")
+                format!("no answer after {bound:?}")
             } else {
                 let mut cause: &dyn std::error::Error = &e;
                 while let Some(next) = cause.source() {
@@ -1436,6 +1449,38 @@ mod placed {
                 assert!(held.len() < 64, "the accept queue never filled");
             }
             (addr, held, listener)
+        }
+
+        /// A download without a placement whose connect gets no answer
+        /// fails at its bound, not at the kernel's retry limit, and names
+        /// the address and the bound.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn an_unplaced_connect_to_a_dropping_address_times_out() {
+            let (addr, _held, _listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
+                .await
+                .unwrap();
+            let bound = std::time::Duration::from_millis(300);
+
+            let started = std::time::Instant::now();
+            let e = storage
+                .download_web_within(
+                    bound,
+                    &format!("http://{addr}/pkg.tar.gz"),
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                    &OpTracker::new_root(),
+                )
+                .await
+                .expect_err("the address drops every packet");
+            let took = started.elapsed();
+
+            assert_eq!(
+                e.to_string(),
+                format!("could not connect to {addr}: no answer after 300ms")
+            );
+            assert!(took < bound * 2, "took {took:?}");
         }
 
         /// A connect to an address that drops packets ends with `TimedOut`
