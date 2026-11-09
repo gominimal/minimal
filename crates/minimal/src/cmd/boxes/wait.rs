@@ -46,8 +46,8 @@ impl BoxTimedOut {
     pub fn waited(target: &str, id: &str, after: &str) -> Self {
         Self {
             code: "wait_timeout",
-            // The wording is the task's `diagnostics:` line, with the id.
-            message: format!("Stopped waiting after {after}; {target} ({id}) is still running."),
+            // The `diagnostics:` wording, with the id, split into two sentences.
+            message: format!("Stopped waiting after {after}. {target} ({id}) is still running."),
             hint: format!(
                 "Run `min box wait {id}` to wait again, or `min box stop {id}` to stop it."
             ),
