@@ -394,9 +394,15 @@ pub enum StartEntryRefusal {
         box_type: Option<String>,
     },
     /// `--name` for a task entry: its box runs through the run path, which
-    /// generates the box's name and takes no `--name`.
+    /// generates the box's name and takes no `--name`. This refusal is an
+    /// interim. <https://github.com/gominimal/minimal/issues/3196> tracks a
+    /// box name for `RunEntry`. Remove this refusal when `RunEntry` takes a
+    /// name.
     NameUnsupported { entry: String },
-    /// `min box start` named an entry of a type it cannot start yet.
+    /// `min box start` named an entry of a type it cannot start yet: an
+    /// agent, service or user-defined type. This refusal is an interim.
+    /// <https://github.com/gominimal/minimal/issues/3197> tracks the start
+    /// of those entries.
     UnsupportedType {
         entry: String,
         box_type: Option<String>,
@@ -655,9 +661,13 @@ pub(crate) fn plan_start(
             })
         }
         // A task box never has a terminal (BOX-054), so the start detaches.
-        // The run path names the box `task-<entry>-<hex>`, which no running
-        // box holds, so `--new` already holds for it. It takes no `--name`,
-        // so the start refuses that flag rather than drop it.
+        // `run_entry` calls `request_fresh_instance`, and the daemon names
+        // the box `<entry>-<n>` (BOX-163). So a task-entry start is always a
+        // fresh instance, and `--new` changes nothing for it. A plain start
+        // does not refuse a held name until gominimal/minimal#3196 lands.
+        // The run path takes no `--name`, so the start refuses that flag
+        // rather than drop it. That refusal is the #3196 interim: remove it
+        // when `RunEntry` takes a name.
         Some(boxes::TASK_BOX_TYPE) if start.name.is_some() => {
             Err(StartEntryRefusal::NameUnsupported { entry: entry.name }.into())
         }
@@ -671,6 +681,8 @@ pub(crate) fn plan_start(
             },
             entry: entry.name,
         }),
+        // Agent, service and user-defined-type entries: an interim refusal
+        // until gominimal/minimal#3197 lets `min box start` start them.
         box_type => Err(StartEntryRefusal::UnsupportedType {
             box_type: box_type.map(str::to_owned),
             entry: entry.name,
