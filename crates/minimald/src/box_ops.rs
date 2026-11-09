@@ -495,11 +495,12 @@ impl BuildTap {
 
     /// The error to report for a failed build. A build the box's egress
     /// rules refused names the destination and the box before the build's
-    /// own error. Any other failure is the build's own error, unchanged.
+    /// own error. A build that could not connect to a source names the host
+    /// and the reason. Any other failure is the build's own error, unchanged.
     pub(crate) fn failure(&self, placement: &BuildPlacement, failure: String) -> String {
         match self.refusal(placement, &failure) {
             Some(refusal) => format!("{refusal}\n{failure}"),
-            None => failure,
+            None => crate::env::unreachable_source(&failure).unwrap_or(failure),
         }
     }
 }
