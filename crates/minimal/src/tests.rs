@@ -11129,6 +11129,85 @@ fn ls_warning_clears_on_recovery_with_no_guest_port() {
     );
 }
 
+// BOX-037: a task run whose box ran past its timeout exits 124, and says
+// why on stderr before the line about the kept box. The record decides
+// it, read only for a 124.
+#[tokio::test]
+async fn task_run_timeout_prints_why_and_exits_124() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let timed_out = crate::task::ended_at_timeout(Some(124), || {
+        std::future::ready(Some(RecordState::Exited(ExitEnding::Timeout)))
+    })
+    .await;
+    assert!(timed_out, "a 124 with a timeout record is the timeout's");
+
+    let why = crate::task::timeout_line("check", Some(90));
+    assert_eq!(
+        why,
+        "Task check ran past its timeout of 90s, and its processes were ended. \
+         The run exits with code 124."
+    );
+    assert_eq!(
+        crate::task::timeout_line("check", Some(2 * 3600)),
+        "Task check ran past its timeout of 2h, and its processes were ended. \
+         The run exits with code 124."
+    );
+    assert_eq!(
+        crate::task::timeout_line("check", None),
+        "Task check ran past its timeout, and its processes were ended. \
+         The run exits with code 124."
+    );
+    assert_eq!(
+        crate::task::kept_box_lines(Some(why.clone()), "check-1"),
+        vec![
+            why,
+            "Kept box check-1. Remove it with min box rm check-1.".to_string()
+        ],
+        "the timeout line comes before the kept-box line"
+    );
+
+    let err = crate::task::exit_outcome(Some(124)).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<crate::task::TaskExit>(),
+        Some(&crate::task::TaskExit(124))
+    );
+}
+
+// BOX-037: a task that exits 124 by itself, or with any other code, gets
+// no timeout line: its record says `reason = "exit"`. A code other than
+// 124 does not read the record.
+#[tokio::test]
+async fn task_run_own_exit_124_prints_no_timeout_line() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let timed_out = crate::task::ended_at_timeout(Some(124), || {
+        std::future::ready(Some(RecordState::Exited(ExitEnding::Exit {
+            exit_code: 124,
+        })))
+    })
+    .await;
+    assert!(!timed_out, "the task's own 124 is not a timeout");
+    assert!(
+        !crate::task::ended_at_timeout(Some(124), || std::future::ready(None)).await,
+        "an unreadable record says nothing about a timeout"
+    );
+
+    let mut read = false;
+    let timed_out = crate::task::ended_at_timeout(Some(7), || {
+        read = true;
+        std::future::ready(Some(RecordState::Exited(ExitEnding::Timeout)))
+    })
+    .await;
+    assert!(!timed_out);
+    assert!(!read, "a code other than 124 does not read the record");
+
+    assert_eq!(
+        crate::task::kept_box_lines(None, "check-1"),
+        vec!["Kept box check-1. Remove it with min box rm check-1.".to_string()]
+    );
+}
+
 // BCLI-006: `min box show` reports the disk a stopped box holds, and
 // `min box prune --dry-run` lists each box it would remove with the disk
 // it holds and the sum, and removes nothing.
