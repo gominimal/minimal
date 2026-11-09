@@ -22,10 +22,13 @@ boots from three artifacts:
 Prereqs:
 - Apple Silicon Mac with Docker (for the `cross` musl toolchain).
 - `brew install slp/krun/libkrun` — third-party tap; required by minvmd.
+- `just` (`brew install just`).
 - `jq` and `zstd` (`brew install jq zstd`), which `just artifacts` uses.
 
 ```sh
-# 1. Fetch the prebuilt kernel + GENERIC guest rootfs into .scratch/.
+# 1. Fetch the prebuilt kernel + GENERIC guest rootfs into .scratch/. Files
+#    already there are reused; after changing the package pin or arch, delete
+#    them first: rm -f .scratch/vmlinuz .scratch/rootfs.img
 just artifacts
 
 # 2. Build the guest initramfs (cross-compiles minimald → static aarch64, cpio).
@@ -51,7 +54,8 @@ target/debug/minvmd boot --foreground   # vm-up = minimald READY from the initra
 
 On a Linux host with `/dev/kvm`, minvmd links libkrun's KVM backend and boots
 natively — **no Docker, no codesigning**. `materialize` runs the build pipeline
-directly, so a native host (aarch64 *or* x86_64) materializes its own artifacts. This is the same flow as the `ci-linux-kvm.yml` lane.
+directly, so a native host (aarch64 *or* x86_64) materializes its own artifacts.
+This is the same flow as the `ci-linux-kvm.yml` lane.
 
 Prereqs:
 - A KVM-capable Linux host, and membership in the `kvm` group (durable — see the
