@@ -210,10 +210,7 @@ impl RemoteStorage {
             .await
             .map_err(|e| match e {
                 either::Either::Left(e) => anyhow::Error::from(e),
-                either::Either::Right(e) if e.is_timeout() => anyhow::Error::from(e).context(
-                    format!("could not connect to {GCS_HOST}:443: no answer after {bound:?}"),
-                ),
-                either::Either::Right(e) => anyhow::Error::from(e),
+                either::Either::Right(e) => gcs_failure(e, bound),
             })
     }
 
@@ -230,6 +227,22 @@ impl RemoteStorage {
             .await?;
 
         Ok(())
+    }
+}
+
+/// A `gs://` download's error. When [`BoundedStorage`] ended the wait at
+/// `bound`, the error names the host and the bound the way a web download's
+/// does. The storage client's own timeouts carry a different source and are
+/// unchanged, as is any other error.
+fn gcs_failure(e: google_cloud_storage::Error, bound: std::time::Duration) -> anyhow::Error {
+    let unanswered = std::error::Error::source(&e)
+        .is_some_and(|source| source.is::<tokio::time::error::Elapsed>());
+    if unanswered {
+        anyhow::Error::from(e).context(format!(
+            "could not connect to {GCS_HOST}:443: no answer after {bound:?}"
+        ))
+    } else {
+        anyhow::Error::from(e)
     }
 }
 
@@ -1878,5 +1891,25 @@ mod connect_tests {
             e.to_string(),
             "could not connect to storage.googleapis.com:443: no answer after 200ms"
         );
+    }
+
+    /// Only the bound's own timeout reads as no answer. A timeout the storage
+    /// client reports keeps its own text.
+    #[tokio::test]
+    async fn only_the_bounds_timeout_reads_as_no_answer() {
+        let bound = std::time::Duration::from_millis(200);
+        let elapsed = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .expect_err("the future never completes");
+
+        let ours = gcs_failure(google_cloud_storage::Error::timeout(elapsed), bound);
+        assert_eq!(
+            ours.to_string(),
+            "could not connect to storage.googleapis.com:443: no answer after 200ms"
+        );
+
+        let clients = google_cloud_storage::Error::timeout("the client's own deadline");
+        let text = clients.to_string();
+        assert_eq!(gcs_failure(clients, bound).to_string(), text);
     }
 }
