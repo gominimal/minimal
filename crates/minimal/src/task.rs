@@ -940,6 +940,8 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
         &args.args,
     );
     let entrypoint_runs = spec.is_some();
+    // The task's timeout, for the line a run past it prints (BOX-037).
+    let timeout_secs = spec.as_ref().and_then(|spec| spec.timeout);
     request.config.ends_with_run = true;
     // BOX-001: the record's type is the one the expanded spec names. Both
     // verbs resolve the entry as a declared task (`declared_task`), and
@@ -1229,7 +1231,13 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
                         end = task_box_end(exit, || entrypoint_started(&mut client, id)).await;
                         match end {
                             TaskBoxEnd::Keep => {
-                                eprintln!("{}", crate::kept_box_line(&session_name));
+                                let timed_out =
+                                    ended_at_timeout(exit, || record_state(&mut client, id)).await;
+                                let why =
+                                    timed_out.then(|| timeout_line(&args.entry, timeout_secs));
+                                for line in kept_box_lines(why, &session_name) {
+                                    eprintln!("{line}");
+                                }
                             }
                             TaskBoxEnd::Remove => {
                                 tracing::info!(
@@ -1372,6 +1380,72 @@ async fn entrypoint_started(client: &mut crate::client::Client, id: boxes::Sessi
             true
         }
     }
+}
+
+/// The code a task run returns when its box ran past its timeout (BOX-037).
+pub(crate) const TIMEOUT_EXIT_CODE: u32 = 124;
+
+/// Whether a task run's box ended at its timeout (BOX-037): the run's code
+/// is 124 and the box's record says `exited` with `reason = "timeout"`. A
+/// task that exits 124 by itself leaves `reason = "exit"`, so the code alone
+/// cannot say it. `state` reads the record, and only for a 124.
+pub(crate) async fn ended_at_timeout<F, Fut>(exit: Option<u32>, state: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<boxes::core::record::RecordState>>,
+{
+    use boxes::core::record::{ExitEnding, RecordState};
+    exit == Some(TIMEOUT_EXIT_CODE)
+        && state().await == Some(RecordState::Exited(ExitEnding::Timeout))
+}
+
+/// The state of the box's record, or `None` when the daemon cannot read it.
+async fn record_state(
+    client: &mut crate::client::Client,
+    id: boxes::SessionId,
+) -> Option<boxes::core::record::RecordState> {
+    let reply = client
+        .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Id(
+            id,
+        ))
+        .await;
+    match reply {
+        Ok(reply) => reply.record.and_then(|record| record.state().ok()),
+        Err(error) => {
+            tracing::warn!(box_id = %id, %error, "could not read the task box's state");
+            None
+        }
+    }
+}
+
+/// A timeout of `secs` seconds as `minimal.toml` can write it: in hours,
+/// minutes or seconds, whichever divides it.
+fn timeout_words(secs: u64) -> String {
+    match secs {
+        s if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s >= 60 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// The line `min task run` prints on stderr when the task's box ran past
+/// its timeout (BOX-037). `timeout_secs` is the task's timeout, when the
+/// run knows it.
+pub(crate) fn timeout_line(task: &str, timeout_secs: Option<u64>) -> String {
+    let limit =
+        timeout_secs.map_or_else(String::new, |secs| format!(" of {}", timeout_words(secs)));
+    format!(
+        "Task {task} ran past its timeout{limit}, and its processes were ended. \
+         The run exits with code {TIMEOUT_EXIT_CODE}."
+    )
+}
+
+/// The lines a task run prints on stderr when it keeps its box: why the
+/// task ended, when its timeout ended it, then how to remove the box.
+pub(crate) fn kept_box_lines(why: Option<String>, box_name: &str) -> Vec<String> {
+    why.into_iter()
+        .chain(std::iter::once(crate::kept_box_line(box_name)))
+        .collect()
 }
 
 /// Releases what a task box held on the VM host daemon once its run

@@ -29,6 +29,9 @@ pub use tasks::{Task, TaskAction};
 
 pub const MFILE_NAME: &str = "minimal.toml";
 
+/// The top-level table that declares the project's Box Types (BOX-059).
+const BOX_TYPES_TABLE: &str = "box_types";
+
 /// Overrides how many seconds an edit of `minimal.toml` waits for another
 /// command's lock before it fails.
 const MFILE_LOCK_TIMEOUT_ENV: &str = "MINIMAL_MFILE_LOCK_TIMEOUT_SECS";
@@ -1663,6 +1666,14 @@ impl File {
             }
         }
 
+        // A warning names the file it is about. A command can load a file
+        // the user did not write (`min init` reads a fetched checkout), so a
+        // bare `minimal.toml` would point at the wrong file.
+        let shown = self
+            .mfile_path
+            .as_ref()
+            .map_or_else(|| MFILE_NAME.to_owned(), |p| p.display().to_string());
+
         let mut was_unknown_fields = false;
         if !self.extra.is_empty() {
             // A key that is valid at another nesting level is not really
@@ -1678,29 +1689,50 @@ impl File {
             for key in self.extra.keys().filter(|key| {
                 *key != boxes::core::bep::STORE_RULES_TABLE
                     && *key != boxes::core::egress::HOST_EXPOSURES_TABLE
+                    // The entry tables and the project's Box Types are read
+                    // by `entry` and `expand`, not by this struct.
+                    && !entry::EntryTable::ALL.iter().any(|t| t.key() == key.as_str())
+                    && *key != BOX_TYPES_TABLE
             }) {
                 match misplaced_top_level_key(key) {
                     Some(correct) => tracing::warn!(
-                        "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
+                        "{key} is unknown at the top level of {shown}; did you mean {correct}?"
                     ),
                     None => unknown.push(key.clone()),
                 }
             }
             if !unknown.is_empty() {
-                tracing::warn!("unknown fields in {}: {}", MFILE_NAME, unknown.join(","));
+                tracing::warn!("unknown fields in {}: {}", shown, unknown.join(","));
                 was_unknown_fields = true;
             }
         }
-        if !self.defaults.extra.is_empty() {
+        // BOX-048: `[defaults]` also holds box settings for every entry, and
+        // a `[defaults.<type>]` table for a built-in or project Box Type.
+        // Expansion reads both and refuses a bad one (BOX-066).
+        let project_types: HashSet<&str> = self
+            .extra
+            .get(BOX_TYPES_TABLE)
+            .and_then(toml::Value::as_table)
+            .map(|t| t.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut unknown_defaults: Vec<&str> = self
+            .defaults
+            .extra
+            .iter()
+            .filter(|(key, value)| {
+                let type_defaults = value.is_table()
+                    && (expand::BUILTIN_BOX_TYPES.contains(&key.as_str())
+                        || project_types.contains(key.as_str()));
+                !type_defaults && !expand::is_spec_key(key)
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        unknown_defaults.sort_unstable();
+        if !unknown_defaults.is_empty() {
             tracing::warn!(
                 "unknown fields in [defaults] section of {}: {}",
-                MFILE_NAME,
-                self.defaults
-                    .extra
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",")
+                shown,
+                unknown_defaults.join(",")
             );
             was_unknown_fields = true;
         }
@@ -1714,7 +1746,7 @@ impl File {
         {
             tracing::warn!(
                 "unknown fields in [stack] section of {}: {}",
-                MFILE_NAME,
+                shown,
                 stack.extra.keys().cloned().collect::<Vec<_>>().join(",")
             );
             was_unknown_fields = true;
@@ -1731,7 +1763,7 @@ impl File {
             if !unknown.is_empty() {
                 tracing::warn!(
                     "unknown fields in [session] section of {}: {}",
-                    MFILE_NAME,
+                    shown,
                     unknown.join(",")
                 );
                 was_unknown_fields = true;
@@ -3506,6 +3538,78 @@ mod tests {
         assert_eq!(printed(new, Some(&path)), 0, "and only once");
         assert_eq!(printed(old, None), 1, "a read with no path prints");
         assert_eq!(printed(old, None), 1, "on every read");
+    }
+
+    /// Reads `body` as a project's `minimal.toml` and returns the warnings
+    /// it prints and the file's path.
+    fn load_warnings(body: &str) -> (String, PathBuf, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, body).unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("the file reads");
+        drop(guard);
+        (capture.contents(), path, dir)
+    }
+
+    /// #3188: the entry tables, `[box_types]`, the box settings in
+    /// `[defaults]` and a `[defaults.<type>]` table are read by `entry` and
+    /// `expand`, so no unknown-field warning names them.
+    #[test]
+    fn entry_shape_tables_are_not_reported_unknown() {
+        let body = "\
+[defaults]
+timeout = \"30s\"
+
+[defaults.session]
+packages = [\"git\"]
+
+[defaults.devbox]
+pty_enabled = true
+
+[box_types.devbox]
+extends = \"session\"
+
+[sessions.shell]
+
+[boxes.dev]
+type = \"devbox\"
+
+[tasks.lint]
+bash = \"true\"
+";
+        let (out, _path, _dir) = load_warnings(body);
+        assert!(!out.contains("unknown fields in"), "{out}");
+        assert!(!out.contains("newer version of minimal"), "{out}");
+    }
+
+    /// #3188: a key nothing reads still warns, and the warning names the
+    /// file's path rather than a bare `minimal.toml`.
+    #[test]
+    fn unknown_keys_still_warn_and_name_the_files_path() {
+        let (out, path, _dir) = load_warnings(
+            "bogus = 1\n\n[defaults]\nnot_a_setting = 1\n\n[defaults.nosuchtype]\nx = 1\n",
+        );
+        let shown = path.display();
+        assert!(
+            out.contains(&format!("unknown fields in {shown}: bogus")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "unknown fields in [defaults] section of {shown}: nosuchtype,not_a_setting"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("help: do you need to update to a newer version of minimal?"),
+            "{out}"
+        );
     }
 
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {
