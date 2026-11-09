@@ -4251,9 +4251,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every refused name is logged, however many names a box asks for
-    /// up to the bound: names that a hash of 256 buckets put together no
-    /// longer share one line a minute (NET-141).
     #[test]
     fn admits_name_answers_as_the_gate_does() {
         let policy = |hosts: Option<&[&str]>| boxes::EgressPolicy {
@@ -4271,6 +4268,9 @@ pub(crate) mod tests {
         assert!(admits_name(Some(&policy(Some(&[]))), "example.com"));
     }
 
+    /// Every refused name is logged, however many names a box asks for
+    /// up to the bound: names that a hash of 256 buckets put together no
+    /// longer share one line a minute (NET-141).
     #[test]
     fn refused_names_sharing_a_bucket_each_logged() {
         let capture = captured_log();
