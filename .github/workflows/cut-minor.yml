@@ -125,6 +125,7 @@ jobs:
                   gh label create "backport $LINE" --repo "$GITHUB_REPOSITORY" --force \
                     --color 0e8a16 --description "Backport this PR to $LINE"
             - name: Open the main bump PR
+              id: bump
               if: ${{ !inputs.dry_run }}
               env:
                   GH_TOKEN: ${{ steps.token.outputs.token }}
@@ -139,6 +140,7 @@ jobs:
                   current="$(git show origin/main:Cargo.toml | sed -n 's/^package\.version[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' | head -n 1)"
                   if [ "$current" != "$VERSION" ]; then
                     echo "::notice::main declares $current, not $VERSION; leaving it as it is"
+                    echo "moved=$current" >> "$GITHUB_OUTPUT"
                     exit 0
                   fi
                   branch="chore/bump-main-$NEXT"
@@ -176,10 +178,13 @@ jobs:
                   SHA: ${{ steps.plan.outputs.sha }}
                   LINE: ${{ steps.plan.outputs.line }}
                   NEXT: ${{ steps.plan.outputs.next }}
+                  MOVED: ${{ steps.bump.outputs.moved }}
                   DRY_RUN: ${{ inputs.dry_run }}
               run: |
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "Dry run: would cut \`$LINE\` from \`$SHA\` and move main to \`$NEXT\`." >> "$GITHUB_STEP_SUMMARY"
+                  elif [ -n "$MOVED" ]; then
+                    echo "Cut \`$LINE\` from \`$SHA\`. Main already declares \`$MOVED\`, so no bump PR." >> "$GITHUB_STEP_SUMMARY"
                   else
                     echo "Cut \`$LINE\` from \`$SHA\`. Main moves to \`$NEXT\` once its PR merges." >> "$GITHUB_STEP_SUMMARY"
                   fi
