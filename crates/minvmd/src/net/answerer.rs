@@ -1943,7 +1943,11 @@ impl Seat {
         uid: u32,
         cap: Option<usize>,
     ) -> Result<Self, usize> {
-        let mut held = seats.lock().expect("the seat count is never poisoned");
+        // A poisoned count is still a count: the holder that panicked
+        // released its seat below, or never took one.
+        let mut held = seats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let open = held.entry(uid).or_insert(0);
         if cap.is_some_and(|cap| *open >= cap) {
             return Err(*open);
