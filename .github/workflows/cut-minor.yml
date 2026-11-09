@@ -33,8 +33,8 @@ jobs:
         # mints a token that can bypass the release branch rules: run only
         # what main carries.
         if: github.ref == 'refs/heads/main'
-        # The minimal-shipper key lives in the `release` environment, which
-        # only main and release/* can deploy to.
+        # The App keys live in the `release` environment, which only main and
+        # release/* can deploy to.
         environment: release
         runs-on: ubuntu-latest
         timeout-minutes: 15
@@ -111,31 +111,46 @@ jobs:
                     fi
                   done
                   exit "$fail"
-            - name: Mint token (minimal-shipper)
+            # Two Apps. minimal-release-ops is the bypass actor on the release
+            # branch rules and only creates the line. minimal-backporter has no
+            # bypass, and does the label and the bump PR, which go through review.
+            - name: Mint line token (minimal-release-ops)
+              id: line-token
+              if: ${{ !inputs.dry_run && !steps.plan.outputs.exists }}
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              with:
+                  app-id: ${{ vars.MINIMAL_RELEASE_OPS_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_RELEASE_OPS_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: ${{ github.event.repository.name }}
+                  permission-contents: write
+            - name: Create the line
+              if: ${{ !inputs.dry_run && !steps.plan.outputs.exists }}
+              env:
+                  GH_TOKEN: ${{ steps.line-token.outputs.token }}
+                  SHA: ${{ steps.plan.outputs.sha }}
+                  LINE: ${{ steps.plan.outputs.line }}
+              run: |
+                  gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+                    -f ref="refs/heads/$LINE" -f sha="$SHA" --silent
+            - name: Mint PR token (minimal-backporter)
               id: token
               if: ${{ !inputs.dry_run }}
               uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
               with:
-                  app-id: ${{ vars.MINIMAL_SHIPPER_APP_ID }}
-                  private-key: ${{ secrets.MINIMAL_SHIPPER_PRIVATE_KEY }}
+                  app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
                   owner: gominimal
                   repositories: ${{ github.event.repository.name }}
                   permission-contents: write
                   permission-issues: write
                   permission-pull-requests: write
-            - name: Create the line and its backport label
+            - name: Create the backport label
               if: ${{ !inputs.dry_run }}
               env:
                   GH_TOKEN: ${{ steps.token.outputs.token }}
-                  SHA: ${{ steps.plan.outputs.sha }}
                   LINE: ${{ steps.plan.outputs.line }}
-                  EXISTS: ${{ steps.plan.outputs.exists }}
               run: |
-                  set -euo pipefail
-                  if [ -z "$EXISTS" ]; then
-                    gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
-                      -f ref="refs/heads/$LINE" -f sha="$SHA" --silent
-                  fi
                   gh label create "backport $LINE" --repo "$GITHUB_REPOSITORY" --force \
                     --color 0e8a16 --description "Backport this PR to $LINE"
             - name: Open the main bump PR
