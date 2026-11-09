@@ -202,6 +202,43 @@ without writing anything to `PATH` — the daemon fabricates a default config
 inside the session's own workspace instead. `--loadout` is resolved before any
 of this, so an unknown loadout name errors even in a directory with no config.
 
+### `session start`
+
+```
+min session start [OPTIONS] [ENTRY]
+```
+
+Creates a box from a session entry in the project's `minimal.toml`, and
+attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
+`[boxes.<name>]` entry with `type = "session"`.
+
+| Argument or flag | Description |
+|------------------|-------------|
+| `ENTRY` | The session entry to start. Optional |
+| `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
+| `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
+| `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
+
+Without `ENTRY`, the command starts the session entry named `default`. When
+no session entry has that name, it starts the project's only session entry. A
+project with no session entry and no entry named `default` gets a `default`
+session entry with no settings of its own. A project with no `minimal.toml`
+gets that entry too.
+
+The command refuses these starts before it creates a box:
+
+| Refusal | Exit code |
+|---------|-----------|
+| `ENTRY` names no entry in `minimal.toml` | 4 |
+| `ENTRY` names an entry that is not a session entry | 4 |
+| Without `ENTRY`: several session entries, and none of them is named `default` | 2 |
+| Without `ENTRY`: no session entry, and an entry of another type is named `default` | 2 |
+| An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type` | 2 |
+| No terminal, and no `--detach` | 2 |
+| A running box holds the box's name. Pass `--new` or `--name` to create the box | 2 |
+
+An invalid `minimal.toml` ends the command with exit code 3.
+
 ### `session attach`
 
 ```
