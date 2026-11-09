@@ -570,8 +570,9 @@ for `mip`, `min`, and `minimald`. Then it does two things:
   artifacts, and `completions.tar.gz`. A nightly build gets
   `release-<sha>`. A versioned run gets a draft `vX.Y.Z` that points at the
   commit. A version with a `-` suffix is a prerelease. On a rerun, the job
-  replaces a draft or a `release-<sha>` that an earlier attempt left. It never
-  replaces a public `vX.Y.Z`, so a rerun fails on one.
+  replaces a draft that an earlier attempt left. It keeps a `release-<sha>` and
+  replaces its assets in place, since people may have downloaded it already. It
+  never replaces a public `vX.Y.Z`, so a rerun fails on one.
 
 **stage-installer job.** A dry run skips this job.
 [`scripts/stage-release.sh`](../../scripts/stage-release.sh) uploads the
