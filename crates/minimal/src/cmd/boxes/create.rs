@@ -422,6 +422,16 @@ pub(crate) struct EffectiveEgress {
 pub(crate) struct ProjectEgress {
     pub(crate) policy: Option<boxes::EgressPolicy>,
     pub(crate) hints: Vec<String>,
+    /// The `network.mode` of the expanded entry, when a layer sets one.
+    /// `min task run` and `min box run` read it. `min session activate`
+    /// does not.
+    pub(crate) mode: Option<boxes::NetworkMode>,
+    /// The table whose `network` the expanded entry holds, as the file
+    /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
+    /// as `[tasks.build]`. A later layer replaces the whole `network` table
+    /// of an earlier one, so one table holds all of it. `None` when no
+    /// layer declares `network`.
+    pub(crate) layer: Option<String>,
 }
 
 /// The project's [`ProjectEgress`]. The layers are `[defaults]`,
@@ -568,23 +578,44 @@ fn entry_egress(
         body: network_of(&entry.body),
         ..entry
     };
-    if layers.defaults.is_empty() && layers.defaults_type.is_empty() && entry.body.is_empty() {
+    // The merge replaces a table whole, so the last layer that declares
+    // `network` holds the expanded entry's `network` table.
+    let layer = if !entry.body.is_empty() {
+        format!("[{}.{}]", entry.table.key(), entry.name)
+    } else if !layers.defaults_type.is_empty() {
+        format!(
+            "[defaults.{}]",
+            entry.box_type.as_deref().unwrap_or_default()
+        )
+    } else if !layers.defaults.is_empty() {
+        "[defaults]".to_owned()
+    } else {
         return Ok(ProjectEgress::default());
-    }
+    };
     let mut expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
     // The network module's own read: a malformed egress table refuses the
     // start with exit 3, as every invalid `minimal.toml` does.
     let hints = mfile::network::canonicalize(&mut expansion.spec)
         .map_err(|error| network_key_invalid(&expansion.spec, error))?;
-    let Some(egress) = expansion
-        .spec
-        .get("network")
-        .and_then(|network| network.get("egress"))
-    else {
+    let network = expansion.spec.get("network");
+    // `canonicalize` has rewritten a legacy spelling and refused a value
+    // that is not a mode, so the word is a current one.
+    let mode = match network
+        .and_then(|network| network.get("mode"))
+        .and_then(toml::Value::as_str)
+    {
+        Some("none") => Some(boxes::NetworkMode::NoNet),
+        Some("host_ip") => Some(boxes::NetworkMode::HostNet),
+        Some("own_ip") => Some(boxes::NetworkMode::OwnIp),
+        _ => None,
+    };
+    let Some(egress) = network.and_then(|network| network.get("egress")) else {
         return Ok(ProjectEgress {
             policy: None,
             hints,
+            mode,
+            layer: Some(layer),
         });
     };
     let mut egress: boxes::EgressPolicy =
@@ -599,6 +630,8 @@ fn entry_egress(
     Ok(ProjectEgress {
         policy: Some(egress),
         hints,
+        mode,
+        layer: Some(layer),
     })
 }
 
@@ -2026,6 +2059,24 @@ pub(crate) fn flag_egress(
     }))
 }
 
+/// The line naming the masked network for each subnet flag that carries
+/// host bits, e.g. `--deny-subnets 10.0.0.1/8 is read as 10.0.0.0/8`.
+/// `min session activate`, `min task run` and `min box run` print them.
+pub(crate) fn subnet_notices(args: &crate::EgressArgs) -> Vec<String> {
+    let notices = |flag: &str, entries: &[String]| -> Vec<String> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                boxes::normalized_cidr(entry)
+                    .map(|normalized| format!("{flag} {entry} is read as {normalized}"))
+            })
+            .collect()
+    };
+    let mut lines = notices("--allow-subnets", &args.allow_subnets);
+    lines.extend(notices("--deny-subnets", &args.deny_subnets));
+    lines
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -2951,15 +3002,8 @@ pub(crate) async fn activate_box(
             // The notice is computed from the original flags, not the stored policy:
             // the policy now holds the normalized form, so reading it back would
             // print nothing.
-            for entry in &args.egress.allow_subnets {
-                if let Some(normalized) = boxes::normalized_cidr(entry) {
-                    eprintln!("--allow-subnets {entry} is read as {normalized}");
-                }
-            }
-            for entry in &args.egress.deny_subnets {
-                if let Some(normalized) = boxes::normalized_cidr(entry) {
-                    eprintln!("--deny-subnets {entry} is read as {normalized}");
-                }
+            for line in subnet_notices(&args.egress) {
+                eprintln!("{line}");
             }
             Ok::<_, anyhow::Error>(())
         })

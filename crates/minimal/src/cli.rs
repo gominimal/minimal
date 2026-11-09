@@ -469,6 +469,12 @@ pub enum BoxCommand {
     /// Create a box from an entry of the project, run it without a terminal
     /// and exit with its exit code. This command's stdin, stdout and stderr
     /// are the box's. `--detach` starts the box, prints its id and returns
+    ///
+    /// The box's network and egress come from `--network`, the egress flags
+    /// and the entry's `network` keys in minimal.toml, as for `min task
+    /// run`. This command's flags go before the entry's own arguments. A
+    /// network or egress flag after an entry argument is refused. An
+    /// argument that shares a flag's name goes after `--`.
     Run(BoxRunArgs),
     /// Run a command in a running box and exit with the command's exit
     /// code. `-t` gives the command a terminal, and `--detach` starts it
@@ -965,12 +971,20 @@ pub enum TaskCommand {
     /// Ctrl-C destroys its box instead. Use `min session attach` for
     /// interactive work.
     ///
-    /// The box's egress rules are the `network.egress` keys minimal.toml
-    /// declares for the task, in `[defaults]`, `[defaults.task]` or the
-    /// task's own entry. Each egress flag replaces the key it names. On a
-    /// host that runs boxes in a VM, which every macOS host is, `--network
-    /// own_ip` is refused. This command's flags go before the task's own
-    /// arguments. A task argument that shares a flag's name goes after `--`.
+    /// The box's network mode is `--network`, else the `network.mode`
+    /// minimal.toml declares for the task, else host_ip. Its egress rules
+    /// are the `network.egress` keys minimal.toml declares for the task, in
+    /// `[defaults]`, `[defaults.task]` or the task's own entry.
+    /// `--allow-subnets`, `--allow-dns-hosts` and `--deny-subnets` add to
+    /// the file's lists, and `--allow-protocols` replaces its list.
+    /// `--deny-all-egress` applies first: it drops the file's
+    /// `allow_subnets` and `allow_dns_hosts`, and the allow flags then add
+    /// theirs. On a host that runs boxes in a VM, which every macOS host
+    /// is, `own_ip` is refused.
+    ///
+    /// This command's flags go before the task's own arguments. A network
+    /// or egress flag after a task argument is refused. A task argument
+    /// that shares a flag's name goes after `--`.
     Run(TaskRunArgs),
 }
 
@@ -985,17 +999,16 @@ pub struct TaskRunArgs {
     #[arg(long)]
     pub path: Option<String>,
     // The same values and parser as `min session activate --network`, with
-    // help worded for a task box. With no flag, the box shares the host's
-    // network.
+    // help worded for a task box. With no flag, the box takes the task's
+    // `network.mode` from minimal.toml, else `NETWORK_DEFAULT`.
     #[arg(
         long,
         value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
-        default_value = NETWORK_DEFAULT,
         help = TASK_NETWORK_HELP,
         long_help = TASK_NETWORK_LONG_HELP
     )]
-    pub network: CliNetworkMode,
+    pub network: Option<CliNetworkMode>,
     #[command(flatten)]
     pub egress: EgressArgs,
     /// Start the box, print its id and return. The task gets no input.
@@ -1018,6 +1031,18 @@ pub struct BoxRunArgs {
     /// Start the box, print its id and return. The box gets no input
     #[arg(long)]
     pub detach: bool,
+    // `min task run`'s network flags, from the same definitions: both verbs
+    // run a declared task through one run path.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        help = TASK_NETWORK_HELP,
+        long_help = TASK_NETWORK_LONG_HELP
+    )]
+    pub network: Option<CliNetworkMode>,
+    #[command(flatten)]
+    pub egress: EgressArgs,
     /// Arguments to the entry, passed through to its declared `args`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
@@ -1383,23 +1408,25 @@ pub(crate) const NETWORK_LONG_HELP: &str = concat!(
      prints a one-line hint naming the current spelling."
 );
 
-/// The first paragraph of `min task run --network`'s help, as a literal so
-/// that [`TASK_NETWORK_LONG_HELP`] can extend it. `min task run` does not
-/// take `--ingress` yet (#3163), so this names neither a session nor ingress.
+/// The first paragraph of the `--network` help of `min task run` and `min
+/// box run`, as a literal so that [`TASK_NETWORK_LONG_HELP`] can extend it.
+/// Neither verb takes `--ingress` yet (#3163), so this names neither a
+/// session nor ingress.
 macro_rules! task_network_help {
     () => {
         "Network mode for the task box: `none` gives the box no network (every socket it opens \
-         to a destination outside itself fails), `host_ip` shares the host's network namespace \
-         (the default), and `own_ip` gives the box its own IP address; unless the host opts \
-         out, an `own_ip` box with no egress rules can reach no external address"
+         to a destination outside itself fails), `host_ip` shares the host's network namespace, \
+         and `own_ip` gives the box its own IP address; unless the host opts out, an `own_ip` \
+         box with no egress rules can reach no external address. With no flag, the box takes \
+         the `network.mode` minimal.toml declares for the task, else `host_ip`"
     };
 }
 
-/// The `min task run --network` short help.
+/// The `--network` short help of `min task run` and `min box run`.
 pub(crate) const TASK_NETWORK_HELP: &str = task_network_help!();
 
-/// The `min task run --network` long help: the short help, the VM-host
-/// refusal, and the legacy spellings.
+/// The `--network` long help of `min task run` and `min box run`: the short
+/// help, the VM-host refusal, and the legacy spellings.
 pub(crate) const TASK_NETWORK_LONG_HELP: &str = concat!(
     task_network_help!(),
     ".\n\n",

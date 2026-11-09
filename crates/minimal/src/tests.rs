@@ -439,6 +439,9 @@ fn every_create_session_asserts_the_daemon_build() {
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",
             "task.rs::run_entry = asserts",
+            // A unit test's request, never sent: it checks what a run
+            // prints once its box exists.
+            "task.rs::run_notices = asserts nothing",
             // A unit test's request, never sent: it checks the task box's
             // network and egress.
             "task.rs::task_box_network_flags_reach_the_create_request = asserts nothing",
@@ -1706,38 +1709,38 @@ fn task_run_parses_task_and_path() {
     assert!(Cli::try_parse_from(["min", "task"]).is_err());
 }
 
-/// NET-060: `min task run` takes `min session activate`'s `--network` flag
-/// and egress flags from the same definitions: they parse before or after
-/// the task name, `--deny-all-egress` conflicts with every rule flag, and a
-/// flag after `--` is a task argument.
-#[test]
-fn task_run_parses_network_and_egress_flags() {
+/// `min <noun> run <args>…` parsed into the run it starts.
+fn parse_run(noun: &str, args: &[&str]) -> Result<task::RunEntry, clap::Error> {
     use clap::Parser as _;
-    let run_args = |args: &[&str]| -> TaskRunArgs {
-        match Cli::try_parse_from(args)
-            .unwrap_or_else(|error| panic!("{args:?} must parse: {error}"))
-            .command
-        {
-            Some(Command::Task(TaskArgs {
-                command: TaskCommand::Run(a),
-            })) => a,
-            _ => panic!("expected `task run` for {args:?}"),
-        }
+    let line = ["min", noun, "run"].into_iter().chain(args.iter().copied());
+    match Cli::try_parse_from(line)?.command {
+        Some(Command::Task(TaskArgs {
+            command: TaskCommand::Run(a),
+        })) => Ok(a.into()),
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Run(a),
+        })) => Ok(a.into()),
+        _ => panic!("expected `{noun} run` for {args:?}"),
+    }
+}
+
+/// NET-060: `min task run` and `min box run` take `min session
+/// activate`'s `--network` flag and egress flags from the same definitions:
+/// they parse before or after the entry name, `--deny-all-egress`
+/// combines with every rule flag (arch#166), and a flag after `--` is the
+/// entry's argument. A network flag after an entry argument is refused
+/// before the run creates anything.
+fn run_parses_network_and_egress_flags(noun: &str) {
+    let run_args = |args: &[&str]| {
+        parse_run(noun, args).unwrap_or_else(|error| panic!("{args:?} must parse: {error}"))
     };
 
-    // No flag: the `host_ip` default and no egress flag.
-    let a = run_args(&["min", "task", "run", "build"]);
-    assert_eq!(a.network, CliNetworkMode::HostNet);
-    assert!(a.egress.allow_subnets.is_empty());
-    assert!(a.egress.allow_dns_hosts.is_empty());
-    assert!(a.egress.allow_protocols.is_empty());
-    assert!(a.egress.deny_subnets.is_empty());
-    assert!(!a.egress.deny_all_egress);
+    // No flag: no mode of the flag's own, and no egress flag.
+    let a = run_args(&["build"]);
+    assert_eq!(a.network, None);
+    assert_eq!(a.egress, EgressArgs::default());
 
     let a = run_args(&[
-        "min",
-        "task",
-        "run",
         "--network",
         "own_ip",
         "--allow-subnets",
@@ -1752,50 +1755,86 @@ fn task_run_parses_network_and_egress_flags() {
         "169.254.169.254/32",
         "build",
     ]);
-    assert_eq!(a.task, "build");
-    assert_eq!(a.network, CliNetworkMode::OwnIp);
+    assert_eq!(a.entry, "build");
+    assert_eq!(a.network, Some(CliNetworkMode::OwnIp));
     assert_eq!(a.egress.allow_subnets, ["10.0.0.0/8"]);
     assert_eq!(a.egress.allow_dns_hosts, ["github.com", "api.github.com"]);
     assert_eq!(a.egress.allow_protocols, ["tcp"]);
     assert_eq!(a.egress.deny_subnets, ["169.254.169.254/32"]);
     assert!(a.args.is_empty());
 
-    // After the task name, before its arguments.
-    let a = run_args(&[
-        "min",
-        "task",
-        "run",
-        "build",
-        "--network",
-        "none",
-        "--deny-all-egress",
-    ]);
-    assert_eq!(a.network, CliNetworkMode::NoNet);
+    // After the entry name, before its arguments.
+    let a = run_args(&["build", "--network", "none", "--deny-all-egress"]);
+    assert_eq!(a.network, Some(CliNetworkMode::NoNet));
     assert!(a.egress.deny_all_egress);
     assert!(a.args.is_empty());
 
-    // After `--`, a flag's name is the task's argument.
-    let a = run_args(&["min", "task", "run", "build", "--", "--network", "x"]);
-    assert_eq!(a.network, CliNetworkMode::HostNet);
-    assert_eq!(a.args, ["--network", "x"]);
-
-    let err = Cli::try_parse_from([
-        "min",
-        "task",
-        "run",
+    // `--deny-all-egress` combines with the rule flags.
+    let a = run_args(&[
         "--deny-all-egress",
         "--allow-dns-hosts",
-        "github.com",
+        "api.example",
+        "--deny-subnets",
+        "10.0.0.0/8",
         "build",
-    ])
-    .map(|_| ())
-    .expect_err("--deny-all-egress conflicts with a rule flag");
-    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    ]);
+    assert!(a.egress.deny_all_egress);
+    assert_eq!(a.egress.allow_dns_hosts, ["api.example"]);
+    assert_eq!(a.egress.deny_subnets, ["10.0.0.0/8"]);
+
+    // After `--`, a flag's name is the entry's argument.
+    let a = run_args(&["build", "--", "--network", "x"]);
+    assert_eq!(a.network, None);
+    assert_eq!(a.args, ["--network", "x"]);
+    let typed = |args: &[&str]| {
+        ["min", noun, "run"]
+            .iter()
+            .chain(args)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        task::misplaced_run_flag(&typed(&["build", "--", "--network", "x"]), &a.args),
+        None,
+        "a flag after `--` is passed through"
+    );
+
+    // After an entry argument, a network flag reaches the entry and not the
+    // box, so the run refuses it, alone or with `=value`.
+    for line in [
+        &["build", "foo", "--deny-all-egress"][..],
+        &["build", "foo", "--network", "none"],
+        &["build", "foo", "--allow-dns-hosts=api.example"],
+        &["build", "foo", "--deny-subnets", "10.0.0.0/8"],
+    ] {
+        let a = run_args(line);
+        assert_eq!(a.egress, EgressArgs::default(), "{line:?}");
+        assert_eq!(a.network, None, "{line:?}");
+        assert_eq!(
+            task::misplaced_run_flag(&typed(line), &a.args),
+            Some(line[2]),
+            "{line:?}"
+        );
+    }
+    // A `--` among the arguments passes everything after it through.
+    let line = ["build", "foo", "--", "--deny-all-egress"];
+    let a = run_args(&line);
+    assert_eq!(task::misplaced_run_flag(&typed(&line), &a.args), None);
 
     assert!(
-        Cli::try_parse_from(["min", "task", "run", "--network", "bridge", "build"]).is_err(),
+        parse_run(noun, &["--network", "bridge", "build"]).is_err(),
         "an unknown network mode is refused by the shared parser"
     );
+}
+
+#[test]
+fn task_run_parses_network_and_egress_flags() {
+    run_parses_network_and_egress_flags("task");
+}
+
+#[test]
+fn box_run_parses_network_and_egress_flags() {
+    run_parses_network_and_egress_flags("box");
 }
 
 // BCLI-011: `min task run` is the task noun's run verb, `min box run` runs
@@ -2097,6 +2136,8 @@ async fn run_pty_entry_exit2_hints_start_new() {
                 entry: "default".into(),
                 path: None,
                 detach: false,
+                network: None,
+                egress: EgressArgs::default(),
                 args: vec![],
             },
         )
@@ -2107,7 +2148,7 @@ async fn run_pty_entry_exit2_hints_start_new() {
             TaskRunArgs {
                 task: "default".into(),
                 path: None,
-                network: CliNetworkMode::HostNet,
+                network: None,
                 egress: EgressArgs::default(),
                 detach: true,
                 args: vec![],
@@ -2177,11 +2218,15 @@ fn run_and_start_new_request_fresh_instance() {
     assert_eq!(request.config.name, None, "the client invents no name");
 
     // Both verbs reach the one run path.
+    let egress = EgressArgs {
+        allow_dns_hosts: vec!["github.com".into()],
+        ..EgressArgs::default()
+    };
     let task_run = task::RunEntry::from(TaskRunArgs {
         task: "build".into(),
         path: None,
-        network: CliNetworkMode::HostNet,
-        egress: EgressArgs::default(),
+        network: Some(CliNetworkMode::OwnIp),
+        egress: egress.clone(),
         detach: false,
         args: vec![],
     });
@@ -2189,10 +2234,15 @@ fn run_and_start_new_request_fresh_instance() {
         entry: "build".into(),
         path: None,
         detach: false,
+        network: Some(CliNetworkMode::OwnIp),
+        egress,
         args: vec![],
     });
     assert_eq!(task_run.entry, box_run.entry);
     assert_eq!(task_run.args, box_run.args);
+    // Both carry the network and egress flags to the one run path.
+    assert_eq!(task_run.network, box_run.network);
+    assert_eq!(task_run.egress, box_run.egress);
     // That path marks its create as a fresh instance, before it sends it.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(manifest.join("src/task.rs")).unwrap();
@@ -3280,54 +3330,71 @@ async fn proxy_exits_when_the_daemon_closes_the_socket() {
     .expect("a bridge that ends on a closed socket is not an error");
 }
 
-/// `min task run --network` has its own help, worded for a task box: it
-/// names neither a session nor `--ingress`, which `min task run` does not
-/// take yet (#3163). `min session activate --network` keeps the session wording.
+/// `min task run --network` and `min box run --network` have their own
+/// help, worded for a task box: it names neither a session nor
+/// `--ingress`, which neither verb takes yet (#3163), and says the box
+/// takes the task's `network.mode` with no flag. Both verbs' help says a
+/// list egress flag adds to minimal.toml's list and `--deny-all-egress`
+/// applies first (arch#166, #3143). `min session activate --network` keeps
+/// the session wording.
 #[test]
 fn task_run_help_describes_the_task_box_network() {
     use clap::CommandFactory as _;
 
+    let short = "Network mode for the task box: `none` gives the box no network (every socket \
+                 it opens to a destination outside itself fails), `host_ip` shares the host's \
+                 network namespace, and `own_ip` gives the box its own IP address; unless the \
+                 host opts out, an `own_ip` box with no egress rules can reach no external \
+                 address. With no flag, the box takes the `network.mode` minimal.toml declares \
+                 for the task, else `host_ip`";
     let mut cmd = Cli::command();
-    let run = cmd
-        .find_subcommand_mut("task")
-        .expect("`task` stays a subcommand")
-        .find_subcommand_mut("run")
-        .expect("`task run` stays a subcommand");
-    let network = run
-        .get_arguments()
-        .find(|a| a.get_id() == "network")
-        .expect("`task run` takes --network");
-    assert_eq!(
-        network.get_help().map(ToString::to_string).as_deref(),
-        Some(
-            "Network mode for the task box: `none` gives the box no network (every socket it \
-             opens to a destination outside itself fails), `host_ip` shares the host's network \
-             namespace (the default), and `own_ip` gives the box its own IP address; unless the \
-             host opts out, an `own_ip` box with no egress rules can reach no external address"
-        ),
-    );
-    assert_eq!(
-        network.get_long_help().map(ToString::to_string).as_deref(),
-        Some(concat!(
-            "Network mode for the task box: `none` gives the box no network (every socket it \
-             opens to a destination outside itself fails), `host_ip` shares the host's network \
-             namespace (the default), and `own_ip` gives the box its own IP address; unless the \
-             host opts out, an `own_ip` box with no egress rules can reach no external address.\n\n",
-            "On a host that runs boxes in a VM, `own_ip` is refused.\n\n",
-            "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but \
-             each prints a one-line hint naming the current spelling."
-        )),
-    );
+    for noun in ["task", "box"] {
+        let run = cmd
+            .find_subcommand_mut(noun)
+            .expect("the noun stays a subcommand")
+            .find_subcommand_mut("run")
+            .expect("`run` stays a subcommand");
+        let network = run
+            .get_arguments()
+            .find(|a| a.get_id() == "network")
+            .expect("`run` takes --network");
+        assert_eq!(
+            network.get_help().map(ToString::to_string).as_deref(),
+            Some(short),
+        );
+        assert_eq!(
+            network.get_long_help().map(ToString::to_string),
+            Some(format!(
+                "{short}.\n\nOn a host that runs boxes in a VM, `own_ip` is refused.\n\n\
+                 The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still \
+                 accepted, but each prints a one-line hint naming the current spelling."
+            )),
+        );
 
-    let help = run.render_long_help().to_string();
-    assert!(
-        help.contains("--network <none|host_ip|own_ip>"),
-        "--help must advertise the network modes: {help}"
-    );
-    assert!(
-        !help.contains("--ingress"),
-        "`task run` does not take --ingress yet (#3163): {help}"
-    );
+        let help = run.render_long_help().to_string();
+        assert!(
+            help.contains("--network <none|host_ip|own_ip>"),
+            "--help must advertise the network modes: {help}"
+        );
+        assert!(
+            !help.contains("--ingress"),
+            "`{noun} run` does not take --ingress yet (#3163): {help}"
+        );
+        for line in [
+            "Adds to the `allow_subnets` that minimal.toml declares for the box",
+            "Adds to the `deny_subnets` that minimal.toml",
+            "Replaces the `allow_protocols` that minimal.toml declares",
+            "Applied before the other egress flags",
+        ] {
+            assert!(
+                help.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(line),
+                "`{noun} run --help` must say: {line}: {help}"
+            );
+        }
+    }
 
     let activate = cmd
         .find_subcommand_mut("session")
