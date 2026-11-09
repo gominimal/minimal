@@ -991,9 +991,9 @@ struct EffectiveEgress {
 /// a session box (NET-060), with the hint for each legacy spelling that the
 /// file uses.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ProjectEgress {
-    policy: Option<boxes::EgressPolicy>,
-    hints: Vec<String>,
+pub(crate) struct ProjectEgress {
+    pub(crate) policy: Option<boxes::EgressPolicy>,
+    pub(crate) hints: Vec<String>,
 }
 
 /// The project's [`ProjectEgress`]. The layers are `[defaults]`,
@@ -1003,10 +1003,14 @@ struct ProjectEgress {
 /// one. With no session entry, the implicit default entry applies. Only the
 /// `network` keys of the layers are read, so a key this read does not own
 /// never refuses an activation. The policy is `None` when there is no
-/// project file or no layer declares egress.
-fn project_egress(project: &camino::Utf8Path) -> anyhow::Result<ProjectEgress> {
+/// project file or no layer declares egress. A start passes the `entry` it
+/// picked, and that entry is the session entry here.
+pub(crate) fn project_egress(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+) -> anyhow::Result<ProjectEgress> {
     match project_file_bytes(project)? {
-        Some(bytes) => project_egress_from(&bytes),
+        Some(bytes) => project_egress_from(&bytes, entry),
         None => Ok(ProjectEgress::default()),
     }
 }
@@ -1040,14 +1044,22 @@ fn declares_network(file: &toml::Table, entries: &[mfile::entry::BoxEntry]) -> b
             .any(|entry| entry.body.contains_key("network"))
 }
 
-/// [`project_egress`] over the bytes of a `minimal.toml`.
-fn project_egress_from(bytes: &[u8]) -> anyhow::Result<ProjectEgress> {
+/// [`project_egress`] over the bytes of a `minimal.toml`. A start that names
+/// its `entry` reads the egress of that entry (BCLI-069). The start already
+/// picked it, so no default is picked here. With no `entry`, or with a name
+/// that only the implicit default entry answers, the pick applies.
+fn project_egress_from(bytes: &[u8], entry: Option<&str>) -> anyhow::Result<ProjectEgress> {
     let file: toml::Table = toml::from_slice(bytes).map_err(|e| ProjectFileInvalid {
         error: mfile::Error::Format(e),
     })?;
     let entries =
         mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?;
-    let entry = match pick_session_entry(&entries) {
+    let typed = entry.and_then(|name| entries.iter().find(|entry| entry.name == name));
+    let picked = match typed {
+        Some(entry) => Ok(entry.clone()),
+        None => pick_session_entry(&entries),
+    };
+    let entry = match picked {
         Ok(entry) => entry,
         // A file that declares no egress does not need a session entry for
         // it, so an undecided pick does not refuse its start.
@@ -2417,6 +2429,13 @@ pub(crate) fn stamp_session_spec(
 /// [`stamp_session_spec`] for the session entry `entry`, when it is not
 /// `default`, with `name` as the spec's `[box] name` (BCLI-069).
 ///
+/// The spec names the typed entry, but its body still comes from the
+/// project's `[session]` table through `BoxSpec::for_session`. The body of
+/// `[sessions.<entry>]` is not applied yet. That is the interim of
+/// gominimal/minimal#3204. Flip it when box creation reads entries
+/// (gominimal/minimal#2418): then expand the typed entry's body into the
+/// spec through BOX-064's layers.
+///
 /// # Errors
 ///
 /// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
@@ -2593,7 +2612,7 @@ pub(crate) async fn activate_box(
                 project_bep_and_grants(&utf8_path)?;
             // NET-060: the project's egress, with each field a flag names
             // replaced by the flag.
-            let project_egress = project_egress(&utf8_path)?;
+            let project_egress = project_egress(&utf8_path, options.entry.as_deref())?;
             // A legacy key spelling still loads. A start with no terminal
             // prints its hint, and an interactive start logs it, so no line
             // prints before the box shell.
@@ -5621,7 +5640,9 @@ mod tests {
         let sub = root.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
 
-        let project = project_egress(&sub).expect("the project file loads").policy;
+        let project = project_egress(&sub, None)
+            .expect("the project file loads")
+            .policy;
         let effective = effective_egress(project, None, false);
         let expected = boxes::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".into()]),
@@ -5654,6 +5675,7 @@ mod tests {
         let layered = project_egress_from(
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [sessions.default.network]\negress_allow_dns = [\"b.example\"]\n",
+            None,
         )
         .expect("the file loads");
         assert_eq!(
@@ -5669,6 +5691,7 @@ mod tests {
         // entry's egress, and `[sessions.default]` wins over another entry.
         let only_dev = project_egress_from(
             b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n",
+            None,
         )
         .unwrap()
         .policy
@@ -5680,6 +5703,7 @@ mod tests {
         let with_default = project_egress_from(
             b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n\n\
               [sessions.default.network.egress]\nallow_dns_hosts = [\"d.example\"]\n",
+            None,
         )
         .unwrap()
         .policy
@@ -5694,6 +5718,7 @@ mod tests {
         let boxes_dev = project_egress_from(
             b"[boxes.dev]\ntype = \"session\"\n\n\
               [boxes.dev.network.egress]\nallow_dns_hosts = [\"box.example\"]\n",
+            None,
         )
         .unwrap()
         .policy
@@ -5708,6 +5733,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n\n\
               [boxes.web]\ntype = \"session\"\n",
+            None,
         )
         .expect_err("two session entries and no default refuse the start");
         let undecided = refusal
@@ -5726,6 +5752,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [tasks.default]\ncommand = \"true\"\n",
+            None,
         )
         .expect_err("a task named default blocks the implicit session entry");
         let undecided = refusal
@@ -5743,6 +5770,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[boxes.dev]\ntype = \"devbox\"\n\n\
               [boxes.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n",
+            None,
         )
         .expect_err("an entry of an unresolved type refuses the start");
         let undecided = refusal
@@ -5759,6 +5787,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [boxes.default]\ntype = \"devbox\"\n",
+            None,
         )
         .expect_err("a default entry of an unresolved type refuses the start");
         let undecided = refusal
@@ -5778,6 +5807,7 @@ mod tests {
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [boxes.dev]\ntype = \"devbox\"\n\n\
               [sessions.default]\npackages = [\"git\"]\n",
+            None,
         )
         .expect("a [sessions.default] entry is picked over an unresolved entry")
         .policy
@@ -5790,6 +5820,7 @@ mod tests {
             b"[box_types.devbox]\nextends = \"session\"\n\n\
               [box_types.devbox.defaults.network.egress]\nallow_dns_hosts = [\"t.example\"]\n\n\
               [boxes.dev]\ntype = \"devbox\"\n",
+            None,
         )
         .expect_err("egress in a type's defaults refuses an undecided start");
         assert!(
@@ -5817,6 +5848,7 @@ mod tests {
         // when its session entry cannot be picked.
         let no_egress = project_egress_from(
             b"[sessions.dev]\npackages = [\"git\"]\n\n[sessions.web]\npackages = [\"git\"]\n",
+            None,
         )
         .expect("a file without egress keys does not refuse the start");
         assert_eq!(no_egress.policy, None);
@@ -5825,6 +5857,7 @@ mod tests {
         // `ProjectFileInvalid`, which `main.rs` ends with exit 3.
         let refusal = project_egress_from(
             b"[defaults.network.egress]\nallow_protocols = [\"carrier-pigeon\"]\n",
+            None,
         )
         .expect_err("an unknown protocol refuses the start");
         assert!(
@@ -5839,6 +5872,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[defaults.network]\nmode = \"none\"\n\n\
               [defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n",
+            None,
         )
         .expect_err("egress with mode none refuses the start");
         let refusal = refusal
@@ -5854,7 +5888,7 @@ mod tests {
 
         // No egress keys, and no project file, declare nothing.
         assert_eq!(
-            project_egress_from(b"[session]\npackages = [\"git\"]\n").unwrap(),
+            project_egress_from(b"[session]\npackages = [\"git\"]\n", None).unwrap(),
             ProjectEgress::default()
         );
         assert_eq!(
@@ -5872,6 +5906,7 @@ mod tests {
               allow_subnets = [\"10.0.0.0/8\"]\n\
               allow_dns_hosts = [\"github.com\"]\n\
               deny_subnets = [\"169.254.169.254/32\"]\n",
+            None,
         )
         .unwrap()
         .policy;

@@ -2465,6 +2465,61 @@ fn create_verbs_name_flag_overrides_box_name() {
     );
 }
 
+/// The egress that `argv`, a `min session start` in a project with
+/// `toml` as its `minimal.toml`, puts on its create request. No egress flag
+/// is set, so the request carries the project's egress as read here.
+fn session_start_egress(argv: &[&str], toml: &str) -> anyhow::Result<Option<boxes::EgressPolicy>> {
+    let cli = Cli::try_parse_from(argv).unwrap();
+    let Some(Command::Session(SessionArgs {
+        command: SessionCommand::Start(args),
+    })) = cli.command
+    else {
+        panic!("not a session start");
+    };
+    let StartPlan::Session { options, .. } =
+        plan_start(&StartEntry::from(args), &start_entries(toml), true)?
+    else {
+        panic!("a session entry starts a session");
+    };
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    Ok(project_egress(root, options.entry.as_deref())?.policy)
+}
+
+// BCLI-069: a typed session entry starts with its own egress, not with the
+// egress of the `default` entry. With no `default`, a typed entry still
+// starts when every session entry declares egress.
+#[test]
+fn session_start_typed_entry_reads_its_own_egress() {
+    let with_default = "[sessions.default]\n\
+                        [sessions.default.network.egress]\n\
+                        allow_dns_hosts = [\"example.com\"]\n\n\
+                        [sessions.ci]\n";
+    let ci =
+        session_start_egress(&["min", "session", "start", "ci"], with_default).expect("ci starts");
+    assert!(
+        !format!("{ci:?}").contains("example.com"),
+        "ci gets the egress of default: {ci:?}"
+    );
+    let default = session_start_egress(&["min", "session", "start"], with_default)
+        .expect("default starts")
+        .expect("default declares egress");
+    assert_eq!(
+        default.allow_dns_hosts,
+        Some(vec!["example.com".to_owned()])
+    );
+
+    let no_default = "[sessions.a.network.egress]\n\
+                      allow_dns_hosts = [\"a.example\"]\n\n\
+                      [sessions.b.network.egress]\n\
+                      allow_dns_hosts = [\"b.example\"]\n";
+    let a = session_start_egress(&["min", "session", "start", "a"], no_default)
+        .expect("a typed entry needs no default")
+        .expect("a declares egress");
+    assert_eq!(a.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
+}
+
 // BCLI-069: a start without `--new` whose name a running box holds exits
 // 2, names the holder, and names `--new` and `--name`.
 #[test]
