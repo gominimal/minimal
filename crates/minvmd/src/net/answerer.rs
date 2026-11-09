@@ -2323,6 +2323,17 @@ pub(crate) fn account_group_list(name: &str, primary: u32) -> Option<Vec<u32>> {
     type Group = libc::c_int;
     #[cfg(not(target_os = "macos"))]
     type Group = libc::gid_t;
+    // A reported entry as a gid: a negative `int` is no group on macOS,
+    // and on Linux the entry is a gid already (clippy's useless_conversion
+    // would fire on a `try_from` there).
+    #[cfg(target_os = "macos")]
+    fn gid_of(group: Group) -> Option<u32> {
+        u32::try_from(group).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn gid_of(group: Group) -> Option<u32> {
+        Some(group)
+    }
     // On truncation macOS reports the count stored, Linux the count
     // needed; either way a failed call is retried with a larger buffer,
     // up to a bound no real account reaches.
@@ -2346,7 +2357,7 @@ pub(crate) fn account_group_list(name: &str, primary: u32) -> Option<Vec<u32>> {
                 groups
                     .iter()
                     .take(count)
-                    .filter_map(|g| u32::try_from(*g).ok())
+                    .filter_map(|g| gid_of(*g))
                     .collect(),
             );
         }
