@@ -6,9 +6,7 @@ name: merge-back
 #
 # NOT READY TO ENABLE. Karl has not agreed the design, and the push needs a
 # bypass actor on the `main` ruleset. Without that actor the push is refused.
-# The App key must also move into a protected environment that only `main` can
-# deploy to: as a repository secret, a workflow on any branch can mint a token.
-# Follow the manual merge in the release steps until all three are done.
+# Follow the manual merge in the release steps until both are done.
 
 on:
     workflow_dispatch:
@@ -34,6 +32,9 @@ jobs:
         # Only main's copy of this workflow and of merge-back.sh may push to
         # main, so a dispatch from any other branch does nothing.
         if: github.ref == 'refs/heads/main'
+        # The minimal-shipper key lives in the `release` environment, which
+        # only main and release/* can deploy to.
+        environment: release
         runs-on: ubuntu-latest
         timeout-minutes: 15
         permissions:
@@ -90,12 +91,12 @@ jobs:
 
             # A bypass applies to the App, so any token it mints with contents
             # write can bypass the `main` ruleset. Minted only after the check.
-            - name: Mint token (gominimal-aw-bot)
+            - name: Mint token (minimal-shipper)
               id: app-token
               uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
               with:
-                  app-id: ${{ vars.AW_BOT_APP_ID }}
-                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  app-id: ${{ vars.MINIMAL_SHIPPER_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_SHIPPER_PRIVATE_KEY }}
                   owner: gominimal
                   repositories: minimal
                   permission-contents: write
@@ -103,10 +104,10 @@ jobs:
             - name: Merge and push
               env:
                   GH_TOKEN: ${{ steps.app-token.outputs.token }}
-                  GIT_AUTHOR_NAME: gominimal-aw-bot[bot]
-                  GIT_AUTHOR_EMAIL: 281738952+gominimal-aw-bot[bot]@users.noreply.github.com
-                  GIT_COMMITTER_NAME: gominimal-aw-bot[bot]
-                  GIT_COMMITTER_EMAIL: 281738952+gominimal-aw-bot[bot]@users.noreply.github.com
+                  GIT_AUTHOR_NAME: minimal-shipper[bot]
+                  GIT_AUTHOR_EMAIL: 354583747+minimal-shipper[bot]@users.noreply.github.com
+                  GIT_COMMITTER_NAME: minimal-shipper[bot]
+                  GIT_COMMITTER_EMAIL: 354583747+minimal-shipper[bot]@users.noreply.github.com
                   REVIEWED: ${{ inputs.reviewed }}
                   VERSION: ${{ inputs.version }}
               run: |

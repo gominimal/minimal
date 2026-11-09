@@ -649,9 +649,8 @@ that is not marked Latest.
 ### merge-back.yml: merge a line into main
 
 > Not ready to enable. The design needs agreement. The `main` ruleset needs a
-> bypass actor for the App. The App key needs a protected environment that only
-> `main` can deploy to. Until then, use the manual merge in the release
-> steps. The job runs only when dispatched from `main`.
+> bypass actor for the `minimal-shipper` App. Until then, use the manual merge
+> in the release steps. The job runs only when dispatched from `main`.
 
 [`.github/workflows/merge-back.yml`](../../.github/workflows/merge-back.yml)
 does the manual merge-back as one run, outside the merge queue. The queue
@@ -715,7 +714,7 @@ the line, retitle the source PR as `fix`, then remove the label and add it
 again. A retitle does not remove a footer, so backport that change by hand.
 
 **The backport PR.** The action cherry-picks the squash commit to the branch
-`backport/<number>-to-release/X.Y.x`. It opens the PR as `gominimal-aw-bot`,
+`backport/<number>-to-release/X.Y.x`. It opens the PR as `minimal-shipper`,
 with the title of the source PR. The body names the source PR. It does not copy
 the source body, because agent-runtime reads `Closes #n` in a PR body as a link
 to an epic.
