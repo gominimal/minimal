@@ -2683,15 +2683,11 @@ pub(crate) async fn read_answerer_step_with_job(job: AnswererJob) -> AnswererSte
         None => None,
     };
     let shared = unit_text
-        .as_deref()
         .and_then(unit_admit_group)
         .map(|group| SharedService {
             group_name: group.to_string(),
             group: group_gid(group),
-            account_uid: unit_text
-                .as_deref()
-                .and_then(unit_user_name)
-                .and_then(account_uid),
+            account_uid: unit_text.and_then(unit_user_name).and_then(account_uid),
         });
     let channel_group = tokio::fs::metadata(&minvmd::net::answerer::resolve_channel_sock())
         .await
@@ -2702,13 +2698,9 @@ pub(crate) async fn read_answerer_step_with_job(job: AnswererJob) -> AnswererSte
         program: file_custody(ANSWERER_PROGRAM_PATH).await,
         units,
         unit_program: unit_text
-            .as_deref()
             .and_then(unit_program_argument)
             .map(str::to_string),
-        unit_log: unit_text
-            .as_deref()
-            .and_then(unit_log_path)
-            .map(str::to_string),
+        unit_log: unit_text.and_then(unit_log_path).map(str::to_string),
         channel_mode: channel.map(|custody| custody.mode),
         channel_owner: channel.map(|custody| custody.owner),
         operator_uid,
