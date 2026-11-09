@@ -31,6 +31,7 @@
 #   packaging/macos/pkg/build-pkg.sh (--version V | --channel stable|unstable)
 #                                    [--with <manifest dest>=<path>]...
 #                                    [--sign "<Developer ID Installer identity>"]
+#                                    [--dmg [--sign-dmg "<Developer ID Application identity>"]]
 #                                    [--out DIR]
 #
 #   --version V      The staged release to package (versions/V/ in the bucket).
@@ -56,6 +57,19 @@
 #                    verdict, staple the ticket, and assess the result as
 #                    Gatekeeper would (`spctl --assess --type install`). Needs
 #                    --sign.
+#   --dmg            Also write a disk image beside the package, for a
+#                    download page: a read-only compressed volume named
+#                    "Minimal" with the package alone at its top. A person
+#                    opens the image and double-clicks the package; an MDM
+#                    takes the package itself. With --notarize the image is
+#                    notarized and stapled too, so a Mac offline at first
+#                    open still sees the ticket.
+#   --sign-dmg ID    Sign the disk image with a Developer ID Application
+#                    identity (the one the binaries carry; a disk image is
+#                    not an installer package, so the Installer identity
+#                    does not apply). Optional: Gatekeeper judges the
+#                    package inside on a double-click. Needs --dmg and
+#                    --sign; refused on a test build as --sign is.
 #   --min-os VER     The oldest macOS the package installs on (default 15.0,
 #                    the first with the hypervisor minvmd needs on Apple
 #                    Silicon). Installer refuses an older Mac before any
@@ -69,7 +83,7 @@
 # moves them to an older copy elsewhere on the disk.
 #
 # Requires: curl, shasum, pkgbuild, productbuild, codesign (Xcode CLT);
-# xcrun notarytool and stapler for --notarize.
+# hdiutil for --dmg; xcrun notarytool and stapler for --notarize.
 # Env: MINIMAL_OVERRIDE_INSTALLER_BUCKET overrides the bucket, as for the
 # installer.
 #
@@ -94,6 +108,8 @@ OUT="$ROOT/target/pkg"
 SIGN=""
 NOTARIZE=""
 MIN_OS="15.0"
+DMG=0
+SIGN_DMG=""
 declare -a WITH=()
 
 while [ $# -gt 0 ]; do
@@ -103,6 +119,8 @@ while [ $# -gt 0 ]; do
         --with) WITH+=("${2:?--with needs dest=path}"); shift 2 ;;
         --sign) SIGN="${2:?--sign needs an identity}"; shift 2 ;;
         --notarize) NOTARIZE="${2:?--notarize needs a notarytool keychain profile}"; shift 2 ;;
+        --dmg) DMG=1; shift ;;
+        --sign-dmg) SIGN_DMG="${2:?--sign-dmg needs an identity}"; shift 2 ;;
         --min-os) MIN_OS="${2:?--min-os needs a version}"; shift 2 ;;
         --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -119,6 +137,9 @@ case "$MIN_OS" in
     *) die "--min-os takes a version such as 15.0" ;;
 esac
 [ -z "$NOTARIZE" ] || [ -n "$SIGN" ] || die "--notarize needs --sign: Apple notarizes signed packages only"
+[ -z "$SIGN_DMG" ] || [ "$DMG" -eq 1 ] || die "--sign-dmg needs --dmg"
+[ -z "$SIGN_DMG" ] || [ -n "$SIGN" ] || die "--sign-dmg needs --sign: a signed image around an unsigned package would say more than is true"
+[ "$DMG" -eq 0 ] || command -v hdiutil >/dev/null || die "hdiutil is not on PATH"
 if [ -n "$CHANNEL" ]; then
     [ -z "$VERSION" ] || die "give --version or --channel, not both"
     case "$CHANNEL" in stable|unstable) ;; *) die "--channel takes stable or unstable" ;; esac
@@ -343,7 +364,40 @@ if [ -n "$NOTARIZE" ]; then
     spctl --assess --type install -vv "$pkg" || die "Gatekeeper does not accept the notarized package"
 fi
 du -h "$pkg"
+# --- 5. The disk image, for a download page ---------------------------------
+# One volume, one package at its top: nothing else for a person to
+# double-click. Read-only and compressed (UDZO), checksummed on attach.
+# The image is a wrapper: the package inside carries the signature and
+# the ticket Gatekeeper judges on a double-click. It is signed and
+# notarized itself when asked, so Finder shows no warning on the image
+# either and a Mac offline at first open finds the ticket stapled.
+dmg=""
+if [ "$DMG" -eq 1 ]; then
+    dmg="${pkg%.pkg}.dmg"
+    stage="$work/dmg-root"
+    mkdir -p "$stage"
+    cp "$pkg" "$stage/"
+    rm -f "$dmg"
+    echo "==> hdiutil create $(basename "$dmg")"
+    hdiutil create -quiet -volname "Minimal" -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg" \
+        || die "hdiutil could not create the disk image"
+    if [ -n "$SIGN_DMG" ]; then
+        echo "==> codesign the disk image, $SIGN_DMG"
+        codesign --force --timestamp --sign "$SIGN_DMG" "$dmg" || die "the disk image did not sign"
+    fi
+    if [ -n "$NOTARIZE" ]; then
+        echo "==> notarytool submit (profile $NOTARIZE) for the disk image, waiting for Apple"
+        xcrun notarytool submit "$dmg" --keychain-profile "$NOTARIZE" --wait \
+            || die "the disk image's notarization did not succeed; xcrun notarytool log <id> --keychain-profile $NOTARIZE says why"
+        echo "==> stapler staple (disk image)"
+        xcrun stapler staple "$dmg" || die "stapling the disk image failed"
+    fi
+    echo "==> hdiutil verify"
+    hdiutil verify -quiet "$dmg" || die "the disk image does not verify"
+    du -h "$dmg"
+fi
 echo "distribution: arm64 only, macOS $MIN_OS or later, local system, $i bundle(s) pinned"
 echo "receipt $ID $version, release $VERSION, bundle $bundle_signing$( [ "$test_build" -eq 1 ] && echo ', TEST BUILD')$( [ -n "$NOTARIZE" ] && echo ', notarized and stapled')"
 echo "install: sudo installer -pkg $pkg -target /"
+[ -z "$dmg" ] || echo "download page: $dmg (open it, double-click $(basename "$pkg"))"
 echo "remove:  sudo /usr/local/share/minimal/uninstall.sh"
