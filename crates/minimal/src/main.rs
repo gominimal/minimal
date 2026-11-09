@@ -244,7 +244,10 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), 124 when an exec ran past its own timeout
+/// is not running, 5 when its spec turns exec off), 2 when a start cannot
+/// pick or start its entry (`minimal::StartEntryRefusal`), needs a terminal
+/// it does not have (`minimal::StartNeedsTerminal`) or asks for a held name
+/// (`minimal::StartNameHeld`), 124 when an exec ran past its own timeout
 /// (`minimal::BoxExecTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
@@ -270,6 +273,18 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-005: `min box prune` off a terminal without `--yes`.
     if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
         return minimal::PruneNeedsYes::EXIT_CODE;
+    }
+    // BCLI-029: a start off a terminal of an entry with a terminal.
+    if e.downcast_ref::<minimal::StartNeedsTerminal>().is_some() {
+        return minimal::StartNeedsTerminal::EXIT_CODE;
+    }
+    // BCLI-071, BCLI-072: a start that cannot pick or start its entry.
+    if e.downcast_ref::<minimal::StartEntryRefusal>().is_some() {
+        return minimal::StartEntryRefusal::EXIT_CODE;
+    }
+    // BCLI-069: a start whose name a running box holds.
+    if e.downcast_ref::<minimal::StartNameHeld>().is_some() {
+        return minimal::StartNameHeld::EXIT_CODE;
     }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {

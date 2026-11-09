@@ -35,6 +35,65 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         .map_err(activate_refusal)
 }
 
+/// `min session start [<entry>]`: create a box from a session entry and
+/// attach this terminal to it, or print its id and return (BCLI-029).
+pub async fn cmd_session_start(
+    global: &GlobalArgs,
+    args: SessionStartArgs,
+) -> Result<(), anyhow::Error> {
+    start_entry(global, args.into())
+        .await
+        .map_err(activate_refusal)
+}
+
+/// The entry `min session start` starts (BCLI-071): the typed session
+/// entry, else the session entry named `default`, else the project's only
+/// session entry. The count includes the implicit `default` session entry.
+pub(crate) fn pick_session_start_entry(
+    entries: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, StartEntryRefusal> {
+    let candidates = start_candidates(entries);
+    let sessions: Vec<&mfile::entry::BoxEntry> =
+        candidates.iter().filter(|e| is_session_entry(e)).collect();
+    let names = || sessions.iter().map(|entry| entry.name.clone()).collect();
+    if let Some(typed) = typed {
+        return match candidates.iter().find(|entry| entry.name == typed) {
+            Some(entry) if is_session_entry(entry) => Ok(entry.clone()),
+            Some(entry) => Err(StartEntryRefusal::NotSession {
+                entry: entry.name.clone(),
+                box_type: entry.box_type.clone(),
+            }),
+            None => Err(StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: typed.to_string(),
+                entries: names(),
+            }),
+        };
+    }
+    if let Some(default) = sessions
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok((*default).clone());
+    }
+    match sessions.as_slice() {
+        [only] => Ok((*only).clone()),
+        // No session entry and no implicit `default`: an entry of another
+        // type holds the name `default` (BOX-165).
+        [] => Err(StartEntryRefusal::DefaultBlocked {
+            box_type: entries
+                .iter()
+                .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+                .and_then(|entry| entry.box_type.clone()),
+        }),
+        _ => Err(StartEntryRefusal::Several {
+            verb: StartVerb::Session,
+            entries: names(),
+        }),
+    }
+}
+
 /// The error `min session activate` ends with (NET-144). When the daemon
 /// refused the activation because a declared host port is already in use,
 /// the refusal's own text replaces the whole chain: it names the port, its

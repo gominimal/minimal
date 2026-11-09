@@ -248,6 +248,551 @@ impl SessionEntryUndecided {
     pub const EXIT_CODE: u8 = 2;
 }
 
+/// The verb a start came from: `min box start` or `min session start`.
+/// Both share one start path ([`start_entry`]). The verb decides which
+/// entries the start counts, and it names the command in the refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartVerb {
+    Box,
+    Session,
+}
+
+impl StartVerb {
+    /// The command, as the person types it.
+    #[must_use]
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Box => "min box start",
+            Self::Session => "min session start",
+        }
+    }
+}
+
+/// What a start creates its box from, whichever verb typed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartEntry {
+    pub verb: StartVerb,
+    /// The entry the person typed, when they typed one.
+    pub entry: Option<String>,
+    /// `--name`: the box's `[box] name` (BCLI-069).
+    pub name: Option<String>,
+    /// `--new`: a fresh instance (BCLI-070).
+    pub new: bool,
+    /// `--detach`: print the id and return, never attach.
+    pub detach: bool,
+}
+
+impl From<BoxStartArgs> for StartEntry {
+    fn from(args: BoxStartArgs) -> Self {
+        Self {
+            verb: StartVerb::Box,
+            entry: args.entry,
+            name: args.name,
+            new: args.new,
+            detach: args.detach,
+        }
+    }
+}
+
+impl From<SessionStartArgs> for StartEntry {
+    fn from(args: SessionStartArgs) -> Self {
+        Self {
+            verb: StartVerb::Session,
+            entry: args.entry,
+            name: args.name,
+            new: args.new,
+            detach: args.detach,
+        }
+    }
+}
+
+/// The built-in root of a Box Type, for a built-in type. The client cannot
+/// resolve a project Box Type, so it has none here.
+fn builtin_root(box_type: &str) -> Option<&'static str> {
+    mfile::expand::BUILTIN_BOX_TYPES
+        .into_iter()
+        .find(|builtin| *builtin == box_type)
+}
+
+/// The entries a start counts: the project's entries, and the implicit
+/// `default` session entry when the project needs one (BOX-165).
+pub(crate) fn start_candidates(entries: &[mfile::entry::BoxEntry]) -> Vec<mfile::entry::BoxEntry> {
+    let mut candidates = entries.to_vec();
+    if let Some(implicit) = mfile::entry::implicit_default_entry(entries, builtin_root) {
+        candidates.push(implicit);
+    }
+    candidates
+}
+
+/// Whether `entry` is a session entry.
+pub(crate) fn is_session_entry(entry: &mfile::entry::BoxEntry) -> bool {
+    entry.box_type.as_deref() == Some(boxes::SESSION_BOX_TYPE)
+}
+
+/// The entry `min box start` starts (BCLI-072): the typed entry, else the
+/// entry named `default` of any type, else the project's only entry. The
+/// count includes the implicit `default` entry.
+pub(crate) fn pick_box_start_entry(
+    entries: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, StartEntryRefusal> {
+    let candidates = start_candidates(entries);
+    let names = || candidates.iter().map(|entry| entry.name.clone()).collect();
+    if let Some(typed) = typed {
+        return candidates
+            .iter()
+            .find(|entry| entry.name == typed)
+            .cloned()
+            .ok_or_else(|| StartEntryRefusal::Unknown {
+                verb: StartVerb::Box,
+                entry: typed.to_string(),
+                entries: names(),
+            });
+    }
+    if let Some(default) = candidates
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok(default.clone());
+    }
+    match candidates.as_slice() {
+        [only] => Ok(only.clone()),
+        _ => Err(StartEntryRefusal::Several {
+            verb: StartVerb::Box,
+            entries: names(),
+        }),
+    }
+}
+
+/// A start the project's `minimal.toml` cannot serve: the start cannot pick
+/// an entry, or the entry it names cannot start this way. The start refuses
+/// it before it creates anything, and the run ends with exit 2 (`main.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartEntryRefusal {
+    /// No entry was typed, several entries count, and none is `default`.
+    Several {
+        verb: StartVerb,
+        /// The entries the start counted, in the order the file is read.
+        entries: Vec<String>,
+    },
+    /// The typed entry is not one the start counts.
+    Unknown {
+        verb: StartVerb,
+        entry: String,
+        /// The entries the start counted, in the order the file is read.
+        entries: Vec<String>,
+    },
+    /// `min session start` found no session entry, and the entry named
+    /// `default` has another type, so no implicit `default` applies.
+    DefaultBlocked {
+        /// The type of the `default` entry, when the file gives one.
+        box_type: Option<String>,
+    },
+    /// `min session start` named an entry that is not a session entry.
+    NotSession {
+        entry: String,
+        box_type: Option<String>,
+    },
+    /// `min box start` named an entry of a type it cannot start yet.
+    UnsupportedType {
+        entry: String,
+        box_type: Option<String>,
+    },
+}
+
+impl StartEntryRefusal {
+    /// The usage-refusal code of the architecture's exit-code table.
+    pub const EXIT_CODE: u8 = 2;
+}
+
+/// The type of an entry, as a refusal names it.
+fn entry_kind(box_type: Option<&str>) -> String {
+    box_type.map_or_else(
+        || "no type".to_owned(),
+        |t| format!("the type \"{}\"", printable(t)),
+    )
+}
+
+impl std::fmt::Display for StartEntryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = mfile::MFILE_NAME;
+        let noun = |verb: &StartVerb| match verb {
+            StartVerb::Box => "entries",
+            StartVerb::Session => "session entries",
+        };
+        match self {
+            Self::Several { verb, entries } => write!(
+                f,
+                "Cannot pick an entry to start. The project's {file} declares the {noun} \
+                 {names}, and none of them is named \"default\". Run {command} <entry> \
+                 with one of them.",
+                noun = noun(verb),
+                names = entries.join(", "),
+                command = verb.command(),
+            ),
+            Self::Unknown {
+                verb,
+                entry,
+                entries,
+            } => {
+                let singular = match verb {
+                    StartVerb::Box => "entry",
+                    StartVerb::Session => "session entry",
+                };
+                write!(
+                    f,
+                    "Cannot start {entry}. The project's {file} declares no {singular} \
+                     named \"{entry}\".",
+                    entry = printable(entry),
+                )?;
+                if entries.is_empty() {
+                    Ok(())
+                } else {
+                    write!(
+                        f,
+                        " Its {noun} are {names}. Run {command} <entry> with one of them.",
+                        noun = noun(verb),
+                        names = entries.join(", "),
+                        command = verb.command(),
+                    )
+                }
+            }
+            Self::DefaultBlocked { box_type } => write!(
+                f,
+                "Cannot start a session. The project's {file} declares no session entry, \
+                 and its entry \"default\" has {kind}. Add a [sessions.<name>] entry to \
+                 {file}, or rename the entry \"default\".",
+                kind = entry_kind(box_type.as_deref()),
+            ),
+            Self::NotSession { entry, box_type } => {
+                write!(
+                    f,
+                    "Cannot start {entry} as a session. Its entry in {file} has {kind}.",
+                    kind = entry_kind(box_type.as_deref()),
+                )?;
+                if box_type.as_deref() == Some(boxes::TASK_BOX_TYPE) {
+                    write!(f, " Run min box start {entry} to start it.")?;
+                }
+                Ok(())
+            }
+            Self::UnsupportedType { entry, box_type } => write!(
+                f,
+                "Cannot start {entry}. Its entry in {file} has {kind}, and min box start \
+                 starts session and task entries only.",
+                kind = entry_kind(box_type.as_deref()),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartEntryRefusal {}
+
+/// The refusal of a start off a terminal for an entry whose box has a
+/// terminal, without `--detach` (BCLI-029). The start refuses it before it
+/// creates anything, and `main.rs` ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartNeedsTerminal {
+    entry: String,
+}
+
+impl StartNeedsTerminal {
+    /// The usage-refusal code of the architecture's exit-code table.
+    pub const EXIT_CODE: u8 = 2;
+
+    #[must_use]
+    pub fn new(entry: &str) -> Self {
+        Self {
+            entry: entry.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for StartNeedsTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} needs a terminal. Run it from a terminal, or pass --detach.",
+            self.entry
+        )
+    }
+}
+
+impl std::error::Error for StartNeedsTerminal {}
+
+/// The refusal of a start whose box name a running box on the host holds
+/// (BCLI-069, BOX-163). It names the holder, and the two flags that create
+/// the box anyway. `main.rs` ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartNameHeld {
+    pub verb: StartVerb,
+    pub entry: String,
+    pub refusal: minimald_rpc::HeldNameRefusal,
+}
+
+impl StartNameHeld {
+    /// The exit code of the held-name refusal.
+    pub const EXIT_CODE: u8 = minimald_rpc::HeldNameRefusal::EXIT_CODE;
+}
+
+impl std::fmt::Display for StartNameHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let minimald_rpc::HeldNameRefusal {
+            name,
+            holder,
+            holder_name,
+        } = &self.refusal;
+        match holder {
+            Some(holder) => write!(
+                f,
+                "Cannot start {entry}. The running box {holder_name} ({holder}) holds the \
+                 name {name}.",
+                entry = self.entry,
+            )?,
+            None => write!(
+                f,
+                "Cannot start {entry}. The running box {holder_name} holds the name {name}.",
+                entry = self.entry,
+            )?,
+        }
+        write!(
+            f,
+            " Run {command} --new {entry} to create another box from the entry, or \
+             pass --name <name> to give the box another name.",
+            command = self.verb.command(),
+            entry = self.entry,
+        )
+    }
+}
+
+impl std::error::Error for StartNameHeld {}
+
+/// The one stderr hint of a start that returns without attaching to a box
+/// that has no terminal (BCLI-029). The box's stdin is already closed.
+#[must_use]
+pub fn unattached_start_hint(entry: &str) -> String {
+    format!(
+        "{entry} started with no input. Run min box run {entry} to connect this \
+         terminal's input and output to a new box. Run min box logs <box> for its \
+         output, and min box wait <box> for its exit code."
+    )
+}
+
+/// How a start creates its box.
+#[derive(Debug)]
+pub(crate) enum StartPlan {
+    /// A session entry: the activation, which attaches unless `--detach`.
+    Session {
+        entry: String,
+        args: ActivateArgs,
+        options: ActivationOptions,
+    },
+    /// An entry whose box has no terminal: a detached run, which closes the
+    /// box's stdin and prints its id.
+    Detached {
+        entry: String,
+        run: crate::task::RunEntry,
+    },
+}
+
+impl StartPlan {
+    /// The entry the start picked.
+    #[must_use]
+    pub fn entry(&self) -> &str {
+        match self {
+            Self::Session { entry, .. } | Self::Detached { entry, .. } => entry,
+        }
+    }
+}
+
+/// Decides how `start` creates its box, from the project's `entries`, before
+/// anything is created. `has_terminal` says whether this command runs on a
+/// terminal that an attach can use.
+///
+/// # Errors
+///
+/// [`StartEntryRefusal`] when no entry can be picked or the entry cannot
+/// start, and [`StartNeedsTerminal`] for an entry whose box has a terminal,
+/// off a terminal, without `--detach`.
+pub(crate) fn plan_start(
+    start: &StartEntry,
+    entries: &[mfile::entry::BoxEntry],
+    has_terminal: bool,
+) -> Result<StartPlan, anyhow::Error> {
+    let entry = match start.verb {
+        StartVerb::Box => pick_box_start_entry(entries, start.entry.as_deref())?,
+        StartVerb::Session => {
+            crate::cmd::session::pick_session_start_entry(entries, start.entry.as_deref())?
+        }
+    };
+    match entry.box_type.as_deref() {
+        // A session box has a terminal: its spec sets `pty_enabled`
+        // (`BoxSpec::for_session`).
+        Some(boxes::SESSION_BOX_TYPE) => {
+            if !start.detach && !has_terminal {
+                return Err(StartNeedsTerminal::new(&entry.name).into());
+            }
+            let mut args = ActivateArgs::unflagged();
+            args.name.clone_from(&start.name);
+            args.attach = !start.detach;
+            Ok(StartPlan::Session {
+                options: ActivationOptions {
+                    offer_scaffold: false,
+                    entry: Some(entry.name.clone()),
+                    box_name: start.name.clone(),
+                    fresh_instance: start.new,
+                },
+                entry: entry.name,
+                args,
+            })
+        }
+        // A task box never has a terminal (BOX-054), so the start detaches.
+        Some(boxes::TASK_BOX_TYPE) => Ok(StartPlan::Detached {
+            run: crate::task::RunEntry {
+                verb: crate::task::RunVerb::Box,
+                entry: entry.name.clone(),
+                path: None,
+                detach: true,
+                args: Vec::new(),
+            },
+            entry: entry.name,
+        }),
+        box_type => Err(StartEntryRefusal::UnsupportedType {
+            box_type: box_type.map(str::to_owned),
+            entry: entry.name,
+        }
+        .into()),
+    }
+}
+
+/// The project directory of a command: `-C`/`--repo-dir`, else the current
+/// working directory.
+fn command_project_dir(global: &GlobalArgs) -> Result<camino::Utf8PathBuf, anyhow::Error> {
+    let effective_path = global
+        .repo_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let project_path = std::fs::canonicalize(&effective_path)
+        .with_context(|| format!("Cannot resolve project path '{}'", effective_path.display()))?;
+    camino::Utf8PathBuf::from_path_buf(project_path)
+        .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))
+}
+
+/// The bytes of the project's `minimal.toml` for `project`, or `None` when
+/// the project has none.
+fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
+        Ok(file) => file,
+        Err(mfile::Error::NotFound) => return Ok(None),
+        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+    };
+    let Some(root) = file.repo_path() else {
+        return Ok(None);
+    };
+    let Some(path) = [
+        root.join(mfile::MFILE_NAME),
+        root.join(".minimal").join(mfile::MFILE_NAME),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path).map_err(|e| ProjectFileInvalid {
+        error: mfile::Error::IO("minimal file", path.clone(), e),
+    })?;
+    Ok(Some(bytes))
+}
+
+/// The entries the project's `minimal.toml` declares. A project with no
+/// `minimal.toml` declares none.
+fn project_entries(project: &camino::Utf8Path) -> anyhow::Result<Vec<mfile::entry::BoxEntry>> {
+    match project_file_bytes(project)? {
+        Some(bytes) => {
+            mfile::entry::read_entries(&bytes).map_err(|error| ProjectFileInvalid { error }.into())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// `min box start [<entry>]`: create a box from an entry and attach this
+/// terminal to it, or print its id and return.
+pub async fn cmd_box_start(global: &GlobalArgs, args: BoxStartArgs) -> Result<(), anyhow::Error> {
+    start_entry(global, args.into()).await
+}
+
+/// The one start path of `min box start` and `min session start` (BCLI-029,
+/// BCLI-069, BCLI-070, BCLI-071, BCLI-072): pick the entry, refuse what
+/// cannot start before anything is created, then create the box. A box with
+/// a terminal attaches unless `--detach`. Any other box starts with its
+/// stdin closed, and the start prints one hint.
+pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), anyhow::Error> {
+    let project = command_project_dir(global)?;
+    let entries = project_entries(&project)?;
+    let has_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let plan = plan_start(&start, &entries, has_terminal).inspect_err(|error| {
+        tracing::info!(verb = start.verb.command(), %error, "the start was refused before it created a box");
+    })?;
+    tracing::info!(
+        verb = start.verb.command(),
+        entry = %plan.entry(),
+        typed_entry = ?start.entry,
+        name = ?start.name,
+        fresh_instance = start.new,
+        detach = start.detach,
+        "starting a box from the entry"
+    );
+    match plan {
+        StartPlan::Session {
+            entry,
+            args,
+            options,
+        } => activate_box(global, args, options)
+            .await
+            .map_err(|error| start_refusal(error, start.verb, &entry)),
+        StartPlan::Detached { entry, run } => {
+            crate::task::run_entry(global, run).await?;
+            eprintln!("{}", unattached_start_hint(&entry));
+            Ok(())
+        }
+    }
+}
+
+/// The error a start ends with: a held name becomes [`StartNameHeld`], with
+/// its hint to `--new` and `--name`. Any other error passes through.
+pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) -> anyhow::Error {
+    match error.downcast::<minimald_rpc::HeldNameRefusal>() {
+        Ok(refusal) => anyhow::Error::new(StartNameHeld {
+            verb,
+            entry: entry.to_string(),
+            refusal,
+        }),
+        Err(error) => error,
+    }
+}
+
+/// Settings of an activation that no `min session activate` flag carries.
+/// A `bool` converts to these settings with only the scaffold offer set, so
+/// a caller that passes `offer_scaffold` alone keeps its meaning.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivationOptions {
+    /// Offer to write a `minimal.toml` when the project has none.
+    pub offer_scaffold: bool,
+    /// The session entry the box is created from, when it is not `default`.
+    pub entry: Option<String>,
+    /// The `[box] name` of the box's spec (BCLI-069).
+    pub box_name: Option<String>,
+    /// Ask for a fresh instance, `<name>-<n>` (BCLI-070).
+    pub fresh_instance: bool,
+}
+
+impl From<bool> for ActivationOptions {
+    fn from(offer_scaffold: bool) -> Self {
+        Self {
+            offer_scaffold,
+            ..Self::default()
+        }
+    }
+}
+
 /// A grant the box cannot receive: a GitHub grant whose value cannot land
 /// in its environment (BEP-007), or a store reference that no rule admits
 /// (BEP-035). The creation is refused with exit 3, before the box exists.
@@ -433,26 +978,10 @@ struct ProjectEgress {
 /// never refuses an activation. The policy is `None` when there is no
 /// project file or no layer declares egress.
 fn project_egress(project: &camino::Utf8Path) -> anyhow::Result<ProjectEgress> {
-    let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
-        Ok(file) => file,
-        Err(mfile::Error::NotFound) => return Ok(ProjectEgress::default()),
-        Err(error) => return Err(ProjectFileInvalid { error }.into()),
-    };
-    let Some(root) = file.repo_path() else {
-        return Ok(ProjectEgress::default());
-    };
-    let Some(path) = [
-        root.join(mfile::MFILE_NAME),
-        root.join(".minimal").join(mfile::MFILE_NAME),
-    ]
-    .into_iter()
-    .find(|path| path.is_file()) else {
-        return Ok(ProjectEgress::default());
-    };
-    let bytes = std::fs::read(&path).map_err(|e| ProjectFileInvalid {
-        error: mfile::Error::IO("minimal file", path.clone(), e),
-    })?;
-    project_egress_from(&bytes)
+    match project_file_bytes(project)? {
+        Some(bytes) => project_egress_from(&bytes),
+        None => Ok(ProjectEgress::default()),
+    }
 }
 
 /// Whether any `network` key appears in `[defaults]`, in a
@@ -1850,16 +2379,38 @@ pub(crate) fn registration_held_name_refusal(
 /// # Errors
 ///
 /// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+#[cfg(test)]
 pub(crate) fn stamp_session_spec(
     request: &mut minimald_rpc::CreateSessionRequest,
     dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    stamp_session_spec_as(request, dir, None, None)
+}
+
+/// [`stamp_session_spec`] for the session entry `entry`, when it is not
+/// `default`, with `name` as the spec's `[box] name` (BCLI-069).
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+pub(crate) fn stamp_session_spec_as(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+    entry: Option<&str>,
+    name: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     let session = match mfile::File::from_dir_recursive(dir.as_std_path()) {
         Ok(file) => file.session,
         Err(mfile::Error::NotFound) => None,
         Err(error) => return Err(ProjectFileInvalid { error }.into()),
     };
-    let spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    let mut spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    if let Some(entry) = entry {
+        spec.entry = entry.to_string();
+    }
+    if let Some(name) = name {
+        spec.name = Some(name.to_string());
+    }
     put_spec(request, &spec)
 }
 
@@ -1926,8 +2477,10 @@ fn ensure_registered_id(
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
-    offer_scaffold: bool,
+    options: impl Into<ActivationOptions>,
 ) -> Result<(), anyhow::Error> {
+    let options: ActivationOptions = options.into();
+    let offer_scaffold = options.offer_scaffold;
     let (utf8_path, abs_path, port_mappings, egress) = ActivationStep::CheckArguments
         .run(async {
             // Before anything is created, and before the daemon is spawned (a cold
@@ -2125,6 +2678,11 @@ pub(crate) async fn activate_box(
     let mut request =
         minimald_rpc::CreateSessionRequest::new(String::new(), abs_path.clone(), network, policy);
     request.config.name = request_name(args.name.as_deref());
+    // BCLI-070: `--new` asks for a fresh instance, `<name>-<n>`. The
+    // spec's `[box] name`, when `--name` gives one, is the base of the name.
+    if options.fresh_instance {
+        request_fresh_instance(&mut request);
+    }
     request.config.hooks_enabled = !args.no_hooks;
     request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
@@ -2227,7 +2785,12 @@ pub(crate) async fn activate_box(
             set_project_root(&mut request, project_root)?;
             // BOX-068: the box's spec, after every flag and the project's
             // policy are on the request.
-            stamp_session_spec(&mut request, &utf8_path)?;
+            stamp_session_spec_as(
+                &mut request,
+                &utf8_path,
+                options.entry.as_deref(),
+                options.box_name.as_deref(),
+            )?;
 
             let Some(root) = upload_root else {
                 return Ok::<_, anyhow::Error>(UploadPlan::Skip);
@@ -3316,6 +3879,7 @@ pub(crate) async fn activate_box(
         .await?;
 
     println!("{id}");
+    crate::output::record_box_id(&id.to_string());
 
     // T126 (NET-138): a `host_ip` box on a VM host names each of its
     // mirrored ports that another program on the host holds. Printed only

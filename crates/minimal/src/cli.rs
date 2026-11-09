@@ -226,6 +226,9 @@ pub enum SessionCommand {
     List(LsArgs),
     /// Activate (create) a new session
     Activate(ActivateArgs),
+    /// Create a box from a session entry of the project and attach this
+    /// terminal to it. `--detach` creates the box, prints its id and returns
+    Start(SessionStartArgs),
     /// Attach to an existing session
     Attach(AttachArgs),
     /// Execute a command in an existing session
@@ -466,6 +469,10 @@ pub enum BoxCommand {
     /// to this project's running box that has a terminal, else to its only
     /// stopped or exited one, which starts again
     Attach(BoxAttachArgs),
+    /// Create a box from an entry of the project. A box with a terminal
+    /// attaches this terminal to it, unless `--detach` is given. Any other
+    /// box starts with no input, and the command prints its id and returns
+    Start(BoxStartArgs),
     /// Create a box from an entry of the project, run it without a terminal
     /// and exit with its exit code. This command's stdin, stdout and stderr
     /// are the box's. `--detach` starts the box, prints its id and returns
@@ -1002,6 +1009,47 @@ pub struct BoxRunArgs {
     pub args: Vec<String>,
 }
 
+// BCLI-029, BCLI-069, BCLI-070, BCLI-072:
+// `min box start [<entry>] [--name <name>] [--new] [--detach]`.
+#[derive(Debug, Args)]
+pub struct BoxStartArgs {
+    /// Name of an entry declared in the project's minimal.toml. With none,
+    /// the entry named `default`, else the project's only entry
+    pub entry: Option<String>,
+    /// Name the box. With `--new`, the box is named `<name>-<n>`
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Create another box from the entry, named `<name>-<n>`, even when a
+    /// running box holds the entry's name
+    #[arg(long)]
+    pub new: bool,
+    /// Create the box, print its id and return. This terminal is not
+    /// attached to the box
+    #[arg(long)]
+    pub detach: bool,
+}
+
+// BCLI-029, BCLI-069, BCLI-070, BCLI-071:
+// `min session start [<entry>] [--name <name>] [--new] [--detach]`.
+#[derive(Debug, Args)]
+pub struct SessionStartArgs {
+    /// Name of a session entry declared in the project's minimal.toml. With
+    /// none, the session entry named `default`, else the project's only
+    /// session entry
+    pub entry: Option<String>,
+    /// Name the box. With `--new`, the box is named `<name>-<n>`
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Create another box from the entry, named `<name>-<n>`, even when a
+    /// running box holds the entry's name
+    #[arg(long)]
+    pub new: bool,
+    /// Create the box, print its id and return. This terminal is not
+    /// attached to the box
+    #[arg(long)]
+    pub detach: bool,
+}
+
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
 /// UC2b). The mesh lets a laptop, or another host's PTasks, reach this host's
 /// PTasks over an encrypted tunnel.
@@ -1282,6 +1330,22 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+impl ActivateArgs {
+    /// The arguments of a `min session activate` typed with no flag and no
+    /// path, from the one command model, so each default is the parser's.
+    #[must_use]
+    pub fn unflagged() -> Self {
+        #[derive(Parser)]
+        struct Unflagged {
+            #[command(flatten)]
+            args: ActivateArgs,
+        }
+        Unflagged::try_parse_from(["activate"])
+            .expect("every activation flag has a default")
+            .args
+    }
 }
 
 /// Which daemon backend (box host) serves sessions, as `--provider` names it.
