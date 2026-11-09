@@ -456,7 +456,8 @@ impl Cause {
 /// placement rather than run it unenforced ([`Cause::host_ip_box_outcome`]),
 /// so over those the line says the box is refused instead of claiming it
 /// runs. A daemon outside its leaf places no box, so nothing is refused
-/// there ([`Cause::DaemonNotPlaced`]): the box runs, and the line says so. The install is named only where running it enforces the
+/// there ([`Cause::DaemonNotPlaced`]): the box runs, and the line says
+/// so. The install is named only where running it enforces the
 /// declaration: a cause no install ends names the own-address start alone
 /// and says why the install cannot help, and a declaration the classifier
 /// cannot enforce on a host address names the own-address start alone too,
@@ -544,19 +545,21 @@ impl Decision {
         }
     }
 
-    /// This decision as an unplaced native daemon reads it: a probe cause
-    /// read by a daemon outside its own leaf is re-spelled
-    /// [`Cause::DaemonNotPlaced`], because such a daemon's probe reads only
-    /// as a table it could not read, while the launch that follows places
-    /// no box and so refuses none. The other causes already say the boxes
+    /// This decision as an unplaced native daemon reads it: a
+    /// [`Cause::ProbeUnreadable`] read by a daemon outside its own leaf is
+    /// re-spelled [`Cause::DaemonNotPlaced`], because such a daemon's probe
+    /// child cannot be placed, so it reads only as a table it could not
+    /// read, while the launch that follows places no box and so refuses
+    /// none. [`Cause::TableNotEffective`] is kept as read: that reading needs
+    /// a probe child placed in the deny leaf, which proves this daemon can
+    /// place a box whatever its own leaf says, and its remedy is the
+    /// table's, not the placement's. The other causes already say the boxes
     /// run unenforced, and a decided host, a placed daemon and the guest
     /// keep their decision as read.
     #[must_use]
     pub fn over_daemon_placement(self, guest: bool, daemon_unplaced: bool) -> Self {
         match self.cause {
-            Some(Cause::TableNotEffective | Cause::ProbeUnreadable)
-                if !guest && daemon_unplaced =>
-            {
+            Some(Cause::ProbeUnreadable) if !guest && daemon_unplaced => {
                 Self::undecidable(Cause::DaemonNotPlaced)
             }
             _ => self,
@@ -10019,24 +10022,31 @@ mod tests {
         }
     }
 
-    /// Only a probe cause read by an unplaced native daemon is re-spelled;
-    /// every other decision keeps what it read.
+    /// Only an unreadable probe read by an unplaced native daemon is
+    /// re-spelled; every other decision keeps what it read.
     #[test]
     fn a_probe_cause_over_an_unplaced_native_daemon_is_its_placement() {
-        for probe in [Cause::TableNotEffective, Cause::ProbeUnreadable] {
-            let read = Decision::undecidable(probe);
-            assert_eq!(
-                read.clone().over_daemon_placement(false, true).cause(),
-                Some(Cause::DaemonNotPlaced),
-                "{probe:?}, native, unplaced"
-            );
-            assert_eq!(
-                read.clone().over_daemon_placement(false, false).cause(),
-                Some(probe)
-            );
-            assert_eq!(read.over_daemon_placement(true, true).cause(), Some(probe));
-        }
-        for kept in [Cause::StepNotInstalled, Cause::CannotConfine] {
+        let read = Decision::undecidable(Cause::ProbeUnreadable);
+        assert_eq!(
+            read.clone().over_daemon_placement(false, true).cause(),
+            Some(Cause::DaemonNotPlaced),
+            "ProbeUnreadable, native, unplaced"
+        );
+        assert_eq!(
+            read.clone().over_daemon_placement(false, false).cause(),
+            Some(Cause::ProbeUnreadable)
+        );
+        assert_eq!(
+            read.over_daemon_placement(true, true).cause(),
+            Some(Cause::ProbeUnreadable)
+        );
+        // A table that read as not in force placed its probe child, so this
+        // daemon can place a box: the cause and its remedy stay the table's.
+        for kept in [
+            Cause::TableNotEffective,
+            Cause::StepNotInstalled,
+            Cause::CannotConfine,
+        ] {
             assert_eq!(
                 Decision::undecidable(kept)
                     .over_daemon_placement(false, true)
