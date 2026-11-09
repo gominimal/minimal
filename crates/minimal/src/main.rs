@@ -231,9 +231,9 @@ fn answer_failure(
 /// The exit code a failed run ends with, from the architecture's reserved
 /// codes ("Exit codes"): 2 when a running box holds the name a create
 /// asked for (`minimald_rpc::HeldNameRefusal`) or a removal without
-/// `--force` finds the box running (`minimal::BoxRunningRefusal`), 3 when
-/// the activation
-/// refused the box spec
+/// `--force` finds the box running (`minimal::BoxRunningRefusal`) or a run
+/// names an entry with a terminal (`minimal::task::RunNeedsTerminal`), 3
+/// when the activation refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
 /// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
 /// grant undeliverable (`minimal::GrantNotDelivered`), 7 when the VM host could not
@@ -256,6 +256,12 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-004: `min box rm` of a running box without `--force`.
     if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
         return minimal::BoxRunningRefusal::EXIT_CODE;
+    }
+    // BCLI-010: `min task run` or `min box run` of an entry with a terminal.
+    if e.downcast_ref::<minimal::task::RunNeedsTerminal>()
+        .is_some()
+    {
+        return minimal::task::RunNeedsTerminal::EXIT_CODE;
     }
     // BCLI-058: `min box rename` to a name BOX-010 refuses.
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
@@ -470,7 +476,7 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                     command: minimal::TaskCommand::Run(_),
                 })
                 | minimal::Command::Box(minimal::BoxArgs {
-                    command: minimal::BoxCommand::Exec(_),
+                    command: minimal::BoxCommand::Exec(_) | minimal::BoxCommand::Run(_),
                 })
         )
     )
@@ -636,6 +642,7 @@ mod tests {
             command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
                 task: "build".to_string(),
                 path: None,
+                detach: false,
                 args: vec![],
             }),
         }));
