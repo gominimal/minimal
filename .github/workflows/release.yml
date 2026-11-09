@@ -1293,7 +1293,10 @@ jobs:
                   NOTES: ${{ runner.temp }}/notes.md
               run: |
                   set -euo pipefail
-                  tar -C artifacts/completions -czf artifacts/completions.tar.gz .
+                  # Same files, same bytes: a rerun compares its assets with the
+                  # ones already published (below), so no timestamps or owners.
+                  tar -C artifacts/completions --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - . \
+                    | gzip -n > artifacts/completions.tar.gz
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "::notice::dry_run — assembled release artifacts but skipping GitHub release create"
                     exit 0
@@ -1304,19 +1307,59 @@ jobs:
                     # tag; promote publishes it (promote.yml), and THAT
                     # creates v<semver> — last, on a smoked and promoted commit.
                     # A pre-release version (one with a `-` suffix) is marked a
-                    # GitHub prerelease so it never shows as "Latest". A
-                    # leftover draft from an earlier attempt at the same version
-                    # is replaced (it was never published).
+                    # GitHub prerelease so it never shows as "Latest".
                     extra+=(--draft)
                     case "$RELEASE_VERSION" in
                       *-*) extra+=(--prerelease) ;;
                     esac
-                    if gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null | grep -qx true; then
-                      echo "replacing the leftover draft $REL_TAG"
-                      gh release delete "$REL_TAG" --repo "$GITHUB_REPOSITORY" --yes
-                    fi
+                  fi
+                  # A rerun finds what an earlier attempt left. A draft was never
+                  # published, so it is replaced. A release-<sha> is this same
+                  # commit's nightly and may already be downloaded, so no asset
+                  # it has is replaced: the rerun uploads only the ones it lacks.
+                  # GitHub can answer 502 to a publish that went through. A
+                  # public v<semver> stays: create fails on it.
+                  # Only "release not found" means no release; any other lookup
+                  # failure (502, network) stops here rather than collide below.
+                  if ! is_draft="$(gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>view.err)"; then
+                    grep -q 'release not found' view.err || { cat view.err >&2; exit 1; }
+                    is_draft=""
+                  fi
+                  if [ "$is_draft" = "true" ]; then
+                    echo "replacing the draft $REL_TAG from an earlier attempt"
+                    gh release delete "$REL_TAG" --repo "$GITHUB_REPOSITORY" --yes
                   fi
                   cd artifacts/
+                  if [ "$is_draft" = "false" ] && [ -z "$RELEASE_VERSION" ]; then
+                    # An asset already uploaded must hold this build's bytes. If
+                    # it differs, a full rerun rebuilt it: stop rather than
+                    # publish two builds under one tag. --clobber below replaces
+                    # only an asset whose upload never finished.
+                    published="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$REL_TAG" \
+                      --jq '.assets[] | select(.state == "uploaded") | "\(.name)\t\(.digest)"')"
+                    missing=()
+                    differ=0
+                    while IFS= read -r f; do
+                      have="$(printf '%s\n' "$published" | awk -F'\t' -v n="$f" '$1 == n {print $2}')"
+                      if [ -z "$have" ]; then
+                        missing+=("$f")
+                      elif [ "$have" != "sha256:$(sha256sum "$f" | cut -d' ' -f1)" ]; then
+                        echo "::error::$REL_TAG already has $f, with other bytes than this build"
+                        differ=1
+                      fi
+                    done < <(find . -maxdepth 1 -type f -printf '%P\n')
+                    if [ "$differ" -ne 0 ]; then
+                      exit 1
+                    fi
+                    echo "$REL_TAG exists; uploading the ${#missing[@]} assets it lacks"
+                    if [ "${#missing[@]}" -gt 0 ]; then
+                      gh release upload "$REL_TAG" "${missing[@]}" \
+                        --repo="${GITHUB_REPOSITORY}" --clobber
+                    fi
+                    gh release edit "$REL_TAG" --repo="${GITHUB_REPOSITORY}" \
+                      --title="$REL_TITLE" --notes-file "$NOTES"
+                    exit 0
+                  fi
                   # --target pins the tag to the commit that was built. Without
                   # it GitHub tags the default branch's tip at create time, which
                   # is a later commit if main moved during the build.
