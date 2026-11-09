@@ -11337,3 +11337,347 @@ fn show_and_prune_dry_run_report_disk_unit_boundaries() {
     assert_eq!(format_disk(1_073_741_824), "1.0 GiB");
     assert_eq!(format_disk(1023 * 1024 * 1024), "1023.0 MiB");
 }
+
+/// The directory of the box `id` in the store the daemon keeps under
+/// `state`: the one whose `record.json` names the box.
+fn box_store_dir(state: &std::path::Path, id: boxes::SessionId) -> std::path::PathBuf {
+    fn walk(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, id) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|name| name == "record.json")
+                && let Ok(record) = serde_json_lenient::from_slice::<serde_json_lenient::Value>(
+                    &std::fs::read(&path).unwrap(),
+                )
+                && record["id"] == id
+            {
+                return path.parent().map(std::path::Path::to_path_buf);
+            }
+        }
+        None
+    }
+    walk(state, &id.to_string()).unwrap_or_else(|| panic!("no record of box {id}"))
+}
+
+/// Appends `bytes` to the output log of the box in `dir`, as its host
+/// appends the box's terminal output.
+fn append_box_output(dir: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(boxes::store::LOG_FILE))
+        .expect("the box's log opens")
+        .write_all(bytes)
+        .expect("the box's log takes the bytes");
+}
+
+impl SharedOut {
+    /// Everything the command wrote so far, as text.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    /// Waits until the command wrote `needle`.
+    async fn until_contains(&self, needle: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let text = self.text();
+            if text.contains(needle) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no {needle:?} in the output so far: {text:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
+// BCLI-012: `min session logs <box> -f`, `min task logs <box> -f` and
+// `min box logs <box> -f` parse to the one logs verb. Each one writes the
+// box's output from its start, then each new chunk the box writes, and
+// ends when the box is removed. Without `-f` the read ends at the end of
+// the output so far.
+#[tokio::test]
+async fn type_noun_logs_follow() {
+    use clap::Parser as _;
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let web = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let job = create_configured_task(&mut daemon, "job", project).await;
+    let dirs = [
+        box_store_dir(&state_path, web),
+        box_store_dir(&state_path, job),
+    ];
+    for dir in &dirs {
+        append_box_output(dir, b"first line\r\n");
+    }
+
+    // Each type noun reads a box of its own type. `min box logs` reads any.
+    let mut follows = Vec::new();
+    for (noun, target) in [("session", "web"), ("task", "job"), ("box", "web")] {
+        let cli = Cli::try_parse_from(["min", noun, "logs", target, "-f"])
+            .unwrap_or_else(|e| panic!("`min {noun} logs {target} -f` parses: {e}"));
+        let (args, box_type, verb) = match cli.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Logs(args),
+            })) => (args, Some(boxes::SESSION_BOX_TYPE), "session logs"),
+            Some(Command::Task(TaskArgs {
+                command: TaskCommand::Logs(args),
+            })) => (args, Some(boxes::TASK_BOX_TYPE), "task logs"),
+            Some(Command::Box(BoxArgs {
+                command: BoxCommand::Logs(args),
+            })) => (args, None, "box logs"),
+            _ => panic!("expected `min {noun} logs`"),
+        };
+        assert_eq!(args.target, target);
+        assert!(args.follow, "`-f` follows");
+
+        // Without `-f`, the read ends at the end of the output so far.
+        let once = BoxLogsArgs {
+            target: target.to_owned(),
+            follow: false,
+        };
+        let mut out = Vec::new();
+        box_logs_on_hosts(
+            local_hosts(&global).unwrap(),
+            &once,
+            box_type,
+            verb,
+            &mut out,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("`min {noun} logs {target}` reads the output: {e:#}"));
+        assert_eq!(String::from_utf8_lossy(&out), "first line\r\n");
+        follows.push((args, box_type, verb, SharedOut::default()));
+    }
+
+    // A type noun refuses a box of another type, and writes nothing.
+    for (target, box_type, verb) in [
+        ("web", boxes::TASK_BOX_TYPE, "task logs"),
+        ("job", boxes::SESSION_BOX_TYPE, "session logs"),
+    ] {
+        let mut out = Vec::new();
+        let other = BoxLogsArgs {
+            target: target.to_owned(),
+            follow: false,
+        };
+        box_logs_on_hosts(
+            local_hosts(&global).unwrap(),
+            &other,
+            Some(box_type),
+            verb,
+            &mut out,
+        )
+        .await
+        .expect_err("a type noun does not read a box of another type");
+        assert!(out.is_empty(), "`min {verb} {target}` writes nothing");
+    }
+
+    let followed =
+        futures::future::join_all(follows.iter().map(|(args, box_type, verb, shared)| {
+            let mut out = shared.clone();
+            let global = &global;
+            async move {
+                box_logs_on_hosts(
+                    local_hosts(global).unwrap(),
+                    args,
+                    *box_type,
+                    verb,
+                    &mut out,
+                )
+                .await
+            }
+        }));
+    let drive = async {
+        for (_, _, _, shared) in &follows {
+            shared.until_contains("first line\r\n").await;
+        }
+        for dir in &dirs {
+            append_box_output(dir, b"second line\r\n");
+        }
+        for (_, _, _, shared) in &follows {
+            shared.until_contains("second line\r\n").await;
+        }
+        for name in ["web", "job"] {
+            stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), name, false)
+                .await
+                .expect("the box stops");
+            rm_box_on_hosts(local_hosts(&global).unwrap(), name, false)
+                .await
+                .expect("the stopped box is removed");
+        }
+    };
+    let (results, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(followed, drive)
+    })
+    .await
+    .expect("each follow ends when the box is removed");
+    for ((_, _, verb, shared), result) in follows.iter().zip(results) {
+        result.unwrap_or_else(|e| panic!("`min {verb} -f` ends cleanly: {e:#}"));
+        assert!(
+            shared.text().starts_with("first line\r\nsecond line\r\n"),
+            "`min {verb} -f` writes the output in order, once: {:?}",
+            shared.text()
+        );
+    }
+
+    // A box that does not exist is refused, and nothing is written.
+    let mut out = Vec::new();
+    let gone = BoxLogsArgs {
+        target: "web".to_owned(),
+        follow: false,
+    };
+    box_logs_on_hosts(
+        local_hosts(&global).unwrap(),
+        &gone,
+        None,
+        "box logs",
+        &mut out,
+    )
+    .await
+    .expect_err("the removed box has no output to read");
+    assert!(out.is_empty());
+}
+
+/// Drives the create flow of `create_configured_session` with the task
+/// verb, so the daemon files a box of the task type. Returns its id.
+async fn create_configured_task(
+    client: &mut minimald::test_harness::TestClient,
+    name: &str,
+    project: &str,
+) -> boxes::SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let mut request = minimald::test_harness::create_session_req(name, project);
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    let id = client.call::<CreateSession>(&request).await.unwrap().id;
+    minimald::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => id,
+        Errorable::Err { error } => panic!("FinalizeSession failed for the task box: {error}"),
+    }
+}
+
+// BCLI-015: `min task list` shows a task that ended with its exit code, as
+// `exited (exit 3)`, in the `min box list` table and wording. It keeps the
+// task until `min box prune` removes it. A box of another type is not a
+// task, so it is not listed.
+#[tokio::test]
+async fn task_list_shows_exited_until_pruned() {
+    use clap::Parser as _;
+
+    match Cli::try_parse_from(["min", "task", "list", "--all"])
+        .unwrap()
+        .command
+    {
+        Some(Command::Task(TaskArgs {
+            command: TaskCommand::List(args),
+        })) => assert!(args.all),
+        _ => panic!("expected `min task list`"),
+    }
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let build =
+        minimald::test_harness::create_configured_session(&mut daemon, "build", project).await;
+    minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    stop_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        &mut Vec::new(),
+        "build",
+        false,
+    )
+    .await
+    .expect("the box stops");
+    // The stopped box becomes a task box that exited with code 3, as the
+    // daemon files a task whose entrypoint ended with that code.
+    let record_path = box_store_dir(&state_path, build).join("record.json");
+    let mut record: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["box_type"] = "task".into();
+    record["status"] = "exited".into();
+    record["reason"] = "exit".into();
+    record["exit_code"] = 3.into();
+    record["signal"] = serde_json_lenient::Value::Null;
+    std::fs::write(&record_path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+
+    let list = async |scope: Option<&str>| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let scope = scope.map(|root| paths::HostAbsPath::try_new(root).unwrap());
+        crate::task::task_list_on_hosts(local_hosts(&global).unwrap(), scope, &mut out, &mut err)
+            .await
+            .expect("the task list");
+        assert_eq!(String::from_utf8_lossy(&err), "", "nothing on stderr");
+        String::from_utf8(out).unwrap()
+    };
+
+    let text = list(None).await;
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "a header and the one task:\n{text}");
+    assert!(lines[0].starts_with("ID"), "{text}");
+    assert!(lines[0].contains("STATE"), "{text}");
+    assert!(lines[1].starts_with(&build.to_string()), "{text}");
+    assert!(lines[1].contains("  build  "), "{text}");
+    assert!(lines[1].contains("  exited (exit 3)  "), "{text}");
+    assert!(lines[1].contains("  task  "), "{text}");
+    assert!(lines[1].ends_with("local0"), "{text}");
+    assert!(
+        !text.contains("  web  "),
+        "a session is not a task:\n{text}"
+    );
+
+    // A listing of another project does not show the task.
+    assert_eq!(
+        list(Some("/another/project")).await,
+        format!("{}\n", crate::cmd::EMPTY_PROJECT_LIST)
+    );
+
+    // The exited task stays until a prune removes it.
+    assert!(list(None).await.contains("exited (exit 3)"));
+    prune_hosts(
+        local_hosts(&global).unwrap(),
+        false,
+        box_prune_request(None, None),
+        PruneMode::Remove,
+        &mut Vec::new(),
+    )
+    .await
+    .expect("the prune");
+    assert_eq!(
+        list(None).await,
+        format!("{}\n", crate::cmd::EMPTY_HOST_LIST)
+    );
+}
