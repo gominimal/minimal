@@ -74,8 +74,10 @@ the run starts, and `main` can move between steps 3 and 4.
 git push origin <commit>:refs/heads/release/X.Y.x
 ```
 
-Only a repository admin can create a branch under `release/`, so ask one to
-push it. The branch name must start with `release/`. CI runs the required checks on
+[`cut-minor.yml`](#cut-minoryml-start-a-minor-release) does this step for you.
+It creates the branch as the `minimal-release-ops` App, the backport label, and
+the bump PR on `main`. By hand, only a repository admin can create a branch
+under `release/`, so ask one to push it. The branch name must start with `release/`. CI runs the required checks on
 pushes and PRs to `main` and `release/**` only. Without those checks, step 4
 refuses each fix that merges into the branch.
 
@@ -115,7 +117,7 @@ release while `main` moves on, and each patch on the line goes out from it.
 Step 8 brings its fixes back to `main`.
 
 Before step 7, open a PR on `main` that bumps `package.version` to the next
-minor. After the `vX.Y.0` tag exists, the version check fails on `main` until
+minor, unless `cut-minor.yml` opened it. After the `vX.Y.0` tag exists, the version check fails on `main` until
 its version is above that tag.
 
 ### 3. Rehearse the release run
@@ -316,6 +318,9 @@ Do these steps:
 
 3. Follow steps 3 to 6 with `--ref release/X.Y.x`. For the final version,
    also follow steps 7 and 8. A release candidate stops after step 6.
+
+[`stage-release.yml`](#stage-from-a-release-line) does step 2 here, and steps 3
+and 4 above, in one dispatch. Then continue from step 5.
 
 ### Emergency release
 
@@ -820,9 +825,8 @@ release branch rules. Steps 2 and 3 run as `minimal-backporter`, which cannot:
    promote the version at the commit, `vX.Y.0` or `vX.Y.0-rcN`. Once that tag
    exists, `main` still declares the same version and its version check fails.
 
-For a line cut this way, steps 3 to 7 use `release/X.Y.x` in place of
-`release/X.Y.Z`: pass `--ref release/X.Y.x` to `release.yml`. In step 7, keep
-the line. Do not delete it, because later patches and backports go to it.
+Then continue from step 3 of [Cut a stable release](#cut-a-stable-release),
+with `--ref release/X.Y.x`.
 
 Run it again after a failure, and pass the original `commit` on every rerun.
 Without it, the rerun cuts from the tip of `main`. After the bump PR merges,
