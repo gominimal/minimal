@@ -648,9 +648,11 @@ that is not marked Latest.
 
 ### merge-back.yml: merge a line into main
 
-> Not ready to enable. The design needs agreement. The `main` ruleset needs a
-> bypass actor for the `minimal-shipper` App. Until then, use the manual merge
-> in the release steps. The job runs only when dispatched from `main`.
+> Not enabled. The workflow does nothing until the repository variable
+> `MERGE_BACK_ENABLED` is `true`, and it stays unset until the design is agreed.
+> The `minimal-shipper` App is already a bypass actor on the `main` ruleset, so
+> the variable is the only switch. Until then, use the manual merge in the
+> release steps. The job runs only when dispatched from `main`.
 
 [`.github/workflows/merge-back.yml`](../../.github/workflows/merge-back.yml)
 does the manual merge-back as one run, outside the merge queue. The queue
@@ -699,8 +701,15 @@ The workflow does nothing until the repository variable `BACKPORT_ENABLED` is
 `true`. Before an admin sets it:
 
 - The labels `backport release/X.Y.x` and `backport-conflict` must exist.
-- The repository setting `squash_merge_commit_title` must be `PR_TITLE`. See
-  the merge rule below.
+- The repository setting `squash_merge_commit_title` must be `PR_TITLE`, and the
+  `release branches` ruleset must allow only squash merges. See the merge rule
+  below.
+- The repository setting that allows rebase merges must be off. The workflow
+  reads one merge commit, so a rebase-merged PR is picked commit by commit and
+  the guard sees only the last one.
+- Each line that takes backports must run the conflict-marker scan. A line cut
+  before the scan existed needs `scripts/check-conflict-markers.sh` and the
+  `conflict-markers` job ported to it by hand.
 
 **Start a backport.** Add the label `backport release/X.Y.x` to a PR on `main`.
 The run starts when the PR merges, or when you add the label to a merged PR.

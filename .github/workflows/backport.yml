@@ -65,9 +65,12 @@ jobs:
               run: |
                   set -euo pipefail
                   gh api "repos/$REPO/commits/$MERGE_SHA" --jq .commit.message >"$RUNNER_TEMP/message"
-                  if reason="$(scripts/backport-title-guard.sh "$PR_TITLE" "$RUNNER_TEMP/message")"; then
-                      exit 0
-                  fi
+                  status=0
+                  reason="$(scripts/backport-title-guard.sh "$PR_TITLE" "$RUNNER_TEMP/message")" || status=$?
+                  [ "$status" -eq 0 ] && exit 0
+                  # 1 is a refusal. Anything else is an error in the guard, which
+                  # printed its own message: fail without a misleading comment.
+                  [ "$status" -eq 1 ] || exit "$status"
                   gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
                       -f body="Backport refused. $reason"
                   echo "::error::$reason"

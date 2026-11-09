@@ -4,9 +4,11 @@ name: merge-back
 # the release tag is reachable from main. A person starts this after a stable
 # promotion. docs/internal/release-pipeline.md describes the flow.
 #
-# NOT READY TO ENABLE. Karl has not agreed the design, and the push needs a
-# bypass actor on the `main` ruleset. Without that actor the push is refused.
-# Follow the manual merge in the release steps until both are done.
+# This does nothing until a person sets the repository variable
+# MERGE_BACK_ENABLED to `true`. Leave it unset until Karl agrees the design, and
+# follow the manual merge in the release steps until then. The minimal-shipper
+# App is already a bypass actor on the `main` ruleset, so the variable is the
+# only thing stopping the push.
 
 on:
     workflow_dispatch:
@@ -31,7 +33,7 @@ jobs:
     merge-back:
         # Only main's copy of this workflow and of merge-back.sh may push to
         # main, so a dispatch from any other branch does nothing.
-        if: github.ref == 'refs/heads/main'
+        if: vars.MERGE_BACK_ENABLED == 'true' && github.ref == 'refs/heads/main'
         # The minimal-shipper key lives in the `release` environment, which
         # only main and release/* can deploy to.
         environment: release

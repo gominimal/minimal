@@ -101,8 +101,10 @@ main() {
     git switch --quiet --detach origin/main
     git merge --quiet --no-edit -s ours -m "Merge branch '$line' into main" "origin/$line"
 
-    git merge-base --is-ancestor "$tag" HEAD
-    [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse 'origin/main^{tree}')" ]
+    git merge-base --is-ancestor "$tag" HEAD ||
+        { echo "the merge did not make $tag reachable from main" >&2; exit 1; }
+    [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse 'origin/main^{tree}')" ] ||
+        { echo "the merge changed the tree of main" >&2; exit 1; }
 
     git push origin HEAD:refs/heads/main
 }
