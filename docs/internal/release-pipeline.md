@@ -656,6 +656,52 @@ months, and it always keeps the newest ten. The logic is in
 deletes a `vX.Y.Z` release. The installer reads from the bucket, so pruning
 does not remove anything that users install.
 
+### backport.yml: open a PR on a release line
+
+[`.github/workflows/backport.yml`](../../.github/workflows/backport.yml) picks
+a merged `main` PR onto a release line and opens a PR there. It uses
+[`korthout/backport-action`](https://github.com/korthout/backport-action).
+
+The workflow does nothing until the repository variable `BACKPORT_ENABLED` is
+`true`. Before an admin sets it:
+
+- The labels `backport release/X.Y.x` and `backport-conflict` must exist.
+- The repository setting `squash_merge_commit_title` must be `PR_TITLE`. See
+  the merge rule below.
+
+**Start a backport.** Add the label `backport release/X.Y.x` to a PR on `main`.
+The run starts when the PR merges, or when you add the label to a merged PR.
+
+**Title guard.**
+[`scripts/backport-title-guard.sh`](../../scripts/backport-title-guard.sh)
+refuses a `feat` title and a breaking title, because either one forces the line
+to the next minor. It also refuses a source commit with a `BREAKING CHANGE`
+footer. The run comments on the source PR and stops. If the change is safe on
+the line, retitle the source PR as `fix`, then remove the label and add it
+again. A retitle does not remove a footer, so backport that change by hand.
+
+**The backport PR.** The action cherry-picks the squash commit to the branch
+`backport/<number>-to-release/X.Y.x`. It opens the PR as `gominimal-aw-bot`,
+with the title of the source PR. The body names the source PR. It does not copy
+the source body, because agent-runtime reads `Closes #n` in a PR body as a link
+to an epic.
+
+**Merge rule.** Squash-merge the PR, and keep the PR title as the subject. A
+cherry-picked commit keeps the source subject. A rebase merge puts that subject
+on the line, so a retitled `feat` still forces a minor. A squash of one commit
+does the same under any other setting.
+
+**Conflicts.** The action commits the first conflict as it stands, in a commit
+named `BACKPORT-CONFLICT`. Then it opens a draft. The workflow adds the label
+`backport-conflict`, and adds the source PR, the source commit, and the
+conflicted paths to the PR body. Resolve each path on the branch, then mark the
+PR ready. A modify/delete conflict does not leave conflict markers, so check
+each path in the list.
+
+**Workflow files.** The token has no `workflows` permission. GitHub refuses the
+push of a pick that changes `.github/workflows`, and the run reports that on
+the source PR. Backport those changes by hand.
+
 ### install.sh: from channel to installed files
 
 [`scripts/install.sh`](../../scripts/install.sh) is the `curl | sh`
