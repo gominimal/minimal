@@ -11258,3 +11258,170 @@ fn show_and_prune_dry_run_report_disk_unit_boundaries() {
     assert_eq!(format_disk(1_073_741_824), "1.0 GiB");
     assert_eq!(format_disk(1023 * 1024 * 1024), "1023.0 MiB");
 }
+
+/// A listed box for the `min box wait` tests: `web` in `state`, with the
+/// reason, the exit code and the signal its record keeps.
+fn waited_entry(
+    state: &str,
+    reason: Option<&str>,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> minimald_rpc::BoxListingEntry {
+    minimald_rpc::BoxListingEntry {
+        reason: reason.map(str::to_owned),
+        exit_code,
+        signal,
+        ..ending_entry(state)
+    }
+}
+
+/// The record of box `id` on `host`, as `min box show` reads it.
+async fn shown_record(host: &LocalHost, id: boxes::SessionId) -> minimald_rpc::BoxListingEntry {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let mut client = box_host_client(host).await.expect("the host answers");
+    match client
+        .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
+        .await
+        .expect("the ShowBox RPC")
+    {
+        Errorable::Ok(shown) => shown.record,
+        Errorable::Err { error } => panic!("ShowBox failed: {error}"),
+    }
+}
+
+// BCLI-013: `min box wait` gives back the exit code the record keeps, and
+// 128 plus the signal for a stopped box with no exit code. A box that has
+// not ended is still waited on. Over a harness daemon, the wait on a
+// stopped box returns what its record keeps.
+#[tokio::test]
+async fn box_wait_returns_retained_exit_code_or_128_plus_signal() {
+    for (entry, code) in [
+        (waited_entry("exited", Some("exit"), Some(0), None), 0),
+        (waited_entry("exited", Some("exit"), Some(3), None), 3),
+        (
+            waited_entry("stopped", Some("stopped"), Some(2), Some(15)),
+            2,
+        ),
+        (
+            waited_entry("stopped", Some("stopped"), None, Some(15)),
+            143,
+        ),
+        (waited_entry("stopped", Some("oom"), None, Some(9)), 137),
+    ] {
+        assert_eq!(wait_exit(&entry, "web"), Some(Ok(code)), "{entry:?}");
+    }
+    for state in ["running", "created", "starting"] {
+        assert_eq!(wait_exit(&ending_entry(state), "web"), None, "{state}");
+    }
+
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let id = alpha.create("web", None).await;
+    alpha.stop("web").await;
+    let record = shown_record(&alpha.host, id).await;
+    let expected = wait_exit(&record, "web")
+        .expect("a stopped box has ended")
+        .expect("a stop is not a timeout");
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        box_wait_on_hosts(
+            vec![alpha.host.clone()],
+            "web",
+            None,
+            std::time::Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("the wait on an ended box returns at once")
+    .expect("the wait succeeds");
+    assert_eq!(code, expected, "{record:?}");
+}
+
+// BCLI-013, BOX-154: a stopped record with neither an exit code nor a
+// signal is an orphaned stop, and the wait gives back 137.
+#[test]
+fn box_wait_orphaned_stopped_record_returns_137() {
+    let orphaned = waited_entry("stopped", Some("stopped"), None, None);
+    assert_eq!(wait_exit(&orphaned, "web"), Some(Ok(137)));
+    let no_reason = waited_entry("stopped", None, None, None);
+    assert_eq!(wait_exit(&no_reason, "web"), Some(Ok(137)));
+}
+
+// BCLI-013: `min box wait --timeout` stops waiting on a box that still
+// runs, with exit 124 and the `timeout` error, and leaves the box running.
+// A wait with no timeout returns once the box is stopped.
+#[tokio::test]
+async fn box_wait_timeout_flag_returns_124_box_runs_on() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let id = alpha.create("web", None).await;
+
+    let err = box_wait_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        Some(std::time::Duration::from_millis(300)),
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect_err("the box runs past the wait's timeout");
+    let timed_out = err
+        .downcast_ref::<BoxTimedOut>()
+        .unwrap_or_else(|| panic!("not a timeout: {err:#}"));
+    assert_eq!(BoxTimedOut::EXIT_CODE, 124);
+    assert_eq!(BoxTimedOut::CODE, "timeout");
+    assert_eq!(
+        timed_out.to_string(),
+        "Stopped waiting after 300ms; web is still running."
+    );
+    assert_eq!(timed_out.hint(), "Run `min box wait web` to wait again.");
+    assert_eq!(
+        BoxTimedOut::waited("web", "30s").to_string(),
+        "Stopped waiting after 30s; web is still running."
+    );
+
+    let record = shown_record(&alpha.host, id).await;
+    assert_eq!(record.state, "running", "the wait leaves the box running");
+    assert_eq!(wait_exit(&record, "web"), None);
+
+    let ended = {
+        let host = alpha.host.clone();
+        tokio::spawn(async move {
+            box_wait_on_hosts(
+                vec![host],
+                "web",
+                None,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+        })
+    };
+    alpha.stop("web").await;
+    let code = tokio::time::timeout(std::time::Duration::from_secs(30), ended)
+        .await
+        .expect("the wait returns once the box stops")
+        .expect("the wait task")
+        .expect("the wait succeeds");
+    let record = shown_record(&alpha.host, id).await;
+    assert_eq!(wait_exit(&record, "web"), Some(Ok(code)), "{record:?}");
+}
+
+// BCLI-014: a box whose `exited` reason is `timeout` gives the `timeout`
+// error with exit 124, whatever exit code its record keeps. `min box wait`
+// answers it so, and the run verbs share the same error.
+#[test]
+fn run_verbs_and_wait_timeout_return_124_with_code_timeout() {
+    for entry in [
+        waited_entry("exited", Some("timeout"), Some(124), None),
+        waited_entry("exited", Some("timeout"), None, Some(9)),
+        waited_entry("stopped", Some("timeout"), None, None),
+    ] {
+        let ended = wait_exit(&entry, "web").expect("the box ended");
+        assert_eq!(ended, Err(BoxTimedOut::ended("web")), "{entry:?}");
+    }
+    let timed_out = BoxTimedOut::ended("web");
+    assert_eq!(
+        timed_out.to_string(),
+        "web ran for longer than its timeout and was stopped."
+    );
+    assert_eq!(BoxTimedOut::EXIT_CODE, 124);
+    assert_eq!(BoxTimedOut::CODE, "timeout");
+}

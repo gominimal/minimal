@@ -474,6 +474,10 @@ pub enum BoxCommand {
     /// code. `-t` gives the command a terminal, and `--detach` starts it
     /// and returns its exec id
     Exec(BoxExecArgs),
+    /// Wait until a box ends and exit with its exit code. A box that ended
+    /// already returns at once. A box stopped by a signal exits with 128
+    /// plus the signal, and a box that ran past its own timeout with 124
+    Wait(BoxWaitArgs),
     /// Show what happened to a box: each event the daemon recorded for
     /// it, such as its creation, each start and stop, each exec and its
     /// exit, oldest first. A stopped or exited box keeps its events until
@@ -654,6 +658,19 @@ pub struct BoxRmArgs {
     /// Remove a running box too: stop it at once, then remove it
     #[arg(long)]
     pub force: bool,
+}
+
+// BCLI-013, BCLI-014: `min box wait <box> [--timeout <d>]`.
+#[derive(Debug, Args)]
+pub struct BoxWaitArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Stop waiting after this long: a number of seconds, or a number
+    /// followed by s, m or h, such as 30s, 5m or 1h. The box keeps running,
+    /// and the command exits with code 124
+    #[arg(long, value_name = "DURATION", value_parser = mfile::duration::parse_timeout_secs)]
+    pub timeout: Option<u64>,
 }
 
 // BOX-149 (BCLI-053): `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`.
