@@ -1387,8 +1387,16 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // The switch's Box Egress Proxy leg answers an ARP claim and admits a
     // connection only from an address's switch-derived MAC, as a box's tap
     // carries. Every host-address box reaches the proxy through this tap, so
-    // it takes the daemon address's derived MAC before it comes up.
-    set_interface_mac(TAP, crate::net::MacAddr::for_switch_ip(ip).0)?;
+    // it takes the daemon address's derived MAC before it comes up. Only
+    // those boxes need it, so a refusal keeps the kernel's MAC and the
+    // daemon's own egress comes up all the same.
+    if let Err(error) = set_interface_mac(TAP, crate::net::MacAddr::for_switch_ip(ip).0) {
+        tracing::warn!(
+            %error,
+            "the guest's eth0 keeps its kernel-assigned MAC; host-address boxes \
+             cannot reach the Box Egress Proxy through it"
+        );
+    }
     // Configure the interface directly via ioctls — the generic guest rootfs
     // ships no `ip`/iproute2 binary, so shelling out is not an option.
     configure_interface_v4(TAP, ip, DEFAULT_SUBNET.prefix(), Some(gateway))?;
@@ -1472,6 +1480,7 @@ fn set_interface_mac(ifname: &str, mac: [u8; 6]) -> std::io::Result<()> {
         addr: libc::sockaddr,
         _pad: [u8; 8],
     }
+    const _: () = assert!(std::mem::size_of::<IfReqHwAddr>() == 40);
 
     // SAFETY: sockaddr is plain old data; zeroing then filling is valid.
     let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };

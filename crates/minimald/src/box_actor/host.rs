@@ -155,6 +155,14 @@ fn run_leaf_set_nft(
             format!("{} is not below {}", leaf.display(), mount.display()),
         )
     })?;
+    // The helper adds only a leaf that is a real directory, and so does
+    // this path. A remove still runs for a leaf that is gone.
+    if nft_verb == "add" && !leaf.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", leaf.display()),
+        ));
+    }
     let ran = std::process::Command::new(nft)
         .arg(nft_verb)
         .arg("element")
@@ -3037,8 +3045,9 @@ mod quic443_cohort_tests {
     /// BEP-018 and BEP-083 on the root daemon's path: `run_leaf_set_nft`
     /// hands `nft` the element for the leaf's path below the mount, in the
     /// lane set for a lane verb and in the blocked-leaves set for `add` and
-    /// `remove`. It refuses a leaf that is not below the mount, and a verb
-    /// the helper does not know, without running `nft`.
+    /// `remove`. It refuses a leaf that is not below the mount, a verb the
+    /// helper does not know, and an add of a leaf that is not a directory,
+    /// without running `nft`.
     #[test]
     fn root_leaf_set_change_runs_nft_on_the_named_set() {
         use crate::net::classifier::{nft_calls, recording_nft};
@@ -3048,6 +3057,7 @@ mod quic443_cohort_tests {
         let id = BoxId::mint().to_string();
         let root = mount.path().join("minimald.slice");
         let leaf = sandbox::classifier::box_leaf(&root, &id, Verdict::Allow);
+        std::fs::create_dir_all(&leaf).unwrap();
         let element = format!("{{ \"minimald.slice/boxes/allow/{id}\" }}");
         let argv = |verb: &str, set: &str| -> Vec<String> {
             [verb, "element", "inet", "minimal_class", set, &element]
@@ -3093,6 +3103,18 @@ mod quic443_cohort_tests {
             nft_calls(stub.path()).len(),
             4,
             "no nft call for the unknown verb"
+        );
+
+        let missing = sandbox::classifier::box_leaf(&root, "no-such-box", Verdict::Allow);
+        for verb in ["add", "lane-add"] {
+            let refused = super::run_leaf_set_nft(&nft, mount.path(), verb, &missing)
+                .expect_err("an add of a leaf that is not a directory is refused");
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            nft_calls(stub.path()).len(),
+            4,
+            "no nft call for an add of a missing leaf"
         );
     }
 }
