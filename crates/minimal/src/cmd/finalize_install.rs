@@ -4161,8 +4161,14 @@ mod tests {
             )),
             "the step still says {PLACE_NO_HOLDER:?} when no process holds the socket"
         );
-        // The note says to restart, and the block can echo it whole.
-        assert!(DAEMON_RUNNING_NOTE.contains("restart the daemon: min stop --force"));
+        // The note says to restart with plain `min stop` first and what `--force` costs, and
+        // the block can echo it whole.
+        assert!(
+            DAEMON_RUNNING_NOTE
+                .contains("restart the daemon: min stop (it refuses while boxes are live")
+        );
+        assert!(DAEMON_RUNNING_NOTE.contains("min stop --force ends them)"));
+        assert!(!DAEMON_RUNNING_NOTE.contains("sessions survive"));
         assert!(!DAEMON_RUNNING_NOTE.contains('\''));
     }
 
