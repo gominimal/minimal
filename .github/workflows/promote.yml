@@ -8,7 +8,7 @@ on:
     workflow_dispatch:
         inputs:
             version:
-                description: "Staged version to promote: a semver (0.6.0, from a versioned release build) or a nightly short SHA (unstable only). Leave empty for the latest staged nightly SHA."
+                description: "Staged version to promote: a semver (0.6.0, from a versioned release build) or a nightly short SHA (unstable only). Leave empty for the latest staged nightly SHA (unstable only)."
                 required: false
                 type: string
             target:
@@ -207,9 +207,11 @@ jobs:
         # both read the same `stable`, pass the check, and write out of order.
         # Job-level, not workflow-level, so a run waiting at the gate holds
         # nothing. GitHub keeps one waiting run per group: a third run cancels
-        # the waiting one before it writes anything.
+        # the waiting one before it writes anything, and that one must be
+        # dispatched again. A dry run writes nothing, so it has its own group
+        # and never cancels a real promotion.
         concurrency:
-            group: promote-cli-${{ inputs.target }}
+            group: promote-cli-${{ inputs.target }}${{ inputs.dry_run && '-dry-run' || '' }}
             cancel-in-progress: false
         runs-on: ubuntu-latest
         timeout-minutes: 20

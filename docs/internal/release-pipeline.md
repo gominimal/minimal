@@ -616,7 +616,8 @@ See [docs/ci-strategy.md](../ci-strategy.md).
 `promote-cli` in the Actions list, moves `stable` or `unstable`. Its inputs are
 `version`, `target`, `dry_run`, `override_provenance`, and `rollback`. `version` is a
 version number or a nightly commit hash. When you leave it empty, the
-workflow uses the newest staged nightly build.
+workflow uses the newest staged nightly build, so an empty `version` works
+only for `unstable`.
 
 **Approval.** The `gate` job opens an approval issue, posts to Slack, and
 waits. Any member of the `@gominimal/minimalists` team can approve, except
@@ -628,12 +629,16 @@ nothing. An approver comments
 `approved` or `denied`. If someone closes the issue without an approval, the
 workflow stops.
 
-**Version guards.** Before a promotion to `stable` moves anything, the `promote`
+**Version guards.** Run promotions from `main`. A release branch that predates
+these guards runs its older workflow, which does not enforce them.
+Before a promotion to `stable` moves anything, the `promote`
 job runs [`scripts/check-promotion.sh`](../../scripts/check-promotion.sh)
 against the current `stable`. The job runs after the approval, because `stable`
 can move while the approval waits. A dry run makes the same checks. The
 `promote` job runs one at a time for each channel, so two approved runs cannot
-both pass the check and then write out of order.
+both pass the check and then write out of order. GitHub keeps one waiting
+run for each channel: a third run cancels the waiting one, which you must then
+start again. A dry run waits in its own queue and never cancels a real run.
 
 - It refuses a candidate, such as `0.7.3-rc2`. No input turns this off. A
   candidate is for soak only, so stage the final version.
