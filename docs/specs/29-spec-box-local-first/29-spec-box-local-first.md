@@ -353,7 +353,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T1
   verify:   cargo nextest run -p mfile expansion_order_and_merge_rules
   property: For every set of layers, expansion equals the fold of the merge rule over the layers before the command-line overrides in the stated order, followed by the command-line override rules below.
-  - WHERE the command-line override layer sets a `[network]` key THE SYSTEM SHALL change only that key of the expanded `[network]` table, adding the override's values to a list key and replacing a scalar key's value, and leave every other `[network]` key as the earlier layers set it.
+  - WHERE the command-line override layer sets a `[network]` key THE SYSTEM SHALL change only that key of the expanded `[network]` table, adding the override's values to a list key other than `egress.allow_protocols`, which the next sub-bullet replaces, and replacing a scalar key's value, and leave every other `[network]` key as the earlier layers set it.
     tier:   T0
     verify: cargo nextest run -p mfile command_line_network_override_changes_only_its_key
   - WHERE the command-line override layer sets `egress.allow_protocols` THE SYSTEM SHALL replace that list with the override's values.
