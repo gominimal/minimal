@@ -5249,6 +5249,15 @@ impl BoxRegistry {
     /// `None`, from a client that predates the field, keeps the pair proof
     /// alone.
     ///
+    /// A box id that is the row's own also stands in for its name (#1116):
+    /// a session renamed since its registration withdraws under its new
+    /// name, while the host keeps the row, its creation and its published
+    /// address under the name it was registered by. The id and the pair
+    /// prove the creator, as a resume finds a renamed box by its id
+    /// ([`Self::resumable_creation`]), so the row and its creation end and
+    /// the old name is free again. A withdrawal without the id is still
+    /// held to the name.
+    ///
     /// The withdrawn switch address returns to the hand-out book
     /// ([`SwitchAddressBook`]): quarantined when the row was ever
     /// attributed, at once when it never was. What the address's frames do
@@ -5267,6 +5276,24 @@ impl BoxRegistry {
         loopback_addr: Ipv4Addr,
         box_id: Option<BoxId>,
     ) -> Result<Option<Arc<BoxRecord>>, WithdrawError> {
+        self.withdraw_client_box_held(name, switch_addr, loopback_addr, box_id)
+            .map(|(removed, _)| removed)
+    }
+
+    /// [`Self::withdraw_client_box`], also answering the name the
+    /// withdrawn box held on the host: the removed row's or the ended
+    /// creation's own name, which is the presented one unless the session
+    /// was renamed since its registration (#1116), and the presented one
+    /// when nothing was withdrawn. The box's published address is the
+    /// answerer's under that name, so it is the name the address is
+    /// released by.
+    pub fn withdraw_client_box_held(
+        &self,
+        name: &str,
+        switch_addr: Ipv4Addr,
+        loopback_addr: Ipv4Addr,
+        box_id: Option<BoxId>,
+    ) -> Result<(Option<Arc<BoxRecord>>, String), WithdrawError> {
         #[expect(
             clippy::unwrap_in_result,
             reason = "the expect is the lock's poison guard, not this function's error \
@@ -5291,27 +5318,48 @@ impl BoxRegistry {
             // with its box: nothing can resume it from here on.
             let ended = {
                 let mut creations = self.creations();
-                let key = canonical_box_name(name);
                 let proves = |creation: &Creation| {
                     !creation.standing
                         && creation.switch_address == switch_addr
                         && creation.loopback_address == loopback_addr
                         && box_id.is_none_or(|asked| asked == creation.id())
                 };
+                // The box id finds the creation first, as a resume finds
+                // it: a session renamed since its registration still ends
+                // the creation kept under its old name (#1116). Without the
+                // id, the presented name is the key.
+                let key = box_id
+                    .and_then(|asked| {
+                        creations
+                            .iter()
+                            .find(|(_, creation)| creation.id() == asked)
+                            .map(|(held, _)| held.clone())
+                    })
+                    .unwrap_or_else(|| canonical_box_name(name));
                 if creations.get(&key).is_some_and(proves) {
                     creations.remove(&key)
                 } else {
                     // A superseded creation (BOX-004) ends the same way:
-                    // its creator destroyed the stopped box.
+                    // its creator destroyed the stopped box. The id, when
+                    // presented, is the proof alone; the name otherwise.
+                    let asked_key = canonical_box_name(name);
                     creations
                         .superseded
                         .iter()
                         .position(|creation| {
-                            canonical_box_name(&creation.name) == key && proves(creation)
+                            (box_id.is_some() || canonical_box_name(&creation.name) == asked_key)
+                                && proves(creation)
                         })
                         .map(|at| creations.superseded.remove(at))
                 }
             };
+            // A registration in flight under the creation's own name must
+            // not land after its end either.
+            if let Some(creation) = &ended
+                && canonical_box_name(&creation.name) != canonical_box_name(name)
+            {
+                self.bump_withdrawal_generation(&creation.name);
+            }
             drop(rows);
             // Its addresses were reserved for it while it was dormant; they
             // go back with it.
@@ -5319,9 +5367,13 @@ impl BoxRegistry {
                 self.give_back_creation_addrs(creation);
                 self.persist();
             }
-            return Ok(None);
+            let held = ended.map_or_else(|| name.to_string(), |creation| creation.name);
+            return Ok((None, held));
         };
-        if canonical_box_name(record.name()) != canonical_box_name(name) {
+        // The row's own id proves its creator whatever the session is
+        // named now (#1116); without it the name must be the row's.
+        let id_proves = box_id.is_some_and(|asked| asked == record.box_id);
+        if !id_proves && canonical_box_name(record.name()) != canonical_box_name(name) {
             return Err(WithdrawError::NotTheCreatorsRow {
                 switch_addr,
                 held_name: record.name().to_string(),
@@ -5354,7 +5406,12 @@ impl BoxRegistry {
         // inverts.
         self.retire_proxy_attachment(switch_addr, Instant::now());
         let removed = rows.remove(&switch_addr.octets());
-        self.bump_withdrawal_generation(name);
+        // The row's own name, which is the presented one unless the
+        // session was renamed since its registration.
+        let held = removed
+            .as_deref()
+            .map_or_else(|| name.to_string(), |record| record.name().to_string());
+        self.bump_withdrawal_generation(&held);
         // The creator withdrew its box: its creation ends with the row,
         // when the row is the creation's.
         let ended = removed.as_deref().is_some_and(|record| {
@@ -5390,7 +5447,7 @@ impl BoxRegistry {
         if ended {
             self.persist();
         }
-        Ok(removed)
+        Ok((removed, held))
     }
 
     /// The creation a resume presenting `(name, switch_addr, loopback_addr)`
@@ -11496,6 +11553,125 @@ mod tests {
             registry.withdraw_client_box("web", new.switch_addr(), new.loopback_addr(), None),
             Ok(Some(Arc::clone(&new))),
             "a client predating the field keeps the pair proof alone"
+        );
+    }
+
+    /// #1116: a session renamed since its registration withdraws under its
+    /// new name, while the host keeps the row and its creation under the
+    /// name it was registered by. The row's own id and pair prove the
+    /// creator: the row and its creation end, the withdrawal names the old
+    /// name, and the old name takes a new box. Without the id, or with
+    /// another box's, the new name is still refused.
+    #[test]
+    fn renamed_creator_withdraws_its_row_by_box_id() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let api = registry
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for the box");
+        let refused: Result<Option<Arc<BoxRecord>>, WithdrawError> =
+            Err(WithdrawError::NotTheCreatorsRow {
+                switch_addr: web.switch_addr(),
+                held_name: "web".to_string(),
+                asked_name: "front".to_string(),
+            });
+
+        assert_eq!(
+            registry.withdraw_client_box("front", web.switch_addr(), web.loopback_addr(), None),
+            refused,
+            "without the id the name must be the row's"
+        );
+        assert_eq!(
+            registry.withdraw_client_box(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(api.box_id())
+            ),
+            refused,
+            "another box's id proves nothing of this row"
+        );
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "the refusals removed nothing"
+        );
+
+        assert_eq!(
+            registry.withdraw_client_box_held(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id())
+            ),
+            Ok((Some(Arc::clone(&web)), "web".to_string())),
+            "the row's own id proves the renamed creator"
+        );
+        assert!(
+            registry.row_by_name("web").is_none(),
+            "the row is withdrawn"
+        );
+        assert!(
+            registry.release_withdrawn_unless_owned("web", || {}),
+            "the creation ended with the row, so nothing owns the old name"
+        );
+        registry
+            .register_client_box(client_spec("web"))
+            .expect("the old name takes a new box");
+        assert!(
+            registry.row_by_name("api").is_some(),
+            "the other box's row stands"
+        );
+    }
+
+    /// #1116 for a stopped box: the drainer withdrew the row and the
+    /// creation stays dormant under the name it was registered by. Its
+    /// renamed creator's destroy, by the box id, ends the creation and
+    /// names the old name; the same destroy without the id keys the new
+    /// name, finds no creation and ends nothing.
+    #[test]
+    fn renamed_creator_ends_its_dormant_creation_by_box_id() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches");
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the row is withdrawn",
+        );
+
+        assert_eq!(
+            registry.withdraw_client_box_held(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                None
+            ),
+            Ok((None, "front".to_string())),
+            "without the id the new name keys no creation"
+        );
+        assert!(
+            !registry.release_withdrawn_unless_owned("web", || {}),
+            "the dormant creation still owns the old name"
+        );
+        assert_eq!(
+            registry.withdraw_client_box_held(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id())
+            ),
+            Ok((None, "web".to_string())),
+            "the id finds the creation under its old name"
+        );
+        assert!(
+            registry.release_withdrawn_unless_owned("web", || {}),
+            "the creation ended, so nothing owns the old name"
         );
     }
 

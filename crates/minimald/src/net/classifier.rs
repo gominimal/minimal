@@ -6819,6 +6819,117 @@ mod tests {
         );
     }
 
+    /// Whether an nft older than 1.0.9 loads a base chain of the inet family
+    /// at `priority` on `hook`. A number loads on every hook. A standard
+    /// name loads only where nft's family and hook matrix pairs it with the
+    /// hook: up to 1.0.8, `dstnat` (-100) on prerouting alone and `srcnat`
+    /// (100) on postrouting alone, so either name on another hook is
+    /// refused with "invalid priority expression value in this context".
+    /// 1.0.9 (nftables commit 8beafab7) added output to `dstnat` and input
+    /// to `srcnat`; Debian 12 ships 1.0.6 and Ubuntu 22.04 ships 1.0.2,
+    /// and one refused chain fails the classifier's whole transaction.
+    fn pre_1_0_9_nft_takes_priority(hook: &str, priority: &str) -> bool {
+        if priority.parse::<i32>().is_ok() {
+            return true;
+        }
+        // `name`, or `name + n` / `name - n`: the name is what is checked.
+        match priority.split_whitespace().next().unwrap_or_default() {
+            "raw" | "mangle" | "filter" | "security" => true,
+            "dstnat" => hook == "prerouting",
+            "srcnat" => hook == "postrouting",
+            _ => false,
+        }
+    }
+
+    /// Every base chain a rendered table declares, as (chain, type, hook,
+    /// priority), read off its `type … hook … priority …;` line.
+    fn base_chains(ruleset: &str) -> Vec<(String, String, String, String)> {
+        let mut chains = Vec::new();
+        let mut chain = String::new();
+        for line in ruleset.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("chain ") {
+                chain = rest.trim_end_matches('{').trim().to_owned();
+                continue;
+            }
+            let Some(decl) = line.strip_prefix("type ") else {
+                continue;
+            };
+            let decl = decl.split(';').next().unwrap_or_default();
+            let words: Vec<&str> = decl.split_whitespace().collect();
+            match words.as_slice() {
+                [kind, "hook", hook, "priority", priority @ ..] if !priority.is_empty() => {
+                    chains.push((
+                        chain.clone(),
+                        (*kind).to_owned(),
+                        (*hook).to_owned(),
+                        priority.join(" "),
+                    ));
+                }
+                _ => panic!("a base chain declaration nft would read: {line:?}"),
+            }
+        }
+        chains
+    }
+
+    /// The matrix the check below holds the table to, pinned on its own:
+    /// the refused spelling of inbox#1196 and its accepted equivalent.
+    #[test]
+    fn pre_1_0_9_nft_priority_matrix() {
+        assert!(!pre_1_0_9_nft_takes_priority("output", "dstnat"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "-100"));
+        assert!(pre_1_0_9_nft_takes_priority("prerouting", "dstnat"));
+        assert!(!pre_1_0_9_nft_takes_priority("input", "srcnat"));
+        assert!(pre_1_0_9_nft_takes_priority("postrouting", "srcnat"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "mangle"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "filter"));
+        assert!(pre_1_0_9_nft_takes_priority("postrouting", "mangle"));
+        assert!(!pre_1_0_9_nft_takes_priority("output", "dstnat + 5"));
+        assert!(!pre_1_0_9_nft_takes_priority("output", "nonsense"));
+    }
+
+    /// The table loads on the oldest nft a supported host ships, not only
+    /// on 1.0.9 and later: every base chain of the native render and of
+    /// the guest's names its priority in a form nft 1.0.2 through 1.0.8
+    /// accept on its hook. The dstnat chain, the one that once spelled
+    /// `priority dstnat` on output and so loaded nowhere before 1.0.9
+    /// (inbox#1196), is a nat chain on output at -100, dstnat's value.
+    #[test]
+    fn every_base_chain_loads_on_nft_before_1_0_9() {
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let renders = [
+            ("native", rendered_ruleset()),
+            (
+                "guest",
+                String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+                    .expect("the guest's render is text"),
+            ),
+        ];
+        for (which, ruleset) in &renders {
+            let chains = base_chains(ruleset);
+            assert!(
+                chains.len() >= 5,
+                "the {which} render declares its base chains: {chains:?}"
+            );
+            for (chain, _, hook, priority) in &chains {
+                assert!(
+                    pre_1_0_9_nft_takes_priority(hook, priority),
+                    "the {which} render's {chain} chain says `hook {hook} priority \
+                     {priority}`, which nft before 1.0.9 refuses: {ruleset}"
+                );
+            }
+            let dstnat: Vec<_> = chains
+                .iter()
+                .filter(|(chain, ..)| chain == "dstnat")
+                .map(|(_, kind, hook, priority)| (kind.as_str(), hook.as_str(), priority.as_str()))
+                .collect();
+            assert_eq!(
+                dstnat,
+                [("nat", "output", "-100")],
+                "the {which} render steers at output's nat hook, at dstnat's -100: {ruleset}"
+            );
+        }
+    }
+
     /// The guest's table writes the sender's cgroup into every packet it
     /// sends: the boxes cohort's connections leave with the box mark, and
     /// every other packet with the field cleared, so the VM host's gate

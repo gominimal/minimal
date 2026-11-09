@@ -301,6 +301,7 @@ fn every_daemon_connection_is_classified() {
             "cmd/boxes/list.rs::list_other_host = ungated",
             "cmd/boxes/list.rs::list_selected_host = gated",
             "cmd/boxes/vm_host.rs::box_record_by = ungated",
+            "cmd/boxes/vm_host.rs::destroyable_box_on_vm_host = ungated",
             // `min host list|show` probes each local host for its state and
             // daemon version. It only reads, and it must show a skewed
             // daemon's version, so it must work when the pair is skewed.

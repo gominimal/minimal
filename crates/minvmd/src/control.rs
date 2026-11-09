@@ -1269,12 +1269,14 @@ fn serve_request(
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
             let reply = order.apply(|| {
-                let (name, switch_address) = (request.name.clone(), request.switch_address);
-                let reply = withdraw_box(boxes, answerer, request);
+                let switch_address = request.switch_address;
+                let (reply, held) = withdraw_box(boxes, answerer, request);
                 // The box is gone: its audit window ends, and the count of
-                // the records it suppressed lands now.
-                if matches!(reply, BoxControlReply::Addresses(_)) {
-                    flush_guest_audit(audit_path, &name, GuestAuditKey::Switch(switch_address));
+                // the records it suppressed lands now, labelled with the
+                // name the host held the box under — not the one a session
+                // renamed since its registration presents (#1116).
+                if let Some(held) = held {
+                    flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
                 }
                 reply
             });
@@ -2423,29 +2425,34 @@ fn allocate_box_address_keeping(
 /// One info line per withdrawal names the box and both addresses, mirroring
 /// the registration's; a withdrawal that finds no row is the goal state
 /// already holding (already withdrawn, or the daemon restarted since) and
-/// is a debug line, not an error.
+/// is a debug line, not an error. Beside the reply, the name the host held
+/// the box under, on a withdrawal it accepted (`None` on a refusal): a
+/// session renamed since its registration presents another (#1116).
 fn withdraw_box(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     request: WithdrawBoxRequest,
-) -> BoxControlReply {
-    match boxes.withdraw_client_box(
+) -> (BoxControlReply, Option<String>) {
+    match boxes.withdraw_client_box_held(
         &request.name,
         request.switch_address,
         request.loopback_address,
         request.box_id.map(minimald_rpc::BoxId::to_bytes),
     ) {
-        Ok(withdrawn) => {
+        Ok((withdrawn, held)) => {
             // The box is gone, so its published address returns to the
             // machine's range — unless a live row or a registration in
             // flight under the name owns it: the answerer allocates per
-            // name, so a release by name would free theirs.
-            boxes.release_withdrawn_unless_owned(&request.name, || {
-                answerer.release_address(&request.name);
+            // name, so a release by name would free theirs. The name is
+            // the one the host holds the box under, which a session
+            // renamed since its registration no longer presents (#1116).
+            boxes.release_withdrawn_unless_owned(&held, || {
+                answerer.release_address(&held);
             });
             if withdrawn.is_some() {
                 tracing::info!(
-                    box = %request.name,
+                    box = %held,
+                    asked_as = %request.name,
                     switch_address = %request.switch_address,
                     loopback_address = %request.loopback_address,
                     "withdrew the box's host row; its addresses admit nothing"
@@ -2457,10 +2464,11 @@ fn withdraw_box(
                     "no host row held at the withdrawn switch address; already withdrawn"
                 );
             }
-            BoxControlReply::Addresses(BoxAddresses {
+            let reply = BoxControlReply::Addresses(BoxAddresses {
                 switch_address: request.switch_address,
                 loopback_address: request.loopback_address,
-            })
+            });
+            (reply, Some(held))
         }
         Err(error) => {
             tracing::debug!(
@@ -2469,9 +2477,10 @@ fn withdraw_box(
                 error = %error,
                 "box row withdrawal refused"
             );
-            BoxControlReply::Error {
+            let reply = BoxControlReply::Error {
                 error: error.to_string(),
-            }
+            };
+            (reply, None)
         }
     }
 }
@@ -6695,6 +6704,105 @@ mod tests {
             1,
             "only the registration asked the answerer"
         );
+    }
+
+    /// #1116 over the control socket: a destroy under the name a session
+    /// was renamed to, with the box id its registration handed back,
+    /// withdraws the row the host keeps under the old name, and the
+    /// answerer releases the published address by that old name, the one
+    /// it allocated it under. Without the id the withdrawal is refused and
+    /// releases nothing.
+    #[test]
+    fn a_renamed_box_is_withdrawn_by_its_id_and_released_by_its_old_name() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        let (released, releases) = std::sync::mpsc::channel();
+        let answerer = AnswererStatus::allocating_for_tests_with(
+            "control-test-node",
+            || None,
+            move |name, address| {
+                let _ = released.send((name.to_string(), address));
+            },
+        );
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer,
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: 0,
+                    host_ip: false,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let withdraw_as_front = |box_id: Option<minimald_rpc::BoxId>| {
+            control(
+                &sock_path,
+                &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                    name: "front".to_string(),
+                    switch_address: web.switch_address,
+                    loopback_address: web.loopback_address,
+                    box_id,
+                }),
+            )
+            .expect("the withdrawal is answered")
+        };
+
+        match withdraw_as_front(None) {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("held by box \"web\"") && error.contains("\"front\""),
+                "the id-less withdrawal is held to the name: {error}"
+            ),
+            other => panic!("an id-less withdrawal under another name is refused, got {other:?}"),
+        }
+        assert!(
+            boxes
+                .table()
+                .by_source(web.switch_address.octets())
+                .is_some(),
+            "the refusal left the row"
+        );
+
+        match withdraw_as_front(Some(web.box_id)) {
+            BoxControlReply::Addresses(echoed) => assert!(
+                echoed.switch_address == web.switch_address
+                    && echoed.loopback_address == web.loopback_address,
+                "the withdrawal echoes the pair it went by: {echoed:?}"
+            ),
+            other => panic!("the renamed creator's withdrawal is answered, got {other:?}"),
+        }
+        assert!(
+            boxes
+                .table()
+                .by_source(web.switch_address.octets())
+                .is_none(),
+            "the row is withdrawn"
+        );
+        let (name, address) = releases
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the published address is released");
+        assert_eq!(name, "web", "released by the name it was allocated under");
+        assert!(address.is_some(), "the release freed the box's address");
     }
 
     /// A box created while the host lacked the box range was handed the
