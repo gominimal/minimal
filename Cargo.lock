@@ -462,10 +462,13 @@ version = "0.0.1"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
+ "bytes",
  "clap",
  "client-config",
  "core-foundation",
  "getrandom 0.3.4",
+ "h2",
+ "http",
  "libc",
  "p256",
  "paths",

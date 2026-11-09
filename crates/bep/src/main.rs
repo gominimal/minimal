@@ -1558,7 +1558,9 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         Arc::new(SystemResolver),
         log.clone(),
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| err.to_string())?
+    // Experimental: BEP_EXPERIMENTAL_H2 turns on the h2 relay.
+    .with_h2(bep::h2relay::enabled());
     let wiring = wire(
         sealing,
         HostKeychain,

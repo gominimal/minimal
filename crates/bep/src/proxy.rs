@@ -73,6 +73,7 @@ use tracing::Instrument as _;
 use crate::audit::{AuditLog, Decision, Kind, Mapping, NO_SNI, Outcome};
 use crate::ca::{Ca, CaError, CaKey, Leaf};
 use crate::forward::{self, Flow, HalfEnd, Redeemer, Unwired, UpstreamError, Validated};
+use crate::h2relay;
 use crate::http::{self, CloseReason, Parse};
 use crate::listener::Delivery;
 use crate::module::Module;
@@ -87,6 +88,14 @@ pub const OFF_MODULE: &str = "off_module";
 
 /// The audit marker of a plain HTTP request to a credentialed host.
 pub const UPSTREAM_NOT_TLS: &str = "upstream_not_tls";
+
+/// The audit marker of a box TLS handshake that offered no protocol the
+/// proxy speaks: in practice a client that requires `h2` (gRPC) while the
+/// proxy offers `http/1.1` alone (§5.7's recorded v1 limit).
+pub const ALPN_H2_ONLY: &str = "alpn_h2_only";
+
+/// The audit marker of an `h2` box flow whose upstream did not pick `h2`.
+pub const UPSTREAM_NO_H2: &str = "upstream_no_h2";
 
 /// The entry form of a box connection that opened with a CONNECT head.
 pub const ENTRY_CONNECT: &str = "connect";
@@ -352,6 +361,10 @@ pub struct Proxy {
     admission: Admission,
     leaves: Arc<dyn LeafIssuer>,
     upstream_tls: TlsConnector,
+    /// The upstream leg of an `h2` box flow: `h2` alone in ALPN.
+    upstream_tls_h2: TlsConnector,
+    /// Whether the box's leg offers `h2` too ([`h2relay`], experimental).
+    h2: bool,
     resolver: Arc<dyn Resolve>,
     audit: Arc<dyn AuditWriter>,
     redeemer: Arc<dyn Redeemer>,
@@ -426,11 +439,15 @@ impl Proxy {
             .with_no_client_auth();
         // BEP-073: the upstream leg is HTTP/1.1 too.
         upstream.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+        let mut upstream_h2 = upstream.clone();
+        upstream_h2.alpn_protocols = vec![h2relay::ALPN_H2.to_vec()];
         let redeemer: Arc<dyn Redeemer> = Arc::new(Unwired);
         Ok(Self {
             admission,
             leaves,
             upstream_tls: TlsConnector::from(Arc::new(upstream)),
+            upstream_tls_h2: TlsConnector::from(Arc::new(upstream_h2)),
+            h2: false,
             resolver,
             audit,
             redeemer,
@@ -442,6 +459,14 @@ impl Proxy {
     #[must_use]
     pub fn with_redeemer(mut self, redeemer: Arc<dyn Redeemer>) -> Self {
         self.redeemer = redeemer;
+        self
+    }
+
+    /// This proxy, with the box's leg offering `h2, http/1.1` when `h2` is
+    /// set ([`h2relay`], experimental and off by default).
+    #[must_use]
+    pub fn with_h2(mut self, h2: bool) -> Self {
+        self.h2 = h2;
         self
     }
 
@@ -679,6 +704,10 @@ impl Proxy {
             Ok(Ok(tls)) => tls,
             Ok(Err(err)) => {
                 tracing::info!(authority, error = %err, "the box's TLS handshake failed");
+                if no_application_protocol(&err) {
+                    self.audit_refusal(box_id, &authority, ALPN_H2_ONLY);
+                    return Ended::Refused(ALPN_H2_ONLY);
+                }
                 return Ended::Refused("box_tls_handshake");
             }
             Err(_) => {
@@ -686,7 +715,8 @@ impl Proxy {
                 return Ended::Closed("box_tls_timeout");
             }
         };
-        self.relay_flow(box_id, host, port, boxed, upstream).await
+        self.relay_terminated(box_id, host, port, boxed, upstream)
+            .await
     }
 
     /// BEP-080: a box connection that opens with a TLS ClientHello. The
@@ -736,6 +766,10 @@ impl Proxy {
             Ok(Ok(tls)) => tls,
             Ok(Err(err)) => {
                 tracing::info!(authority, error = %err, "the box's TLS handshake failed");
+                if no_application_protocol(&err) {
+                    self.audit_refusal(box_id, &authority, ALPN_H2_ONLY);
+                    return Ended::Refused(ALPN_H2_ONLY);
+                }
                 return Ended::Refused("box_tls_handshake");
             }
             Err(_) => {
@@ -743,7 +777,8 @@ impl Proxy {
                 return Ended::Closed("box_tls_timeout");
             }
         };
-        self.relay_flow(box_id, host, port, boxed, upstream).await
+        self.relay_terminated(box_id, host, port, boxed, upstream)
+            .await
     }
 
     /// The leaf for an admitted `host` and a validated upstream leg to
@@ -813,6 +848,71 @@ impl Proxy {
         }
     }
 
+    /// Relays a terminated box flow: over [`h2relay`] when the box picked
+    /// `h2`, and otherwise over the HTTP/1.1 relay to `upstream`.
+    async fn relay_terminated<T>(
+        &self,
+        box_id: &str,
+        host: String,
+        port: u16,
+        boxed: tokio_rustls::server::TlsStream<T>,
+        upstream: Validated<UpstreamTls>,
+    ) -> Ended
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        if boxed.get_ref().1.alpn_protocol() == Some(h2relay::ALPN_H2) {
+            // The HTTP/1.1 leg validated the upstream before the box got its
+            // `200` (BEP-055). The h2 flow dials and validates its own leg.
+            drop(upstream);
+            return self.relay_h2(box_id, host, port, boxed).await;
+        }
+        self.relay_flow(box_id, host, port, boxed, upstream).await
+    }
+
+    /// Relays a terminated `h2` box flow over a validated `h2` upstream leg.
+    async fn relay_h2<B>(&self, box_id: &str, host: String, port: u16, boxed: B) -> Ended
+    where
+        B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let authority = format!("{host}:{port}");
+        let dialed = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            self.dial_upstream_with(&self.upstream_tls_h2, &host, port),
+        )
+        .await;
+        let upstream = match dialed {
+            Ok(Ok(upstream)) => upstream,
+            Ok(Err(err)) => {
+                tracing::warn!(authority, error = %err, "the upstream h2 leg failed");
+                if let Some(marker) = err.marker() {
+                    self.audit_refusal(box_id, &authority, marker);
+                    return Ended::Refused(marker);
+                }
+                return Ended::Refused("upstream_connect");
+            }
+            Err(_) => return Ended::Closed("upstream_timeout"),
+        };
+        let proof = upstream.proof();
+        let upstream = upstream.into_inner();
+        if upstream.get_ref().1.alpn_protocol() != Some(h2relay::ALPN_H2) {
+            tracing::warn!(authority, "the upstream did not pick h2");
+            self.audit_refusal(box_id, &authority, UPSTREAM_NO_H2);
+            return Ended::Refused(UPSTREAM_NO_H2);
+        }
+        tracing::debug!(authority, "relaying an h2 flow");
+        let flow = Flow::new(
+            box_id,
+            redeem::Authority { host, port },
+            Arc::clone(&self.audit),
+            Arc::clone(&self.redeemer),
+            proof,
+        )
+        .with_store(Arc::new(HostStore));
+        h2relay::relay(flow, boxed, upstream).await;
+        Ended::Relayed
+    }
+
     /// Relays a terminated box flow to its validated upstream leg.
     async fn relay_flow<B>(
         &self,
@@ -844,13 +944,23 @@ impl Proxy {
         host: &str,
         port: u16,
     ) -> Result<Validated<UpstreamTls>, UpstreamError> {
+        self.dial_upstream_with(&self.upstream_tls, host, port)
+            .await
+    }
+
+    async fn dial_upstream_with(
+        &self,
+        connector: &TlsConnector,
+        host: &str,
+        port: u16,
+    ) -> Result<Validated<UpstreamTls>, UpstreamError> {
         let resolver = Arc::clone(&self.resolver);
         let name = host.to_owned();
         let addrs = tokio::task::spawn_blocking(move || resolver.resolve(&name, port))
             .await
             .map_err(io::Error::other)??;
         let tcp = TcpStream::connect(&addrs[..]).await?;
-        forward::validate(&self.upstream_tls, host, tcp).await
+        forward::validate(connector, host, tcp).await
     }
 
     /// The TLS server side for `host`, with a leaf the CA issued for it. A
@@ -873,11 +983,23 @@ impl Proxy {
             .with_no_client_auth()
             .with_single_cert(leaf.chain, key)
             .map_err(|err| err.to_string())?;
-        config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+        config.alpn_protocols = if self.h2 {
+            vec![h2relay::ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()]
+        } else {
+            vec![ALPN_HTTP11.to_vec()]
+        };
         let config = Arc::new(config);
         servers.insert(host.to_owned(), (Instant::now(), Arc::clone(&config)));
         Ok(config)
     }
+}
+
+/// Whether a failed box handshake failed because the box offered no ALPN
+/// protocol the proxy speaks.
+fn no_application_protocol(err: &io::Error) -> bool {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .is_some_and(|tls| matches!(tls, rustls::Error::NoApplicationProtocol))
 }
 
 /// The upstream leg's TLS stream.
@@ -1216,6 +1338,8 @@ pub(crate) mod tests {
     use rustls::pki_types::ServerName;
     use tokio::net::{TcpListener, UnixStream};
     use zeroize::Zeroizing;
+    // `http` is this crate's own HTTP/1.1 module here.
+    use ::http as http_crate;
 
     use super::*;
     use crate::audit::{LogReader, segment_name};
@@ -1343,6 +1467,10 @@ pub(crate) mod tests {
                     n.lock()
                         .unwrap()
                         .push(tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec));
+                    if tls.get_ref().1.alpn_protocol() == Some(h2relay::ALPN_H2) {
+                        h2_upstream(tls, h).await;
+                        return;
+                    }
                     if let Ok((head, _)) = read_head(&mut tls).await {
                         h.lock()
                             .unwrap()
@@ -1361,6 +1489,51 @@ pub(crate) mod tests {
             offered,
             negotiated,
             heads,
+        }
+    }
+
+    /// The h2 side of [`upstream`]: records each stream's head as
+    /// `METHOD authority path` and its headers, one per line, and answers
+    /// `200` with an `alt-svc` header, the request body echoed in
+    /// `x-request-body`, the body `ok`, and a `grpc-status: 0` trailer.
+    async fn h2_upstream<S>(tls: S, heads: Arc<Mutex<Vec<String>>>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let Ok(mut connection) = h2::server::handshake(tls).await else {
+            return;
+        };
+        while let Some(Ok((request, mut respond))) = connection.accept().await {
+            let (parts, mut body) = request.into_parts();
+            let mut head = format!(
+                "{} {} {}",
+                parts.method,
+                parts.uri.authority().map_or("", |a| a.as_str()),
+                parts.uri.path()
+            );
+            for (name, value) in &parts.headers {
+                head.push_str(&format!("\n{name}: {}", value.to_str().unwrap_or("?")));
+            }
+            heads.lock().unwrap().push(head);
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                while let Some(Ok(chunk)) = body.data().await {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    got.extend_from_slice(&chunk);
+                }
+                let response = http_crate::Response::builder()
+                    .status(200)
+                    .header("alt-svc", "h3=\":443\"")
+                    .header("x-request-body", String::from_utf8_lossy(&got).into_owned())
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+                send.send_data(bytes::Bytes::from_static(b"ok"), false)
+                    .unwrap();
+                let mut trailers = http_crate::HeaderMap::new();
+                trailers.insert("grpc-status", "0".parse().unwrap());
+                send.send_trailers(trailers).unwrap();
+            });
         }
     }
 
@@ -1596,6 +1769,135 @@ pub(crate) mod tests {
         );
         let refused = box_tls(&h.root, &[b"h2"]).connect(name, stream).await;
         assert!(refused.is_err(), "an h2-only client completed TLS");
+    }
+
+    /// A box flow to `api.github.com` through a CONNECT, its TLS offering
+    /// `alpn`.
+    async fn connect_box(
+        h: &Harness,
+        alpn: &[&[u8]],
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::io::DuplexStream>, io::Error> {
+        let mut stream = box_connection(&h.proxy);
+        stream.write_all(CONNECT_GITHUB).await.unwrap();
+        let head = response_head(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        let name = ServerName::try_from("api.github.com").unwrap();
+        box_tls(&h.root, alpn).connect(name, stream).await
+    }
+
+    // Experimental (h2relay): with the relay on, a client that requires
+    // `h2` completes TLS, each stream goes through the decision, an
+    // admitted stream reaches an `h2` upstream leg with its body, and the
+    // response comes back with its trailers and without `alt-svc`. A
+    // stream whose authority is not the flow's is refused `403` and never
+    // reaches the upstream.
+    #[tokio::test]
+    async fn h2_relay_decides_each_stream_and_carries_trailers() {
+        let audit = Arc::new(Mutex::new(Vec::<Decision>::new()));
+        let (mut h, _) = harness_with(audit.clone()).await;
+        let proxy = Arc::try_unwrap(h.proxy).unwrap().with_h2(true);
+        h.proxy = Arc::new(proxy);
+
+        let tls = connect_box(&h, &[h2relay::ALPN_H2])
+            .await
+            .expect("an h2-only client completes TLS when the relay is on");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(h2relay::ALPN_H2));
+        let (client, connection) = h2::client::handshake(tls).await.unwrap();
+        tokio::spawn(connection);
+
+        // A gRPC-shaped call: POST, a body, an answer with trailers.
+        let mut client = client.ready().await.unwrap();
+        let request = http_crate::Request::builder()
+            .method("POST")
+            .uri("https://api.github.com/pkg.Service/Method")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .unwrap();
+        let (response, mut send) = client.send_request(request, false).unwrap();
+        send.send_data(bytes::Bytes::from_static(b"ping"), true)
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(10), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.headers().get("alt-svc").is_none());
+        assert_eq!(response.headers()["x-request-body"], "ping");
+        let mut body = response.into_body();
+        let mut got = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, b"ok");
+        let trailers = body.trailers().await.unwrap().unwrap();
+        assert_eq!(trailers["grpc-status"], "0");
+
+        // The h1 leg validated before the `200`; the h2 leg carried the call.
+        assert_eq!(
+            *h.upstream.offered.lock().unwrap(),
+            [vec![ALPN_HTTP11.to_vec()], vec![h2relay::ALPN_H2.to_vec()]]
+        );
+        assert_eq!(
+            h.upstream.negotiated.lock().unwrap().last().cloned(),
+            Some(Some(h2relay::ALPN_H2.to_vec()))
+        );
+        {
+            let heads = h.upstream.heads.lock().unwrap();
+            assert_eq!(heads.len(), 1, "{heads:?}");
+            assert!(
+                heads[0].starts_with("POST api.github.com /pkg.Service/Method"),
+                "{heads:?}"
+            );
+            assert!(
+                heads[0].contains("content-type: application/grpc"),
+                "{heads:?}"
+            );
+        }
+        let admitted = audit.lock().unwrap().len();
+        assert!(admitted >= 1, "the admitted stream was not audited");
+
+        // A stream for another authority on the same flow is refused.
+        let mut client = client.ready().await.unwrap();
+        let request = http_crate::Request::builder()
+            .method("GET")
+            .uri("https://example.com/x")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(10), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(h.upstream.heads.lock().unwrap().len(), 1);
+        let records = audit.lock().unwrap();
+        assert!(records.len() > admitted, "the refusal was not audited");
+        assert_eq!(records.last().unwrap().outcome, Outcome::Refuse);
+    }
+
+    // With the relay off (the default), a client that requires `h2` is
+    // refused at the handshake, and the audit log says why.
+    #[tokio::test]
+    async fn h2_only_client_refusal_is_audited() {
+        let h = harness().await;
+        let refused = connect_box(&h, &[h2relay::ALPN_H2]).await;
+        assert!(refused.is_err(), "an h2-only client completed TLS");
+        // The proxy writes the record after the handshake fails; give it a
+        // moment to land.
+        for _ in 0..50 {
+            if !h.audit.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let records = h.audit.lock().unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(records[0].marker.as_deref(), Some(ALPN_H2_ONLY));
+        assert_eq!(records[0].authority, "api.github.com:443");
     }
 
     // BEP-029: a CONNECT or an absolute-form request outside the modules'
