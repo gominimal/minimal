@@ -336,7 +336,7 @@ mod tests {
                     [sessions.dev.network.egress]\n\
                     allow_dns_hosts = [\"b.example\", \"a.example\"]\n\
                     [sessions.dev.network.bep]\n\
-                    enabled = true\n";
+                    steering = \"dns\"\n";
         let (expansion, hints) = expand_network(file, "dev");
         let hints = hints.expect("flat keys are accepted");
         assert_eq!(hints.len(), 3, "one hint per flat key: {hints:?}");
@@ -370,7 +370,7 @@ mod tests {
         );
         assert_eq!(
             network["bep"],
-            toml::Value::Table(toml::from_str("enabled = true").unwrap())
+            toml::Value::Table(toml::from_str("steering = \"dns\"").unwrap())
         );
 
         let bytes = expansion.spec_bytes().expect("spec writes");
