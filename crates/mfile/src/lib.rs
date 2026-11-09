@@ -1038,6 +1038,26 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Whether to print the legacy-table hints for this read of a file.
+///
+/// One command parses the same file many times, so without this a single
+/// `min session activate` prints each hint once per parse. A file's hints
+/// print the first time this process reads a given (path, content). The
+/// key holds the content as well as the path, as in
+/// [`File::warn_unknown_fields`], so the long-lived `minimald` prints them
+/// again after the file is edited. A read with no path always prints.
+fn legacy_hints_due(path: Option<&Path>, bytes: &[u8]) -> bool {
+    static HINTED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let Some(path) = path else {
+        return true;
+    };
+    HINTED_FILES
+        .lock()
+        .unwrap()
+        .insert((path.to_path_buf(), hash_bytes(bytes)))
+}
+
 /// Whether a load refuses a task that sets `interactive = true` (BOX-054).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskCheck {
@@ -1060,11 +1080,27 @@ impl File {
     /// serde's internal enum name.
     ///
     /// It then reads the legacy tables (BOX-050, BOX-051, BOX-052) and
-    /// prints one hint on stderr for each, on every read.
+    /// prints one hint on stderr for each, the first time this process reads
+    /// the file (see [`legacy_hints_due`]).
     fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
+        Self::parse_to(bytes, path, &mut std::io::stderr())
+    }
+
+    /// [`File::parse`], writing the legacy hints to `hints_out` rather than
+    /// stderr, so a test can read what a parse prints.
+    fn parse_to(
+        bytes: &[u8],
+        path: Option<&Path>,
+        hints_out: &mut dyn std::io::Write,
+    ) -> Result<Self, Error> {
         let mut file = Self::deserialize_bytes(bytes, path)?;
-        for legacy in legacy::settle(&mut file, legacy::this_release(), path)? {
-            eprintln!("{legacy}");
+        let hints = legacy::settle(&mut file, legacy::this_release(), path)?;
+        if !hints.is_empty() && legacy_hints_due(path, bytes) {
+            for legacy in hints {
+                // A hint that cannot be written (a closed stderr) is not a
+                // reason to fail the read.
+                let _ = writeln!(hints_out, "{legacy}");
+            }
         }
         Ok(file)
     }
@@ -3448,6 +3484,60 @@ mod tests {
         assert!(out.contains("unknown fields in [session] section"), "{out}");
         assert!(out.contains("bogus"), "{out}");
         assert!(!out.contains("hooks_on_resume"), "{out}");
+    }
+
+    /// #3190: a file's legacy-table hints print on the first read of a
+    /// given (path, content) in this process, not on every read. An edit
+    /// prints them again, and a read with no path always prints.
+    #[test]
+    fn legacy_hints_print_once_per_path_and_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        let old = b"[session]\npackages = [\"git\"]\n";
+        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
+        assert!(legacy_hints_due(Some(&path), old), "first read prints");
+        assert!(
+            !legacy_hints_due(Some(&path), old),
+            "second read of the same file is quiet"
+        );
+        assert!(legacy_hints_due(Some(&path), new), "an edit prints again");
+        assert!(!legacy_hints_due(Some(&path), new), "and only once");
+        assert!(legacy_hints_due(None, old), "a read with no path prints");
+        assert!(legacy_hints_due(None, old), "every time");
+    }
+
+    /// #3190, end to end through the parse: reading the same legacy file
+    /// twice prints its hint once, an edit prints it again, and a read with
+    /// no path prints it on every read.
+    #[test]
+    fn parse_prints_a_files_legacy_hint_once_until_it_changes() {
+        // A `[session]` table is the one legacy table here, so a read that
+        // prints prints exactly one `hint:` line.
+        let printed = |bytes: &[u8], path: Option<&Path>| {
+            let mut out = Vec::new();
+            File::parse_to(bytes, path, &mut out).expect("the file parses");
+            let out = String::from_utf8(out).unwrap();
+            out.lines().filter(|l| l.starts_with("hint: ")).count()
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        let old = b"[session]\npackages = [\"git\"]\n";
+        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
+
+        assert_eq!(
+            printed(old, Some(&path)),
+            1,
+            "the first read prints the hint"
+        );
+        assert_eq!(
+            printed(old, Some(&path)),
+            0,
+            "a second read of the same file is quiet"
+        );
+        assert_eq!(printed(new, Some(&path)), 1, "an edit prints it again");
+        assert_eq!(printed(new, Some(&path)), 0, "and only once");
+        assert_eq!(printed(old, None), 1, "a read with no path prints");
+        assert_eq!(printed(old, None), 1, "on every read");
     }
 
     /// Reads `body` as a project's `minimal.toml` and returns the warnings
