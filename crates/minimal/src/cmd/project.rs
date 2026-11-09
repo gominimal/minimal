@@ -525,9 +525,21 @@ pub(crate) fn run_init_flow(
 ) -> Result<InitOutcome, anyhow::Error> {
     use op::ProjectOp as _;
     let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut plan = op::InitProject
+    let plan = op::InitProject
         .run(&mut env)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    write_init_plan(plan, skip_confirm, force)
+}
+
+/// The write half of [`run_init_flow`]: convert the initializer's plan to
+/// the entry shape, show it, prompt for confirmation, and write the file.
+/// Split out so a test can drive it without the packages checkout that
+/// [`op::InitProject`] needs.
+pub(crate) fn write_init_plan(
+    mut plan: op::InitPlan,
+    skip_confirm: bool,
+    force: bool,
+) -> Result<InitOutcome, anyhow::Error> {
     plan.content = to_entry_shape(&plan.content)?;
 
     // Overwriting an existing minimal.toml is destructive — no backup is
