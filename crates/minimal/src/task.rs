@@ -1233,7 +1233,8 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
                             TaskBoxEnd::Keep => {
                                 let timed_out =
                                     ended_at_timeout(exit, || record_state(&mut client, id)).await;
-                                let why = timed_out.then(|| timeout_line(&args.entry, timeout_secs));
+                                let why =
+                                    timed_out.then(|| timeout_line(&args.entry, timeout_secs));
                                 for line in kept_box_lines(why, &session_name) {
                                     eprintln!("{line}");
                                 }
