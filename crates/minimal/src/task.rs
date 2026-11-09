@@ -22,7 +22,7 @@ use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
 use tracing::Instrument as _;
 
-use crate::{BoxRunArgs, GlobalArgs, TaskRunArgs};
+use crate::{BoxRunArgs, GlobalArgs, TaskListArgs, TaskRunArgs};
 
 /// A task's non-zero exit status, carried as a typed error so `main.rs` can
 /// downcast it and terminate with the task's own code instead of printing an
@@ -790,6 +790,77 @@ fn interactive_task_box_name(task: &str) -> String {
 /// daemon end the session with the run (NET-131).
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
     run_entry(global, args.into()).await.map(drop)
+}
+
+/// `min task list [--all]` (BCLI-015): the task boxes of the current
+/// project, or of every project, in any state. The daemon keeps a task's
+/// record after the task ends, so an exited task stays in the list until
+/// `min box prune` or `min box rm` removes it.
+pub async fn cmd_task_list(global: &GlobalArgs, args: TaskListArgs) -> Result<(), anyhow::Error> {
+    let scope = if args.all {
+        None
+    } else {
+        let cwd = crate::attach::cwd_host_path(global)?;
+        Some(crate::cmd::box_list_scope(cwd.as_ref())?)
+    };
+    crate::cmd::ensure_daemon(global)?;
+    let hosts = crate::cmd::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    task_list_on_hosts(hosts, scope, &mut out, &mut err).await
+}
+
+/// `min task list` over the local `hosts`: the `min box list` listing,
+/// filtered to the task boxes of `project_root`, or of every project when
+/// it is `None`. It prints the same table, state labels and empty-list
+/// lines as `min box list`. A host that does not answer is named on `err`,
+/// and the list goes on without it. The selected host that does not answer
+/// ends the command, as it does for `min box list`.
+pub(crate) async fn task_list_on_hosts(
+    hosts: Vec<crate::cmd::LocalHost>,
+    project_root: Option<paths::HostAbsPath>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Result<(), anyhow::Error> {
+    let mut tasks = Vec::new();
+    for host in hosts {
+        let records = match crate::cmd::read_host_boxes(&host).await? {
+            Ok(records) => records,
+            Err(why) if host.selected => {
+                tracing::info!(verb = "task list", outcome = "error", host = %host.host, "{why}");
+                bail!("{why}");
+            }
+            Err(why) => {
+                tracing::info!(
+                    verb = "task list",
+                    outcome = "host unreachable",
+                    host = %host.host,
+                    "{why}"
+                );
+                writeln!(err, "{}", crate::cmd::unreachable_host_line(&host.host))?;
+                continue;
+            }
+        };
+        tasks.extend(
+            records
+                .into_iter()
+                .filter(|entry| entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE))
+                .filter(|entry| {
+                    project_root
+                        .as_ref()
+                        .is_none_or(|root| entry.project_root.as_ref() == Some(root))
+                })
+                .map(|record| crate::cmd::ListedBox {
+                    provider: host.provider.to_string(),
+                    host: host.host.clone(),
+                    record,
+                }),
+        );
+    }
+    tracing::info!(verb = "task list", outcome = "ok", tasks = tasks.len());
+    let mut out = out;
+    crate::cmd::render_box_list(&mut out, &tasks, project_root.is_some())?;
+    Ok(())
 }
 
 /// `min box run <entry>`: the run of [`cmd_task_run`], from an entry the
