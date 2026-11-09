@@ -583,6 +583,7 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         record.id,
         record.name.as_deref(),
         record.box_addresses,
+        record.box_id,
         args.force,
     )
     .await

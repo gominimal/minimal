@@ -306,14 +306,18 @@ async fn box_via_ssh_with(
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
-        // The pair the box's row was registered with, read before the
-        // attach: an attach that ends in a daemon-side destroy leaves no
-        // record to read it from, and the row is still this client's to
-        // withdraw.
-        let box_addresses = match host_asks_for {
-            Some(_) => record.and_then(|record| record.box_addresses),
+        // The pair the box's row was registered with, and the box id beside
+        // it, read before the attach: an attach that ends in a daemon-side
+        // destroy leaves no record to read them from, and the row is still
+        // this client's to withdraw. The id proves a box renamed since its
+        // registration (#1116); it goes only with a pair.
+        let box_row = match host_asks_for {
+            Some(_) => {
+                record.and_then(|record| record.box_addresses.map(|pair| (pair, record.box_id)))
+            }
             None => None,
         };
+        let box_addresses = box_row.map(|(pair, _)| pair);
         let host_asks = host_asks_target(
             control_sock_beside(sock),
             host_asks_for,
@@ -349,7 +353,7 @@ async fn box_via_ssh_with(
         // destroy made daemon-side: withdraw the row an own-address box
         // registered, or release the name a `host_ip` box held.
         if let Some(name) = host_asks_for {
-            release_held_name_after_attach(sock, id, name, box_addresses).await;
+            release_held_name_after_attach(sock, id, name, box_row).await;
         }
         // Terminate with ssh's own status, exactly as the `exec()` this
         // replaced did: `min` has nothing of its own left to say after an

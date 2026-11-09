@@ -309,8 +309,11 @@ async fn box_record_by(
 /// `min session attach` nor `activate --attach` passes through
 /// [`destroy_box`], and this is the release that destroy would have
 /// made — the row's withdrawal (T66) for a box that registered one, whose
-/// pair `box_addresses` was read off the record before the attach, and the
-/// name hold's release for one that did not. The lookup and the release
+/// pair and box id `box_row` were read off the record before the attach,
+/// and the name hold's release for one that did not. The id is what proves
+/// a session renamed since its registration, whose row the host keeps under
+/// the old name (#1116); it rides only with the pair, as on the destroy
+/// paths. The lookup and the release
 /// are both by the session's `id`: a session still there — a detach, a
 /// Keep — keeps its row and its hold, a newer session that took the name
 /// keeps its own, and a hold a rename moved to another name is freed with
@@ -330,12 +333,15 @@ pub(crate) async fn release_held_name_after_attach(
     sock: &std::path::Path,
     id: boxes::SessionId,
     name: &str,
-    box_addresses: Option<boxes::BoxAddresses>,
+    box_row: Option<(boxes::BoxAddresses, Option<boxes::BoxId>)>,
 ) {
     match attached_box_record(sock, id).await {
-        Ok(None) => match box_addresses {
-            // The record carries no box id, so the pair is the proof.
-            Some(addresses) => withdraw_box_row_with_vm_host(sock, name, addresses).await,
+        Ok(None) => match box_row {
+            // The record is gone, so the pair (and the id beside it) is the
+            // proof.
+            Some((addresses, box_id)) => {
+                withdraw_box_row_with_vm_host(sock, name, addresses, box_id).await
+            }
             None => {
                 retire_host_ip_box_with_vm_host(
                     control_sock_beside(sock),
@@ -505,18 +511,21 @@ pub(crate) fn holds_name(record: &boxes::Record) -> bool {
 
 /// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
 /// off the async worker: the control exchange is a blocking socket call.
-/// The pair comes off the session record, which carries no box id, so the
-/// pair is the withdrawal's proof. `min session attach`'s post-attach
-/// release and the dashboard's destroy both go through this, so a change to
-/// the call (a timeout, a box id) reaches both.
+/// The pair comes off the session record, and so does the box id beside it
+/// where the caller holds the record: the id is what proves a session
+/// renamed since its registration, whose row the host keeps under the old
+/// name (#1116). `None` keeps the pair proof alone. `min session attach`'s
+/// post-attach release and the dashboard's destroy both go through this, so
+/// a change to the call (a timeout) reaches both.
 pub(crate) async fn withdraw_box_row_with_vm_host(
     sock: &std::path::Path,
     name: &str,
     addresses: boxes::BoxAddresses,
+    box_id: Option<boxes::BoxId>,
 ) {
     let (sock, name) = (sock.to_path_buf(), name.to_string());
     if let Err(error) = tokio::task::spawn_blocking(move || {
-        minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, None);
+        minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, box_id);
     })
     .await
     {
@@ -2782,12 +2791,138 @@ mod tests {
         ));
     }
 
+    /// A session destroyed on a VM-backed host, with its record's pair and
+    /// box id handed to [`destroy_box`]: the VM host sees one destroy-side
+    /// request, its row's withdrawal, presenting the session's name, the
+    /// pair and the id. The id is what proves a box renamed since its
+    /// registration (#1116), and `box_addresses.and(box_id)` sends it.
+    #[tokio::test]
+    async fn a_destroy_withdraws_its_row_by_pair_and_box_id() {
+        // Bound whole: the dirs and the daemon live as long as the test.
+        let mut fixture = destroyable_box_on_vm_host().await;
+        let handed = boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        let row_id = minimald_rpc::BoxId::from_bytes([7; 16]);
+
+        destroy_box(
+            &mut fixture.client,
+            &fixture.global,
+            fixture.id,
+            Some("web"),
+            Some(handed),
+            Some(row_id),
+            false,
+        )
+        .await
+        .expect("the destroy succeeds");
+        let seen = fixture.requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one withdrawal, one request: {seen:?}");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!("the row is withdrawn by the withdraw verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.switch_address, handed.switch_address);
+        assert_eq!(request.loopback_address, handed.loopback_address);
+        assert_eq!(
+            request.box_id,
+            Some(row_id),
+            "the record's box id rides beside the pair"
+        );
+    }
+
+    /// The id goes only with a pair: a destroy whose record carries a box id
+    /// but no pair (a box that registered no row) sends no withdrawal, so it
+    /// never becomes the unspecified-pair `host_ip` withdrawal
+    /// [`withdraw_box_row`] makes of an id alone.
+    #[tokio::test]
+    async fn a_destroy_with_a_box_id_but_no_pair_withdraws_nothing() {
+        // Bound whole: the dirs and the daemon live as long as the test.
+        let mut fixture = destroyable_box_on_vm_host().await;
+        let row_id = minimald_rpc::BoxId::from_bytes([7; 16]);
+
+        destroy_box(
+            &mut fixture.client,
+            &fixture.global,
+            fixture.id,
+            Some("web"),
+            None,
+            Some(row_id),
+            false,
+        )
+        .await
+        .expect("the destroy succeeds");
+        let seen = fixture.requests.lock().unwrap();
+        for line in seen.iter() {
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(line).expect("the request is the wire type");
+            assert!(
+                !matches!(request, minimald_rpc::BoxControlRequest::Withdraw(_)),
+                "no pair, no withdrawal, and no id sent: {line}"
+            );
+        }
+    }
+
+    /// A configured session named `web` on a daemon, a client connected to
+    /// it, and a stand-in VM host control server where a VM-backed
+    /// `global`'s destroy finds it, recording the destroy-side requests
+    /// (the `host_ip` retires kept apart).
+    struct DestroyableBox {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        global: GlobalArgs,
+        client: client::Client,
+        id: boxes::SessionId,
+        // Held for the test's length.
+        _dirs: [tempfile::TempDir; 3],
+        _server: minimald::test_harness::TestServer,
+    }
+
+    async fn destroyable_box_on_vm_host() -> DestroyableBox {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let requests = fake_vm_host(
+            host_dir.join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let daemon_dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = daemon_dir.path().join("ssh.sock");
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let client = client::Client::connect(&ssh_sock).await.unwrap();
+        DestroyableBox {
+            requests,
+            global,
+            client,
+            id,
+            _dirs: [dir, daemon_dir, project],
+            _server: server,
+        }
+    }
+
     /// T66's attach-exit side: an own-address box whose attach ended in the
     /// shell-exit prompt's Delete has its row withdrawn by the attach's own
-    /// exit, with the pair read off the record before the attach — one
-    /// withdraw request naming the box and the pair, with no box id, which
-    /// the record does not carry — and nothing while the session is still
-    /// there.
+    /// exit, with the pair and the box id read off the record before the
+    /// attach — one withdraw request naming the box, the pair and the id,
+    /// which proves a box renamed since its registration (#1116) — and
+    /// nothing while the session is still there.
     #[tokio::test]
     async fn an_attach_that_ends_with_the_session_gone_withdraws_its_row() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2811,8 +2946,9 @@ mod tests {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
+        let row_id = minimald_rpc::BoxId::from_bytes([7; 16]);
 
-        release_held_name_after_attach(&ssh_sock, id, "web", Some(handed)).await;
+        release_held_name_after_attach(&ssh_sock, id, "web", Some((handed, Some(row_id)))).await;
         assert!(
             requests.lock().unwrap().is_empty(),
             "a session still there keeps its row"
@@ -2828,7 +2964,7 @@ mod tests {
             minimald_rpc::Errorable::Ok(_) => {}
             minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
         }
-        release_held_name_after_attach(&ssh_sock, id, "web", Some(handed)).await;
+        release_held_name_after_attach(&ssh_sock, id, "web", Some((handed, Some(row_id)))).await;
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 1, "one withdrawal, one request");
         let minimald_rpc::BoxControlRequest::Withdraw(request) =
@@ -2839,7 +2975,11 @@ mod tests {
         assert_eq!(request.name, "web");
         assert_eq!(request.switch_address, handed.switch_address);
         assert_eq!(request.loopback_address, handed.loopback_address);
-        assert_eq!(request.box_id, None, "the record carries no box id");
+        assert_eq!(
+            request.box_id,
+            Some(row_id),
+            "the id read before the attach is presented"
+        );
     }
 
     /// The macOS shape of every VM-backed gate (NET-081's other half): the
