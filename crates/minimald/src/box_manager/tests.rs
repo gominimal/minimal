@@ -3255,9 +3255,9 @@ async fn show_returns_record_state_identity_and_live_execs() {
         minimald_rpc::exec::ExecMode::Tty,
         &["bash"],
     );
-    let live = |rows: &[minimald_rpc::LiveExec]| -> Vec<(String, Vec<String>, bool)> {
+    let live = |rows: &[minimald_rpc::LiveExec]| -> Vec<(String, Vec<String>, minimald_rpc::exec::ExecMode)> {
         rows.iter()
-            .map(|exec| (exec.id.clone(), exec.argv.clone(), exec.pty))
+            .map(|exec| (exec.id.clone(), exec.argv.clone(), exec.mode))
             .collect()
     };
     let shown = mngr.show_box(id).await.unwrap().expect("retained");
@@ -3267,12 +3267,12 @@ async fn show_returns_record_state_identity_and_live_execs() {
             (
                 "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b".to_owned(),
                 vec!["sleep".to_owned(), "60".to_owned()],
-                false
+                minimald_rpc::exec::ExecMode::Detached
             ),
             (
                 "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c".to_owned(),
                 vec!["bash".to_owned()],
-                true
+                minimald_rpc::exec::ExecMode::Tty
             ),
         ]
     );
@@ -3286,7 +3286,7 @@ async fn show_returns_record_state_identity_and_live_execs() {
         vec![(
             "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c".to_owned(),
             vec!["bash".to_owned()],
-            true
+            minimald_rpc::exec::ExecMode::Tty
         )],
         "the ended exec left the list"
     );

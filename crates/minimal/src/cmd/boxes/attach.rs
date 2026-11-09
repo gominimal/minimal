@@ -852,7 +852,7 @@ pub(crate) fn exec_found(
     use boxes::events::{BoxEventType, exec_data};
 
     if let Some(live) = live_execs.iter().find(|exec| exec.id == exec_id) {
-        return if live.pty {
+        return if live.mode == minimald_rpc::exec::ExecMode::Tty {
             ExecFound::Terminal
         } else {
             ExecFound::NoTerminal

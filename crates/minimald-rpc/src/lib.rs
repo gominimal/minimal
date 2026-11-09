@@ -2857,9 +2857,10 @@ pub struct LiveExec {
     pub id: String,
     /// The exec's argv, as the client sent it.
     pub argv: Vec<String>,
-    /// Whether the exec holds a PTY. False for a detached or an attached
-    /// exec.
-    pub pty: bool,
+    /// How the exec meets its client: `tty` for an exec that holds a PTY,
+    /// `detached` for one that runs without a client, `attached` for one
+    /// whose stdio is a client's pipes.
+    pub mode: exec::ExecMode,
 }
 
 /// The response for a [`ShowBox`] RPC.
@@ -4045,7 +4046,7 @@ mod box_listing_tests {
             live_execs: vec![LiveExec {
                 id: "exec-1".to_string(),
                 argv: vec!["sleep".to_string(), "60".to_string()],
-                pty: false,
+                mode: crate::exec::ExecMode::Detached,
             }],
             disk_bytes: Some(4096),
         };

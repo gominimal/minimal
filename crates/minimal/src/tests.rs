@@ -9027,19 +9027,23 @@ async fn box_attach_exec_non_pty_exit2_names_logs() {
 
     // BOX-159: the host's live exec row decides the terminal, whatever the
     // events say. A started exec the host does not list has ended.
-    let row = |pty| minimald_rpc::LiveExec {
+    let row = |mode| minimald_rpc::LiveExec {
         id: AN_EXEC_ID.to_owned(),
         argv: vec!["sh".to_owned()],
-        pty,
+        mode,
     };
+    use minimald_rpc::exec::ExecMode;
     assert_eq!(
-        crate::exec_found(&[row(true)], None, AN_EXEC_ID),
+        crate::exec_found(&[row(ExecMode::Tty)], None, AN_EXEC_ID),
         crate::ExecFound::Terminal,
     );
-    assert_eq!(
-        crate::exec_found(&[row(false)], None, AN_EXEC_ID),
-        crate::ExecFound::NoTerminal,
-    );
+    for mode in [ExecMode::Detached, ExecMode::Attached] {
+        assert_eq!(
+            crate::exec_found(&[row(mode)], None, AN_EXEC_ID),
+            crate::ExecFound::NoTerminal,
+            "{mode:?}"
+        );
+    }
     let mut started = boxes::events::BoxEvent {
         box_id: web,
         parent: None,

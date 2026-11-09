@@ -2104,7 +2104,7 @@ pub(crate) fn live_execs(box_id: SessionId) -> Vec<minimald_rpc::LiveExec> {
         .map(|entry| minimald_rpc::LiveExec {
             id: entry.id.as_str().to_owned(),
             argv: entry.argv.clone(),
-            pty: entry.mode == ExecMode::Tty,
+            mode: entry.mode,
         })
         .collect()
 }

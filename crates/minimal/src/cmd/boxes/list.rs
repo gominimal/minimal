@@ -482,7 +482,7 @@ Host:       local0
             live_execs: vec![minimald_rpc::LiveExec {
                 id: "exec-1".to_string(),
                 argv: vec!["sleep".to_string(), "60".to_string()],
-                pty: false,
+                mode: minimald_rpc::exec::ExecMode::Detached,
             }],
             disk_bytes: None,
         };
