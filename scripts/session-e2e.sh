@@ -7253,9 +7253,13 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # $1: the run's stderr; $2: the task, e2e-tn-loopback by default.
   tn_rm_kept() {
     local tn_kept
-    tn_kept="$(grep -o "Kept box ${2:-e2e-tn-loopback}-[0-9][0-9]*" "$1" | head -n1)"
+    # The run names the box, or gives its id when it cannot read the name.
+    tn_kept="$(grep -Eo "Kept box (${2:-e2e-tn-loopback}-[0-9]+|[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})" "$1" | head -n1)"
     tn_kept="${tn_kept#Kept box }"
-    [ -n "$tn_kept" ] || return 0
+    if [ -z "$tn_kept" ]; then
+      echo "::warning::no 'Kept box' line in $1; the task-run box, if any, stays until teardown"
+      return 0
+    fi
     for _ in $(seq 1 20); do
       mnl box rm "$tn_kept" >/dev/null 2>&1 && return 0
       sleep 0.5
