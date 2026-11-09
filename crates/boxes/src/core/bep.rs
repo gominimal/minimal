@@ -456,12 +456,24 @@ impl HostFacts {
 pub struct ActivationSpec<'a> {
     /// The box's network mode.
     pub network: NetworkMode,
-    /// The box's declared egress, if any. `None` admits no name.
+    /// The box's declared egress, if any. `None` admits no name, except on
+    /// a box that [`egress_admits_every_name`] says reaches them all.
     pub egress: Option<&'a EgressPolicy>,
     /// The proxy settings.
     pub bep: &'a BepSettings,
     /// The grants.
     pub secrets: &'a SecretGrants,
+}
+
+/// Whether a box's egress admits every name without listing any: a
+/// `host_ip` box with no `egress` section. That box shares its host's
+/// address, so the absent section stays allow-all in every phase
+/// ([`crate::effective_egress`]). It can also declare no list, because the
+/// classifier decides addresses and refuses a name rule (NET-079). An
+/// `egress` section of any shape decides by what it lists.
+#[must_use]
+pub fn egress_admits_every_name(network: NetworkMode, egress: Option<&EgressPolicy>) -> bool {
+    network == NetworkMode::HostNet && egress.is_none()
 }
 
 impl ActivationSpec<'_> {
@@ -910,8 +922,9 @@ pub fn refusals(
         });
     }
 
-    // BEP-008: every host of the GitHub set must be an egress name.
-    if !github.is_empty() {
+    // BEP-008: every host of the GitHub set must be reachable: an egress
+    // name, or a box whose egress admits every name.
+    if !github.is_empty() && !egress_admits_every_name(spec.network, spec.egress) {
         let allowed: Vec<String> = spec
             .egress
             .and_then(|egress| egress.allow_dns_hosts.as_ref())
@@ -1490,7 +1503,9 @@ mod tests {
                 .filter(|h| !allowed.contains(&(**h).to_string()))
                 .map(|h| (*h).to_string())
                 .collect();
-            let expected = secrets.values().any(SecretGrant::is_github) && !absent.is_empty();
+            let expected = secrets.values().any(SecretGrant::is_github)
+                && !absent.is_empty()
+                && !(network == NetworkMode::HostNet && egress.is_none());
             let named = refusals(&spec, host, &module).into_iter().find_map(|r| match r {
                 BepRefusal::HostsOutsideEgress { missing } => Some(missing),
                 _ => None,
@@ -2186,6 +2201,33 @@ mod tests {
         assert!(include_str!("../../../bep/src/store.rs").contains(&format!(
             "pub const NATIVE_STORE: &str = \"{NATIVE_STORE}\";"
         )));
+    }
+
+    /// BEP-008: a `host_ip` box with no `egress` section reaches the GitHub
+    /// set, and a declared section of any shape still has to list it.
+    #[test]
+    fn host_ip_grant_box_with_no_egress_section_reaches_the_github_hosts() {
+        let bep = BepSettings::default();
+        let secrets = grants(github_grant(None));
+        let outside = |network, egress: Option<&EgressPolicy>| {
+            let spec = ActivationSpec {
+                network,
+                egress,
+                bep: &bep,
+                secrets: &secrets,
+            };
+            refusals(&spec, RESOLVER_HOST, GITHUB_HOSTS)
+                .iter()
+                .any(|refusal| matches!(refusal, BepRefusal::HostsOutsideEgress { .. }))
+        };
+        let deny_all = EgressPolicy {
+            allow_dns_hosts: Some(Vec::new()),
+            ..EgressPolicy::default()
+        };
+
+        assert!(!outside(NetworkMode::HostNet, None));
+        assert!(outside(NetworkMode::HostNet, Some(&deny_all)));
+        assert!(outside(NetworkMode::OwnIp, None));
     }
 
     // --- store rules (BEP-034 to BEP-037) ---------------------------------

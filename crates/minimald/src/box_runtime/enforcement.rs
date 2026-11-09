@@ -384,6 +384,152 @@ pub(crate) async fn re_read_classifier_fact(
     .map_err(std::io::Error::other)
 }
 
+/// How often [`re_read_when_moved`] reads the daemon's own cgroup: one small
+/// procfs read a second.
+pub const OWN_CGROUP_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// gominimal/inbox#1054: the cgroup the node fact was last read in. `None`
+/// until a native daemon's start-up reading records one
+/// ([`read_fact_and_watch_placement`]), and always in a guest daemon, which
+/// is never moved: with nothing recorded, no cgroup is a move. An async lock
+/// held across a move's re-read, so a create that arrives while the watch
+/// re-reads waits for that read and answers over it.
+static FACT_CGROUP: tokio::sync::Mutex<Option<String>> = tokio::sync::Mutex::const_new(None);
+
+/// Records `cgroup` as the one the node fact was read in, as a test's
+/// daemon start-up would.
+#[cfg(test)]
+pub(crate) async fn set_fact_cgroup(cgroup: Option<String>) {
+    *FACT_CGROUP.lock().await = cgroup;
+}
+
+/// The cgroup the node fact was last read in, as recorded.
+#[cfg(test)]
+pub(crate) async fn fact_cgroup() -> Option<String> {
+    FACT_CGROUP.lock().await.clone()
+}
+
+/// Forgets the recorded cgroup, so a test that recorded one leaves the
+/// daemon it shares a process with as it found it. Synchronous, for a
+/// test's drop guard: a watch the test aborted may still be dropping its
+/// guard on another worker, so it waits up to a second for the lock.
+#[cfg(test)]
+pub(crate) fn clear_fact_cgroup() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if let Ok(mut recorded) = FACT_CGROUP.try_lock() {
+            *recorded = None;
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// gominimal/inbox#1054: the daemon's start-up reading of the node fact
+/// (`read`), and the watch that keeps it current when the daemon is moved
+/// after it. `min finalize-install` run under a running daemon installs the
+/// tree and moves that daemon into its leaf, and a placement can land after
+/// the start-up reading. Without a re-read, the creates that follow answer
+/// with the cause read before the move, such as "the classifier's
+/// privileged step is not installed".
+///
+/// `own_cgroup` reads the daemon's cgroup now (`/proc/self/cgroup`'s
+/// unified line in the daemon). It is read before `read` runs and recorded
+/// as the cgroup the fact was read in, so a placement that lands while the
+/// reading runs is still a move. A native daemon then reads its cgroup
+/// every `poll` for its whole life and re-reads the fact on each move
+/// ([`re_read_when_moved`]); a host-address create compares the same
+/// recorded cgroup itself, so it never waits a poll for a move. A guest
+/// daemon (`in_guest`) mounts its own tree and is never moved, and a host
+/// whose cgroup has no unified line has nothing to compare: neither records
+/// a cgroup nor starts a watch, and `None` is returned.
+pub async fn read_fact_and_watch_placement(
+    root: std::path::PathBuf,
+    mountinfo_knob: Option<String>,
+    in_guest: bool,
+    poll: std::time::Duration,
+    own_cgroup: impl Fn() -> Option<String> + Send + 'static,
+    read: impl FnOnce(),
+) -> Option<tokio::task::JoinHandle<()>> {
+    let at_reading = if in_guest { None } else { own_cgroup() };
+    read();
+    let at_reading = at_reading?;
+    *FACT_CGROUP.lock().await = Some(at_reading);
+    Some(crate::traced::spawn(re_read_when_moved(
+        root,
+        mountinfo_knob,
+        poll,
+        own_cgroup,
+    )))
+}
+
+/// The watch [`read_fact_and_watch_placement`] starts: every `poll`, reads
+/// the daemon's cgroup and re-reads the node fact when it moved
+/// (`re_read_if_moved`).
+pub async fn re_read_when_moved(
+    root: std::path::PathBuf,
+    mountinfo_knob: Option<String>,
+    poll: std::time::Duration,
+    own_cgroup: impl Fn() -> Option<String> + Send + 'static,
+) {
+    loop {
+        tokio::time::sleep(poll).await;
+        let now = own_cgroup();
+        re_read_if_moved(
+            root.clone(),
+            mountinfo_knob.clone(),
+            now,
+            "the cgroup watch",
+        )
+        .await;
+    }
+}
+
+/// Re-reads the node fact when `now` is a cgroup other than the one the
+/// fact was last read in, records `now`, and says whether it re-read. An
+/// unreadable cgroup (`None`), or no recorded one, is no move. Each move is
+/// one line naming both cgroups, what noticed the move (`by`), and what the
+/// re-read found. A re-read that does not run keeps the stored fact, and
+/// the move is still recorded, so a lost read is not retried every poll.
+pub(crate) async fn re_read_if_moved(
+    root: std::path::PathBuf,
+    mountinfo_knob: Option<String>,
+    now: Option<String>,
+    by: &'static str,
+) -> bool {
+    let Some(now) = now else {
+        return false;
+    };
+    let mut recorded = FACT_CGROUP.lock().await;
+    let from = match recorded.as_deref() {
+        Some(from) if from != now => from.to_string(),
+        _ => return false,
+    };
+    match re_read_classifier_fact(root, mountinfo_knob, false).await {
+        Ok((_, decision)) => tracing::info!(
+            from = %from,
+            to = %now,
+            by,
+            host_fact = %host_ip_enforcement_fact().enforcement.machine_str(),
+            cause = decision.cause().map(crate::net::classifier::Cause::detail),
+            "this daemon moved to another cgroup, so it re-read the classifier fact"
+        ),
+        Err(e) => tracing::warn!(
+            from = %from,
+            to = %now,
+            by,
+            error = %e,
+            "this daemon moved to another cgroup, but the classifier fact could \
+             not be re-read, so it keeps the stored one"
+        ),
+    }
+    *recorded = Some(now);
+    true
+}
+
 /// Creates the classifier leaf this session's host-address box is placed in
 /// (NET-079), under the tree the privileged step installs on a native host
 /// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for

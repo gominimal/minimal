@@ -130,14 +130,19 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             SessionCommand::Policy(_) => "session policy",
             SessionCommand::SetupZed(_) => "session setup-zed",
             SessionCommand::Hooks(_) => "session hooks",
+            SessionCommand::Logs(_) => "session logs",
         },
         Some(Command::Loadout(_)) => "loadout list",
-        Some(Command::Task(_)) => "task run",
-        Some(Command::Run(_)) => "run",
+        Some(Command::Task(TaskArgs { command })) => match command {
+            TaskCommand::Run(_) => "task run",
+            TaskCommand::List(_) => "task list",
+            TaskCommand::Logs(_) => "task logs",
+        },
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(_) => "box spec",
             BoxCommand::Audit(_) => "box audit",
             BoxCommand::List(_) => "box list",
+            BoxCommand::Run(_) => "box run",
             BoxCommand::Show(_) => "box show",
             BoxCommand::Stop(_) => "box stop",
             BoxCommand::Rm(_) => "box rm",
@@ -147,6 +152,7 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             BoxCommand::Cp(_) => "box cp",
             BoxCommand::Rename(_) => "box rename",
             BoxCommand::Prune(_) => "box prune",
+            BoxCommand::Logs(_) => "box logs",
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => "host list",
@@ -381,18 +387,27 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
             SessionCommand::SetupZed(args) => cmd_session_setup_zed(&cli.global_args, args).await,
             SessionCommand::Hooks(args) => cmd_session_hooks(&cli.global_args, args).await,
+            SessionCommand::Logs(args) => {
+                let session = Some(boxes::SESSION_BOX_TYPE);
+                cmd_box_logs(&cli.global_args, args, session, "session logs").await
+            }
         },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         })) => loadouts::cmd_loadout_list(args, &cli.global_args),
         Some(Command::Task(TaskArgs { command })) => match command {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
+            TaskCommand::List(args) => task::cmd_task_list(&cli.global_args, args).await,
+            TaskCommand::Logs(args) => {
+                let task = Some(boxes::TASK_BOX_TYPE);
+                cmd_box_logs(&cli.global_args, args, task, "task logs").await
+            }
         },
-        Some(Command::Run(args)) => task::cmd_run(&args),
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
+            BoxCommand::Run(args) => task::cmd_box_run(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
             BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
@@ -402,6 +417,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
             BoxCommand::Rename(args) => cmd_box_rename(&cli.global_args, args).await,
             BoxCommand::Prune(args) => cmd_box_prune(&cli.global_args, args).await,
+            BoxCommand::Logs(args) => cmd_box_logs(&cli.global_args, args, None, "box logs").await,
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => {

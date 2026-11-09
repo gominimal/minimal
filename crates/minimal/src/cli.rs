@@ -96,11 +96,6 @@ pub enum Command {
     Provider(ProviderArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
-    /// Muscle-memory catch for the in-box `min run <task>`: always errors,
-    /// naming the canonical `min task run <task>` (host) and
-    /// `min session attach --command 'min task run <task>'` (in-box) forms.
-    #[command(hide = true)]
-    Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
     /// Check this host for problems: today, that no record of the audit log
@@ -272,6 +267,10 @@ pub enum SessionCommand {
     /// List the lifecycle hooks composed into a session, and where each
     /// was declared
     Hooks(HooksArgs),
+    /// Show what a session's terminal printed, from its start. `-f` keeps
+    /// showing new output until the session is removed or the command is
+    /// interrupted
+    Logs(BoxLogsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -471,6 +470,10 @@ pub enum BoxCommand {
     /// to this project's running box that has a terminal, else to its only
     /// stopped or exited one, which starts again
     Attach(BoxAttachArgs),
+    /// Create a box from an entry of the project, run it without a terminal
+    /// and exit with its exit code. This command's stdin, stdout and stderr
+    /// are the box's. `--detach` starts the box, prints its id and returns
+    Run(BoxRunArgs),
     /// Run a command in a running box and exit with the command's exit
     /// code. `-t` gives the command a terminal, and `--detach` starts it
     /// and returns its exec id
@@ -490,6 +493,23 @@ pub enum BoxCommand {
     /// files. A running box is never removed. `--older-than` and `--parent`
     /// narrow what is removed. Off a terminal, `--yes` is required
     Prune(BoxPruneArgs),
+    /// Show what a box printed, from its start. A stopped or exited box
+    /// keeps its output until `min box rm` removes it. `-f` keeps showing
+    /// new output until the box is removed or the command is interrupted
+    Logs(BoxLogsArgs),
+}
+
+// BOX-155 (BCLI-012): `min session logs`, `min task logs` and
+// `min box logs`, each `<box> [-f]`, with one set of arguments.
+#[derive(Debug, Args)]
+pub struct BoxLogsArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Show the output so far, then keep showing new output as the box
+    /// writes it, until the box is removed or the command is interrupted
+    #[arg(short = 'f', long)]
+    pub follow: bool,
 }
 
 // BOX-162 (BCLI-016): `min box events <box> | --parent <box> [-o jsonl] [--follow]`.
@@ -957,6 +977,7 @@ pub enum TaskCommand {
     /// lines on stderr, beside the task's stderr. So
     /// `cat q.sql | min task run query > out.csv` gives the task q.sql and
     /// writes only the task's output to out.csv.
+    /// `--detach` starts the box, prints its id and returns.
     ///
     /// When the task ends, the box stays with its exit code: see it with
     /// `min box show <task>-<n>` and remove it with `min box rm <task>-<n>`.
@@ -965,6 +986,22 @@ pub enum TaskCommand {
     /// Ctrl-C destroys its box instead. Use `min session attach` for
     /// interactive work.
     Run(TaskRunArgs),
+    /// List the task boxes of the current project, in any state. A task
+    /// that ended shows its exit code, as `exited (exit 3)`, until
+    /// `min box prune` removes it. `--all` lists the tasks of every project
+    List(TaskListArgs),
+    /// Show what a task printed, from its start. `-f` keeps showing new
+    /// output until the task's box is removed or the command is interrupted
+    Logs(BoxLogsArgs),
+}
+
+// BCLI-015: `min task list [--all]`.
+#[derive(Debug, Args)]
+pub struct TaskListArgs {
+    /// List the tasks of every project, not only the tasks of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -977,18 +1014,29 @@ pub struct TaskRunArgs {
     /// task name is a task argument, never a project path.
     #[arg(long)]
     pub path: Option<String>,
+    /// Start the box, print its id and return. The task gets no input.
+    #[arg(long)]
+    pub detach: bool,
     /// Arguments to the task, passed through to its declared `args`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
 }
 
-/// Arguments for the hidden top-level `run` catch. Everything after `run` is
-/// swallowed (flags included) so any in-box spelling reaches the redirect
-/// error in [`task::cmd_run`] instead of a clap parse error.
+// BCLI-010, BCLI-035, BCLI-070: `min box run <entry> [--detach] [-- <args>…]`.
 #[derive(Debug, Args)]
-pub struct RunArgs {
+pub struct BoxRunArgs {
+    /// Name of an entry declared in the project's minimal.toml: a task
+    pub entry: String,
+    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
+    /// or the current working directory when neither is given
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Start the box, print its id and return. The box gets no input
+    #[arg(long)]
+    pub detach: bool,
+    /// Arguments to the entry, passed through to its declared `args`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-    pub rest: Vec<String>,
+    pub args: Vec<String>,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
