@@ -67,9 +67,15 @@ jobs:
                   scripts/next-version.sh --rev "$sha" --cargo-toml "$RUNNER_TEMP/Cargo.toml" --check
                   # A rerun after a later step failed finds the line on the same
                   # commit and carries on. Any other commit means a stale line.
-                  existing=""
-                  if found="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$line" --jq .object.sha 2>/dev/null)"; then
-                    existing="$found"
+                  # Only a 404 means no line. Any other failure (rate limit,
+                  # network) fails the job rather than cut over a line it
+                  # could not see.
+                  if ! existing="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$line" --jq .object.sha 2>"$RUNNER_TEMP/ref.err")"; then
+                    if ! grep -q 'HTTP 404' "$RUNNER_TEMP/ref.err"; then
+                      echo "::error::could not read $line: $(cat "$RUNNER_TEMP/ref.err")"
+                      exit 1
+                    fi
+                    existing=""
                   fi
                   if [ -n "$existing" ] && [ "$existing" != "$sha" ]; then
                     echo "::error::$line already exists at $existing. If an earlier cut-minor run created it, rerun with $existing as the commit input"
