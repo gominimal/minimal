@@ -302,6 +302,29 @@ Do these steps:
 3. Follow steps 3 to 6 with `--ref release/X.Y.x`. For the final version,
    also follow steps 7 and 8. A release candidate stops after step 6.
 
+### Emergency release
+
+An emergency release abandons any staged version that no one promoted. The
+abandoned version never goes out, and its number stays used up, because
+`versions/` is write-once.
+
+Suppose that a run stages the planned `0.7.3` for Monday. An emergency on
+Thursday takes the next number, `0.7.4`, and goes out from the tip of the line.
+On Monday, do not promote `0.7.3`, because that moves `stable` backwards. The
+tip already has everything that was in `0.7.3`. The next planned version is
+`0.7.5`.
+
+1. Merge the fix into the line. Set `package.version` to the next unused
+   number. The number of a staged version does not count as unused, even if
+   the line still declares it.
+2. Stage it, test it, and promote it as usual. A short soak is your decision.
+3. Leave the abandoned version alone. Do not delete its folder or its draft
+   GitHub Release, because the draft is how `gominimal/release-ops` knows that no
+   one can use the number again.
+
+The [release manager runbook](https://github.com/gominimal/release-ops/blob/main/RUNBOOK.md)
+says who decides and how to log the release.
+
 ### Roll back
 
 Run the promotion again with `target=stable` and an earlier version that has a
