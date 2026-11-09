@@ -599,7 +599,7 @@ move `unstable`.
 
 Only a minor release gets a new branch. Patches come from the line.
 [`.github/workflows/cut-minor.yml`](../../.github/workflows/cut-minor.yml) starts
-a minor. It runs only on dispatch, and it replaces step 2 above:
+a minor. It runs only on dispatch from `main`, and it replaces step 2 above:
 
 ```sh
 gh workflow run cut-minor.yml -f commit=<commit>
@@ -615,21 +615,28 @@ these things as the `gominimal-aw-bot` App:
 
 1. It creates `release/X.Y.x` at the commit.
 2. It creates the `backport release/X.Y.x` label.
-3. It opens a PR that moves `main` to the next minor. Merge this PR before the
-   promotion creates `vX.Y.0`, or the version check fails on `main`.
+3. It opens a PR that moves `main` to the next minor. Merge this PR before you
+   promote the version at the commit, `vX.Y.0` or `vX.Y.0-rcN`. Once that tag
+   exists, `main` still declares the same version and its version check fails.
 
-Run it again after a failure, with the same `commit`. If you left `commit` out
-and `main` has moved since, the rerun refuses and prints the commit the line is
-at: pass that as `commit`. It carries on if the line already exists at the same
-commit, and it refuses a line at any other commit. If the bump branch exists
-with no PR, it opens the PR. It opens no bump PR when the branch already has an
-open or merged one, or when `main` no longer declares the version at the commit.
+For a line cut this way, steps 3 to 7 use `release/X.Y.x` in place of
+`release/X.Y.Z`: pass `--ref release/X.Y.x` to `release.yml`. In step 7, keep
+the line. Do not delete it, because later patches and backports go to it.
 
-**Admin step for each new line.** The workflow cannot do this: an organization
-owner adds `gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.x`
-to the `signing` runner group. See [step 2](#2-give-the-commit-a-branch).
+Run it again after a failure, and pass the original `commit` on every rerun.
+Without it, the rerun cuts from the tip of `main`. After the bump PR merges,
+that tip is the next minor, and the rerun cuts the next line. It carries on if
+the line already exists at the same commit, and it refuses a line at any other
+commit. If the bump branch exists with no PR, it opens the PR. It does not
+open a bump PR when the branch already has an open or merged one. It also does
+not open one when `main` no longer declares the version at the commit.
 
-The buckets need no change. Both Workload Identity providers map any
+**Admin step for each new line.** An organization owner adds
+`gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.x`
+to the `signing` runner group, because the workflow cannot. See
+[step 2](#2-give-the-commit-a-branch).
+
+The buckets do not need a change. Both Workload Identity providers map any
 `release/X.Y.x` branch to `attribute.minimal_release`, which has write access to
 `gs://minimal-shim` and `gs://minimal-one`.
 
