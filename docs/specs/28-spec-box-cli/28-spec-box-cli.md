@@ -188,7 +188,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- event-driven with a precondition; keeps the `--network` of the documented `min box spec [--network <mode>] [PATH]` (`docs/reference/cli-min.md`), so `min box spec --network own_ip --repo-dir ./project` gives what `min box spec --network own_ip ./project` gives today. The project form takes no other override flag -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_project_form_network_flag_sets_mode
-  - IF `min box spec` renders BEP-038's rows, with no argument, and gets an override flag of BCLI-024 other than `--network`, or `--loadout`, `--no-loadouts` or `--no-hooks`, THEN THE SYSTEM SHALL fail with exit 2, naming the flag. It SHALL render nothing.
+  - IF `min box spec` renders BEP-038's rows, with no argument, and gets `--loadout`, `--no-loadouts`, `--no-hooks` or any override flag of BCLI-024 except `--network`, THEN THE SYSTEM SHALL fail with exit 2, naming the flag. It SHALL render nothing.
     <!-- unwanted; the same refusal the box form gives (BCLI-022): only the entry form takes the override flags, and the project form keeps only the `--network` it takes today -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_project_form_other_override_flag_exit2
@@ -208,7 +208,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- unwanted; the architecture's `min box spec <box|self>` line: the box form renders the spec as stored and takes no override flags -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_with_override_flag_exit2
-  - WHEN `min box spec <box>` renders a stored spec THE SYSTEM SHALL list each lifecycle hook in the spec. Each row SHALL show the hook's transition, whether it is inline or external, and the loadout or project that declared it.
+  - WHEN `min box spec <box>` renders a stored spec THE SYSTEM SHALL list each lifecycle hook in the spec. Each row SHALL show the hook's transition, its description, whether it is inline or external, and the loadout or project that declared it.
     <!-- event-driven; the rows `min session hooks` lists today (11-spec-lifecycle-hooks, Disabling and listing). The ruling on gominimal/minimal#2877 keeps each hook's declarer in the stored spec, so `min box spec <box>` lists every column `min session hooks` lists today; the BOX amendment that names the field is in the Rollout. A box created with `--no-hooks` (BCLI-076) carries no hook -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_box_lists_hooks_with_declarer
@@ -232,7 +232,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal network_scalar_flag_replaces_value
   - WHERE `--allow-protocols` is given THE SYSTEM SHALL replace `egress.allow_protocols` with the values its uses give, whether that list is wider or narrower than the one below it.
-    <!-- optional-feature; the architecture: the key restricts protocols, so its flag replaces the list instead of adding to it -->
+    <!-- optional-feature; the architecture's Type nouns paragraph (gominimal/arch#166): the key restricts protocols, so its flag replaces the list instead of adding to it. BOX-064's command-line layer sub-bullet (gominimal/minimal#3200, in gominimal/minimal#3177) states the same replace rule -->
     tier:   T0
     verify: cargo nextest run -p minimal allow_protocols_flag_replaces_list
   - WHERE `--deny-all-egress` is given THE SYSTEM SHALL empty every allow list in `egress`: `egress.allow_dns_hosts`, `egress.allow_subnets` and `egress.allow_protocols`. A key that is not an allow list, such as `mode`, SHALL keep the value its own override flag or the layers below give it, so `--network own_ip --deny-all-egress` sets `mode = own_ip`.
@@ -249,7 +249,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   tier:     T0
   verify:   cargo nextest run -p minimal start_loadout_flag_selects_loadouts_layer
 
-- **BCLI-075** WHEN `min box start`, `min box run`, `min session start`, `min task run` or `min box spec <entry>` runs with `--no-loadouts` THE SYSTEM SHALL leave BOX-064's selected-loadouts layer empty. It SHALL apply neither the client config's `default_loadouts` nor a loadout that `--loadout` names.
+- **BCLI-075** WHEN `min box start`, `min box run`, `min session start`, `min task run` or `min box spec <entry>` runs with `--no-loadouts` THE SYSTEM SHALL leave BOX-064's selected-loadouts layer empty. It SHALL not apply the client config's `default_loadouts`.
   <!-- event-driven; the architecture's Type nouns paragraph (gominimal/arch#166). Where the box's `loadout_mode` seals loadouts out, none applies anyway and the flag changes nothing (gominimal/minimal#3068) -->
   tier:     T0
   verify:   cargo nextest run -p minimal create_verbs_no_loadouts_empties_loadouts_layer
@@ -594,7 +594,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **One provider per local deployment style, with hosts named after the instances.** The architecture names one provider per local deployment style (gominimal/arch#45). The `0..N` suffix is the state-directory convention, so it names hosts, not providers. `local` serves the native daemons on this machine, `local-minvmd` serves its VMs, and `local-box` serves the parent daemon of the box `min` runs in. `local-minvmd/local-minvmd0/<box>` is a box on the first VM. The architecture's global `--host` flag names a host too, and it arrives with the global flags (Non-goals). `local-minvmd` is a canonical provider name and does not expire, so NET-049, NET-051 and TEL-034 cite the right spelling. `local-box` exists only inside a box, which needs nesting (Non-goals), so BCLI-052 lists it only where it is present. A local host's endpoint is `unix:<path>` with port 0. The socket's file mode is its access control, as §3 of the Box Provider API states.
 
-**`min box spec` moves its path form to `--repo-dir` and adds the entry and box forms.** `min box spec [path]` renders the Box Egress Proxy rows for a project (BEP-038). This spec adds the architecture's `<entry>` and `<box>` forms and `-o` (BCLI-021, BCLI-022). A positional argument is an entry of the current project, else a box. The path form moves to `--repo-dir <dir>`, or the global `-C <dir>`, as the ruling on gominimal/minimal#2878 decides. Under a directory first rule, an entry such as `docs` or `scripts` cannot be reached by its own name. The bare directory form gets no alias, as the owner confirmed on 2026-11-09. A bare argument is never a path, so a box keeps its name when a directory has the same name. With `--repo-dir P`, an argument is an entry of `P`, else a box (BCLI-022). Each existing `min box spec <path>` call moves to `--repo-dir <path>` in the same change (Rollout). The entry form shows BEP-038's rows inside the expanded spec, beside the values they come from. Only the entry form takes the override flags. The project form keeps the `--network <mode>` it takes today (BCLI-021). The box form renders the spec as stored, and an override flag there is exit 2 (BCLI-022).
+**`min box spec` moves its path form to `--repo-dir` and adds the entry and box forms.** `min box spec [path]` renders the Box Egress Proxy rows for a project (BEP-038). This spec adds the architecture's `<entry>` and `<box>` forms and `-o` (BCLI-021, BCLI-022). A positional argument is an entry of the project that `--repo-dir` names, else of the current one, else a box (BCLI-022). The path form moves to `--repo-dir <dir>`, or the global `-C <dir>`, as the ruling on gominimal/minimal#2878 decides. Under a directory first rule, an entry such as `docs` or `scripts` cannot be reached by its own name. The bare directory form gets no alias, as the owner confirmed on 2026-11-09. A bare argument is never a path, so a box keeps its name when a directory has the same name. Each existing `min box spec <path>` call moves to `--repo-dir <path>` in the same change (Rollout). The entry form shows BEP-038's rows inside the expanded spec, beside the values they come from. Only the entry form takes the override flags. The project form keeps the `--network <mode>` it takes today (BCLI-021). The box form renders the spec as stored, and an override flag there is exit 2 (BCLI-022).
 
 **`min host show` names the host-side socket only.** On the VM provider it is the host-side socket the client connects to (BCLI-048). The in-VM path is an in-VM fact the client never uses, so `min host show` leaves it out.
 
@@ -622,11 +622,11 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 - `min session activate`: NET-018, NET-020, NET-035, NET-040, NET-049, NET-051 and NET-122, the last in a sub-bullet's comment. A BOX-001 sub-bullet cites it too. The installer's closing card names `min session activate --attach .` (`docs/specs/07-spec-installer`, R10.4). The lifecycle-hooks spec cites `min session activate --no-hooks` (`docs/specs/11-spec-lifecycle-hooks`), whose new spelling is `min session start --no-hooks` (BCLI-076). Scripts: `scripts/session-e2e.sh`, `scripts/bulk-upload-e2e.sh`, `scripts/stress-session-e2e.sh` and `scripts/kernel-bump-review.sh`.
 - `min session policy`: NET-044, NET-058, NET-061, NET-075, NET-130 (in a sub-bullet's comment), NET-140, NET-146 and a NET-160 sub-bullet's comment, and BEP-085's comment. The draft GWI-003 cites it too. Its successor is `min box show --network` (BCLI-025). Script: `scripts/session-e2e.sh`.
-- `min session hooks`: the lifecycle-hooks spec. Its successor is `min box spec <box>` (BCLI-022). Script: `scripts/session-e2e.sh`.
+- `min session hooks`: the lifecycle-hooks spec. Its successor is `min box spec <box-id>` (BCLI-022). A caller addresses the box by its id, or by `provider/host/name`, because a bare name reads an entry of the same name first. Script: `scripts/session-e2e.sh`.
 - `min session rename`: no requirement. Script: `scripts/session-e2e.sh`.
 - `min session destroy`: NET-058 and BEP-043. Its successor is `min box rm --force` (BCLI-060), which still stops a live box and fires BEP-043's revoke-on-destroy. Scripts: `scripts/session-e2e.sh`, and `scripts/bulk-upload-e2e.sh`, whose cleanup runs `session destroy --all --force`.
 - `min session exec`: NET-058, a NET-015 sub-bullet and TEL-031. Script: `scripts/session-e2e.sh`.
-- `min session run`: the same NET-015 sub-bullet. A task runs as its own box, so its successor is `min task run` (BCLI-010).
+- `min session run`: the same NET-015 sub-bullet. It has no equivalent. It ran a task inside an existing session, and `min task run` (BCLI-010) runs the task as its own box, with its own filesystem and network. A run inside a running box needs `min` inside that box, which waits on nesting (Open questions).
 - `min task run --path <dir>`: its successor is the global `-C <dir>`.
 - Bare `min stop`: TEL-011, and the installer's R5.5. The installer, `scripts/install.sh`, runs `min stop` and matches its refusal for live sessions by message. Without that match it runs `min stop --force`. `min host stop` does not refuse while boxes run (BCLI-049). So the installer moves to `min host stop` with a running-box check of its own, and keeps its choice of a forced stop. The end-to-end scripts `scripts/session-e2e.sh`, `scripts/stress-session-e2e.sh` and `scripts/bulk-upload-e2e.sh`, and the installer's tests in `scripts/install_test.sh`, call `min stop` too.
 - `docs/reference` and `docs/concepts`: every page that names one of these spellings.
