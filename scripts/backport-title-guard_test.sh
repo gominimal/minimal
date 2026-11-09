@@ -128,5 +128,18 @@ else
     bad "conflict paths left the tree dirty"
 fi
 
+# A pick that fails for another reason must not read as "no conflicts".
+missing="$(printf '%040d' 0 | tr 0 f)"
+if (cd "$repo" && "$paths" "$onto" "$missing" >/dev/null 2>&1); then
+    bad "a pick that fails without a conflict exits 0"
+else
+    ok "a pick that fails without a conflict is an error"
+fi
+if [ -z "$(git -C "$repo" status --porcelain)" ]; then
+    ok "a failed pick leaves a clean tree"
+else
+    bad "a failed pick left the tree dirty"
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
