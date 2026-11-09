@@ -4295,19 +4295,22 @@ const MAX_LOGGED_WHAT: usize = 120;
 /// a field of a body the gate refused to summarize, up to
 /// [`MAX_CONTROL_BODY`] bytes of anything a JSON string can spell, newlines
 /// and control characters included, and the line writes it with `%`. A
-/// value of printable ASCII within [`MAX_LOGGED_WHAT`] — every value the
-/// daemon's own client sends — is written as it is, so the line reads the
-/// same as before; anything else is written escaped (`{:?}`), so it cannot
-/// break the line or forge another, and cut to the bound on a char boundary
-/// with a marker naming the value's full length, so it cannot flood the log.
+/// value of printable ASCII within [`MAX_LOGGED_WHAT`] with no `=`, `"` or
+/// `\` — every value the daemon's own client sends — is written as it is,
+/// so the line reads the same as before; anything else is written escaped
+/// (`{:?}`, one quoted token, so a value carrying `rule_matched="..."` cannot
+/// pose as a field of the line, nor break it or forge another), and cut to
+/// the bound on a char boundary, the closing quote kept and a marker naming
+/// the value's full length, so it cannot flood the log.
 fn loggable_what(what: &str) -> std::borrow::Cow<'_, str> {
-    if what.len() <= MAX_LOGGED_WHAT && what.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+    let plain = |b: u8| (b == b' ' || b.is_ascii_graphic()) && !matches!(b, b'=' | b'"' | b'\\');
+    if what.len() <= MAX_LOGGED_WHAT && what.bytes().all(plain) {
         return std::borrow::Cow::Borrowed(what);
     }
     let mut escaped = format!("{what:?}");
     if escaped.len() > MAX_LOGGED_WHAT {
         escaped.truncate(escaped.floor_char_boundary(MAX_LOGGED_WHAT));
-        escaped.push_str(&format!("... ({} bytes in all)", what.len()));
+        escaped.push_str(&format!("\"... ({} bytes in all)", what.len()));
     }
     std::borrow::Cow::Owned(escaped)
 }
@@ -18832,12 +18835,29 @@ mod tests {
             "127.0.0.2:8080",
             "100.64.0.9",
             "min.internal.",
-            "name \"web\"",
+            "name web",
             "",
         ] {
             assert!(
                 matches!(loggable_what(plain), Cow::Borrowed(named) if named == plain),
                 "{plain:?} is named as it is"
+            );
+        }
+        // A value that could pose as a field of the line (`key=value`, a quote,
+        // a backslash) is one quoted token, its own quotes escaped.
+        for posed in [
+            "x rule_matched=\"egress-control-upgrade\"",
+            "name \"web\"",
+            "a=b",
+            "back\\slash",
+        ] {
+            let named = loggable_what(posed);
+            assert_eq!(named, format!("{posed:?}"), "{posed:?} is escaped whole");
+            assert!(
+                named.starts_with('"')
+                    && named.ends_with('"')
+                    && !named[1..named.len() - 1].contains("\" "),
+                "{posed:?} is one quoted token: {named:?}"
             );
         }
         let refused = |zone: &str| {
@@ -18885,8 +18905,11 @@ mod tests {
             "the refusal keeps the name"
         );
         let named = loggable_what(&long);
-        let marker = format!("... ({} bytes in all)", long.len());
-        assert!(named.ends_with(&marker), "the cut is marked: {named:?}");
+        let marker = format!("\"... ({} bytes in all)", long.len());
+        assert!(
+            named.ends_with(&marker),
+            "the cut is marked, its quote closed: {named:?}"
+        );
         assert_eq!(
             named.len(),
             MAX_LOGGED_WHAT + marker.len(),
@@ -18902,7 +18925,7 @@ mod tests {
         for run in 0..=MAX_LOGGED_WHAT {
             let name = format!("{}日{}", "x".repeat(run), "é".repeat(MAX_LOGGED_WHAT));
             let named = loggable_what(&name);
-            let marker = format!("... ({} bytes in all)", name.len());
+            let marker = format!("\"... ({} bytes in all)", name.len());
             assert!(
                 named.len() <= MAX_LOGGED_WHAT + marker.len(),
                 "a {}-byte name is named within the bound, got {} bytes",
