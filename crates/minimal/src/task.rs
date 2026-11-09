@@ -124,8 +124,8 @@ pub(crate) struct TaskBoxNetwork {
 /// The network mode and box policy of task `task`'s box (NET-060). The
 /// mode is `--network`, else the `network.mode` the project's
 /// `minimal.toml` declares for the task, else `host_ip`. The egress is the
-/// one the file declares for the task, with each field an egress flag
-/// names replaced by the flag, as an activation takes them. With no flag
+/// one the file declares for the task with the egress flags applied by
+/// [`crate::effective_egress`], as an activation applies them. With no flag
 /// and no declaration, the box is a `host_ip` box with the default policy.
 /// An `own_ip` box with no egress gets the deny-all default where the box
 /// is created (NET-074), as an activation's does.
@@ -145,11 +145,7 @@ fn task_box_network(
     let flag_egress = crate::flag_egress(flags)?;
     let project_egress = crate::task_project_egress(project, task)?;
     let file_policy = project_egress.policy.is_some();
-    let egress = crate::effective_egress(
-        project_egress.policy,
-        flag_egress.clone(),
-        flags.deny_all_egress,
-    );
+    let egress = crate::effective_egress(project_egress.policy, flag_egress, flags.deny_all_egress);
     tracing::debug!(
         egress = ?egress.policy,
         sources = ?egress.sources,
@@ -166,16 +162,12 @@ fn task_box_network(
         ),
     };
     // Where the box's egress came from, for the refusals below: each egress
-    // flag given, and the file's table when one of its fields stays.
-    let file_egress = egress
-        .sources
-        .iter()
-        .any(|(_, source)| *source == crate::EgressSource::ProjectFile)
-        || (file_policy && flag_egress.is_none() && !flags.deny_all_egress);
+    // flag given, and the file's table whenever it declares egress, since
+    // the box would still have egress without the flags.
     let file_layer = project_egress
         .layer
         .as_deref()
-        .filter(|_| file_egress)
+        .filter(|_| file_policy)
         .map(|layer| format!("{layer} in {}", mfile::MFILE_NAME));
     if mode == boxes::NetworkMode::NoNet && egress.policy.is_some() {
         let given = given_egress_flags(flags);
@@ -3093,6 +3085,22 @@ mod tests {
                 format!(
                     "{daemon} The box's egress rules come from {layer} in minimal.toml. Run it \
                      with --network host_ip or --network own_ip."
+                )
+            );
+            // A flag that replaces every field the file sets still leaves
+            // the file's egress, so the file is named and dropping the flag
+            // is not offered.
+            assert_eq!(
+                refusal(
+                    &declared,
+                    crate::EgressArgs {
+                        deny_all_egress: true,
+                        ..crate::EgressArgs::default()
+                    }
+                ),
+                format!(
+                    "{daemon} The box's egress rules come from --deny-all-egress and {layer} in \
+                     minimal.toml. Run it with --network host_ip or --network own_ip."
                 )
             );
         }
