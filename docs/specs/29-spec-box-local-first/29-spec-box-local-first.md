@@ -261,10 +261,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p mfile entry_name_invalid_exit3_names_entry
 
-- **BOX-048** THE SYSTEM SHALL merge `[defaults]` into every entry and `[defaults.<type>]` into entries of that type, unioning lists and replacing scalars and tables with the more specific layer's.
+- **BOX-048** THE SYSTEM SHALL merge `[defaults]` into every entry and `[defaults.<type>]` into entries of that type, unioning lists and replacing scalars and tables with the more specific layer's, except the `vars` table, which BOX-176 merges by name.
   tier:     T1
   verify:   cargo nextest run -p mfile defaults_merge_lists_union_scalars_replace
-  property: For every pair of layers, merging unions list values in layer order and replaces scalars and tables with the more specific layer's.
+  property: For every pair of layers, merging unions list values in layer order, merges `vars` by name with the more specific layer's value for a name both set, and replaces other scalars and tables with the more specific layer's.
 
 - **BOX-049** THE SYSTEM SHALL accept per-entry keys written flat (`timeout`, `pty_enabled`, and the `[machine]` and `on_oom` keys as the resources spec (gominimal/inbox#698; BRES) defines them) and keep the meaning of `packages`, `patches`, `vars` and `lifecycle_hooks`.
   tier:     T0
