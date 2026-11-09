@@ -1210,10 +1210,9 @@ impl SessionChannel {
     /// leave from (where it stands in one), the host the daemon fetches the
     /// configured remote cache from, and each package in the install's scope
     /// spelled the way `min search` spells it, with its upstream version
-    /// when the graph knows one. It also says whether the install's web
-    /// sources are fetched in the box's classifier leaf (NET-155). Those are
-    /// the box's traffic and are not recorded. A `gs://` source, and a web
-    /// source of a box with no leaf, leave from the daemon and are recorded.
+    /// when the graph knows one. A source a package declares is a package
+    /// build's traffic (NET-155), never the node plane's, so the record
+    /// does not list it.
     fn fetch_record(
         &self,
         graph: &Graph,
