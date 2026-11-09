@@ -1,6 +1,6 @@
 ---
 title: Release pipeline
-description: "How to cut a stable release, and how the pipeline builds, stages, smoke-tests, promotes, and installs releases: release.yml, nightly.yml, promote.yml, prune-releases.yml, and the curl|sh installer."
+description: "How to cut a stable release, and how the pipeline builds, stages, smoke-tests, promotes, and installs releases: release.yml, stage-release.yml, nightly.yml, promote.yml, prune-releases.yml, and the curl|sh installer."
 ---
 
 > This is internal documentation. It is not published to the docs site.
@@ -218,6 +218,63 @@ a version below the current `stable`. It also refuses a version without a smoke
 record. Choose a version that was on `stable` before, and choose it before you
 promote. Use `override_provenance=true` only
 in an emergency. The approval issue shows that you used it.
+
+## Stage from a release line
+
+Patches and release candidates go out from the newest `release/X.Y.x` line.
+[`.github/workflows/stage-release.yml`](../../.github/workflows/stage-release.yml)
+stages one with one dispatch. It replaces steps 1 to 4 above for a line that
+exists:
+
+```sh
+gh workflow run stage-release.yml
+```
+
+Set `package.version` on the line by PR first. To stage a candidate, set it to
+`X.Y.Z-rcN`. To stage the final version, set it to `X.Y.Z`. The final version
+is a new build, even when it has the same commits as the last candidate.
+
+The workflow does these things, in this order:
+
+1. It picks the newest `release/X.Y.x` branch. Only the newest line gets
+   patches.
+2. It checks that the five required checks from step 1 are green on the tip.
+3. It checks `package.version` on the tip against the computed version.
+4. It runs `release.yml` on the line with `versioned=true` and `dry_run=true`,
+   and waits.
+5. It checks that the tip did not move, then runs `release.yml` with
+   `versioned=true` and `dry_run=false`, and waits. If the run built any other
+   commit, the workflow cancels it.
+
+Then continue from step 5, [Test the staged release](#5-test-the-staged-release).
+
+**The computed version.** A tag or a staged folder uses up a version number,
+whether or not anyone promoted it.
+[`scripts/stage-version.sh`](../../scripts/stage-version.sh) reads the tags and
+the staged folders. The next final version is one patch above the highest final
+version used on the line, or `X.Y.0` on a new line. The next candidate is one
+above the highest candidate of that version, or `rc1`. A candidate uses up only
+its own number. `package.version` must be one of those two. It must also pass
+`next-version.sh --check`, so a `feat:` commit on a line stops the run.
+
+| Used on `release/0.7.x` | Accepted `package.version` |
+| --- | --- |
+| `0.7.2`, `0.7.3-rc1` | `0.7.3-rc2` or `0.7.3` |
+| `0.7.2`, `0.7.3-rc1`, `0.7.3-rc2` | `0.7.3-rc3` or `0.7.3` |
+| `0.7.2`, `0.7.3-rc1`, `0.7.3` | `0.7.4-rc1` or `0.7.4` |
+
+**Inputs.** `dry_run=true` stops after the dry run and uses up no number. Use
+`restage=true` when a run failed after the staging job and the folder has no
+smoke record. The workflow refuses to restage a folder that has one.
+
+**What a dry run does not prove.** A dry run skips the uploads, so it can pass
+on a line whose identity cannot write to the buckets. The first real stage from
+`release/0.7.x` failed this way at the `gs://minimal-shim` upload. The failure
+comes before the staging job, so it does not use up the number.
+
+**If you stop the workflow.** Canceling `stage-release` or reaching its timeout
+stops only the wait. A running `release.yml` run keeps going, so cancel it in the
+Actions list as well.
 
 ## We test every artifact we release
 
