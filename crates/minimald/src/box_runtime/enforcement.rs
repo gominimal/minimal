@@ -489,11 +489,13 @@ pub async fn re_read_when_moved(
 }
 
 /// Re-reads the node fact when `now` is a cgroup other than the one the
-/// fact was last read in, records `now`, and says whether it re-read. An
-/// unreadable cgroup (`None`), or no recorded one, is no move. Each move is
-/// one line naming both cgroups, what noticed the move (`by`), and what the
-/// re-read found. A re-read that does not run keeps the stored fact, and
-/// the move is still recorded, so a lost read is not retried every poll.
+/// fact was last read in, records `now`, and says whether the re-read ran
+/// and succeeded. An unreadable cgroup (`None`), or no recorded one, is no
+/// move. Each move is one line naming both cgroups, what noticed the move
+/// (`by`), and what the re-read found. A re-read that fails keeps the stored
+/// fact and answers `false`, so a caller with a retry of its own (a create
+/// whose stored fact says the probe could not read the table) still takes
+/// it; the move is still recorded, so a lost read is not retried every poll.
 pub(crate) async fn re_read_if_moved(
     root: std::path::PathBuf,
     mountinfo_knob: Option<String>,
@@ -508,26 +510,32 @@ pub(crate) async fn re_read_if_moved(
         Some(from) if from != now => from.to_string(),
         _ => return false,
     };
-    match re_read_classifier_fact(root, mountinfo_knob, false).await {
-        Ok((_, decision)) => tracing::info!(
-            from = %from,
-            to = %now,
-            by,
-            host_fact = %host_ip_enforcement_fact().enforcement.machine_str(),
-            cause = decision.cause().map(crate::net::classifier::Cause::detail),
-            "this daemon moved to another cgroup, so it re-read the classifier fact"
-        ),
-        Err(e) => tracing::warn!(
-            from = %from,
-            to = %now,
-            by,
-            error = %e,
-            "this daemon moved to another cgroup, but the classifier fact could \
-             not be re-read, so it keeps the stored one"
-        ),
-    }
+    let reread = match re_read_classifier_fact(root, mountinfo_knob, false).await {
+        Ok((_, decision)) => {
+            tracing::info!(
+                from = %from,
+                to = %now,
+                by,
+                host_fact = %host_ip_enforcement_fact().enforcement.machine_str(),
+                cause = decision.cause().map(crate::net::classifier::Cause::detail),
+                "this daemon moved to another cgroup, so it re-read the classifier fact"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                from = %from,
+                to = %now,
+                by,
+                error = %e,
+                "this daemon moved to another cgroup, but the classifier fact could \
+                 not be re-read, so it keeps the stored one"
+            );
+            false
+        }
+    };
     *recorded = Some(now);
-    true
+    reread
 }
 
 /// Creates the classifier leaf this session's host-address box is placed in

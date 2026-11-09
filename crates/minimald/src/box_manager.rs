@@ -157,7 +157,9 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
 /// also re-reads when the daemon stands in another cgroup than the one the
 /// fact was read in (gominimal/inbox#1054: `min finalize-install` placed a
 /// running daemon after its start-up reading), so it never answers in the
-/// second before the daemon's own cgroup watch would notice the move.
+/// second before the daemon's own cgroup watch would notice the move; when
+/// that re-read fails, the create goes on to the probe-unreadable retry
+/// below rather than answer the stale fact as re-read.
 // The create lines carry the fact as `host_fact`, never as
 // `host_ip_enforcement`: that field marks the per-launch classifier record,
 // and readers of the log take every line with it as a launch decision.
