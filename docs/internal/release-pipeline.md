@@ -79,6 +79,11 @@ push it. The branch name must start with `release/`. CI runs the required checks
 pushes and PRs to `main` and `release/**` only. Without those checks, step 4
 refuses each fix that merges into the branch.
 
+The `release branches` ruleset keeps the branch safe to sign from. Except
+for admins, it refuses direct pushes, force pushes and deletion on
+`release/**`, so each change needs a PR with a code-owner approval and the
+required checks.
+
 The draft release and the tag point at the commit. The branch name also
 decides whether the signing jobs can run:
 
@@ -101,6 +106,9 @@ again, then check that the second command prints `gominimal/minimal`:
 gh api -X PUT orgs/gominimal/actions/runner-groups/3/repositories/$(gh api repos/gominimal/minimal --jq .id)
 gh api orgs/gominimal/actions/runner-groups/3/repositories --jq '.repositories[].full_name'
 ```
+
+When the line stops getting patches, remove its entry from the group in the
+same way, and add the repository again.
 
 Keep the branch after the release. It carries the fixes that go into the
 release while `main` moves on, and each patch on the line goes out from it.
@@ -179,8 +187,9 @@ Check its claims against the staged version `X.Y.Z`, before the promotion,
 so that a fix can still go in before users get the build. Run its evals, and
 file each place where minimal-skills and the running build disagree in
 [`gominimal/inbox`](https://github.com/gominimal/inbox). The repository keeps
-one `release/vX.Y.x` branch for each release line.
-The release manager creates it when the line is cut.
+one `release/vX.Y.x` branch for each release line. That name has a `v`,
+unlike `release/X.Y.x` in this repository. minimal-skills has no rule on
+`release/` branches, so the release manager creates it when the line is cut.
 
 A release candidate stops here.
 
