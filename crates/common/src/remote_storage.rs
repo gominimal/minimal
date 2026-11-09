@@ -66,7 +66,10 @@ impl std::fmt::Display for Placement {
 #[derive(Clone)]
 pub struct NetNamespace {
     /// The user namespace that owns `net`. A process needs it to enter `net`.
+    // Only Linux joins a namespace, so only Linux reads `user` and `net`.
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     user: Arc<OwnedFd>,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     net: Arc<OwnedFd>,
     nameservers: Vec<std::net::SocketAddr>,
     /// Whether the namespace's egress rules allow a host name.
