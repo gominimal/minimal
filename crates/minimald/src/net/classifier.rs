@@ -3496,20 +3496,36 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
 ///
 /// [`enter_daemon_leaf`]: sandbox::classifier::enter_daemon_leaf
 pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
-    let members =
-        std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
-    members
-        .lines()
-        .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
+    daemon_in_leaf(root)
+        .ok()?
         .then_some(sandbox::classifier::DAEMON_LEAF)
 }
 
-/// Whether this daemon stands outside a daemon leaf the step installed: the
-/// leaf is there and [`daemon_fetch_leaf`] does not find this process in it.
-/// A tree without the leaf is the step not installed, its own cause, so it
-/// does not read as unplaced here.
+/// Whether this process is among the members of its daemon leaf's
+/// `cgroup.procs`, read once. `Err` is a leaf that is not there or whose
+/// members could not be read, which says nothing about where this daemon
+/// stands, so callers keep it apart from `Ok(false)`, a leaf read whole
+/// without this process in it.
+pub fn daemon_in_leaf(root: &Path) -> std::io::Result<bool> {
+    let members = std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE))?;
+    Ok(members
+        .lines()
+        .any(|member| member.trim().parse::<u32>() == Ok(std::process::id())))
+}
+
+/// Whether one read of the daemon leaf ([`daemon_in_leaf`]) says this
+/// daemon stands outside it: only a leaf read whole without this process
+/// does. A tree without the leaf is the step not installed, its own cause,
+/// and a leaf whose members could not be read proves no placement either
+/// way, so neither reads as unplaced: the decision keeps the cause it read.
+pub fn unplaced_over(in_leaf: &std::io::Result<bool>) -> bool {
+    matches!(in_leaf, Ok(false))
+}
+
+/// Whether this daemon stands outside a daemon leaf the step installed,
+/// over one fresh read of it ([`unplaced_over`]).
 pub fn daemon_unplaced(root: &Path) -> bool {
-    sandbox::classifier::daemon_leaf(root).is_dir() && daemon_fetch_leaf(root).is_none()
+    unplaced_over(&daemon_in_leaf(root))
 }
 
 /// How long a daemon waits for the placer to finish: the placer scans every
@@ -10191,5 +10207,14 @@ mod tests {
         )
         .expect("this process as a member");
         assert!(!daemon_unplaced(tree.path()), "a leaf this process is in");
+        // A leaf whose members cannot be read proves no placement, so it
+        // does not read as unplaced.
+        std::fs::remove_file(leaf.join(PROCS_FILE)).expect("drop the members file");
+        std::fs::create_dir(leaf.join(PROCS_FILE)).expect("an unreadable members file");
+        assert!(daemon_in_leaf(tree.path()).is_err());
+        assert!(
+            !daemon_unplaced(tree.path()),
+            "a leaf whose members cannot be read"
+        );
     }
 }

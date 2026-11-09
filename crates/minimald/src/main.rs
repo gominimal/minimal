@@ -1440,8 +1440,9 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // The placement is read once, for both the fact and the log lines: the
     // placement unit answers asynchronously, so two reads could disagree.
     let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
-    let placed = minimald::net::classifier::daemon_fetch_leaf(tree_root).is_some();
-    let unplaced = daemon_leaf.is_dir() && !placed;
+    let in_leaf = minimald::net::classifier::daemon_in_leaf(tree_root);
+    let placed = matches!(in_leaf, Ok(true));
+    let unplaced = minimald::net::classifier::unplaced_over(&in_leaf);
     // An unreadable probe read by a daemon outside its own leaf is that
     // daemon's placement, not the table's: it places no box, so it refuses
     // none, and its fact says so (gominimal/minimal#3067).
