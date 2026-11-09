@@ -133,7 +133,13 @@ async fn copy_log(
         let update: ReadLogUpdate = match serde_json_lenient::from_str(&line) {
             Ok(update) => update,
             Err(e) => {
-                tracing::warn!(verb, box_name = address, line, "decode a log line: {e}");
+                // The line carries box output, which can hold secrets: log only its length.
+                tracing::warn!(
+                    verb,
+                    box_name = address,
+                    line_len = line.len(),
+                    "decode a log line: {e}"
+                );
                 bail!("The output of box {address} is in a form this version of min cannot read.");
             }
         };
