@@ -81,7 +81,7 @@ refuses each fix that merges into the branch.
 
 The `release branches` ruleset keeps the branch safe to sign from. Except
 for admins, it refuses direct pushes, force pushes and deletion on
-`release/**`, so each change needs a PR with a code-owner approval and the
+`release/**`. Each change needs a PR with a code-owner approval and the
 required checks.
 
 The draft release and the tag point at the commit. The branch name also
