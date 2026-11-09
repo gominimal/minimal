@@ -680,7 +680,7 @@ every check and create nothing.
 The workflow refuses a commit that is not on `main`, or that does not have the
 five required checks green. It also refuses one whose `package.version` is not
 `X.Y.0` or `X.Y.0-rcN`, and one that fails `next-version.sh --check`. Then it does
-these things as the `gominimal-aw-bot` App:
+these things as the `minimal-shipper` App:
 
 1. It creates `release/X.Y.x` at the commit.
 2. It creates the `backport release/X.Y.x` label.
@@ -709,7 +709,7 @@ The buckets do not need a change. Both Workload Identity providers map any
 `release/X.Y.x` branch to `attribute.minimal_release`, which has write access to
 `gs://minimal-shim` and `gs://minimal-one`.
 
-The workflow itself needs one admin step, once: add `gominimal-aw-bot` as a bypass
+The workflow itself needs one admin step, once: add `minimal-shipper` as a bypass
 actor on the `release branches` repository rules. Those rules stop anyone else
 from creating a branch under `release/`.
 
@@ -780,7 +780,7 @@ commit, and the docs site at docs.minimal.dev rebuilds from that commit.
 **Next-patch bump.** After a real `stable` promotion of `X.Y.Z`, the `bump-line`
 job sets `package.version` to the next patch with
 [`scripts/set-package-version.sh`](../../scripts/set-package-version.sh). It opens
-a PR from `chore/bump-X.Y.Z+1` to `release/X.Y.x`, as the `gominimal-aw-bot` App, so
+a PR from `chore/bump-X.Y.Z+1` to `release/X.Y.x`, as the `minimal-shipper` App, so
 CI runs on the PR. The job does nothing unless the line still declares the version
 it just promoted, so a rollback changes nothing. A rerun changes nothing when
 the branch already has an open or merged PR. If the branch exists with no PR,

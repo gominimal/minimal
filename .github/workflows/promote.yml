@@ -355,6 +355,9 @@ jobs:
         # a rerun the line has moved on, or the PR's branch is already there.
         needs: [promote, publish]
         if: ${{ inputs.target == 'stable' && !inputs.dry_run }}
+        # The minimal-shipper key lives in the `release` environment, which
+        # only main and release/* can deploy to.
+        environment: release
         runs-on: ubuntu-latest
         timeout-minutes: 10
         permissions:
@@ -400,13 +403,13 @@ jobs:
                   persist-credentials: false
             # A PR opened with GITHUB_TOKEN starts no CI, and the line requires
             # the five aggregators.
-            - name: Mint PR token (gominimal-aw-bot)
+            - name: Mint PR token (minimal-shipper)
               id: bump-token
               if: steps.line.outputs.line != ''
               uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
               with:
-                  app-id: ${{ vars.AW_BOT_APP_ID }}
-                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  app-id: ${{ vars.MINIMAL_SHIPPER_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_SHIPPER_PRIVATE_KEY }}
                   owner: gominimal
                   repositories: ${{ github.event.repository.name }}
                   permission-contents: write
@@ -551,18 +554,21 @@ jobs:
         # version it has already logged, so a rerun or a rollback changes nothing.
         needs: [promote, publish]
         if: ${{ inputs.target == 'stable' && !inputs.dry_run }}
+        # The minimal-shipper key lives in the `release` environment, which
+        # only main and release/* can deploy to.
+        environment: release
         runs-on: ubuntu-latest
         timeout-minutes: 5
         permissions: {}
         steps:
             # Same pattern as the webapp token above: contents:write is what
             # POST /repos/{owner}/{repo}/dispatches needs, and nothing else.
-            - name: Mint release-ops token (gominimal-aw-bot)
+            - name: Mint release-ops token (minimal-shipper)
               id: ops-token
               uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
               with:
-                  app-id: ${{ vars.AW_BOT_APP_ID }}
-                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  app-id: ${{ vars.MINIMAL_SHIPPER_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_SHIPPER_PRIVATE_KEY }}
                   owner: gominimal
                   repositories: release-ops
                   permission-contents: write

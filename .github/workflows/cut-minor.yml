@@ -33,6 +33,9 @@ jobs:
         # mints a token that can bypass the release branch rules: run only
         # what main carries.
         if: github.ref == 'refs/heads/main'
+        # The minimal-shipper key lives in the `release` environment, which
+        # only main and release/* can deploy to.
+        environment: release
         runs-on: ubuntu-latest
         timeout-minutes: 15
         permissions:
@@ -108,13 +111,13 @@ jobs:
                     fi
                   done
                   exit "$fail"
-            - name: Mint token (gominimal-aw-bot)
+            - name: Mint token (minimal-shipper)
               id: token
               if: ${{ !inputs.dry_run }}
               uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
               with:
-                  app-id: ${{ vars.AW_BOT_APP_ID }}
-                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  app-id: ${{ vars.MINIMAL_SHIPPER_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_SHIPPER_PRIVATE_KEY }}
                   owner: gominimal
                   repositories: ${{ github.event.repository.name }}
                   permission-contents: write
