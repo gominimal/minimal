@@ -11427,7 +11427,8 @@ fn box_wait_orphaned_stopped_record_returns_137() {
 }
 
 // BCLI-013: `min box wait --timeout` stops waiting on a box that still
-// runs, with exit 124 and the `timeout` error, and leaves the box running.
+// runs, with exit 124 and the `wait_timeout` error that names the box id,
+// and leaves the box running.
 // A wait with no timeout returns once the box is stopped.
 #[tokio::test]
 async fn box_wait_timeout_flag_returns_124_box_runs_on() {
@@ -11446,15 +11447,18 @@ async fn box_wait_timeout_flag_returns_124_box_runs_on() {
         .downcast_ref::<BoxTimedOut>()
         .unwrap_or_else(|| panic!("not a timeout: {err:#}"));
     assert_eq!(BoxTimedOut::EXIT_CODE, 124);
-    assert_eq!(BoxTimedOut::CODE, "timeout");
+    assert_eq!(timed_out.code(), "wait_timeout");
     assert_eq!(
         timed_out.to_string(),
-        "Stopped waiting after 300ms; web is still running."
+        format!("Stopped waiting after 300ms; web ({id}) is still running.")
     );
-    assert_eq!(timed_out.hint(), "Run `min box wait web` to wait again.");
     assert_eq!(
-        BoxTimedOut::waited("web", "30s").to_string(),
-        "Stopped waiting after 30s; web is still running."
+        timed_out.hint(),
+        format!("Run `min box wait {id}` to wait again, or `min box stop {id}` to stop it.")
+    );
+    assert_eq!(
+        BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s").to_string(),
+        "Stopped waiting after 30s; web (0190a3c4-0000-7000-8000-000000000000) is still running."
     );
 
     let record = shown_record(&alpha.host, id).await;
@@ -11502,5 +11506,9 @@ fn run_verbs_and_wait_timeout_return_124_with_code_timeout() {
         "web ran for longer than its timeout and was stopped."
     );
     assert_eq!(BoxTimedOut::EXIT_CODE, 124);
-    assert_eq!(BoxTimedOut::CODE, "timeout");
+    assert_eq!(timed_out.code(), "timeout");
+    assert_eq!(
+        BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s").code(),
+        "wait_timeout"
+    );
 }

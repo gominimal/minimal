@@ -425,10 +425,11 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             timed_out.hint().to_string(),
         ));
     }
-    // BCLI-013, BCLI-014: a box timeout or a wait timeout is `timeout`.
+    // BCLI-013, BCLI-014: a box timeout is `timeout`, and a wait timeout is
+    // `wait_timeout`.
     if let Some(timed_out) = e.downcast_ref::<minimal::BoxTimedOut>() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
-            minimal::BoxTimedOut::CODE,
+            timed_out.code(),
             format!("{e:#}"),
             timed_out.hint().to_string(),
         ));
@@ -1180,18 +1181,22 @@ mod tests {
 
     /// BCLI-013, BCLI-014: a box that its own timeout ended, and a `min box
     /// wait --timeout` that ran out, end the run with 124 in both output
-    /// modes, and a machine-mode run answers them with the `timeout` object.
+    /// modes. A machine-mode run answers the first with the `timeout`
+    /// object and the second with the `wait_timeout` object.
     #[test]
     fn run_verbs_and_wait_timeout_return_124_with_code_timeout() {
-        for timed_out in [
-            minimal::BoxTimedOut::ended("web"),
-            minimal::BoxTimedOut::waited("web", "30s"),
+        for (timed_out, code) in [
+            (minimal::BoxTimedOut::ended("web"), "timeout"),
+            (
+                minimal::BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s"),
+                "wait_timeout",
+            ),
         ] {
             let e = anyhow::Error::new(timed_out.clone());
             assert_eq!(failure_exit_code(&e), 124);
             match machine_mode_answer(&e) {
                 MachineModeAnswer::Object(failure) => {
-                    assert_eq!(failure.code(), "timeout");
+                    assert_eq!(failure.code(), code);
                     assert_eq!(failure.message(), timed_out.to_string());
                     assert_eq!(failure.hint(), timed_out.hint());
                 }
@@ -1203,7 +1208,7 @@ mod tests {
                 ExitCode::from(124)
             );
             let line = String::from_utf8(stderr).unwrap();
-            assert!(line.contains(r#""code":"timeout""#), "{line}");
+            assert!(line.contains(&format!(r#""code":"{code}""#)), "{line}");
             let mut stderr = Vec::new();
             assert_eq!(
                 answer_failure(&e, false, false, None, &mut stderr),

@@ -1,7 +1,8 @@
 //! `min box wait`: waits until a box ends and gives back its exit code
 //! (BCLI-013). A box that its own timeout ended, and a wait that its
-//! `--timeout` ran out on, end with 124 and the machine-mode `timeout`
-//! error (BCLI-013, BCLI-014).
+//! `--timeout` ran out on, end with 124. The machine-mode error is
+//! `timeout` for the first and `wait_timeout` for the second (BCLI-013,
+//! BCLI-014).
 
 use super::*;
 
@@ -14,10 +15,11 @@ pub(crate) const ORPHANED_STOP_EXIT_CODE: i32 = 137;
 
 /// A box that ran past its own timeout (BCLI-014), or a `min box wait
 /// --timeout` that ran out before the box ended (BCLI-013). Both end the
-/// command with exit 124, and a machine-mode run answers them with `code =
-/// "timeout"`.
+/// command with exit 124. A machine-mode run answers the first with `code =
+/// "timeout"` and the second with `code = "wait_timeout"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxTimedOut {
+    code: &'static str,
     message: String,
     hint: String,
 }
@@ -26,28 +28,37 @@ impl BoxTimedOut {
     /// The exit code, as `timeout(1)` gives it.
     pub const EXIT_CODE: u8 = 124;
 
-    /// The `code` of the machine-mode error object.
-    pub const CODE: &'static str = "timeout";
-
     /// The box `target` ran for longer than its own timeout, and its host
     /// stopped it.
     #[must_use]
     pub fn ended(target: &str) -> Self {
         Self {
+            code: "timeout",
             message: format!("{target} ran for longer than its timeout and was stopped."),
             hint: String::new(),
         }
     }
 
     /// The wait for `target` stopped after `after`, with the box still
-    /// running.
+    /// running. `id` is the box id the wait resolved, so that a script can
+    /// address the box by it.
     #[must_use]
-    pub fn waited(target: &str, after: &str) -> Self {
+    pub fn waited(target: &str, id: &str, after: &str) -> Self {
         Self {
-            // The wording is the task's `diagnostics:` line.
-            message: format!("Stopped waiting after {after}; {target} is still running."),
-            hint: format!("Run `min box wait {target}` to wait again."),
+            code: "wait_timeout",
+            // The wording is the task's `diagnostics:` line, with the id.
+            message: format!("Stopped waiting after {after}; {target} ({id}) is still running."),
+            hint: format!(
+                "Run `min box wait {id}` to wait again, or `min box stop {id}` to stop it."
+            ),
         }
+    }
+
+    /// The `code` of the machine-mode error object: `timeout` for a box
+    /// that its own timeout ended, `wait_timeout` for a wait that ran out.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        self.code
     }
 
     /// The hint of the machine-mode error object.
@@ -159,7 +170,9 @@ pub(crate) async fn box_wait_on_hosts(
             let now = tokio::time::Instant::now();
             if now >= at {
                 tracing::info!(verb = "box wait", box_id = %id, outcome = "wait timeout");
-                return Err(BoxTimedOut::waited(target, &wait_label(after)).into());
+                return Err(
+                    BoxTimedOut::waited(target, &id.to_string(), &wait_label(after)).into(),
+                );
             }
             pause = pause.min(at - now);
         }
