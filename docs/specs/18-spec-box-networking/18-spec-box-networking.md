@@ -727,6 +727,7 @@ box that holds it returns to `running`. These terms follow the decision in
     verify: cargo nextest run -p common a_gs_source_fails_when_no_answer_comes
     verify: cargo nextest run -p common only_the_bounds_timeout_reads_as_no_answer
     verify: cargo nextest run -p common a_placed_connect_shares_its_bound_across_a_hosts_addresses
+    verify: cargo nextest run -p common a_placed_connect_refused_last_counts_the_unanswered
     verify: cargo nextest run -p common a_placed_connect_carries_unused_time_to_the_next_address
     verify: cargo nextest run -p common a_placed_connect_counts_its_lookup_against_the_bound
     verify: cargo nextest run -p minimald unreachable_source_names_the_package_and_the_host
