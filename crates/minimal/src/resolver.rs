@@ -1234,13 +1234,13 @@ pub(crate) fn unit_admit_group(text: &str) -> Option<&str> {
 /// words of a service unit's first `ExecStart=` line. A word elsewhere in
 /// the file (a comment, a `Description=`) is not an argument. Pure.
 fn unit_program_arguments(text: &str) -> Vec<&str> {
-    if let Some(key) = text.find("<key>ProgramArguments</key>") {
-        let after = &text[key + "<key>ProgramArguments</key>".len()..];
-        let Some(open) = after.find("<array>") else {
+    if let Some((_, after)) = text.split_once("<key>ProgramArguments</key>") {
+        let Some((_, array)) = after.split_once("<array>") else {
             return Vec::new();
         };
-        let array = &after[open + "<array>".len()..];
-        let array = array.find("</array>").map_or(array, |end| &array[..end]);
+        let array = array
+            .split_once("</array>")
+            .map_or(array, |(inside, _)| inside);
         return array
             .split("<string>")
             .skip(1)
@@ -2201,7 +2201,10 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     for path in ANSWERER_UNIT_PATHS {
         units.push(file_custody(path).await);
     }
-    let unit_path = ANSWERER_UNIT_PATHS[ANSWERER_UNIT_PATHS.len() - 1];
+    let unit_path = ANSWERER_UNIT_PATHS
+        .last()
+        .copied()
+        .expect("every platform names at least one unit path");
     let unit = unit_read(unit_path, tokio::fs::read(unit_path).await);
     let unit_text = match &unit {
         UnitRead::Text(text) => Some(text.as_str()),
@@ -7529,12 +7532,11 @@ exit 0
         /// arguments: inside the plist's `ProgramArguments` array, or on
         /// the service unit's `ExecStart=` line.
         fn shared_unit(text: &str) -> String {
-            if let Some(key) = text.find("<key>ProgramArguments</key>") {
-                let close = key + text[key..].find("</array>").expect("the array closes");
+            if let Some((before, after)) = text.split_once("<key>ProgramArguments</key>") {
+                let (array, rest) = after.split_once("</array>").expect("the array closes");
                 format!(
-                    "{}<string>--admit-group</string><string>_minimal</string>{}",
-                    &text[..close],
-                    &text[close..]
+                    "{before}<key>ProgramArguments</key>{array}\
+                     <string>--admit-group</string><string>_minimal</string></array>{rest}"
                 )
             } else {
                 text.lines()
