@@ -114,6 +114,13 @@ pub trait Process: Send + 'static {
     /// Request termination. Idempotent. Returns immediately — the
     /// caller is expected to follow up with `wait` for the actual exit.
     fn start_kill(&mut self) -> io::Result<()>;
+
+    /// A line for the client's stderr about why the process ended, once
+    /// `wait` has returned. `None` (the default) when the process's own
+    /// output says all there is: it ran and exited, or was signalled.
+    fn exit_notice(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Handles a request to run a program on an SSH channel.
@@ -388,6 +395,9 @@ pub(crate) async fn handle_exec(
                 trace_env.clone(),
             );
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
+            // `min session run` resolved them all, and says so (inbox#778).
+            let client_resolved =
+                minimald_rpc::taskenv::resolved_from_channel_env(&config.env_vars);
             let span = span.clone();
             session.channel_success(id)?;
             spawn(tracing::Instrument::instrument(
@@ -406,6 +416,7 @@ pub(crate) async fn handle_exec(
                             task: task.clone(),
                             env: task_env,
                             drop_env,
+                            client_resolved,
                             cwd,
                         },
                     };

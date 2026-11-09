@@ -108,6 +108,27 @@ pub(crate) static CREATE_CLASSIFIER_TREE_STANDIN: std::sync::Mutex<
     Option<(std::path::PathBuf, String)>,
 > = std::sync::Mutex::new(None);
 
+/// The cgroup a create reads the daemon in, standing in for
+/// `/proc/self/cgroup` in a test that moves the daemon. `None` in every
+/// production path.
+#[cfg(test)]
+pub(crate) static CREATE_OWN_CGROUP_STANDIN: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// The daemon's cgroup as a create reads it (gominimal/inbox#1054): its
+/// own, read live, unless a test stood one in.
+fn create_own_cgroup() -> Option<String> {
+    #[cfg(test)]
+    if let Some(cgroup) = CREATE_OWN_CGROUP_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Some(cgroup);
+    }
+    sandbox::classifier::own_cgroup_path()
+}
+
 /// The tree and mount table a create's re-read answers over: the constant
 /// tree every launch reads and the daemon's own mount table, read live
 /// (`None`), unless a test stood a tree in.
@@ -132,7 +153,11 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
 /// that is the one cause a later read can clear without anything on the
 /// host changing (a daemon not yet placed in its leaf at start reads so),
 /// so the create re-reads the host rather than answer from a stale read.
-/// A re-read that does not run keeps the stored fact.
+/// A re-read that does not run keeps the stored fact. A host-address create
+/// also re-reads when the daemon stands in another cgroup than the one the
+/// fact was read in (gominimal/inbox#1054: `min finalize-install` placed a
+/// running daemon after its start-up reading), so it never answers in the
+/// second before the daemon's own cgroup watch would notice the move.
 // The create lines carry the fact as `host_fact`, never as
 // `host_ip_enforcement`: that field marks the per-launch classifier record,
 // and readers of the log take every line with it as a launch decision.
@@ -140,10 +165,30 @@ async fn create_host_ip_fact(
     network: boxes::NetworkMode,
     session_name: &str,
 ) -> crate::box_runtime::HostIpEnforcementFact {
-    let stored = crate::box_runtime::host_ip_enforcement_fact();
     if !matches!(network, boxes::NetworkMode::HostNet) {
-        return stored;
+        return crate::box_runtime::host_ip_enforcement_fact();
     }
+    let (root, mountinfo) = create_classifier_tree();
+    if crate::box_runtime::re_read_if_moved(
+        root.clone(),
+        mountinfo.clone(),
+        create_own_cgroup(),
+        "a host-address create",
+    )
+    .await
+    {
+        let fact = crate::box_runtime::host_ip_enforcement_fact();
+        tracing::info!(
+            session_name,
+            reread = true,
+            host_fact = %fact.enforcement.machine_str(),
+            cause = fact.cause.map(crate::net::classifier::Cause::detail),
+            "host-address create re-read the classifier fact because the daemon \
+             moved since the fact was read"
+        );
+        return fact;
+    }
+    let stored = crate::box_runtime::host_ip_enforcement_fact();
     if stored.cause != Some(crate::net::classifier::Cause::ProbeUnreadable) {
         tracing::info!(
             session_name,
@@ -153,7 +198,6 @@ async fn create_host_ip_fact(
         );
         return stored;
     }
-    let (root, mountinfo) = create_classifier_tree();
     match crate::box_runtime::re_read_classifier_fact(
         root,
         mountinfo,
@@ -1220,6 +1264,38 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
     }
     serde_json_lenient::to_vec(spec)
         .map_err(|e| BoxManagerError::other(format!("could not serialize the box spec: {e}")))
+}
+
+/// The Box Spec sections that a spec can carry and that this daemon does
+/// not enforce (BOX-076): the top-level key, the key inside it when the
+/// section is one key of a table, and the section as the log names it.
+const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
+    ("file_imports", None, "[[file_imports]]"),
+    ("file_exports", None, "[[file_exports]]"),
+    ("github_imports", None, "[[github_imports]]"),
+    ("otel", None, "[otel]"),
+    (
+        "network",
+        Some("vpn_network_names"),
+        "[network] vpn_network_names",
+    ),
+];
+
+/// The sections of `spec` that the daemon carries in the stored spec but
+/// does not enforce, in the order of [`UNENFORCED_SECTIONS`], each once.
+fn unenforced_sections(spec: &serde_json_lenient::Value) -> Vec<&'static str> {
+    let Some(object) = spec.as_object() else {
+        return Vec::new();
+    };
+    UNENFORCED_SECTIONS
+        .iter()
+        .filter(|(key, inner, _)| match (object.get(*key), inner) {
+            (Some(_), None) => true,
+            (Some(value), Some(inner)) => value.get(*inner).is_some(),
+            (None, _) => false,
+        })
+        .map(|(_, _, section)| *section)
+        .collect()
 }
 
 enum ManagerMessage {
@@ -3568,6 +3644,9 @@ impl BoxManager {
             name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         config.name = name;
+        // BOX-076: the sections the daemon carries but does not enforce,
+        // read before the spec becomes its stored bytes.
+        let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -3755,12 +3834,25 @@ impl BoxManager {
         if let Some(bytes) = &spec {
             let stored = object.store_spec(bytes).map(|()| object.spec_path());
             match stored {
-                Ok(path) => tracing::info!(
-                    session_id = %session_id,
-                    spec_bytes = bytes.len(),
-                    spec_path = %path.as_str(),
-                    "stored the box spec"
-                ),
+                Ok(path) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        spec_bytes = bytes.len(),
+                        spec_path = %path.as_str(),
+                        "stored the box spec"
+                    );
+                    // BOX-076: one warning for each unenforced section.
+                    // The stored spec keeps the section, and the box is
+                    // created.
+                    for section in &unenforced {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            section = ?section,
+                            "the box spec carries a section this daemon does not \
+                             enforce; the box is created without it"
+                        );
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(
                         session_id = %session_id,

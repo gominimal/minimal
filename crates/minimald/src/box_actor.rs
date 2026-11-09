@@ -149,6 +149,10 @@ pub(super) struct PendingResume {
     before: Record,
     span: tracing::Span,
     restarted_from_stored_spec: bool,
+    /// The resume launched the host itself, to run `on_activate` again
+    /// (BOX-028). A launch that fails after it stops that host, so the box
+    /// does not stay running on the hook host alone.
+    minted_host: bool,
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -202,6 +206,27 @@ enum Teardown {
 enum Next<M> {
     Message(Option<M>),
     Exit(Option<box_runtime::HostExit>),
+    /// The box ran past its `timeout` (BOX-037).
+    Timeout,
+}
+
+/// When an `until_complete` box runs past its `timeout` (BOX-037). Armed at
+/// each start of the box's entrypoint, so a resumed box gets its full
+/// timeout again.
+#[derive(Debug, Clone, Copy)]
+struct TimeoutDeadline {
+    /// The instant the box runs past its timeout.
+    at: tokio::time::Instant,
+    /// The spec's timeout, in whole seconds, for the log and the span.
+    secs: u64,
+}
+
+/// Completes when `deadline` passes, or never when no deadline is armed.
+async fn next_timeout(deadline: Option<TimeoutDeadline>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Whether `msg` is handled ahead of an entrypoint exit that is already in.
@@ -675,6 +700,11 @@ pub struct BoxActor {
     /// time (BOX-038).
     exit_unsettled: bool,
 
+    /// When the box runs past its `timeout` (BOX-037): armed by each launch
+    /// that starts the entrypoint of an `until_complete` box with a timeout,
+    /// and disarmed when the box stops, is destroyed or ends on its own.
+    timeout_deadline: Option<TimeoutDeadline>,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config: the launcher resolves
     /// this session's effective egress (NET-074) against it, and the task
@@ -714,6 +744,11 @@ pub struct BoxActor {
     /// and a retried stop writes this ending, not one it has no process
     /// left to observe.
     unrecorded_stop: Option<boxes::core::record::StopEnding>,
+
+    /// How the box ended, kept when its timeout (BOX-037) ended its
+    /// processes but could not write the `exited` record. While it is set,
+    /// [`Self::launch_host`] refuses, and a stop writes this ending.
+    unrecorded_exit: Option<boxes::core::record::ExitEnding>,
 }
 
 impl BoxActor {
@@ -773,6 +808,8 @@ impl BoxActor {
             // No launch yet, so no loop to watch.
             entrypoint_watch: None,
             exit_unsettled: false,
+            // Armed by the launch that starts the entrypoint.
+            timeout_deadline: None,
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
@@ -784,6 +821,8 @@ impl BoxActor {
             composed_graph_names: None,
             // No stop has run yet.
             unrecorded_stop: None,
+            // No timeout has ended the box yet.
+            unrecorded_exit: None,
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
@@ -1024,6 +1063,8 @@ impl BoxActor {
     /// reported, never obeyed), its host, its hostname, its record. Returns
     /// one line per hook that failed.
     async fn destroy_now(&mut self) -> Result<Vec<String>, std::io::Error> {
+        // A destroyed box never reaches its timeout.
+        self.timeout_deadline = None;
         // Before `stop_running`: a destroy hook runs *inside* the
         // session, so the sandbox it joins has to still exist — or
         // be minted, which is what this does when the session's
@@ -1224,8 +1265,11 @@ impl BoxActor {
             box_id = %self.record.id(),
             from = from.name(),
             outcome = tracing::field::Empty,
+            hooks_on_resume = tracing::field::Empty,
+            activate_hooks = tracing::field::Empty,
         );
         let before = record.clone();
+        let had_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
         let resumed =
             tracing::Instrument::instrument(self.resume_ended(record, from), span.clone()).await;
         match resumed {
@@ -1234,6 +1278,8 @@ impl BoxActor {
                 before,
                 span,
                 restarted_from_stored_spec,
+                minted_host: !had_host
+                    && matches!(self.inner, BoxInner::Active { host: Some(_), .. }),
             })),
             Err(error) => {
                 span.record("outcome", "refused");
@@ -1250,7 +1296,9 @@ impl BoxActor {
     /// the `resumed` event. A launch that failed and left no host writes
     /// back the whole record the resume read, so the box does not read as
     /// running with no processes and keeps the settings it had, and marks
-    /// its name stopped again.
+    /// its name stopped again. A launch that failed beside a host the resume
+    /// launched for `on_activate` stops that host first, and then does the
+    /// same.
     pub(super) async fn finish_resume(
         &mut self,
         pending: PendingResume,
@@ -1261,12 +1309,24 @@ impl BoxActor {
             before,
             span,
             restarted_from_stored_spec,
+            minted_host,
         } = pending;
         let outcome_span = span.clone();
         let finish = async {
             let has_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
-            if let (Err(error), false) = (launched, has_host) {
+            if let Err(error) = launched
+                && (!has_host || minted_host)
+            {
                 span.record("outcome", "launch failed");
+                // The host is the one the resume launched for `on_activate`.
+                // The attach did not take it, so it stops with the resume.
+                if has_host {
+                    tracing::info!(
+                        %error,
+                        "resume: the launch failed, and the host started for on_activate is stopping"
+                    );
+                    self.stop_running(false).await;
+                }
                 let restored = self.record.write(before).await;
                 match restored {
                     Ok(()) => tracing::info!(
@@ -1439,6 +1499,7 @@ impl BoxActor {
         // BOX-025: the box restarts from the spec stored at its creation
         // (BOX-068), refused as a create of that spec would be refused.
         let mut resumed = record.clone();
+        let mut hooks_on_resume = false;
         if let Some(bytes) = &stored {
             let unsatisfiable = |error: std::io::Error| {
                 tracing::info!(refusal = "spec", %error, "resume: the stored spec cannot be satisfied");
@@ -1453,6 +1514,7 @@ impl BoxActor {
             };
             let spec = box_runtime::stored_spec(bytes).map_err(unsatisfiable)?;
             box_runtime::restart_from_stored_spec(&mut resumed, &spec);
+            hooks_on_resume = spec.hooks_on_resume;
             // The restart's launches start the box from this spec.
             self.held_spec = Some(Some(Arc::new(spec)));
             resumed.validate_policy().map_err(|error| {
@@ -1509,6 +1571,25 @@ impl BoxActor {
                 .expect("hostname registry lock poisoned")
                 .mark_running(id);
         }
+        // BOX-028: a spec that sets `hooks_on_resume` runs `on_activate`
+        // again, before the attach's launch runs `on_attach`. A hook that
+        // fails refuses the resume as a failed activation does, and the
+        // box goes back to the state it resumed from.
+        tracing::Span::current().record("hooks_on_resume", hooks_on_resume);
+        if hooks_on_resume
+            && let Err(why) = self.rerun_activate_hooks(&name).await
+        {
+            self.stop_running(false).await;
+            if let Err(restore_error) = self.record.write(record.clone()).await {
+                tracing::warn!(
+                    %restore_error,
+                    to = from.name(),
+                    "resume: on_activate failed, and the record could not be put back"
+                );
+            }
+            self.mark_name_stopped().await;
+            return Err(refused(std::io::ErrorKind::InvalidInput, 1, why));
+        }
         Ok(stored.is_some())
         }
         .await;
@@ -1516,6 +1597,94 @@ impl BoxActor {
         // record holds the name from here, or nothing does.
         manager.release_name_claim(id).await;
         outcome
+    }
+
+    /// Runs the box's `on_activate` hooks again for a resume whose spec sets
+    /// `hooks_on_resume` (BOX-028), on a host launched for them. The attach
+    /// that follows reuses that host. Each run and its outcome is logged,
+    /// and the `box.resume` span records how many ran. Answers the refusal
+    /// text when the launch or a hook fails, and when the box has no
+    /// composition to read its hooks from.
+    async fn rerun_activate_hooks(&mut self, name: &str) -> Result<(), String> {
+        let event = crate::hooks::HookEvent::Activate;
+        // A box with no composition (its sidecar is missing or unreadable)
+        // can declare an `on_activate` the daemon cannot see. A resume
+        // without it breaks the spec's promise, so it is refused.
+        if let BoxInner::Active {
+            composition: None, ..
+        } = &self.inner
+        {
+            tracing::info!(
+                refusal = "hooks",
+                "resume: hooks_on_resume is set, and the box has no composition to read its hooks from"
+            );
+            return Err(format!(
+                "The daemon cannot read its hook settings. Destroy it with \
+                 `min session destroy {name}`, then start a new one with \
+                 `min session activate`."
+            ));
+        }
+        if !self.has_hooks_for(event) {
+            tracing::Span::current().record("activate_hooks", 0);
+            tracing::info!("resume: hooks_on_resume is set, and the box has no on_activate hook");
+            return Ok(());
+        }
+        // Bounded as the destroy's hook launches are: a wedged sandbox build
+        // must not stall the actor and the resume forever. A launch cut off
+        // here is reaped by the launcher's drop guard.
+        let box_id = *self.record.id();
+        let limit = HOOK_LAUNCH_TIMEOUT;
+        #[cfg(test)]
+        let limit = resume_launch_seam::timeout(&box_id).unwrap_or(limit);
+        let launch = async {
+            #[cfg(test)]
+            if let Some(hold) = resume_launch_seam::held(&box_id) {
+                tokio::time::sleep(hold).await;
+            }
+            self.launch_host_for_hooks(LaunchPhase::Attached).await
+        };
+        match tokio::time::timeout(limit, launch).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::info!(%error, "resume: launching the box for its on_activate hooks failed");
+                return Err(format!(
+                    "It could not start to run its activation hooks: {error}."
+                ));
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %box_id,
+                    timeout_secs = limit.as_secs_f64(),
+                    "resume: launching the box for its on_activate hooks timed out"
+                );
+                return Err(format!(
+                    "Its activation hooks did not start in time. \
+                     Run `min session attach {name}` to try the resume again."
+                ));
+            }
+        }
+        let outcomes = run_session_hooks(&self.inner, &self.record, event).await;
+        tracing::Span::current().record("activate_hooks", outcomes.len());
+        for outcome in &outcomes {
+            tracing::info!(
+                declared_by = %outcome.declared_by,
+                status = %outcome.status,
+                "resume: ran on_activate again"
+            );
+        }
+        match outcomes.iter().find(|o| o.failed()) {
+            Some(failed) => Err(format!(
+                "Its activation hook from {} {}.{}",
+                failed.declared_by,
+                failed.status,
+                if failed.output.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", failed.output)
+                },
+            )),
+            None => Ok(()),
+        }
     }
 
     /// The exit the watch holds before a message runs, as
@@ -1570,6 +1739,7 @@ impl BoxActor {
                 biased;
                 msg = self.receiver.recv() => Next::Message(msg),
                 exit = next_entrypoint_exit(&mut self.entrypoint_watch) => Next::Exit(exit),
+                () = next_timeout(self.timeout_deadline) => Next::Timeout,
             };
             let ((msg, caller), ended) = match next {
                 Next::Message(Some(queued)) => {
@@ -1589,6 +1759,19 @@ impl BoxActor {
                         }
                         self.publish_host();
                     }
+                    // A box past its timeout ends before the message runs,
+                    // as an exit already in does (BOX-037).
+                    if ended.is_none()
+                        && !goes_before_exit(&queued.0)
+                        && self
+                            .timeout_deadline
+                            .is_some_and(|d| d.at <= tokio::time::Instant::now())
+                    {
+                        if let ControlFlow::Break(t) = self.end_on_timeout().await {
+                            ended = Some(t);
+                        }
+                        self.publish_host();
+                    }
                     (queued, ended)
                 }
                 Next::Message(None) => break,
@@ -1596,6 +1779,14 @@ impl BoxActor {
                     self.entrypoint_watch = None;
                     let Some(exit) = exit else { continue };
                     if let ControlFlow::Break(t) = self.end_on_entrypoint_return(exit).await {
+                        teardown = t;
+                        break;
+                    }
+                    self.publish_host();
+                    continue;
+                }
+                Next::Timeout => {
+                    if let ControlFlow::Break(t) = self.end_on_timeout().await {
                         teardown = t;
                         break;
                     }
@@ -1666,7 +1857,8 @@ impl BoxActor {
             tracing::debug!(box_id = %box_id, "the host ended on a kill; the box is not ended here");
             return ControlFlow::Continue(());
         }
-        if self.has_live_host() || self.unrecorded_stop.is_some() {
+        if self.has_live_host() || self.unrecorded_stop.is_some() || self.unrecorded_exit.is_some()
+        {
             return ControlFlow::Continue(());
         }
         let ends = match self.held_spec().await {
@@ -1701,6 +1893,8 @@ impl BoxActor {
             }
         }
 
+        // The box ends on its own, so it never reaches its timeout.
+        self.timeout_deadline = None;
         // The loop already ended: what is left of the host goes, and what
         // ran beside it comes down as a stop takes it down.
         if let BoxInner::Active { host, .. } = &mut self.inner {
@@ -1711,11 +1905,35 @@ impl BoxActor {
         self.mark_name_stopped().await;
 
         // The host is gone and the watch is cleared, so this is the one
-        // chance to record the exit: a failed write is retried with a short
-        // backoff before the box is left running with nothing in it.
+        // chance to record the exit.
         let ending = boxes::core::record::ExitEnding::Exit { exit_code };
+        if self.write_exited_record(ending).await.is_err() {
+            // The record stays running with no host. The actor keeps hosting
+            // the box, as a failed stop does, so a `min stop` can still set
+            // the record and end the actor.
+            return ControlFlow::Continue(());
+        }
+        tracing::info!(
+            box_id = %box_id,
+            exit_code,
+            reason = boxes::core::record::EndReason::Exit.name(),
+            "box exited: its entrypoint returned"
+        );
+        self.write_exited_event(ending).await;
+        // No actor hosts an ended box (#2393), as after a stop.
+        ControlFlow::Break(Teardown::SelfInitiated)
+    }
+
+    /// Sets the record to `exited` with `ending`. A failed write is retried
+    /// with a short backoff, because nothing else records the end: the host
+    /// is gone and the watch is cleared.
+    async fn write_exited_record(
+        &self,
+        ending: boxes::core::record::ExitEnding,
+    ) -> Result<(), std::io::Error> {
+        let box_id = *self.record.id();
         let mut attempt = 0u32;
-        let written = loop {
+        loop {
             attempt += 1;
             let written = async {
                 #[cfg(test)]
@@ -1728,45 +1946,43 @@ impl BoxActor {
             }
             .await;
             match written {
-                Ok(()) => break Ok(()),
+                Ok(()) => return Ok(()),
                 Err(error) if attempt < EXIT_RECORD_WRITE_ATTEMPTS => {
                     tracing::warn!(
                         box_id = %box_id,
-                        exit_code,
+                        ending = ?ending,
                         attempt,
                         %error,
-                        "the entrypoint returned, but the record could not be set to exited; retrying"
+                        "the box ended, but the record could not be set to exited; retrying"
                     );
                     tokio::time::sleep(EXIT_RECORD_RETRY_BACKOFF * attempt).await;
                 }
-                Err(error) => break Err(error),
+                Err(error) => {
+                    tracing::error!(
+                        box_id = %box_id,
+                        ending = ?ending,
+                        attempts = attempt,
+                        %error,
+                        "the box ended, but the record could not be set to exited"
+                    );
+                    return Err(error);
+                }
             }
-        };
-        if let Err(error) = written {
-            // The record stays running with no host. The actor keeps hosting
-            // the box, as a failed stop does, so a `min stop` can still set
-            // the record and end the actor.
-            tracing::error!(
-                box_id = %box_id,
-                exit_code,
-                attempts = attempt,
-                %error,
-                "the entrypoint returned, but the record could not be set to exited"
-            );
-            return ControlFlow::Continue(());
         }
-        tracing::info!(
-            box_id = %box_id,
-            exit_code,
-            reason = boxes::core::record::EndReason::Exit.name(),
-            "box exited: its entrypoint returned"
-        );
+    }
+
+    /// Records the `exited` event for `ending` (BOX-040): its `reason`, and
+    /// the exit code when the record keeps one. The record already says
+    /// `exited`, so a failed write is logged.
+    async fn write_exited_event(&self, ending: boxes::core::record::ExitEnding) {
+        let state = boxes::core::record::RecordState::Exited(ending);
         let mut data = boxes::events::EventData::new();
-        data.insert(
-            "reason".to_string(),
-            boxes::core::record::EndReason::Exit.name().into(),
-        );
-        data.insert("exit_code".to_string(), exit_code.into());
+        if let Some(reason) = state.reason() {
+            data.insert("reason".to_string(), reason.name().into());
+        }
+        if let Some(code) = state.exit_code() {
+            data.insert("exit_code".to_string(), code.into());
+        }
         let event = match self.record.object().await {
             Ok(object) => crate::box_manager::write_box_event(
                 &object,
@@ -1778,13 +1994,83 @@ impl BoxActor {
         };
         if let Err(error) = event {
             tracing::warn!(
-                box_id = %box_id,
+                box_id = %self.record.id(),
                 %error,
                 "the record is exited, but its exited event could not be written"
             );
         }
-        // No actor hosts an ended box (#2393), as after a stop.
-        ControlFlow::Break(Teardown::SelfInitiated)
+    }
+
+    /// Ends an `until_complete` box that ran past its `timeout` (BOX-037):
+    /// signals every process in the box, execs included, as a stop does,
+    /// sets the record to `exited` with `reason = "timeout"` and no exit
+    /// code, records an `exited` event, and ends the actor. One
+    /// `box.timeout` span covers the ending and carries the signals sent.
+    ///
+    /// Changes nothing when no deadline is armed or the record is not
+    /// running.
+    async fn end_on_timeout(&mut self) -> ControlFlow<Teardown> {
+        let Some(deadline) = self.timeout_deadline.take() else {
+            return ControlFlow::Continue(());
+        };
+        let box_id = *self.record.id();
+        #[cfg(test)]
+        let read = if timeout_read_seam::fail_this_read(&box_id) {
+            Err(std::io::Error::other(
+                "injected timeout record-read failure",
+            ))
+        } else {
+            self.record.record().await
+        };
+        #[cfg(not(test))]
+        let read = self.record.record().await;
+        match read {
+            Ok(record) if record.status == BoxState::Active => {}
+            Ok(_) => return ControlFlow::Continue(()),
+            // The actor's own host runs, so the entrypoint runs: the box ends.
+            Err(error) if self.has_live_host() => {
+                tracing::warn!(
+                    box_id = %box_id,
+                    timeout_secs = deadline.secs,
+                    %error,
+                    "the box ran past its timeout and the record could not be read; its host runs, so the box ends"
+                );
+            }
+            Err(error) => {
+                self.timeout_deadline = Some(TimeoutDeadline {
+                    at: tokio::time::Instant::now() + EXIT_RECORD_RETRY_BACKOFF,
+                    secs: deadline.secs,
+                });
+                tracing::warn!(
+                    box_id = %box_id,
+                    timeout_secs = deadline.secs,
+                    %error,
+                    "the box ran past its timeout and the record could not be read; the timeout is tried again"
+                );
+                return ControlFlow::Continue(());
+            }
+        }
+        let span = tracing::info_span!(
+            "box.timeout",
+            box_id = %box_id,
+            timeout_secs = deadline.secs,
+            signals = tracing::field::Empty,
+            ending = tracing::field::Empty,
+        );
+        let ended =
+            tracing::Instrument::instrument(self.time_out_box(deadline.secs), span.clone()).await;
+        match ended {
+            Ok(sent) => {
+                span.record("signals", tracing::field::debug(host::signal_names(&sent)));
+                span.record("ending", "exited:timeout");
+                // No actor hosts an ended box (#2393), as after a stop.
+                ControlFlow::Break(Teardown::SelfInitiated)
+            }
+            Err(_) => {
+                span.record("ending", "unrecorded");
+                ControlFlow::Continue(())
+            }
+        }
     }
 
     /// Handles a specific message recieved by the session.
@@ -1914,6 +2200,7 @@ impl BoxActor {
                 });
             }
             BoxMessage::Stop(r) => {
+                self.timeout_deadline = None;
                 self.stop_running(true).await;
                 self.mark_name_stopped().await;
                 let _ = r.send(());
@@ -1935,11 +2222,22 @@ impl BoxActor {
                 // graceful stop then sends SIGKILL at once (design: `--force`
                 // kills at once). A stop that waited answers with the first
                 // stop's ending (`BoxManagerHandle::stop_box_with_grace`).
+                // A box stopped before its timeout ends `stopped`, never
+                // `exited` with `reason = "timeout"`.
+                self.timeout_deadline = None;
+                let kept_exit = self.unrecorded_exit.is_some();
                 let stopped = self.stop_box(force, grace).await;
                 // NET-128 fail-closed, as the `Stop` arm: the processes are
                 // dead whether or not the record write succeeded, so the
                 // name no longer answers for the box.
                 self.mark_name_stopped().await;
+                if stopped.is_err() && kept_exit && self.unrecorded_exit.is_none() {
+                    // The stop wrote the kept timeout ending (BOX-037). The
+                    // box is `exited`, and the manager answers from its
+                    // record. No actor hosts an ended box (#2393).
+                    let _ = reply.send(stopped);
+                    return ControlFlow::Break(Teardown::SelfInitiated);
+                }
                 if stopped.is_err() {
                     // The record is not `stopped` yet. The actor keeps
                     // hosting the box, so a retried stop can finish it.
@@ -2262,6 +2560,73 @@ pub(crate) mod exit_record_seam {
     }
 }
 
+/// The test seam for the record read of a timeout (BOX-037): a test makes
+/// the next reads for a box fail, as [`exit_record_seam`] fails a write.
+#[cfg(test)]
+pub(crate) mod timeout_read_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+
+    static FAILING: Mutex<Option<HashMap<SessionId, u32>>> = Mutex::new(None);
+
+    /// Makes the next `n` timeout record reads for `id` fail.
+    pub(crate) fn fail_next_reads(id: SessionId, n: u32) {
+        FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, n);
+    }
+
+    /// Whether this read for `id` fails, using up one injected failure.
+    pub(super) fn fail_this_read(id: &SessionId) -> bool {
+        let mut failing = FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match failing.as_mut().and_then(|f| f.get_mut(id)) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The test seam for the grace period of a timeout (BOX-037): a test names
+/// a box whose timeout waits `grace` between SIGTERM and SIGKILL, not the
+/// stop's ten seconds. Keyed by box id, as [`exit_settle_seam`] is.
+#[cfg(test)]
+pub(crate) mod timeout_grace_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use boxes::SessionId;
+
+    static GRACE: Mutex<Option<HashMap<SessionId, Duration>>> = Mutex::new(None);
+
+    /// Makes the timeout of box `id` wait `grace` before SIGKILL.
+    pub(crate) fn set(id: SessionId, grace: Duration) {
+        GRACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, grace);
+    }
+
+    /// The grace a test set for box `id`, if any.
+    pub(super) fn grace(id: &SessionId) -> Option<Duration> {
+        GRACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|graces| graces.get(id).copied())
+    }
+}
+
 /// The test seam for an exit that does not settle (BOX-038): a test names
 /// a box whose watched host loop holds its exit back for a while, and
 /// whose actor waits a short time for that exit. Keyed by box id, so tests
@@ -2302,6 +2667,50 @@ pub(crate) mod exit_settle_seam {
     /// How long the actor of box `id` waits for a closed host's exit.
     pub(super) fn settle_timeout(id: &SessionId) -> Option<Duration> {
         get(id).map(|(_, settle)| settle)
+    }
+}
+
+/// The test seam for a resume whose `on_activate` launch does not start in
+/// time (BOX-028): a test names a box whose hook launch on resume waits
+/// `hold` first, and whose actor waits only `timeout` for that launch.
+/// Keyed by box id, so tests running beside each other never slow each
+/// other's launches.
+#[cfg(test)]
+pub(crate) mod resume_launch_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use boxes::SessionId;
+
+    /// For each box: how long its launch waits, and how long its actor
+    /// waits for the launch.
+    static HELD: Mutex<Option<HashMap<SessionId, (Duration, Duration)>>> = Mutex::new(None);
+
+    /// Makes the resume's hook launch of box `id` wait `hold`, and makes
+    /// its actor give up on it after `timeout`.
+    pub(crate) fn stall(id: SessionId, hold: Duration, timeout: Duration) {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (hold, timeout));
+    }
+
+    fn get(id: &SessionId) -> Option<(Duration, Duration)> {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|held| held.get(id).copied())
+    }
+
+    /// How long the resume's hook launch of box `id` waits.
+    pub(super) fn held(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(hold, _)| hold)
+    }
+
+    /// How long the actor of box `id` waits for the resume's hook launch.
+    pub(super) fn timeout(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(_, timeout)| timeout)
     }
 }
 

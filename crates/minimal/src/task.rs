@@ -16,13 +16,13 @@
 //! refactored out of it: a few duplicated lines of glue keep
 //! `cmd_activate`'s diff at zero.
 
-use std::io::{IsTerminal as _, Read as _};
+use std::io::Read as _;
 
 use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
 use tracing::Instrument as _;
 
-use crate::{GlobalArgs, RunArgs, TaskRunArgs};
+use crate::{BoxRunArgs, GlobalArgs, TaskListArgs, TaskRunArgs};
 
 /// A task's non-zero exit status, carried as a typed error so `main.rs` can
 /// downcast it and terminate with the task's own code instead of printing an
@@ -46,7 +46,7 @@ impl std::error::Error for TaskExit {}
 /// WITHOUT reporting a status — a daemon or transport death mid-task —
 /// fails closed as an ordinary error (printed to stderr, process exit 1)
 /// rather than defaulting to success.
-fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
+pub(crate) fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
     match code {
         Some(0) => Ok(()),
         Some(code) => Err(TaskExit(u8::try_from(code).unwrap_or(1)).into()),
@@ -141,23 +141,135 @@ fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Pat
         .unwrap_or_default()
 }
 
-/// The hidden top-level `min run` muscle-memory catch: always errors, naming
-/// the canonical host spelling and the in-box form.
-pub fn cmd_run(args: &RunArgs) -> Result<(), anyhow::Error> {
-    bail!(run_alias_message(args.rest.first().map(String::as_str)))
+/// The refusal of a run whose entry has a terminal (BCLI-010): `min task
+/// run` and `min box run` never give a box a terminal, so the entry starts
+/// with `min box start --new` instead. The run refuses it before it creates
+/// anything, and `main.rs` ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunNeedsTerminal {
+    entry: String,
 }
 
-/// The redirect copy for the hidden `min run`: substitutes the task name the
-/// user typed (when there was one) so both spellings are copy-pasteable.
-fn run_alias_message(task: Option<&str>) -> String {
-    let task = task.unwrap_or("<task>");
-    format!(
-        "`min run` runs inside a session. On the host, use:\n\n  \
-         min task run {task}\n\n\
-         which runs the task in an ephemeral session; or run it in an \
-         existing session:\n\n  \
-         min session attach --command 'min task run {task}'"
-    )
+impl RunNeedsTerminal {
+    /// The usage-refusal code of the architecture's exit-code table.
+    pub const EXIT_CODE: u8 = 2;
+
+    #[must_use]
+    pub fn new(entry: &str) -> Self {
+        Self {
+            entry: entry.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for RunNeedsTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entry = &self.entry;
+        write!(
+            f,
+            "{entry} runs with a terminal. Start it with min box start --new {entry}."
+        )
+    }
+}
+
+impl std::error::Error for RunNeedsTerminal {}
+
+/// The verb a run came from: `min task run` or `min box run`. Both share
+/// one run path ([`run_entry`]). The verb only names the command in the
+/// run's span and in its refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunVerb {
+    Task,
+    Box,
+}
+
+impl RunVerb {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Task => "min task run",
+            Self::Box => "min box run",
+        }
+    }
+}
+
+/// What a run creates its box from, whichever verb typed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunEntry {
+    pub verb: RunVerb,
+    pub entry: String,
+    pub path: Option<String>,
+    pub detach: bool,
+    pub args: Vec<String>,
+}
+
+impl From<TaskRunArgs> for RunEntry {
+    fn from(args: TaskRunArgs) -> Self {
+        Self {
+            verb: RunVerb::Task,
+            entry: args.task,
+            path: args.path,
+            detach: args.detach,
+            args: args.args,
+        }
+    }
+}
+
+impl From<BoxRunArgs> for RunEntry {
+    fn from(args: BoxRunArgs) -> Self {
+        Self {
+            verb: RunVerb::Box,
+            entry: args.entry,
+            path: args.path,
+            detach: args.detach,
+            args: args.args,
+        }
+    }
+}
+
+/// Refuses an entry whose spec sets `pty_enabled` (BCLI-010): a run never
+/// gives its box a terminal. Today the only such entry is the project's
+/// session entry, [`mfile::spec::DEFAULT_SESSION_ENTRY`], when no task
+/// takes its name. A task's spec never has a terminal. `file` is the
+/// project's `minimal.toml`, when there is one. The check reads nothing
+/// else, so it runs before the run creates anything.
+fn refuse_terminal_entry(file: Option<&mfile::File>, entry: &str) -> Result<(), anyhow::Error> {
+    let is_task = file.is_some_and(|file| file.task(entry).is_some());
+    if is_task || entry != mfile::spec::DEFAULT_SESSION_ENTRY {
+        return Ok(());
+    }
+    let spec = mfile::spec::BoxSpec::for_session(
+        file.and_then(|file| file.session.as_ref()),
+        mfile::spec::SpecFlags::default(),
+    );
+    if spec.pty_enabled {
+        return Err(RunNeedsTerminal::new(entry).into());
+    }
+    Ok(())
+}
+
+/// Detaches a run from the box it started (BCLI-010 `--detach`): prints
+/// only the box's id on `out`, closes the box's stdin and lets the channel
+/// go. The entrypoint runs on without a client, and the box's log keeps
+/// its output.
+///
+/// The id goes out first, because the entrypoint already runs: a later
+/// failure must not leave a running box whose id nobody saw. A failure to
+/// close stdin or the channel after that is logged, not fatal. Dropping the
+/// channel and the connection closes both anyway.
+pub(crate) async fn detach_run(
+    channel: russh::Channel<russh::client::Msg>,
+    id: boxes::SessionId,
+    out: &mut impl std::io::Write,
+) -> Result<(), anyhow::Error> {
+    writeln!(out, "{id}").context("write the box id")?;
+    out.flush().context("write the box id")?;
+    if let Err(e) = channel.eof().await {
+        tracing::warn!(box_id = %id, error = %e, "detached run: closing the box's stdin failed");
+    }
+    if let Err(e) = channel.close().await {
+        tracing::warn!(box_id = %id, error = %e, "detached run: leaving the box's run failed");
+    }
+    Ok(())
 }
 
 /// Look up `task` in the project's `minimal.toml`, walking up from `dir`
@@ -312,6 +424,192 @@ fn resolve_task_env(
         resolved.set.insert(name.to_string(), value);
     }
     Ok(resolved)
+}
+
+/// Gate a task's `env_vars` against the user policy and resolve them
+/// against this shell ([`resolve_task_env`]), in the lane the terminal
+/// allows: the interactive prompt on a real terminal, the collect-and-refuse
+/// [`RefuseAndRecord`] anywhere else. Returns the resolved set and the
+/// policy as the prompt left it, which the interactive lane has already
+/// saved.
+///
+/// Shared by `min task run` and `min session run` (inbox#778), so the two
+/// verbs pass one gate and print one refusal.
+pub(crate) fn gate_task_env(
+    global: &GlobalArgs,
+    declared: &mfile::Task,
+    task_name: &str,
+    source: &boxes::core::source::Source,
+    user_policy: boxes::core::policy::UserPolicy,
+    policy_path: &std::path::Path,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<
+    (
+        minimald_rpc::taskenv::TaskEnv,
+        boxes::core::policy::UserPolicy,
+    ),
+    anyhow::Error,
+> {
+    // Gated against `[vars]` on the way, `allow` included. Resolving here
+    // reads the user's own shell, so the project naming a variable is the
+    // project asking for its value — the same two lanes as an activate: the
+    // interactive prompt on a real terminal, the collect-and-refuse
+    // `NoPromptHook` anywhere else.
+    let non_interactive = global.no_input || !crate::can_prompt_interactively();
+    if non_interactive {
+        let hooks = RefuseAndRecord::default();
+        let task_env = resolve_task_env(
+            declared,
+            task_name,
+            user_policy.vars().clone(),
+            policy_path,
+            source,
+            &hooks,
+            env,
+        );
+        // Checked before the result: the hook refused, so `task_env` is
+        // the abort error and the names are the useful half of it.
+        let refused = hooks.into_names();
+        if !refused.is_empty() {
+            let count = refused.len();
+            let snippet = refused_vars_snippet(&refused);
+            bail!(
+                "task '{task_name}' declares {count} environment variable{s} that your \
+                 policy does not allow, and stdin/stderr is not a terminal.\n\n\
+                 Add the following to {path}:\n\n{snippet}\n\
+                 Then re-run this command.",
+                path = policy_path.display(),
+                s = if count == 1 { "" } else { "s" },
+            );
+        }
+        Ok((task_env?, user_policy))
+    } else {
+        let hooks = crate::prompt::InteractivePrompt::new(policy_path, user_policy.clone());
+        let task_env = resolve_task_env(
+            declared,
+            task_name,
+            user_policy.vars().clone(),
+            policy_path,
+            source,
+            &hooks,
+            env,
+        );
+        // Persist before propagating a refusal: a rule the user chose to
+        // record is theirs whether or not this run goes on to fail.
+        let after = hooks.into_final_policy();
+        if after != user_policy {
+            match crate::prompt::save_user_policy(policy_path, &after) {
+                Ok(()) => eprintln!("Updated {}", policy_path.display()),
+                Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
+            }
+        }
+        Ok((task_env?, after))
+    }
+}
+
+/// The `env_vars` of `task` for a `min session run` against a session built
+/// from the project at `project_path`, gated and resolved here as
+/// `min task run` does them ([`gate_task_env`]) (inbox#778).
+///
+/// The declaration is read from the project on this host, the only copy the
+/// client can read. The daemon runs the task from the session's own copy,
+/// taken at activation, so the two can differ. The daemon is told the
+/// client resolved the task, and it then refuses an `inherit` this set does
+/// not answer rather than reading its own environment for it. A project
+/// with no `minimal.toml` here, or one that does not declare `task` (a task
+/// a stack provides), yields an empty set for the same reason: the run goes
+/// on, and only an `inherit` stops it. A `minimal.toml` that is there but
+/// does not load is refused here, as `declared_task` refuses it, so the
+/// daemon's refusal never stands in for the real cause.
+pub(crate) fn session_run_task_env(
+    global: &GlobalArgs,
+    project_path: &camino::Utf8Path,
+    task: &str,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<minimald_rpc::taskenv::TaskEnv, anyhow::Error> {
+    // The daemon trims the name it is sent, so the lookup does too.
+    let task = task.trim();
+    let file = match mfile::File::from_dir_recursive(project_path.as_std_path()) {
+        Ok(file) => file,
+        Err(mfile::Error::NotFound) => {
+            tracing::debug!(
+                project = %project_path,
+                "no minimal.toml for the session's project on this host"
+            );
+            return Ok(minimald_rpc::taskenv::TaskEnv::default());
+        }
+        Err(e) => bail!(
+            "found a broken {name} in the session's project at {project_path} \
+             while resolving tasks: {e}",
+            name = mfile::MFILE_NAME,
+        ),
+    };
+    let Some(declared) = file.task(task) else {
+        return Ok(minimald_rpc::taskenv::TaskEnv::default());
+    };
+    let policy_path = crate::config::user_policy_path(global);
+    let user_policy = crate::config::read_user_policy(global)?;
+    let source = boxes::core::source::Source::Project {
+        path: paths::HostPath::try_new(project_path.to_path_buf())
+            .context("Invalid project path")?,
+    };
+    let (task_env, _) = gate_task_env(
+        global,
+        &declared,
+        task,
+        &source,
+        user_policy,
+        &policy_path,
+        env,
+    )?;
+    ensure_carried_by_ssh(task, &task_env)?;
+    Ok(task_env)
+}
+
+/// Refuses a resolved variable the ssh transport of `min session run`
+/// cannot carry: ssh forwards a variable from its own environment, which
+/// holds no name with `=` or a NUL, and no value with a NUL. `min task run`
+/// sends its variables over the daemon's own channel and has no such limit,
+/// but it runs the task in a new box, so the refusal says so.
+fn ensure_carried_by_ssh(
+    task: &str,
+    task_env: &minimald_rpc::taskenv::TaskEnv,
+) -> Result<(), anyhow::Error> {
+    for (name, value) in &task_env.set {
+        let shown = printable_name(name);
+        let why = if name.is_empty() {
+            "One of its variables has an empty name".to_string()
+        } else if name.contains('=') {
+            format!("Its variable `{shown}` has `=` in its name")
+        } else if name.contains('\0') {
+            format!("Its variable `{shown}` has a NUL in its name")
+        } else if value.contains('\0') {
+            format!("Its variable `{shown}` has a NUL in its value")
+        } else {
+            continue;
+        };
+        bail!(
+            "refused to run task '{task}' with `min session run`. {why}, and \
+             `min session run` passes variables to the session in ssh's environment, \
+             which cannot hold it. `min task run {task}` can carry it, and runs the task \
+             in a new box instead of in the session."
+        );
+    }
+    Ok(())
+}
+
+/// `name` as the person wrote it, with control characters escaped so the
+/// refusal stays one readable line: no Debug quotes around it.
+fn printable_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The non-interactive lane's hook: records what the policy could not
@@ -574,23 +872,38 @@ fn arm_task_run_interrupt(
 /// mid-task — yields `None`, which [`exit_outcome`] fails closed rather
 /// than reading as success.
 ///
-/// stdin is pumped into the channel only when it is NOT a terminal: a piped
-/// stdin EOFs and half-closes the channel like the git helper's does, but a
-/// terminal stdin never EOFs — and a blocking stdin read cannot be
-/// cancelled once the task exits — so a terminal caller half-closes
-/// immediately and a stdin-reading task sees EOF instead of hanging. The
-/// upshot: tasks run non-interactively; stdin content reaches the task only
-/// when piped. That is not just the cancellation constraint — the daemon's
-/// exec channel has no PTY (only the shell path does), so interactive tasks
-/// are structurally unsupported here anyway; interactive work belongs in
-/// `min session attach`.
+/// This command's stdin is the box's stdin (BCLI-010), a terminal or not:
+/// it is pumped into the channel until it EOFs, and the EOF half-closes the
+/// channel like the git helper's does. The daemon's exec channel has no
+/// PTY, so the bytes reach the entrypoint as typed, with no terminal of its
+/// own. Interactive work belongs in `min session attach`.
 async fn bridge_exec(
-    mut channel: russh::Channel<russh::client::Msg>,
+    channel: russh::Channel<russh::client::Msg>,
 ) -> Result<Option<u32>, anyhow::Error> {
-    let pump = if std::io::stdin().is_terminal() {
-        channel.eof().await.context("half-close task stdin")?;
-        None
-    } else {
+    bridge_channel(
+        channel,
+        Some(Box::new(std::io::stdin())),
+        tokio::io::stdout(),
+        tokio::io::stderr(),
+    )
+    .await
+}
+
+/// [`bridge_exec`] over any stdio: `stdin` is pumped into the channel (or
+/// the channel is half-closed at once for `None`), channel data goes to
+/// `stdout` and extended data (stream 1) to `stderr`, and nothing else is
+/// written to either. Returns the exit status the channel reported.
+pub(crate) async fn bridge_channel<O, E>(
+    mut channel: russh::Channel<russh::client::Msg>,
+    stdin: Option<Box<dyn std::io::Read + Send>>,
+    mut stdout: O,
+    mut stderr: E,
+) -> Result<Option<u32>, anyhow::Error>
+where
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
+    let pump = if let Some(mut stdin) = stdin {
         let mut to_channel = channel.make_writer();
         // Read stdin on a detached thread, not `tokio::io::stdin()`: the
         // latter parks a blocking `read(0)` on tokio's blocking pool, which
@@ -599,7 +912,6 @@ async fn bridge_exec(
         // exits. A detached thread is abandoned on exit instead of awaited.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         std::thread::spawn(move || {
-            let mut stdin = std::io::stdin();
             let mut buf = [0u8; 8192];
             loop {
                 match stdin.read(&mut buf) {
@@ -623,10 +935,11 @@ async fn bridge_exec(
             }
             let _ = to_channel.shutdown().await;
         }))
+    } else {
+        channel.eof().await.context("half-close task stdin")?;
+        None
     };
 
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
     let mut exit_status = None;
     while let Some(msg) = channel.wait().await {
         match msg {
@@ -662,6 +975,92 @@ fn interactive_task_box_name(task: &str) -> String {
 /// canonical in-box `min task run <task>`, relay its exit code, and let the
 /// daemon end the session with the run (NET-131).
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
+    run_entry(global, args.into()).await
+}
+
+/// `min task list [--all]` (BCLI-015): the task boxes of the current
+/// project, or of every project, in any state. The daemon keeps a task's
+/// record after the task ends, so an exited task stays in the list until
+/// `min box prune` or `min box rm` removes it.
+pub async fn cmd_task_list(global: &GlobalArgs, args: TaskListArgs) -> Result<(), anyhow::Error> {
+    let scope = if args.all {
+        None
+    } else {
+        let cwd = crate::attach::cwd_host_path(global)?;
+        Some(crate::cmd::box_list_scope(cwd.as_ref())?)
+    };
+    crate::cmd::ensure_daemon(global)?;
+    let hosts = crate::cmd::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    task_list_on_hosts(hosts, scope, &mut out, &mut err).await
+}
+
+/// `min task list` over the local `hosts`: the `min box list` listing,
+/// filtered to the task boxes of `project_root`, or of every project when
+/// it is `None`. It prints the same table, state labels and empty-list
+/// lines as `min box list`. A host that does not answer is named on `err`,
+/// and the list goes on without it. The selected host that does not answer
+/// ends the command, as it does for `min box list`.
+pub(crate) async fn task_list_on_hosts(
+    hosts: Vec<crate::cmd::LocalHost>,
+    project_root: Option<paths::HostAbsPath>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Result<(), anyhow::Error> {
+    let mut tasks = Vec::new();
+    for host in hosts {
+        let records = match crate::cmd::read_host_boxes(&host).await? {
+            Ok(records) => records,
+            Err(why) if host.selected => {
+                tracing::info!(verb = "task list", outcome = "error", host = %host.host, "{why}");
+                bail!("{why}");
+            }
+            Err(why) => {
+                tracing::info!(
+                    verb = "task list",
+                    outcome = "host unreachable",
+                    host = %host.host,
+                    "{why}"
+                );
+                writeln!(err, "{}", crate::cmd::unreachable_host_line(&host.host))?;
+                continue;
+            }
+        };
+        tasks.extend(
+            records
+                .into_iter()
+                .filter(|entry| entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE))
+                .filter(|entry| {
+                    project_root
+                        .as_ref()
+                        .is_none_or(|root| entry.project_root.as_ref() == Some(root))
+                })
+                .map(|record| crate::cmd::ListedBox {
+                    provider: host.provider.to_string(),
+                    host: host.host.clone(),
+                    record,
+                }),
+        );
+    }
+    tracing::info!(verb = "task list", outcome = "ok", tasks = tasks.len());
+    let mut out = out;
+    crate::cmd::render_box_list(&mut out, &tasks, project_root.is_some())?;
+    Ok(())
+}
+
+/// `min box run <entry>`: the run of [`cmd_task_run`], from an entry the
+/// project declares. Both verbs share [`run_entry`].
+pub async fn cmd_box_run(global: &GlobalArgs, args: BoxRunArgs) -> Result<(), anyhow::Error> {
+    run_entry(global, args.into()).await
+}
+
+/// The one run path of `min task run` and `min box run` (BCLI-010,
+/// BCLI-035, BCLI-070): create a fresh instance of the entry's box, wire
+/// this command's stdin, stdout and stderr to its entrypoint, and end with
+/// the entrypoint's exit code. With `--detach`, print only the box's id
+/// and return.
+pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(), anyhow::Error> {
     // Same project-path resolution as `cmd_activate`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
     let effective_path = match (&args.path, &global.repo_dir) {
@@ -679,7 +1078,17 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // The task must be declared before anything touches the daemon: a typo'd
     // name fails instantly, listing what IS declared, without a session ever
     // existing.
-    let declared = declared_task(&utf8_path, &args.task)?;
+    //
+    // BCLI-010: an entry with a terminal is refused first, with exit 2,
+    // before the run creates anything. A broken file is left to
+    // `declared_task`, which names it.
+    match mfile::File::from_dir_recursive(utf8_path.as_std_path()) {
+        Ok(file) => refuse_terminal_entry(Some(&file), &args.entry)?,
+        Err(mfile::Error::NotFound) => refuse_terminal_entry(None, &args.entry)?,
+        Err(_) => {}
+    }
+    // A declared task is never interactive: the load refuses one (BOX-054).
+    let declared = declared_task(&utf8_path, &args.entry)?;
 
     // Read before `ensure_daemon` because the env resolution below is
     // gated on it: a malformed policy, or a variable the policy refuses,
@@ -691,87 +1100,42 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // values to the daemon on the exec channel (#585). Done alongside the
     // declared-task check, before `ensure_daemon`, so an unset inherited
     // variable also fails with no session built.
-    //
-    // Gated against `[vars]` on the way, `allow` included. Resolving here
-    // reads the user's own shell, so the project naming a variable is the
-    // project asking for its value — the same two lanes as an activate: the
-    // interactive prompt on a real terminal, the collect-and-refuse
-    // `NoPromptHook` anywhere else.
     let source = boxes::core::source::Source::Project {
         path: paths::HostPath::try_new(utf8_path.clone()).context("Invalid project path")?,
     };
-    let non_interactive = global.no_input || !crate::can_prompt_interactively();
-    // The policy amended by the task-env gating above: persisted to disk on
-    // the interactive path, and carried into `prepare_activation_inputs`
-    // below as an override, so composition and the pending gate run under the
-    // approved rules even when that save failed.
-    let (task_env, amended_policy) = if non_interactive {
-        let hooks = RefuseAndRecord::default();
-        let task_env = resolve_task_env(
-            &declared,
-            &args.task,
-            user_policy.vars().clone(),
-            &policy_path,
-            &source,
-            &hooks,
-            |k| std::env::var(k),
-        );
-        // Checked before the result: the hook refused, so `task_env` is
-        // the abort error and the names are the useful half of it.
-        let refused = hooks.into_names();
-        if !refused.is_empty() {
-            let count = refused.len();
-            let snippet = refused_vars_snippet(&refused);
-            bail!(
-                "task '{task}' declares {count} environment variable{s} that your \
-                 policy does not allow, and stdin/stderr is not a terminal.\n\n\
-                 Add the following to {path}:\n\n{snippet}\n\
-                 Then re-run this command.",
-                task = args.task,
-                path = policy_path.display(),
-                s = if count == 1 { "" } else { "s" },
-            );
-        }
-        (task_env?, user_policy)
-    } else {
-        let hooks = crate::prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
-        let task_env = resolve_task_env(
-            &declared,
-            &args.task,
-            user_policy.vars().clone(),
-            &policy_path,
-            &source,
-            &hooks,
-            |k| std::env::var(k),
-        );
-        // Persist before propagating a refusal: a rule the user chose to
-        // record is theirs whether or not this run goes on to fail.
-        let after = hooks.into_final_policy();
-        if after != user_policy {
-            match crate::prompt::save_user_policy(&policy_path, &after) {
-                Ok(()) => eprintln!("Updated {}", policy_path.display()),
-                Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
-            }
-        }
-        (task_env?, after)
-    };
+    // The policy amended by the task-env gating: persisted to disk on the
+    // interactive path, and carried into `prepare_activation_inputs` below as
+    // an override, so composition and the pending gate run under the approved
+    // rules even when that save failed.
+    let (task_env, amended_policy) = gate_task_env(
+        global,
+        &declared,
+        &args.entry,
+        &source,
+        user_policy,
+        &policy_path,
+        |k| std::env::var(k),
+    )?;
 
     crate::ensure_daemon(global)?;
 
     // Same default as an activate with no flags, matching the loadout
     // handling below: `min task run` has no `--no-hooks` of its own, so its
     // hooks behave like any other session's. The constructor turns them on.
+    //
+    // BCLI-070, BOX-163: every run is a fresh instance. The daemon names the
+    // box `<task>-<n>` from the spec's entry, with the smallest `n` no
+    // retained box uses. The client invents no name.
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         abs_path.clone(),
         boxes::NetworkMode::HostNet,
         boxes::BoxPolicy::default(),
     );
-    // BOX-163: every task run is a fresh instance. The daemon names the box
-    // `<task>-<n>` from the spec's entry, with the smallest `n` no retained
-    // box uses. The client invents no name.
-    request.config.name = None;
-    request.fresh_instance = true;
+    crate::request_fresh_instance(&mut request);
+    // Refused by a daemon of another build before it allocates anything;
+    // `None` under the skew override.
+    request.must_match_version = minimal_client::version_assertion();
     // The task box runs its task as its entrypoint and keeps its record
     // when the task returns (BOX-038). Every created box stores its spec
     // (BOX-068). An interactive task, which has no spec, takes the exec
@@ -779,17 +1143,19 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // task starts destroys it rather than resuming it (NET-131). The daemon
     // clears the mark when the task box's entrypoint starts.
     let spec = task_box_spec(
-        &args.task,
+        &args.entry,
         &declared,
         crate::spec_flags(&request),
         &args.args,
     );
     let entrypoint_runs = spec.is_some();
+    // The task's timeout, for the line a run past it prints (BOX-037).
+    let timeout_secs = spec.as_ref().and_then(|spec| spec.timeout);
     request.config.ends_with_run = true;
-    // Refused by a daemon of another build before it allocates anything;
-    // `None` under the skew override.
-    request.must_match_version = minimal_client::version_assertion();
-    // The record's type is the task verb's (BOX-001).
+    // BOX-001: the record's type is the one the expanded spec names. Both
+    // verbs resolve the entry as a declared task (`declared_task`), and
+    // `task_box_spec` names the task type, so `min box run` creates a task
+    // box too.
     request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
     // BOX-068: the declared task's spec, with this command's settings. An
     // interactive task sends none: the task type denies a terminal.
@@ -798,7 +1164,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     } else {
         // With no spec to name it, the request carries the entry's name,
         // cleaned as the daemon cleans a spec's entry.
-        request.config.name = Some(interactive_task_box_name(&args.task));
+        request.config.name = Some(interactive_task_box_name(&args.entry));
     }
 
     // Upload per the normal activate rules: tarball sync (the default), the
@@ -848,7 +1214,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
     tracing::info!(
-        task = %args.task,
+        task = %args.entry,
         requested_name = ?request.config.name,
         fresh_instance = request.fresh_instance,
         "creating the task box as a fresh instance"
@@ -1027,18 +1393,45 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     );
 
     if entrypoint_runs {
-        eprintln!("Running task {} in box {session_name}...", args.task);
         // One span for the run, from the request to the exit code.
         let span = tracing::info_span!(
             "task_run",
+            verb = args.verb.command(),
             box_id = %id,
             box_name = %session_name,
-            task = %args.task,
+            task = %args.entry,
         );
+        if args.detach {
+            // BCLI-010 `--detach`: the box's stdin closes at its start, and
+            // only the box's id goes to stdout. The box keeps running, and
+            // keeps its record when its entrypoint returns.
+            let detached = async {
+                let channel =
+                    open_task_box_run(&mut client, id, &args.entry, &task_cwd, &task_env).await;
+                match channel {
+                    Ok(channel) => detach_run(channel, id, &mut std::io::stdout()).await,
+                    Err(e) => {
+                        crate::best_effort_destroy(&mut client, id, false).await;
+                        Err(e)
+                    }
+                }
+            }
+            .instrument(span.clone())
+            .await;
+            span.in_scope(|| {
+                tracing::info!(outcome = ?detached.as_ref().map(|()| "detached"), "run detached");
+            });
+            if let Some(residency) = host_ip_residency.as_mut() {
+                residency.keep();
+            }
+            drop(run_guard);
+            return detached;
+        }
+        eprintln!("Running task {} in box {session_name}...", args.entry);
         // What the run did with its box: only a box it removed gives up
         // its name hold and its egress ([`release_task_box_holds`]).
         let (outcome, end) = async {
-            match open_task_box_run(&mut client, id, &args.task, &task_cwd, &task_env).await {
+            match open_task_box_run(&mut client, id, &args.entry, &task_cwd, &task_env).await {
                 Ok(channel) => {
                     let outcome = bridge_exec(channel).await;
                     run_guard.yield_to_handler().await;
@@ -1047,7 +1440,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                         end = task_box_end(exit, || entrypoint_started(&mut client, id)).await;
                         match end {
                             TaskBoxEnd::Keep => {
-                                eprintln!("{}", crate::kept_box_line(&session_name));
+                                let timed_out =
+                                    ended_at_timeout(exit, || record_state(&mut client, id)).await;
+                                let why =
+                                    timed_out.then(|| timeout_line(&args.entry, timeout_secs));
+                                for line in kept_box_lines(why, &session_name) {
+                                    eprintln!("{line}");
+                                }
                             }
                             TaskBoxEnd::Remove => {
                                 tracing::info!(
@@ -1072,7 +1471,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         .instrument(span.clone())
         .await;
         span.in_scope(|| {
-            tracing::info!(exit = ?outcome.as_ref().ok().copied().flatten(), "task run ended");
+            tracing::info!(
+                outcome = ?outcome.as_ref().map(|exit| *exit).map_err(ToString::to_string),
+                "task run ended"
+            );
         });
         if let Some(residency) = host_ip_residency.as_mut() {
             residency.keep();
@@ -1091,12 +1493,12 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         return exit_outcome(outcome?);
     }
 
-    eprintln!("Running task {} in session {session_name}...", args.task);
+    eprintln!("Running task {} in session {session_name}...", args.entry);
 
     let outcome = match client
         .open_session_exec_channel(
             id,
-            &task_run_request(&args.task, &args.args, task_cwd).encode(),
+            &task_run_request(&args.entry, &args.args, task_cwd).encode(),
             &task_env,
         )
         .await
@@ -1187,6 +1589,72 @@ async fn entrypoint_started(client: &mut crate::client::Client, id: boxes::Sessi
             true
         }
     }
+}
+
+/// The code a task run returns when its box ran past its timeout (BOX-037).
+pub(crate) const TIMEOUT_EXIT_CODE: u32 = 124;
+
+/// Whether a task run's box ended at its timeout (BOX-037): the run's code
+/// is 124 and the box's record says `exited` with `reason = "timeout"`. A
+/// task that exits 124 by itself leaves `reason = "exit"`, so the code alone
+/// cannot say it. `state` reads the record, and only for a 124.
+pub(crate) async fn ended_at_timeout<F, Fut>(exit: Option<u32>, state: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<boxes::core::record::RecordState>>,
+{
+    use boxes::core::record::{ExitEnding, RecordState};
+    exit == Some(TIMEOUT_EXIT_CODE)
+        && state().await == Some(RecordState::Exited(ExitEnding::Timeout))
+}
+
+/// The state of the box's record, or `None` when the daemon cannot read it.
+async fn record_state(
+    client: &mut crate::client::Client,
+    id: boxes::SessionId,
+) -> Option<boxes::core::record::RecordState> {
+    let reply = client
+        .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Id(
+            id,
+        ))
+        .await;
+    match reply {
+        Ok(reply) => reply.record.and_then(|record| record.state().ok()),
+        Err(error) => {
+            tracing::warn!(box_id = %id, %error, "could not read the task box's state");
+            None
+        }
+    }
+}
+
+/// A timeout of `secs` seconds as `minimal.toml` can write it: in hours,
+/// minutes or seconds, whichever divides it.
+fn timeout_words(secs: u64) -> String {
+    match secs {
+        s if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s >= 60 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// The line `min task run` prints on stderr when the task's box ran past
+/// its timeout (BOX-037). `timeout_secs` is the task's timeout, when the
+/// run knows it.
+pub(crate) fn timeout_line(task: &str, timeout_secs: Option<u64>) -> String {
+    let limit =
+        timeout_secs.map_or_else(String::new, |secs| format!(" of {}", timeout_words(secs)));
+    format!(
+        "Task {task} ran past its timeout{limit}, and its processes were ended. \
+         The run exits with code {TIMEOUT_EXIT_CODE}."
+    )
+}
+
+/// The lines a task run prints on stderr when it keeps its box: why the
+/// task ended, when its timeout ended it, then how to remove the box.
+pub(crate) fn kept_box_lines(why: Option<String>, box_name: &str) -> Vec<String> {
+    why.into_iter()
+        .chain(std::iter::once(crate::kept_box_line(box_name)))
+        .collect()
 }
 
 /// Releases what a task box held on the VM host daemon once its run
@@ -1306,29 +1774,6 @@ mod tests {
             crate::kept_box_line("check-1"),
             "Kept box check-1. Remove it with min box rm check-1."
         );
-    }
-
-    /// The hidden `min run` redirect names both canonical forms — the host
-    /// `min task run <task>` and the in-box
-    /// `min session attach --command 'min task run <task>'` — substituting
-    /// the typed task name when there was one.
-    #[test]
-    fn run_alias_message_names_both_canonical_forms() {
-        let msg = run_alias_message(Some("build"));
-        assert!(msg.contains("min task run build"), "got: {msg}");
-        assert!(
-            msg.contains("min session attach --command 'min task run build'"),
-            "got: {msg}"
-        );
-
-        let bare = run_alias_message(None);
-        assert!(bare.contains("min task run <task>"), "got: {bare}");
-
-        let err = cmd_run(&RunArgs {
-            rest: vec!["build".into(), "--keep".into()],
-        })
-        .expect_err("the hidden run must always error");
-        assert!(err.to_string().contains("min task run build"));
     }
 
     /// The unknown-task error lists the declared tasks sorted, or says none
@@ -2031,6 +2476,7 @@ mod tests {
         let args = TaskRunArgs {
             task: "deploy".into(),
             path: None,
+            detach: false,
             args: vec![],
         };
 
@@ -2077,6 +2523,7 @@ mod tests {
         let args = TaskRunArgs {
             task: "build".into(),
             path: None,
+            detach: false,
             args: vec![],
         };
 
@@ -2093,6 +2540,184 @@ mod tests {
             msg.contains("policy does not allow"),
             "names the gate: {msg}"
         );
+    }
+
+    /// A project on disk declaring `toml`, and a config dir whose
+    /// `user_policy.toml` holds `policy`, isolated from the developer's own.
+    fn session_run_fixture(
+        toml: &str,
+        policy: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, GlobalArgs) {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let minimal_dir = config.path().join("minimal");
+        std::fs::create_dir_all(&minimal_dir).unwrap();
+        std::fs::write(minimal_dir.join("user_policy.toml"), policy).unwrap();
+        let global = GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        (project, config, global)
+    }
+
+    fn utf8(dir: &tempfile::TempDir) -> &camino::Utf8Path {
+        camino::Utf8Path::from_path(dir.path()).unwrap()
+    }
+
+    const SESSION_RUN_TOML: &str = "[tasks.t778]\nexec = 'true'\n\
+        env_vars.X778 = { inherit = true }\nenv_vars.LIT778 = 'lit'\n";
+
+    /// inbox#778: `min session run` resolves the task's `inherit` against
+    /// this shell, as `min task run` does, and carries literals too, so the
+    /// daemon never reads its own environment for the task.
+    #[test]
+    fn session_run_resolves_an_allowed_inherit_from_this_shell() {
+        let (project, _config, global) =
+            session_run_fixture(SESSION_RUN_TOML, "[vars]\nallow = [\"X778\", \"LIT778\"]\n");
+
+        let out = session_run_task_env(&global, utf8(&project), "t778", |k| match k {
+            "X778" => Ok("x-from-shell".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("an allowed, set inherit resolves");
+
+        assert_eq!(
+            out.set.get("X778").map(String::as_str),
+            Some("x-from-shell")
+        );
+        assert_eq!(out.set.get("LIT778").map(String::as_str), Some("lit"));
+        assert!(out.drop.is_empty());
+    }
+
+    /// inbox#778: the policy gate `min task run` passes applies to
+    /// `min session run` too. With no terminal, a name the policy does not
+    /// allow refuses the run naming the policy file, and nothing is read
+    /// out of the shell.
+    #[test]
+    fn session_run_refuses_a_name_the_policy_does_not_allow() {
+        let (project, config, global) =
+            session_run_fixture(SESSION_RUN_TOML, "[vars]\nallow = [\"LIT778\"]\n");
+
+        let err = session_run_task_env(&global, utf8(&project), "t778", |_| {
+            panic!("no value may be read before the policy allows it")
+        })
+        .expect_err("an unallowed name must refuse the run");
+
+        let msg = err.to_string();
+        assert!(msg.contains("task 't778'"), "names the task: {msg}");
+        assert!(
+            msg.contains("policy does not allow"),
+            "names the gate: {msg}"
+        );
+        assert!(msg.contains("X778"), "names the variable: {msg}");
+        let policy = config.path().join("minimal").join("user_policy.toml");
+        assert!(
+            msg.contains(&policy.display().to_string()),
+            "names the policy file: {msg}"
+        );
+    }
+
+    /// The daemon trims the task name it is sent, so the lookup does too:
+    /// a padded name still passes the gate rather than skipping it.
+    #[test]
+    fn session_run_gates_a_padded_task_name() {
+        let (project, _config, global) = session_run_fixture(SESSION_RUN_TOML, "[vars]\n");
+        let err = session_run_task_env(&global, utf8(&project), " t778 ", |_| {
+            panic!("nothing is read")
+        })
+        .expect_err("the padded name is the same task");
+        assert!(err.to_string().contains("policy does not allow"), "{err}");
+    }
+
+    /// A task the project on this host does not declare (one a stack
+    /// provides, or one added to the session's copy only), and a project
+    /// with no `minimal.toml` here, resolve to an empty set. The run goes
+    /// on, and the daemon, told the client resolved it, refuses any
+    /// `inherit` the task has rather than reading its own environment.
+    #[test]
+    fn session_run_resolves_nothing_for_a_task_this_host_does_not_declare() {
+        let (project, _config, global) = session_run_fixture(SESSION_RUN_TOML, "[vars]\n");
+        let out = session_run_task_env(&global, utf8(&project), "other", |_| {
+            panic!("nothing is read")
+        })
+        .unwrap();
+        assert!(out.is_empty(), "{out:?}");
+
+        let empty = tempfile::tempdir().unwrap();
+        let out =
+            session_run_task_env(&global, utf8(&empty), "t778", |_| panic!("nothing is read"))
+                .unwrap();
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A `minimal.toml` for the session's project that is there but does
+    /// not parse is refused on the client, naming the file and its error,
+    /// as `min task run` refuses it. Read as "no file", it would surface
+    /// only as the daemon's refusal of an unanswered `inherit`.
+    #[test]
+    fn session_run_refuses_a_broken_minimal_toml() {
+        let (project, _config, global) = session_run_fixture("[tasks.t778\n", "[vars]\n");
+        let err = session_run_task_env(&global, utf8(&project), "t778", |_| {
+            panic!("nothing is read")
+        })
+        .expect_err("a file that does not parse must refuse the run");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with(&format!(
+                "found a broken {} in the session's project at {}",
+                mfile::MFILE_NAME,
+                utf8(&project),
+            )),
+            "names the file: {msg}"
+        );
+        assert!(
+            msg.contains("while resolving tasks: "),
+            "carries the cause: {msg}"
+        );
+    }
+
+    /// A name or value ssh cannot carry is refused in short sentences: what
+    /// was refused, why, and that `min task run` carries it, in a new box.
+    /// The name reads as written, without Debug quotes.
+    #[test]
+    fn session_run_refuses_a_var_ssh_cannot_carry() {
+        let mut env = minimald_rpc::taskenv::TaskEnv::default();
+        env.set.insert("OK".to_string(), "v".to_string());
+        ensure_carried_by_ssh("t", &env).expect("a plain name is carried");
+        env.set.insert("A=B".to_string(), "v".to_string());
+        let msg = ensure_carried_by_ssh("t", &env)
+            .expect_err("`=` cannot be carried")
+            .to_string();
+        assert_eq!(
+            msg,
+            "refused to run task 't' with `min session run`. Its variable `A=B` has `=` in \
+             its name, and `min session run` passes variables to the session in ssh's \
+             environment, which cannot hold it. `min task run t` can carry it, and runs \
+             the task in a new box instead of in the session."
+        );
+
+        let mut env = minimald_rpc::taskenv::TaskEnv::default();
+        env.set.insert("NUL".to_string(), "a\0b".to_string());
+        let msg = ensure_carried_by_ssh("t", &env)
+            .expect_err("a NUL cannot be carried")
+            .to_string();
+        assert!(
+            msg.contains("Its variable `NUL` has a NUL in its value,"),
+            "{msg}"
+        );
+
+        let mut env = minimald_rpc::taskenv::TaskEnv::default();
+        env.set.insert("N\0L".to_string(), "v".to_string());
+        let msg = ensure_carried_by_ssh("t", &env)
+            .expect_err("a NUL in a name cannot be carried")
+            .to_string();
+        assert!(
+            msg.contains(r"Its variable `N\u{0}L` has a NUL in its name,"),
+            "{msg}"
+        );
+        assert!(!msg.contains('\0'), "the NUL is escaped: {msg:?}");
     }
 
     /// `cmd_task_run` resolves a task's `env_vars` against the invoking
@@ -2131,6 +2756,7 @@ mod tests {
         let args = TaskRunArgs {
             task: "build".into(),
             path: None,
+            detach: false,
             args: vec![],
         };
 

@@ -54,6 +54,7 @@ pub use forward::{
 mod spool;
 pub use spool::is_spool_file;
 mod switches;
+pub use switches::Flag;
 
 /// The providers installed by [`layers`], kept so [`shutdown`] can flush them.
 static PROVIDERS: OnceLock<(Option<SdkTracerProvider>, Option<SdkLoggerProvider>)> =

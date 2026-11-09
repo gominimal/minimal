@@ -96,11 +96,6 @@ pub enum Command {
     Provider(ProviderArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
-    /// Muscle-memory catch for the in-box `min run <task>`: always errors,
-    /// naming the canonical `min task run <task>` (host) and
-    /// `min session attach --command 'min task run <task>'` (in-box) forms.
-    #[command(hide = true)]
-    Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
     /// Check this host for problems: today, that no record of the audit log
@@ -168,6 +163,13 @@ pub enum Command {
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
+    /// Check now whether your channel has a newer release.
+    ///
+    /// min makes this check by itself once a day; see
+    /// https://docs.minimal.dev/reference/telemetry#update-check for what
+    /// it sends and how to turn it off.
+    #[command(name = "update-check", hide = true)]
+    UpdateCheck(UpdateCheckArgs),
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
@@ -265,6 +267,10 @@ pub enum SessionCommand {
     /// List the lifecycle hooks composed into a session, and where each
     /// was declared
     Hooks(HooksArgs),
+    /// Show what a session's terminal printed, from its start. `-f` keeps
+    /// showing new output until the session is removed or the command is
+    /// interrupted
+    Logs(BoxLogsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -464,6 +470,10 @@ pub enum BoxCommand {
     /// to this project's running box that has a terminal, else to its only
     /// stopped or exited one, which starts again
     Attach(BoxAttachArgs),
+    /// Create a box from an entry of the project, run it without a terminal
+    /// and exit with its exit code. This command's stdin, stdout and stderr
+    /// are the box's. `--detach` starts the box, prints its id and returns
+    Run(BoxRunArgs),
     /// Run a command in a running box and exit with the command's exit
     /// code. `-t` gives the command a terminal, and `--detach` starts it
     /// and returns its exec id
@@ -483,6 +493,23 @@ pub enum BoxCommand {
     /// files. A running box is never removed. `--older-than` and `--parent`
     /// narrow what is removed. Off a terminal, `--yes` is required
     Prune(BoxPruneArgs),
+    /// Show what a box printed, from its start. A stopped or exited box
+    /// keeps its output until `min box rm` removes it. `-f` keeps showing
+    /// new output until the box is removed or the command is interrupted
+    Logs(BoxLogsArgs),
+}
+
+// BOX-155 (BCLI-012): `min session logs`, `min task logs` and
+// `min box logs`, each `<box> [-f]`, with one set of arguments.
+#[derive(Debug, Args)]
+pub struct BoxLogsArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Show the output so far, then keep showing new output as the box
+    /// writes it, until the box is removed or the command is interrupted
+    #[arg(short = 'f', long)]
+    pub follow: bool,
 }
 
 // BOX-162 (BCLI-016): `min box events <box> | --parent <box> [-o jsonl] [--follow]`.
@@ -667,38 +694,12 @@ pub struct BoxExecArgs {
     /// Stop the command when it runs for longer than this: a number of
     /// seconds, or a number followed by s, m or h, such as 30s, 5m or 1h.
     /// The command then ends with exit code 124
-    #[arg(long, value_name = "DURATION", value_parser = parse_exec_timeout)]
+    #[arg(long, value_name = "DURATION", value_parser = mfile::duration::parse_timeout_secs)]
     pub timeout: Option<u64>,
     /// The command and its arguments, after `--`. The command runs as these
     /// words, with no shell
     #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
     pub command: Vec<String>,
-}
-
-/// Reads a `min box exec --timeout` value as whole seconds: a number of
-/// seconds, or a number followed by `s`, `m` or `h`. Zero is refused, as the
-/// daemon refuses a timeout of zero seconds (BOX-149).
-pub(crate) fn parse_exec_timeout(raw: &str) -> Result<u64, String> {
-    let refused = || {
-        format!(
-            "'{raw}' is not a timeout. Give a whole number of seconds, minutes or hours \
-             that is more than zero, such as 30s, 5m or 1h."
-        )
-    };
-    let (digits, scale) = match raw.char_indices().last() {
-        Some((at, 's')) => (&raw[..at], 1),
-        Some((at, 'm')) => (&raw[..at], 60),
-        Some((at, 'h')) => (&raw[..at], 3600),
-        _ => (raw, 1),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(refused());
-    }
-    let count: u64 = digits.parse().map_err(|_| refused())?;
-    match count.checked_mul(scale) {
-        Some(secs) if secs > 0 => Ok(secs),
-        _ => Err(refused()),
-    }
 }
 
 /// Why `min box exec` ran no command in the box: `-t` without a terminal
@@ -847,8 +848,8 @@ pub struct BoxRenameArgs {
     pub new_name: String,
 }
 
-// BOX-021 (BCLI-061, BCLI-005): `min box prune [--older-than <d>]
-// [--parent <box>] [--yes]`.
+// BOX-021 (BCLI-061, BCLI-005, BCLI-006): `min box prune [--older-than <d>]
+// [--parent <box>] [--yes] [--dry-run]`.
 #[derive(Debug, Args)]
 pub struct BoxPruneArgs {
     /// Remove only the boxes that stopped or exited at least this long ago.
@@ -863,6 +864,10 @@ pub struct BoxPruneArgs {
     /// Remove the boxes without asking first
     #[arg(long, short)]
     pub yes: bool,
+    /// List the boxes prune would remove and the disk each one holds, and
+    /// remove nothing
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Parses the `--older-than` age of `min box prune`: a whole number with a
@@ -972,6 +977,7 @@ pub enum TaskCommand {
     /// lines on stderr, beside the task's stderr. So
     /// `cat q.sql | min task run query > out.csv` gives the task q.sql and
     /// writes only the task's output to out.csv.
+    /// `--detach` starts the box, prints its id and returns.
     ///
     /// When the task ends, the box stays with its exit code: see it with
     /// `min box show <task>-<n>` and remove it with `min box rm <task>-<n>`.
@@ -980,6 +986,22 @@ pub enum TaskCommand {
     /// Ctrl-C destroys its box instead. Use `min session attach` for
     /// interactive work.
     Run(TaskRunArgs),
+    /// List the task boxes of the current project, in any state. A task
+    /// that ended shows its exit code, as `exited (exit 3)`, until
+    /// `min box prune` removes it. `--all` lists the tasks of every project
+    List(TaskListArgs),
+    /// Show what a task printed, from its start. `-f` keeps showing new
+    /// output until the task's box is removed or the command is interrupted
+    Logs(BoxLogsArgs),
+}
+
+// BCLI-015: `min task list [--all]`.
+#[derive(Debug, Args)]
+pub struct TaskListArgs {
+    /// List the tasks of every project, not only the tasks of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -992,18 +1014,29 @@ pub struct TaskRunArgs {
     /// task name is a task argument, never a project path.
     #[arg(long)]
     pub path: Option<String>,
+    /// Start the box, print its id and return. The task gets no input.
+    #[arg(long)]
+    pub detach: bool,
     /// Arguments to the task, passed through to its declared `args`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
 }
 
-/// Arguments for the hidden top-level `run` catch. Everything after `run` is
-/// swallowed (flags included) so any in-box spelling reaches the redirect
-/// error in [`task::cmd_run`] instead of a clap parse error.
+// BCLI-010, BCLI-035, BCLI-070: `min box run <entry> [--detach] [-- <args>…]`.
 #[derive(Debug, Args)]
-pub struct RunArgs {
+pub struct BoxRunArgs {
+    /// Name of an entry declared in the project's minimal.toml: a task
+    pub entry: String,
+    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
+    /// or the current working directory when neither is given
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Start the box, print its id and return. The box gets no input
+    #[arg(long)]
+    pub detach: bool,
+    /// Arguments to the entry, passed through to its declared `args`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-    pub rest: Vec<String>,
+    pub args: Vec<String>,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
@@ -1673,6 +1706,28 @@ pub struct InitArgs {
     /// already exists.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+    // BCLI-018: `<entry> --type <type>` appends one entry; each noun flag is
+    // the same append with that noun as the type. The flags are checked by
+    // hand in `cmd_init`, not with clap conflicts, so a conflict prints the
+    // one message the task fixes.
+    /// Name of the entry to append to minimal.toml (use with --type)
+    #[arg(value_name = "ENTRY")]
+    pub entry: Option<String>,
+    /// Type of the entry to append: session, task, or a type from [box_types]
+    #[arg(long = "type", value_name = "TYPE")]
+    pub box_type: Option<String>,
+    /// Append a session entry with this name (the same as <ENTRY> --type session)
+    #[arg(long, value_name = "NAME")]
+    pub session: Option<String>,
+    /// Append a task entry with this name (the same as <ENTRY> --type task)
+    #[arg(long, value_name = "NAME")]
+    pub task: Option<String>,
+    /// Append an agent entry with this name (the same as <ENTRY> --type agent)
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+    /// Append a service entry with this name (the same as <ENTRY> --type service)
+    #[arg(long, value_name = "NAME")]
+    pub service: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1712,6 +1767,19 @@ pub struct SpinArgs {
     /// Ctrl-C cuts it short.
     #[arg(long, default_value_t = 10)]
     pub seconds: u64,
+}
+
+/// `min update-check`: see [`crate::update_check`].
+#[derive(Debug, Default, Args)]
+pub struct UpdateCheckArgs {
+    /// Check without printing anything and keep the answer for the next
+    /// command, as the daily check does. Always exits 0.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub background: bool,
+    /// Print the request that would be made, and the switch that stops it
+    /// if one is set, without making it.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

@@ -610,6 +610,15 @@ pub(crate) fn entry_run_as_entrypoint(spec: &mfile::spec::BoxSpec) -> Option<&st
     runs.then_some(spec.entry.as_str())
 }
 
+/// The `timeout` of a box that ends at it (BOX-037), in whole seconds: the
+/// spec sets `lifetime = "until_complete"` and a timeout. A box that runs
+/// until it is stopped runs past its timeout.
+pub(super) fn timeout_of(spec: &mfile::spec::BoxSpec) -> Option<u64> {
+    (spec.lifetime == mfile::spec::Lifetime::UntilComplete)
+        .then_some(spec.timeout)
+        .flatten()
+}
+
 /// Watches a host's runtime loop `task` for the box's actor. When the loop
 /// ends, the watch receives its [`box_runtime::HostExit`], and the actor
 /// decides from it whether the box ends.
@@ -1106,6 +1115,18 @@ impl BoxActor {
         // BOX-013: a stop ended the box's processes and could not set its
         // record to `stopped`. The record still says running, so no launch
         // starts new processes in the box before the retried stop.
+        // BOX-037: the same for a timeout that ended the box's processes and
+        // could not set its record to `exited`.
+        if let Some(ending) = self.unrecorded_exit {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                ending = ?ending,
+                "launch refused: the timeout ended the box and its record is not exited yet"
+            );
+            return Err(AttachError::LaunchRecordUnwritable(std::io::Error::other(
+                "this session ran past its timeout and ended, and its exited state is not saved yet",
+            )));
+        }
         if let Some(ending) = self.unrecorded_stop {
             tracing::warn!(
                 box_id = %self.record.id(),
@@ -1175,6 +1196,12 @@ impl BoxActor {
             .then(|| spec.spec.as_deref().and_then(entry_run_as_entrypoint))
             .flatten()
             .map(str::to_string);
+        // BOX-037: a launch that starts the entrypoint of an `until_complete`
+        // box with a timeout arms the deadline. A hook launch starts no
+        // entrypoint and leaves the deadline as it is.
+        let timeout_secs = (!for_hooks)
+            .then(|| spec.spec.as_deref().and_then(timeout_of))
+            .flatten();
         let launcher = self
             .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
             .await?;
@@ -1367,6 +1394,9 @@ impl BoxActor {
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
         let (task, watch) = watch_entrypoint_exit(task, record.id, box_name, entry);
         self.entrypoint_watch = Some(watch);
+        if let Some(secs) = timeout_secs {
+            self.arm_timeout(secs);
+        }
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
         #[cfg(target_os = "linux")]
@@ -2021,6 +2051,22 @@ fn stop_signal_name(signal: i32) -> &'static str {
     }
 }
 
+/// The names of `signals`, in order, for the log and the span.
+pub(super) fn signal_names(signals: &[i32]) -> Vec<&'static str> {
+    signals.iter().map(|s| stop_signal_name(*s)).collect()
+}
+
+/// The grace period between the SIGTERM and the SIGKILL a timeout sends
+/// (BOX-037): the stop's [`STOP_GRACE`]. A test can shorten it per box.
+fn timeout_grace(box_id: &boxes::SessionId) -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(grace) = super::timeout_grace_seam::grace(box_id) {
+        return grace;
+    }
+    let _ = box_id;
+    STOP_GRACE
+}
+
 /// What a stop's signals did to the box (BOX-013).
 #[derive(Debug)]
 pub(crate) struct StopOutcome {
@@ -2232,6 +2278,14 @@ impl BoxActor {
             BoxInner::Draft { .. } => None,
         };
         self.publish_host();
+        // BOX-037: the timeout ended the processes and could not write the
+        // `exited` record. `launch_host` refuses while it is unrecorded, so
+        // no process runs, and this stop writes the timeout's ending.
+        if launched.is_none()
+            && let Some(ending) = self.unrecorded_exit
+        {
+            return self.write_kept_exit(ending).await;
+        }
         let ending = match (self.unrecorded_stop, launched) {
             // An earlier stop ended the processes and could not write the
             // record. This one writes how they ended then. `launch_host`
@@ -2334,6 +2388,133 @@ impl BoxActor {
             );
         }
         Ok(ending)
+    }
+
+    /// Arms the deadline of an `until_complete` box whose spec sets a
+    /// timeout of `secs` seconds (BOX-037), from now. A timeout too large
+    /// for the clock arms nothing: the box never reaches it.
+    pub(super) fn arm_timeout(&mut self, secs: u64) {
+        let at = tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(secs));
+        self.timeout_deadline = at.map(|at| super::TimeoutDeadline { at, secs });
+        tracing::info!(
+            box_id = %self.record.id(),
+            timeout_secs = secs,
+            armed = self.timeout_deadline.is_some(),
+            "timeout: the box's entrypoint started; the box ends when it runs past its timeout"
+        );
+    }
+
+    /// Signals every process in a box that ran past its timeout (BOX-037),
+    /// execs included, as a graceful stop does: SIGTERM, the grace period,
+    /// then SIGKILL to what still runs. Then tears the host down, sets the
+    /// record to `exited` with `reason = "timeout"` and no exit code, and
+    /// records the `exited` event. Answers the signals sent, in order.
+    ///
+    /// A record write that fails returns the error. The processes are gone
+    /// then, and the actor keeps hosting the box, so a `min box stop` can
+    /// still set its record.
+    pub(super) async fn time_out_box(
+        &mut self,
+        timeout_secs: u64,
+    ) -> Result<Vec<i32>, std::io::Error> {
+        let box_id = *self.record.id();
+        tracing::info!(
+            box_id = %box_id,
+            timeout_secs,
+            "timeout: the box ran past its timeout; ending it"
+        );
+        // The loop ends on these signals, and the exit is then nobody's:
+        // the box ends with `reason = "timeout"`, not with the code.
+        self.entrypoint_watch = None;
+        let launched = match &mut self.inner {
+            BoxInner::Active { host, .. } => host.take(),
+            BoxInner::Draft { .. } => None,
+        };
+        self.publish_host();
+        let sent = match launched {
+            Some((host, task)) => {
+                let container_pid = probe_host(host.get_attrs())
+                    .await
+                    .and_then(|attrs| attrs.container_pid);
+                if container_pid.is_none() {
+                    tracing::warn!(
+                        box_id = %box_id,
+                        "timeout: the host did not name its container; the host kill ends the box"
+                    );
+                }
+                let outcome = stop_box_processes(
+                    box_id,
+                    container_pid.map(box_runtime::BoxProcesses::of_container),
+                    task,
+                    false,
+                    timeout_grace(&box_id),
+                    &self.weak_self.3,
+                )
+                .await;
+                if let Some(mut task) = outcome.unfinished {
+                    Self::kill_and_stop_loop(&host, &mut task, false).await;
+                }
+                outcome.sent
+            }
+            None => {
+                tracing::info!(box_id = %box_id, "timeout: the box has no process to signal");
+                Vec::new()
+            }
+        };
+        // A forced stop sent meanwhile has had its effect.
+        self.weak_self
+            .3
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            box_id = %box_id,
+            timeout_secs,
+            signals = ?signal_names(&sent),
+            "timeout: the box's processes ended"
+        );
+        self.stop_running(false).await;
+        self.mark_name_stopped().await;
+
+        let ending = boxes::core::record::ExitEnding::Timeout;
+        // Kept until the write succeeds, as a stop keeps `unrecorded_stop`.
+        self.unrecorded_exit = Some(ending);
+        self.write_exited_record(ending).await?;
+        self.unrecorded_exit = None;
+        tracing::info!(
+            box_id = %box_id,
+            timeout_secs,
+            signals = ?signal_names(&sent),
+            reason = boxes::core::record::EndReason::Timeout.name(),
+            "box exited: it ran past its timeout"
+        );
+        self.write_exited_event(ending).await;
+        Ok(sent)
+    }
+
+    /// Writes the `exited` record and event that a timeout (BOX-037) kept
+    /// on the actor when its own write failed. On success the box is
+    /// `exited`, not `stopped`, so this answers an error, and the stop's
+    /// caller answers from the record that the box already exited.
+    async fn write_kept_exit(
+        &mut self,
+        ending: boxes::core::record::ExitEnding,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        let box_id = *self.record.id();
+        tracing::info!(
+            box_id = %box_id,
+            ending = ?ending,
+            "stop: the timeout ended the processes earlier; writing its exited record"
+        );
+        self.write_exited_record(ending).await?;
+        self.unrecorded_exit = None;
+        tracing::info!(
+            box_id = %box_id,
+            ending = ?ending,
+            "box exited: it ran past its timeout"
+        );
+        self.write_exited_event(ending).await;
+        Err(std::io::Error::other(
+            "the session already ended at its timeout",
+        ))
     }
 
     /// Sets the box's record to `stopped` with `ending`.

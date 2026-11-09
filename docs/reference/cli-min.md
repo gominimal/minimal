@@ -313,6 +313,10 @@ Because the task is named as a task rather than inferred from a command string,
 a task may share a name with a daemon subcommand or with a program on the
 session's `PATH`.
 
+The task's `env_vars` are resolved against your shell and checked against
+your `[vars]` policy before the task runs, as for `min task run`; see
+[Tasks](./tasks.md#env_vars).
+
 ### `session destroy`
 
 ```
@@ -678,7 +682,13 @@ anything other than the `kvm` group membership ends with
 `Running boxes pick this up on their next start.`. A run that added you to
 the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
-When both apply, both lines print, the login line last. On a host that needs nothing it prints
+When both apply, both lines print, the login line last. When the step that
+enforces deny-all egress installs while a daemon is running, on a host with
+systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress, restart the daemon: min stop (it refuses while boxes are live: stop them first, or min stop --force ends them), and your next min command starts it again.`
+A daemon of this release reads the machine again once the step places it, so
+the restart is for a daemon started by an earlier release. Without systemd no
+unit places a restarted daemon, so the script does not advise a restart.
+On a host that needs nothing it prints
 `Every part of the install is finished on this machine; there is nothing to run.`
 and exits 0. It lists a fact that no script can change, such as cgroup2
 mounted without `nsdelegate`, under `can't do on this machine:`. The other
@@ -801,7 +811,7 @@ Prints important directories and file paths for debugging.
 ### `bug`
 
 ```
-min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--endpoint <URL>]]
+min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--security] [--endpoint <URL>]]
 ```
 
 Collects a diagnostic bundle (logs, state, config) to send to the minimal
@@ -870,11 +880,25 @@ starts it there. The report URL does not contain the delete token, so
 you can share the URL. To remove the bundle sooner, run the `Delete:`
 line. See [`diag`](#diag).
 
+`--security` sends the bundle as a security report, for a suspected
+vulnerability. It needs `--upload`. Only portal owners can read the
+report. Its description is never public, it is never filed to public
+GitHub, and the results go to a private channel. `bug` prints these
+lines instead:
+
+```
+Received privately as a security report. Only the minimal team's portal owners can read it.
+Receipt: https://agents.minimal.farm/diag/<id>
+That page only confirms receipt. It shows nothing else and will not change.
+Expires: <date>
+Delete:  min diag delete <id> <token>
+```
+
 ### `diag`
 
 ```
 min diag collect [<bug options>]
-min diag upload <PATH> [--context <TEXT>] [--endpoint <URL>]
+min diag upload <PATH> [--context <TEXT>] [--security] [--endpoint <URL>]
 min diag delete <ID> <TOKEN> [--endpoint <URL>]
 ```
 
@@ -883,7 +907,8 @@ options.
 
 `diag upload` sends a bundle that you collected earlier. Use it for a
 bundle someone gave you, or for one you collected while the portal was
-unreachable. It prints the same lines as `bug --upload`.
+unreachable. It prints the same lines as `bug --upload`, and takes
+`--security` the same way.
 
 `diag delete` deletes an uploaded bundle before it expires. Give it the
 id and the delete token that the upload printed. The portal deletes the
