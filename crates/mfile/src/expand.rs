@@ -476,6 +476,12 @@ const SPEC_KEYS: &[(&str, Shape)] = &[
     ("volumes", Shape::StrList),
 ];
 
+/// Whether `key` is a box setting an expanded spec can carry, so a
+/// `[defaults]` table that sets it is read by expansion (BOX-048).
+pub(crate) fn is_spec_key(key: &str) -> bool {
+    SPEC_KEYS.iter().any(|(k, _)| *k == key)
+}
+
 /// Checks every key of the expanded spec, in key order.
 fn check_keys(entry: &BoxEntry, expansion: &Expansion) -> Result<(), Error> {
     let keys: BTreeSet<&String> = expansion.spec.keys().collect();
