@@ -2442,6 +2442,27 @@ fn create_verbs_name_flag_overrides_box_name() {
     request.config.name = minimal_client::box_name::request_name(None);
     stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
     assert_eq!(created_box_name(&request).as_deref(), Some("dev"));
+
+    // A task entry's box takes a generated name, so `--name` is refused
+    // before anything is created, not dropped.
+    let entries = start_entries("[tasks.build]\necho = 'x'\n");
+    let mut start = typed_start(StartVerb::Box, Some("build"));
+    start.name = Some("x".to_owned());
+    let error = plan_start(&start, &entries, true).expect_err("--name is refused");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("a start refusal, which exits 2");
+    assert_eq!(
+        refusal,
+        &StartEntryRefusal::NameUnsupported {
+            entry: "build".to_owned()
+        }
+    );
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot start build with --name. A box from a task entry gets a generated \
+         name. Run min box start build without --name."
+    );
 }
 
 // BCLI-069: a start without `--new` whose name a running box holds exits

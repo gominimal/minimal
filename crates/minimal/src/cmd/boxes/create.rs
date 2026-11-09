@@ -393,6 +393,9 @@ pub enum StartEntryRefusal {
         entry: String,
         box_type: Option<String>,
     },
+    /// `--name` for a task entry: its box runs through the run path, which
+    /// generates the box's name and takes no `--name`.
+    NameUnsupported { entry: String },
     /// `min box start` named an entry of a type it cannot start yet.
     UnsupportedType {
         entry: String,
@@ -475,6 +478,12 @@ impl std::fmt::Display for StartEntryRefusal {
                 }
                 Ok(())
             }
+            Self::NameUnsupported { entry } => write!(
+                f,
+                "Cannot start {entry} with --name. A box from a task entry gets a \
+                 generated name. Run min box start {entry} without --name.",
+                entry = printable(entry),
+            ),
             Self::UnsupportedType { entry, box_type } => write!(
                 f,
                 "Cannot start {entry}. Its entry in {file} has {kind}, and min box start \
@@ -646,6 +655,12 @@ pub(crate) fn plan_start(
             })
         }
         // A task box never has a terminal (BOX-054), so the start detaches.
+        // The run path names the box `task-<entry>-<hex>`, which no running
+        // box holds, so `--new` already holds for it. It takes no `--name`,
+        // so the start refuses that flag rather than drop it.
+        Some(boxes::TASK_BOX_TYPE) if start.name.is_some() => {
+            Err(StartEntryRefusal::NameUnsupported { entry: entry.name }.into())
+        }
         Some(boxes::TASK_BOX_TYPE) => Ok(StartPlan::Detached {
             run: crate::task::RunEntry {
                 verb: crate::task::RunVerb::Box,
