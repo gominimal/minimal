@@ -8,7 +8,7 @@ on:
     workflow_dispatch:
         inputs:
             version:
-                description: "Staged version to promote: a semver (0.6.0, from a versioned release build) or a nightly short SHA. Leave empty for the latest staged nightly SHA."
+                description: "Staged version to promote: a semver (0.6.0, from a versioned release build) or a nightly short SHA (unstable only). Leave empty for the latest staged nightly SHA (unstable only)."
                 required: false
                 type: string
             target:
@@ -26,6 +26,11 @@ on:
                 default: false
             override_provenance:
                 description: "EMERGENCY ONLY — promote a version whose staged bytes were never smoked by a release run (no versions/<version>/smoked marker, or one that no longer matches)"
+                required: false
+                type: boolean
+                default: false
+            rollback:
+                description: "Move stable to a version below the current one, on purpose. Without this, a lower version is refused"
                 required: false
                 type: boolean
                 default: false
@@ -99,6 +104,7 @@ jobs:
                   TARGET_INPUT: ${{ inputs.target }}
                   DRY_RUN: ${{ inputs.dry_run }}
                   OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
+                  ROLLBACK: ${{ inputs.rollback }}
               run: |
                   set -euo pipefail
                   BODY="**Repo:** \`${REPO}\`
@@ -109,6 +115,7 @@ jobs:
                   **Target channel:** \`${TARGET_INPUT}\`
                   **Dry run:** \`${DRY_RUN}\`
                   **Smoke-provenance override (EMERGENCY):** \`${OVERRIDE_PROVENANCE}\`
+                  **Rollback:** \`${ROLLBACK}\`
 
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
                   Closing this issue without an approval comment counts as denial.
@@ -196,6 +203,16 @@ jobs:
 
     promote:
         needs: gate
+        # One promotion per channel at a time, so two approved runs cannot
+        # both read the same `stable`, pass the check, and write out of order.
+        # Job-level, not workflow-level, so a run waiting at the gate holds
+        # nothing. GitHub keeps one waiting run per group: a third run cancels
+        # the waiting one before it writes anything, and that one must be
+        # dispatched again. A dry run writes nothing, so it has its own group
+        # and never cancels a real promotion.
+        concurrency:
+            group: promote-cli-${{ inputs.target }}${{ inputs.dry_run && '-dry-run' || '' }}
+            cancel-in-progress: false
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:
@@ -222,6 +239,7 @@ jobs:
                   INPUT_VERSION: ${{ inputs.version }}
                   INPUT_TARGET: ${{ inputs.target }}
                   OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
+                  ROLLBACK: ${{ inputs.rollback }}
               run: |
                   set -euo pipefail
                   # Trim leading/trailing whitespace; users often paste versions with stray spaces.
@@ -236,6 +254,15 @@ jobs:
                     # deliberately, never as "whatever is newest".
                     VERSION="$(scripts/latest-staged-version.sh --bucket gs://minimal-one)"
                     echo "Latest staged SHA: ${VERSION}"
+                  fi
+
+                  # Checked here, after the approval, because `stable` can move
+                  # while the gate waits. An unreadable `stable` stops the run.
+                  if [ "$TARGET" = "stable" ]; then
+                    CURRENT="$(gcloud storage cat gs://minimal-one/stable)"
+                    ROLLBACK_FLAG=""
+                    [ "$ROLLBACK" = "true" ] && ROLLBACK_FLAG="--rollback"
+                    scripts/check-promotion.sh --version "$VERSION" --current "$CURRENT" $ROLLBACK_FLAG
                   fi
 
                   # Provenance gate: the row's bytes must be the bytes a
