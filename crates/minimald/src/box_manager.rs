@@ -325,6 +325,10 @@ struct CreateBoxMsg {
     /// Whether the create asks for a fresh instance (BOX-163): the box is
     /// named `<name>-<n>` and never refused for a held name.
     fresh: bool,
+    /// Where a created box's host-address fact goes: the one the create's
+    /// own gate read ([`create_host_ip_fact`]), so the reply states what
+    /// this create saw rather than whatever the global fact reads later.
+    fact: Option<tokio::sync::oneshot::Sender<crate::box_runtime::HostIpEnforcementFact>>,
 }
 
 /// The refusal of a create whose name a running box holds (BOX-163). It
@@ -459,7 +463,7 @@ impl BoxManagerHandle {
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
-        self.send_create_box(config, spec, false, username, creator)
+        self.send_create_box(config, spec, false, username, creator, None)
             .await
     }
 
@@ -474,8 +478,31 @@ impl BoxManagerHandle {
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
-        self.send_create_box(config, spec, true, username, creator)
+        self.send_create_box(config, spec, true, username, creator, None)
             .await
+    }
+
+    /// [`Self::create_box_with_spec`], or the fresh-instance create when
+    /// `fresh` is set, that also returns the host-address fact the create's
+    /// own gate read. The create reply states this fact, never a later read
+    /// of the global one, which another create or launch may have refreshed
+    /// in between.
+    pub(crate) async fn create_box_reporting_fact(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        fresh: bool,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<(SessionId, crate::box_runtime::HostIpEnforcementFact), BoxManagerError> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        let id = self
+            .send_create_box(config, spec, fresh, username, creator, Some(send))
+            .await?;
+        let fact = recv
+            .await
+            .expect("a created box's manager sends its fact before its id");
+        Ok((id, fact))
     }
 
     async fn send_create_box(
@@ -485,6 +512,7 @@ impl BoxManagerHandle {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
+        fact: Option<tokio::sync::oneshot::Sender<crate::box_runtime::HostIpEnforcementFact>>,
     ) -> Result<SessionId, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
@@ -499,6 +527,7 @@ impl BoxManagerHandle {
                 },
                 spec,
                 fresh,
+                fact,
             })))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
@@ -1191,6 +1220,38 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
     }
     serde_json_lenient::to_vec(spec)
         .map_err(|e| BoxManagerError::other(format!("could not serialize the box spec: {e}")))
+}
+
+/// The Box Spec sections that a spec can carry and that this daemon does
+/// not enforce (BOX-076): the top-level key, the key inside it when the
+/// section is one key of a table, and the section as the log names it.
+const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
+    ("file_imports", None, "[[file_imports]]"),
+    ("file_exports", None, "[[file_exports]]"),
+    ("github_imports", None, "[[github_imports]]"),
+    ("otel", None, "[otel]"),
+    (
+        "network",
+        Some("vpn_network_names"),
+        "[network] vpn_network_names",
+    ),
+];
+
+/// The sections of `spec` that the daemon carries in the stored spec but
+/// does not enforce, in the order of [`UNENFORCED_SECTIONS`], each once.
+fn unenforced_sections(spec: &serde_json_lenient::Value) -> Vec<&'static str> {
+    let Some(object) = spec.as_object() else {
+        return Vec::new();
+    };
+    UNENFORCED_SECTIONS
+        .iter()
+        .filter(|(key, inner, _)| match (object.get(*key), inner) {
+            (Some(_), None) => true,
+            (Some(value), Some(inner)) => value.get(*inner).is_some(),
+            (None, _) => false,
+        })
+        .map(|(_, _, section)| *section)
+        .collect()
 }
 
 enum ManagerMessage {
@@ -3448,7 +3509,7 @@ impl BoxManager {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
-    ) -> Result<SessionId, BoxManagerError> {
+    ) -> Result<(SessionId, crate::box_runtime::HostIpEnforcementFact), BoxManagerError> {
         if self.in_shutdown.is_cancelled() {
             return Err(BoxManagerError::new(
                 std::io::ErrorKind::ConnectionRefused,
@@ -3539,6 +3600,9 @@ impl BoxManager {
             name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         config.name = name;
+        // BOX-076: the sections the daemon carries but does not enforce,
+        // read before the spec becomes its stored bytes.
+        let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -3726,12 +3790,25 @@ impl BoxManager {
         if let Some(bytes) = &spec {
             let stored = object.store_spec(bytes).map(|()| object.spec_path());
             match stored {
-                Ok(path) => tracing::info!(
-                    session_id = %session_id,
-                    spec_bytes = bytes.len(),
-                    spec_path = %path.as_str(),
-                    "stored the box spec"
-                ),
+                Ok(path) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        spec_bytes = bytes.len(),
+                        spec_path = %path.as_str(),
+                        "stored the box spec"
+                    );
+                    // BOX-076: one warning for each unenforced section.
+                    // The stored spec keeps the section, and the box is
+                    // created.
+                    for section in &unenforced {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            section = ?section,
+                            "the box spec carries a section this daemon does not \
+                             enforce; the box is created without it"
+                        );
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(
                         session_id = %session_id,
@@ -3758,7 +3835,7 @@ impl BoxManager {
         match BoxActor::run(seed).await {
             Ok(session) => {
                 self.running.insert(session_id, session);
-                Ok(session_id)
+                Ok((session_id, host_ip_fact))
             }
             // The actor never started, so no one else will delete the
             // record. Best-effort: the spawn error is what the client needs
@@ -4113,7 +4190,8 @@ impl BoxManager {
                 } = *msg;
                 let created = self
                     .create_session(config, None, false, username, creator)
-                    .await;
+                    .await
+                    .map(|(id, _)| id);
                 responder.handle(async move { created }).await;
             }
             ManagerMessage::CreateBox(msg) => {
@@ -4127,10 +4205,17 @@ impl BoxManager {
                         },
                     spec,
                     fresh,
+                    fact,
                 } = *msg;
                 let created = self
                     .create_session(config, spec, fresh, username, creator)
-                    .await;
+                    .await
+                    .map(|(id, host_ip_fact)| {
+                        if let Some(fact) = fact {
+                            let _ = fact.send(host_ip_fact);
+                        }
+                        id
+                    });
                 responder.handle(async move { created }).await;
             }
             // Deletes a session: see `delete_box`.

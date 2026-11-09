@@ -635,6 +635,12 @@ pub struct HakoniwaProcess {
     /// A line the daemon shows ahead of the child's own stderr, such as the
     /// `inherit_cwd` fallback notice (see [`task_start_dir`]).
     pub(super) stderr_notice: Option<String>,
+    /// hakoniwa's account of a sandbox that failed, for the client's
+    /// stderr ([`Process::exit_notice`]).
+    pub(super) failure: Option<String>,
+    /// Set by [`Process::start_kill`]: the daemon ended this task, so its
+    /// status is not read as a sandbox failure.
+    pub(super) killed: bool,
 }
 
 /// The release of a task's network, owed once its process is gone.
@@ -710,6 +716,8 @@ impl HakoniwaProcess {
             state: WaitState::Spawned(Box::new(child)),
             net: NetRelease::new(net_guard),
             stderr_notice: None,
+            failure: None,
+            killed: false,
         }
     }
 }
@@ -751,7 +759,13 @@ impl Process for HakoniwaProcess {
                 // signal death), so a SIGKILL reports 137 rather than 1. The
                 // `exit_code` field is `None` for signals and would collapse
                 // to 1 downstream; `code` is what the session path reports too.
-                Ok(Ok(status)) => WaitState::Exited(Some(status.code)),
+                Ok(Ok(status)) => {
+                    self.failure = sandbox_failure(&status, self.killed);
+                    if let Some(reason) = &self.failure {
+                        tracing::warn!(pid = self.pid, %reason, "task: the sandbox failed");
+                    }
+                    WaitState::Exited(Some(status.code))
+                }
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
         }
@@ -777,8 +791,49 @@ impl Process for HakoniwaProcess {
         // invariants beyond the pid being a valid `pid_t`, which we
         // captured from `Child::id()` at construction time.
         unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        self.killed = true;
         Ok(())
     }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        self.failure
+            .take()
+            .map(|reason| sandbox_failure_notice(&reason))
+    }
+}
+
+/// hakoniwa's exit code for a container that failed itself, rather than a
+/// command that ran (`ExitStatus::FAILURE`).
+pub(super) const SANDBOX_FAILURE_CODE: i32 = 125;
+
+/// hakoniwa's reason for a container that a SIGKILL ended. It reports that
+/// as [`SANDBOX_FAILURE_CODE`] with no inner exit code, the same shape as a
+/// sandbox failure, whether or not the command had started.
+pub(super) const CONTAINER_SIGKILL_REASON: &str = "container received signal SIGKILL";
+
+/// The reason a task's sandbox failed, or `None` for any other end of the
+/// task. hakoniwa reports a sandbox failure as code 125 with no inner
+/// exit code. A command that itself exits 125 carries its own exit code, and
+/// a signalled one reports `128 + signo`, so neither is taken for it. A
+/// container that was killed, by the daemon (`killed`) or by anything else,
+/// is not a sandbox failure either.
+pub(super) fn sandbox_failure(status: &hakoniwa::ExitStatus, killed: bool) -> Option<String> {
+    (!killed
+        && status.code == SANDBOX_FAILURE_CODE
+        && status.exit_code.is_none()
+        && status.reason != CONTAINER_SIGKILL_REASON)
+        .then(|| status.reason.clone())
+}
+
+/// The line on the client's stderr for a task whose sandbox failed: the
+/// command's own output may be empty, so this is the only account of why the
+/// task ended with 125. The reason can quote a path the box chose, so its
+/// control characters are escaped and it stays one line.
+pub(super) fn sandbox_failure_notice(reason: &str) -> String {
+    format!(
+        "the task's sandbox failed: {}\n",
+        crate::env::one_line(reason)
+    )
 }
 
 /// The [`Process`] produced by a [`TaskExec`]: either a real sandboxed child
@@ -827,6 +882,15 @@ impl Process for TaskProcess {
             TaskProcess::Echo(p) => p.start_kill(),
             TaskProcess::Entrypoint(p) => p.start_kill(),
             TaskProcess::Refused(p) => p.start_kill(),
+        }
+    }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        match self {
+            TaskProcess::Sandbox(p) => p.exit_notice(),
+            TaskProcess::Echo(p) => p.exit_notice(),
+            TaskProcess::Entrypoint(p) => p.exit_notice(),
+            TaskProcess::Refused(p) => p.exit_notice(),
         }
     }
 }
@@ -906,6 +970,7 @@ impl TaskEntrypointBox {
             box_id = %box_id,
             box_name = %box_name,
             task = %exec.task,
+            stdin = tracing::field::Empty,
         );
         // `inherit_cwd`: the client sends a directory only for a task that
         // declares it. The entrypoint starts there, so the in-box `min task
@@ -993,6 +1058,9 @@ impl TaskEntrypointBox {
                 )));
             }
         };
+        // Whether this run passes its stdin to the entrypoint, whose in-box
+        // `min task run` forwards it to the task (T123).
+        span.record("stdin", io.stdin.is_some());
         span.in_scope(|| {
             tracing::info!(
                 drop_env = exec.drop_env.len(),
@@ -1046,6 +1114,130 @@ async fn relay_entrypoint_stream(
         }
     }
     let _ = out.shutdown().await;
+}
+
+/// The stdin that the in-box `min task run` forwards over its minenv
+/// connection, as it goes to the task's stdin pipe (T123). The in-box run
+/// is a task box's entrypoint, so this is how the run's own stdin reaches
+/// the task.
+///
+/// A thread copies the connection to the pipe and closes the pipe at the
+/// connection's EOF, so the task reads EOF. When the task closes its stdin
+/// or ends first, the thread reads on and drops the rest until the helper
+/// closes its side. So the helper's writes never fail, and the run's last
+/// lines (its `exit:` line among them) reach it.
+pub(crate) struct ForwardedStdin {
+    connection: std::os::unix::net::UnixStream,
+    done: std::sync::mpsc::Receiver<io::Result<()>>,
+    ended: bool,
+    task_ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ForwardedStdin {
+    /// Starts the copy of `connection` to `task_stdin`.
+    pub(crate) fn start(
+        connection: &std::os::unix::net::UnixStream,
+        task_stdin: impl io::Write + Send + 'static,
+    ) -> io::Result<Self> {
+        let reader = connection.try_clone()?;
+        let connection = connection.try_clone()?;
+        let (tx, done) = std::sync::mpsc::channel();
+        let task_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended_flag = task_ended.clone();
+        std::thread::Builder::new()
+            .name("task-stdin".to_string())
+            .spawn(move || {
+                let _ = tx.send(copy_forwarded_stdin(reader, task_stdin, &ended_flag));
+            })?;
+        Ok(Self {
+            connection,
+            done,
+            ended: false,
+            task_ended,
+        })
+    }
+
+    /// Records that the task ended. A read of the connection that fails
+    /// after this is not an error: the task no longer reads its stdin.
+    pub(crate) fn task_ended(&self) {
+        self.task_ended
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Waits for the copy to end, and keeps its result for [`Self::failure`].
+    #[cfg(test)]
+    pub(crate) fn wait_for_copy_end(&mut self) {
+        let result = self.done.recv().unwrap_or(Ok(()));
+        let (tx, done) = std::sync::mpsc::channel();
+        let _ = tx.send(result);
+        self.done = done;
+    }
+
+    /// The error that stopped the copy while the task still read its
+    /// stdin, if the copy ended with one. Does not wait.
+    pub(crate) fn failure(&mut self) -> Option<io::Error> {
+        match self.done.try_recv() {
+            Ok(Err(error)) => {
+                self.ended = true;
+                Some(error)
+            }
+            Ok(Ok(())) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ended = true;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        }
+    }
+
+    /// Waits, up to `wait`, for the helper to close its side once the run
+    /// sent its last line. Past `wait`, the connection's read side closes
+    /// and the copy ends. Blocks, so call it off the runtime.
+    pub(crate) fn finish(self, wait: Duration) {
+        if self.ended {
+            return;
+        }
+        if self.done.recv_timeout(wait).is_err() {
+            tracing::warn!(
+                wait_secs = wait.as_secs(),
+                "the in-box min task run did not close its forwarded stdin; closed it"
+            );
+            let _ = self.connection.shutdown(std::net::Shutdown::Read);
+            let _ = self.done.recv();
+        }
+    }
+}
+
+/// Copies `from` to `to` until `from` ends, and closes `to` then. A write
+/// that fails means the task closed its stdin or ended. The copy then
+/// drops the rest of `from` and reads on to its end. Only a read that
+/// fails while the task reads its stdin is an error. A read that fails
+/// once `task_ended` is set is not.
+fn copy_forwarded_stdin(
+    mut from: impl io::Read,
+    to: impl io::Write,
+    task_ended: &std::sync::atomic::AtomicBool,
+) -> io::Result<()> {
+    let mut to = Some(to);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if to.is_some() && !task_ended.load(std::sync::atomic::Ordering::SeqCst) => {
+                return Err(e);
+            }
+            Err(_) => return Ok(()),
+        };
+        if let Some(pipe) = to.as_mut()
+            && pipe
+                .write_all(&buf[..n])
+                .and_then(|()| pipe.flush())
+                .is_err()
+        {
+            to = None;
+        }
+    }
 }
 
 /// The [`Process`] of a task run whose task is its box's entrypoint (T43).
@@ -2338,6 +2530,9 @@ impl<P: Process> Process for TimedProcess<P> {
 
     fn start_kill(&mut self) -> io::Result<()> {
         self.inner.start_kill()
+    }
+    fn exit_notice(&mut self) -> Option<String> {
+        self.inner.exit_notice()
     }
 }
 

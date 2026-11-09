@@ -25,10 +25,10 @@ locked_commit = "d39aaaa581f983d6b3ba5eaaf383485a602f37f0"
 use = "pnpm"
 build_packages = ["railway"]
 
-[defaults]
+[defaults.task]
 state_key = "dev"
 
-[session]
+[defaults.session]
 packages = ["base", "git", "nano"]
 
 [tasks.dev]
@@ -41,11 +41,6 @@ bash = "pnpm run build && pnpm run start"
 [tasks.deploy]
 packages = ["railway"]
 exec = "railway up"
-
-[tasks.shell]
-interactive = true
-packages = ["base", "git", "nano"]
-exec = "bash -l"
 ```
 
 ## Schema
@@ -108,18 +103,28 @@ additional package dependencies for build time or run time respectively.
 
 
 
-### `[defaults]` - Settings for all tasks {#defaults}
+### `[defaults]` - Settings for every entry {#defaults}
+
+`[defaults]` holds settings that apply to every [entry](#entries). A table
+under it that has the name of a type, such as `[defaults.session]` or
+`[defaults.task]`, applies only to the entries of that type. When the same
+key is set in more than one place, the lists combine, and the more specific
+place sets every other value: the entry over `[defaults.<type>]`, and
+`[defaults.<type>]` over `[defaults]`.
 
 ```toml
-[defaults]
+[defaults.task]
 state_key = "<state key>"  # optional
 ```
 
-When set, `defaults.state_key` will set a state key on all tasks which do not set `state_key`.
+When set, `defaults.task.state_key` sets a state key on all tasks that do not
+set `state_key`.
+
+`[defaults.session]` is described [below](#session).
 
 
 
-### `[session]` - What every contributor's session gets {#session}
+### `[defaults.session]` - What every contributor's session gets {#session}
 
 Contributes to [sessions](../concepts/sessions.md) activated
 on this project (`min session activate`). It carries the same primitives as a
@@ -130,7 +135,7 @@ working on this codebase needs". There is at most one per `minimal.toml`, and
 it has no name or description.
 
 ```toml
-[session]
+[defaults.session]
 # Toolchain every contributor's session gets.
 packages = ["rustc", "cargo", "postgresql-client"]
 
@@ -140,7 +145,7 @@ patches = [
     { dest = ".psqlrc",            source = "config/psqlrc" },
 ]
 
-[session.vars]
+[defaults.session.vars]
 # Applies uniformly to every developer's session.
 RUST_LOG         = "info"
 CARGO_TERM_COLOR = "always"
@@ -151,7 +156,7 @@ DATABASE_URL     = { inherit = true, default = "postgres://localhost/dev" }
 GITHUB_TOKEN     = { inherit = true }
 
 # Declared to warm the compile cache when a session comes up.
-[[session.lifecycle_hooks]]
+[[defaults.session.lifecycle_hooks]]
 on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&1 || true" }
 ```
 
@@ -189,6 +194,12 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
   the developer to allow-list the project in their
   [user policy](./user-policy.md) before they will run — a hook is arbitrary
   code, so the developer must opt in.
+- **`hooks_on_resume`**: Set `hooks_on_resume = true` to run the
+  `on_activate` hooks again each time a stopped or exited session resumes.
+  They run before the `on_attach` hooks of the attach that resumes it. If an
+  `on_activate` hook fails, the session does not resume and stays stopped or
+  exited. The error names the hook's source and its exit status. Without the
+  key, a resume runs only the `on_attach` hooks.
 
 The field shapes and composition semantics (conflicts, policy gating) are the
 same as loadouts; see the [loadout reference](./loadouts.md) for the exact
@@ -205,7 +216,7 @@ disagree about everything else:
 
 | Surface | Host variable unset | `default = "..."` |
 |---|---|---|
-| This file's `[session.vars]` (and `[[session.vars_lenient]]`) | Activation fails: `could not resolve pending var <NAME>` | Supported; the default is used |
+| This file's `[defaults.session.vars]` (and `[[defaults.session.vars_lenient]]`) | Activation fails: `could not resolve pending var <NAME>` | Supported; the default is used |
 | A loadout's [`[vars]`](./loadouts.md#vars) and [`[[vars_lenient]]`](./loadouts.md#vars_lenient) | Dropped, with a warning on the terminal; activation continues | Supported; the default is used |
 | A task's [`env_vars`](./tasks.md#env_vars) | The run fails before the session is built | Rejected when the file is parsed — a task's `inherit` takes no `default` |
 
@@ -221,6 +232,37 @@ against your shell, as `min task run` does. Both are covered in
 ### `[tasks.*]` - Run tasks, scripts, & dev tooling {#tasks}
 
 See: [tasks](./tasks.md).
+
+A task cannot set `interactive = true`. A file with such a task fails to load
+with exit code 3, and the error names the `[sessions.<name>]` entry to
+declare instead. Interactive work belongs in a session.
+
+A task entry takes `hooks_on_resume = true` too, with the same meaning as
+[the `[defaults.session]` key](#session). Only a box with a terminal
+resumes, so the key changes nothing for a task that runs without one.
+
+### Entry tables {#entries}
+
+An entry is a named table that a box is created from. `[boxes.<name>]` is
+the general form, and its `type` key names the entry's type. Each of these
+tables is a shorter way to write `[boxes.<name>]` with its `type` set:
+
+| Table | Same as |
+|---|---|
+| `[sessions.<name>]` | `[boxes.<name>]` with `type = "session"` |
+| `[tasks.<name>]` | `[boxes.<name>]` with `type = "task"` |
+| `[agents.<name>]` | `[boxes.<name>]` with `type = "agent"` |
+| `[services.<name>]` | `[boxes.<name>]` with `type = "service"` |
+
+An entry name is 1 to 63 lowercase letters, digits, or hyphens, and does not
+start or end with a hyphen. Each name is used once in the file, whichever
+table declares it, and `self` cannot name an entry. A file that breaks one
+of these rules fails to load with exit code 3.
+
+An entry writes its settings as flat keys, such as `timeout`, `pty_enabled`,
+`on_oom`, and the `[machine]` table. `packages`, `patches`, `vars`, and
+`lifecycle_hooks` mean the same in an entry as in
+[`[defaults.session]`](#session).
 
 
 
@@ -307,18 +349,18 @@ path = "usr/share/virtio-linux/Image"
 mip materialize virtio-kernel -o ./Image
 ```
 
-### `[params]` - Repo-wide parameters {#params}
+### `[args]` - Repo-wide parameters {#args}
 
 Declares named parameters available to tasks across the repository, using the
 same `{type, help, default}` shape as per-task [`args`](./tasks.md). Every
-`[params]` entry must declare a `default`.
+parameter in `[args]` must declare a `default`.
 
 Each parameter acts as a defaulted arg on every task: a command reads it as
 `%{name}`, and `--name <value>` overrides it for one run. A task that
 declares an arg of the same name uses its own arg instead.
 
 ```toml
-[params]
+[args]
 greeting = { type = "string", default = "hi" }
 
 [tasks.hello]
@@ -342,3 +384,19 @@ minimum_version = "<version>"  # optional; alias: min_version
 
 Refuses to operate when the upstream's standard library is older than the
 declared minimum.
+
+### Legacy tables {#legacy}
+
+Release 0.8 still reads three older spellings, each as its new place. Each
+time Minimal reads one, it prints a hint that names the change to make.
+Release 0.9.0 and later refuse each of them with exit code 3 and the same
+hint.
+
+| Older spelling | Write instead |
+|---|---|
+| `[session]` | [`[defaults.session]`](#session) |
+| `state_key` and `profile` under `[defaults]` | the same keys under [`[defaults.task]`](#defaults) |
+| `[params]` | [`[args]`](#args) |
+
+`profile` is deprecated. A task's own `args` key is not a legacy spelling,
+and it keeps its meaning.

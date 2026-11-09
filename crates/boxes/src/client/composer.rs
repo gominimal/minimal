@@ -157,6 +157,33 @@ impl UserComposer {
         Ok(())
     }
 
+    /// The selected loadouts' layer of a box's spec: the keys that the
+    /// `mfile` expansion folds in after the entry and before the
+    /// command-line overrides (BOX-064).
+    ///
+    /// Today the layer carries `packages`: every package the added
+    /// loadouts ask for, in the order they were added, each once. It
+    /// carries no key when no loadout asks for a package. Vars, patches
+    /// and lifecycle hooks stay on the [`WireContribution`], because the
+    /// daemon gates them and their values must not reach the spec bytes.
+    #[must_use]
+    pub fn loadout_layer(&self) -> toml::Table {
+        let mut seen = std::collections::BTreeSet::new();
+        let packages: Vec<toml::Value> = self
+            .contribution
+            .packages()
+            .iter()
+            .map(crate::core::source::ProvenancedPackage::package)
+            .filter(|p| seen.insert(*p))
+            .map(|p| toml::Value::String(p.to_owned()))
+            .collect();
+        let mut layer = toml::Table::new();
+        if !packages.is_empty() {
+            layer.insert("packages".to_owned(), toml::Value::Array(packages));
+        }
+        layer
+    }
+
     /// Compose every accumulated loadout against `policy` and emit
     /// the wire form ready to ship to the daemon.
     ///
@@ -332,6 +359,38 @@ mod tests {
         assert_eq!(wire.requested_packages.len(), 1);
         assert_eq!(wire.requested_packages[0].name, "helix");
         assert_eq!(wire.lifecycle_hooks.len(), 1);
+    }
+
+    // BOX-064: the selected loadouts feed the loadout layer of the spec
+    // expansion, in the order they were added, each package once.
+    #[test]
+    fn loadout_contribution_feeds_the_loadout_layer() {
+        assert!(UserComposer::new().loadout_layer().is_empty());
+
+        let mut composer = UserComposer::new();
+        composer
+            .add_all([
+                loadout_named("dev")
+                    .with_package("helix")
+                    .with_package("ripgrep")
+                    .with_var(
+                        StrictVarName::try_new("EDITOR").unwrap(),
+                        VarValue::specified("hx"),
+                    ),
+                loadout_named("extra")
+                    .with_package("ripgrep")
+                    .with_package("fish"),
+            ])
+            .unwrap();
+        let layer = composer.loadout_layer();
+        let expected: toml::Table =
+            toml::from_str(r#"packages = ["helix", "ripgrep", "fish"]"#).unwrap();
+        assert_eq!(layer, expected);
+        // A var is never part of the layer, so its value stays out of
+        // the spec bytes.
+        assert!(!toml::to_string(&layer).unwrap().contains("hx"));
+        // The same loadouts feed the same layer.
+        assert_eq!(composer.loadout_layer(), layer);
     }
 
     /// Adding two loadouts with the same name is rejected. This is

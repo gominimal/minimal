@@ -36,6 +36,40 @@ pub enum Error {
         name: String,
         rule: EntryNameRule,
     },
+    /// An expanded box spec carries a key it cannot carry, or a value of
+    /// the wrong shape (BOX-066). Carries the key, the layer that set it,
+    /// as the message names it, and the problem. Exits 3.
+    InvalidSpecKey {
+        key: String,
+        layer: String,
+        problem: SpecKeyProblem,
+    },
+    /// The file carries a legacy table, and this release is past the one
+    /// release that read it (BOX-050). Carries the file, when it is known,
+    /// and the table. Exits 3.
+    LegacyTable {
+        path: Option<PathBuf>,
+        legacy: crate::legacy::LegacyTable,
+    },
+    /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
+    /// the task name. Exits 3.
+    InteractiveTask(String),
+}
+
+/// What is wrong with a key of an expanded box spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecKeyProblem {
+    /// No box setting has this name.
+    Unknown,
+    /// The key is inside an `[upstream]` table, and is not one of the
+    /// registry pin's keys.
+    UnknownUpstream,
+    /// The value has the wrong shape. Carries what the key takes and what
+    /// the layer wrote, each as the message names it.
+    WrongShape {
+        expected: &'static str,
+        found: &'static str,
+    },
 }
 
 /// The naming rule that an entry name breaks.
@@ -59,7 +93,7 @@ pub enum EntryNameRule {
 
 /// Writes an entry as its table header, `[sessions.dev]`, and quotes a name
 /// that TOML cannot write as a bare key.
-struct EntryHeader<'a>(&'a str, &'a str);
+pub(crate) struct EntryHeader<'a>(pub(crate) &'a str, pub(crate) &'a str);
 
 impl fmt::Display for EntryHeader<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,7 +117,10 @@ impl Error {
     #[must_use]
     pub fn exit_code(&self) -> Option<u8> {
         match self {
-            Error::InvalidEntryName { .. } => Some(3),
+            Error::InvalidEntryName { .. }
+            | Error::InvalidSpecKey { .. }
+            | Error::LegacyTable { .. }
+            | Error::InteractiveTask(_) => Some(3),
             _ => None,
         }
     }
@@ -183,6 +220,47 @@ impl fmt::Display for Error {
                     ),
                 }
             }
+            Error::InvalidSpecKey {
+                key,
+                layer,
+                problem,
+            } => match problem {
+                SpecKeyProblem::Unknown => write!(
+                    f,
+                    "{layer} sets `{key}`, which is not a box setting. \
+                     Remove the key or correct its name."
+                ),
+                SpecKeyProblem::UnknownUpstream => write!(
+                    f,
+                    "{layer} sets `{key}`, which is not an `[upstream]` setting. \
+                     The `[upstream]` settings are `repo_url`, `branch`, \
+                     `commit` and `build_cache_url`. Remove the key or correct \
+                     its name."
+                ),
+                SpecKeyProblem::WrongShape { expected, found } => write!(
+                    f,
+                    "{layer} sets `{key}` to {found}, but `{key}` takes \
+                     {expected}. Fix the value."
+                ),
+            },
+            Error::LegacyTable { path, legacy } => {
+                match path {
+                    Some(path) => write!(f, "{}: ", path.display())?,
+                    None => write!(f, "minimal.toml: ")?,
+                }
+                write!(
+                    f,
+                    "this release no longer reads {}.\n{legacy}",
+                    legacy.what()
+                )
+            }
+            Error::InteractiveTask(name) => write!(
+                f,
+                "`{}` in minimal.toml sets `interactive = true`, and a task \
+                 cannot be interactive. Declare the entry as `{}` instead.",
+                EntryHeader("tasks", name),
+                EntryHeader("sessions", name)
+            ),
         }
     }
 }
@@ -201,6 +279,9 @@ impl std::error::Error for Error {
             Error::MultipleTaskActions(..) => None,
             Error::HarnessTable(_) => None,
             Error::InvalidEntryName { .. } => None,
+            Error::InvalidSpecKey { .. } => None,
+            Error::LegacyTable { .. } => None,
+            Error::InteractiveTask(_) => None,
         }
     }
 }

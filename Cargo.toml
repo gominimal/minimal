@@ -253,6 +253,7 @@ vt100 = { version = "0.16.2" }
 zeroize = "1"
 zstd = "0.14"
 
+memchr = "2"
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 globset = "0.4"
 walkdir = "2.5"

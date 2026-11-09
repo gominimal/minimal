@@ -68,7 +68,7 @@ pub(super) fn host_ip_enforcement(
 /// display shows and the advice the create reply carries both come from the
 /// one decision the probe read — the cause is `None` only while the host
 /// decides — and a fact that held the state alone could not say why.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct HostIpEnforcementFact {
     /// The state itself, in the enum the listing's entries carry.
     pub(crate) enforcement: minimald_rpc::HostIpEnforcement,
