@@ -1280,7 +1280,20 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
 
         tracing::info!("Started listening on {}", cli.listen_on());
         request_daemon_placement(tree_root).await;
-        read_host_ip_enforcement_fact(tree_root);
+        // gominimal/inbox#1054: a native daemon re-reads the fact each time
+        // its own cgroup changes, so a placement that lands after the
+        // start-up reading (`min finalize-install` under a running daemon, a
+        // late placer) reaches the creates that follow. The tree the daemon
+        // answers over, and its own mount table read live (no knob).
+        minimald::box_runtime::read_fact_and_watch_placement(
+            tree_root.to_path_buf(),
+            None,
+            minimald::guest::is_microvm_daemon(),
+            minimald::box_runtime::OWN_CGROUP_POLL,
+            sandbox::classifier::own_cgroup_path,
+            || read_host_ip_enforcement_fact(tree_root),
+        )
+        .await;
         let (opts, ssh_name) = cli.ssh_args();
         tracing::info!(
             "Run the following to debug the socket:\n\nssh \\\n\t{} \\\n\t{}",
