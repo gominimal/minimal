@@ -686,14 +686,12 @@ fn network_key_invalid(
 /// the egress flags applied. `--allow-subnets`, `--allow-dns-hosts` and
 /// `--deny-subnets` add their values to the file's list, the file's values
 /// first and each value once. `--allow-protocols` replaces the file's list.
-/// `--deny-all-egress` applies first: it empties the file's
-/// `allow_subnets` and `allow_dns_hosts`, and the allow flags then add
-/// theirs, so `--deny-all-egress --allow-dns-hosts api.example` allows
-/// exactly `api.example` whatever the file says. The file's `deny_subnets`
-/// always stays. A deny-all declaration that ends with no destination
-/// allowed also has an empty `allow_protocols` unless `--allow-protocols`
-/// is given, so it is [`boxes::EgressPolicy::deny_all`] with the file's
-/// and the flags' deny ranges (NET-140).
+/// `--deny-all-egress`, which never comes with an allow flag (the parse
+/// refuses the pair), can only narrow: it empties the file's
+/// `allow_subnets` and `allow_dns_hosts`, and `allow_protocols` too unless
+/// `--allow-protocols` is given, so the section is
+/// [`boxes::EgressPolicy::deny_all`] (NET-140). The file's `deny_subnets`
+/// stay, and `--deny-subnets` adds to them.
 pub(crate) fn effective_egress(
     project: Option<boxes::EgressPolicy>,
     flags: Option<boxes::EgressPolicy>,
@@ -708,32 +706,22 @@ pub(crate) fn effective_egress(
     if project.is_none() && flags.is_none() && !deny_all_flag {
         return EffectiveEgress::default();
     }
-    let mut project = project.unwrap_or_default();
+    let project = project.unwrap_or_default();
     let flags = flags.unwrap_or_default();
     let mut sources = Vec::new();
-    if deny_all_flag {
-        project.allow_subnets = Some(Vec::new());
-        project.allow_dns_hosts = Some(Vec::new());
-    }
     // A list key: the file's values, then each flag value not already
-    // there. `deny_all` marks the two lists `--deny-all-egress` emptied,
-    // which the flag, not the file, set.
+    // there.
     let mut add = |field: &'static str,
                    file: Option<Vec<String>>,
-                   flag: Option<Vec<String>>,
-                   emptied: bool|
+                   flag: Option<Vec<String>>|
      -> Option<Vec<String>> {
-        if emptied {
-            sources.push((field, EgressSource::Flag));
-        } else if file.is_some() {
+        if file.is_some() {
             sources.push((field, EgressSource::ProjectFile));
         }
         let Some(flag) = flag else {
             return file;
         };
-        if !emptied {
-            sources.push((field, EgressSource::Flag));
-        }
+        sources.push((field, EgressSource::Flag));
         let mut list = file.unwrap_or_default();
         for value in flag {
             if !list.contains(&value) {
@@ -742,25 +730,19 @@ pub(crate) fn effective_egress(
         }
         Some(list)
     };
-    let allow_subnets = add(
-        FIELDS[0],
-        project.allow_subnets,
-        flags.allow_subnets,
-        deny_all_flag,
-    );
-    let allow_dns_hosts = add(
-        FIELDS[1],
-        project.allow_dns_hosts,
-        flags.allow_dns_hosts,
-        deny_all_flag,
-    );
-    let deny_subnets = add(FIELDS[3], project.deny_subnets, flags.deny_subnets, false);
-    let grants_nothing = allow_subnets.as_ref().is_some_and(Vec::is_empty)
-        && allow_dns_hosts.as_ref().is_some_and(Vec::is_empty);
+    let (allow_subnets, allow_dns_hosts) = if deny_all_flag {
+        (Some(Vec::new()), Some(Vec::new()))
+    } else {
+        (
+            add(FIELDS[0], project.allow_subnets, flags.allow_subnets),
+            add(FIELDS[1], project.allow_dns_hosts, flags.allow_dns_hosts),
+        )
+    };
+    let deny_subnets = add(FIELDS[3], project.deny_subnets, flags.deny_subnets);
     let allow_protocols = if flags.allow_protocols.is_some() {
         sources.push((FIELDS[2], EgressSource::Flag));
         flags.allow_protocols
-    } else if deny_all_flag && grants_nothing {
+    } else if deny_all_flag {
         sources.push((FIELDS[2], EgressSource::Flag));
         Some(Vec::new())
     } else {
@@ -769,6 +751,10 @@ pub(crate) fn effective_egress(
         }
         project.allow_protocols
     };
+    if deny_all_flag {
+        sources.push((FIELDS[0], EgressSource::Flag));
+        sources.push((FIELDS[1], EgressSource::Flag));
+    }
     sources.sort_by_key(|(field, _)| FIELDS.iter().position(|f| f == field));
     EffectiveEgress {
         policy: Some(boxes::EgressPolicy {
@@ -2043,8 +2029,7 @@ pub(crate) fn flag_egress(
     // Any rule flag makes the declaration; a field with no values stays
     // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
     // records an allow-all policy that denies one range. `--deny-all-egress`
-    // is not a rule: [`effective_egress`] applies it to the file's lists
-    // before these flags add theirs.
+    // is not a rule: [`effective_egress`] applies it to the file's lists.
     let has_egress = !args.allow_subnets.is_empty()
         || !allow_protocols.is_empty()
         || !args.allow_dns_hosts.is_empty()
@@ -5453,13 +5438,14 @@ mod tests {
             Some(boxes::EgressPolicy::deny_all())
         );
 
-        // `--deny-all-egress` applies before the allow flags: the file's
-        // two destination lists go, and the flags' values are all that is
-        // allowed. The file's protocols and deny ranges stay.
+        // `--deny-all-egress` only narrows: it empties the file's allow
+        // lists, `--allow-protocols` replaces the protocols, and
+        // `--deny-subnets` adds to the file's denies.
         let narrowed = effective_egress(
             project,
             Some(boxes::EgressPolicy {
-                allow_dns_hosts: Some(vec!["api.example".into()]),
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                deny_subnets: Some(vec!["10.0.0.0/8".into()]),
                 ..boxes::EgressPolicy::default()
             }),
             true,
@@ -5468,9 +5454,9 @@ mod tests {
             narrowed.policy,
             Some(boxes::EgressPolicy {
                 allow_subnets: Some(vec![]),
-                allow_dns_hosts: Some(vec!["api.example".into()]),
-                allow_protocols: Some(vec![boxes::IpProto::Udp]),
-                deny_subnets: Some(vec!["169.254.169.254/32".into()]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                deny_subnets: Some(vec!["169.254.169.254/32".into(), "10.0.0.0/8".into()]),
             })
         );
     }

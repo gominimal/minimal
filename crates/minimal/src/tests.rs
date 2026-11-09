@@ -1726,8 +1726,8 @@ fn parse_run(noun: &str, args: &[&str]) -> Result<task::RunEntry, clap::Error> {
 
 /// NET-060: `min task run` and `min box run` take `min session
 /// activate`'s `--network` flag and egress flags from the same definitions:
-/// they parse before or after the entry name, `--deny-all-egress`
-/// combines with every rule flag (arch#166), and a flag after `--` is the
+/// they parse before or after the entry name, `--deny-all-egress` refuses
+/// the two allow flags (arch#166, NET-140), and a flag after `--` is the
 /// entry's argument. A network flag after an entry argument is refused
 /// before the run creates anything.
 fn run_parses_network_and_egress_flags(noun: &str) {
@@ -1769,18 +1769,32 @@ fn run_parses_network_and_egress_flags(noun: &str) {
     assert!(a.egress.deny_all_egress);
     assert!(a.args.is_empty());
 
-    // `--deny-all-egress` combines with the rule flags.
+    // `--deny-all-egress` combines with the flags that only narrow, and
+    // refuses the two that would widen it.
     let a = run_args(&[
         "--deny-all-egress",
-        "--allow-dns-hosts",
-        "api.example",
+        "--allow-protocols",
+        "tcp",
         "--deny-subnets",
         "10.0.0.0/8",
         "build",
     ]);
     assert!(a.egress.deny_all_egress);
-    assert_eq!(a.egress.allow_dns_hosts, ["api.example"]);
+    assert_eq!(a.egress.allow_protocols, ["tcp"]);
     assert_eq!(a.egress.deny_subnets, ["10.0.0.0/8"]);
+    for (flag, value) in [
+        ("--allow-subnets", "0.0.0.0/0"),
+        ("--allow-dns-hosts", "api.example"),
+    ] {
+        let err = parse_run(noun, &["--deny-all-egress", flag, value, "build"])
+            .map(|_| ())
+            .expect_err("--deny-all-egress refuses an allow flag");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{flag}"
+        );
+    }
 
     // After `--`, a flag's name is the entry's argument.
     let a = run_args(&["build", "--", "--network", "x"]);
@@ -3335,7 +3349,7 @@ async fn proxy_exits_when_the_daemon_closes_the_socket() {
 /// `--ingress`, which neither verb takes yet (#3163), and says the box
 /// takes the task's `network.mode` with no flag. Both verbs' help says a
 /// list egress flag adds to minimal.toml's list and `--deny-all-egress`
-/// applies first (arch#166, #3143). `min session activate --network` keeps
+/// refuses the two allow flags (arch#166, #3143). `min session activate --network` keeps
 /// the session wording.
 #[test]
 fn task_run_help_describes_the_task_box_network() {
@@ -3384,7 +3398,7 @@ fn task_run_help_describes_the_task_box_network() {
             "Adds to the `allow_subnets` that minimal.toml declares for the box",
             "Adds to the `deny_subnets` that minimal.toml",
             "Replaces the `allow_protocols` that minimal.toml declares",
-            "Applied before the other egress flags",
+            "Cannot be combined with `--allow-subnets` or `--allow-dns-hosts`",
         ] {
             assert!(
                 help.split_whitespace()
@@ -3569,47 +3583,54 @@ fn network_parser_round_trips_every_mode_word() {
     }
 }
 
-/// `--deny-all-egress` combines with every egress rule flag at parse
-/// (arch#166): it applies first, emptying the allow lists of
-/// `minimal.toml`, and the rule flags then add theirs, so `--deny-all-egress
-/// --allow-dns-hosts api.example` allows exactly that host. It also
+/// `--deny-all-egress` can only narrow (arch#166, NET-140): at parse it
+/// refuses `--allow-subnets` and `--allow-dns-hosts`, naming both flags,
+/// and combines with `--deny-subnets` and `--allow-protocols`, on `min
+/// session activate`, `min task run` and `min box run` alike. It also
 /// combines with `--credentialed-upstream` (NET-134): the proxy listener
 /// is infrastructure, the machine-internal analogue of the fabric pin's
 /// infrastructure set, so a deny-all box may still declare the lane.
 #[test]
-fn deny_all_egress_combines_with_every_egress_flag() {
+fn deny_all_egress_refuses_the_allow_flags() {
     use clap::Parser as _;
 
-    for (rule, value) in [
-        ("--allow-subnets", "10.0.0.0/8"),
-        ("--allow-dns-hosts", "github.com"),
-        ("--allow-protocols", "tcp"),
-        ("--deny-subnets", "0.0.0.0/0"),
+    for verb in [
+        &["session", "activate"][..],
+        &["task", "run"],
+        &["box", "run"],
     ] {
-        let args = Cli::try_parse_from([
-            "min",
-            "session",
-            "activate",
-            "--deny-all-egress",
-            rule,
-            value,
-        ])
-        .unwrap_or_else(|err| panic!("--deny-all-egress must combine with {rule}: {err}"));
-        match args.command {
-            Some(Command::Session(SessionArgs {
-                command: SessionCommand::Activate(a),
-            })) => {
-                assert!(a.egress.deny_all_egress);
-                assert_ne!(
-                    a.egress,
-                    EgressArgs {
-                        deny_all_egress: true,
-                        ..EgressArgs::default()
-                    },
-                    "{rule} must land on the args"
-                );
-            }
-            _ => panic!("expected an activate command"),
+        let line = |rest: &[&'static str]| {
+            ["min"]
+                .iter()
+                .chain(verb)
+                .copied()
+                .chain(rest.iter().copied())
+                .chain(verb.iter().filter(|w| **w == "run").map(|_| "build"))
+                .collect::<Vec<_>>()
+        };
+        for (rule, value) in [
+            ("--allow-subnets", "10.0.0.0/8"),
+            ("--allow-dns-hosts", "github.com"),
+        ] {
+            let err = Cli::try_parse_from(line(&["--deny-all-egress", rule, value]))
+                .map(|_| ())
+                .expect_err("--deny-all-egress must refuse an allow flag");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{verb:?} {rule}: {err}"
+            );
+            let rendered = err.to_string();
+            assert!(rendered.contains("--deny-all-egress"), "{rendered}");
+            assert!(rendered.contains(rule), "{rendered}");
+        }
+        for (rule, value) in [
+            ("--allow-protocols", "tcp"),
+            ("--deny-subnets", "0.0.0.0/0"),
+        ] {
+            Cli::try_parse_from(line(&["--deny-all-egress", rule, value])).unwrap_or_else(|err| {
+                panic!("{verb:?}: --deny-all-egress must combine with {rule}: {err}")
+            });
         }
     }
 

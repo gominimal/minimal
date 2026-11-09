@@ -977,10 +977,10 @@ pub enum TaskCommand {
     /// `[defaults]`, `[defaults.task]` or the task's own entry.
     /// `--allow-subnets`, `--allow-dns-hosts` and `--deny-subnets` add to
     /// the file's lists, and `--allow-protocols` replaces its list.
-    /// `--deny-all-egress` applies first: it drops the file's
-    /// `allow_subnets` and `allow_dns_hosts`, and the allow flags then add
-    /// theirs. On a host that runs boxes in a VM, which every macOS host
-    /// is, `own_ip` is refused.
+    /// `--deny-all-egress` drops the file's `allow_subnets` and
+    /// `allow_dns_hosts`, and cannot be combined with `--allow-subnets` or
+    /// `--allow-dns-hosts`. On a host that runs boxes in a VM, which every
+    /// macOS host is, `own_ip` is refused.
     ///
     /// This command's flags go before the task's own arguments. A network
     /// or egress flag after a task argument is refused. A task argument
@@ -1286,7 +1286,7 @@ pub struct ActivateArgs {
 // `min task run` and `min box run` take them from this one definition.
 // `effective_egress` applies them to the egress minimal.toml declares
 // (arch#166, #3143): a list flag adds, `--allow-protocols` replaces, and
-// `--deny-all-egress` applies first and combines with every other flag.
+// `--deny-all-egress` only narrows, so it refuses the two allow flags.
 //
 // Deliberately NOT a doc comment: clap propagates a flattened struct's doc
 // comment into the parent command's long_about.
@@ -1324,16 +1324,18 @@ pub struct EgressArgs {
     /// declares for the box, so it never drops a range the file denies.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
-    /// Declare deny-all egress: drop every `allow_subnets` and
-    /// `allow_dns_hosts` value minimal.toml declares for the box. Applied
-    /// before the other egress flags, so `--deny-all-egress
-    /// --allow-dns-hosts api.example` allows exactly `api.example`, and
-    /// alone it leaves the box no external address. The file's
-    /// `deny_subnets` stay. Unless the host opts out, a `--network own_ip`
-    /// box with no egress rules already reaches no external address. With
-    /// `--network host_ip` it is enforced only on a host that can filter
-    /// each box.
-    #[arg(long = "deny-all-egress")]
+    /// Declare deny-all egress: the box reaches no external address. Drops
+    /// every `allow_subnets` and `allow_dns_hosts` value minimal.toml
+    /// declares for the box. Cannot be combined with `--allow-subnets` or
+    /// `--allow-dns-hosts`. The file's `deny_subnets` stay, and
+    /// `--deny-subnets` and `--allow-protocols` still apply. Unless the
+    /// host opts out, a `--network own_ip` box with no egress rules already
+    /// reaches no external address. With `--network host_ip` it is enforced
+    /// only on a host that can filter each box.
+    #[arg(
+        long = "deny-all-egress",
+        conflicts_with_all = ["allow_subnets", "allow_dns_hosts"]
+    )]
     pub deny_all_egress: bool,
 }
 

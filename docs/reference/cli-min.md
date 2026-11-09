@@ -140,14 +140,15 @@ the current directory).
 | `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Adds to the `allow_dns_hosts` that `minimal.toml` declares. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
 | `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant. Replaces the `allow_protocols` that `minimal.toml` declares |
 | `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. Adds to the `deny_subnets` that `minimal.toml` declares, so it never drops a range the file denies. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
-| `--deny-all-egress` | | Drop every `allow_subnets` and `allow_dns_hosts` value that `minimal.toml` declares. It applies before the other egress flags, so `--deny-all-egress --allow-dns-hosts api.example` allows exactly `api.example`, whatever the file says. The file's `deny_subnets` stay. Alone, it writes the deny-all `egress` section, every allow list present and empty, and the box reaches no external address. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box gets deny-all by default when it does not declare egress by flag or in its `minimal.toml` (see below) |
+| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Drops every `allow_subnets` and `allow_dns_hosts` value that `minimal.toml` declares, and writes the deny-all `egress` section, every allow list present and empty. The file's `deny_subnets` stay. Combines with `--deny-subnets` and `--allow-protocols`, which only narrow, and conflicts with `--allow-subnets` and `--allow-dns-hosts`. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box gets deny-all by default when it does not declare egress by flag or in its `minimal.toml` (see below) |
 
 Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
 declaration. Naming one of them stores it on the session, and `min session
 policy` shows what the session ended up with. The flags apply to the
 `network.egress` keys that `minimal.toml` declares for the box: a list flag
 adds its values to the file's list, and `--allow-protocols` replaces it.
-`--deny-all-egress` applies first and combines with the other flags.
+`--deny-all-egress` can only narrow, so it cannot combine with
+`--allow-subnets` or `--allow-dns-hosts`.
 
 An unset `--allow-subnets` or `--allow-dns-hosts` inside a declaration
 grants nothing, whatever the box's network mode. This changes

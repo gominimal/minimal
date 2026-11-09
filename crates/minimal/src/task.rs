@@ -2982,12 +2982,12 @@ mod tests {
         );
     }
 
-    /// arch#166: `--deny-all-egress` applies first. It empties the file's
-    /// `allow_subnets` and `allow_dns_hosts`, the allow flags then add
-    /// theirs, and the file's `deny_subnets` stays, so the result allows
-    /// exactly what the flags name whatever the file says.
+    /// arch#166, NET-140: `--deny-all-egress` only narrows. It empties the
+    /// file's `allow_subnets` and `allow_dns_hosts`, `--allow-protocols`
+    /// replaces the protocols, and the file's `deny_subnets` stays with the
+    /// flag's added.
     #[test]
-    fn task_box_network_deny_all_then_allow_flags() {
+    fn task_box_network_deny_all_only_narrows() {
         let (_dir, project) = project_with(
             "[tasks.build]\nexec = 'true'\n\n\
              [tasks.build.network.egress]\n\
@@ -3009,14 +3009,14 @@ mod tests {
         assert_eq!(
             run(crate::EgressArgs {
                 deny_all_egress: true,
-                allow_dns_hosts: vec!["api.example".into()],
+                allow_protocols: vec!["tcp".into()],
                 deny_subnets: vec!["10.0.0.0/8".into()],
                 ..crate::EgressArgs::default()
             }),
             Some(boxes::EgressPolicy {
                 allow_subnets: Some(vec![]),
-                allow_dns_hosts: Some(vec!["api.example".into()]),
-                allow_protocols: None,
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 deny_subnets: Some(vec!["169.254.169.254/32".into(), "10.0.0.0/8".into()]),
             })
         );
@@ -3051,15 +3051,15 @@ mod tests {
             refusal(
                 &project,
                 crate::EgressArgs {
-                    allow_dns_hosts: vec!["github.com".into()],
+                    deny_subnets: vec!["10.0.0.0/8".into()],
                     deny_all_egress: true,
                     ..crate::EgressArgs::default()
                 }
             ),
             format!(
-                "{daemon} The box's egress rules come from --allow-dns-hosts and \
+                "{daemon} The box's egress rules come from --deny-subnets and \
                  --deny-all-egress. Run it with --network host_ip or --network own_ip, or \
-                 without --allow-dns-hosts and --deny-all-egress."
+                 without --deny-subnets and --deny-all-egress."
             )
         );
         for (body, layer) in [
