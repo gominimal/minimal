@@ -184,26 +184,14 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- event-driven; the ruling on gominimal/minimal#2878, option 1. `--repo-dir` is the long form of the global `-C`, so it selects the project for every form: `min box spec --repo-dir <dir> <entry>` renders `<entry>` of the project in `<dir>` (BCLI-022) -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_repo_dir_renders_bep_rows
-  - WHERE `min box spec` renders BEP-038's rows, with no argument or through the bare-directory alias, WHEN it runs with `--network <mode>` THE SYSTEM SHALL render the rows for a box of that network mode, and refuse a spec with exit 3 where a box created with that mode is refused.
-    <!-- event-driven with a precondition; keeps the documented `min box spec [--network <mode>] [PATH]` behaviour of `docs/reference/cli-min.md`, so `min box spec --network own_ip ./project` keeps its output through the alias window. The project form takes no other override flag -->
+  - WHERE `min box spec` renders BEP-038's rows, with no argument, WHEN it runs with `--network <mode>` THE SYSTEM SHALL render the rows for a box of that network mode, and refuse a spec with exit 3 where a box created with that mode is refused.
+    <!-- event-driven with a precondition; keeps the `--network` of the documented `min box spec [--network <mode>] [PATH]` (`docs/reference/cli-min.md`), so `min box spec --network own_ip --repo-dir ./project` gives what `min box spec --network own_ip ./project` gives today. The project form takes no other override flag -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_project_form_network_flag_sets_mode
-  - IF `min box spec` renders BEP-038's rows, with no argument or through the bare-directory alias, and gets an override flag of BCLI-024 other than `--network`, or `--loadout`, `--no-loadouts` or `--no-hooks`, THEN THE SYSTEM SHALL fail with exit 2, naming the flag. It SHALL render nothing.
+  - IF `min box spec` renders BEP-038's rows, with no argument, and gets an override flag of BCLI-024 other than `--network`, or `--loadout`, `--no-loadouts` or `--no-hooks`, THEN THE SYSTEM SHALL fail with exit 2, naming the flag. It SHALL render nothing.
     <!-- unwanted; the same refusal the box form gives (BCLI-022): only the entry form takes the override flags, and the project form keeps only the `--network` it takes today -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_project_form_other_override_flag_exit2
-  - WHERE `min box spec` runs without `--repo-dir`, and its argument names no entry of the current project and is a directory, THE SYSTEM SHALL render BEP-038's rows for the project there, as a hidden alias of `--repo-dir <dir>`. The alias SHALL print one stderr hint naming `min box spec --repo-dir <dir>` after the command ends. It SHALL leave `-o json` output unchanged. The alias SHALL last one release after `scripts/session-e2e.sh` uses `--repo-dir` (Rollout).
-    <!-- optional-feature; the one-release alias the ruling on gominimal/minimal#2878 keeps for the bare directory form; an entry wins over a directory of the same name from the first release, which is the collision the ruling removes. With `--repo-dir`, the caller has already named the project, so the argument is an entry of that project, else a box, and never a directory (BCLI-022) -->
-    tier:   T0
-    verify: cargo nextest run -p minimal box_spec_bare_directory_alias_hints_repo_dir
-  - WHEN the window of the bare-directory alias has ended THE SYSTEM SHALL never read the argument of `min box spec` as a directory. It SHALL read it as an entry, else as a box address, so a box keeps its name when a directory has the same name. 
-    <!-- event-driven; the ruling on gominimal/minimal#2878: a bare argument is an entry, else a box -->
-    tier:   T0
-    verify: cargo nextest run -p minimal box_spec_after_alias_window_argument_is_entry_else_box
-  - IF, after that window, the argument resolves to no entry and no box and names a directory, THEN THE SYSTEM SHALL fail with BCLI-064's exit 4. Its hint SHALL name `min box spec --repo-dir <dir>` with that directory.
-    <!-- unwanted; the caller of an old path call learns the new spelling, and a box that has the name is never shadowed by the hint -->
-    tier:   T0
-    verify: cargo nextest run -p minimal box_spec_after_alias_window_directory_exit4_hints_repo_dir
   - WHEN `min box spec <entry>` runs with an override flag of BCLI-024, `--loadout`, `--no-loadouts` (BCLI-075) or `--no-hooks` (BCLI-076) THE SYSTEM SHALL pass it to BOX-064's command-line override layer exactly as `min box start` does. Its expanded spec SHALL have the same BOX-065 bytes as the spec `min box start` sends with the same flags. The comparison excludes the `-o` format and the layer and type beside each value.
     <!-- event-driven; the architecture's `min box spec <entry>` line and layer 7 of its expansion order (gominimal/arch#166): the pre-flight render is what the host receives -->
     tier:   T0
@@ -212,8 +200,8 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 - **BCLI-022** WHEN `min box spec <box>` addresses a box (BCLI-002) THE SYSTEM SHALL render the spec stored in that box's record.
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_box_renders_stored_copy
-  - WHEN `min box spec` runs with an argument THE SYSTEM SHALL read it as an entry of the project that `--repo-dir` names, else of the current one, else as a box address. During the window of BCLI-021's bare-directory alias, and without `--repo-dir`, a directory that names no entry takes that alias before the box lookup.
-    <!-- event-driven; the ruling on gominimal/minimal#2878: a bare argument is an entry, else a box -->
+  - WHEN `min box spec` runs with an argument THE SYSTEM SHALL read it as an entry of the project that `--repo-dir` names, else of the current one, else as a box address. It SHALL never read the argument as a directory.
+    <!-- event-driven; the ruling on gominimal/minimal#2878: a bare argument is an entry, else a box. The owner confirmed on 2026-11-09 that the bare directory form gets no alias: the directory form is only `-C` / `--repo-dir`. So a box keeps its name when a directory has the same name -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_argument_entry_then_box
   - IF `min box spec` gets an override flag of BCLI-024, `--loadout`, `--no-loadouts` or `--no-hooks`, and its argument resolves to a box, THEN THE SYSTEM SHALL fail with exit 2, naming the flag. It SHALL render nothing.
@@ -509,7 +497,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- the reference-reading test form NET-036 and NET-111 use; the justfile has no doc-check recipe -->
   tier:     T0
   verify:   cargo nextest run -p minimal cli_reference_documents_box_grammar
-  - THE SYSTEM SHALL name BCLI-046's `local-minimald` alias and BCLI-021's bare-directory alias, each with its replacement and removal release, only in one migration note in `docs/reference` and `docs/concepts`.
+  - THE SYSTEM SHALL name BCLI-046's `local-minimald` alias, with its replacement `local` and its removal in 0.9, only in one migration note in `docs/reference` and `docs/concepts`.
     tier:   T0
     verify: cargo nextest run -p minimal docs_name_aliases_only_in_one_migration_note
 
@@ -517,7 +505,8 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- one provider per local deployment style, and hosts carry the instance names (gominimal/arch#45) -->
   tier:     T0
   verify:   cargo nextest run -p minimal local_provider_and_host_names
-  - WHERE a command runs with `--provider local-minimald` THE SYSTEM SHALL read it as `local` for one release and print one stderr hint naming `local` after the command ends. After that release, the value SHALL fail with exit 2 and the same hint.
+  - WHERE a command runs with `--provider local-minimald` THE SYSTEM SHALL read it as `local` and print one stderr hint naming `local` after the command ends, in every release before 0.9. Release 0.9 removes the alias.
+    <!-- optional-feature; the owner ruled on 2026-11-09 that shipped compatibility windows stay and are removed on schedule in 0.9 -->
     tier:   T0
     verify: cargo nextest run -p minimal local_minimald_alias_reads_as_local
 
@@ -577,11 +566,11 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **A secret is never rendered, in any output mode.** BCLI-063 is T1, with a property over every output mode and every secret-bearing field. The invariant is a universal. One example test leaves every untested mode free to leak.
 
-**The old session verbs are removed, with no alias.** The owner ruled on 2026-11-09 that the old spellings go with no alias and no window, against compatibility shims for unfinished work. So `min session activate|destroy|exec|rename|policy|hooks|run`, `min task run --path` and bare `min stop` are not commands (BCLI-042). Each fails as any unknown command fails, with exit 2. `min session list`, `min session attach` (BCLI-032) and the filtered type-noun verbs (BCLI-030) are part of the grammar, not aliases, and stay. The shipped `--provider local-minimald` alias stays for its one release (BCLI-046). T31 (gominimal/minimal#2917) removes the verbs and moves every caller in the same PR (Rollout).
+**The old session verbs are removed, with no alias.** The owner ruled on 2026-11-09 that the old spellings go with no alias and no window, against compatibility shims for unfinished work. So `min session activate|destroy|exec|rename|policy|hooks|run`, `min task run --path` and bare `min stop` are not commands (BCLI-042). Each fails as any unknown command fails, with exit 2. `min session list`, `min session attach` (BCLI-032) and the filtered type-noun verbs (BCLI-030) are part of the grammar, not aliases, and stay. The shipped `--provider local-minimald` alias stays until 0.9, which removes it (BCLI-046). T31 (gominimal/minimal#2917) removes the verbs and moves every caller in the same PR (Rollout).
 
 **The create-time flags live on in `min session start`.** This spec takes the architecture's command tree verbatim, apart from the daily shortcuts. It adds `min box rename`, `min box attach` (BCLI-068), `min box exec --timeout` (BCLI-053), `--name` on the create verbs (BCLI-069) and `min host stop`. It also adds `min box prune --dry-run` (BCLI-006) and the create-time overrides: a flag for each `[network]` key and `--deny-all-egress` (BCLI-024), `--no-loadouts` (BCLI-075) and `--no-hooks` (BCLI-076). `min box spec <entry>` accepts those overrides too, so the pre-flight render is what the daemon receives (BCLI-021). The architecture has every one of them (gominimal/arch#117, gominimal/arch#124, gominimal/arch#166). So each flag of today's `session activate` has a home on `min session start`, except `--sync` (Non-goals). The architecture's `min box prune` has no `--stopped` (gominimal/arch#112), so BCLI-061 does not accept it.
 
-**An alias hint follows the command, never an attached terminal.** A line before an attached shell goes under its prompt, or mixes with its output in the PTY stream. So the hints of BCLI-021 and BCLI-046 print after the command ends and the shell gives the terminal back. The caller then reads it at their own prompt. `--provider local-minimald` is a global flag, and the same rule keeps its hint off a healthy `min session start`.
+**An alias hint follows the command, never an attached terminal.** A line before an attached shell goes under its prompt, or mixes with its output in the PTY stream. So the hint of BCLI-046 prints after the command ends and the shell gives the terminal back. The caller then reads it at their own prompt. `--provider local-minimald` is a global flag, and the same rule keeps its hint off a healthy `min session start`.
 
 **The exec id never enters the exec's stdout.** `min box exec -t` prints the exec id to stderr, so stdout has only the exec's output. `--detach` has no other output, so it prints only the id on stdout. `min box show <box>` lists the live execs (BCLI-053, BCLI-067). The id stays off stdout under `-t`. There it ends up in the attached PTY stream and in any transcript that wraps it. That breaks the architecture's payload-only stdout (design principle 4).
 
@@ -601,7 +590,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **One provider per local deployment style, with hosts named after the instances.** The architecture names one provider per local deployment style (gominimal/arch#45). The `0..N` suffix is the state-directory convention, so it names hosts, not providers. `local` serves the native daemons on this machine, `local-minvmd` serves its VMs, and `local-box` serves the parent daemon of the box `min` runs in. `local-minvmd/local-minvmd0/<box>` is a box on the first VM. The architecture's global `--host` flag names a host too, and it arrives with the global flags (Non-goals). `local-minvmd` is a canonical provider name and does not expire, so NET-049, NET-051 and TEL-034 cite the right spelling. `local-box` exists only inside a box, which needs nesting (Non-goals), so BCLI-052 lists it only where it is present. A local host's endpoint is `unix:<path>` with port 0. The socket's file mode is its access control, as §3 of the Box Provider API states.
 
-**`min box spec` moves its path form to `--repo-dir` and adds the entry and box forms.** `min box spec [path]` renders the Box Egress Proxy rows for a project (BEP-038). This spec adds the architecture's `<entry>` and `<box>` forms and `-o` (BCLI-021, BCLI-022). A positional argument is an entry of the current project, else a box. The path form moves to `--repo-dir <dir>`, or the global `-C <dir>`, as the ruling on gominimal/minimal#2878 decides. Under a directory first rule, an entry such as `docs` or `scripts` cannot be reached by its own name. The bare directory form stays as a hidden alias for one release, with a hint naming `--repo-dir`. During that window, an argument that names no entry and is a directory takes the alias before the box lookup. So an existing `min box spec <path>` call keeps its output and never waits on a host lookup. The exception is a path whose name is also an entry, such as `docs`. That call renders the entry from the first release, with no alias hint, and must move to `--repo-dir <dir>`. After the window, a bare argument is never a path, so a box keeps its name when a directory has the same name. The entry form shows BEP-038's rows inside the expanded spec, beside the values they come from. Only the entry form takes the override flags. The project form keeps the `--network <mode>` it takes today (BCLI-021). The box form renders the spec as stored, and an override flag there is exit 2 (BCLI-022).
+**`min box spec` moves its path form to `--repo-dir` and adds the entry and box forms.** `min box spec [path]` renders the Box Egress Proxy rows for a project (BEP-038). This spec adds the architecture's `<entry>` and `<box>` forms and `-o` (BCLI-021, BCLI-022). A positional argument is an entry of the current project, else a box. The path form moves to `--repo-dir <dir>`, or the global `-C <dir>`, as the ruling on gominimal/minimal#2878 decides. Under a directory first rule, an entry such as `docs` or `scripts` cannot be reached by its own name. The bare directory form gets no alias, as the owner confirmed on 2026-11-09. A bare argument is never a path, so a box keeps its name when a directory has the same name. With `--repo-dir P`, an argument is an entry of `P`, else a box (BCLI-022). Each existing `min box spec <path>` call moves to `--repo-dir <path>` in the same change (Rollout). The entry form shows BEP-038's rows inside the expanded spec, beside the values they come from. Only the entry form takes the override flags. The project form keeps the `--network <mode>` it takes today (BCLI-021). The box form renders the spec as stored, and an override flag there is exit 2 (BCLI-022).
 
 **`min host show` names the host-side socket only.** On the VM provider it is the host-side socket the client connects to (BCLI-048). The in-VM path is an in-VM fact the client never uses, so `min host show` leaves it out.
 
@@ -638,7 +627,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 - Bare `min stop`: TEL-011, and the installer's R5.5. The installer, `scripts/install.sh`, runs `min stop` and matches its refusal for live sessions by message. Without that match it runs `min stop --force`. `min host stop` does not refuse while boxes run (BCLI-049). So the installer moves to `min host stop` with a running-box check of its own, and keeps its choice of a forced stop. The end-to-end scripts `scripts/session-e2e.sh`, `scripts/stress-session-e2e.sh` and `scripts/bulk-upload-e2e.sh`, and the installer's tests in `scripts/install_test.sh`, call `min stop` too.
 - `docs/reference` and `docs/concepts`: every page that names one of these spellings.
 
-**BCLI-021's bare-directory alias waits on one script.** `scripts/session-e2e.sh` renders the Box Egress Proxy demo project as `min box spec "$GRANT_SEED_DIR"`. No requirement uses the bare directory form. The alias lasts one release after that script uses `--repo-dir`.
+**`scripts/session-e2e.sh` moves to `--repo-dir` with BCLI-021.** The script renders the Box Egress Proxy demo project as `min box spec "$GRANT_SEED_DIR"`. No requirement uses the bare directory form. The change that implements BCLI-021 and BCLI-022 moves the script to `min box spec --repo-dir "$GRANT_SEED_DIR"`, because the bare form has no alias.
 
 ## Open questions
 
