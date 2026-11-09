@@ -1206,8 +1206,8 @@ pub(crate) mod linux {
                         } else {
                             "the step that enforces deny-all egress is installed but its \
                              systemd units are missing or not enabled, so a daemon restart \
-                             can leave deny-all boxes refused, and a reboot can leave \
-                             deny-all egress not enforced"
+                             can leave deny-all boxes running unenforced, and a reboot can \
+                             leave deny-all egress not enforced"
                                 .to_string()
                         },
                         format!(
@@ -3353,13 +3353,14 @@ mod tests {
             sock,
         );
         assert_eq!(unitless.state, ItemState::Missing, "{unitless:?}");
-        // An unplaced daemon refuses a deny-all box (the probe cannot read
-        // the table); only the reboot, which loses the tree, runs it unenforced.
-        // Any one missing unit or link lands here, so the sentence says "can".
+        // An unplaced daemon places no box, so its deny-all box runs
+        // unenforced (gominimal/minimal#3067), and so does one after a reboot
+        // that loses the tree. Any one missing unit or link lands here, so the
+        // sentence says "can".
         let today = unitless.today.as_deref().unwrap();
         for words in [
             "units are missing or not enabled",
-            "a daemon restart can leave deny-all boxes refused",
+            "a daemon restart can leave deny-all boxes running unenforced",
             "a reboot can leave deny-all egress not enforced",
         ] {
             assert!(today.contains(words), "{unitless:?}");

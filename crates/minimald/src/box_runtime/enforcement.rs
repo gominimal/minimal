@@ -374,9 +374,13 @@ pub(crate) async fn re_read_classifier_fact(
 ) -> std::io::Result<(Option<String>, crate::net::classifier::Decision)> {
     crate::traced::spawn_blocking(move || {
         let mountinfo = launch_mountinfo(mountinfo_knob);
+        // An unplaced native daemon places no box and so refuses none: its
+        // probe cause is re-spelled as its placement, so the fact and the
+        // advisory say the box runs unenforced (gominimal/minimal#3067).
         let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
             classifier_reading(&root, guest)
-        });
+        })
+        .over_daemon_placement(guest, crate::net::classifier::daemon_unplaced(&root));
         set_host_ip_enforcement_fact(&decision);
         (mountinfo, decision)
     })
