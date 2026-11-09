@@ -48,7 +48,7 @@ Classes:
 | --- | --- | --- | --- | --- |
 | 1 hazard | 9 | 6 | 2 | 1 |
 | 2 safe | 17 | - | - | - |
-| 3 unsure / accepted | 9 | - | - | 9 |
+| 3 unsure / accepted | 10 | - | - | 10 |
 
 One row can cover several tests that share a helper or a shape, so the
 counts are rows, not tests.
@@ -80,6 +80,7 @@ counts are rows, not tests.
 | minimald | `net::listeners` restart tests (`listener_close_withdraws_publication` and three more that rebind `0.0.0.0:<port>` after dropping a listener) | Rebinding a port the test just dropped | The rebind is the behaviour under test (a fresh listener on the same port republishes). The port is ephemeral and the window is one poll |
 | minvmd | `cmd::run::tests::draw_skips_the_answerer_hook_port_while_free` | Premise `!loopback_answers(7656)`: a TCP dial to the host's real `127.0.0.1:7656` | Nothing in Minimal listens on TCP 7656 (the answerer is UDP), so the premise fails only if some foreign program holds TCP 7656, and it fails loudly with that message. The draw itself never probes 7656, because the reserved-set check runs first |
 | minvmd | `tests/*_integration.rs` VM boots (`boot`, `egress_allowlist`, `guest_classifier`, `minimald_session`, `otel`, `otel_vsock`, `resource_vm`, `supervision`, `vm_escape`, `volume_quiesce`, `named_vm`) | A real `minvmd` assigns the node proxy at 7654 first and runs the host answerer at 7656 and the global channel | They get their own state dirs and `HOME`, and run in the `vm` nextest profile one at a time. They deliberately exercise the defaults the session e2e depends on, so the isolation belongs to the lane (its own netns or runner), not to a seam |
+| minimald | `guest` (handed proxy port token tests) and `server/tests.rs` (`HANDED_PROXY_PORT_TOKEN`) | `set_var` on one variable from two modules of one test binary | Safe under nextest, which CI and the lab run. `just test-cross` runs `cross test` on `minimald`, a threaded `cargo test`, where the two race and either can fail. Fixing it means an `ENV_LOCK` shared by the two modules, left for a follow-up |
 
 ## Class 2: safe
 
@@ -98,7 +99,7 @@ counts are rows, not tests.
 | minimald | `diag` bundle tests | Bundle reads `/proc/net/route`, `fib_trie`, `unix` | Assert that sections are present, not what they contain |
 | minimald, mlog, bep | `/proc/self/fd`, `/proc/self/fdinfo`, `/proc/<own child>/stat` | procfs | This process or its own children |
 | minimald, minvmd, paths, check, switch | Env tests with `ENV_LOCK` or `UDS_ENV_LOCK` (`logging`, `image`, `sock`, `switch`, `check` sources and outputs, `paths` XDG config) and `#[serial]` (`mip`) | `set_var` | Locked |
-| minimald, minvmd, minimal-client, paths, mlog | Env tests without a lock: `guest` (handed port and egress opt-out tokens), `server/tests.rs` (`HANDED_PROXY_PORT_TOKEN`), `connection` (`RelayPathGuard`), `minvmd cmd::run` (`MINVMD_NODE_PROXY_PORT`), `minimal-client` (`GIT_CEILING_DIRECTORIES`), `paths` (`XDG_STATE_HOME`), `mlog/tests/otel_without_ca_roots.rs` (its own binary) | `set_var` | nextest gives every test its own process, and CI and the lab run nextest only. Under a threaded `cargo test`, `guest` and `server/tests.rs` race on `HANDED_PROXY_PORT_TOKEN` in one binary |
+| minimald, minvmd, minimal-client, paths, mlog | Env tests without a lock: `connection` (`RelayPathGuard`), `minvmd cmd::run` (`MINVMD_NODE_PROXY_PORT`), `minimal-client` (`GIT_CEILING_DIRECTORIES`), `paths` (`XDG_STATE_HOME`), `mlog/tests/otel_without_ca_roots.rs` (its own binary), and `guest`'s egress opt-out tokens | `set_var` | nextest gives every test its own process, and CI and the lab run nextest only. Each variable here has one writer per test binary, so a threaded `cargo test` does not race on it either |
 | many | Literal `/tmp/...`, `/run/user/1000/...` and `/run/minimal/...` paths (`mfile`, `minimal-client`, `attach`, `minvmd sock`, `shuttle`, `timekeep`, `krun ctx`, `sandbox config`, `resolver` undo scripts) | `/tmp` and `/run` | Computed and compared, never opened. The script tests run the script under a tempdir root with stub `systemctl` and `resolvectl` |
 | minimal | `tests::resolve_upload_root_returns_input_when_no_mfile`, `sync_none_drops_project_config_false_when_no_mfile` | `tempdir_in($HOME)` | A unique tempdir, removed afterwards. `$HOME` is the walk's boundary, which is the point of the tests; they skip when `$HOME` is read-only |
 | minimald, sandbox | `*_root_integration.rs`, `mesh_uc7.rs`, `nsenter_integration.rs` | netns, nft, `/var/run/netns`, fixed lock and fixture names in `temp_dir()` | Root lane only, each in its own namespace, serialized by `minimald-classifier-root-proof.lock`; the fixed names are deliberate |
@@ -107,6 +108,10 @@ counts are rows, not tests.
 
 - Tests outside `crates/` (shell harnesses under `tests/` or `scripts/`).
 - Unix-socket paths, beyond checking that they sit under tempdirs.
+- Release-profile test runs (`cargo test --release`). The answerer's path overrides are
+  honoured by debug builds only, so `tests/otel_shutdown_integration.rs` is compiled
+  out there rather than left to reach the machine-global answerer; no CI, lab or
+  `just` target runs tests in release.
 - Recurring lab failures that were not tied to host state:
   `rpc::trace_tests::the_reap_of_an_unfinalized_session_joins_its_creators_trace`,
   `box_actor::tests::a_mint_whose_host_dies_before_attach_reports_a_spawn_failure`,

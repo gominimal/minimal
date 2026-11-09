@@ -8,6 +8,11 @@
 //! `MINIMAL_*`, `DO_NOT_TRACK` and `RUST_LOG` variable removed, asks it to
 //! shut down over its socket, and reads what a stub collector received.
 #![cfg(target_os = "linux")]
+// The answerer's channel-socket and install-marker path overrides (the
+// `MINIMAL_ANSWERER_*` variables set below) are honoured by debug builds
+// only, so a release-profile `minimald` would ignore them and register with
+// the machine-global answerer. These tests run only where the overrides hold.
+#![cfg(debug_assertions)]
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
