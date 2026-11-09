@@ -1786,6 +1786,9 @@ pub(crate) struct ExecEntry {
     /// The box the exec runs in. A request from another box does not find it.
     pub(crate) box_id: SessionId,
     pub(crate) mode: ExecMode,
+    /// The exec's argv as the client sent it, the same argv its
+    /// `exec_started` event records (BOX-152). A box read lists it (BOX-159).
+    pub(crate) argv: Vec<String>,
     /// Where the exec's output is captured, beside the box's record.
     pub(crate) transcript: camino::Utf8PathBuf,
     terminal: Option<ExecTerminal>,
@@ -1800,6 +1803,7 @@ impl ExecEntry {
         id: ExecId,
         box_id: SessionId,
         mode: ExecMode,
+        argv: Vec<String>,
         transcript: camino::Utf8PathBuf,
         terminal: Option<ExecTerminal>,
     ) -> Self {
@@ -1807,6 +1811,7 @@ impl ExecEntry {
             id,
             box_id,
             mode,
+            argv,
             transcript,
             terminal,
             input_dropped: std::sync::atomic::AtomicBool::new(false),
@@ -2085,6 +2090,23 @@ pub(crate) fn register_exec(entry: Arc<ExecEntry>) {
     let mut execs = EXECS.lock().unwrap_or_else(|e| e.into_inner());
     execs.retain(|_, entry| !entry.is_reaped());
     execs.insert(entry.id.clone(), entry);
+}
+
+/// Each exec of the box `box_id` that this daemon started and that has not
+/// ended, in id order, for a read of the box's record (BOX-159). An exec
+/// leaves the list when it ends.
+pub(crate) fn live_execs(box_id: SessionId) -> Vec<minimald_rpc::LiveExec> {
+    EXECS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|entry| entry.box_id == box_id && entry.exit.borrow().is_none())
+        .map(|entry| minimald_rpc::LiveExec {
+            id: entry.id.as_str().to_owned(),
+            argv: entry.argv.clone(),
+            pty: entry.mode == ExecMode::Tty,
+        })
+        .collect()
 }
 
 /// The exec `id` of the box `box_id`, if this daemon started it.

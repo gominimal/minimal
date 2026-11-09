@@ -3731,6 +3731,7 @@ mod managed {
             id.clone(),
             box_id,
             ExecMode::Detached,
+            Vec::new(),
             transcript.clone(),
             None,
         ));
@@ -3750,6 +3751,7 @@ mod managed {
             mint_exec_id(),
             box_id,
             ExecMode::Detached,
+            Vec::new(),
             transcript,
             None,
         ));

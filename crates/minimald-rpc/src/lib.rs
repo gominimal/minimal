@@ -2849,6 +2849,19 @@ pub enum BoxIdentity {
     Unknown,
 }
 
+/// One exec running in a box, as a read of the box's record lists it
+/// (BOX-159): the fields its `exec_started` event records (BOX-152).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveExec {
+    /// The exec's id, which a wait, a stop or an attach takes.
+    pub id: String,
+    /// The exec's argv, as the client sent it.
+    pub argv: Vec<String>,
+    /// Whether the exec holds a PTY. False for a detached or an attached
+    /// exec.
+    pub pty: bool,
+}
+
 /// The response for a [`ShowBox`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShowBoxResponse {
@@ -2857,14 +2870,10 @@ pub struct ShowBoxResponse {
     /// The identity the box runs under.
     #[serde(default)]
     pub identity: BoxIdentity,
-    /// The exec id of each exec running in the box now.
-    ///
-    /// The daemon does not give an exec an id yet (BOX-149), so this
-    /// list is always empty. An empty list does not mean that no process
-    /// runs in the box. The list fills when each exec has an id:
-    /// <https://github.com/gominimal/minimal/issues/2404> (T30, BOX-149).
+    /// Each exec running in the box now, in exec id order (BOX-159). An
+    /// exec leaves the list when it ends.
     #[serde(default)]
-    pub live_execs: Vec<String>,
+    pub live_execs: Vec<LiveExec>,
     /// The bytes on disk that a reap of the box frees: the box's
     /// directory, with its filesystem, record, events and log. The daemon
     /// gives it for a `stopped` or `exited` box only. It is absent for a
@@ -4033,7 +4042,11 @@ mod box_listing_tests {
         let show = ShowBoxResponse {
             record: stopped,
             identity: BoxIdentity::None,
-            live_execs: vec!["exec-1".to_string()],
+            live_execs: vec![LiveExec {
+                id: "exec-1".to_string(),
+                argv: vec!["sleep".to_string(), "60".to_string()],
+                pty: false,
+            }],
             disk_bytes: Some(4096),
         };
         let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();

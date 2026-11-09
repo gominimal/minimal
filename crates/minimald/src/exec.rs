@@ -571,6 +571,7 @@ async fn run_attached_exec(
             exec_id.clone(),
             exec_box.record.id,
             ExecMode::Attached,
+            facts.argv.clone(),
             transcript,
             None,
         ));

@@ -839,60 +839,35 @@ pub(crate) enum ExecFound {
     Terminal,
 }
 
-/// Classifies the exec `exec_id` from the box's `events`, the ids the host
-/// lists as live (`live_execs`), and whether the box runs. An exec of a box
-/// that does not run has ended, even if no end event was written for it.
-///
-/// Interim: `ShowBox.live_execs` stays empty until
-/// <https://github.com/gominimal/minimal/issues/2404> fills it, so a started
-/// exec with no `exec_exited` event in a running box counts as live here.
-/// Once #2404 fills `live_execs`, only `live_execs` decides whether an exec
-/// is live, and the events decide only its terminal.
+/// Classifies the exec `exec_id` of a box. The host's `live_execs`
+/// (BOX-159) decide whether the exec runs and whether it holds a PTY. For
+/// an id the host does not list, `events` is read only when the caller
+/// passes it. A started exec has then ended, and an id with no start was
+/// never an exec of this box.
 pub(crate) fn exec_found(
-    events: &[boxes::events::BoxEvent],
-    live_execs: &[String],
-    box_running: bool,
+    live_execs: &[minimald_rpc::LiveExec],
+    events: Option<&[boxes::events::BoxEvent]>,
     exec_id: &str,
 ) -> ExecFound {
     use boxes::events::{BoxEventType, exec_data};
 
-    let names = |event: &&boxes::events::BoxEvent| {
-        event.data.get(exec_data::EXEC_ID).and_then(|v| v.as_str()) == Some(exec_id)
-    };
-    let started = events
-        .iter()
-        .filter(names)
-        .rfind(|event| event.kind == BoxEventType::ExecStarted);
-    let exited = events
-        .iter()
-        .filter(names)
-        .any(|event| event.kind == BoxEventType::ExecExited);
-    let live = live_execs.iter().any(|id| id == exec_id);
-    if started.is_none() && !live {
-        return ExecFound::Unknown;
+    if let Some(live) = live_execs.iter().find(|exec| exec.id == exec_id) {
+        return if live.pty {
+            ExecFound::Terminal
+        } else {
+            ExecFound::NoTerminal
+        };
     }
-    if !live && (exited || !box_running) {
-        return ExecFound::Ended;
-    }
-    let pty = started.and_then(|event| {
-        event
-            .data
-            .get(exec_data::PTY)
-            .and_then(|v| v.as_bool())
-            .or_else(|| {
-                event
-                    .data
-                    .get(exec_data::MODE)
-                    .and_then(|v| v.as_str())
-                    .map(|mode| mode == "tty")
-            })
+    let started = events.is_some_and(|events| {
+        events.iter().any(|event| {
+            event.kind == BoxEventType::ExecStarted
+                && event.data.get(exec_data::EXEC_ID).and_then(|v| v.as_str()) == Some(exec_id)
+        })
     });
-    // A live id with no start event, or a start event that says nothing of
-    // a terminal, leaves the terminal check to the host.
-    if pty == Some(false) {
-        ExecFound::NoTerminal
+    if started {
+        ExecFound::Ended
     } else {
-        ExecFound::Terminal
+        ExecFound::Unknown
     }
 }
 
@@ -971,15 +946,15 @@ pub(crate) async fn box_attach_exec_target(
         }
         Errorable::Err { error } => bail!("{error}"),
     };
-    let events = read_kept_events(&mut client, box_id, address).await?;
     let parsed = minimald_rpc::exec::ExecId::parse(exec_id).ok();
     let found = match &parsed {
-        Some(id) => exec_found(
-            &events,
-            &shown.live_execs,
-            shown.record.state == "running",
-            id.as_str(),
-        ),
+        Some(id) if shown.live_execs.iter().any(|exec| exec.id == id.as_str()) => {
+            exec_found(&shown.live_execs, None, id.as_str())
+        }
+        Some(id) => {
+            let events = read_kept_events(&mut client, box_id, address).await?;
+            exec_found(&shown.live_execs, Some(&events), id.as_str())
+        }
         None => ExecFound::Unknown,
     };
     let refusal = match found {
