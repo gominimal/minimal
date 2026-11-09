@@ -62,10 +62,12 @@ jobs:
                         - "crates/rcache/**"
                         # `sessions`, renamed `boxes`; the old path is gone.
                         - "crates/boxes/**"
-                        # scripts/kani.sh also proves mlog (the OTel spool and
-                        # switch harnesses) and minvmd (vm.rs); without these
-                        # two a PR touching only one of them merged with its
-                        # proofs unrun (#3117).
+                        # The rule: this filter lists every crate that has an
+                        # `expect <crate> <n>` line in scripts/kani.sh (boxes,
+                        # rcache, mlog, minvmd, bep today). A crate that gains a
+                        # harness gets a path here in the same change, or a PR
+                        # touching only that crate merges with its proofs
+                        # unrun, as mlog and minvmd once did (#3117).
                         - "crates/mlog/**"
                         - "crates/minvmd/**"
                         # The Box Egress Proxy's redemption decision and
