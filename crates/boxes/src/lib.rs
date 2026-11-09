@@ -875,7 +875,7 @@ fn is_valid_cidr(s: &str) -> bool {
 /// carry one.
 /// One trailing dot is tolerated because the DNS gate strips it before
 /// matching, so `example.com.` and `example.com` name the same host.
-fn is_valid_dns_host(s: &str) -> bool {
+pub fn is_valid_dns_host(s: &str) -> bool {
     if s.chars().any(char::is_whitespace) {
         return false;
     }

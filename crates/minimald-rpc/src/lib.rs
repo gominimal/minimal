@@ -2139,6 +2139,10 @@ pub struct CreateSessionRequest {
     /// `None` comes from three senders: a client that predates the field,
     /// the dashboard create (#2635), and `min task run` of an interactive
     /// task (#2411). The daemon then files a record with no stored spec.
+    ///
+    /// The client validates `[network] egress`, `[network] ingress`,
+    /// `[network.bep]` and `[secrets]`, and the request carries them to the
+    /// daemon unchanged, key for key (BOX-080).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<serde_json_lenient::Value>,
     /// Whether the create asks for a fresh instance (BOX-163). The daemon

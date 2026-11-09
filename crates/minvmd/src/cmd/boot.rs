@@ -50,7 +50,7 @@ fn run_boot(foreground: bool) -> Result<()> {
     use anyhow::Context as _;
 
     use crate::cmd::MARKER_SOCK_ENV;
-    use crate::image::{resolve_kernel_path, resolve_rootfs_path};
+    use crate::image::resolve_boot_images;
     use crate::state::StateDir;
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
@@ -60,8 +60,8 @@ fn run_boot(foreground: bool) -> Result<()> {
     // Fail-fast: resolve paths before spawning anything. The UDS length
     // checks catch sun_path overflows here, with a clear error, instead of as
     // a libkrun abort in the VMM child after the READY timeout.
-    let _kernel = resolve_kernel_path().context("resolving kernel path")?;
-    let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
+    let (_kernel, _rootfs, _initramfs) =
+        resolve_boot_images().context("resolving boot image paths")?;
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
 

@@ -25,10 +25,16 @@ work. This spec is that work.
 With this work in a release, a user who opts in gets every process's spans
 and log records at a collector they run. The records travel as OTLP over
 HTTP, joined into one trace per command. The same user also gets a local
-OTLP-JSON copy of those records that survives a crash. A user who does not opt in gets nothing new.
+OTLP-JSON copy of those records that survives a crash. A user who does not
+opt in gets nothing new from this spec. The daily update check of
+gominimal/inbox#589 is outside it: on by default until 1.0 under
+gominimal/arch#152 (D9), with its own switches, documented in
+`docs/reference/telemetry.md` under "Update check".
 
 **Arch alignment (re-checked 2026-10-05 against `gominimal/arch` `5c120151`).**
-This spec covers AT20 ("telemetry is opt-in and minimized") and the
+This spec covers AT20 ("telemetry is opt-in and minimized"; gominimal/arch#152
+splits the update check out of it as the one on-by-default exception until
+1.0) and the
 threat-model scrub rule of gominimal/inbox#515 follow-up 4. Where this spec
 differs from AT20, gominimal/arch#102 carries the amendment, and this spec
 differs from AT20 until arch#102 closes. A box receives `TRACEPARENT` and
@@ -134,6 +140,11 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
 - **TEL-001** THE SYSTEM SHALL export nothing, spool nothing and open no
   connection for telemetry unless `MINIMAL_TELEMETRY` is `1`, `true`, `yes`
   or `on` (any case). Plain `OTEL_*` variables alone never turn it on.
+  The daily update check (gominimal/inbox#589) is not telemetry in this
+  sense: it is the one on-by-default exception until 1.0 (gominimal/arch#152,
+  D9), makes one request a day under its own switches, and
+  `OTEL_SDK_DISABLED=true`, `DO_NOT_TRACK` and a falsy `MINIMAL_TELEMETRY`
+  turn it off as well.
   tier:     T2
   verify:   cargo nextest run -p mlog without_the_opt_in_export_is_off_and_installs_nothing
   test:     crates/mlog/src/otel.rs::without_the_opt_in_export_is_off_and_installs_nothing;

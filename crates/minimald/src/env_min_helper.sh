@@ -133,6 +133,27 @@ __min_rpc() {
     if [[ "${TRACEPARENT:-}" =~ ^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$ ]]; then
         prefix="traceparent%${TRACEPARENT}%"
     fi
+    local request="${prefix}${method}%${data}"
+
+    # A `run` whose stdin is a pipe or a file forwards that stdin to the
+    # task. A last `stdin` group in the request says so. The daemon answers
+    # with a `stdin:` line when the task starts, and only then does the stdin
+    # follow the request on the connection, up to its EOF. A terminal stays
+    # with this shell. `-t` keeps socat reading the daemon's answer after
+    # the stdin ends. The daemon reads and drops what the task leaves
+    # unread until this side closes, so a write here never fails.
+    local forward=0 sock_out sock_in="" sock_pid="" stdin_fd="" feeder=""
+    if [[ "$method" == "run" && ! -t 0 ]]; then
+        forward=1
+        request+=$'\x1e'stdin
+        coproc __MIN_SOCK { exec socat -t 2000000000 - UNIX-CONNECT:/run/minenv_sock; }
+        sock_pid="$__MIN_SOCK_PID"
+        exec {sock_out}<&"${__MIN_SOCK[0]}" {sock_in}>&"${__MIN_SOCK[1]}" {stdin_fd}<&0
+        eval "exec ${__MIN_SOCK[0]}<&- ${__MIN_SOCK[1]}>&-"
+        printf '%s\n' "$request" >&"$sock_in"
+    else
+        exec {sock_out}< <(printf '%s\n' "$request" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+    fi
 
     while IFS= read -r line; do
         local tag="${line%%:*}"
@@ -180,6 +201,17 @@ __min_rpc() {
                 declare -gx "$varname=$varval"
                 env_pairs+=("${varname}=${varval}")
                 ;;
+            stdin)
+                # The task starts: copy this command's stdin to it. The
+                # copy's end closes the connection's sending side, so the
+                # task reads EOF.
+                if [[ "$forward" -eq 1 && -z "$feeder" ]]; then
+                    cat <&"$stdin_fd" >&"$sock_in" &
+                    feeder=$!
+                    exec {sock_in}>&-
+                    sock_in=""
+                fi
+                ;;
             done)
                 break
                 ;;
@@ -202,7 +234,22 @@ __min_rpc() {
                 fi
                 ;;
         esac
-    done < <(printf '%s\n' "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+    done <&"$sock_out"
+
+    if [[ "$forward" -eq 1 ]]; then
+        # The run ended: stop the copy of a stdin the task did not read to
+        # its end, and close the connection.
+        if [[ -n "$feeder" ]]; then
+            { kill "$feeder"; wait "$feeder"; } 2>/dev/null
+        fi
+        if [[ -n "$sock_in" ]]; then
+            exec {sock_in}>&-
+        fi
+        exec {stdin_fd}<&- {sock_out}<&-
+        wait "$sock_pid" 2>/dev/null
+    else
+        exec {sock_out}<&-
+    fi
 
     if [[ "$bar_open" -eq 1 ]]; then
         printf '\r\033[K'
