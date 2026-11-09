@@ -2914,8 +2914,15 @@ originates is refused" \
         grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
     want_ok "the deny subtree's DNS-port lookups are steered onto the answerer" \
         grep -q 'level 3 "minimald.slice/boxes/deny" udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
-    want_ok "the steer runs at dstnat, before the filter chain decides" \
-        grep -q 'type nat hook output priority dstnat' "$nft_input"
+    want_ok "the steer runs at dstnat's -100, before the filter chain decides" \
+        grep -q 'type nat hook output priority -100;' "$nft_input"
+    # nft before 1.0.9 refuses a priority name on a hook its matrix does not
+    # pair it with (dstnat is prerouting's, srcnat postrouting's), and one
+    # refusal fails the whole transaction, so no base chain may spell one.
+    want_err "no chain names dstnat off prerouting: nft before 1.0.9 refuses it" \
+        grep -qE 'hook (input|forward|output|postrouting) priority dstnat' "$nft_input"
+    want_err "no chain names srcnat off postrouting: nft before 1.0.9 refuses it" \
+        grep -qE 'hook (prerouting|input|forward|output) priority srcnat' "$nft_input"
     want_ok "the deny rule refuses actively, never a silent drop" \
         grep -q 'reject with icmpx admin-prohibited' "$nft_input"
     # NET-078, translated: classification and translation are two chains,

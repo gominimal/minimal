@@ -268,23 +268,30 @@ pub async fn cmd_session_run(
         "found session"
     );
 
-    box_via_ssh(
+    // The task's `env_vars`, gated against the user policy and resolved
+    // against this shell, as `min task run` resolves them (inbox#778). The
+    // daemon's environment is not the caller's, so it is never asked.
+    let task_env = crate::task::session_run_task_env(
+        global,
+        r.project_path.as_utf8_path(),
+        &args.task,
+        |k| std::env::var(k),
+    )?;
+
+    task_via_ssh(
         daemon_host_kind(global),
         &sock,
         r.id,
         // No owns-box flag (NET-131): the task runs in a session someone
         // else keeps, so its end stays with whoever holds it.
-        Some(
-            minimald_rpc::exec::ExecRequest::TaskRun {
-                task: args.task,
-                owns_box: false,
-                args: vec![],
-                cwd: String::new(),
-            }
-            .encode(),
-        ),
-        None,
-        None,
+        minimald_rpc::exec::ExecRequest::TaskRun {
+            task: args.task,
+            owns_box: false,
+            args: vec![],
+            cwd: String::new(),
+        }
+        .encode(),
+        &task_env,
     )
     .await
 }
@@ -649,6 +656,7 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         record.id,
         record.name.as_deref(),
         record.box_addresses,
+        record.box_id,
         args.force,
     )
     .await
