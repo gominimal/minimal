@@ -646,6 +646,39 @@ release commit. For a nightly commit hash, it prints a notice and does
 nothing. A prerelease, such as `0.6.0-rc1`, gets a public GitHub Release
 that is not marked Latest.
 
+### merge-back.yml: merge a line into main
+
+> Not ready to enable. The design needs agreement, and the `main` ruleset needs
+> a bypass actor for the App. Until then, use the manual merge in the release
+> steps.
+
+[`.github/workflows/merge-back.yml`](../../.github/workflows/merge-back.yml)
+does the manual merge-back as one run, outside the merge queue. The queue
+squashes every PR, and a squash drops the link to the tag. A person starts the
+run after a stable promotion. Its inputs are `version` and `reviewed`.
+
+The run uses [`scripts/merge-back.sh`](../../scripts/merge-back.sh):
+
+1. It stops if the tag `vX.Y.Z` is not on `release/X.Y.x`.
+2. It does nothing if the line is already on `main`.
+3. It runs `git cherry` against `main`, on the line tip and not the tag. A fix
+   can merge into the line after the tag.
+4. If a line commit has no identical patch on `main`, the workflow opens an
+   issue that lists the commit, and stops. It updates the open issue on a
+   second run. It does not merge.
+5. It merges the line with the `ours` strategy, which keeps the tree of `main`.
+   It pushes the merge commit to `main`, without force.
+
+`git cherry` always lists the version bumps, and each pick with resolved
+conflicts. For each commit in the issue, land the fix on `main` if `main` does
+not have it. Then run the workflow again, and put each remaining commit in
+`reviewed`. Those are the commits that `main` has in another form, or does not
+need. The issue marks a commit whose `cherry-pick -x` source is on `main`, but
+you must still read it. The merge drops any change that only the line has.
+
+If `main` moves during the run, the push fails and changes nothing. Run the
+workflow again.
+
 ### prune-releases.yml: delete old nightly releases
 
 [`.github/workflows/prune-releases.yml`](../../.github/workflows/prune-releases.yml)
