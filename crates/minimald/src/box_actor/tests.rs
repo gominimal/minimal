@@ -17378,3 +17378,482 @@ async fn daemon_never_stops_for_idle_or_client_loss() {
     .expect("the box's entrypoint still runs after the client went away");
     assert!(screen.contains("got:still"));
 }
+
+/// Creates and finalizes a task box as [`create_task_box`] does, whose spec
+/// sets `timeout` in whole seconds (BOX-049), and returns its id.
+async fn create_task_box_with_timeout(
+    client: &mut TestClient,
+    argv: &[&str],
+    timeout: u64,
+) -> SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let mut spec = mfile::spec::BoxSpec::for_task(
+        "check",
+        &mfile::Task::default(),
+        mfile::spec::SpecFlags::default(),
+    )
+    .expect("a task that is not interactive has a spec");
+    spec.entrypoint = mfile::spec::Entrypoint::Exec(argv.iter().map(ToString::to_string).collect());
+    spec.timeout = Some(timeout);
+    let mut req = crate::test_harness::create_session_req("check", "/tmp");
+    req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    req.config.ends_with_run = true;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    id
+}
+
+/// A session spec with `lifetime`, `timeout` seconds and a terminal.
+fn timeout_session_spec(
+    lifetime: mfile::spec::Lifetime,
+    timeout: u64,
+) -> serde_json_lenient::Value {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = true;
+    spec.lifetime = lifetime;
+    spec.timeout = Some(timeout);
+    serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// Whether `pid` is a live process: it exists and is not a zombie.
+fn process_lives(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_ascii_whitespace().next())
+            .is_some_and(|state| state != "Z" && state != "X")
+    })
+}
+
+/// Reads the pid that a stand-in process wrote to `path`, waiting up to ten
+/// seconds for it.
+async fn pid_written_to(path: &std::path::Path) -> i32 {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stand-in process writes its pid")
+}
+
+/// The `exited` events of box `id`.
+async fn exited_events(server: &TestServer, id: SessionId) -> Vec<boxes::events::BoxEvent> {
+    event_kinds(server, id)
+        .await
+        .into_iter()
+        .filter(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .collect()
+}
+
+// BOX-037: an `until_complete` box that runs past its timeout gets SIGTERM
+// on every process in it, then SIGKILL on those still running after the
+// grace period. The record ends `exited` with `reason = "timeout"` and no
+// exit code, and the `exited` event says the same. No process of the box
+// outlives it. The entrypoint and the process it starts both ignore
+// SIGTERM, so only the SIGKILL ends them. The second process stands in for
+// a running exec: the mock launcher runs an exec outside the box's process
+// tree, and in a real box an exec joins the box's PID namespace, which the
+// stop's signals reach (BOX-013).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_timeout_terms_then_kills_box_and_execs_reason_timeout() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let log = crate::test_harness::captured_log();
+    let dir = tempfile::tempdir().unwrap();
+    let entrypoint_pid = dir.path().join("entrypoint.pid");
+    let exec_pid = dir.path().join("exec.pid");
+    let script = format!(
+        "trap '' TERM; \
+         sh -c 'echo $$ > {exec}; while :; do sleep 0.05; done' & \
+         echo $$ > {entrypoint}; while :; do sleep 0.05; done",
+        exec = exec_pid.display(),
+        entrypoint = entrypoint_pid.display(),
+    );
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box_with_timeout(&mut client, &["/bin/sh", "-c", &script], 1).await;
+    crate::box_actor::timeout_grace_seam::set(id, Duration::from_millis(300));
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let started = std::time::Instant::now();
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active box launches its entrypoint");
+    assert!(host.is_alive());
+    let pids = [
+        pid_written_to(&entrypoint_pid).await,
+        pid_written_to(&exec_pid).await,
+    ];
+    assert!(pids.iter().all(|pid| process_lives(*pid)));
+
+    let record = record_once_exited(&manager, id).await;
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the box ended before its timeout: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Timeout)
+    );
+    assert_eq!(record.exit_code, None);
+    assert_eq!(record.signal, None);
+
+    let exited = exited_events(&server, id).await;
+    assert_eq!(exited.len(), 1, "{exited:?}");
+    assert_eq!(exited[0].data["reason"], "timeout");
+    assert!(!exited[0].data.contains_key("exit_code"));
+    assert!(!exited[0].data.contains_key("signal"));
+
+    let gone = tokio::time::timeout(Duration::from_secs(5), async {
+        while pids.iter().any(|pid| process_lives(*pid)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "a process of the box outlived its timeout");
+
+    let log = log.contents();
+    let ended = log
+        .lines()
+        .find(|line| {
+            line.contains("box exited: it ran past its timeout") && line.contains(&id.to_string())
+        })
+        .unwrap_or_else(|| panic!("the daemon log names the box's timeout: {log}"));
+    assert!(
+        ended.contains("timeout_secs=1") && ended.contains("SIGTERM") && ended.contains("SIGKILL"),
+        "the log line names the timeout and the signals: {ended}"
+    );
+}
+
+// BOX-037: only an `until_complete` box ends at its timeout. A box that
+// runs until it is stopped runs past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_stopped_box_runs_past_its_timeout() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("runs-on"),
+        "/uwu",
+        Some(timeout_session_spec(mfile::spec::Lifetime::UntilStopped, 1)),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let host = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active box launches a headless host");
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(host.is_alive(), "the box ended at its timeout");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+    assert!(exited_events(&server, id).await.is_empty());
+}
+
+// BOX-037, T43: a task run whose box runs past its timeout ends with exit
+// 124, the code `min task run` gives a timeout, and keeps what the
+// entrypoint wrote before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_timeout_task_run_exits_124() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id =
+        create_task_box_with_timeout(&mut client, &["/bin/sh", "-c", "echo started; sleep 30"], 1)
+            .await;
+    crate::box_actor::timeout_grace_seam::set(id, Duration::from_millis(300));
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run ends at the box's timeout")
+    .expect("the daemon takes the run");
+    assert_eq!(
+        outcome.exit_status,
+        Some(124),
+        "{outcome:?}: {}",
+        log.contents()
+    );
+    assert_eq!(String::from_utf8_lossy(&outcome.stdout), "started\n");
+
+    let manager = server.state.sessions_manager().await;
+    let record = record_once_exited(&manager, id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Timeout)
+    );
+}
+
+// BOX-013, BOX-037: a box stopped before its timeout ends `stopped`. The
+// timeout does not fire later, so the record keeps the stop and the box
+// has one `exited` event, with `reason = "stopped"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_before_timeout_records_stopped_not_timeout() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box_with_timeout(
+        &mut client,
+        &["/bin/sh", "-c", "while :; do sleep 0.05; done"],
+        2,
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active box launches its entrypoint");
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let record = read_record(&server, id).await;
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+    let exited = exited_events(&server, id).await;
+    assert_eq!(exited.len(), 1, "{exited:?}");
+    assert_eq!(exited[0].data["reason"], "stopped");
+}
+
+// BOX-037, BOX-025: a box that ended at its timeout and is resumed gets
+// its full timeout again from the resume. It runs for that long, then ends
+// at its timeout a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_box_gets_its_full_timeout_again() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("timed"),
+        "/uwu",
+        Some(timeout_session_spec(
+            mfile::spec::Lifetime::UntilComplete,
+            2,
+        )),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let before = manager.running_count().await;
+    manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active box launches a headless host");
+    let record = record_once_exited(&manager, id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Timeout)
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while manager.running_count().await >= before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ended box's actor was not evicted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let resumed = std::time::Instant::now();
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach to an exited PTY box resumes it");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running,
+        "the resumed box ended before its full timeout"
+    );
+
+    let record = record_once_exited(&manager, id).await;
+    assert!(
+        resumed.elapsed() >= Duration::from_secs(2),
+        "the resumed box ended before its full timeout: {:?}",
+        resumed.elapsed()
+    );
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Timeout)
+    );
+    let exited = exited_events(&server, id).await;
+    assert_eq!(exited.len(), 2, "{exited:?}");
+    assert!(
+        exited.iter().all(|e| e.data["reason"] == "timeout"),
+        "{exited:?}"
+    );
+}
+
+// BOX-037: a timeout whose record read fails still ends the box. The
+// actor's own host runs the entrypoint, so the box is active, and the
+// record ends `exited` with `reason = "timeout"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_record_read_failure_still_ends_box_reason_timeout() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box_with_timeout(
+        &mut client,
+        &["/bin/sh", "-c", "while :; do sleep 0.05; done"],
+        1,
+    )
+    .await;
+    crate::box_actor::timeout_grace_seam::set(id, Duration::from_millis(300));
+    crate::box_actor::timeout_read_seam::fail_next_reads(id, 1);
+    let manager = server.state.sessions_manager().await;
+    manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active box launches its entrypoint");
+
+    let record = record_once_exited(&manager, id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Timeout)
+    );
+    let exited = exited_events(&server, id).await;
+    assert_eq!(exited.len(), 1, "{exited:?}");
+    assert_eq!(exited[0].data["reason"], "timeout");
+}
+
+// BOX-037, BOX-013: a timeout that ends the box's processes and cannot
+// write the `exited` record keeps its ending on the actor. A resume is
+// refused while it is unrecorded, and a later stop writes `exited` with
+// `reason = "timeout"`, not a `stopped` ending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_record_write_failure_refuses_resume_and_stop_keeps_timeout() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box_with_timeout(
+        &mut client,
+        &["/bin/sh", "-c", "while :; do sleep 0.05; done"],
+        1,
+    )
+    .await;
+    crate::box_actor::timeout_grace_seam::set(id, Duration::from_millis(300));
+    // Every attempt of the timeout's write fails.
+    crate::box_actor::exit_record_seam::fail_next_writes(id, 5);
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active box launches its entrypoint");
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let contents = log.contents();
+            if contents.lines().any(|line| {
+                line.contains("the record could not be set to exited")
+                    && line.contains("attempts=")
+                    && line.contains(&id.to_string())
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the timeout's record write fails: {}", log.contents()));
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+
+    assert!(
+        handle.ensure_host("tester".to_string()).await.is_err(),
+        "a resume launched while the timeout's ending was unrecorded"
+    );
+
+    let answer = manager
+        .stop_box_answer(id, false, Duration::from_secs(5))
+        .await
+        .expect("the stop answers");
+    assert!(
+        matches!(
+            answer,
+            crate::box_manager::StopAnswer::AlreadyExited(ExitEnding::Timeout)
+        ),
+        "{answer:?}"
+    );
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Exited(ExitEnding::Timeout)
+    );
+    let exited = exited_events(&server, id).await;
+    assert_eq!(exited.len(), 1, "{exited:?}");
+    assert_eq!(exited[0].data["reason"], "timeout");
+}
