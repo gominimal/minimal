@@ -210,6 +210,9 @@ After this ships, a developer on a stock install with no identity plane runs ses
   - IF a restart meets one of the refusals BOX-025 states for a resume (the name check, which a running box's own name does not trip, the unsatisfiable-spec check, or BVOL-013's volume-hold check, which the box's own volume holds do not trip) THEN THE SYSTEM SHALL refuse the restart with that refusal's exit code and leave the box's state unchanged, a running box still running, evaluating the lifetime check above first and then those three refusals in BOX-025's order, all before the restart stops any process, and never applying BOX-030's PTY check, which a restart of a box without `pty_enabled` exists to pass.
     tier:   T0
     verify: cargo nextest run -p minimald restart_takes_resume_refusals_before_it_stops_anything
+  - IF a restart's start fails after the restart has stopped the box's processes THEN THE SYSTEM SHALL leave the box `stopped` with the `exited` event its stop recorded (BOX-013), record no `started` event, and fail the restart with the start's error, leaving no other change to the record.
+    tier:   T0
+    verify: cargo nextest run -p minimald restart_start_failure_leaves_box_stopped_with_its_stop_recorded
 
 - **BOX-177** WHEN a restart starts a box's processes again THE SYSTEM SHALL run only the lifecycle hooks that BOX-027 and BOX-028 run on resume.
   tier:     T0
@@ -353,7 +356,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T1
   verify:   cargo nextest run -p mfile expansion_order_and_merge_rules
   property: For every set of layers, expansion equals the fold of the merge rule over the layers before the command-line overrides in the stated order, followed by the command-line override rules below.
-  - WHERE the command-line override layer sets a `[network]` key THE SYSTEM SHALL change only that key of the expanded `[network]` table, adding the override's values to a list key other than `egress.allow_protocols`, which the next sub-bullet replaces, and replacing a scalar key's value, and leave every other `[network]` key as the earlier layers set it.
+  - WHERE the command-line override layer sets one or more `[network]` keys THE SYSTEM SHALL apply every one of those overrides, each to the key it names in the expanded `[network]` table, adding an override's values to a list key other than `egress.allow_protocols`, which the next sub-bullet replaces, and replacing a scalar key's value, and leave each `[network]` key that no override names with the value the earlier layers set.
     tier:   T0
     verify: cargo nextest run -p mfile command_line_network_override_changes_only_its_key
   - WHERE the command-line override layer sets `egress.allow_protocols` THE SYSTEM SHALL replace that list with the override's values.
@@ -362,7 +365,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   - WHERE the command-line override layer denies all egress THE SYSTEM SHALL empty every allow list of the expanded spec's `egress` section, `egress.allow_dns_hosts`, `egress.allow_subnets` and `egress.allow_protocols`, and leave each present (NET-140).
     tier:   T0
     verify: cargo nextest run -p mfile command_line_deny_all_egress_empties_allow_lists
-  - IF the command-line override layer both denies all egress and sets an `egress` allow or deny list THEN THE SYSTEM SHALL refuse the expansion with exit 2, naming both overrides.
+  - IF the command-line override layer both denies all egress and sets an `egress` allow or deny list THEN THE SYSTEM SHALL refuse the expansion with exit 2, naming both overrides and telling the person to drop one of them.
     tier:   T0
     verify: cargo nextest run -p mfile command_line_deny_all_egress_with_egress_override_exit2
   - WHERE the command-line override layer turns hooks off THE SYSTEM SHALL empty the expanded spec's composed `lifecycle_hooks`.
