@@ -3217,6 +3217,21 @@ fn end_held(child: &mut hakoniwa::Child) {
     }
 }
 
+/// The error for a held process that ended before its network was attached.
+#[cfg(target_os = "linux")]
+fn held_process_ended(status: &hakoniwa::ExitStatus) -> Error {
+    Error::Execution(ExecutionError::InvocationFailed {
+        idx: 0,
+        code: status.code,
+        reason: format!(
+            "the held network's process ended before its attach: {}",
+            status.reason
+        ),
+        stderr: String::new(),
+        stdout: String::new(),
+    })
+}
+
 /// The sandbox a [`HeldNetwork`] runs in. Its rootfs is the bare `usr/` that
 /// [`Sandbox::new`] links `usr/lib64` in.
 #[cfg(target_os = "linux")]
@@ -3274,24 +3289,24 @@ pub async fn hold_network(
         .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
     let pid = child.id();
     let spawned = network::Spawned::from_child(&mut child);
+    // A held process waits at its start gate, so one that has ended failed
+    // its own setup. Its exit status says why, and neither the attach's
+    // error nor a later read of its namespace carries that.
     let guard = match planned.attach(spawned).await {
-        Ok(guard) => guard,
+        Ok(guard) => {
+            // An attach that touches no namespace succeeds over an ended
+            // process too.
+            if let Ok(Some(status)) = child.try_wait() {
+                end_held(&mut child);
+                return Err(held_process_ended(&status));
+            }
+            guard
+        }
         Err(e) => {
-            // A held process that ended before its attach ended for a reason
-            // of its own, which the attach's error does not carry.
             let ended = child.try_wait().ok().flatten();
             end_held(&mut child);
             return Err(match ended {
-                Some(status) => Error::Execution(ExecutionError::InvocationFailed {
-                    idx: 0,
-                    code: status.code,
-                    reason: format!(
-                        "the held network's process ended before its attach: {}",
-                        status.reason
-                    ),
-                    stderr: String::new(),
-                    stdout: String::new(),
-                }),
+                Some(status) => held_process_ended(&status),
                 None => e,
             });
         }
