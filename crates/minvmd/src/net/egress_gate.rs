@@ -4307,11 +4307,22 @@ fn loggable_what(what: &str) -> std::borrow::Cow<'_, str> {
     if what.len() <= MAX_LOGGED_WHAT && what.bytes().all(plain) {
         return std::borrow::Cow::Borrowed(what);
     }
-    let mut escaped = format!("{what:?}");
-    if escaped.len() > MAX_LOGGED_WHAT {
-        escaped.truncate(escaped.floor_char_boundary(MAX_LOGGED_WHAT));
-        escaped.push_str(&format!("\"... ({} bytes in all)", what.len()));
+    let full = format!("{what:?}");
+    if full.len() <= MAX_LOGGED_WHAT {
+        return std::borrow::Cow::Owned(full);
     }
+    // Cut between whole escape sequences, never inside one: a cut right after a
+    // backslash would make the closing quote read as an escaped one, and the
+    // value is the guest's to shape.
+    let mut escaped = String::from("\"");
+    for ch in what.chars() {
+        let piece: String = ch.escape_debug().collect();
+        if escaped.len() + piece.len() > MAX_LOGGED_WHAT {
+            break;
+        }
+        escaped.push_str(&piece);
+    }
+    escaped.push_str(&format!("\"... ({} bytes in all)", what.len()));
     std::borrow::Cow::Owned(escaped)
 }
 
@@ -18913,7 +18924,27 @@ mod tests {
         assert_eq!(
             named.len(),
             MAX_LOGGED_WHAT + marker.len(),
-            "the name is cut to the bound"
+            "an ASCII name is cut at the bound"
+        );
+        // a cut never lands inside an escape: a value of quotes (two bytes each, escaped) keeps whole pairs,
+        // and the token still ends at its own quote before the marker
+        let quotes = "\"".repeat(MAX_LOGGED_WHAT);
+        let named = loggable_what(&quotes);
+        let body = named
+            .strip_suffix(&format!("\"... ({} bytes in all)", quotes.len()))
+            .expect("marked");
+        assert!(
+            body.starts_with('"') && body.len() <= MAX_LOGGED_WHAT,
+            "{named:?}"
+        );
+        assert!(
+            !body.ends_with('\\') || body.ends_with("\\\\"),
+            "no dangling backslash before the closing quote: {named:?}"
+        );
+        assert_eq!(
+            (body.len() - 1) % 2,
+            0,
+            "whole escape pairs only: {named:?}"
         );
         assert!(
             named.starts_with("\"aaa"),
