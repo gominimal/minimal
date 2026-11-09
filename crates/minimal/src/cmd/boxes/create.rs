@@ -1437,6 +1437,26 @@ fn store_grants(
         .collect()
 }
 
+/// The authorities to register with the proxy as the box's declared egress
+/// (BEP-022). A box whose egress admits every name lists none, so a GitHub
+/// grant registers the module's hosts for it, or the proxy would refuse them.
+fn proxy_egress(
+    egress: Option<&boxes::EgressPolicy>,
+    network: boxes::NetworkMode,
+    github_grant: bool,
+) -> Vec<String> {
+    if github_grant && boxes::core::bep::egress_admits_every_name(network, egress) {
+        return bep::module::GITHUB
+            .hosts
+            .iter()
+            .map(|authority| authority.host.to_string())
+            .collect();
+    }
+    egress
+        .and_then(|egress| egress.allow_dns_hosts.clone())
+        .unwrap_or_default()
+}
+
 /// Mints the box's GitHub grants and its accepted store references for the
 /// box id `box_id` the registration handed back, and puts each grant's
 /// sealed value on the request for the box's launches to place (BEP-005,
@@ -1460,14 +1480,12 @@ async fn mint_into_request(
     let delivered = proxy_grant_names(github_grants, store_grants);
     let stored = github_grants.is_empty();
     let box_id = registered_id.map(|box_id| box_id.to_string());
-    let egress = request
-        .config
-        .policy
-        .egress
-        .as_ref()
-        .and_then(|egress| egress.allow_dns_hosts.clone())
-        .unwrap_or_default();
     let network = request.config.network;
+    let egress = proxy_egress(
+        request.config.policy.egress.as_ref(),
+        network,
+        !github_grants.is_empty(),
+    );
     // The mint blocks on the proxy's control socket and the host keychain,
     // so it runs off the runtime's workers.
     let minted = tokio::task::spawn_blocking(move || {
@@ -3908,6 +3926,29 @@ mod tests {
                 .downcast_ref::<NameAlreadyHeld>()
                 .map(|refused| refused.held.as_str()),
             Some("dev")
+        );
+    }
+
+    /// BEP-022: a `host_ip` box with no `egress` section registers the GitHub
+    /// hosts for its grant. A box with a section registers what it lists.
+    #[test]
+    fn host_ip_grant_box_with_no_egress_section_registers_the_github_hosts() {
+        let hosts: Vec<String> = bep::module::GITHUB
+            .hosts
+            .iter()
+            .map(|authority| authority.host.to_string())
+            .collect();
+        assert_eq!(proxy_egress(None, boxes::NetworkMode::HostNet, true), hosts);
+        assert!(proxy_egress(None, boxes::NetworkMode::HostNet, false).is_empty());
+        assert!(proxy_egress(None, boxes::NetworkMode::OwnIp, true).is_empty());
+
+        let listed = boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec!["github.com".to_string()]),
+            ..boxes::EgressPolicy::default()
+        };
+        assert_eq!(
+            proxy_egress(Some(&listed), boxes::NetworkMode::HostNet, true),
+            ["github.com"]
         );
     }
 
