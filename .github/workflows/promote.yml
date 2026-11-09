@@ -346,9 +346,15 @@ jobs:
                   fi
                   line="release/${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.x"
                   next="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
-                  if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$line" --silent 2>/dev/null; then
-                    echo "::notice::no $line branch; nothing to bump"
-                    exit 0
+                  # Only a 404 means no line. Any other failure (rate limit,
+                  # network) fails the job, so a rerun can still open the PR.
+                  if ! err="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$line" --silent 2>&1)"; then
+                    if [[ "$err" == *"HTTP 404"* ]]; then
+                      echo "::notice::no $line branch; nothing to bump"
+                      exit 0
+                    fi
+                    echo "::error::could not read $line: $err"
+                    exit 1
                   fi
                   {
                     echo "line=$line"

@@ -650,7 +650,7 @@ it just promoted, so a rollback changes nothing. A rerun changes nothing when
 the branch already has an open or merged PR. If the branch exists with no PR,
 because an earlier run pushed it and then failed to open the PR, a rerun opens
 the PR. The job does nothing for a nightly commit hash, or when the line does
-not exist.
+not exist. It fails if it cannot read the line, so you can run it again.
 
 To start the next version with a candidate, change the PR to `X.Y.Z-rc1` before
 you merge it.
