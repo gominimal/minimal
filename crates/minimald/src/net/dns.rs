@@ -952,13 +952,13 @@ pub struct HostnameRegistry {
     /// for the sessions manager to bind the new holder's forward while its
     /// box runs ([`Self::notify_hand_overs`]). `None` leaves a hand-over a
     /// change of record alone, bound at the new holder's next attach.
-    hand_overs: Option<tokio::sync::mpsc::UnboundedSender<PortHandOver>>,
+    hand_overs: Option<tokio::sync::mpsc::UnboundedSender<(PortHandOver, crate::traced::Caller)>>,
     /// Where each move of a box's publish is sent
     /// ([`Self::hand_over_moved_publish`]), for the sessions manager to move
     /// the forwards the box's `min net expose` bound while its box runs
     /// ([`Self::notify_publish_moves`]). `None` leaves those forwards where
     /// they are until the box's spawn ends.
-    publish_moves: Option<tokio::sync::mpsc::UnboundedSender<PublishMove>>,
+    publish_moves: Option<tokio::sync::mpsc::UnboundedSender<(PublishMove, crate::traced::Caller)>>,
     /// The loopback address a creator handed each own-address box, by stable
     /// session id (T66, NET-123 §7.1): recorded at the box's registration
     /// whether the publish lands at it or at the `127.0.0.1` interim — a
@@ -1204,8 +1204,13 @@ impl HostnameRegistry {
     /// (NET-129): a destroyed holder's, and a holder's that moved off the
     /// address or stopped naming the port. The receiver binds the new
     /// holder's forward if its box is running; the send never waits, so the
-    /// registry's lock is held no longer for it.
-    pub fn notify_hand_overs(&mut self, sender: tokio::sync::mpsc::UnboundedSender<PortHandOver>) {
+    /// registry's lock is held no longer for it. Each hand-over carries the
+    /// trace context of the work that made it (a destroy, a release, a
+    /// publish), for the receiver's span to join (TEL-022).
+    pub fn notify_hand_overs(
+        &mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<(PortHandOver, crate::traced::Caller)>,
+    ) {
         self.hand_overs = Some(sender);
     }
 
@@ -1213,10 +1218,11 @@ impl HostnameRegistry {
     /// (#2748): the receiver moves the forwards the box's runtime
     /// `min net expose` bound at the old address, if its box is running.
     /// The send never waits, so the registry's lock is held no longer for
-    /// it.
+    /// it. Each move carries the trace context of the work that made it, as
+    /// a hand-over does ([`Self::notify_hand_overs`]).
     pub fn notify_publish_moves(
         &mut self,
-        sender: tokio::sync::mpsc::UnboundedSender<PublishMove>,
+        sender: tokio::sync::mpsc::UnboundedSender<(PublishMove, crate::traced::Caller)>,
     ) {
         self.publish_moves = Some(sender);
     }
@@ -1283,12 +1289,14 @@ impl HostnameRegistry {
             // A receiver that is gone moves nothing: the box binds its
             // declared ports at the new address at its next attach, and its
             // runtime forwards come down with its spawn.
-            drop(sender.send(PublishMove {
+            let moved = PublishMove {
                 holder: session_id,
                 from,
                 to: own.address,
                 hand_overs: hand_overs.clone(),
-            }));
+            };
+            let caller = crate::traced::caller_context();
+            drop(sender.send((moved, caller)));
         }
         hand_overs
     }
@@ -1989,7 +1997,8 @@ impl HostnameRegistry {
                     // A receiver that is gone binds nothing: the hand-over
                     // stands as a change of record.
                     if let Some(sender) = &self.hand_overs {
-                        drop(sender.send(hand_over.clone()));
+                        let caller = crate::traced::caller_context();
+                        drop(sender.send((hand_over.clone(), caller)));
                     }
                     hand_overs.push(hand_over);
                 }
@@ -6526,7 +6535,7 @@ mod tests {
             "the closed listener's port passes to the declared publisher"
         );
         assert_eq!(
-            sent.try_recv().ok(),
+            sent.try_recv().ok().map(|(hand_over, _)| hand_over),
             Some(PortHandOver {
                 holder: second,
                 address: node,
@@ -6636,7 +6645,7 @@ mod tests {
         // The holder stops naming one port: that port alone is handed over.
         reg.publish_own_address(first, "first", node, BTreeSet::from([9090u16]));
         assert_eq!(
-            sent.try_recv().ok(),
+            sent.try_recv().ok().map(|(hand_over, _)| hand_over),
             Some(PortHandOver {
                 holder: second,
                 address: node,
@@ -6650,7 +6659,7 @@ mod tests {
         // The holder of the other port moves to an address of its own.
         reg.publish_own_address(first, "first", elsewhere, BTreeSet::from([9090u16]));
         assert_eq!(
-            sent.try_recv().ok(),
+            sent.try_recv().ok().map(|(hand_over, _)| hand_over),
             Some(PortHandOver {
                 holder: second,
                 address: node,
@@ -6665,8 +6674,8 @@ mod tests {
         assert!(sent.try_recv().is_err());
         let (_, hand_overs) = reg.unpublish_own_address(second);
         let mut received = vec![
-            sent.try_recv().expect("the first hand-over"),
-            sent.try_recv().expect("the second hand-over"),
+            sent.try_recv().expect("the first hand-over").0,
+            sent.try_recv().expect("the second hand-over").0,
         ];
         received.sort_by_key(|hand_over| hand_over.port);
         let mut returned = hand_overs;

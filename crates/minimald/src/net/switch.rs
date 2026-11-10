@@ -9313,10 +9313,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// A reply-flow record ends four ways, and only those: at the FIN or RST
-    /// of its own conversation (from either end), at its window's edge, and
-    /// at revocation — where session stop lands too, ending the records
-    /// with the relay.
+    /// A reply-flow record ends four ways, and only those: at the box's FIN
+    /// or an RST from either end of its own conversation, at its window's
+    /// edge, and at revocation — where session stop lands too, ending the
+    /// records with the relay. The client's FIN is a half-close and ends
+    /// nothing (`reply_record_survives_the_client_half_close`).
     #[tokio::test]
     async fn reply_records_end_on_fin_rst_timeout_and_revocation() {
         let mut harness = spawn_test_relay_with(&deny_all_with_published_ports(), |gate| {
@@ -9412,6 +9413,57 @@ pub(crate) mod tests {
             gate.inbound_flow_records(),
             0,
             "session stop ended the box's records with the relay"
+        );
+    }
+
+    /// A client's FIN is a half-close (790d): a client that shuts down its
+    /// sending side after its request — `printf req | socat - TCP:box:port`
+    /// does, at stdin's end — is still reading, so the box's answer behind
+    /// the FIN is a reply the record admits. Ending the record at the
+    /// client's FIN dropped the whole answer at the box's rules, and the
+    /// client read an empty reply. The box's own FIN still ends it.
+    #[tokio::test]
+    async fn reply_record_survives_the_client_half_close() {
+        let mut harness = spawn_test_relay(&deny_all_with_published_ports());
+        let client = Ipv4Addr::new(203, 0, 113, 7);
+
+        // The connect, the request's ACK-bearing segment, and the client's
+        // FIN behind it: all delivered, the first one recorded.
+        for flags in [SYN, ACK, FIN | ACK] {
+            let segment = egress_tcp_segment(client, 51000, LEASE, 8080, flags);
+            deliver_inbound(&mut harness, &segment).await;
+            assert_delivered(&mut harness, &segment).await;
+        }
+
+        // The box's answer, then its close: both reach the switch, though the
+        // deny-all box's own rules refuse the client's address.
+        let answer = egress_tcp_segment(LEASE, 8080, client, 51000, ACK);
+        let close = egress_tcp_segment(LEASE, 8080, client, 51000, FIN | ACK);
+        for frame in [&answer, &close] {
+            harness.box_end.write_all(frame).unwrap();
+            let read = read_framed(&mut harness.switch);
+            let sent = tokio::time::timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the box's answer to a half-closed client passed")
+                .expect("the switch side stays open");
+            assert_eq!(
+                &sent, frame,
+                "the box answers a client that half-closed after its request"
+            );
+        }
+
+        // The box's FIN ended the record: its next segment on the flow is
+        // new traffic the deny-all rules drop.
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&answer).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "a record the box's FIN ended admits nothing"
         );
     }
 
