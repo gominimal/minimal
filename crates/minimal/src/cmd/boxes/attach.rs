@@ -879,7 +879,7 @@ pub(crate) enum BoxAfterAttach {
 }
 
 /// Refuses an attach from a caller with no terminal on stdin. It runs
-/// before any lookup, so the box is not resumed and its state and events
+/// before the hand-off, so the box is not resumed and its state and events
 /// do not change.
 pub(crate) fn ensure_box_attach_tty(stdin_is_tty: bool) -> Result<(), BoxAttachRefusal> {
     if stdin_is_tty {
@@ -896,7 +896,6 @@ pub(crate) fn ensure_box_attach_tty(stdin_is_tty: bool) -> Result<(), BoxAttachR
 /// after one line that names why the daemon ended the attach.
 pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<(), anyhow::Error> {
     let stdin_is_tty = std::io::stdin().is_terminal();
-    ensure_box_attach_tty(stdin_is_tty)?;
     if let Some(exec_id) = args.exec.as_deref() {
         // clap refuses `--exec` without a box (BCLI-068), so this holds.
         let address = args
@@ -947,7 +946,6 @@ async fn attach_command(
     target: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     let stdin_is_tty = std::io::stdin().is_terminal();
-    ensure_box_attach_tty(stdin_is_tty)?;
     let scope = match target {
         Some(_) => None,
         None => {
@@ -1301,8 +1299,9 @@ pub(crate) fn ssh_exit_code(attached: Result<(), anyhow::Error>) -> Result<i32, 
 }
 
 /// An attach of `verb` over the local `hosts`: `min box attach`,
-/// `min box resume` or `min session attach`. It refuses a caller with no
-/// terminal, finds the box ([`attach_target`]), runs `attach` on it, and
+/// `min box resume` or `min session attach`. It finds the box
+/// ([`attach_target`]), refuses a caller with no terminal, runs `attach`
+/// on the box, and
 /// reads how the attach ended ([`attach_ending`]). `scope` is the current
 /// project's root, which the bare form reads.
 pub(crate) async fn attach_on_hosts<A>(
@@ -1317,8 +1316,11 @@ where
     A: AsyncFnOnce(&BoxAttachTarget) -> Result<i32, anyhow::Error>,
 {
     let name = verb.name();
-    ensure_box_attach_tty(stdin_is_tty)?;
+    // The address refusals come first, because a script without a terminal
+    // reads them: none is exit 4, ambiguous is exit 2. Only a chosen box
+    // meets the terminal check, and the box resumes only in `attach`.
     let target = attach_target(verb, hosts, address, scope).await?;
+    ensure_box_attach_tty(stdin_is_tty)?;
     tracing::info!(
         verb = name,
         box_id = %target.box_id,

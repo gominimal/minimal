@@ -9680,7 +9680,8 @@ async fn box_attach_reattaches_pty_box() {
 }
 
 /// BCLI-068: without a terminal on stdin the attach fails with exit 2
-/// before any lookup, so a stopped box is not resumed and stays stopped.
+/// after the box is chosen and before the hand-off, so a stopped box is
+/// not resumed and stays stopped.
 #[tokio::test]
 async fn box_attach_without_tty_exit2() {
     let alpha = AttachHost::start("alpha.local-minvmd0").await;
