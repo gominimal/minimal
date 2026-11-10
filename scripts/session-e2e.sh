@@ -1018,7 +1018,14 @@ proxy_port_from_ls() {
     case "$PROXY_LS_OUT" in
       *"the hostname proxy is not serving"*) ;;
       *)
-        PROXY_PORT="$(printf '%s\n' "$PROXY_LS_OUT" | grep -F -- 'HOSTNAME PROXY' \
+        # The port the daemon itself reports (`hostname_proxy_port` in the
+        # JSON listing): on a VM lane the row also names every host port the
+        # VM host's proxy serves on (NET-154), and the first of those is not
+        # the one a box dials. The row's text is the fallback without jq.
+        PROXY_PORT="$(mnl ls --json 2>/dev/null \
+          | jq -r 'first(.. | objects | select(has("hostname_proxy_port")) | .hostname_proxy_port | numbers)' 2>/dev/null || true)"
+        case "$PROXY_PORT" in *[!0-9]*|"") PROXY_PORT="" ;; esac
+        [ -n "$PROXY_PORT" ] || PROXY_PORT="$(printf '%s\n' "$PROXY_LS_OUT" | grep -F -- 'HOSTNAME PROXY' \
           | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
         ;;
     esac
