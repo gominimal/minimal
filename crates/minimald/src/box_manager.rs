@@ -664,11 +664,9 @@ impl BoxManagerHandle {
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
                 identity: minimald_rpc::BoxIdentity::None,
-                // BOX-149: the daemon does not give an exec an id yet, so
-                // this list is always empty, even when a process runs in
-                // the box. It fills when each exec has an id (BOX-149):
-                // https://github.com/gominimal/minimal/issues/2404 (T30).
-                live_execs: Vec::new(),
+                // BOX-159: each exec running in the box, from the execs this
+                // daemon started under an id (BOX-149).
+                live_execs: crate::exec::live_execs(record.id),
                 disk_bytes,
             }))
         }
