@@ -126,7 +126,12 @@ pub(crate) fn render_box_show(
     lines.push(("Provider", provider.to_string()));
     lines.push(("Host", host.to_string()));
     if !shown.live_execs.is_empty() {
-        lines.push(("Live execs", shown.live_execs.join(", ")));
+        let ids: Vec<&str> = shown
+            .live_execs
+            .iter()
+            .map(|exec| exec.id.as_str())
+            .collect();
+        lines.push(("Live execs", ids.join(", ")));
     }
     for (label, value) in lines {
         let label = format!("{label}:");

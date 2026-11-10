@@ -842,6 +842,27 @@ pub mod classifier {
         file.write_all(format!("{pid}\n").as_bytes())
     }
 
+    /// What a refused join of a box's leaf most likely means, for the line
+    /// the box's launch fails with: `None` for an error that is not a
+    /// refusal. The kernel moves a process into a cgroup only for a writer
+    /// of the `cgroup.procs` of the closest cgroup the process's own cgroup
+    /// and the leaf share, so a refusal says the process was somewhere the
+    /// daemon's tree does not reach — the scope a CPU weight put a box's
+    /// build in, before gominimal/inbox#1219, was such a place.
+    #[must_use]
+    pub fn join_refusal_hint(err: &std::io::Error) -> Option<&'static str> {
+        // `EACCES` and `EPERM` both read as `PermissionDenied`.
+        if err.kind() != std::io::ErrorKind::PermissionDenied {
+            return None;
+        }
+        Some(
+            "the kernel refused the move; most likely the process was not in a cgroup of the \
+             daemon's tree, and only a writer of the cgroup.procs of the closest cgroup the two \
+             share may move it (/proc/<pid>/cgroup of the daemon and of the sandbox say where \
+             each sits); otherwise the leaf's own cgroup.procs is not writable by the daemon",
+        )
+    }
+
     /// Removes the box's leaf, once its last process is gone: a cgroup
     /// directory is removed with `rmdir` and refuses while it holds a process
     /// or a child cgroup, which is the failure a still-running box must
@@ -1574,7 +1595,12 @@ fn exec_box_program(
     // must not run.
     if let Some(procs) = classifier_join {
         if let Err(e) = classifier::place_pid(procs, std::process::id()) {
-            exit_child("joining the box's classifier leaf", &e, closure_report);
+            exit_child_hinted(
+                "joining the box's classifier leaf",
+                &e,
+                classifier::join_refusal_hint(&e),
+                closure_report,
+            );
         }
         // SAFETY: `unshare(2)` with the cgroup-namespace flag only;
         // async-signal-safe.
@@ -1915,11 +1941,27 @@ fn wait_at_start_gate(gate: std::os::fd::OwnedFd) {
 /// `_exit(2)` rather than the Rust stdio and exit machinery.
 #[cfg(target_os = "linux")]
 fn exit_child(what: &str, err: &std::io::Error, report: Option<&Path>) -> ! {
+    exit_child_hinted(what, err, None, report)
+}
+
+/// [`exit_child`], with what the failure most likely means appended to the
+/// stderr line only: the report file's line keeps the one shape the daemon
+/// parses (`failed <what> errno <n>`).
+#[cfg(target_os = "linux")]
+fn exit_child_hinted(
+    what: &str,
+    err: &std::io::Error,
+    hint: Option<&str>,
+    report: Option<&Path>,
+) -> ! {
     write_closure_report(
         report,
         &format!("failed {what} errno {}", err.raw_os_error().unwrap_or(0)),
     );
-    let msg = format!("minimal: sandbox: {what} failed: {err}\n");
+    let msg = match hint {
+        Some(hint) => format!("minimal: sandbox: {what} failed: {err}: {hint}\n"),
+        None => format!("minimal: sandbox: {what} failed: {err}\n"),
+    };
     // SAFETY: `write` and `_exit` are async-signal-safe; `msg` outlives the
     // write, and `_exit` does not return.
     unsafe {
@@ -2371,18 +2413,34 @@ impl<C: Channel> Sandbox<C> {
         // box's resolver does not know still answers from `/etc/hosts`.
         write_hosts(&self.rootfs(), plan.hosts(), ipv6_disabled())?;
 
-        if let Some(s) = &self.config.cpu_weight
+        // A box's leaf is the one cgroup its processes may sit in, and a
+        // weight's scope would move the first of them out of the daemon's
+        // tree before the closure joins the leaf, which the kernel then
+        // refuses (gominimal/inbox#1219). See `Config::hakoniwa_cpu_weight`.
+        // Without systemd no weight is ever applied, so there is nothing to
+        // drop and nothing to log.
+        if let Some(weight) = self.config.cpu_weight
             && booted_with_systemd()
         {
-            container.cgroups_resources({
-                let mut resources = hakoniwa::cgroups::Resources::default();
-                resources.cpu({
-                    let mut cpu = hakoniwa::cgroups::Cpu::default();
-                    cpu.shares(*s);
-                    cpu
-                });
-                resources
-            });
+            match self.config.hakoniwa_cpu_weight() {
+                Some(s) => {
+                    container.cgroups_resources({
+                        let mut resources = hakoniwa::cgroups::Resources::default();
+                        resources.cpu({
+                            let mut cpu = hakoniwa::cgroups::Cpu::default();
+                            cpu.shares(s);
+                            cpu
+                        });
+                        resources
+                    });
+                }
+                None => tracing::debug!(
+                    leaf = ?self.config.classifier_leaf.as_ref().map(|l| l.dir()),
+                    cpu_weight = weight,
+                    "sandbox launch: the build's CPU weight is not applied: it runs in the box's \
+                     classifier leaf, which a cgroup scope of its own would take it out of"
+                ),
+            }
         }
 
         Ok(Container {
@@ -3239,6 +3297,201 @@ impl Drop for PlannedLaunch {
     }
 }
 
+/// A network namespace on a [`Network`](network::Network), held open with no
+/// program in it. A process of this daemon can create sockets in the
+/// namespace, so they leave on that network and under its rules. Dropping it
+/// ends the namespace and releases the network.
+pub struct HeldNetwork {
+    pid: u32,
+    nameservers: Vec<std::net::Ipv4Addr>,
+    #[cfg(target_os = "linux")]
+    _held: std::sync::Mutex<Held>,
+}
+
+impl std::fmt::Debug for HeldNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldNetwork")
+            .field("pid", &self.pid)
+            .field("nameservers", &self.nameservers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HeldNetwork {
+    /// The process whose `/proc/<pid>/ns` holds the namespace.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// The name servers the network's plan names, which answer inside the
+    /// namespace.
+    #[must_use]
+    pub fn nameservers(&self) -> &[std::net::Ipv4Addr] {
+        &self.nameservers
+    }
+}
+
+/// What keeps a [`HeldNetwork`] up. The sandbox's process waits at the start
+/// gate and never runs a program, so its rootfs holds nothing to run.
+#[cfg(target_os = "linux")]
+struct Held {
+    child: hakoniwa::Child,
+    guard: Option<Box<dyn NetGuard>>,
+    _gate: StartGate,
+    _sandbox: Sandbox<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Held {
+    fn drop(&mut self) {
+        // Killed before the gate goes, so no program ever starts.
+        end_held(&mut self.child);
+        // `Drop` cannot `await`; with no runtime there is nothing to release to.
+        if let (Some(guard), Ok(handle)) =
+            (self.guard.take(), tokio::runtime::Handle::try_current())
+        {
+            handle.spawn(guard.teardown());
+        }
+    }
+}
+
+/// Ends a held process and reaps it. A process that already exited refuses
+/// the kill, and the wait still reaps it.
+#[cfg(target_os = "linux")]
+fn end_held(child: &mut hakoniwa::Child) {
+    if let Err(e) = child.kill() {
+        tracing::debug!(error = %e, "a held process refused the kill");
+    }
+    if let Err(e) = child.wait() {
+        tracing::warn!(error = %e, "could not reap a held process");
+    }
+}
+
+/// The error for a held process that ended before its network was attached.
+#[cfg(target_os = "linux")]
+fn held_process_ended(status: &hakoniwa::ExitStatus) -> Error {
+    Error::Execution(ExecutionError::InvocationFailed {
+        idx: 0,
+        code: status.code,
+        reason: format!(
+            "the held network's process ended before its attach: {}",
+            status.reason
+        ),
+        stderr: String::new(),
+        stdout: String::new(),
+    })
+}
+
+/// The sandbox a [`HeldNetwork`] runs in. Its rootfs is the bare `usr/` that
+/// [`Sandbox::new`] links `usr/lib64` in.
+#[cfg(target_os = "linux")]
+async fn held_sandbox(
+    base_dir: &Path,
+    network: std::sync::Arc<dyn network::Network>,
+) -> Result<Sandbox<()>, Error> {
+    let rootfs = tempfile::tempdir()
+        .map_err(|e| Error::IO("create held rootfs", base_dir.to_path_buf(), e))?;
+    let usr = rootfs.path().join("usr");
+    fs::create_dir(&usr).map_err(|e| Error::IO("create held rootfs usr", usr, e))?;
+    Config::new("held-network")
+        .with_add_rootfs(config::SandboxMapped::TempDir(rootfs))
+        .with_network(network)
+        .build(base_dir, ())
+        .await
+}
+
+/// Starts a sandbox under `base_dir` that holds `network` up with no program
+/// in it.
+///
+/// # Errors
+///
+/// Propagates a failure to plan, spawn or attach. Nothing stays held.
+#[cfg(target_os = "linux")]
+pub async fn hold_network(
+    base_dir: &Path,
+    network: std::sync::Arc<dyn network::Network>,
+) -> Result<HeldNetwork, Error> {
+    let mut sandbox = held_sandbox(base_dir, network).await?;
+    let planned = sandbox.plan_launch().await?;
+    let nameservers = match planned.plan().resolver() {
+        network::Resolver::Nameservers(nameservers) => nameservers.clone(),
+        _ => Vec::new(),
+    };
+    let mut container = sandbox.new_container(planned.plan())?;
+    let gate = sandbox.hold_start(&mut container)?;
+    let mut cmd = sandbox.command(&container, "/held-network", [""; 0], [("", ""); 0])?;
+    // A held process reads and writes nothing, so its stdio is /dev/null. It
+    // must not take the daemon's terminal: hakoniwa binds a terminal stdout
+    // as the box's console, and a daemon whose stdout is a microVM guest's
+    // console has none it can bind there.
+    let null = || {
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .map(hakoniwa::Stdio::from)
+            .map_err(|e| Error::IO("open the held network's stdio", "/dev/null".into(), e))
+    };
+    cmd.stdin(null()?);
+    cmd.stdout(null()?);
+    cmd.stderr(null()?);
+    let mut child = forker::on_fork_thread(move || cmd.spawn())
+        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+    let pid = child.id();
+    let spawned = network::Spawned::from_child(&mut child);
+    // A held process waits at its start gate, so one that has ended failed
+    // its own setup. Its exit status says why, and neither the attach's
+    // error nor a later read of its namespace carries that.
+    let guard = match planned.attach(spawned).await {
+        Ok(guard) => {
+            // An attach that touches no namespace succeeds over an ended
+            // process too.
+            if let Ok(Some(status)) = child.try_wait() {
+                end_held(&mut child);
+                return Err(held_process_ended(&status));
+            }
+            guard
+        }
+        Err(e) => {
+            let ended = child.try_wait().ok().flatten();
+            end_held(&mut child);
+            return Err(match ended {
+                Some(status) => held_process_ended(&status),
+                None => e,
+            });
+        }
+    };
+    Ok(HeldNetwork {
+        pid,
+        nameservers,
+        _held: std::sync::Mutex::new(Held {
+            child,
+            guard: Some(guard),
+            _gate: gate,
+            _sandbox: sandbox,
+        }),
+    })
+}
+
+/// Sandboxes run only on Linux, so no network is held anywhere else.
+///
+/// # Errors
+///
+/// Always.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
+pub async fn hold_network(
+    base_dir: &Path,
+    _network: std::sync::Arc<dyn network::Network>,
+) -> Result<HeldNetwork, Error> {
+    Err(Error::IO(
+        "holding a network",
+        base_dir.to_path_buf(),
+        std::io::Error::from(std::io::ErrorKind::Unsupported),
+    ))
+}
+
 /// The network plan a sandbox's built-in configuration implies. See
 /// [`Sandbox::built_in_plan`].
 fn plan_from_config(config: &config::Config) -> network::NetPlan {
@@ -3901,6 +4154,30 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gominimal/inbox#1219: a refused join of a box's leaf says why on the
+    /// line the launch fails with; any other failure keeps its plain line.
+    #[test]
+    fn a_refused_leaf_join_carries_a_hint_and_other_errors_do_not() {
+        // EACCES and EPERM (13 and 1, on Linux and macOS alike), as the
+        // join's write returns them.
+        for errno in [13, 1] {
+            let hint = classifier::join_refusal_hint(&std::io::Error::from_raw_os_error(errno))
+                .expect("a refusal is explained");
+            assert!(
+                hint.contains("closest cgroup the two share"),
+                "the hint names the rule the kernel applied: {hint}"
+            );
+        }
+        // ENOENT, EBUSY, EINVAL.
+        for errno in [2, 16, 22] {
+            assert_eq!(
+                classifier::join_refusal_hint(&std::io::Error::from_raw_os_error(errno)),
+                None,
+                "errno {errno} is not a refusal"
+            );
+        }
+    }
 
     /// A copied input is a new file with the source's bytes and mode.
     #[test]
@@ -6540,6 +6817,48 @@ int main(int argc, char **argv) {
             first_mark.exists(),
             "the released program never ran: no mark at {}",
             first_mark.display()
+        );
+    }
+
+    /// A held network builds with no package in its rootfs, holds a namespace
+    /// of its own while it lives, and takes its process with it when dropped.
+    /// Building needs no user namespace, so that part holds on every host.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_network_holds_its_namespace_until_dropped() {
+        let name = "held-network";
+        let base_dir = box_base_dir(name);
+        let home = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let rec = std::sync::Arc::new(Recorder::default());
+        held_sandbox(home.path(), rec.clone())
+            .await
+            .expect("building the held sandbox");
+
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping the rest of a_held_network_holds_its_namespace_until_dropped: \
+                 this host denies the unprivileged user namespace every \
+                 sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+
+        let held = hold_network(home.path(), rec.clone())
+            .await
+            .expect("holding the network");
+        let proc_dir = PathBuf::from(format!("/proc/{}", held.pid()));
+        assert_ne!(
+            fs::read_link(proc_dir.join("ns/net")).expect("reading the held namespace"),
+            fs::read_link("/proc/self/ns/net").expect("reading this process's namespace"),
+            "the held process shares this process's network namespace"
+        );
+
+        drop(held);
+        assert!(
+            !proc_dir.exists(),
+            "the held process outlived its handle: {}",
+            proc_dir.display()
         );
     }
 

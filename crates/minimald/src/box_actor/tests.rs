@@ -7757,6 +7757,13 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
         .expect("the daemon walks the range through the forwarder");
     assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
 
+    // The box's table is this test process's network namespace, which every
+    // concurrently running test shares: another test's listener on the any
+    // address inside the range is the box's listener too. The watcher moves
+    // its forwards one port at a time, so such a port can still stand at the
+    // interim when this test's own two have moved. Its move is awaited; this
+    // test's own ports are held to the assertion below at once.
+    let ours = [exposed, listened];
     let rows = listed_once(&handle, |rows| {
         rows.exposed
             .iter()
@@ -7765,6 +7772,12 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
                 .listened
                 .iter()
                 .any(|row| row.local == at(handed, listened))
+            && rows
+                .exposed
+                .iter()
+                .chain(&rows.listened)
+                .filter(|row| !ours.contains(&row.internal_port))
+                .all(|row| !row.local.starts_with("127.0.0.1:"))
     })
     .await;
     assert!(
@@ -14362,7 +14375,9 @@ fn box_package_build_under_box_egress_verdict() {
             "the build of fetcher could not reach downloads.example.org: \
              the egress rules of box sealed do not allow it. \
              To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org"
+             --network own_ip --allow-dns-hosts downloads.example.org. \
+             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip"
         )
     );
     assert_eq!(run("open", Some(open)), None);
@@ -14414,9 +14429,13 @@ async fn box_build_web_source_under_box_verdict() {
             &self,
             url: &str,
             _sha256: &str,
-            leaf: Option<&ClassifierLeaf>,
+            place: Option<op::SourcePlace<'_>>,
             _op: &ot::OpTracker,
         ) -> anyhow::Result<(std::path::PathBuf, bool)> {
+            let leaf = match place {
+                Some(op::SourcePlace::Leaf(leaf)) => Some(leaf),
+                _ => None,
+            };
             self.1.lock().unwrap().push(leaf.cloned());
             assert!(url.starts_with("https://downloads.example.org/"), "{url}");
             match leaf {
@@ -14508,7 +14527,11 @@ async fn box_build_web_source_under_box_verdict() {
         (spec_build, lines)
     };
     let expected = "the build of fetcher could not reach downloads.example.org: \
-                    the egress rules of box sealed do not allow it";
+                    the egress rules of box sealed do not allow it. \
+                    To allow it, activate a new session with \
+                    --network own_ip --allow-dns-hosts downloads.example.org. \
+                    Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                    then activate a new session with --network own_ip";
 
     // The deny-all box: its build fails, naming the host and the box.
     let (mut spec_build, lines) = build(sealed.clone());
@@ -14654,7 +14677,9 @@ fn box_package_build_refusal_names_destination_and_box_for_materialize() {
             "the build of fetcher could not reach downloads.example.org: \
              the egress rules of box sealed do not allow it. \
              To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org\n{failed}"
+             --network own_ip --allow-dns-hosts downloads.example.org. \
+             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip\n{failed}"
         )
     );
 }
@@ -14728,7 +14753,9 @@ fn box_package_build_refusal_names_destination_and_box() {
             "93.184.215.14" => String::new(),
             host => format!(
                 ". To allow it, activate a new session with \
-                --network own_ip --allow-dns-hosts {host}"
+                --network own_ip --allow-dns-hosts {host}. \
+                Or add {host} to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                then activate a new session with --network own_ip"
             ),
         };
         assert_eq!(
@@ -14841,7 +14868,9 @@ fn box_package_build_refusal_names_destination_and_box_only_for_the_error() {
             "the build of hello could not reach example.com:443: \
              the egress rules of box my-box do not allow it. \
              To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts example.com"
+             --network own_ip --allow-dns-hosts example.com. \
+             Or add example.com to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip"
                 .to_string()
         )
     );
@@ -15097,7 +15126,9 @@ async fn box_package_build_under_box_egress_verdict_runs_own_address_box_on_its_
             "the build of fetcher could not reach downloads.example.org: \
              the egress rules of box sealed do not allow it. \
              To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org"
+             --network own_ip --allow-dns-hosts downloads.example.org. \
+             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip"
         )
     );
     assert_eq!(run(open_network), None);
@@ -15119,6 +15150,27 @@ async fn box_package_build_under_box_egress_verdict_runs_own_address_box_on_its_
         refused.to_string().contains("could not confirm"),
         "{refused}"
     );
+}
+
+/// NET-155: a box with no network gets a network that gives its builds none,
+/// never the daemon's. Its record has no rules, so nothing reports a failure
+/// as the box's rules. Every other box keeps the placement its mode gives it.
+#[test]
+fn box_package_build_under_box_egress_verdict_gives_no_network_box_none() {
+    let switch = build_switch();
+    let record = build_record(boxes::NetworkMode::NoNet, None);
+    let network = super::setup::box_build_network(&record, &switch, false)
+        .expect("a box with no network has a build network");
+    assert!(network.is_none());
+    assert!(!network.denies_all());
+
+    let own = build_record(boxes::NetworkMode::OwnIp, None);
+    let network = super::setup::box_build_network(&own, &switch, false).unwrap();
+    assert!(!network.is_none());
+
+    let mut host = build_record(boxes::NetworkMode::HostNet, None);
+    host.host_ip_enforcement = Some(boxes::HostIpEnforcement::None);
+    assert!(super::setup::box_build_network(&host, &switch, false).is_none());
 }
 
 /// NET-155: a host-address box with no per-box enforcement has no leaf and
