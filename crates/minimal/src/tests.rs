@@ -8721,6 +8721,10 @@ async fn box_attach_exec_reattaches_live_pty_exec() {
         AN_EXEC_ID,
         true,
     );
+    // BOX-159: the daemon lists the exec as running in the box.
+    let _live = alpha
+        .server
+        .list_running_exec(web, AN_EXEC_ID, &["sh", "-i"], true);
 
     for address in [
         "web",
@@ -8782,6 +8786,10 @@ async fn box_attach_exec_own_end_code7_exits_0() {
         AN_EXEC_ID,
         true,
     );
+    // BOX-159: the daemon lists the exec as running in the box.
+    let _live = alpha
+        .server
+        .list_running_exec(web, AN_EXEC_ID, &["sh", "-i"], true);
     let ending = box_attach_exec_on_hosts(
         vec![alpha.host.clone()],
         "web",
@@ -8815,6 +8823,10 @@ async fn box_attach_exec_box_stopped_exit254_names_stop() {
         AN_EXEC_ID,
         true,
     );
+    // BOX-159: the daemon lists the exec as running in the box.
+    let _live = alpha
+        .server
+        .list_running_exec(web, AN_EXEC_ID, &["sh", "-i"], true);
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
     let attach = box_attach_exec_on_hosts(
         vec![alpha.host.clone()],
@@ -8906,6 +8918,10 @@ async fn box_attach_exec_late_stop_record_exit254_names_stop() {
         AN_EXEC_ID,
         true,
     );
+    // BOX-159: the daemon lists the exec as running in the box.
+    let _live = alpha
+        .server
+        .list_running_exec(web, AN_EXEC_ID, &["sh", "-i"], true);
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
     let attach = box_attach_exec_on_hosts(
         vec![alpha.host.clone()],
@@ -8986,6 +9002,10 @@ async fn box_attach_exec_non_pty_exit2_names_logs() {
         AN_EXEC_ID,
         false,
     );
+    // BOX-159: the daemon lists the exec as running in the box.
+    let _live = alpha
+        .server
+        .list_running_exec(web, AN_EXEC_ID, &["sh", "-i"], false);
 
     let err = box_attach_exec_on_hosts(
         vec![alpha.host.clone()],
@@ -9006,21 +9026,42 @@ async fn box_attach_exec_non_pty_exit2_names_logs() {
         )
     );
 
-    // A start event that says nothing of a terminal proves no refusal: the
-    // command leaves the terminal check to the host.
-    let mut silent = boxes::events::BoxEvent {
+    // BOX-159: the host's live exec row decides the terminal, whatever the
+    // events say. A started exec the host does not list has ended.
+    let row = |mode| minimald_rpc::LiveExec {
+        id: AN_EXEC_ID.to_owned(),
+        argv: vec!["sh".to_owned()],
+        mode,
+    };
+    use minimald_rpc::exec::ExecMode;
+    assert_eq!(
+        crate::exec_found(&[row(ExecMode::Tty)], None, AN_EXEC_ID),
+        crate::ExecFound::Terminal,
+    );
+    for mode in [ExecMode::Detached, ExecMode::Attached] {
+        assert_eq!(
+            crate::exec_found(&[row(mode)], None, AN_EXEC_ID),
+            crate::ExecFound::NoTerminal,
+            "{mode:?}"
+        );
+    }
+    let mut started = boxes::events::BoxEvent {
         box_id: web,
         parent: None,
         ts: 0,
         kind: boxes::events::BoxEventType::ExecStarted,
         data: Default::default(),
     };
-    silent
+    started
         .data
         .insert(boxes::events::exec_data::EXEC_ID.into(), AN_EXEC_ID.into());
     assert_eq!(
-        crate::exec_found(&[silent], &[], true, AN_EXEC_ID),
-        crate::ExecFound::Terminal,
+        crate::exec_found(&[], Some(&[started]), AN_EXEC_ID),
+        crate::ExecFound::Ended,
+    );
+    assert_eq!(
+        crate::exec_found(&[], Some(&[]), AN_EXEC_ID),
+        crate::ExecFound::Unknown,
     );
 }
 

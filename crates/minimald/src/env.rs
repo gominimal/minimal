@@ -1505,8 +1505,10 @@ struct BoxChannel {
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
-/// The span one helper request is handled in, and the request with its
-/// trace prefix removed.
+/// The span one helper request is handled in, the request with its trace
+/// prefix removed, and the `TRACEPARENT` a task the request runs may be given:
+/// the span's own context, and only when the span is recorded
+/// ([`crate::exec::box_traceparent`], TEL-024).
 ///
 /// The helper (`env_min_helper.sh`, `__min_rpc`) sends
 /// `traceparent%<w3c traceparent>%<method>%<data>` when the box has a
@@ -1530,7 +1532,7 @@ fn channel_request_span<'a>(
     line: &'a str,
     box_id: &str,
     session_id: Option<boxes::SessionId>,
-) -> (tracing::Span, &'a str) {
+) -> (tracing::Span, &'a str, Option<String>) {
     let (traceparent, request) = match line.split_once('%') {
         Some(("traceparent", rest)) => match rest.split_once('%') {
             Some((tp, request)) => (Some(tp), request),
@@ -1550,8 +1552,9 @@ fn channel_request_span<'a>(
         parent_span_id = tracing::field::Empty,
     );
     let client_ctx = traceparent.and_then(minimald_rpc::trace::TraceContext::parse_traceparent);
-    crate::exec::adopt_trace(&span, client_ctx);
-    (span, request)
+    let adopted = crate::exec::adopt_trace(&span, client_ctx);
+    let task_traceparent = crate::exec::box_traceparent(&adopted);
+    (span, request, task_traceparent)
 }
 
 /// The methods [`BoxChannel::handle`] dispatches: the only values the
@@ -1606,14 +1609,12 @@ impl BoxChannel {
         }) = self.rx.recv().await
         {
             tracing::trace!("session channel handling: {}", loggable_request(&line));
-            let (span, line) = channel_request_span(&line, &self.box_id, self.session_id);
+            let (span, line, traceparent) =
+                channel_request_span(&line, &self.box_id, self.session_id);
             // Boxed: the handler's future is large (every subcommand's state in
             // one `async fn`) and it is awaited once per request, not per byte.
-            tracing::Instrument::instrument(
-                Box::pin(self.handle_raw(line, raw.as_deref(), &mut stream)),
-                span,
-            )
-            .await;
+            let handled = self.handle_raw(line, raw.as_deref(), traceparent, &mut stream);
+            tracing::Instrument::instrument(Box::pin(handled), span).await;
             // `stream` is dropped here, closing the connection so the client's
             // `socat` reads EOF and the `min` helper's read loop terminates.
         }
@@ -1622,12 +1623,20 @@ impl BoxChannel {
     /// Dispatches a single valid `method%data` request line.
     #[cfg(test)]
     async fn handle(&mut self, line: &str, stream: &mut UnixStream) {
-        self.handle_raw(line, None, stream).await;
+        self.handle_raw(line, None, None, stream).await;
     }
 
     /// Dispatches a single `method%data` request line. `raw` is the line as
-    /// the box sent it when `line` is its lossy decode.
-    async fn handle_raw(&mut self, line: &str, raw: Option<&[u8]>, stream: &mut UnixStream) {
+    /// the box sent it when `line` is its lossy decode. `traceparent` is the
+    /// request span's context for a task the request runs
+    /// ([`channel_request_span`]).
+    async fn handle_raw(
+        &mut self,
+        line: &str,
+        raw: Option<&[u8]>,
+        traceparent: Option<String>,
+        stream: &mut UnixStream,
+    ) {
         let add_dep = match line.split_once('%') {
             Some(("add-transient", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
@@ -1686,7 +1695,7 @@ impl BoxChannel {
                 if let Some(data) = raw.and_then(run_data_bytes) {
                     request.mark_invalid_bytes(data);
                 }
-                self.run_task(stream, request).await;
+                self.run_task(stream, request, traceparent).await;
                 None
             }
             Some(("build", args)) => {
@@ -2154,7 +2163,14 @@ impl BoxChannel {
     /// Implements `min task run <task> [args...]`: runs the task and, for a
     /// helper that sends its argv, relays the task's exit code as `exit:<n>`
     /// so the helper exits with it. A task box's entrypoint is that helper.
-    async fn run_task(&mut self, stream: &mut UnixStream, request: TaskRunRequest) {
+    /// `traceparent` is the request span's context, which the task gets on
+    /// opt-in ([`run_task_trace`]).
+    async fn run_task(
+        &mut self,
+        stream: &mut UnixStream,
+        request: TaskRunRequest,
+        traceparent: Option<String>,
+    ) {
         let task_name = request.task.as_str();
         let relays = request.relays_exit();
         // BCLI-010 (T62): a relaying helper prints `err:` lines on stderr,
@@ -2218,6 +2234,12 @@ impl BoxChannel {
             let _ = writeln!(stream, "{}", inherit_refusal(task_name, &name));
             return relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
         }
+        run_task_trace(
+            &mut task.vars,
+            mlog::otel::exporting(),
+            traceparent,
+            &request.env,
+        );
         let start_dir = match start_dir_in_box(
             task.inherit_cwd,
             request.cwd.as_deref(),
@@ -3234,6 +3256,35 @@ fn run_task_vars(
     Ok(())
 }
 
+/// Adds the trace variables to an in-box run's task variables (TEL-023), as
+/// the sandboxed task path adds them (`minimald_rpc::taskenv::with_trace`).
+/// Since T43 a task box's entrypoint is the in-box `min task run`: the
+/// exec's `TRACEPARENT` reaches that helper, and the helper hands it on as
+/// the request's trace prefix, but the task runs in a sandbox of its own
+/// whose variables are the task's alone. Without this the task got no
+/// `TRACEPARENT`, and a `min` it ran started a trace of its own.
+///
+/// `traceparent` is the request span's context ([`channel_request_span`]),
+/// so the task's work is a child of the span that served it. `caller` is
+/// the helper's exported environment: a helper that opted out
+/// (`MINIMAL_OTEL=off`, TEL-045) hands the task the marker and no
+/// `TRACEPARENT`. With `telemetry_on` false nothing is added.
+fn run_task_trace(
+    vars: &mut BTreeMap<String, EnvVarValue>,
+    telemetry_on: bool,
+    traceparent: Option<String>,
+    caller: &BTreeMap<String, String>,
+) {
+    let trace = minimald_rpc::taskenv::trace_env(
+        telemetry_on,
+        traceparent,
+        minimald_rpc::trace::opted_out(caller),
+    );
+    for (name, value) in trace {
+        vars.insert(name, EnvVarValue::Value(value));
+    }
+}
+
 /// Gives each `inherit` variable of a task the caller's value. The daemon's
 /// own environment never fills one (#585). `Err(name)` names the first
 /// `inherit` variable the caller does not set, or sets to a value in
@@ -4045,16 +4096,16 @@ mod tests {
     fn channel_request_span_strips_the_traceparent_prefix() {
         let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
         let expose = format!("traceparent%{tp}%net-expose%8770");
-        let (_, request) = super::channel_request_span(&expose, "b", None);
+        let (_, request, _) = super::channel_request_span(&expose, "b", None);
         assert_eq!(request, "net-expose%8770");
         let materialize = format!("traceparent%{tp}%materialize%/workbench%--output o o717b");
-        let (_, request) = super::channel_request_span(&materialize, "b", None);
+        let (_, request, _) = super::channel_request_span(&materialize, "b", None);
         assert_eq!(request, "materialize%/workbench%--output o o717b");
-        let (_, request) = super::channel_request_span("net-expose%8770", "b", None);
+        let (_, request, _) = super::channel_request_span("net-expose%8770", "b", None);
         assert_eq!(request, "net-expose%8770");
         // A prefix with no request after it is handed on as-is, to be refused
         // by the dispatcher as unhandled input rather than guessed at.
-        let (_, request) = super::channel_request_span("traceparent%garbage", "b", None);
+        let (_, request, _) = super::channel_request_span("traceparent%garbage", "b", None);
         assert_eq!(request, "garbage");
     }
 
@@ -4072,7 +4123,7 @@ mod tests {
             boxes::SessionId::parse_str("7b3e1f2a-9c4d-4e5f-8a6b-1c2d3e4f5a6b").unwrap();
         let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
         let line = format!("traceparent%{tp}%net-expose%8770");
-        let (span, request) = super::channel_request_span(&line, "leaf-7", Some(session_id));
+        let (span, request, _) = super::channel_request_span(&line, "leaf-7", Some(session_id));
         assert_eq!(request, "net-expose%8770");
         drop(span);
         let served = log.one("session.channel", "method", "net-expose");
@@ -4089,7 +4140,7 @@ mod tests {
         );
 
         // Without a session id the field is simply absent; the box id stays.
-        let (span, _) = super::channel_request_span("net-expose%8770", "solo", None);
+        let (span, _, _) = super::channel_request_span("net-expose%8770", "solo", None);
         drop(span);
         let bare = log.find("session.channel", "box.id", "solo");
         assert_eq!(bare.len(), 1);
@@ -4117,7 +4168,7 @@ mod tests {
             (long.clone(), "other"),
             (format!("traceparent%{tp}%{long}"), "other"),
         ] {
-            let (span, _) = super::channel_request_span(&line, "m", None);
+            let (span, _, _) = super::channel_request_span(&line, "m", None);
             drop(span);
             let served = log.find("session.channel", "box.id", "m");
             let last = served.last().expect("a session.channel span");
@@ -4187,7 +4238,7 @@ mod tests {
 
         let log = crate::test_harness::SpanLog::default();
         let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
-        let (span, request) = super::channel_request_span(&line, "inner", None);
+        let (span, request, _) = super::channel_request_span(&line, "inner", None);
         assert_eq!(request, "net-expose%8770");
         drop(span);
         let served = log.one("session.channel", "box.id", "inner");
@@ -5364,6 +5415,81 @@ exit $rc
         assert_eq!(vars.len(), 1);
     }
 
+    /// TEL-023 on a task box (T43): the task an in-box `min task run` runs
+    /// gets the request span's `TRACEPARENT` on opt-in, over whatever the
+    /// task declares, and keeps its other variables. The helper's exported
+    /// `TRACEPARENT` is not what it gets: that names the exec, and the task's
+    /// work is a child of the span that served the request. A helper that
+    /// opted out hands the task the marker and no `TRACEPARENT`; with
+    /// telemetry off, or no recorded span, nothing is added. Scenario 712b.
+    #[test]
+    fn an_in_box_task_run_gives_the_task_the_request_traceparent() {
+        let exec_tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let span_tp = "00-af79b928d8ae574b659f1fbf40208758-1111111111111111-01";
+        let declared = || {
+            BTreeMap::from([
+                ("KEPT".to_string(), EnvVarValue::Value("k".to_string())),
+                (
+                    "TRACEPARENT".to_string(),
+                    EnvVarValue::Value("from-toml".to_string()),
+                ),
+            ])
+        };
+        let on = TaskRunRequest::parse(&format!(
+            "/workbench{RUN_GROUP_SEP}t{RUN_GROUP_SEP}TRACEPARENT={exec_tp}"
+        ));
+
+        let mut vars = declared();
+        run_task_trace(&mut vars, true, Some(span_tp.to_string()), &on.env);
+        assert_eq!(
+            vars,
+            BTreeMap::from([
+                ("KEPT".to_string(), EnvVarValue::Value("k".to_string())),
+                (
+                    "TRACEPARENT".to_string(),
+                    EnvVarValue::Value(span_tp.to_string()),
+                ),
+            ]),
+            "the task gets the request span's TRACEPARENT and keeps the rest"
+        );
+
+        // Telemetry off, or a request span no export records: nothing added.
+        for (telemetry_on, traceparent) in [(false, Some(span_tp.to_string())), (true, None)] {
+            let mut vars = declared();
+            run_task_trace(&mut vars, telemetry_on, traceparent, &on.env);
+            assert_eq!(vars, declared());
+        }
+
+        // TEL-045: an opted-out helper's task gets the marker, never a
+        // TRACEPARENT, even when the daemon minted one for the request.
+        let off = TaskRunRequest::parse(&format!(
+            "/workbench{RUN_GROUP_SEP}t{RUN_GROUP_SEP}{}={}",
+            minimald_rpc::trace::OTEL_ENV,
+            minimald_rpc::trace::OTEL_OFF,
+        ));
+        let mut vars = BTreeMap::new();
+        run_task_trace(&mut vars, true, Some(span_tp.to_string()), &off.env);
+        assert_eq!(
+            vars,
+            BTreeMap::from([(
+                minimald_rpc::trace::OTEL_ENV.to_string(),
+                EnvVarValue::Value(minimald_rpc::trace::OTEL_OFF.to_string()),
+            )])
+        );
+    }
+
+    /// TEL-024 on the in-box path: with no exporter the request span is not
+    /// recorded, so a `run` request yields no `TRACEPARENT` for its task,
+    /// even when the helper sent one.
+    #[test]
+    fn an_unrecorded_request_span_gives_the_task_no_traceparent() {
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = format!("traceparent%{tp}%run%/workbench{RUN_GROUP_SEP}t");
+        let (_, request, task_tp) = super::channel_request_span(&line, "b", None);
+        assert_eq!(request, format!("run%/workbench{RUN_GROUP_SEP}t"));
+        assert_eq!(task_tp, None);
+    }
+
     /// BCLI-010 (T62): the request `min task run` sends carries the caller's
     /// args with their spaces, its `$PWD` and its exported variables. The
     /// channel fills the task's `inherit` variables from them and starts an
@@ -5553,7 +5679,7 @@ exit $rc
             setup_channel_in(crate::box_actor::WeakBoxHandle::dangling(), "web", repo);
         let (mut ours, mut theirs) = UnixStream::pair().unwrap();
         let line = String::from_utf8_lossy(raw).into_owned();
-        chan.handle_raw(&line, Some(raw), &mut ours).await;
+        chan.handle_raw(&line, Some(raw), None, &mut ours).await;
         drop(ours);
         let mut reply = String::new();
         std::io::Read::read_to_string(&mut theirs, &mut reply).unwrap();

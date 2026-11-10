@@ -842,6 +842,27 @@ pub mod classifier {
         file.write_all(format!("{pid}\n").as_bytes())
     }
 
+    /// What a refused join of a box's leaf most likely means, for the line
+    /// the box's launch fails with: `None` for an error that is not a
+    /// refusal. The kernel moves a process into a cgroup only for a writer
+    /// of the `cgroup.procs` of the closest cgroup the process's own cgroup
+    /// and the leaf share, so a refusal says the process was somewhere the
+    /// daemon's tree does not reach — the scope a CPU weight put a box's
+    /// build in, before gominimal/inbox#1219, was such a place.
+    #[must_use]
+    pub fn join_refusal_hint(err: &std::io::Error) -> Option<&'static str> {
+        // `EACCES` and `EPERM` both read as `PermissionDenied`.
+        if err.kind() != std::io::ErrorKind::PermissionDenied {
+            return None;
+        }
+        Some(
+            "the kernel refused the move; most likely the process was not in a cgroup of the \
+             daemon's tree, and only a writer of the cgroup.procs of the closest cgroup the two \
+             share may move it (/proc/<pid>/cgroup of the daemon and of the sandbox say where \
+             each sits); otherwise the leaf's own cgroup.procs is not writable by the daemon",
+        )
+    }
+
     /// Removes the box's leaf, once its last process is gone: a cgroup
     /// directory is removed with `rmdir` and refuses while it holds a process
     /// or a child cgroup, which is the failure a still-running box must
@@ -1574,7 +1595,12 @@ fn exec_box_program(
     // must not run.
     if let Some(procs) = classifier_join {
         if let Err(e) = classifier::place_pid(procs, std::process::id()) {
-            exit_child("joining the box's classifier leaf", &e, closure_report);
+            exit_child_hinted(
+                "joining the box's classifier leaf",
+                &e,
+                classifier::join_refusal_hint(&e),
+                closure_report,
+            );
         }
         // SAFETY: `unshare(2)` with the cgroup-namespace flag only;
         // async-signal-safe.
@@ -1915,11 +1941,27 @@ fn wait_at_start_gate(gate: std::os::fd::OwnedFd) {
 /// `_exit(2)` rather than the Rust stdio and exit machinery.
 #[cfg(target_os = "linux")]
 fn exit_child(what: &str, err: &std::io::Error, report: Option<&Path>) -> ! {
+    exit_child_hinted(what, err, None, report)
+}
+
+/// [`exit_child`], with what the failure most likely means appended to the
+/// stderr line only: the report file's line keeps the one shape the daemon
+/// parses (`failed <what> errno <n>`).
+#[cfg(target_os = "linux")]
+fn exit_child_hinted(
+    what: &str,
+    err: &std::io::Error,
+    hint: Option<&str>,
+    report: Option<&Path>,
+) -> ! {
     write_closure_report(
         report,
         &format!("failed {what} errno {}", err.raw_os_error().unwrap_or(0)),
     );
-    let msg = format!("minimal: sandbox: {what} failed: {err}\n");
+    let msg = match hint {
+        Some(hint) => format!("minimal: sandbox: {what} failed: {err}: {hint}\n"),
+        None => format!("minimal: sandbox: {what} failed: {err}\n"),
+    };
     // SAFETY: `write` and `_exit` are async-signal-safe; `msg` outlives the
     // write, and `_exit` does not return.
     unsafe {
@@ -2371,18 +2413,34 @@ impl<C: Channel> Sandbox<C> {
         // box's resolver does not know still answers from `/etc/hosts`.
         write_hosts(&self.rootfs(), plan.hosts(), ipv6_disabled())?;
 
-        if let Some(s) = &self.config.cpu_weight
+        // A box's leaf is the one cgroup its processes may sit in, and a
+        // weight's scope would move the first of them out of the daemon's
+        // tree before the closure joins the leaf, which the kernel then
+        // refuses (gominimal/inbox#1219). See `Config::hakoniwa_cpu_weight`.
+        // Without systemd no weight is ever applied, so there is nothing to
+        // drop and nothing to log.
+        if let Some(weight) = self.config.cpu_weight
             && booted_with_systemd()
         {
-            container.cgroups_resources({
-                let mut resources = hakoniwa::cgroups::Resources::default();
-                resources.cpu({
-                    let mut cpu = hakoniwa::cgroups::Cpu::default();
-                    cpu.shares(*s);
-                    cpu
-                });
-                resources
-            });
+            match self.config.hakoniwa_cpu_weight() {
+                Some(s) => {
+                    container.cgroups_resources({
+                        let mut resources = hakoniwa::cgroups::Resources::default();
+                        resources.cpu({
+                            let mut cpu = hakoniwa::cgroups::Cpu::default();
+                            cpu.shares(s);
+                            cpu
+                        });
+                        resources
+                    });
+                }
+                None => tracing::debug!(
+                    leaf = ?self.config.classifier_leaf.as_ref().map(|l| l.dir()),
+                    cpu_weight = weight,
+                    "sandbox launch: the build's CPU weight is not applied: it runs in the box's \
+                     classifier leaf, which a cgroup scope of its own would take it out of"
+                ),
+            }
         }
 
         Ok(Container {
@@ -3901,6 +3959,30 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gominimal/inbox#1219: a refused join of a box's leaf says why on the
+    /// line the launch fails with; any other failure keeps its plain line.
+    #[test]
+    fn a_refused_leaf_join_carries_a_hint_and_other_errors_do_not() {
+        // EACCES and EPERM (13 and 1, on Linux and macOS alike), as the
+        // join's write returns them.
+        for errno in [13, 1] {
+            let hint = classifier::join_refusal_hint(&std::io::Error::from_raw_os_error(errno))
+                .expect("a refusal is explained");
+            assert!(
+                hint.contains("closest cgroup the two share"),
+                "the hint names the rule the kernel applied: {hint}"
+            );
+        }
+        // ENOENT, EBUSY, EINVAL.
+        for errno in [2, 16, 22] {
+            assert_eq!(
+                classifier::join_refusal_hint(&std::io::Error::from_raw_os_error(errno)),
+                None,
+                "errno {errno} is not a refusal"
+            );
+        }
+    }
 
     /// A copied input is a new file with the source's bytes and mode.
     #[test]
