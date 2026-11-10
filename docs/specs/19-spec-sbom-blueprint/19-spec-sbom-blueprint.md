@@ -421,6 +421,15 @@ developer running agent boxes, build-infra operator, and auditor.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_failure_names_pin_object_check_and_remediation
     property: ¬emitted(a) ⇒ error(a) names (pin, o, check(o), remediation)
+  - WHEN an emission has more than one failure THE SYSTEM SHALL report the
+    first in a fixed order, so the exit code and the error are the same on
+    every emission: the resolution record first, then the pinned index,
+    then the components in name order, and within a component its checks
+    in SBOM-013's order (bundle, subject, then the rest). The fetch order
+    never decides.
+    tier:   T1
+    verify: cargo nextest run -p sbom sbom_first_failure_in_fixed_order_decides
+    property: for all attempts a with failures F ≠ ∅: (exit(a), error(a)) = code_and_error(min_order(F)), the same for every fetch order
 
 - **SBOM-013** WHEN the system resolves a component's per-package document
   THE SYSTEM SHALL read `<spec_hash>.sbom.intoto.jsonl` beside the package's
@@ -486,9 +495,10 @@ developer running agent boxes, build-infra operator, and auditor.
     unverified document as it bounds every other field. The component's
     own name, version and `purl` never come from the document (SBOM-009
     takes name and version from the Box Record's resolution record and
-    builds the `purl` from them). IF the document's subject names a package
-    other than the closure entry's THEN THE SYSTEM SHALL treat it as a
-    subject mismatch (SBOM-012). The identities of the build closure's
+    builds the `purl` from them). IF the subject's sha256 differs from the
+    closure entry's digest THEN THE SYSTEM SHALL treat it as a subject
+    mismatch (SBOM-012), as the first sub-bullet above does for a bundled
+    document; the subject's name decides nothing. The identities of the build closure's
     entries are the document's claims from an untrusted source (the cache's
     writer, Security considerations), nested under the component and
     covered by its `unverified` mark, never promoted to components of the
