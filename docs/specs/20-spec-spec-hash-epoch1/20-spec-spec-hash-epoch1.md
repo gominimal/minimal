@@ -308,8 +308,19 @@ build-infra operator. Release manager.
   form.
   tier:     T0
   verify:   cargo nextest run -p graph epoch1_tests_outside_the_hash
+  - THE SYSTEM SHALL run a spec's tests against a read-only view of its
+    **output tree**, the files the build produced under its declared
+    outputs as the orchestrator captured them into the store, the bytes
+    the spec's key names. The view is read-only by the sandbox's mount of
+    those files, outside the test's own process, so no test can turn it
+    off; the standalone test sandbox mounts its rootfs this way today.
+    tier:   T0
+    verify: cargo nextest run -p orchestrator a_test_sees_the_output_tree_read_only
   - IF a test writes into the output tree THEN THE SYSTEM SHALL fail the
-    test.
+    test, and the captured outputs SHALL be the bytes they were before the
+    test ran. This boundary is what makes leaving `tests` out of the key
+    safe: a test that could change the output tree would give two outputs
+    under one key.
     tier:   T0
     verify: cargo nextest run -p orchestrator a_test_that_writes_the_output_tree_fails
 
@@ -667,6 +678,16 @@ EPOCH-007, EPOCH-021). A flip of either reopens the canonical form, EPOCH-010
 and the Success claim together, and is a new revision of this spec, not an
 amendment.
 
+- [NEEDS CLARIFICATION (HIGH): the mechanism of EPOCH-010's write guard for a
+  `build_test` test. A standalone test already runs in a test sandbox whose
+  rootfs, the outputs it depends on included, is mounted read-only, so the
+  guard is the mount. A `build_test` test is declared and nothing runs it
+  yet: the checker skips it and the test operation refuses it. Whether it
+  runs in the build sandbox after the outputs are captured, against a
+  read-only remount of them, or in a test sandbox of its own like a
+  standalone test, depends on how the orchestrator runs a `build_test` in
+  the sandbox. Either way the guard is the sandbox's, never the test's.
+  This closes before `epoch1_tests_outside_the_hash` is written.]
 - [NEEDS CLARIFICATION (MEDIUM): the Lean theorem for EPOCH-001. Which
   project and proof lane carry it, and when. EPOCH-001 moves to T3 with a
   `proof:` line once the theorem exists.]
