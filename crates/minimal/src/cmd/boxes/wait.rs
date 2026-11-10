@@ -59,6 +59,25 @@ impl BoxTimedOut {
         }
     }
 
+    /// The wait for the exec `exec_id` in `target` stopped after `after`,
+    /// before the exec ended (BCLI-057). `id` is the box id the wait
+    /// resolved. The hint gives the `--exec` forms, so that neither
+    /// command acts on the whole box.
+    #[must_use]
+    pub fn waited_exec(target: &str, id: &str, exec_id: &str, after: &str) -> Self {
+        Self {
+            code: "wait_timeout",
+            message: format!(
+                "Stopped waiting after {after}. Exec {exec_id} in {target} has not ended."
+            ),
+            hint: format!(
+                "Run `min box wait {id} --exec {exec_id}` to wait again, \
+                 or `min box stop {id} --exec {exec_id}` to stop it."
+            ),
+            printed: false,
+        }
+    }
+
     /// The `code` of the machine-mode error object: `timeout` for a box
     /// that its own timeout ended, `wait_timeout` for a wait that ran out.
     #[must_use]
@@ -230,9 +249,10 @@ where
             None => waited.await,
             Some(after) => match tokio::time::timeout(after, waited).await {
                 Ok(waited) => waited,
-                Err(_) => Err(BoxTimedOut::waited(
+                Err(_) => Err(BoxTimedOut::waited_exec(
                     target,
                     &resolved.box_id.to_string(),
+                    exec_id.as_str(),
                     &wait_label(after),
                 )
                 .into()),

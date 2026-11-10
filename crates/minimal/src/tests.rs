@@ -13422,6 +13422,17 @@ async fn box_wait_exec_returns_exec_code() {
         .downcast_ref::<BoxTimedOut>()
         .unwrap_or_else(|| panic!("a wait timeout, not {error:#}"));
     assert_eq!(timed_out.code(), "wait_timeout");
+    assert_eq!(
+        timed_out.to_string(),
+        format!("Stopped waiting after 300ms. Exec {SECOND_EXEC_ID} in web has not ended.")
+    );
+    assert_eq!(
+        timed_out.hint(),
+        format!(
+            "Run `min box wait {web} --exec {SECOND_EXEC_ID}` to wait again, \
+             or `min box stop {web} --exec {SECOND_EXEC_ID}` to stop it."
+        )
+    );
     assert_eq!(exec_failure_code(&error), 124);
     let text = box_show_text(&alpha.host, "web").await;
     assert!(
