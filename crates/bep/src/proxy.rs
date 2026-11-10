@@ -88,10 +88,12 @@ pub const OFF_MODULE: &str = "off_module";
 /// The audit marker of a plain HTTP request to a credentialed host.
 pub const UPSTREAM_NOT_TLS: &str = "upstream_not_tls";
 
-/// The audit marker of a box TLS handshake that offered no protocol the
-/// proxy speaks: in practice a client that requires `h2` (gRPC) while the
-/// proxy offers `http/1.1` alone (§5.7's recorded v1 limit).
-pub const ALPN_H2_ONLY: &str = "alpn_h2_only";
+/// The audit marker of a box TLS handshake that offered ALPN protocols and
+/// none the proxy speaks: the proxy offers `http/1.1` alone (§5.7's recorded
+/// v1 limit), so this is what a client that requires `h2` (gRPC) meets, and
+/// so would one offering only `h3` or any other protocol. The marker says
+/// what the code checks, an unsupported offer, not which protocol it was.
+pub const ALPN_UNSUPPORTED: &str = "alpn_unsupported";
 
 /// The entry form of a box connection that opened with a CONNECT head.
 pub const ENTRY_CONNECT: &str = "connect";
@@ -685,8 +687,8 @@ impl Proxy {
             Ok(Err(err)) => {
                 tracing::info!(authority, error = %err, "the box's TLS handshake failed");
                 if no_application_protocol(&err) {
-                    self.audit_refusal(box_id, &authority, ALPN_H2_ONLY);
-                    return Ended::Refused(ALPN_H2_ONLY);
+                    self.audit_refusal(box_id, &authority, ALPN_UNSUPPORTED);
+                    return Ended::Refused(ALPN_UNSUPPORTED);
                 }
                 return Ended::Refused("box_tls_handshake");
             }
@@ -746,8 +748,8 @@ impl Proxy {
             Ok(Err(err)) => {
                 tracing::info!(authority, error = %err, "the box's TLS handshake failed");
                 if no_application_protocol(&err) {
-                    self.audit_refusal(box_id, &authority, ALPN_H2_ONLY);
-                    return Ended::Refused(ALPN_H2_ONLY);
+                    self.audit_refusal(box_id, &authority, ALPN_UNSUPPORTED);
+                    return Ended::Refused(ALPN_UNSUPPORTED);
                 }
                 return Ended::Refused("box_tls_handshake");
             }
@@ -1636,9 +1638,62 @@ pub(crate) mod tests {
             .iter()
             .find(|r| r.outcome == Outcome::Refuse)
             .unwrap_or_else(|| panic!("the h2-only refusal was not audited: {records:?}"));
-        assert_eq!(refusal.outcome, Outcome::Refuse);
-        assert_eq!(refusal.marker.as_deref(), Some(ALPN_H2_ONLY));
+        assert_eq!(refusal.marker.as_deref(), Some(ALPN_UNSUPPORTED));
         assert_eq!(refusal.authority, "api.github.com:443");
+    }
+
+    // BEP-080 with BEP-073: the same refusal on the direct-TLS entry. A box
+    // that opens TLS to the proxy's port 443 offering `h2` alone fails the
+    // handshake, nothing is relayed, and the audit log records the refusal
+    // under the ALPN marker for the SNI's authority.
+    #[tokio::test]
+    async fn direct_tls_h2_only_client_is_refused_alpn_unsupported() {
+        let upstream = upstream().await;
+        let (leaves, root) = interception_ca();
+        let resolver = Arc::new(To(upstream.addr, AtomicUsize::new(0)));
+        let audit = Arc::new(Mutex::new(Vec::<Decision>::new()));
+        let proxy = Arc::new(
+            Proxy::new(
+                Admission::new(&[GITHUB], [("vault.example.com", 443)]),
+                leaves,
+                upstream.roots.clone(),
+                resolver.clone(),
+                audit.clone(),
+            )
+            .unwrap()
+            .with_redeemer(Arc::new(AdmitsGithub)),
+        );
+
+        let name = ServerName::try_from("api.github.com").unwrap();
+        let refused = box_tls(&root, &[b"h2"])
+            .connect(name, direct_tls_connection(&proxy))
+            .await;
+        assert!(refused.is_err(), "an h2-only client completed direct TLS");
+
+        // The proxy writes the record after the handshake fails; give it a
+        // moment to land.
+        for _ in 0..50 {
+            if audit
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.outcome == Outcome::Refuse)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let records = audit.lock().unwrap();
+        let refusal = records
+            .iter()
+            .find(|r| r.outcome == Outcome::Refuse)
+            .unwrap_or_else(|| panic!("the direct-TLS refusal was not audited: {records:?}"));
+        assert_eq!(refusal.marker.as_deref(), Some(ALPN_UNSUPPORTED));
+        assert_eq!(refusal.authority, "api.github.com:443");
+        assert!(
+            upstream.heads.lock().unwrap().is_empty(),
+            "nothing was relayed"
+        );
     }
 
     // BEP-029: a CONNECT or an absolute-form request outside the modules'
