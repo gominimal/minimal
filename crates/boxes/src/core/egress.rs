@@ -450,7 +450,9 @@ pub const IPPROTO_TCP: u8 = 6;
 /// TCP control flags, read from the L4 header the two gates parse: the
 /// opening-packet test reads SYN and ACK (a connect is a bare SYN; every
 /// mid-stream segment carries ACK), and the record's end reads FIN and RST —
-/// a flow ends when either end sends either.
+/// a flow ends at the box's FIN or at an RST from either end. A client's FIN
+/// is a half-close: the client has finished sending, not receiving, so the
+/// box's answer still in flight behind it is a reply.
 pub const TCP_FIN: u8 = 0x01;
 pub const TCP_SYN: u8 = 0x02;
 pub const TCP_RST: u8 = 0x04;
@@ -484,8 +486,9 @@ pub const REPLY_UDP_REPLIED_WINDOW: Duration = Duration::from_mins(5);
 
 /// How long a TCP inbound flow's record keeps admitting after anything —
 /// the working-value idle cap for an established flow, since a TCP record's
-/// own end is read from the wire: a FIN or RST from either end ends it, and
-/// only a flow nothing has ridden for this long is reclaimed in its absence.
+/// own end is read from the wire: the box's FIN, or an RST from either end,
+/// ends it (a client's FIN only half-closes it), and only a flow nothing has
+/// ridden for this long is reclaimed in their absence.
 /// Every segment in either direction refreshes it, so a long-lived
 /// connection stays admitted for as long as it stays live.
 pub const REPLY_TCP_IDLE_CAP: Duration = Duration::from_mins(5);
@@ -1860,7 +1863,7 @@ impl FlowTuple {
 /// past the unreplied window, and so the one thing a UDP record's window
 /// selection reads ([`REPLY_UDP_UNREPLIED_WINDOW`] versus
 /// [`REPLY_UDP_REPLIED_WINDOW`]). A TCP record's own end is read from the
-/// wire — FIN or RST — so it needs no `replied` distinction.
+/// wire — the box's FIN, or an RST — so it needs no `replied` distinction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplyRecord {
     /// The instant past which the record is no longer live.
@@ -1906,10 +1909,12 @@ pub enum InboundFlow {
     /// The frame belongs to a live record, which now runs longer — an
     /// established flow's segment or datagram, mid-conversation.
     Refreshed,
-    /// The frame ended a live record: an inbound FIN or RST on a flow that
-    /// was live. The frame itself is still delivered — the close is part of
-    /// the conversation — but nothing the box sends on the flow after it is
-    /// a reply this record admits.
+    /// The frame ended a live record: an inbound RST on a flow that was
+    /// live. The frame itself is still delivered — the abort is part of the
+    /// conversation — but nothing the box sends on the flow after it is a
+    /// reply this record admits. An inbound FIN is not an end: it is the
+    /// client's half-close, and the record it refreshes keeps admitting the
+    /// box's answer until the box's own FIN.
     Ended,
     /// The frame opens no record: a mid-stream TCP segment (only a bare SYN
     /// opens a TCP record, never a mid-stream ACK) or a protocol with no
@@ -2029,13 +2034,16 @@ impl ReplyFlows {
     ///
     /// Every other box frame falls through to the rules: one that reverses
     /// no live record, one whose record has expired, one whose record the
-    /// client's FIN or RST already ended. A TCP FIN or RST on a live flow
-    /// is admitted *and* ends it — the close is part of the conversation,
-    /// and what the box sends after it is new traffic the rules decide. A
-    /// UDP answer moves the record onto the replied window and refreshes
-    /// it; a TCP answer refreshes the idle cap. Either way the frame's own
-    /// conversation keeps the record live, and only the record's timers or
-    /// its close can end it.
+    /// client's RST already ended. A TCP FIN or RST on a live flow is
+    /// admitted *and* ends it — the close is part of the conversation, and
+    /// what the box sends after it is new traffic the rules decide. The
+    /// client's FIN ends nothing: a client that half-closes after its
+    /// request (`shutdown(SHUT_WR)`, what `socat` and `nc -N` do at stdin's
+    /// end) is still reading, and the box's answer is exactly the reply the
+    /// record exists to admit. A UDP answer moves the record onto the
+    /// replied window and refreshes it; a TCP answer refreshes the idle cap.
+    /// Either way the frame's own conversation keeps the record live, and
+    /// only the record's timers or its close can end it.
     ///
     /// This is the only arm an egress frame reaches, and it is read-only in
     /// the direction that matters: it never opens a record, so no frame a
@@ -2086,22 +2094,29 @@ impl ReplyFlows {
     /// for a packet the box's own ingress admitted.
     ///
     /// A live record's inbound traffic refreshes it — the conversation is
-    /// still live while the client is still speaking — and an inbound FIN or
-    /// RST ends it from the client's side. At the cap the *new* flow is
+    /// still live while the client is still speaking — and an inbound RST
+    /// ends it from the client's side. An inbound FIN refreshes it like any
+    /// other segment: it half-closes the client's sending side only, and the
+    /// box's answer behind it is still owed. At the cap the *new* flow is
     /// refused, counted, and the caller is told not to deliver it, while
     /// existing flows keep refreshing: a box under a connection flood keeps
     /// its established conversations, and only the flood pays.
     #[must_use = "the flow outcome's RefusedAtCap half is the only refusal signal the caller gets"]
     pub fn observe_inbound(&mut self, tuple: FlowTuple, flags: u8, now: Instant) -> InboundFlow {
-        // A live record first — and a close from the client's own side ends
-        // it, delivered though the closing frame still is.
+        // A live record first — and an abort from the client's own side
+        // ends it, delivered though the aborting frame still is.
         if let Some(record) = self.flows.get_mut(&tuple) {
             if record.deadline <= now {
                 self.flows.remove(&tuple);
-            } else if tuple.proto == IPPROTO_TCP && flags & (TCP_FIN | TCP_RST) != 0 {
+            } else if tuple.proto == IPPROTO_TCP && flags & TCP_RST != 0 {
                 self.flows.remove(&tuple);
                 return InboundFlow::Ended;
             } else {
+                // A client's FIN lands here too: a half-close, not an end.
+                // Ending the record at it dropped every byte of the box's
+                // answer to a client that shut down its sending side after
+                // its request, so the client read an empty reply.
+                //
                 // A UDP record the box already answered stays on the replied
                 // window: the client's next datagram refreshes it, never
                 // demotes it to the unreplied one.
@@ -3812,8 +3827,9 @@ mod tests {
     /// is admitted by the record: not the client's address at another port,
     /// not another client's address, not another protocol, not the box
     /// speaking from its own connecting port. The record ends at its close
-    /// (FIN, from either end), at its window, and at revocation — and the
-    /// egress arm can open none of it back up.
+    /// (the box's FIN, or an RST from either end), at its window, and at
+    /// revocation — and the egress arm can open none of it back up. The
+    /// client's FIN is a half-close and ends nothing.
     #[test]
     fn reply_on_admitted_inbound_flow_passes_egress() {
         let t0 = Instant::now();
@@ -3861,16 +3877,30 @@ mod tests {
             !flows.reply_admits(opening.reversed(), TCP_ACK, t0),
             "a record the box's FIN ended admits nothing after it"
         );
-        // The client's FIN ends it from its own side, delivered though the
-        // closing frame still is.
+        // The client's RST ends it from its own side, delivered though the
+        // aborting frame still is.
         assert_eq!(
             flows.observe_inbound(opening, TCP_SYN, t0),
             InboundFlow::Recorded { filled: false }
         );
         assert_eq!(
-            flows.observe_inbound(opening, TCP_FIN, t0),
+            flows.observe_inbound(opening, TCP_RST | TCP_ACK, t0),
             InboundFlow::Ended
         );
+        assert!(!flows.reply_admits(opening.reversed(), TCP_ACK, t0));
+        // The client's FIN is a half-close: it refreshes the record, and the
+        // box's answer behind it still passes, up to and including the box's
+        // own FIN, which ends it.
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_SYN, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_FIN | TCP_ACK, t0),
+            InboundFlow::Refreshed
+        );
+        assert!(flows.reply_admits(opening.reversed(), TCP_ACK, t0));
+        assert!(flows.reply_admits(opening.reversed(), TCP_FIN | TCP_ACK, t0));
         assert!(!flows.reply_admits(opening.reversed(), TCP_ACK, t0));
         // Revocation and session stop end every record without reading the
         // wire at all.
@@ -3916,6 +3946,69 @@ mod tests {
             flows.observe_inbound(quiet, 0, t0 + REPLY_UDP_UNREPLIED_WINDOW),
             InboundFlow::Recorded { filled: false }
         );
+    }
+
+    /// A client that half-closes after its request still gets the box's
+    /// answer (790d): `printf req | socat - TCP:box:port` sends its request,
+    /// then a FIN at stdin's end, and reads the reply. The client's FIN
+    /// arrives at the gate before the box has written a byte, so a record it
+    /// ended dropped the whole answer at the box's egress rules — for a reply
+    /// to the node address, at the infrastructure set — and the client read
+    /// 0 B where the box served 1000. The FIN refreshes the record instead;
+    /// the box's answer passes segment by segment, its own FIN passes and
+    /// ends the record, and the idle cap still reclaims a half-closed record
+    /// the box never closes.
+    #[test]
+    fn client_half_close_keeps_the_box_answer_admitted() {
+        let t0 = Instant::now();
+        let client = [100, 64, 255, 253];
+        let opening = FlowTuple::new(IPPROTO_TCP, client, 58412, LEASE, 8000);
+        let answer = opening.reversed();
+        let mut flows = ReplyFlows::new();
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_SYN, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert!(flows.reply_admits(answer, TCP_SYN | TCP_ACK, t0));
+        // The handshake's last ACK, the request, and the client's FIN behind
+        // it: every one refreshes the record and none ends it.
+        for flags in [TCP_ACK, TCP_ACK, TCP_FIN | TCP_ACK] {
+            assert_eq!(
+                flows.observe_inbound(opening, flags, t0),
+                InboundFlow::Refreshed,
+                "the client's segment refreshes the record: flags {flags:#04x}"
+            );
+        }
+        assert!(
+            flows.record_of(opening).is_some(),
+            "the client's FIN is a half-close and leaves the record live"
+        );
+        // The box's answer: the ACK of the FIN, the head and body segments,
+        // spread over time — each passes and refreshes the idle cap.
+        let mut now = t0;
+        for _ in 0..4 {
+            now += REPLY_TCP_IDLE_CAP / 2;
+            assert!(
+                flows.reply_admits(answer, TCP_ACK, now),
+                "the box's answer to a half-closed client passes"
+            );
+        }
+        // The box's FIN passes and ends the record; nothing after it does.
+        assert!(flows.reply_admits(answer, TCP_FIN | TCP_ACK, now));
+        assert_eq!(flows.record_of(opening), None);
+        assert!(!flows.reply_admits(answer, TCP_ACK, now));
+        // A half-closed record the box never answers or closes still dies
+        // at the idle cap: the half-close extends nothing past it.
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_SYN, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_FIN | TCP_ACK, t0),
+            InboundFlow::Refreshed
+        );
+        assert!(!flows.reply_admits(answer, TCP_ACK, t0 + REPLY_TCP_IDLE_CAP));
+        assert_eq!(flows.record_of(opening), None);
     }
 
     /// The record's other face: no frame a box sends can open one. The
