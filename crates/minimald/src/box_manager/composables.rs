@@ -947,7 +947,12 @@ mod tests {
         let names: Vec<&str> = packages.iter().map(|p| p.package_name()).collect();
         assert_eq!(names, ["wired"], "the entry package is walked");
         let env = |_: &str| Err(std::env::VarError::NotPresent);
-        let wired = packages.into_iter().next().unwrap().contribute(&env).unwrap();
+        let wired = packages
+            .into_iter()
+            .next()
+            .unwrap()
+            .contribute(&env)
+            .unwrap();
         let vars: Vec<(&str, &str)> = wired
             .vars()
             .iter()
