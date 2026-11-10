@@ -549,13 +549,12 @@ impl Env {
                     Err(e) => Some(e.to_string()),
                 }
             };
-            // A refused source names the package and the host (main's
-            // `unreachable_source`) after the tap has named the box.
+            // The tap names the box for a refused source, and the package
+            // and the host for one it could not connect to
+            // (`BuildTap::failure`); the error is taken as it hands it back.
             tapped_build(build, log_rx, &placement)
                 .await
-                .map_err(|failure| {
-                    std::io::Error::other(unreachable_source(&failure).unwrap_or(failure))
-                })?;
+                .map_err(std::io::Error::other)?;
         }
 
         // Collect the package-derived wiring and merge caller-supplied

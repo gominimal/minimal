@@ -14647,10 +14647,14 @@ async fn box_launch_build_refused_web_source_names_host_and_box() {
     );
     assert!(!denied.contains(box_id), "{denied}");
 
-    // A box its rules allow the host is never reported as refused.
+    // A box its rules allow the host is never reported as refused: its
+    // failure names the package and the host, as any build's does (NET-155).
     assert_eq!(
         launch(placement(Verdict::Allow), Some(failed.clone())).await,
-        Err(failed)
+        Err(format!(
+            "the build of fetch876 could not reach deb.debian.org: \
+             the egress rules admit no destination"
+        ))
     );
     assert_eq!(launch(placement(Verdict::Deny), None).await, Ok(()));
 }
