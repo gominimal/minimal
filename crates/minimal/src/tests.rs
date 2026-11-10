@@ -2267,7 +2267,9 @@ async fn start_off_tty_exit2_names_detach() {
         cmd_session_start(
             &global,
             SessionStartArgs {
-                entry: Some("dev".into()),
+                // A bare start picks the only session entry, `dev`. A typed
+                // `dev` is refused until gominimal/minimal#3204.
+                entry: None,
                 name: None,
                 new: false,
                 detach: false,
