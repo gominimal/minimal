@@ -1339,13 +1339,14 @@ fn entry_egress(
 /// name, the session entry pick applies, and the implicit `default` entry
 /// answers a project that declares none (BOX-165).
 ///
-/// `None` for a project with no `minimal.toml`, and when no single session
-/// entry can be picked. The daemon then composes from the project's
-/// `[session]` table alone, as it did before entries.
+/// `None` for a project with no `minimal.toml`. The daemon then composes
+/// from what it reads itself, as it did before entries.
 ///
 /// # Errors
 ///
 /// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
+/// Fails with [`SessionEntryUndecided`] (exit 2) when no single session
+/// entry can be picked.
 pub(crate) fn session_box_entry(
     project: &camino::Utf8Path,
     entry: Option<&str>,
@@ -1359,13 +1360,9 @@ pub(crate) fn session_box_entry(
     let typed = entry.and_then(|name| entries.iter().find(|entry| entry.name == name));
     let picked = match typed {
         Some(entry) => entry.clone(),
-        None => match pick_session_entry(&entries) {
-            Ok(entry) => entry,
-            Err(undecided) => {
-                tracing::info!(%undecided, "no session entry picked; the daemon composes from [session]");
-                return Ok(None);
-            }
-        },
+        // An undecided pick refuses the start. It never falls back to the
+        // project's `[session]` table.
+        None => pick_session_entry(&entries)?,
     };
     box_entry(project, &bytes, picked, hooks_enabled).map(Some)
 }

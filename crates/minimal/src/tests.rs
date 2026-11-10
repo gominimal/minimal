@@ -13033,7 +13033,7 @@ async fn start_from_entry(
     use boxes::wire::request::{BoxStep, ContributionVerdict, WireContribution};
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSession,
-        Errorable, FinalizeSession, FinalizeSessionRequest, SubmitVerdict,
+        Errorable, SubmitVerdict,
     };
     let request = minimald::test_harness::create_session_req(
         name,
@@ -13051,7 +13051,11 @@ async fn start_from_entry(
         .await;
     let response = match configured {
         Errorable::Ok(ConfigureLoadoutResponse::Pending { response }) => response,
-        Errorable::Ok(other) => panic!("the entry's items must reach the gate, got {other:?}"),
+        // Nothing to gate: the box composed with no vars and no hooks.
+        Errorable::Ok(ConfigureLoadoutResponse::Materialized) => {
+            finalize_from_entry(daemon, id).await;
+            return (Vec::new(), Vec::new());
+        }
         Errorable::Err { error } => panic!("ConfigureLoadout failed: {error}"),
     };
     let mut vars = Vec::new();
@@ -13092,6 +13096,16 @@ async fn start_from_entry(
         Errorable::Ok(BoxStep::Materialized { .. }) => {}
         other => panic!("SubmitVerdict did not compose the box: {other:?}"),
     }
+    finalize_from_entry(daemon, id).await;
+    (vars, hooks)
+}
+
+/// Finalizes box `id`, which [`start_from_entry`] composed.
+async fn finalize_from_entry(
+    daemon: &mut minimald::test_harness::TestClient,
+    id: boxes::SessionId,
+) {
+    use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
     match daemon
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
@@ -13102,7 +13116,6 @@ async fn start_from_entry(
         Errorable::Ok(_) => {}
         Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
     }
-    (vars, hooks)
 }
 
 /// BOX-068 with BOX-048 and BOX-050: one `minimal.toml` declares a session
@@ -13184,11 +13197,13 @@ echo = "ok"
     assert!(task_hooks[0].contains("echo shared"), "{task_hooks:?}");
 
     // An old `[session]` table expands as `[defaults.session]` of the
-    // implicit `default` entry.
+    // implicit `default` entry. A task entry in the same project gets
+    // none of it: the daemon reads no `[session]` table when it gets an
+    // entry.
     let legacy = tempfile::tempdir().expect("a legacy project dir");
     std::fs::write(
         legacy.path().join(mfile::MFILE_NAME),
-        "[session]\nvars = { EDITOR = \"vi\" }\n",
+        "[session]\nvars = { EDITOR = \"vi\" }\n\n[tasks.check]\necho = \"ok\"\n",
     )
     .unwrap();
     let legacy_root = camino::Utf8Path::from_path(legacy.path()).expect("a UTF-8 path");
@@ -13198,6 +13213,34 @@ echo = "ok"
     assert_eq!(entry.name, "default");
     let (legacy_vars, _) = start_from_entry(&mut daemon, "legacy", legacy.path(), entry).await;
     assert_eq!(legacy_vars, ["EDITOR=vi"]);
+    let legacy_task = crate::task_box_entry(legacy_root, "check", true)
+        .expect("the legacy project's task entry expands")
+        .expect("the legacy project declares the task");
+    let (legacy_task_vars, _) =
+        start_from_entry(&mut daemon, "legacy-check", legacy.path(), legacy_task).await;
+    assert_eq!(
+        legacy_task_vars,
+        Vec::<String>::new(),
+        "a legacy [session] table stays off the task"
+    );
+
+    // A project with two session entries and no `default` cannot pick one.
+    // The start fails with the refusal, and sends no entry.
+    let undecided = tempfile::tempdir().expect("an undecided project dir");
+    std::fs::write(
+        undecided.path().join(mfile::MFILE_NAME),
+        "[sessions.a]\n\n[sessions.b]\n",
+    )
+    .unwrap();
+    let undecided_root = camino::Utf8Path::from_path(undecided.path()).expect("a UTF-8 path");
+    let error = crate::session_box_entry(undecided_root, None, true)
+        .expect_err("an undecided pick refuses the start");
+    assert_eq!(
+        error.downcast_ref::<crate::SessionEntryUndecided>(),
+        Some(&crate::SessionEntryUndecided::NoDefault {
+            candidates: vec!["a".into(), "b".into()],
+        }),
+    );
 }
 
 /// The state dir of box `id` under the daemon state dir `state`.
