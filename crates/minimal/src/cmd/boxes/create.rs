@@ -694,10 +694,6 @@ impl std::fmt::Display for StartNameHeld {
 
 impl std::error::Error for StartNameHeld {}
 
-// BCLI-029 makes this hint name `min box logs` and `min box wait`. This
-// branch does not define those verbs yet. gominimal/minimal#3184 and
-// gominimal/minimal#3195 add them. Merge this change after both, so that
-// the hint names commands that run as written.
 /// The one stderr hint of a start that returns without attaching to a box
 /// that has no terminal (BCLI-029). The box's stdin is already closed.
 /// `box_id` is the id of the box the start created.
