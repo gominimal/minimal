@@ -504,7 +504,8 @@ Disk:       -
 Identity:   unknown
 Provider:   local
 Host:       local0
-Live execs: exec-1
+Live execs:
+  exec-1  detached  sleep 60
 "
         );
 

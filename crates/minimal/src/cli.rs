@@ -513,8 +513,9 @@ pub enum BoxCommand {
     Prune(BoxPruneArgs),
     /// Show what a box printed, from its start. A stopped or exited box
     /// keeps its output until `min box rm` removes it. `-f` keeps showing
-    /// new output until the box is removed or the command is interrupted
-    Logs(BoxLogsArgs),
+    /// new output until the box is removed or the command is interrupted.
+    /// `--exec` shows what one command that `min box exec` started printed
+    Logs(BoxLogsExecArgs),
 }
 
 // BOX-155 (BCLI-012): `min session logs`, `min task logs` and
@@ -528,6 +529,19 @@ pub struct BoxLogsArgs {
     /// writes it, until the box is removed or the command is interrupted
     #[arg(short = 'f', long)]
     pub follow: bool,
+}
+
+// BCLI-012, BCLI-056: `min box logs <box> [-f | --exec <id>]`. Only the box
+// noun takes `--exec`, so `min session logs` and `min task logs` keep
+// `BoxLogsArgs` alone.
+#[derive(Debug, Args)]
+pub struct BoxLogsExecArgs {
+    #[command(flatten)]
+    pub logs: BoxLogsArgs,
+    /// Show what one command printed, by the exec id that `min box exec`
+    /// printed for it. The command can be running or ended
+    #[arg(long = "exec", value_name = "EXEC_ID", conflicts_with = "follow")]
+    pub exec: Option<String>,
 }
 
 // BOX-162 (BCLI-016): `min box events <box> | --parent <box> [-o jsonl] [--follow]`.
@@ -665,7 +679,8 @@ pub struct BoxShowArgs {
     pub network: bool,
 }
 
-// BOX-013 (BCLI-059): `min box stop <box> [--force]`.
+// BOX-013 (BCLI-059), BOX-151 (BCLI-055):
+// `min box stop <box> [--force | --exec <id>]`.
 #[derive(Debug, Args)]
 pub struct BoxStopArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
@@ -674,6 +689,10 @@ pub struct BoxStopArgs {
     /// Kill every process in the box at once, with no grace period
     #[arg(long)]
     pub force: bool,
+    /// Stop only one command, by the exec id that `min box exec` printed
+    /// for it. The box and its other commands keep running
+    #[arg(long = "exec", value_name = "EXEC_ID", conflicts_with = "force")]
+    pub exec: Option<String>,
 }
 
 // BCLI-068: `min box attach [<box>] [--exec <id>]`.
@@ -700,7 +719,8 @@ pub struct BoxRmArgs {
     pub force: bool,
 }
 
-// BCLI-013, BCLI-014: `min box wait <box> [--timeout <d>]`.
+// BCLI-013, BCLI-014, BCLI-057:
+// `min box wait <box> [--timeout <d>] [--exec <id>]`.
 #[derive(Debug, Args)]
 pub struct BoxWaitArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
@@ -711,6 +731,11 @@ pub struct BoxWaitArgs {
     /// and the command exits with code 124
     #[arg(long, value_name = "DURATION", value_parser = mfile::duration::parse_timeout_secs)]
     pub timeout: Option<u64>,
+    /// Wait for one command, by the exec id that `min box exec` printed for
+    /// it, and exit with that command's exit code. The command can be
+    /// running or ended
+    #[arg(long = "exec", value_name = "EXEC_ID")]
+    pub exec: Option<String>,
 }
 
 // BOX-149 (BCLI-053): `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`.
@@ -818,6 +843,80 @@ impl std::fmt::Display for BoxExecRefusal {
 }
 
 impl std::error::Error for BoxExecRefusal {}
+
+/// A refusal of `min box stop`, `min box logs` or `min box wait` with
+/// `--exec <id>` (BCLI-055, BCLI-056, BCLI-057): the text is not an exec
+/// id, or the box's host knows no exec of that id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxExecIdRefusal {
+    /// The text is not an exec id. Exit 2.
+    NotAnId {
+        /// The box as the user named it.
+        target: String,
+        /// The exec id as the user typed it.
+        exec_id: String,
+    },
+    /// The box has no exec of this id, running or ended. Exit 4.
+    Unknown {
+        /// The box as the user named it.
+        target: String,
+        /// The exec id.
+        exec_id: String,
+    },
+    /// The box's host has no running exec of this id, and the box's events
+    /// record no end for one, so no exit code is known. Exit 4.
+    NoExitCode {
+        /// The box as the user named it.
+        target: String,
+        /// The exec id.
+        exec_id: String,
+    },
+}
+
+impl BoxExecIdRefusal {
+    /// The exit code the command ends with: 2 for text that is not an exec
+    /// id, 4 for an exec that is not found.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::NotAnId { .. } => 2,
+            Self::Unknown { .. } | Self::NoExitCode { .. } => 4,
+        }
+    }
+
+    /// The outcome the command's tracing event records.
+    #[must_use]
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Self::NotAnId { .. } => "not an exec id",
+            Self::Unknown { .. } => "no such exec",
+            Self::NoExitCode { .. } => "no exit code",
+        }
+    }
+}
+
+impl std::fmt::Display for BoxExecIdRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hint = |target: &str| {
+            format!("Run `min box show {target}` to see the commands that run in the box now.")
+        };
+        match self {
+            Self::NotAnId { target, exec_id } => {
+                write!(f, "`{exec_id}` is not an exec id. {}", hint(target))
+            }
+            Self::Unknown { target, exec_id } => {
+                write!(f, "{target} has no exec {exec_id}. {}", hint(target))
+            }
+            Self::NoExitCode { target, exec_id } => write!(
+                f,
+                "No exit code is known for exec {exec_id} in {target}. {}",
+                hint(target)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoxExecIdRefusal {}
 
 /// A command in a box that ran past its own timeout and was stopped
 /// (BOX-149, BCLI-053). `min box exec` and the wait for an exec end with

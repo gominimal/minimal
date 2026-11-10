@@ -60,6 +60,89 @@ impl ReqwestUrl {
     }
 }
 
+/// The `User-Agent` a web fetch sends, such as
+/// `minimal/0.8.0 (+https://minimal.dev)`.
+///
+/// Some hosts refuse a request that carries no agent: ftp.gnu.org answers it
+/// 403, so a package whose source is a GNU tarball could not build
+/// (inbox#1218). A release build names its version, read from the
+/// `MINIMAL_RELEASE_VERSION` the release workflow builds with. Any other
+/// build sends `minimal (+https://minimal.dev)`. The `version` crate is not
+/// used: it is rebuilt on every commit, and so would be this crate and every
+/// crate that depends on it.
+pub fn user_agent() -> &'static str {
+    static AGENT: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| agent_for(option_env!("MINIMAL_RELEASE_VERSION")));
+    &AGENT
+}
+
+/// The agent for a build whose release version is `release`. A version with
+/// a character outside SemVer's is left out, so the agent is always a valid
+/// header value and the client always builds.
+fn agent_for(release: Option<&str>) -> String {
+    match release.map(str::trim).filter(|v| is_semver_text(v)) {
+        Some(version) => format!("minimal/{version} (+https://minimal.dev)"),
+        None => "minimal (+https://minimal.dev)".to_string(),
+    }
+}
+
+/// `v` is not empty and has only the characters a SemVer version is spelled
+/// with.
+fn is_semver_text(v: &str) -> bool {
+    !v.is_empty()
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
+/// The builder of every client that fetches a web source. It sets
+/// [`user_agent`], so a caller adds only what its fetch needs, such as a
+/// proxy.
+pub fn web_client_builder() -> reqwest::ClientBuilder {
+    Client::builder().user_agent(user_agent())
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn a_release_build_names_its_version() {
+        assert_eq!(
+            agent_for(Some("0.8.0")),
+            "minimal/0.8.0 (+https://minimal.dev)"
+        );
+        assert_eq!(
+            agent_for(Some("0.8.0-rc.1+g1e236070")),
+            "minimal/0.8.0-rc.1+g1e236070 (+https://minimal.dev)"
+        );
+    }
+
+    #[test]
+    fn a_build_without_a_usable_version_sends_the_bare_agent() {
+        const UNUSABLE: [Option<&str>; 5] = [
+            None,
+            Some(""),
+            Some("  "),
+            Some("0.8.0\r\nx: y"),
+            Some("0.8 0"),
+        ];
+        for release in UNUSABLE {
+            assert_eq!(
+                agent_for(release),
+                "minimal (+https://minimal.dev)",
+                "{release:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_is_a_valid_header_value() {
+        HeaderValue::from_str(user_agent()).expect("a valid header value");
+        web_client_builder().build().expect("the client builds");
+    }
+}
+
 /// The response to an RPC for some resource.
 pub trait FetchResponse: std::fmt::Debug + Sized {
     type Error: std::fmt::Debug;

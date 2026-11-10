@@ -135,8 +135,9 @@ pub(crate) fn not_found_remedy(host: &str, several_hosts: bool) -> String {
 
 /// Writes one box record as `Label: value` lines, with the `provider`
 /// and `host` it came from. A value the record does not carry prints as
-/// `-`. The live execs line prints only when
-/// the daemon names an exec, because today's daemon gives no exec an id.
+/// `-`. A `Live execs:` block follows when the box runs execs, with one
+/// row for each: its exec id, `terminal`, `detached` or `attached`, and its
+/// command.
 pub(crate) fn render_box_show(
     out: &mut impl std::io::Write,
     shown: &minimald_rpc::ShowBoxResponse,
@@ -177,19 +178,64 @@ pub(crate) fn render_box_show(
     lines.push(("Identity", identity.to_string()));
     lines.push(("Provider", provider.to_string()));
     lines.push(("Host", host.to_string()));
-    if !shown.live_execs.is_empty() {
-        let ids: Vec<&str> = shown
-            .live_execs
-            .iter()
-            .map(|exec| exec.id.as_str())
-            .collect();
-        lines.push(("Live execs", ids.join(", ")));
-    }
     for (label, value) in lines {
         let label = format!("{label}:");
         writeln!(out, "{label:<11} {value}")?;
     }
+    // BCLI-067: one row for each live exec, with its id, whether it holds a
+    // terminal, and its command.
+    if !shown.live_execs.is_empty() {
+        writeln!(out, "Live execs:")?;
+        for exec in &shown.live_execs {
+            let mode = match exec.mode {
+                minimald_rpc::exec::ExecMode::Tty => "terminal",
+                minimald_rpc::exec::ExecMode::Detached => "detached",
+                minimald_rpc::exec::ExecMode::Attached => "attached",
+            };
+            let command: Vec<String> = exec.argv.iter().map(|word| shell_word(word)).collect();
+            writeln!(out, "  {}  {mode:<8}  {}", exec.id, command.join(" "))?;
+        }
+    }
     Ok(())
+}
+
+/// `word` as a shell reads it back as one word: as it is when it holds only
+/// safe characters, in single quotes when its other characters print, and
+/// in `$'...'` with escapes when it holds a control character. So a newline
+/// or a terminal escape in an exec's argv never breaks the row or reaches
+/// the terminal raw.
+fn shell_word(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c));
+    if safe {
+        return word.to_owned();
+    }
+    if !word.chars().any(char::is_control) {
+        return format!("'{}'", word.replace('\'', r"'\''"));
+    }
+    let mut quoted = String::from("$'");
+    for c in word.chars() {
+        match c {
+            '\\' => quoted.push_str(r"\\"),
+            '\'' => quoted.push_str(r"\'"),
+            '\n' => quoted.push_str(r"\n"),
+            '\t' => quoted.push_str(r"\t"),
+            '\r' => quoted.push_str(r"\r"),
+            c if c.is_control() => {
+                let code = u32::from(c);
+                if code <= 0xff {
+                    quoted.push_str(&format!(r"\x{code:02x}"));
+                } else {
+                    quoted.push_str(&format!(r"\u{code:04x}"));
+                }
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Formats a disk figure in bytes in the largest binary unit that keeps it
@@ -212,4 +258,19 @@ pub(crate) fn format_disk(bytes: u64) -> String {
         unit = next;
     }
     format!("{value:.1} {unit}")
+}
+
+#[cfg(test)]
+mod shell_word_tests {
+    use super::shell_word;
+
+    #[test]
+    fn box_show_exec_command_escapes_control_characters() {
+        assert_eq!(shell_word("ls"), "ls");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("a\nb"), r"$'a\nb'");
+        assert_eq!(shell_word("\u{1b}[2J"), r"$'\x1b[2J'");
+        assert_eq!(shell_word("x\\'\u{7f}"), r"$'x\\\'\x7f'");
+    }
 }
