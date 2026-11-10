@@ -74,8 +74,10 @@ the run starts, and `main` can move between steps 3 and 4.
 git push origin <commit>:refs/heads/release/X.Y.x
 ```
 
-Only a repository admin can create a branch under `release/`, so ask one to
-push it. The branch name must start with `release/`. CI runs the required checks on
+[`cut-minor.yml`](#cut-minoryml-start-a-minor-release) does this step for you.
+It creates the branch as the `minimal-release-ops` App, the backport label, and
+the bump PR on `main`. By hand, only a repository admin can create a branch
+under `release/`, so ask one to push it. The branch name must start with `release/`. CI runs the required checks on
 pushes and PRs to `main` and `release/**` only. Without those checks, step 4
 refuses each fix that merges into the branch.
 
@@ -115,7 +117,7 @@ release while `main` moves on, and each patch on the line goes out from it.
 Step 8 brings its fixes back to `main`.
 
 Before step 7, open a PR on `main` that bumps `package.version` to the next
-minor. After the `vX.Y.0` tag exists, the version check fails on `main` until
+minor, unless `cut-minor.yml` opened it. After the `vX.Y.0` tag exists, the version check fails on `main` until
 its version is above that tag.
 
 ### 3. Rehearse the release run
@@ -275,8 +277,10 @@ git merge -s ours origin/release/X.Y.x -m "Merge branch 'release/X.Y.x' into mai
 
 Push the branch and open a PR. The PR must go in as a merge commit, because
 the other merge buttons drop the link to the branch and its tag. The merge
-queue squashes every PR, so this PR cannot go through it. Until this step is
-automated, someone on the bypass list of the `main` ruleset does these things:
+queue squashes every PR, so this PR cannot go through it.
+[`merge-back.yml`](#merge-backyml-merge-a-line-into-main) automates this step
+once it is enabled. Until then, someone on the bypass list of the `main` ruleset
+does these things:
 
 1. Turns on **Create a merge commit** in the repository settings.
 2. Merges the PR outside the queue, with a merge commit.
@@ -302,7 +306,8 @@ the newest `v*` tag, so a line stops when the next minor is promoted.
 Do these steps:
 
 1. Land each fix on `main` first, then cherry-pick it to `release/X.Y.x` by
-   PR. Title the PR `fix:`, because a `feat:` or breaking subject on the line
+   PR. Once [`backport.yml`](#backportyml-open-a-pr-on-a-release-line) is
+   enabled, the `backport release/X.Y.x` label opens that PR for you. Title the PR `fix:`, because a `feat:` or breaking subject on the line
    requires a minor and fails the version check. Land the `package.version`
    bump by PR if the line is not already on the next patch.
 2. Check that the five required checks from step 1 are green on the branch
@@ -316,6 +321,9 @@ Do these steps:
 
 3. Follow steps 3 to 6 with `--ref release/X.Y.x`. For the final version,
    also follow steps 7 and 8. A release candidate stops after step 6.
+
+[`stage-release.yml`](#stage-from-a-release-line) does step 2 here, and steps 3
+and 4 above, in one dispatch. Then continue from step 5.
 
 ### Emergency release
 
@@ -820,9 +828,8 @@ release branch rules. Steps 2 and 3 run as `minimal-backporter`, which cannot:
    promote the version at the commit, `vX.Y.0` or `vX.Y.0-rcN`. Once that tag
    exists, `main` still declares the same version and its version check fails.
 
-For a line cut this way, steps 3 to 7 use `release/X.Y.x` in place of
-`release/X.Y.Z`: pass `--ref release/X.Y.x` to `release.yml`. In step 7, keep
-the line. Do not delete it, because later patches and backports go to it.
+Then continue from step 3 of [Cut a stable release](#cut-a-stable-release),
+with `--ref release/X.Y.x`.
 
 Run it again after a failure, and pass the original `commit` on every rerun.
 Without it, the rerun cuts from the tip of `main`. After the bump PR merges,
@@ -939,6 +946,41 @@ commit to `main`. It skips a version that it already logged, so a rerun or a
 rollback changes nothing. A nightly commit hash is not reported. Do not edit
 `releases` by hand.
 
+### merge-back.yml: merge a line into main
+
+> Not enabled. The workflow does nothing until the repository variable
+> `MERGE_BACK_ENABLED` is `true`, and it stays unset until the design is agreed.
+> The `minimal-release-ops` App is already a bypass actor on the `main` ruleset, so
+> the variable is the only switch. Until then, use the manual merge in the
+> release steps. The job runs only when dispatched from `main`.
+
+[`.github/workflows/merge-back.yml`](../../.github/workflows/merge-back.yml)
+does the manual merge-back as one run, outside the merge queue. The queue
+squashes every PR, and a squash drops the link to the tag. A person starts the
+run after a stable promotion. Its inputs are `version` and `reviewed`.
+
+The run uses [`scripts/merge-back.sh`](../../scripts/merge-back.sh):
+
+1. It stops if the tag `vX.Y.Z` is not on `release/X.Y.x`.
+2. It does nothing if the line is already on `main`.
+3. It runs `git cherry` against `main`, on the line tip and not the tag. A fix
+   can merge into the line after the tag.
+4. If a line commit has no identical patch on `main`, the workflow opens an
+   issue that lists the commit, and stops. It updates the open issue on a
+   second run. It does not merge.
+5. It merges the line with the `ours` strategy, which keeps the tree of `main`.
+   It pushes the merge commit to `main`, without force.
+
+`git cherry` always lists the version bumps, and each pick with resolved
+conflicts. For each commit in the issue, land the fix on `main` if `main` does
+not have it. Then run the workflow again, and put each remaining commit in
+`reviewed`. Those are the commits that `main` has in another form, or does not
+need. The issue marks a commit whose `cherry-pick -x` source is on `main`, but
+you must still read it. The merge drops any change that only the line has.
+
+If `main` moves during the run, the push fails and changes nothing. Run the
+workflow again.
+
 ### prune-releases.yml: delete old nightly releases
 
 [`.github/workflows/prune-releases.yml`](../../.github/workflows/prune-releases.yml)
@@ -948,6 +990,59 @@ months, and it always keeps the newest ten. The logic is in
 [`scripts/prune-releases.sh`](../../scripts/prune-releases.sh). It never
 deletes a `vX.Y.Z` release. The installer reads from the bucket, so pruning
 does not remove anything that users install.
+
+### backport.yml: open a PR on a release line
+
+[`.github/workflows/backport.yml`](../../.github/workflows/backport.yml) picks
+a merged `main` PR onto a release line and opens a PR there. It uses
+[`korthout/backport-action`](https://github.com/korthout/backport-action).
+
+The workflow does nothing until the repository variable `BACKPORT_ENABLED` is
+`true`. Before an admin sets it:
+
+- The labels `backport release/X.Y.x` and `backport-conflict` must exist.
+- The repository setting `squash_merge_commit_title` must be `PR_TITLE`, and the
+  `release branches` ruleset must allow only squash merges. See the merge rule
+  below.
+- The repository setting that allows rebase merges must be off. The workflow
+  reads one merge commit, so a rebase-merged PR is picked commit by commit and
+  the guard sees only the last one.
+- Each line that takes backports must run the conflict-marker scan. A line cut
+  before the scan existed needs `scripts/check-conflict-markers.sh` and the
+  `conflict-markers` job ported to it by hand.
+
+**Start a backport.** Add the label `backport release/X.Y.x` to a PR on `main`.
+The run starts when the PR merges, or when you add the label to a merged PR.
+
+**Title guard.**
+[`scripts/backport-title-guard.sh`](../../scripts/backport-title-guard.sh)
+refuses a `feat` title and a breaking title, because either one forces the line
+to the next minor. It also refuses a source commit with a `BREAKING CHANGE`
+footer. The run comments on the source PR and stops. If the change is safe on
+the line, retitle the source PR as `fix`, then remove the label and add it
+again. A retitle does not remove a footer, so backport that change by hand.
+
+**The backport PR.** The action cherry-picks the squash commit to the branch
+`backport/<number>-to-release/X.Y.x`. It opens the PR as `minimal-backporter`,
+with the title of the source PR. The body names the source PR. It does not copy
+the source body, because agent-runtime reads `Closes #n` in a PR body as a link
+to an epic.
+
+**Merge rule.** Squash-merge the PR, and keep the PR title as the subject. A
+cherry-picked commit keeps the source subject. A rebase merge puts that subject
+on the line, so a retitled `feat` still forces a minor. A squash of one commit
+does the same under any other setting.
+
+**Conflicts.** The action commits the first conflict as it stands, in a commit
+named `BACKPORT-CONFLICT`. Then it opens a draft. The workflow adds the label
+`backport-conflict`, and adds the source PR, the source commit, and the
+conflicted paths to the PR body. Resolve each path on the branch, then mark the
+PR ready. A modify/delete conflict does not leave conflict markers, so check
+each path in the list.
+
+**Workflow files.** The token has no `workflows` permission. GitHub refuses the
+push of a pick that changes `.github/workflows`, and the run reports that on
+the source PR. Backport those changes by hand.
 
 ### install.sh: from channel to installed files
 
@@ -988,3 +1083,18 @@ one marked block in the shell rc file. `--uninstall` removes all of it with no
 network access, from the local install record. It keeps files that you
 changed unless you add `--force`. `--purge` also deletes the data, state, and
 cache folders.
+
+### ci.yml: the conflict-marker scan
+
+The `conflict-markers` job in
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs
+[`scripts/check-conflict-markers.sh`](../../scripts/check-conflict-markers.sh)
+on every PR and push. It fails on a conflict marker in a tracked text file. The
+required check `ci-success` depends on it, so a PR with markers cannot merge.
+
+For a PR, GitHub runs the `ci.yml` of the merge with the base branch. The scan
+covers a release line only when that line has this job. A line cut from `main`
+has it. An older line needs this job and the script ported by PR.
+
+The scan does not see a modify/delete conflict, because that conflict leaves no
+markers. The list of conflicted paths in the draft PR body names those paths.
