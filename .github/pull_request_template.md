@@ -1,8 +1,9 @@
 <!-- PR title: use a Conventional Commit subject — `type(scope): summary`,
-     imperative, lower-case, no trailing period. Add `!` before the colon for
-     a breaking change. The `pr-title` check lints it. A squash merge uses it
-     as the commit subject, and the release version is read from that subject.
-     See docs/commit-conventions.md. -->
+     imperative, lower-case, no trailing period. A title in the task-key form
+     `feat(boxes): T102 — Summary` may keep its capitals. Add `!` before the
+     colon for a breaking change. The `pr-title` check lints it. A squash
+     merge uses it as the commit subject, and the release version is read
+     from that subject. See docs/commit-conventions.md. -->
 
 ## Summary
 

@@ -70,6 +70,8 @@ The `pr-title` check lints titles on pull requests to `main` and `release/**`. I
 feat(boxes): T102 — Add CWD-relative path types
 ```
 
+Commits on the branch still follow the lower-case rule above. Only a PR title may keep the capitals of the task-key form.
+
 ## Examples
 
 ```
