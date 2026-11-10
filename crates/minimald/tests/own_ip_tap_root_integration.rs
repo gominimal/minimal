@@ -13,7 +13,7 @@ use std::path::Path;
 
 use minimald::net::{DEFAULT_MTU, SwitchSubnet};
 use sandbox2::config::{Config, SandboxMapped};
-use sandbox2::{NetPlan, Spawned, TapSpec};
+use sandbox2::{NetPlan, Network, PlanFuture, Resolver, Spawned, TapSpec};
 
 /// `/bin/true` and the libraries `ldd` says it loads, at their own paths, plus
 /// the `usr/lib` the sandbox layer's `lib64` symlink expects.
@@ -87,5 +87,105 @@ async fn the_sandbox_layer_builds_the_tap_a_plan_asks_for() {
     assert!(
         spawned.take_tap_fd().is_none(),
         "the descriptor must be handed out once (017-010)"
+    );
+}
+
+/// A network with an empty namespace and a name server that nothing serves.
+#[derive(Debug)]
+struct Empty;
+
+impl Network for Empty {
+    fn plan(&self) -> PlanFuture<'_> {
+        Box::pin(std::future::ready(Ok(NetPlan::isolated().with_resolver(
+            Resolver::Nameservers(vec![Ipv4Addr::LOCALHOST]),
+        ))))
+    }
+}
+
+/// NET-155: a fetch placed in a held namespace leaves from that namespace and
+/// not from this process's. A listener on this process's loopback serves the
+/// file to an unplaced download. The placed download of the same URL cannot
+/// reach it, and the listener sees no connection. The namespace's process
+/// goes when the hold ends.
+#[tokio::test]
+#[ignore = "creates a user+network namespace; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
+async fn a_placed_fetch_leaves_from_the_held_namespace() {
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if std::env::var_os("MINIMALD_NETNS_TEST").is_none() {
+        eprintln!("skipping the held namespace proof: MINIMALD_NETNS_TEST not set");
+        return;
+    }
+    let body = b"the source archive";
+    let sha = "1f8ba2cd2f1fae8c6d3f4b2fc2e31a97f2bfb3bb70e6cfa3f6a4a6d3c1f6f7f0";
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 1024];
+            assert!(stream.read(&mut buf).unwrap() > 0);
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+    });
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let storage = common::RemoteStorage::new(tmp.path().join("downloads"), false)
+        .await
+        .unwrap();
+    let op = ot::OpTracker::new_root();
+    let url = format!("http://{addr}/pkg-1.0.tar.gz");
+
+    let held = sandbox2::hold_network(&tmp.path().join("held"), Arc::new(Empty))
+        .await
+        .expect("a held namespace");
+    let pid = held.pid();
+    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    assert_eq!(held.nameservers(), &[Ipv4Addr::LOCALHOST]);
+    let namespace =
+        common::NetNamespace::of_process(pid, held.nameservers(), Arc::new(|_| true)).unwrap();
+
+    let placed = storage
+        .download_web_placed(&url, sha, &common::Placement::Namespace(namespace), &op)
+        .await
+        .expect_err("this process's loopback is not in the namespace");
+    assert!(
+        placed
+            .to_string()
+            .starts_with(&format!("could not connect to {addr}: ")),
+        "{placed:#}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        0,
+        "nothing reached the listener"
+    );
+
+    drop(held);
+    for _ in 0..50 {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!Path::new(&format!("/proc/{pid}")).exists());
+
+    // The control: the same URL from this process's namespace reaches the
+    // listener, so the placed download's failure was its placement.
+    drop(
+        storage
+            .download_web_with_verification_and_caching(&url, sha, None, &op)
+            .await,
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "the listener was reachable"
     );
 }
