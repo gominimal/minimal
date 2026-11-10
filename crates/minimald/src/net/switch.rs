@@ -270,6 +270,24 @@ pub async fn move_tap_into_netns(
     lease: PtaskLease,
     subnet: SwitchSubnet,
 ) -> io::Result<()> {
+    // Before the tap arrives and comes up: a namespace with IPv6 on sends
+    // router solicitations and MLD reports out of every interface that comes
+    // up in it, and the switch, which carries IPv4 alone, drops each one with
+    // a warning per box (gominimal/inbox#1228). Turned off on `all` and
+    // `default`, so the tap moved in below is born with it off. Best-effort:
+    // a namespace that keeps IPv6 still gets its tap, and only the warnings.
+    if let Err(e) = crate::traced::spawn_blocking(move || disable_ipv6_in_netns(netns_pid))
+        .await
+        .map_err(io::Error::other)
+        .and_then(|r| r)
+    {
+        tracing::debug!(
+            netns_pid,
+            error = %e,
+            "could not turn IPv6 off in the PTask's network namespace; its router \
+             solicitations will be dropped at the switch"
+        );
+    }
     for (index, argv) in tap_netns_commands(tap, netns_pid, lease, subnet)
         .into_iter()
         .enumerate()
@@ -318,6 +336,38 @@ pub async fn move_tap_into_netns(
             )));
         }
     }
+    Ok(())
+}
+
+/// Turns IPv6 off in the network namespace `/proc/<netns_pid>/ns/net`, for
+/// the interfaces it holds and every one moved in after: the `all` and
+/// `default` `disable_ipv6` sysctls, written from a thread that entered the
+/// namespace, since `/proc/sys/net` is read against the writer's own. Needs
+/// `CAP_NET_ADMIN` over the namespace, which the daemon that wires the tap
+/// has. Runs on its own thread: `setns(2)` moves the calling thread alone,
+/// and a tokio worker must not be left in a box's namespace.
+#[cfg(target_os = "linux")]
+fn disable_ipv6_in_netns(netns_pid: u32) -> io::Result<()> {
+    let ns = std::fs::File::open(format!("/proc/{netns_pid}/ns/net"))?;
+    std::thread::Builder::new()
+        .name("ptask-ipv6-off".into())
+        .spawn(move || -> io::Result<()> {
+            nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNET)
+                .map_err(|e| io::Error::other(format!("setns: {e}")))?;
+            for scope in ["all", "default"] {
+                std::fs::write(
+                    format!("/proc/sys/net/ipv6/conf/{scope}/disable_ipv6"),
+                    "1\n",
+                )?;
+            }
+            Ok(())
+        })?
+        .join()
+        .map_err(|_| io::Error::other("the IPv6 switch-off thread panicked"))?
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disable_ipv6_in_netns(_netns_pid: u32) -> io::Result<()> {
     Ok(())
 }
 
@@ -1046,7 +1096,7 @@ where
                 // flow, outside the VM: reported only when the drop line
                 // fires, so under the same rate limit, never per frame.
                 if gate.limiter.warn(
-                    &gate.label,
+                    gate.offender(),
                     Direction::Egress,
                     remote,
                     transport,
@@ -2100,6 +2150,27 @@ impl BoxGate {
     /// target holds, `Some(Err(name))` otherwise, and `None` for a box that
     /// names no box. A target gate built with no name is named by its
     /// label, the name its own log lines carry.
+    /// The box's own name for a log line: its zone name without the zone's
+    /// suffix, so a reader sees what `min box list` shows. `None` for a gate
+    /// built with no name.
+    fn box_name(&self) -> Option<&str> {
+        let zone = self.zone_name.as_deref()?;
+        Some(
+            zone.strip_suffix(super::dns::HOSTNAME_SUFFIX)
+                .and_then(|name| name.strip_suffix('.'))
+                .unwrap_or(zone),
+        )
+    }
+
+    /// The box as a violation line names it ([`super::policy::Offender`]):
+    /// its switch address and its own name.
+    fn offender(&self) -> super::policy::Offender<'_> {
+        super::policy::Offender {
+            session_id: &self.label,
+            box_name: self.box_name(),
+        }
+    }
+
     fn names_box(&self, target: &BoxGate) -> Option<Result<(), String>> {
         if self.box_names.is_empty() {
             return None;
@@ -2124,6 +2195,7 @@ impl BoxGate {
         }
         tracing::warn!(
             session_id = %self.label,
+            box = self.box_name(),
             direction = %Direction::Egress,
             remote_addr = %destination,
             %proto,
@@ -2295,6 +2367,7 @@ impl BoxGate {
         {
             tracing::warn!(
                 session_id = %self.label,
+                box = self.box_name(),
                 %direction,
                 remote_addr = %SocketAddrV4::new(self.host_alias, port),
                 proto = %Proto::from_ipproto(match proto {
@@ -2689,7 +2762,7 @@ impl BoxGate {
         // audit's line below, which stays the reset channel's account.
         if class == refusal::UNPUBLISHED_PORT {
             self.limiter.warn(
-                &self.label,
+                self.offender(),
                 Direction::Ingress,
                 Some(SocketAddr::V4(pkt.src)),
                 Proto::Tcp,
@@ -2902,7 +2975,7 @@ impl BoxGate {
         // source box and rule per minute (R2.7), whichever leg said it, so
         // the two legs' says of one violation can never be two lines.
         peer.limiter.warn(
-            &peer.label,
+            peer.offender(),
             Direction::Egress,
             Some(SocketAddr::V4(pkt.dst)),
             Proto::Tcp,
@@ -3152,7 +3225,7 @@ impl BoxGate {
                 // Rate-limited per flow (R2.7): one refused flow is one line,
                 // naming the client whose connect was refused.
                 self.limiter.warn(
-                    &self.label,
+                    self.offender(),
                     Direction::Ingress,
                     Some(SocketAddr::V4(pkt.src)),
                     Proto::from_ipv4_number(pkt.proto),
@@ -4343,7 +4416,7 @@ where
                 // count for the refusal audit's line to carry — its audit is
                 // the drop limiter's, with the drop's own vocabulary.
                 gate.limiter.warn(
-                    &gate.label,
+                    gate.offender(),
                     Direction::Ingress,
                     Some(SocketAddr::V4(src)),
                     Proto::from_ipproto(proto),
@@ -6347,12 +6420,19 @@ pub(crate) mod tests {
 
     /// NET-062's warning: every drop is logged once per box per rule per
     /// minute — a flood of identical drops says one line, a different rule is
-    /// still heard — and the line carries the box, the direction, the
-    /// destination and the protocol (R2.7).
+    /// still heard — and the line carries the box's address and name, the
+    /// direction, the destination and the protocol (R2.7; the name since
+    /// gominimal/inbox#1228, so a reader need not map an address that
+    /// means nothing once the box is gone).
     #[tokio::test]
     async fn egress_drop_logged_rate_limited() {
         let capture = crate::test_harness::captured_log();
-        let mut harness = spawn_test_relay(&undeclared_destination_egress());
+        let mut harness = spawn_named_relay_for(
+            LEASE,
+            Some("drop-1228"),
+            Some(&undeclared_destination_egress()),
+            |_| {},
+        );
 
         // Three identical drops, then the sentinel.
         let denied = egress_tcp_frame(LEASE, Ipv4Addr::new(203, 0, 113, 7), 443);
@@ -6380,6 +6460,7 @@ pub(crate) mod tests {
         for expected in [
             "network policy violation",
             "session_id=\"100.64.0.9\"",
+            "box=\"drop-1228\"",
             "direction=egress",
             "remote_addr=203.0.113.7:443",
             "proto=tcp",
