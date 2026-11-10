@@ -492,6 +492,15 @@ impl StartEntryRefusal {
     }
 }
 
+/// The entry names of a refusal, each with its control characters escaped.
+fn printable_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| printable(name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The type of an entry, as a refusal names it.
 fn entry_kind(box_type: Option<&str>) -> String {
     box_type.map_or_else(
@@ -514,7 +523,7 @@ impl std::fmt::Display for StartEntryRefusal {
                  {names}, and none of them is named \"default\". Run {command} <entry> \
                  with one of them.",
                 noun = noun(verb),
-                names = entries.join(", "),
+                names = printable_list(entries),
                 command = verb.command(),
             ),
             Self::Unknown {
@@ -539,7 +548,7 @@ impl std::fmt::Display for StartEntryRefusal {
                         f,
                         " Its {noun} are {names}. Run {command} <entry> with one of them.",
                         noun = noun(verb),
-                        names = entries.join(", "),
+                        names = printable_list(entries),
                         command = verb.command(),
                     )
                 }
@@ -555,10 +564,11 @@ impl std::fmt::Display for StartEntryRefusal {
                 write!(
                     f,
                     "Cannot start {entry} as a session. Its entry in {file} has {kind}.",
+                    entry = printable(entry),
                     kind = entry_kind(box_type.as_deref()),
                 )?;
                 if box_type.as_deref() == Some(boxes::TASK_BOX_TYPE) {
-                    write!(f, " Run min box start {entry} to start it.")?;
+                    write!(f, " Run min box start {} to start it.", printable(entry))?;
                 }
                 Ok(())
             }
@@ -579,6 +589,7 @@ impl std::fmt::Display for StartEntryRefusal {
                 f,
                 "Cannot start {entry}. Its entry in {file} has {kind}, and min box start \
                  starts session and task entries only.",
+                entry = printable(entry),
                 kind = entry_kind(box_type.as_deref()),
             ),
         }
@@ -612,7 +623,7 @@ impl std::fmt::Display for StartNeedsTerminal {
         write!(
             f,
             "{} needs a terminal. Run it from a terminal, or pass --detach.",
-            self.entry
+            printable(&self.entry)
         )
     }
 }
@@ -4092,6 +4103,41 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use boxes::DynamicIngress;
+
+    /// A start refusal escapes the control characters of every entry name
+    /// it prints, so a name from `minimal.toml` cannot move the cursor.
+    #[test]
+    fn start_refusals_escape_entry_names() {
+        let bad = "dev\u{1b}[2K\n".to_owned();
+        let refusals = [
+            StartEntryRefusal::Several {
+                verb: StartVerb::Box,
+                entries: vec![bad.clone(), "ok".to_owned()],
+            },
+            StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: bad.clone(),
+                entries: vec![bad.clone()],
+            },
+            StartEntryRefusal::NotSession {
+                entry: bad.clone(),
+                box_type: Some(boxes::TASK_BOX_TYPE.to_owned()),
+            },
+            StartEntryRefusal::NameUnsupported { entry: bad.clone() },
+            StartEntryRefusal::TaskNotInTasks { entry: bad.clone() },
+            StartEntryRefusal::UnsupportedType {
+                entry: bad.clone(),
+                box_type: Some("agent".to_owned()),
+            },
+        ];
+        let mut texts: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+        texts.push(StartNeedsTerminal::new(&bad).to_string());
+        for text in texts {
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(!text.contains('\n'), "{text:?}");
+            assert!(text.contains("dev\\u{1b}[2K\\n"), "{text:?}");
+        }
+    }
 
     /// BOX-001: a create from `<root>/sub` sends `<root>`, the directory
     /// that holds `minimal.toml`, as the project root.
