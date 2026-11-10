@@ -949,7 +949,7 @@ fn find_init_mfile(
                 message: format!(
                     "min init did not add the entry: {file} is not valid. \
                      Fix the file, then run the command again.\n{}",
-                    e.to_string().trim_end()
+                    format!("{:#}", anyhow::Error::new(e)).trim_end()
                 ),
             }
             .into())
