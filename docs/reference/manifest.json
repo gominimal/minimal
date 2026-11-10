@@ -1,6 +1,7 @@
 {
   "pages": [
     "cli.md",
+    "glossary.md",
     "cli-mip.md",
     "cli-min.md",
     "cli-minimald.md",
