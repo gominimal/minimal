@@ -2000,6 +2000,7 @@ pub(super) fn start_managed_exec_within(
         id.clone(),
         exec_box.record.id,
         mode,
+        facts.argv.clone(),
         transcript_path,
         terminal,
     ));

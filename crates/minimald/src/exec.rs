@@ -575,6 +575,7 @@ async fn run_attached_exec(
             exec_id.clone(),
             exec_box.record.id,
             ExecMode::Attached,
+            facts.argv.clone(),
             transcript,
             None,
         ));
@@ -796,7 +797,7 @@ pub(crate) struct AdoptedTrace {
 /// the daemon handed the box a `TRACEPARENT` whose span id was spooled and
 /// exported nowhere, so a `min` run inside parented itself to an orphan. A
 /// trace nobody can follow is worse than a fresh one: hand the box nothing.
-fn box_traceparent(adopted: &AdoptedTrace) -> Option<String> {
+pub(crate) fn box_traceparent(adopted: &AdoptedTrace) -> Option<String> {
     adopted.recorded.then(|| adopted.ctx.traceparent())
 }
 
