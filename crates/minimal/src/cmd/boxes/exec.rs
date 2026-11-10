@@ -845,8 +845,11 @@ struct StopExecRequest {
 }
 
 /// The response for a [`StopExec`] RPC: how the exec ended.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct StopExecResponse {
+    /// Why the exec ended, as its `exec_exited` event spells it. Required,
+    /// so the untagged `Errorable` never reads a refusal as this answer.
+    reason: String,
     /// Set when the exec had already ended before the stop, so the stop
     /// sent no signal.
     #[serde(default)]
@@ -903,14 +906,7 @@ pub(crate) async fn box_stop_exec_on_hosts(
                 });
             }
         };
-        if stopped.already_ended {
-            writeln!(
-                out,
-                "Exec {exec_id} in {target} ended before the stop, so the stop changed nothing."
-            )?;
-        } else {
-            writeln!(out, "Stopped exec {exec_id} in {target}.")?;
-        }
+        write_exec_stop_line(out, target, exec_id.as_str(), stopped.already_ended)?;
         Ok(())
     }
     .await;
@@ -929,4 +925,22 @@ pub async fn cmd_box_stop_exec(
     let hosts = crate::cmd::list::local_hosts(global)?;
     let mut out = std::io::stdout().lock();
     box_stop_exec_on_hosts(hosts, &mut out, target, exec_text).await
+}
+
+/// The one line `min box stop <box> --exec <id>` prints: the exec stopped,
+/// or it had already ended when the stop came (BCLI-055).
+pub(crate) fn write_exec_stop_line(
+    out: &mut impl std::io::Write,
+    target: &str,
+    exec_id: &str,
+    already_ended: bool,
+) -> std::io::Result<()> {
+    if already_ended {
+        writeln!(
+            out,
+            "Exec {exec_id} in {target} ended before the stop, so the stop changed nothing."
+        )
+    } else {
+        writeln!(out, "Stopped exec {exec_id} in {target}.")
+    }
 }
