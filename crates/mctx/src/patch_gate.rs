@@ -263,7 +263,11 @@ fn judge_task_patches(
                 .map_err(|e| anyhow!("task `{task_name}`: {e}"))?;
             let at = Utf8PathBuf::from(at);
             let decided = decide_entry(&expanded, &source, &at, is_file).map_err(|e| {
-                anyhow!("task `{task_name}`: {kind}.\"{declared}\": {e}; refusing to mount it")
+                anyhow!(
+                    "task `{task_name}`: {kind}.\"{declared}\" was not mounted. {e} The \
+                     `[patches]` rules are in {}.",
+                    policy_path.display()
+                )
             })?;
             match decided.verdict {
                 Verdict::Allowed => {
@@ -340,7 +344,9 @@ fn decide_entry(
 ) -> anyhow::Result<Decided> {
     let dotted = at.as_str().split('/').any(|s| s == "." || s == "..");
     if dotted {
-        return Err(anyhow!("a patch path may not hold a `.` or `..` segment"));
+        return Err(anyhow!(
+            "The path holds a `.` or `..` segment. Write the entry without one."
+        ));
     }
     let own = decide(expanded, source, at);
     let resolved = resolve(at)?.filter(|r| r.as_path() != at);
@@ -398,8 +404,13 @@ fn resolve(path: &Utf8Path) -> anyhow::Result<Option<Utf8PathBuf>> {
     loop {
         match std::fs::canonicalize(cur) {
             Ok(real) => {
-                let mut real = Utf8PathBuf::from_path_buf(real)
-                    .map_err(|p| anyhow!("`{}` resolves to a non-UTF-8 path", p.display()))?;
+                let mut real = Utf8PathBuf::from_path_buf(real).map_err(|p| {
+                    anyhow!(
+                        "`{}` resolves to a path that is not UTF-8. Point the entry at \
+                             a path that is.",
+                        p.display()
+                    )
+                })?;
                 for seg in tail.iter().rev().copied() {
                     real.push(seg);
                 }
@@ -407,10 +418,18 @@ fn resolve(path: &Utf8Path) -> anyhow::Result<Option<Utf8PathBuf>> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if std::fs::symlink_metadata(cur).is_ok_and(|m| m.file_type().is_symlink()) {
-                    return Err(anyhow!("`{cur}` is a symlink that does not resolve"));
+                    return Err(anyhow!(
+                        "`{cur}` is a symbolic link that does not resolve. Fix the link, or \
+                         point the entry at a path that exists."
+                    ));
                 }
             }
-            Err(e) => return Err(anyhow!("cannot resolve `{cur}`: {e}")),
+            Err(e) => {
+                return Err(anyhow!(
+                    "`{cur}` cannot be resolved: {e}. Point the entry at a path the daemon \
+                     can read."
+                ));
+            }
         }
         let (Some(parent), Some(name)) = (cur.parent(), cur.file_name()) else {
             return Ok(None);
@@ -447,8 +466,7 @@ fn probe_dir_for_deny(
     on_disk: &Utf8Path,
 ) -> anyhow::Result<Option<String>> {
     let reaches = expanded.deny().iter().any(|fs| {
-        deny_reaches_inside(fs.pattern(), declared.as_str())
-            || deny_reaches_inside(fs.pattern(), on_disk.as_str())
+        deny_reaches_inside(fs, declared.as_str()) || deny_reaches_inside(fs, on_disk.as_str())
     });
     if !reaches || !on_disk.as_std_path().is_dir() {
         return Ok(None);
@@ -461,13 +479,20 @@ fn probe_dir_for_deny(
     {
         let item = match item {
             Ok(item) => item,
-            Err(e) => return Err(anyhow!("cannot read it to check `[patches] deny`: {e}")),
+            Err(e) => {
+                return Err(anyhow!(
+                    "A part of it cannot be read to check it against `[patches] deny`: {e}. \
+                     Narrow the entry in the project's minimal.toml to the part the daemon \
+                     can read."
+                ));
+            }
         };
         seen += 1;
         if seen > DIR_PROBE_LIMIT {
             return Err(anyhow!(
-                "it holds more than {DIR_PROBE_LIMIT} entries, too many to check against \
-                 `[patches] deny`"
+                "It holds more than {DIR_PROBE_LIMIT} entries, too many to check against \
+                 `[patches] deny`. Narrow the entry in the project's minimal.toml, or narrow \
+                 the `deny` pattern so it does not reach inside this directory."
             ));
         }
         let real = Utf8PathBuf::from(item.path().to_string_lossy().into_owned());
@@ -484,22 +509,24 @@ fn probe_dir_for_deny(
     Ok(None)
 }
 
-/// Whether the expanded `deny` pattern `pattern` can match a path strictly
-/// inside the directory `dir`. Errs towards `true`, which costs a walk; a
-/// false `false` would skip a deny.
+/// Whether the expanded `deny` pattern can match a path strictly inside the
+/// directory `dir`. Errs towards `true`, which costs a walk; a false `false`
+/// would skip a deny.
 ///
-/// The pattern's literal prefix, read up to its first glob metacharacter
-/// (`*`, `?`, `[`, `{`, or a `\` escape), decides. A pattern with no
-/// metacharacter names one path, so it must lie under `dir`. Otherwise a `*`
-/// can cross `/`, so the prefix only has to agree with `dir/` as far as the
-/// shorter of the two reaches.
-fn deny_reaches_inside(pattern: &str, dir: &str) -> bool {
+/// The pattern's own walk root decides ([`FileSet::walk_root`], the one
+/// reading of a glob's literal prefix): a pattern with no metacharacter is
+/// its own root and names one path, so it must lie under `dir`; one with no
+/// literal prefix at all can reach anywhere; otherwise a `*` can cross `/`,
+/// so the root only has to agree with `dir/` as far as the shorter of the
+/// two reaches.
+fn deny_reaches_inside(fs: &boxes::core::primitives::FileSet, dir: &str) -> bool {
     let inside = format!("{}/", dir.trim_end_matches('/'));
-    match pattern.find(['*', '?', '[', '{', '\\']) {
-        None => pattern.starts_with(&inside),
-        Some(i) => {
-            let literal = pattern.get(..i).unwrap_or_default();
-            literal.starts_with(&inside) || inside.starts_with(literal)
+    match fs.walk_root() {
+        None => true,
+        Some(root) if root.as_str() == fs.pattern() => fs.pattern().starts_with(&inside),
+        Some(root) => {
+            let root = format!("{}/", root.as_str().trim_end_matches('/'));
+            root.starts_with(&inside) || inside.starts_with(&root)
         }
     }
 }
@@ -712,13 +739,22 @@ mod tests {
     /// allowed tree unwalked.
     #[test]
     fn a_deny_elsewhere_does_not_walk_the_directory() {
-        assert!(!deny_reaches_inside("/home/u/.ssh/**", "/home/u/cache"));
-        assert!(!deny_reaches_inside("/home/u/.ssh", "/home/u/cache"));
-        assert!(!deny_reaches_inside("/home/u/.ssh", "/home/u/.ssh"));
-        assert!(deny_reaches_inside("/home/u/.ssh", "/home/u"));
-        assert!(deny_reaches_inside("/home/u/.ssh/**", "/home/u"));
-        assert!(deny_reaches_inside("/home/u/**", "/home/u/cache"));
-        assert!(deny_reaches_inside("**/*.pem", "/home/u/cache"));
+        let reaches = |pattern: &str, dir: &str| {
+            deny_reaches_inside(
+                &boxes::core::primitives::FileSet::try_new(pattern).unwrap(),
+                dir,
+            )
+        };
+        assert!(!reaches("/home/u/.ssh/**", "/home/u/cache"));
+        assert!(!reaches("/home/u/.ssh", "/home/u/cache"));
+        assert!(!reaches("/home/u/.ssh", "/home/u/.ssh"));
+        assert!(reaches("/home/u/.ssh", "/home/u"));
+        assert!(reaches("/home/u/.ssh/**", "/home/u"));
+        assert!(reaches("/home/u/**", "/home/u/cache"));
+        assert!(reaches("**/*.pem", "/home/u/cache"));
+        // A root that is a prefix of the name, not of the path, reaches no
+        // further than its own directory.
+        assert!(!reaches("/home/u/**", "/home/user/cache"));
     }
 
     /// `~/` expands against the home `mip` mounts from, and the policy's own
