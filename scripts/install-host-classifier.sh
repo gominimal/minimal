@@ -1788,6 +1788,30 @@ do
     chown "$owner_uid:$owner_gid" "$dir"
 done
 
+# The cover the sandbox gives a host-address box (a read-only cgroup2 mount
+# of its own leaf) is there so the box reads its own memory.max where a
+# runtime looks for it. A controller reaches a cgroup only when every cgroup
+# above it has enabled it in cgroup.subtree_control. The daemon enables the
+# memory controller on the cohort and its subtrees when it enters its leaf,
+# but never on the slice: it is still a member of the slice's tree at that
+# point, and a cgroup that holds a process cannot enable a controller for
+# its children. So the slice is this step's, as root, once its leaves exist
+# and before anything is placed. What the mount root offers the slice is
+# the root's own cgroup.subtree_control; a root that offers no memory
+# controller is a note, not a failure: boxes still get their leaves and
+# their verdicts, and read no memory.max. (A rehearsal's stand-in root has
+# that file only if the rehearsal wrote it.)
+mount_root=$(dirname "$tree_root")
+if grep -qw memory "$mount_root/cgroup.subtree_control" 2>/dev/null; then
+    if printf '+memory\n' >"$tree_root/cgroup.subtree_control" 2>/dev/null; then
+        note "enabled the memory controller on the slice ($tree_root/cgroup.subtree_control): a box reads its own memory.max under its cgroup2 cover once minimald enables it on the cohort below"
+    else
+        note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control): a process standing in the slice itself rather than in a leaf refuses it; boxes read no memory.max until a re-install with the slice's processes in their leaves"
+    fi
+else
+    note "the mount root offers the slice no memory controller ($mount_root/cgroup.subtree_control): boxes get their leaves and verdicts, and read no memory.max"
+fi
+
 # The cgroups' paths the ruleset is keyed on, as the covering mount spells
 # them (see compute_cgroup_paths).
 compute_cgroup_paths

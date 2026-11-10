@@ -2808,6 +2808,10 @@ STUB
 
     run_hc unenrolled "$root/mi-on" --user "$me"
     check 0 "$rc" "install exits 0 with neither identity"
+    want_ok "a mount root with no memory controller is noted, and the install goes on" \
+        grep -q "offers the slice no memory controller" "$OUT"
+    want_err "no controller is enabled on the slice over such a root" \
+        grep -q "+memory" "$tree/cgroup.subtree_control"
     want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
     want_ok "the un-enrolled install lays out the QUIC block leaf" \
         test -d "$tree/boxes/quic443-blocked"
@@ -2833,6 +2837,10 @@ STUB
     # The QUIC block helper and its sudoers rule go under the scratch root,
     # through the step's own override knobs: a rehearsal writes nothing to
     # /usr/local or /etc.
+    # The stand-in mount root now offers the memory controller, as a systemd
+    # host's does: the step enables it on the slice, the one cgroup the
+    # daemon cannot enable it on itself.
+    printf 'cpuset cpu io memory pids\n' >"$cg/cgroup.subtree_control"
     HC_HELPER="$root/hclib/quic443-leaf"
     HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
     run_hc install "$root/mi-on" --user "$me" \
@@ -2846,6 +2854,10 @@ STUB
     want_ok "the host-address QUIC block leaf exists" test -d "$tree/boxes/quic443-blocked"
     want_ok "the table's marker exists once the transaction succeeded" \
         test -d "$tree/classifier-table"
+    want_ok "the memory controller is enabled on the slice for the leaves below" \
+        grep -q "^+memory$" "$tree/cgroup.subtree_control"
+    want_ok "install says it enabled the memory controller on the slice" \
+        grep -q "enabled the memory controller on the slice" "$OUT"
     want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
     want_ok "install names the delegated account" grep -q "delegated to" "$OUT"
     want_ok "install names the contract it delegated" grep -q "v2 contract" "$OUT"
