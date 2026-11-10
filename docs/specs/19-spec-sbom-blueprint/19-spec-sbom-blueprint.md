@@ -5,7 +5,7 @@ owner: bryan-minimal
 epic: gominimal/inbox#582
 arch: https://github.com/gominimal/arch/blob/3dab1097cda11652ad24282969ed8dfe61d0d497/architecture.md
 arch_sha: "3dab1097cda11652ad24282969ed8dfe61d0d497"
-updated: 2026-10-22
+updated: 2026-11-10
 ---
 
 # SBOM — box SBOM + CycloneDX Blueprint
@@ -452,18 +452,20 @@ developer running agent boxes, build-infra operator, and auditor.
   - WHEN the pin records a bundle for the document (its state in the sealed
     map, PKV-017's) THE SYSTEM SHALL check the bundle with PKV-011's checks
     first, then check the subject, and only then read any other field of the
-    document. IF the bundle fails a check or is absent THEN THE SYSTEM SHALL
-    treat the document as unresolved (SBOM-012's failure, exit code 6,
-    naming the check or the missing bundle), and never read it. IF the
-    bundle's host cannot be reached THEN THE SYSTEM SHALL fail with exit
-    code 7 naming the host, as SBOM-012 does for any object. IF the cache
-    refuses the bundle request for authentication or authorization THEN THE
-    SYSTEM SHALL fail with exit code 5 naming the pin, the bundle and the
-    host. The pin decides, so SBOM-001 holds: the same pin always takes the
-    same path.
+    document. The pin decides, so SBOM-001 holds: the same pin always takes
+    the same path.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_bundle_verified_before_read
-    property: pin_records_bundle(d) ⇒ (read(d) ⇒ verified(bundle(d))) ∧ (unreachable(bundle(d)) ⇒ exit = 7) ∧ (refused(bundle(d)) ⇒ exit = 5) ∧ (¬unreachable(bundle(d)) ∧ ¬refused(bundle(d)) ∧ ¬verified(bundle(d)) ⇒ exit = 6); checks(d) = [bundle, subject, rest] in that order
+    property: pin_records_bundle(d) ⇒ (read(d) ⇒ verified(bundle(d))); checks(d) = [bundle, subject, rest] in that order
+  - WHILE the pin records a bundle for the document, IF the bundle fails a
+    check or is absent THEN THE SYSTEM SHALL treat the document as
+    unresolved (SBOM-012's failure, exit code 6, naming the check or the
+    missing bundle), and never read it. A bundle whose host cannot be
+    reached, or whose request the cache refuses, is SBOM-012's failure for
+    that object, exit code 7 or 5, naming the host.
+    tier:   T1
+    verify: cargo nextest run -p sbom per_package_document_failed_or_missing_bundle_is_unresolved
+    property: pin_records_bundle(d) ∧ ¬unreachable(bundle(d)) ∧ ¬refused(bundle(d)) ∧ ¬verified(bundle(d)) ⇒ exit = 6 ∧ ¬read(d)
   - WHILE the pin records no bundle for the document, IF the cache holds no
     document beside the artifact (the producer has published none, which is
     every package today) THEN THE SYSTEM SHALL emit the component with its
@@ -568,19 +570,23 @@ developer running agent boxes, build-infra operator, and auditor.
     other boxes.
     tier:   T0
     verify: cargo nextest run -p minimal box_list_using_reports_an_unreadable_box_with_its_reason
-  - THE SYSTEM SHALL keep, as part of the Box Record (the host-side
-    state of one box, which minimald alone writes, outside the box's
-    filesystem and unwritable from inside it), a resolution record of every package the
-    box was materialized with: its name, version and Build Spec Hash as the
-    graph resolved them at activation. Both the list's `@<ver>` filter and
-    the SBOM's component name and version (SBOM-009) SHALL read from that
-    record, so the two agree offline and a version is never fetched to
-    answer a list. IF the record is missing or unreadable THEN the box's
-    SBOM is SBOM-012's failure, exit code 6, naming the record, with no
-    fallback to the graph (AT2), and the list reports the box with that
-    reason.
+  - THE SYSTEM SHALL keep, as part of the Box Record (the host-side state
+    of one box, which minimald alone writes, outside the box's filesystem
+    and unwritable from inside it), a resolution record of every package
+    the box was materialized with: its name, version and Build Spec Hash as
+    the graph resolved them at activation.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_record_keeps_a_resolution_record_per_package
+  - THE SYSTEM SHALL read both the list's `@<ver>` filter and the SBOM's
+    component name and version (SBOM-009) from that record, so the two
+    agree offline and a version is never fetched to answer a list.
     tier:   T0
     verify: cargo nextest run -p minimal box_list_using_version_answers_from_the_stored_resolution_record
+  - IF the record is missing or unreadable THEN THE SYSTEM SHALL fail the
+    box's SBOM as SBOM-012 does, exit code 6, naming the record, with no
+    fallback to the graph (AT2), and SHALL list the box with that reason.
+    tier:   T0
+    verify: cargo nextest run -p minimal sbom_missing_resolution_record_exits_6_without_graph_fallback
 
 ## Non-goals
 
@@ -601,8 +607,8 @@ developer running agent boxes, build-infra operator, and auditor.
   reader agree.
 - Pinning the document digest in the signed closure, which is what makes a
   per-package document sealed under a pin rather than bound through its
-  subject: build infrastructure, first step. Until it is merged the chain
-  runs bundle identity, then the tarball digest, then the closure.
+  subject: build infrastructure, first step. Without it the chain runs
+  bundle identity, then the tarball digest, then the closure.
 - Enforcing the declared-only posture axes (file imports and exports, GitHub
   imports, `[otel]`, the VPN mesh): the specs that define them (NET, MRF,
   the file-rules work). The Blueprint labels them `declared` until then.
@@ -740,9 +746,9 @@ from the spec and stay schema-TODO.
   private registry's cache is written by whoever operates it. The spec's
   controls on that boundary are the `unverified` and `partial` marks, the
   stderr diagnostic, SBOM-008's allowlist of copied fields, and the
-  `require_bundles` option. A gate that consumes a box document as evidence
-  SHALL refuse a `partial` one, and the boundary closes per document as the
-  pin records bundles (SBOM-013).
+  `require_bundles` option. The `partial` mark is what a gate that consumes
+  a box document as evidence refuses on, and the boundary closes per
+  document as the pin records bundles (SBOM-013).
 - **Invariant:** THE SYSTEM SHALL never present a document that holds any
   unverified component as evidence.
   enforced by: the top-level `partial` mark in every serializer, which a
@@ -763,27 +769,24 @@ from the spec and stay schema-TODO.
   reasoning: `min box sbom <box>`, a payload command like `pkg sbom`, with
   the Blueprint a mode of it (`--blueprint`) rather than an output format of
   `min box spec`, whose `-o` formats and `min/v1/spec` schema a CycloneDX
-  document cannot satisfy. Ruling requested as gominimal/arch#66. The spec
-  binds no command until the ruling is merged. The earlier worry that "blueprint"
-  already means the Box Spec in the architecture's vocabulary no longer
-  holds: the current text uses the word once, for the document itself.]
+  document cannot satisfy. The ruling is the architecture's, and the
+  requirements bind either answer, so the spec names no command.]
 - [NEEDS CLARIFICATION (HIGH): is a composed box document signed in its own
   right, or a verifiable derivation over signed per-package inputs it
-  references? Recommendation on record: a derivation. It calls for no per-box
-  signing infrastructure and stays valid as inputs are re-signed. Decide
-  with the attestation cutover, gominimal/build-servers#86.]
+  references? A derivation is the better answer: it calls for no per-box
+  signing infrastructure and stays valid as inputs are re-signed. The
+  attestation cutover decides it.]
 - [NEEDS CLARIFICATION (MEDIUM): the sealed map's state name for a published
   SBOM bundle and the closure's `sbom_digest` field, which the producer's
   first step adds. SBOM-013 binds the object names and the statement shape
   now. The state name follows the provenance bundle's (`bundled`) unless the
-  producer rules otherwise. Settle on gominimal/build-servers#185 before the
-  first slice's golden fixtures.]
+  producer rules otherwise. The first slice's golden fixtures need the
+  answer.]
 - [NEEDS CLARIFICATION (MEDIUM): does the Box Spec record, per loadout
   package, the registry it resolved from under `open` loadout mode? Today
   it does not (the architecture's "Packages, Containers and supply chain"
   and "Box Spec" sections), so a foreign loadout package resolves as upstream and
-  `outside-pin` cannot occur. Asked as gominimal/arch#138. A yes makes the
-  kind live with no change here.]
+  `outside-pin` cannot occur. A yes makes the kind live with no change
+  here.]
 - [NEEDS CLARIFICATION (LOW): SPDX `created` timestamp source (proposal:
-  pinned commit's committer timestamp). Both answers satisfy SBOM-001.
-  Settle in first-slice review.]
+  pinned commit's committer timestamp). Both answers satisfy SBOM-001.]
