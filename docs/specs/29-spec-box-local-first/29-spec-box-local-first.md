@@ -336,7 +336,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p mfile expansion_order_and_merge_rules
   property: For every set of layers, expansion equals the fold of the merge rule over the layers in the stated order.
 
-- **BOX-176** THE SYSTEM SHALL merge the `vars` and `vars_lenient` of BOX-064's layers by variable name, so that each name keeps the value of the most specific layer up to and including the entry that sets it, and each selected loadout adds the names it sets.
+- **BOX-176** THE SYSTEM SHALL merge the `vars` and `vars_lenient` of BOX-064's layers by variable name, keyed across both tables, so that each name keeps the value, and the table, of the most specific layer up to and including the entry that sets it, and each selected loadout adds the names it sets.
   tier:   T0
   verify: cargo nextest run -p mfile vars_merge_by_name_across_layers
   <!-- decided 2026-11-09: a wholesale replace would let a loadout's `vars`, such as the built-in default loadout's, erase an open entry's own; a loadout that sets a name to the same value adds nothing (docs/reference/loadouts.md, "Composition, conflicts, and policy") -->
