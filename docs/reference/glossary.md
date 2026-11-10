@@ -11,7 +11,7 @@ These terms come from Minimal's design of record. Each one names one thing. Othe
 
 ### Box
 
-A box is an isolated Linux runtime that holds the packages its spec declares. Each box has one Box Type. On macOS, and under `--provider local-minvmd` on Linux, the box runs inside a microVM. Today you create and manage interactive boxes with the `min session` commands.
+A box is an isolated Linux runtime that holds the packages its spec declares. Each box has one Box Type. On macOS, and under `--provider local-minvmd` on Linux, the box runs inside a microVM. You manage boxes with the `min box` commands. `min session start` creates a box of the `session` type.
 
 ### Box Type
 
@@ -27,7 +27,7 @@ The `task` Box Type is for boxes that run one command to completion and exit. Th
 
 ### exec
 
-An exec is a command that you run inside a box that is already running, with `min session exec`. It runs inside that box's isolation.
+An exec is a command that you run inside a box that is already running, with `min box exec`. It runs inside that box's isolation.
 
 ### Box Spec
 
@@ -77,4 +77,4 @@ A Box Host is a running `minimald` that creates and runs boxes.
 
 ### Box Provider
 
-A Box Provider gives `min` a Box Host. With `local-minimald`, `minimald` runs on your Linux machine. With `local-minvmd`, `minimald` runs inside a microVM. macOS uses `local-minvmd` only.
+A Box Provider gives `min` a Box Host. With `local`, `minimald` runs on your Linux machine. With `local-minvmd`, `minimald` runs inside a microVM. macOS uses `local-minvmd` only.
