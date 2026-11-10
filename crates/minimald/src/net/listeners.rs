@@ -3148,13 +3148,17 @@ fn box_listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>>
 /// the leader's table ([`listening_ports`]), kept to the listeners this test
 /// process holds itself. A unit test's box has no network namespace of its
 /// own — its leader is a plain host child, so the leader's table is the
-/// host's — and a listener that any other process on the machine (a
-/// concurrently running test, another lane's daemon) opens inside the
-/// test's port range would otherwise be the box's listener too, published
-/// and moved beside the test's own. The test's listeners are the sockets
-/// it binds in its own process, so the box's surface is exactly those, and
-/// an assertion over all of the box's rows is an assertion over the test's.
+/// host's — and a listener that another process on the machine opens inside
+/// the test's port range (another lane's daemon, or another test under a
+/// process-per-test runner such as nextest, which `just test` uses) would
+/// otherwise be the box's listener too, published and moved beside the
+/// test's own. The test's listeners are the sockets it binds in its own
+/// process, so the box's surface is exactly those, and an assertion over
+/// all of the box's rows is an assertion over the test's.
 ///
+/// The read is by process, not by test: under plain `cargo test` the
+/// binary's tests are threads of one process, their sockets are in this
+/// `/proc/self/fd` too, and a sibling test's listener in the range is kept.
 /// The filter only ever drops ports. A future in-crate test whose box
 /// listener is held by another process — a child the test spawns, or a real
 /// box in its own network namespace — will see no listeners through this
