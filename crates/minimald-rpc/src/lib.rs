@@ -4134,6 +4134,7 @@ mod box_listing_tests {
             exit_code: None,
             signal: None,
             pty_enabled: true,
+            lifetime: None,
         }
     }
 
