@@ -15100,6 +15100,33 @@ async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_pl
         .expect("a box that was never placed starts a check");
 }
 
+/// gominimal/minimal#1373: the context a box builds keys its task state on
+/// the record's host project, so a run's state survives the next session's
+/// freshly laid-out tree. A context made from the fixture repo carries no
+/// state root until the record keys it.
+#[test]
+fn a_box_context_keys_task_state_on_the_records_project() {
+    let state = tempfile::tempdir().unwrap();
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = mctx::ConfigBuilder::new()
+        .with_state_dir(state.path().to_path_buf())
+        .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
+        .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+        .with_no_fetch(true)
+        .build()
+        .unwrap();
+    let ctx = mctx::Context::new(config).unwrap();
+    assert_eq!(ctx.state_root(), None, "nothing keys a fresh context");
+
+    let record = build_record(boxes::NetworkMode::OwnIp, None);
+    let keyed = super::setup::keyed_on_project(ctx, &record);
+    assert_eq!(
+        keyed.state_root(),
+        Some(std::path::Path::new("/tmp/project")),
+        "the state root is the record's host project path"
+    );
+}
+
 /// A box record for the NET-155 tests, in `mode` and under `egress`.
 fn build_record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -> boxes::Record {
     boxes::Record {

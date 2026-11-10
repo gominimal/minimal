@@ -2003,9 +2003,10 @@ impl File {
     /// Returns the path to the durable state directory for the given key,
     /// keyed on `project_dir` instead of where this minimal file sits on disk.
     ///
-    /// For a daemon that reads the project from a copy whose path changes
-    /// every session (the VM guest's uploaded tree), so the caller supplies
-    /// the stable host path. The `~` prefix is never used: the host's home
+    /// For a daemon that reads every box's project from a tree laid out
+    /// afresh each session, native or VM, whose path changes every time, so
+    /// the caller supplies the stable host path. The `~` prefix is never
+    /// used: the host's home
     /// is not this machine's. Components are encoded with
     /// [`Self::encode_component_escaped`], so two project paths never share a
     /// directory.

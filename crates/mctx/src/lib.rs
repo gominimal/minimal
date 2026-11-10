@@ -514,7 +514,9 @@ impl Context {
 
     /// Keys every task's durable state on `dir` rather than on the
     /// directory the mfile was read from (gominimal/minimal#1373). For a
-    /// daemon whose copy of the project moves every session.
+    /// daemon that parses every box's mfile from a tree laid out afresh
+    /// each session, native or VM, and so has a stable host path to key on
+    /// and no stable mfile directory.
     #[must_use]
     pub fn with_state_root(mut self, dir: PathBuf) -> Self {
         self.state_root = Some(dir);
