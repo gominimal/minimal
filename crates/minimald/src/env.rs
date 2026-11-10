@@ -532,10 +532,29 @@ impl Env {
                      with no per-box egress enforcement, because the box has none",
                 ),
             }
-            ctx.build_graph(&graph, false, None).await.map_err(|e| {
-                let failure = e.to_string();
-                std::io::Error::other(unreachable_source(&failure, &args.name).unwrap_or(failure))
-            })?;
+            // NET-155: a build the box's egress rules refused names the
+            // destination and the box before the build's own error, as the
+            // build side operation's does. The launch knows the box's name.
+            let placement = crate::box_ops::BuildPlacement {
+                box_name: args.name.clone(),
+                leaf: ctx.classifier_leaf().cloned(),
+                network: ctx.box_network().cloned(),
+            };
+            let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
+            // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to
+            // a string in the same poll it appears, so `join!` never holds it.
+            let build = async {
+                match ctx.build_graph(&graph, false, Some(log_tx)).await {
+                    Ok(()) => None,
+                    Err(e) => Some(e.to_string()),
+                }
+            };
+            // The tap names the box for a refused source, and the package
+            // and the host for one it could not connect to
+            // (`BuildTap::failure`); the error is taken as it hands it back.
+            tapped_build(build, log_rx, &placement)
+                .await
+                .map_err(std::io::Error::other)?;
         }
 
         // Collect the package-derived wiring and merge caller-supplied
@@ -4000,6 +4019,32 @@ pub(crate) fn egress_refusal<'a>(
     Some(format!(
         "the build of {package} could not reach {destination}: {reason}"
     ))
+}
+
+/// Runs `build`, a box's package builds, while it reads the events they
+/// send on `log_rx`, and returns the error to report when they fail
+/// (NET-155). A build the box's egress rules refused names the destination
+/// and the box before the build's own error. Any other failure is the
+/// build's own error, unchanged. `build` resolves to the build's error, if
+/// any, and drops the events' sender when it ends.
+pub(crate) async fn tapped_build(
+    build: impl std::future::Future<Output = Option<String>>,
+    mut log_rx: futures::channel::mpsc::UnboundedReceiver<orchestrator::BuildEvent>,
+    placement: &crate::box_ops::BuildPlacement,
+) -> Result<(), String> {
+    use futures::StreamExt as _;
+    let tap = async {
+        let mut tap = crate::box_ops::BuildTap::default();
+        while let Some(event) = log_rx.next().await {
+            tap.observe(&event, placement);
+        }
+        tap
+    };
+    let (failure, tap) = tokio::join!(build, tap);
+    match failure {
+        None => Ok(()),
+        Some(failure) => Err(tap.failure(placement, failure)),
+    }
 }
 
 #[cfg(test)]
