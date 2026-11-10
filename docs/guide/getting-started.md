@@ -4,7 +4,7 @@ description: "Install Minimal and run Claude Code in an isolated box, in six com
 
 # Quickstart
 
-Run a coding agent in an isolated box on your own machine. The agent sees your project and the tools you declare, and nothing else from your host.
+Run a coding agent in an isolated [box](../reference/glossary.md#box) on your own machine. The agent sees your project and the tools you declare, and nothing else from your host.
 
 ## 1. Install
 
@@ -21,7 +21,7 @@ cd my-project
 min init
 ```
 
-`min init` detects your stack and writes a `minimal.toml`. It asks before it writes.
+`min init` detects your [stack](../reference/glossary.md#stack) and writes a [`minimal.toml`](../reference/glossary.md#minimaltoml). It asks before it writes.
 
 ## 3. Add the agent
 
@@ -29,15 +29,15 @@ min init
 min add --session claude
 ```
 
-The `claude` package is Claude Code plus the Minimal plugin for it.
+This adds the `claude` [package](../reference/glossary.md#package) to the project's sessions. It holds Claude Code and its Minimal plugin.
 
 ## 4. Start a box
 
 ```shell
-min session activate --attach .
+min session start
 ```
 
-Minimal fetches the packages, copies your project into a new box and opens a shell inside it.
+Minimal creates a box of the [`session`](../reference/glossary.md#session) type from your project and attaches your terminal to its shell. The packages from step 3 are on its `PATH`.
 
 ## 5. Run the agent
 
@@ -45,14 +45,14 @@ Minimal fetches the packages, copies your project into a new box and opens a she
 claude
 ```
 
-Type `exit` to leave the shell. The box keeps running.
+Type `exit` to leave the shell.
 
 ## 6. Come back, or clean up
 
 ```shell
-min ls                       # list your boxes
-min session attach           # open a shell in this project's box again
-min session destroy <name>   # remove a box
+min box list            # list this project's boxes and their state
+min box attach          # attach to this project's box again
+min box rm <box>        # remove a box (add --force if it is running)
 ```
 
 ## Next
