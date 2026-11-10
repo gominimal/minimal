@@ -4490,9 +4490,22 @@ mod tests {
             crate::control::PublishDecision::FailStart { port, .. } if port == pin
         ));
         // Once the holder exits, the watcher's check passes and takes the
-        // reservation.
+        // reservation. Another test in the process can take the released
+        // port before the check probes it: the check then correctly answers
+        // Skip, so release a fresh pin and ask again.
         drop(held);
-        assert!(super::proxy_reclaim_check(ports.path().to_path_buf())(pin).is_some());
+        let mut reclaimed = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            if let Some(reservation) = super::proxy_reclaim_check(ports.path().to_path_buf())(free)
+            {
+                reclaimed = Some(reservation);
+                break;
+            }
+        }
+        assert!(reclaimed.is_some(), "the watcher takes a freed pin");
 
         let reserved = crate::net::answerer::DEFAULT_ANSWERER_PORT;
         let err = super::configured_node_port(ports.path(), reserved)
