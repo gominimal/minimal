@@ -13049,15 +13049,18 @@ async fn show_network_daemon() -> (
     (state, global, server)
 }
 
+/// The create request of [`planned_session_request`].
+type PlannedRequest = minimald_rpc::CreateSessionRequest;
+
 /// The create request that the activation of a planned session start
 /// sends for the project in `root`: the network mode, the ingress and the
 /// effective egress, built the way `activate_box` builds them, and the
-/// spec stamped on it.
+/// spec stamped on it. The request is built with its constructor.
 fn planned_session_request(
     args: &ActivateArgs,
     options: &ActivationOptions,
     root: &camino::Utf8Path,
-) -> minimald_rpc::CreateSessionRequest {
+) -> PlannedRequest {
     let port_mappings: Vec<boxes::PortMapping> = args
         .ingress
         .iter()
