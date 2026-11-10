@@ -1441,16 +1441,24 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // placement unit answers asynchronously, so two reads could disagree.
     let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
     let in_leaf = minimald::net::classifier::daemon_in_leaf(tree_root);
+    // A membership read that failed for another reason than a missing leaf
+    // proves neither placement nor absence: it gets its own line, and never
+    // the absence line below.
+    let membership_unknown = matches!(
+        &in_leaf,
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound
+    );
     if !guest
         && let Err(e) = &in_leaf
-        && e.kind() != std::io::ErrorKind::NotFound
+        && membership_unknown
     {
         tracing::warn!(
             error = %e,
             leaf = %daemon_leaf.display(),
-            "reading this daemon's classifier leaf membership failed, so it \
-             counts as unplaced: its host-address boxes are said to run \
-             unenforced, and a placed deny-all box is still refused"
+            "reading this daemon's classifier leaf membership failed, so whether \
+             it stands in its leaf is unknown. It counts as unplaced: a probe that \
+             cannot read the table is then reported as the daemon's placement, \
+             and a placed deny-all box is still refused"
         );
     }
     let placed = matches!(in_leaf, Ok(true));
@@ -1476,6 +1484,7 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // so; the line is for a daemon outside an installed tree's leaf.
     if !guest
         && unplaced
+        && !membership_unknown
         && (daemon_leaf.is_dir()
             || classifier_decision.cause()
                 == Some(minimald::net::classifier::Cause::DaemonNotPlaced))
