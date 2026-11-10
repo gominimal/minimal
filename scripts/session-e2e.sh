@@ -7995,11 +7995,13 @@ relay_sid="$(printf '%s\n' "$relay_sid" | tail -n1 | tr -d '\r')"
 # to show the new size before it prints. Each poll prints a dot: the helper
 # sends the detach chord once the pty has been quiet for two seconds, so a
 # silent wait would be cut short at about two seconds and the line would
-# never print. What is asserted is unchanged: the size the session reports
-# is the resized one.
+# never print. The helper also waits for the shell's RELAY_READY before it
+# counts the stream as quiet: under load the sandbox can take longer than
+# two seconds to mint, and the chord then left before a line ran. What is
+# asserted is unchanged: the size the session reports is the resized one.
 # shellcheck disable=SC2016 # `$(stty size)` must run in the SESSION's shell.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-relay_out="$(E2E_PTY_COMMANDS='echo RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_READY' E2E_PTY_READY='RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
   E2E_PTY_AFTER='for _ in $(seq 1 40); do s=$(stty size); [ "$s" = "41 117" ] && break; printf .; sleep 0.25; done; printf "\nRELAY_SIZE[%s]\n" "$s"' E2E_PTY_DETACH=1 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-resize.err")" || {
