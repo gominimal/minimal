@@ -813,6 +813,8 @@ pub(crate) fn plan_start(
                 path: None,
                 detach: true,
                 args: Vec::new(),
+                network: None,
+                egress: crate::EgressArgs::default(),
             },
             entry: entry.name,
         }),

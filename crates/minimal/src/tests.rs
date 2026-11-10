@@ -2483,6 +2483,8 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
             path: None,
             detach: true,
             args: vec![],
+            network: None,
+            egress: crate::EgressArgs::default(),
         },
         "the start takes the detached run, which closes the box's stdin"
     );
