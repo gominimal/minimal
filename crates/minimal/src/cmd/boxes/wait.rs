@@ -22,6 +22,9 @@ pub struct BoxTimedOut {
     code: &'static str,
     message: String,
     hint: String,
+    /// The command already printed this fact on stderr, so a human-mode
+    /// run prints no `error:` line for it.
+    printed: bool,
 }
 
 impl BoxTimedOut {
@@ -36,6 +39,7 @@ impl BoxTimedOut {
             code: "timeout",
             message: format!("{target} ran for longer than its timeout and was stopped."),
             hint: String::new(),
+            printed: false,
         }
     }
 
@@ -51,6 +55,7 @@ impl BoxTimedOut {
             hint: format!(
                 "Run `min box wait {id}` to wait again, or `min box stop {id}` to stop it."
             ),
+            printed: false,
         }
     }
 
@@ -59,6 +64,22 @@ impl BoxTimedOut {
     #[must_use]
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    /// Marks that the command already printed this fact on stderr, as a
+    /// run prints its timeout line. A human-mode run then ends with 124
+    /// and prints nothing more. A machine-mode run still answers the
+    /// error object.
+    #[must_use]
+    pub fn already_printed(mut self) -> Self {
+        self.printed = true;
+        self
+    }
+
+    /// Whether the command already printed this fact on stderr.
+    #[must_use]
+    pub fn is_printed(&self) -> bool {
+        self.printed
     }
 
     /// The hint of the machine-mode error object.

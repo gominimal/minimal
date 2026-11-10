@@ -1430,17 +1430,18 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
         eprintln!("Running task {} in box {session_name}...", args.entry);
         // What the run did with its box: only a box it removed gives up
         // its name hold and its egress ([`release_task_box_holds`]).
-        let (outcome, end) = async {
+        let (outcome, end, timed_out) = async {
             match open_task_box_run(&mut client, id, &args.entry, &task_cwd, &task_env).await {
                 Ok(channel) => {
                     let outcome = bridge_exec(channel).await;
                     run_guard.yield_to_handler().await;
                     let mut end = TaskBoxEnd::Keep;
+                    let mut timed_out = false;
                     if let Ok(exit) = outcome {
                         end = task_box_end(exit, || entrypoint_started(&mut client, id)).await;
                         match end {
                             TaskBoxEnd::Keep => {
-                                let timed_out =
+                                timed_out =
                                     ended_at_timeout(exit, || record_state(&mut client, id)).await;
                                 let why =
                                     timed_out.then(|| timeout_line(&args.entry, timeout_secs));
@@ -1458,13 +1459,13 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
                             }
                         }
                     }
-                    (outcome, end)
+                    (outcome, end, timed_out)
                 }
                 // The exec never started, so no entrypoint ran: the box is
                 // removed, as the client always removed it.
                 Err(e) => {
                     crate::best_effort_destroy(&mut client, id, false).await;
-                    (Err(e), TaskBoxEnd::Remove)
+                    (Err(e), TaskBoxEnd::Remove, false)
                 }
             }
         }
@@ -1490,7 +1491,7 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
         )
         .await;
         drop(run_guard);
-        return exit_outcome(outcome?);
+        return run_outcome(outcome?, timed_out, &args.entry);
     }
 
     eprintln!("Running task {} in session {session_name}...", args.entry);
@@ -1606,6 +1607,20 @@ where
     use boxes::core::record::{ExitEnding, RecordState};
     exit == Some(TIMEOUT_EXIT_CODE)
         && state().await == Some(RecordState::Exited(ExitEnding::Timeout))
+}
+
+/// How a task box run ends, from the exit code the run bridged and whether
+/// [`ended_at_timeout`] found that the box's own timeout ended it. A box
+/// timeout is [`crate::BoxTimedOut`], so `min task run` and `min box run`
+/// exit 124 and a machine-mode run answers `code = "timeout"` (BCLI-014).
+/// The run already printed [`timeout_line`], so a human-mode run prints
+/// nothing more for it. Any other exit, a 124 from the entrypoint itself
+/// included, is [`exit_outcome`].
+pub fn run_outcome(exit: Option<u32>, timed_out: bool, entry: &str) -> Result<(), anyhow::Error> {
+    if timed_out {
+        return Err(crate::BoxTimedOut::ended(entry).already_printed().into());
+    }
+    exit_outcome(exit)
 }
 
 /// The state of the box's record, or `None` when the daemon cannot read it.

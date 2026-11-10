@@ -11491,8 +11491,39 @@ async fn box_wait_timeout_flag_returns_124_box_runs_on() {
 // BCLI-014: a box whose `exited` reason is `timeout` gives the `timeout`
 // error with exit 124, whatever exit code its record keeps. `min box wait`
 // answers it so, and the run verbs share the same error.
-#[test]
-fn run_verbs_and_wait_timeout_return_124_with_code_timeout() {
+#[tokio::test]
+async fn run_verbs_and_wait_timeout_return_124_with_code_timeout() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    // `min task run` and `min box run`: a 124 on a record that its timeout
+    // ended is the `timeout` error, and the run prints its line only once.
+    let timed_out = crate::task::ended_at_timeout(Some(124), || {
+        std::future::ready(Some(RecordState::Exited(ExitEnding::Timeout)))
+    })
+    .await;
+    let e = crate::task::run_outcome(Some(124), timed_out, "web").expect_err("a timeout fails");
+    let run_timed_out = e
+        .downcast_ref::<BoxTimedOut>()
+        .expect("a box timeout is BoxTimedOut");
+    assert_eq!(run_timed_out.code(), "timeout");
+    assert!(
+        run_timed_out.is_printed(),
+        "the run printed its timeout line"
+    );
+    // A 124 from the entrypoint itself, with reason `exit`, stays its code.
+    let timed_out = crate::task::ended_at_timeout(Some(124), || {
+        std::future::ready(Some(RecordState::Exited(ExitEnding::Exit {
+            exit_code: 124,
+        })))
+    })
+    .await;
+    let e = crate::task::run_outcome(Some(124), timed_out, "web").expect_err("124 fails");
+    assert!(e.downcast_ref::<BoxTimedOut>().is_none(), "{e:?}");
+    assert_eq!(
+        e.downcast_ref::<crate::task::TaskExit>(),
+        Some(&crate::task::TaskExit(124))
+    );
+
     for entry in [
         waited_entry("exited", Some("timeout"), Some(124), None),
         waited_entry("exited", Some("timeout"), None, Some(9)),

@@ -221,6 +221,16 @@ fn answer_failure(
     if quiet_on_closed_pipe && is_broken_pipe(e) {
         return ExitCode::from(141);
     }
+    // A run that its box's timeout ended already printed why on stderr
+    // (BCLI-014): it relays 124 with no second line for the same fact.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxTimedOut>()
+        && timed_out.is_printed()
+    {
+        if let Some(hint) = alias_hint {
+            let _ = writeln!(stderr, "{hint}");
+        }
+        return ExitCode::from(minimal::BoxTimedOut::EXIT_CODE);
+    }
     let _ = writeln!(stderr, "error: {e:#}");
     if let Some(hint) = alias_hint {
         let _ = writeln!(stderr, "{hint}");
@@ -1217,6 +1227,45 @@ mod tests {
             let text = String::from_utf8(stderr).unwrap();
             assert_eq!(text, format!("error: {timed_out}\n"));
         }
+
+        // `min task run` and `min box run`: a box that its timeout ended
+        // exits 124 and answers `timeout`. The run printed its own timeout
+        // line, so human mode adds nothing.
+        let e = minimal::task::run_outcome(Some(124), true, "web").unwrap_err();
+        assert_eq!(failure_exit_code(&e), 124);
+        match machine_mode_answer(&e) {
+            MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "timeout"),
+            MachineModeAnswer::Quiet => panic!("a timeout is an error object"),
+        }
+        let mut stderr = Vec::new();
+        assert_eq!(
+            answer_failure(&e, true, false, None, &mut stderr),
+            ExitCode::from(124)
+        );
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains(r#""code":"timeout""#)
+        );
+        let mut stderr = Vec::new();
+        assert_eq!(
+            answer_failure(&e, false, false, None, &mut stderr),
+            ExitCode::from(124)
+        );
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        // An entrypoint that exits 124 by itself relays its code, with no
+        // error object.
+        let e = minimal::task::run_outcome(Some(124), false, "web").unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<minimal::task::TaskExit>(),
+            Some(&minimal::task::TaskExit(124))
+        );
+        let mut stderr = Vec::new();
+        assert_eq!(
+            answer_failure(&e, true, false, None, &mut stderr),
+            ExitCode::from(124)
+        );
+        assert!(stderr.is_empty());
     }
 
     /// BCLI-018: `min init` ends with 2 when it gets more than one type
