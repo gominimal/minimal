@@ -149,10 +149,11 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
 
 /// The host's classifier fact a create answers over (NET-079). Another
 /// mode's box reads the node fact as it stands. A host-address create reads
-/// it too, unless the stored fact says the probe could not read the table:
-/// that is the one cause a later read can clear without anything on the
-/// host changing (a daemon not yet placed in its leaf at start reads so),
-/// so the create re-reads the host rather than answer from a stale read.
+/// it too, unless the stored fact says the probe could not read the table
+/// or the daemon was not in its leaf: those are the causes a later read can
+/// clear without anything on the host changing (the placement unit places a
+/// daemon whose start outran it), so the create re-reads the host rather
+/// than answer from a stale read.
 /// A re-read that does not run keeps the stored fact. A host-address create
 /// also re-reads when the daemon stands in another cgroup than the one the
 /// fact was read in (gominimal/inbox#1054: `min finalize-install` placed a
@@ -189,7 +190,13 @@ async fn create_host_ip_fact(
         return fact;
     }
     let stored = crate::box_runtime::host_ip_enforcement_fact();
-    if stored.cause != Some(crate::net::classifier::Cause::ProbeUnreadable) {
+    if !matches!(
+        stored.cause,
+        Some(
+            crate::net::classifier::Cause::ProbeUnreadable
+                | crate::net::classifier::Cause::DaemonNotPlaced
+        )
+    ) {
         tracing::info!(
             session_name,
             reread = false,

@@ -2366,6 +2366,22 @@ fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
         "the native ProbeUnreadable refusal names the unreadable effect it \
          refused on: {unreadable}"
     );
+    // A probe cause re-spelled DaemonNotPlaced still refuses a box that was
+    // placed after all: the re-spelling never turns a refusal into a run.
+    let unplaced_daemon = refused_unenforced_host_address_box(
+        false,
+        NetworkMode::HostNet,
+        Verdict::Deny,
+        true,
+        Some(&Decision::undecidable(Cause::DaemonNotPlaced)),
+    )
+    .expect("a placed deny-all box over an unplaced daemon's cause is refused");
+    assert!(
+        unplaced_daemon.contains("not in its classifier leaf")
+            && unplaced_daemon.contains(&sandbox::classifier::install_hint()),
+        "the DaemonNotPlaced refusal names the daemon's placement and its \
+         command: {unplaced_daemon}"
+    );
     // The rest of the native matrix keeps NET-079's advisory posture: the
     // causes this host can still fix from itself, the unplaced box (nothing
     // decided-looking to refuse), and the decided host — all run, enforced
@@ -2388,6 +2404,7 @@ fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
         (Cause::ProbeUnreadable, false, false, "the unplaced box"),
         (Cause::StepNotInstalled, false, false, "the unplaced box"),
         (Cause::CannotConfine, false, false, "the unplaced box"),
+        (Cause::DaemonNotPlaced, false, false, "the unplaced box"),
         (Cause::GuestTableNotLoaded, true, true, "the decided host"),
     ] {
         let decision = if decided {

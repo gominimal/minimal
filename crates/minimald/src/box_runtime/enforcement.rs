@@ -230,8 +230,9 @@ pub(crate) fn displayed_host_ip_enforcement(
 }
 
 /// Whether a fact's cause says the step's tree is there to place a leaf in:
-/// the causes that imply a box nothing places are the step's absence and the
-/// mount that cannot confine, and every other cause — the two probe causes,
+/// the causes that imply a box nothing places are the step's absence, the
+/// mount that cannot confine and the daemon outside its own leaf, and every
+/// other cause — the two probe causes,
 /// the guest's unloaded table — arises only over a tree the step already
 /// installed (the marker and the delegated subtrees gate the probe), which is
 /// also where a decided fact's box goes. `None` — a decided fact, or the
@@ -247,6 +248,7 @@ pub(crate) fn fact_places_a_leaf(cause: Option<crate::net::classifier::Cause>) -
         Some(
             crate::net::classifier::Cause::StepNotInstalled
                 | crate::net::classifier::Cause::CannotConfine
+                | crate::net::classifier::Cause::DaemonNotPlaced
         )
     )
 }
@@ -374,9 +376,13 @@ pub(crate) async fn re_read_classifier_fact(
 ) -> std::io::Result<(Option<String>, crate::net::classifier::Decision)> {
     crate::traced::spawn_blocking(move || {
         let mountinfo = launch_mountinfo(mountinfo_knob);
+        // An unplaced native daemon places no box and so refuses none: its
+        // unreadable probe is re-spelled as its placement, so the fact and the
+        // advisory say the box runs unenforced (gominimal/minimal#3067).
         let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
             classifier_reading(&root, guest)
-        });
+        })
+        .over_daemon_placement(guest, crate::net::classifier::daemon_unplaced(&root));
         set_host_ip_enforcement_fact(&decision);
         (mountinfo, decision)
     })
@@ -845,6 +851,18 @@ pub(super) fn refused_unenforced_host_address_box(
                  daemon's log carries the probe's own failure)"
                     .to_string(),
             ),
+            // A daemon outside its own leaf places no box, so this cause
+            // should never meet a placed one. If it does, the probe cause
+            // it was re-spelled from still stands, and the box is refused:
+            // the re-spelling may change an unplaced box's words, never let
+            // a placed deny-all box run where it was refused before.
+            Some(crate::net::classifier::Cause::DaemonNotPlaced) => Some(format!(
+                "this daemon is not in its classifier leaf, yet it placed a \
+                 deny-all box over a table it could not prove in force, so the \
+                 box's connections might not be refused: the box was refused \
+                 rather than run unenforced (place the daemon: {install})",
+                install = sandbox::classifier::install_hint()
+            )),
             // Everything else natively is the state this host can still fix
             // from itself — the step not installed, a tree that cannot
             // confine — or a host that decides, whose refusal no gate makes.
