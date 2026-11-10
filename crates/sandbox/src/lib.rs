@@ -2369,9 +2369,9 @@ impl<C: Channel> Sandbox<C> {
         // a bind made by path. The command's pre-exec closure binds it through
         // handles instead (inbox#1152; see [`session_bind`]), after every
         // mount here; one from outside the trees is bound here onto a stage
-        // the closure moves it from. No mount hakoniwa makes lies in a tree
-        // any more, so the order of the closure's binds among themselves is
-        // the whole of the layering under `/home` and `/workbench`.
+        // the closure moves it from. hakoniwa makes no mount in a tree, so
+        // the order of the closure's binds among themselves is the whole of
+        // the layering under `/home` and `/workbench`.
         let trees = match &self.config.wd {
             WdSetup::Session {
                 home,
@@ -2392,7 +2392,8 @@ impl<C: Channel> Sandbox<C> {
         let mounts = session_bind::plan(&trees, self.config.wd.fs_mappings(), locked_ms_flags)
             .map_err(|path| {
                 Error::Execution(ExecutionError::MountError {
-                    msg: "a patch from a session tree must land in the home or workbench",
+                    msg: "a patch read from the session's home or workbench must land in the \
+                          home or workbench. Put the entry's path under one of them",
                     path,
                 })
             })?;

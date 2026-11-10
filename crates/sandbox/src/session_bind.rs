@@ -20,14 +20,14 @@
 //! 1. Every source is opened first, before any of these binds is made. A
 //!    source in a tree is opened once, `O_PATH`, with `openat2(2)` beneath the
 //!    tree's mount, `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`: a relative link
-//!    that stays in the tree is followed wherever it points from, as it was
-//!    before (a stow link `~/.config/nvim -> ../dotfiles/nvim/.config/nvim`
+//!    that stays in the tree is followed wherever it points from (a stow
+//!    link `~/.config/nvim -> ../dotfiles/nvim/.config/nvim`
 //!    climbs above its own directory and stays in the home); `..` or a link
 //!    out of the tree, and every absolute link, is refused (`EXDEV`), as is a
 //!    `/proc` magic link (`ELOOP`). A refusal is then walked again by
 //!    [`walk`] to say which link or `..` it was and what to do ([`Refused`]).
 //!    A source outside the trees (a host path whose mount point is under
-//!    `/home`) is not the box's: hakoniwa binds it by path, as before, but
+//!    `/home`) is not the box's: hakoniwa binds it by path, but
 //!    onto a stage, [`STAGE`]`/<n>` on a tmpfs of the box's own that nothing
 //!    of the box's reaches before it runs, and the closure opens the stage.
 //! 2. Then, in target order, each mount point is resolved beneath its tree
@@ -235,46 +235,46 @@ impl std::fmt::Display for Refused {
         match &self.why {
             Why::Climbs => write!(
                 f,
-                "the patch path `{path}` climbs out of the session's {tree} through `..`; \
-                 name the patch by a path that stays in the {tree}"
+                "The patch path `{path}` climbs out of the session's {tree} through `..`. \
+                 Name the patch by a path that stays in the {tree}."
             ),
             Why::LinkClimbs { link, to } => write!(
                 f,
-                "{} is a symbolic link to `{}`, which climbs out of the session's {tree}; a \
-                 patch is reached only through links that stay in the {tree}: point that link \
-                 at a place in the {tree}, or remove it",
+                "{} is a symbolic link to `{}`. That link climbs out of the session's {tree}. \
+                 A patch is reached only through links that stay in the {tree}. Point that \
+                 link at a place in the {tree}, or remove it.",
                 self.the_link(link),
                 to.display()
             ),
             Why::Absolute { link, to } => write!(
                 f,
-                "{} is a symbolic link to the absolute path `{}`, and a patch path follows only \
-                 relative links, also when an absolute one names a place in the {tree}: \
-                 replace it with a relative link that stays in the {tree}, or remove it",
+                "{} is a symbolic link to the absolute path `{}`. A patch path follows only \
+                 relative links, also when an absolute one names a place in the {tree}. \
+                 Replace it with a relative link that stays in the {tree}, or remove it.",
                 self.the_link(link),
                 to.display()
             ),
             Why::Loop => write!(
                 f,
-                "the patch path `{path}` goes through more than {MAX_LINKS} symbolic links, so \
-                 they loop; remove the loop among the links on it"
+                "The patch path `{path}` goes through more than {MAX_LINKS} symbolic links, \
+                 so they loop. Remove the loop among the links on it."
             ),
             Why::NotDir { at } => write!(
                 f,
-                "`{}`, on the patch path `{path}`, is not a directory, so the path cannot go on \
-                 after it; name the patch by a path through directories",
+                "`{}`, on the patch path `{path}`, is not a directory, so the path cannot go \
+                 on after it. Name the patch by a path through directories.",
                 self.show(at)
             ),
             Why::Kernel(libc::ELOOP) => write!(
                 f,
-                "the patch path `{path}` goes through a /proc magic link or a loop of symbolic \
-                 links, which a patch never follows; remove that link"
+                "The patch path `{path}` goes through a /proc magic link or a loop of \
+                 symbolic links, which a patch never follows. Remove that link."
             ),
             Why::Kernel(_) => write!(
                 f,
-                "the patch path `{path}` leads out of the session's {tree} through `..` or a \
-                 symbolic link that is absolute or leaves it; a patch is reached only through \
-                 relative links that stay in the {tree}: replace or remove that link"
+                "The patch path `{path}` leads out of the session's {tree} through `..` or a \
+                 symbolic link that is absolute or leaves it. A patch is reached only through \
+                 relative links that stay in the {tree}. Replace or remove that link."
             ),
         }
     }
@@ -374,7 +374,7 @@ fn any_staged(binds: &[SessionBind]) -> bool {
 
 /// Splits `mappings` between hakoniwa and the closure. A mapping whose mount
 /// point is in one of `trees` is the closure's, whatever its source; any
-/// other is hakoniwa's, as before. `locked_of_host` reads the locked flags of a
+/// other is hakoniwa's. `locked_of_host` reads the locked flags of a
 /// host path. A mapping from a tree whose mount point is outside both is
 /// refused with its host path: its mount point is in the root the closure
 /// cannot write, and a bind by path would read the box's names (no session
@@ -436,7 +436,9 @@ pub(crate) fn plan<'a>(
 
 /// The tree `host` is in, with its path relative to the tree: the more
 /// specific tree when one is nested in the other, as `mctx` retargets it.
-fn in_tree<'t>(trees: &'t [Tree], host: &Path) -> Option<(&'t Tree, PathBuf)> {
+/// The daemon's create of a mapped path reads the same answer
+/// (`Config::session_tree_of`), so the two cannot drift.
+pub(crate) fn in_tree<'t>(trees: &'t [Tree], host: &Path) -> Option<(&'t Tree, PathBuf)> {
     trees
         .iter()
         .filter_map(|t| {
@@ -455,15 +457,6 @@ fn target_in_tree<'t>(trees: &'t [Tree], target: &str) -> Option<(&'t Tree, Path
     })
 }
 
-/// The host directory of `roots` that `host` is in, with its path relative
-/// to it: the longest, when one is nested in the other.
-pub(crate) fn within<'p>(roots: &[&'p Path], host: &Path) -> Option<(&'p Path, PathBuf)> {
-    roots
-        .iter()
-        .filter_map(|r| Some((*r, host.strip_prefix(r).ok()?.to_path_buf())))
-        .max_by_key(|(r, _)| r.as_os_str().len())
-}
-
 impl SessionBind {
     /// What the closure was doing when this bind failed in `step`, for
     /// `exit_child`'s `<what> failed: <err>` line. A refused path is the
@@ -475,7 +468,7 @@ impl SessionBind {
                 format!("reading the patch for `{target}` from the session's {name}")
             }
             (Step::Source, Source::Staged { .. }) => {
-                format!("opening the stage of the patch for `{target}`")
+                format!("reading the patch for `{target}` from outside the session")
             }
             (Step::MountPoint, Source::Tree { .. }) => format!("placing the patch at `{target}`"),
             (Step::MountPoint, Source::Staged { .. }) => {
@@ -1345,7 +1338,7 @@ mod tests {
         );
         assert_eq!(
             staged.failure(Step::Source),
-            "opening the stage of the patch for `/home/x811`"
+            "reading the patch for `/home/x811` from outside the session"
         );
         assert_eq!(
             staged.failure(Step::MountPoint),
@@ -1384,7 +1377,9 @@ mod tests {
         );
         assert!(
             text.starts_with("`~/.gitconfig` is a symbolic link to the absolute path")
-                && text.contains("replace it with a relative link that stays in the home")
+                && text.contains(
+                    "Replace it with a relative link that stays in the home, or remove it."
+                )
                 && !text.contains("outside"),
             "an absolute link into the home is refused as absolute, not as outside: {text}"
         );
@@ -1400,7 +1395,7 @@ mod tests {
         assert!(
             text.starts_with("`~/x/up`, on the patch path `~/x/up/token`, is a symbolic link")
                 && text.contains("climbs out of the session's home")
-                && text.contains("point that link at a place in the home, or remove it"),
+                && text.contains("Point that link at a place in the home, or remove it."),
             "{text}"
         );
 
