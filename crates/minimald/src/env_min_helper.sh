@@ -128,9 +128,14 @@ __min_rpc() {
     # instead of the channel actor's own root (scenarios 717b, 770). Only a
     # value in the 55-character W3C form crosses: anything in the box can
     # set TRACEPARENT, and a `%` in it would shift the daemon's split of the
-    # line.
+    # line. A box whose request opted out of telemetry has MINIMAL_OTEL=off
+    # instead (TEL-045): send the opt-out ahead of the request, and never a
+    # TRACEPARENT, so the daemon records nothing for it and a task it runs
+    # is opted out too.
     local prefix=""
-    if [[ "${TRACEPARENT:-}" =~ ^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$ ]]; then
+    if [[ "${MINIMAL_OTEL:-}" == "off" ]]; then
+        prefix="otel%off%"
+    elif [[ "${TRACEPARENT:-}" =~ ^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$ ]]; then
         prefix="traceparent%${TRACEPARENT}%"
     fi
     local request="${prefix}${method}%${data}"

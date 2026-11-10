@@ -280,6 +280,9 @@ pub struct StartEntry {
     pub new: bool,
     /// `--detach`: print the id and return, never attach.
     pub detach: bool,
+    /// The override flags: `--network`, `--ingress`, the egress flags and
+    /// `--loadout` (BCLI-024, BCLI-073).
+    pub overrides: crate::StartOverrideArgs,
 }
 
 impl From<BoxStartArgs> for StartEntry {
@@ -290,6 +293,7 @@ impl From<BoxStartArgs> for StartEntry {
             name: args.name,
             new: args.new,
             detach: args.detach,
+            overrides: args.overrides,
         }
     }
 }
@@ -302,6 +306,7 @@ impl From<SessionStartArgs> for StartEntry {
             name: args.name,
             new: args.new,
             detach: args.detach,
+            overrides: args.overrides,
         }
     }
 }
@@ -457,6 +462,13 @@ pub enum StartEntryRefusal {
     /// box name for `RunEntry`. Remove this refusal when `RunEntry` takes a
     /// name.
     NameUnsupported { entry: String },
+    /// `--ingress` or `--loadout` for a task entry: its box runs through the
+    /// run path, which takes neither flag. `flag` is the flag as typed.
+    /// This refusal is an interim, like [`Self::NameUnsupported`]. Remove
+    /// it for a flag when `RunEntry` takes that flag
+    /// (<https://github.com/gominimal/minimal/issues/3163> for `--ingress`,
+    /// <https://github.com/gominimal/minimal/issues/3237> for `--loadout`).
+    FlagUnsupported { entry: String, flag: &'static str },
     /// A task entry declared as `[boxes.<name>]` with `type = "task"`: the
     /// run path finds its task in `[tasks]` only. This refusal is an
     /// interim. <https://github.com/gominimal/minimal/issues/3213> tracks
@@ -494,6 +506,7 @@ impl StartEntryRefusal {
             Self::Several { .. }
             | Self::DefaultBlocked { .. }
             | Self::NameUnsupported { .. }
+            | Self::FlagUnsupported { .. }
             | Self::TaskNotInTasks { .. }
             | Self::UnsupportedType { .. }
             | Self::NamedSessionUnsupported { .. } => 2,
@@ -585,6 +598,12 @@ impl std::fmt::Display for StartEntryRefusal {
                 f,
                 "Cannot start {entry} with --name. A box from a task entry gets a \
                  generated name. Run min box start {entry} without --name.",
+                entry = printable(entry),
+            ),
+            Self::FlagUnsupported { entry, flag } => write!(
+                f,
+                "Cannot start {entry} with {flag}. A box from a task entry does not \
+                 take {flag}. Run min box start {entry} without {flag}.",
                 entry = printable(entry),
             ),
             Self::TaskNotInTasks { entry } => write!(
@@ -777,6 +796,16 @@ pub(crate) fn plan_start(
             let mut args = ActivateArgs::unflagged();
             args.name.clone_from(&start.name);
             args.attach = !start.detach;
+            // BCLI-024, BCLI-073: the override flags reach the activation's
+            // command-line layer. Each flag changes only its own key, so a
+            // flag that is not given leaves the activation's value in place.
+            let overrides = &start.overrides;
+            if let Some(network) = overrides.network {
+                args.network = network;
+            }
+            args.ingress.clone_from(&overrides.ingress);
+            args.egress.clone_from(&overrides.egress);
+            args.loadout.clone_from(&overrides.loadout);
             Ok(StartPlan::Session {
                 options: ActivationOptions {
                     offer_scaffold: false,
@@ -806,6 +835,24 @@ pub(crate) fn plan_start(
         Some(boxes::TASK_BOX_TYPE) if start.name.is_some() => {
             Err(StartEntryRefusal::NameUnsupported { entry: entry.name }.into())
         }
+        // The run path takes `--network` and the egress flags, as `min box
+        // run` does, but neither `--ingress` (#3163) nor `--loadout`
+        // (#3237). The start refuses those two rather than drop them.
+        // Remove the `--loadout` refusal when `RunEntry` takes the flag.
+        Some(boxes::TASK_BOX_TYPE) if !start.overrides.ingress.is_empty() => {
+            Err(StartEntryRefusal::FlagUnsupported {
+                entry: entry.name,
+                flag: "--ingress",
+            }
+            .into())
+        }
+        Some(boxes::TASK_BOX_TYPE) if !start.overrides.loadout.is_empty() => {
+            Err(StartEntryRefusal::FlagUnsupported {
+                entry: entry.name,
+                flag: "--loadout",
+            }
+            .into())
+        }
         Some(boxes::TASK_BOX_TYPE) => Ok(StartPlan::Detached {
             run: crate::task::RunEntry {
                 verb: crate::task::RunVerb::Box,
@@ -813,8 +860,8 @@ pub(crate) fn plan_start(
                 path: None,
                 detach: true,
                 args: Vec::new(),
-                network: None,
-                egress: crate::EgressArgs::default(),
+                network: start.overrides.network,
+                egress: start.overrides.egress.clone(),
             },
             entry: entry.name,
         }),
@@ -902,6 +949,10 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
         name = ?start.name,
         fresh_instance = start.new,
         detach = start.detach,
+        network = ?start.overrides.network,
+        ingress = ?start.overrides.ingress,
+        egress = ?start.overrides.egress,
+        loadouts = ?start.overrides.loadout,
         "starting a box from the entry"
     );
     match plan {
@@ -1136,7 +1187,7 @@ pub(crate) struct ProjectEgress {
     pub(crate) hints: Vec<String>,
     /// The `network.mode` of the expanded entry, when a layer sets one.
     /// `min task run` and `min box run` read it. `min session activate`
-    /// does not.
+    /// does not yet: <https://github.com/gominimal/minimal/issues/3238>.
     pub(crate) mode: Option<boxes::NetworkMode>,
     /// The table whose `network` the expanded entry holds, as the file
     /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
@@ -2951,6 +3002,58 @@ pub(crate) fn subnet_notices(args: &crate::EgressArgs) -> Vec<String> {
     lines
 }
 
+/// The `--ingress` mappings and the egress flags of an activation, parsed
+/// (BCLI-024). Each flag overrides only its own key of the entry's
+/// `[network]` table.
+///
+/// # Errors
+///
+/// Fails when an `--ingress` mapping or an egress flag does not parse.
+pub(crate) fn flag_network_overrides(
+    args: &ActivateArgs,
+) -> Result<(Vec<boxes::PortMapping>, Option<boxes::EgressPolicy>), anyhow::Error> {
+    let mut port_mappings = Vec::with_capacity(args.ingress.len());
+    for spec in &args.ingress {
+        port_mappings.push(parse_ingress_mapping(spec)?);
+    }
+    let egress = flag_egress(&args.egress)?;
+    Ok((port_mappings, egress))
+}
+
+/// The egress and ingress half of an activation's create policy: the
+/// effective `egress` and the parsed `--ingress` mappings (BCLI-024). The
+/// other fields keep their defaults, for the caller to set.
+///
+/// NET-043: any dynamic declaration makes the ingress policy too. A stance
+/// alone (with no range, no static mapping) still names how dynamic
+/// requests are decided. Nothing set keeps `None`: the deny-all default,
+/// which the policy module evaluates the same as an explicit deny.
+pub(crate) fn network_override_policy(
+    args: &ActivateArgs,
+    port_mappings: Vec<boxes::PortMapping>,
+    egress: Option<boxes::EgressPolicy>,
+) -> boxes::BoxPolicy {
+    let has_ingress =
+        !port_mappings.is_empty() || args.dynamic_ingress.is_some() || args.dynamic_range.is_some();
+    boxes::BoxPolicy {
+        egress,
+        ingress: has_ingress.then_some(boxes::IngressPolicy {
+            port_mappings,
+            dynamic_allowed_range: args.dynamic_range,
+            dynamic_ingress: args.dynamic_ingress,
+        }),
+        ..boxes::BoxPolicy::default()
+    }
+}
+
+/// The loadouts an activation resolves (BCLI-073): each `--loadout` in
+/// place of the client config's `default_loadouts`, or none under
+/// `--no-loadouts`. The stored spec does not record the selected loadouts
+/// yet: <https://github.com/gominimal/minimal/issues/3236>.
+pub(crate) fn start_loadout_selection(args: &ActivateArgs) -> loadouts::LoadoutSelection {
+    loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts)
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -2988,26 +3091,12 @@ pub(crate) async fn activate_box(
             let abs_path =
                 paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-            let mut port_mappings = Vec::with_capacity(args.ingress.len());
-            for spec in &args.ingress {
-                let mapping = parse_ingress_mapping(spec)?;
-                port_mappings.push(mapping);
-            }
-            let egress = flag_egress(&args.egress)?;
+            let (port_mappings, egress) = flag_network_overrides(&args)?;
             Ok::<_, anyhow::Error>((utf8_path, abs_path, port_mappings, egress))
         })
         .await?;
-    // NET-043: any dynamic declaration makes the ingress policy too — a
-    // stance alone (with no range, no static mapping) still names how
-    // dynamic requests are decided, and a range without a stance cannot
-    // reach the create (the flag requires its mode). Nothing set keeps
-    // `None`: the deny-all default, which the policy module evaluates the
-    // same as an explicit deny.
     let (policy, github_grants, store_grants) = ActivationStep::CheckProject
         .run(async {
-            let has_ingress = !port_mappings.is_empty()
-                || args.dynamic_ingress.is_some()
-                || args.dynamic_range.is_some();
             let (project_bep, project_secrets, project_env, project_quic443) =
                 project_bep_and_grants(&utf8_path)?;
             // NET-060: the project's egress, with each field a flag names
@@ -3032,12 +3121,6 @@ pub(crate) async fn activate_box(
                 "the create request's effective egress"
             );
             let mut policy = boxes::BoxPolicy {
-                egress: egress.policy,
-                ingress: has_ingress.then_some(boxes::IngressPolicy {
-                    port_mappings,
-                    dynamic_allowed_range: args.dynamic_range,
-                    dynamic_ingress: args.dynamic_ingress,
-                }),
                 // NET-134: the lane is the box's own declaration, never a default —
                 // a box that did not ask for a credentialed upstream keeps every
                 // frame it sends to the proxy's address refused at the host-side
@@ -3051,6 +3134,7 @@ pub(crate) async fn activate_box(
                 // or not, so a declared `block` reaches the gate of a box with
                 // no credentialed upstream.
                 quic443: project_quic443,
+                ..network_override_policy(&args, port_mappings, egress.policy)
             };
 
             // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
@@ -3175,7 +3259,7 @@ pub(crate) async fn activate_box(
             // sizes the finalize hook budget, so `min session activate`,
             // `min task run`, and the dashboard share it.
             let policy_path = config::user_policy_path(global);
-            let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
+            let selection = start_loadout_selection(&args);
             // The project root the upload will carry, so the project's own
             // hooks are checked and its `[session]` timeouts size the finalize
             // budget; a subdirectory invocation must not look empty.
