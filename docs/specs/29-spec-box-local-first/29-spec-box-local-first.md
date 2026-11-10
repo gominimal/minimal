@@ -377,10 +377,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify: cargo nextest run -p mfile vars_merge_by_name_across_layers
   <!-- decided 2026-11-09: a wholesale replace would let a loadout's `vars`, such as the built-in default loadout's, erase an open entry's own; a loadout that sets a name to the same value adds nothing (docs/reference/loadouts.md, "Composition, conflicts, and policy") -->
 
-- **BOX-183** IF a loadout that BOX-167 applies sets a variable name to a value other than the one that the layers up to and including the entry, or another loadout that BOX-167 applies, set THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the variable and both sources, and name the remedy of adding the variable to the `ignore` list of the user policy.
+- **BOX-183** IF a loadout that BOX-167 applies sets a variable name to a resolved value other than the one that the layers up to and including the entry, or another loadout that BOX-167 applies, resolve it to THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the variable and both sources, and name the remedy of adding the variable to the `ignore` list of the user policy.
   tier:   T0
   verify: cargo nextest run -p mfile conflicting_loadout_var_refused_exit3
-  <!-- decided 2026-11-09: keeps the documented rule, with no override precedence between loadouts and the project (docs/reference/loadouts.md); a different value is a hard conflict, not a silent override; a sealed box applies no loadout (BOX-166), so it has no conflict to check -->
+  <!-- decided 2026-11-09: keeps the documented rule, with no override precedence between loadouts and the project (docs/reference/loadouts.md); a different value is a hard conflict, not a silent override; a sealed box applies no loadout (BOX-166), so it has no conflict to check; the check compares resolved values, so a literal and an `inherit` that resolve to one value are one variable, and a loadout's `inherit` that finds no value on the host is dropped with a warning, so it contributes nothing to compare (docs/reference/loadouts.md) -->
 
 - **BOX-184** IF one layer sets a variable name twice, in `vars_lenient` or in both `vars` and `vars_lenient`, to different values THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the variable and the layer.
   tier:   T0
