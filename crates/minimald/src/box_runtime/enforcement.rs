@@ -378,11 +378,13 @@ pub(crate) async fn re_read_classifier_fact(
         let mountinfo = launch_mountinfo(mountinfo_knob);
         // An unplaced native daemon places no box and so refuses none: its
         // unreadable probe is re-spelled as its placement, so the fact and the
-        // advisory say the box runs unenforced (gominimal/minimal#3067).
+        // advisory say the box runs unenforced (gominimal/minimal#3067). The
+        // placement is read once, before the probe whose reading it re-spells.
+        let unplaced = !guest && crate::net::classifier::daemon_unplaced(&root);
         let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
             classifier_reading(&root, guest)
         })
-        .over_daemon_placement(guest, crate::net::classifier::daemon_unplaced(&root));
+        .over_daemon_placement(guest, unplaced);
         set_host_ip_enforcement_fact(&decision);
         (mountinfo, decision)
     })
