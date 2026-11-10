@@ -993,15 +993,17 @@ mnl() {
   fi
 }
 
-# The port this run's daemon serves its hostname proxy on, read off `min ls`'s
-# HOSTNAME PROXY row (NET-026). The default is 7654 (DEFAULT_EGRESS_PROXY_PORT,
-# crates/minimald/src/net/proxy.rs), but an unpinned daemon whose default is
-# busy — a dev box already running its own minimald — selects a free port
-# instead (NET-025), so every proof that sends a request through the proxy
-# must send it to the port the row names, never to the literal default: a
-# request to :7654 on such a host reaches the other daemon, which knows nothing
-# about this run's boxes and answers 502 — the proxy refusing, not the route
-# failing. Sets PROXY_PORT and PROXY_LS_OUT (the `min ls` output it read).
+# The port this run's daemon serves its hostname proxy on: `hostname_proxy_port`
+# in `min ls --json`, the port the daemon itself reports, with the HOSTNAME
+# PROXY row's text (NET-026) as the fallback only where jq is not available.
+# The default is 7654 (DEFAULT_EGRESS_PROXY_PORT, crates/minimald/src/net/proxy.rs),
+# but an unpinned daemon whose default is busy — a dev box already running its
+# own minimald — selects a free port instead (NET-025), so every proof that
+# sends a request through the proxy must send it to the port the daemon
+# reports, never to the literal default: a request to :7654 on such a host
+# reaches the other daemon, which knows nothing about this run's boxes and
+# answers 502 — the proxy refusing, not the route failing. Sets PROXY_PORT and
+# PROXY_LS_OUT (the `min ls` output it read).
 # Retries for a few seconds first: the whole-lane run restarts the daemon
 # between proofs, and a stop-race must not read as a conflict. Returns 0 with
 # PROXY_PORT set; 1 when the row still says the proxy is not serving (a pinned
@@ -24173,8 +24175,9 @@ proof_min_internal_names_through_proxy() {
   #    (DEFAULT_EGRESS_PROXY_PORT, crates/minimald/src/net/proxy.rs), and a
   #    host that already runs a minimald — a dev box serving its own sessions
   #    — has it taken. This run's daemon does not fight for it: an unpinned
-  #    daemon whose default is busy selects a free port (NET-025) and `min ls`
-  #    reports the one it serves on its HOSTNAME PROXY row (NET-026). Every
+  #    daemon whose default is busy selects a free port (NET-025) and reports
+  #    the one it serves as `hostname_proxy_port` in `min ls --json` (the
+  #    HOSTNAME PROXY row's text, NET-026, is the fallback without jq). Every
   #    probe below goes through THAT port, read here, never through the
   #    literal default: a request sent to :7654 on such a host reaches the
   #    other daemon, which knows nothing about this run's boxes and answers
