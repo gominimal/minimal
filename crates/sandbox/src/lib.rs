@@ -1687,6 +1687,40 @@ fn exec_box_program(
                     closure_report,
                 );
             }
+            // One more attempt at the design's cover, over the fallback:
+            // the first mount was refused with EBUSY, not for any cause a
+            // different mount could share. cgroup2 has one superblock per
+            // hierarchy, and `do_add_mount` refuses a fresh mount of the
+            // same superblock at a mountpoint its bind already covers —
+            // which the launch's own read-write bind of the classifier
+            // tree is, since the tree lives on the host's cgroup2, the
+            // same superblock a new mount would reuse. A tmpfs on top
+            // breaks that cover: the mountpoint is now the fallback's own
+            // superblock, so the cgroup2 mount grafts cleanly under it
+            // and the box reads its `memory.max` where a runtime looks —
+            // the bind, and the fallback beneath the new mount, stay
+            // hidden. A refusal here leaves the recorded fallback standing
+            // untouched, as the only cover the box got; the forced knob
+            // never reaches this, so the fallback it asks for is the one
+            // its tests assert on.
+            //
+            // SAFETY: `mount(2)` exactly as the refused attempt above —
+            // same source, target, and flags — only with the fallback
+            // mounted over the bind first. Async-signal-safe.
+            if !force_cover_fallback
+                && unsafe {
+                    libc::mount(
+                        c"cgroup2".as_ptr(),
+                        target.as_ptr(),
+                        c"cgroup2".as_ptr(),
+                        libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                        std::ptr::null(),
+                    )
+                } == 0
+            {
+                write_closure_report(closure_report, &format!("cover cgroup2{devpts_refused}"));
+                set_box_cover_marker("cgroup2");
+            }
         }
     }
     // Bring loopback up before taking the box credentials: the ioctl needs
