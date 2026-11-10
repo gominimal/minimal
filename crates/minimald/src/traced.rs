@@ -226,6 +226,21 @@ impl<T> Sender<T> {
             .map_err(|e| mpsc::error::SendError(e.0.0))
     }
 
+    /// [`Self::send`], with `caller` as the context the message carries: for
+    /// a sender that knows the trace its message belongs to better than the
+    /// current span does (the daemon's own boot work, sent from no span).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn send_from(
+        &self,
+        msg: T,
+        caller: Caller,
+    ) -> Result<(), mpsc::error::SendError<T>> {
+        self.0
+            .send((msg, caller))
+            .await
+            .map_err(|e| mpsc::error::SendError(e.0.0))
+    }
+
     /// `try_send`, for a caller that must not wait (the session mailbox's
     /// non-blocking paths); the message carries the caller's span as `send`'s does.
     pub(crate) fn try_send(&self, msg: T) -> Result<(), mpsc::error::TrySendError<T>> {
