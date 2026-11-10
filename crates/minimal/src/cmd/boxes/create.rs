@@ -1334,6 +1334,145 @@ fn entry_egress(
     })
 }
 
+/// The expanded session entry of the project at `project`, for the daemon
+/// to compose the box from (BOX-068). `entry` names the entry. With no
+/// name, the session entry pick applies, and the implicit `default` entry
+/// answers a project that declares none (BOX-165).
+///
+/// `None` for a project with no `minimal.toml`, and when no single session
+/// entry can be picked. The daemon then composes from the project's
+/// `[session]` table alone, as it did before entries.
+///
+/// # Errors
+///
+/// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
+pub(crate) fn session_box_entry(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    hooks_enabled: bool,
+) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
+    let Some(bytes) = project_file_bytes(project)? else {
+        return Ok(None);
+    };
+    let entries =
+        mfile::entry::read_entries(&bytes).map_err(|error| ProjectFileInvalid { error })?;
+    let typed = entry.and_then(|name| entries.iter().find(|entry| entry.name == name));
+    let picked = match typed {
+        Some(entry) => entry.clone(),
+        None => match pick_session_entry(&entries) {
+            Ok(entry) => entry,
+            Err(undecided) => {
+                tracing::info!(%undecided, "no session entry picked; the daemon composes from [session]");
+                return Ok(None);
+            }
+        },
+    };
+    box_entry(project, &bytes, picked, hooks_enabled).map(Some)
+}
+
+/// The expanded `[tasks.<task>]` entry of the project at `project`, for the
+/// daemon to compose the task box from (BOX-068). `None` when the project
+/// declares no such entry.
+///
+/// # Errors
+///
+/// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
+pub(crate) fn task_box_entry(
+    project: &camino::Utf8Path,
+    task: &str,
+    hooks_enabled: bool,
+) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
+    let Some(bytes) = project_file_bytes(project)? else {
+        return Ok(None);
+    };
+    let entries =
+        mfile::entry::read_entries(&bytes).map_err(|error| ProjectFileInvalid { error })?;
+    let Some(entry) = entries.into_iter().find(|entry| {
+        entry.name == task && entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE)
+    }) else {
+        return Ok(None);
+    };
+    box_entry(project, &bytes, entry, hooks_enabled).map(Some)
+}
+
+/// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
+/// `[defaults.<type>]` (BOX-048, BOX-064), with a legacy `[session]` table
+/// read as `[defaults.session]` (BOX-050), and takes the lists the daemon
+/// composes from the expanded spec.
+///
+/// A list the spec has no key for stays `None`. A task entry sends only
+/// `packages` and `lifecycle_hooks`: its own `vars` and `patches` have the
+/// task shape, and `min task run` applies them inside the box. With hooks
+/// off (`--no-hooks`), no `lifecycle_hooks` list is sent.
+fn box_entry(
+    project: &camino::Utf8Path,
+    bytes: &[u8],
+    entry: mfile::entry::BoxEntry,
+    hooks_enabled: bool,
+) -> anyhow::Result<boxes::wire::request::WireBoxEntry> {
+    let format_error = |error| ProjectFileInvalid {
+        error: mfile::Error::Format(error),
+    };
+    let mut doc: toml::Table = toml::from_slice(bytes).map_err(format_error)?;
+    // The hint for a legacy table is printed when the file loads
+    // (`mfile::File`), so the hints this rewrite returns are not printed
+    // again.
+    mfile::legacy::canonicalize(&mut doc, mfile::legacy::this_release())
+        .map_err(|error| ProjectFileInvalid { error })?;
+    let defaults = doc
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let project_types: std::collections::BTreeSet<String> = doc
+        .get("box_types")
+        .and_then(toml::Value::as_table)
+        .map(|types| types.keys().cloned().collect())
+        .unwrap_or_default();
+    let layers = mfile::expand::Layers::default().with_file_defaults(
+        &defaults,
+        entry.box_type.as_deref(),
+        &project_types,
+    );
+    let expansion =
+        mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
+    let spec = &expansion.spec;
+    fn list<T: serde::de::DeserializeOwned>(
+        spec: &toml::Table,
+        key: &str,
+    ) -> Result<Option<T>, toml::de::Error> {
+        spec.get(key)
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+    }
+    let box_type = entry
+        .box_type
+        .clone()
+        .unwrap_or_else(|| boxes::SESSION_BOX_TYPE.to_owned());
+    let project_path = paths::HostAbsPath::try_new(project.to_path_buf())
+        .context("Invalid project root")?
+        .into();
+    let mut wire = boxes::wire::request::WireBoxEntry::new(&entry.name, &box_type, project_path);
+    wire.packages = list(spec, "packages").map_err(format_error)?;
+    if hooks_enabled {
+        wire.lifecycle_hooks = list(spec, "lifecycle_hooks").map_err(format_error)?;
+    }
+    if box_type != boxes::TASK_BOX_TYPE {
+        wire.vars = list(spec, "vars").map_err(format_error)?;
+        wire.vars_lenient = list(spec, "vars_lenient").map_err(format_error)?;
+        wire.patches = list(spec, "patches").map_err(format_error)?;
+    }
+    tracing::info!(
+        entry = %wire.name,
+        box_type = %wire.box_type,
+        implicit = entry.implicit,
+        packages = ?wire.packages,
+        "expanded the box's entry"
+    );
+    Ok(wire)
+}
+
 /// The refusal for a `[network]` key that the network module cannot read:
 /// an invalid spec key of `minimal.toml`, named by its dotted path.
 fn network_key_invalid(
@@ -3087,6 +3226,16 @@ pub(crate) async fn activate_box(
         })
         .await?;
 
+    // BOX-068: the box's expanded entry rides on the contribution, and the
+    // daemon composes the project's part of the box from it. One span
+    // covers the expansion and the compose call that sends it.
+    use tracing::Instrument as _;
+    let entry_span = tracing::info_span!("box_entry", box_type = boxes::SESSION_BOX_TYPE);
+    let mut contribution = contribution;
+    contribution.entry = entry_span
+        .in_scope(|| session_box_entry(&project_root, options.entry.as_deref(), !args.no_hooks))?
+        .map(Box::new);
+
     // The upload decision needs no TTY — the interactive `Confirm` is answered
     // at the upload step, once the session exists — so it is resolved here,
     // still before the create. A `$HOME` whose lifecycle hooks a skip would
@@ -3852,6 +4001,7 @@ pub(crate) async fn activate_box(
                     session_id: id,
                     contribution,
                 })
+                .instrument(entry_span.clone())
                 .await;
             let configured = match configured {
                 // A transport failure abandons the activation and its row (T66).
