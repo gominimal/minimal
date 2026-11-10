@@ -1791,6 +1791,10 @@ impl BoxActor {
                 // As `ensure_host` refuses it: replacing the hook shell would
                 // end the box's host-side row, and keeping it never starts
                 // the entrypoint (BOX-176, BOX-178).
+                // Known gap: a restart of such a box fails closed. Tracked by
+                // https://github.com/gominimal/minimal/issues/3231. It flips
+                // when the hook shell can be replaced without ending the
+                // host-side row (#3042).
                 tracing::warn!(
                     box_id = %self.record.id(),
                     "restart: refused the start: replacing the hook-launched shell would end \
