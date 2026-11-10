@@ -12288,13 +12288,12 @@ async fn task_run_logs_wait_list_end_to_end() {
         ran.push("min task run check", &out, &err, format!("{status:?}"));
         assert_eq!(String::from_utf8_lossy(&out), "got:input\n", "{ran}");
         assert_eq!(String::from_utf8_lossy(&err), "diag\n", "{ran}");
-        assert_eq!(
-            task::exit_outcome(status)
-                .expect_err("a non-zero code fails the run")
-                .downcast_ref::<task::TaskExit>(),
-            Some(&task::TaskExit(3)),
-            "{ran}"
-        );
+        let run_exit = task::exit_outcome(status).expect_err("a non-zero code fails the run");
+        let run_code = match run_exit.downcast_ref::<task::TaskExit>() {
+            Some(&task::TaskExit(code)) => i32::from(code),
+            None => panic!("the run ends with a task exit, not {run_exit:#}\n{ran}"),
+        };
+        assert_eq!(run_code, 3, "{ran}");
 
         // The task's box keeps what its entrypoint wrote.
         append_box_output(&dir, b"first line\r\n");
@@ -12361,16 +12360,35 @@ async fn task_run_logs_wait_list_end_to_end() {
                 "{record:?}\n{ran}"
             );
 
-            // The ended task keeps the exit code of its run, as the daemon
-            // files a task whose entrypoint ended with that code.
+            // The record is filed here by hand, with the code the run ended
+            // with. The harness daemon cannot start a real entrypoint, so it
+            // never ends a task on its own. The daemon half, an entrypoint
+            // return filed as `exited` with its code, is pinned in minimald by
+            // `until_complete_ends_on_entrypoint_return_without_client_records_exited`.
+            // From here on, the wait and the list read that filed code.
             let record_path = dir.join("record.json");
             let mut record: serde_json_lenient::Value =
                 serde_json_lenient::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
             record["status"] = "exited".into();
             record["reason"] = "exit".into();
-            record["exit_code"] = 3.into();
+            record["exit_code"] = run_code.into();
             record["signal"] = serde_json_lenient::Value::Null;
             std::fs::write(&record_path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+
+            // A wait on the ended task returns the code of its run.
+            let rewaited = box_wait_on_hosts(
+                local_hosts(&global).unwrap(),
+                "check",
+                Some(std::time::Duration::from_secs(10)),
+                std::time::Duration::from_millis(20),
+            )
+            .await;
+            ran.push("min box wait check", b"", b"", format!("{rewaited:?}"));
+            assert_eq!(
+                rewaited.unwrap_or_else(|e| panic!("the wait on the ended task: {e:#}\n{ran}")),
+                run_code,
+                "the wait returns the run's exit code\n{ran}"
+            );
 
             let list = async |ran: &mut Transcript| {
                 let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -12396,10 +12414,11 @@ async fn task_run_logs_wait_list_end_to_end() {
             assert_eq!(lines.len(), 2, "a header and the one task\n{ran}");
             assert!(lines[1].starts_with(&id.to_string()), "{ran}");
             assert!(lines[1].contains("  check  "), "{ran}");
-            assert!(lines[1].contains("  exited (exit 3)  "), "{ran}");
+            let exited = format!("exited (exit {run_code})");
+            assert!(lines[1].contains(&format!("  {exited}  ")), "{ran}");
             assert!(lines[1].contains("  task  "), "{ran}");
             assert!(
-                list(ran).await.contains("exited (exit 3)"),
+                list(ran).await.contains(&exited),
                 "the ended task stays until a prune\n{ran}"
             );
 
