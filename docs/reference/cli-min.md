@@ -226,8 +226,10 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | Overrides of the entry's `network.egress` keys, as on [`session activate`](#session-activate): a list flag adds to the entry's list, `--allow-protocols` replaces it, and `--deny-all-egress` empties the allow lists |
 | `--loadout <NAME>` | Apply the named loadout. Repeatable. With any `--loadout`, the config file's `default_loadouts` are not applied |
 
-Each override flag changes only the key it names. The other keys of the
-entry's `[network]` table stay as the entry declares them. The box keeps the
+Each override flag changes only the key it names. The other
+`network.egress` keys of the entry stay as the entry declares them. A session
+box does not take the entry's `network.mode` or `network.ingress` yet
+([#3238](https://github.com/gominimal/minimal/issues/3238)). The box keeps the
 result: `min box show <box> --network` prints the `[network]` section that
 the box was created with.
 

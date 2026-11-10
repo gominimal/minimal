@@ -466,7 +466,8 @@ pub enum StartEntryRefusal {
     /// run path, which takes neither flag. `flag` is the flag as typed.
     /// This refusal is an interim, like [`Self::NameUnsupported`]. Remove
     /// it for a flag when `RunEntry` takes that flag
-    /// (<https://github.com/gominimal/minimal/issues/3163> for `--ingress`).
+    /// (<https://github.com/gominimal/minimal/issues/3163> for `--ingress`,
+    /// <https://github.com/gominimal/minimal/issues/3237> for `--loadout`).
     FlagUnsupported { entry: String, flag: &'static str },
     /// A task entry declared as `[boxes.<name>]` with `type = "task"`: the
     /// run path finds its task in `[tasks]` only. This refusal is an
@@ -835,8 +836,9 @@ pub(crate) fn plan_start(
             Err(StartEntryRefusal::NameUnsupported { entry: entry.name }.into())
         }
         // The run path takes `--network` and the egress flags, as `min box
-        // run` does, but neither `--ingress` (#3163) nor `--loadout`. The
-        // start refuses those two rather than drop them.
+        // run` does, but neither `--ingress` (#3163) nor `--loadout`
+        // (#3237). The start refuses those two rather than drop them.
+        // Remove the `--loadout` refusal when `RunEntry` takes the flag.
         Some(boxes::TASK_BOX_TYPE) if !start.overrides.ingress.is_empty() => {
             Err(StartEntryRefusal::FlagUnsupported {
                 entry: entry.name,
@@ -1185,7 +1187,7 @@ pub(crate) struct ProjectEgress {
     pub(crate) hints: Vec<String>,
     /// The `network.mode` of the expanded entry, when a layer sets one.
     /// `min task run` and `min box run` read it. `min session activate`
-    /// does not.
+    /// does not yet: <https://github.com/gominimal/minimal/issues/3238>.
     pub(crate) mode: Option<boxes::NetworkMode>,
     /// The table whose `network` the expanded entry holds, as the file
     /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
@@ -2910,7 +2912,8 @@ pub(crate) fn network_override_policy(
 
 /// The loadouts an activation resolves (BCLI-073): each `--loadout` in
 /// place of the client config's `default_loadouts`, or none under
-/// `--no-loadouts`.
+/// `--no-loadouts`. The stored spec does not record the selected loadouts
+/// yet: <https://github.com/gominimal/minimal/issues/3236>.
 pub(crate) fn start_loadout_selection(args: &ActivateArgs) -> loadouts::LoadoutSelection {
     loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts)
 }
