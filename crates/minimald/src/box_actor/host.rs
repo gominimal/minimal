@@ -1786,7 +1786,21 @@ impl BoxActor {
             BoxInner::Active { host: Some((h, _)), .. } if h.is_alive()
         ) && self.host_origin == HostOrigin::Hooks;
         if live_hooks_host {
-            if holds_host_row || !self.starts_argv().await {
+            let starts_argv = self.starts_argv().await;
+            if holds_host_row && starts_argv {
+                // As `ensure_host` refuses it: replacing the hook shell would
+                // end the box's host-side row, and keeping it never starts
+                // the entrypoint (BOX-176, BOX-178).
+                tracing::warn!(
+                    box_id = %self.record.id(),
+                    "restart: refused the start: replacing the hook-launched shell would end \
+                     the box's host-side row, so the box's entrypoint cannot start"
+                );
+                return Err(AttachError::SpawnFailed(std::io::Error::other(
+                    EntrypointBehindHookShell,
+                )));
+            }
+            if !starts_argv {
                 tracing::info!(
                     box_id = %self.record.id(),
                     "restart: keeping the host launched for on_activate"

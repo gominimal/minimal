@@ -18418,3 +18418,63 @@ async fn restart_records_exited_then_started_only() {
         .collect();
     assert_eq!(added, [BoxEventType::Started], "{added:?}");
 }
+
+/// BOX-176, BOX-178: an argv until_stopped box that holds a host-side row
+/// and sets `hooks_on_resume` cannot start its entrypoint behind the shell
+/// its `on_activate` hooks run in. Its restart fails after the stop: the
+/// box stays `stopped` with the stop's `exited` event, and no `started`
+/// event follows it. #3231 tracks the restart of such a box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_argv_box_behind_hook_shell_with_host_row_fails_stopped() {
+    use boxes::core::record::RecordState;
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = until_stopped_session_with_hook(
+        &mut client,
+        "argv-behind-hooks",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline("true".to_string())),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.hooks_on_resume = true;
+    spec.entrypoint =
+        mfile::spec::Entrypoint::Exec(vec!["/bin/sleep".to_string(), "600".to_string()]);
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    rewrite_spec(&server, id, &spec).await;
+    rewrite_record(&server, id, |record| {
+        record.box_addresses = Some(boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 31),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 31),
+        });
+    })
+    .await;
+    let before = event_kinds(&server, id).await.len();
+
+    match restart_box_in(&server, id).await {
+        Err(super::RestartError::Failed(error)) => {
+            let text = error.to_string();
+            assert!(
+                text.contains(
+                    "Session `argv-behind-hooks` did not start again. It is stopped now."
+                ),
+                "{text}"
+            );
+        }
+        other => panic!("the restart did not fail: {other:?}"),
+    }
+
+    let record = read_record(&server, id).await;
+    let RecordState::Stopped(_) = record.state().unwrap() else {
+        panic!("a failed start leaves the box stopped: {record:?}");
+    };
+    let events = event_kinds(&server, id).await;
+    let added: Vec<_> = events[before..].iter().map(|e| e.kind).collect();
+    assert_eq!(added, [BoxEventType::Exited], "{added:?}");
+    assert_eq!(events[before].data["reason"], "stopped");
+}
