@@ -7757,13 +7757,11 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
         .expect("the daemon walks the range through the forwarder");
     assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
 
-    // The box's table is this test process's network namespace, which every
-    // concurrently running test shares: another test's listener on the any
-    // address inside the range is the box's listener too. The watcher moves
-    // its forwards one port at a time, so such a port can still stand at the
-    // interim when this test's own two have moved. Its move is awaited; this
-    // test's own ports are held to the assertion below at once.
-    let ours = [exposed, listened];
+    // Every row is this test's: the mock box's leader is a host child, so its
+    // table is the host's, but under test the watcher keeps it to the
+    // listeners this test process holds (`box_listening_ports`) — a listener
+    // another process opens inside the range is never the box's, so it is
+    // never published at the interim for the move to leave behind.
     let rows = listed_once(&handle, |rows| {
         rows.exposed
             .iter()
@@ -7772,12 +7770,6 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
                 .listened
                 .iter()
                 .any(|row| row.local == at(handed, listened))
-            && rows
-                .exposed
-                .iter()
-                .chain(&rows.listened)
-                .filter(|row| !ours.contains(&row.internal_port))
-                .all(|row| !row.local.starts_with("127.0.0.1:"))
     })
     .await;
     assert!(
