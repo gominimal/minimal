@@ -145,6 +145,12 @@ pub const GVPROXY_FILE: &str = "gvproxy-min";
 /// install.
 pub const PACKAGE_GVPROXY_BIN: &str = "/usr/bin/gvproxy-min";
 
+/// Where the macOS system package places the switch binary. macOS seals
+/// `/usr/bin`, so a machine-wide package there installs under `/usr/local/bin`
+/// (`packaging/macos`); without this path a package-only Mac finds no switch
+/// and its VM boots without guest egress.
+pub const LOCAL_PACKAGE_GVPROXY_BIN: &str = "/usr/local/bin/gvproxy-min";
+
 /// Operator-provisioned system-wide install path for the switch binary: the
 /// final fallback when neither a user-local nor a system package install
 /// exists.
@@ -175,8 +181,9 @@ fn installer_bin_dir() -> Option<PathBuf> {
 
 /// Resolve the switch binary an install placed on this host: an existing
 /// user-local install (`<bin-dir>/gvproxy-min`, where the curl|sh installer
-/// stamps it), else the system package install ([`PACKAGE_GVPROXY_BIN`]), else
-/// the operator-provisioned [`DEFAULT_GVPROXY_BIN`].
+/// stamps it), else the system package install ([`PACKAGE_GVPROXY_BIN`], or
+/// [`LOCAL_PACKAGE_GVPROXY_BIN`] where the macOS package puts it), else the
+/// operator-provisioned [`DEFAULT_GVPROXY_BIN`].
 ///
 /// One definition shared by `minimald` (which spawns the switch for native
 /// own-IP sessions) and `minvmd` (the host switch supervisor), so the two
@@ -189,10 +196,24 @@ fn installer_bin_dir() -> Option<PathBuf> {
 pub fn installed_gvproxy_bin() -> PathBuf {
     resolve_installed(
         installer_bin_dir(),
-        Path::new(PACKAGE_GVPROXY_BIN),
+        &package_install(&[
+            Path::new(PACKAGE_GVPROXY_BIN),
+            Path::new(LOCAL_PACKAGE_GVPROXY_BIN),
+        ]),
         Path::new(DEFAULT_GVPROXY_BIN),
         Path::new(LEGACY_SYSTEM_GVPROXY_BIN),
     )
+}
+
+/// The system package's copy: the first of `candidates` that exists, else the
+/// first, which then fails the caller's own existence check.
+fn package_install(candidates: &[&Path]) -> PathBuf {
+    candidates
+        .iter()
+        .find(|path| path.exists())
+        .or(candidates.first())
+        .map(|path| path.to_path_buf())
+        .unwrap_or_default()
 }
 
 /// The resolution itself, with every probed location passed in.
@@ -1053,6 +1074,23 @@ mod tests {
             resolve_installed(Some(bin), &package, &system, &legacy),
             want
         );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_macos_package_path_is_found_when_the_linux_one_is_absent() {
+        // The macOS package cannot write /usr/bin; its copy under
+        // /usr/local/bin must resolve, and a Linux package's copy still wins
+        // where both exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let usr_bin = tmp.path().join("usr-bin-gvproxy-min");
+        let usr_local_bin = tmp.path().join("usr-local-bin-gvproxy-min");
+        assert_eq!(package_install(&[&usr_bin, &usr_local_bin]), usr_bin);
+        std::fs::write(&usr_local_bin, b"macOS package").unwrap();
+        assert_eq!(package_install(&[&usr_bin, &usr_local_bin]), usr_local_bin);
+        std::fs::write(&usr_bin, b"Linux package").unwrap();
+        assert_eq!(package_install(&[&usr_bin, &usr_local_bin]), usr_bin);
+        assert!(LOCAL_PACKAGE_GVPROXY_BIN.ends_with(GVPROXY_FILE));
     }
 
     #[cfg_attr(miri, ignore)]
