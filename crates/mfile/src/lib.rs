@@ -1855,16 +1855,21 @@ impl File {
             home_dir,
             mfile_dir,
             Self::encode_component,
+            None,
         )
     }
 
-    /// [`Self::state_dir_from_path`] with the component encoder chosen.
+    /// [`Self::state_dir_from_path`] with the component encoder chosen, and
+    /// what a `..` component becomes: `None` drops it, as the native names
+    /// always have; `Some(text)` keeps it as `text`, so that two paths that
+    /// differ only by a `..` get two directories.
     fn state_dir_encoded<P: AsRef<Path>>(
         state_key: &str,
         env_base_dir: P,
         home_dir: Option<&Path>,
         mfile_dir: &Path,
         encode: fn(&OsStr) -> OsString,
+        parent_dir: Option<&str>,
     ) -> PathBuf {
         let (start_marker, components) = home_dir
             .map(|home| mfile_dir.strip_prefix(home))
@@ -1876,6 +1881,7 @@ impl File {
         for (i, c) in components
             .filter_map(|c| match c {
                 Component::Normal(s) => Some(encode(s)),
+                Component::ParentDir => parent_dir.map(OsString::from),
                 _ => None,
             })
             .enumerate()
@@ -1939,6 +1945,9 @@ impl File {
             None,
             project_dir,
             Self::encode_component_escaped,
+            // A `..` the caller did not resolve stays in the key, escaped
+            // like a name would be, so `/work/a/../b` and `/work/b` differ.
+            Some("%2E%2E"),
         )
     }
 
@@ -2850,6 +2859,19 @@ mod tests {
         let three = f.state_dir_under("env", "/tmp/state", Path::new("/work/a%2D/b"));
         assert_eq!(three, Path::new("/tmp/state/-work-a%252D-b/env"));
         assert_ne!(three, one);
+        // A `..` the caller left in the path is kept, so it cannot pose as
+        // the path it would resolve to.
+        let up = f.state_dir_under("env", "/tmp/state", Path::new("/work/a/../b"));
+        let flat = f.state_dir_under("env", "/tmp/state", Path::new("/work/b"));
+        assert_ne!(up, flat);
+        assert_eq!(up, Path::new("/tmp/state/-work-a-%2E%2E-b/env"));
+        // The native names drop it, as they always have: `/work/a/../b` and
+        // `/work/a/b` share one directory there, the aliasing this encoder
+        // is for.
+        assert_eq!(
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/work/a/../b")),
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/work/a/b"))
+        );
     }
 
     #[test]
