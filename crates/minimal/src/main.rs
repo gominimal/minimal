@@ -221,6 +221,16 @@ fn answer_failure(
     if quiet_on_closed_pipe && is_broken_pipe(e) {
         return ExitCode::from(141);
     }
+    // A run that its box's timeout ended already printed why on stderr
+    // (BCLI-014): it relays 124 with no second line for the same fact.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxTimedOut>()
+        && timed_out.is_printed()
+    {
+        if let Some(hint) = alias_hint {
+            let _ = writeln!(stderr, "{hint}");
+        }
+        return ExitCode::from(minimal::BoxTimedOut::EXIT_CODE);
+    }
     let _ = writeln!(stderr, "error: {e:#}");
     if let Some(hint) = alias_hint {
         let _ = writeln!(stderr, "{hint}");
@@ -232,7 +242,9 @@ fn answer_failure(
 /// codes ("Exit codes"): 2 when a running box holds the name a create
 /// asked for (`minimald_rpc::HeldNameRefusal`) or a removal without
 /// `--force` finds the box running (`minimal::BoxRunningRefusal`) or a run
-/// names an entry with a terminal (`minimal::task::RunNeedsTerminal`), 3
+/// names an entry with a terminal (`minimal::task::RunNeedsTerminal`) or
+/// puts one of its network flags among the task's arguments
+/// (`minimal::task::RunFlagMisplaced`), 3
 /// when the activation refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
 /// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
@@ -245,7 +257,8 @@ fn answer_failure(
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
 /// is not running, 5 when its spec turns exec off), 124 when an exec ran past its own timeout
-/// (`minimal::BoxExecTimedOut`), and 1, the unspecified error,
+/// (`minimal::BoxExecTimedOut`) or a box ran past its own timeout or a
+/// `min box wait --timeout` ran out (`minimal::BoxTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
@@ -262,6 +275,13 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
         .is_some()
     {
         return minimal::task::RunNeedsTerminal::EXIT_CODE;
+    }
+    // `min task run` or `min box run` with a network flag among the task's
+    // arguments: a usage error.
+    if e.downcast_ref::<minimal::task::RunFlagMisplaced>()
+        .is_some()
+    {
+        return minimal::task::RunFlagMisplaced::EXIT_CODE;
     }
     // BCLI-058: `min box rename` to a name BOX-010 refuses.
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
@@ -314,6 +334,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-053: an exec that its own timeout ended.
     if e.downcast_ref::<minimal::BoxExecTimedOut>().is_some() {
         return minimal::BoxExecTimedOut::EXIT_CODE;
+    }
+    // BCLI-013, BCLI-014: a box that its own timeout ended, or a `min box
+    // wait --timeout` that ran out.
+    if e.downcast_ref::<minimal::BoxTimedOut>().is_some() {
+        return minimal::BoxTimedOut::EXIT_CODE;
     }
     // BCLI-018: `min init` refused a request (2) or a type (3).
     if let Some(refusal) = e.downcast_ref::<minimal::InitRefusal>() {
@@ -415,6 +440,15 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
     if let Some(timed_out) = e.downcast_ref::<minimal::BoxExecTimedOut>() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             minimal::BoxExecTimedOut::CODE,
+            format!("{e:#}"),
+            timed_out.hint().to_string(),
+        ));
+    }
+    // BCLI-013, BCLI-014: a box timeout is `timeout`, and a wait timeout is
+    // `wait_timeout`.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxTimedOut>() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            timed_out.code(),
             format!("{e:#}"),
             timed_out.hint().to_string(),
         ));
@@ -642,6 +676,8 @@ mod tests {
             command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
                 task: "build".to_string(),
                 path: None,
+                network: None,
+                egress: minimal::EgressArgs::default(),
                 detach: false,
                 args: vec![],
             }),
@@ -1110,6 +1146,17 @@ mod tests {
         }
     }
 
+    /// A run with one of its network flags among the task's arguments is a
+    /// usage error: it ends with 2.
+    #[test]
+    fn misplaced_run_flag_exits_2() {
+        let err = anyhow::Error::new(minimal::task::RunFlagMisplaced::new(
+            "build",
+            "--deny-all-egress",
+        ));
+        assert_eq!(failure_exit_code(&err), 2, "{err:#}");
+    }
+
     /// BCLI-053: an exec that its own timeout ended ends the run with 124
     /// in both output modes, and a machine-mode run answers it with the
     /// `timeout` object. The exec refusals end with 2 and 5.
@@ -1162,6 +1209,85 @@ mod tests {
         ] {
             assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
         }
+    }
+
+    /// BCLI-013, BCLI-014: a box that its own timeout ended, and a `min box
+    /// wait --timeout` that ran out, end the run with 124 in both output
+    /// modes. A machine-mode run answers the first with the `timeout`
+    /// object and the second with the `wait_timeout` object.
+    #[test]
+    fn run_verbs_and_wait_timeout_return_124_with_code_timeout() {
+        for (timed_out, code) in [
+            (minimal::BoxTimedOut::ended("web"), "timeout"),
+            (
+                minimal::BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s"),
+                "wait_timeout",
+            ),
+        ] {
+            let e = anyhow::Error::new(timed_out.clone());
+            assert_eq!(failure_exit_code(&e), 124);
+            match machine_mode_answer(&e) {
+                MachineModeAnswer::Object(failure) => {
+                    assert_eq!(failure.code(), code);
+                    assert_eq!(failure.message(), timed_out.to_string());
+                    assert_eq!(failure.hint(), timed_out.hint());
+                }
+                MachineModeAnswer::Quiet => panic!("a timeout is an error object"),
+            }
+            let mut stderr = Vec::new();
+            assert_eq!(
+                answer_failure(&e, true, false, None, &mut stderr),
+                ExitCode::from(124)
+            );
+            let line = String::from_utf8(stderr).unwrap();
+            assert!(line.contains(&format!(r#""code":"{code}""#)), "{line}");
+            let mut stderr = Vec::new();
+            assert_eq!(
+                answer_failure(&e, false, false, None, &mut stderr),
+                ExitCode::from(124)
+            );
+            let text = String::from_utf8(stderr).unwrap();
+            assert_eq!(text, format!("error: {timed_out}\n"));
+        }
+
+        // `min task run` and `min box run`: a box that its timeout ended
+        // exits 124 and answers `timeout`. The run printed its own timeout
+        // line, so human mode adds nothing.
+        let e = minimal::task::run_outcome(Some(124), true, "web").unwrap_err();
+        assert_eq!(failure_exit_code(&e), 124);
+        match machine_mode_answer(&e) {
+            MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "timeout"),
+            MachineModeAnswer::Quiet => panic!("a timeout is an error object"),
+        }
+        let mut stderr = Vec::new();
+        assert_eq!(
+            answer_failure(&e, true, false, None, &mut stderr),
+            ExitCode::from(124)
+        );
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains(r#""code":"timeout""#)
+        );
+        let mut stderr = Vec::new();
+        assert_eq!(
+            answer_failure(&e, false, false, None, &mut stderr),
+            ExitCode::from(124)
+        );
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        // An entrypoint that exits 124 by itself relays its code, with no
+        // error object.
+        let e = minimal::task::run_outcome(Some(124), false, "web").unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<minimal::task::TaskExit>(),
+            Some(&minimal::task::TaskExit(124))
+        );
+        let mut stderr = Vec::new();
+        assert_eq!(
+            answer_failure(&e, true, false, None, &mut stderr),
+            ExitCode::from(124)
+        );
+        assert!(stderr.is_empty());
     }
 
     /// BCLI-018: `min init` ends with 2 when it gets more than one type
