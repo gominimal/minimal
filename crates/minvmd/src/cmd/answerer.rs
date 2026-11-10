@@ -18,7 +18,7 @@
 //! holds nothing of are republished by the nodes unprompted
 //! ([`crate::net::answerer`]).
 
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
@@ -241,7 +241,12 @@ fn activated_sockets() -> Result<(UdpSocket, UnixListener)> {
     }
     match (listener, channel) {
         (Some(listener), Some(channel)) => {
-            Ok((UdpSocket::from(listener), UnixListener::from(channel)))
+            let listener = UdpSocket::from(listener);
+            bind_if_unbound(
+                &listener,
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, answerer::DEFAULT_ANSWERER_PORT),
+            )?;
+            Ok((listener, UnixListener::from(channel)))
         }
         (None, _) => bail!(
             "the unit hands the answerer no datagram listener at the hook port; \
@@ -252,6 +257,60 @@ fn activated_sockets() -> Result<(UdpSocket, UnixListener)> {
              socket must ListenStream= the channel's path"
         ),
     }
+}
+
+/// Binds the listener to `hook` when the manager handed it over unbound.
+///
+/// launchd creates the listener when the service is loaded. When another
+/// program holds the hook port at that moment, launchd's bind fails, and it
+/// still starts the service with the socket it made: a datagram socket with
+/// no address, which receives nothing. launchd keeps that socket for every
+/// later start, so the service stayed deaf after the other program left,
+/// until the next reboot or reinstall. A listener with port 0 is that
+/// socket, and the service binds it here itself.
+///
+/// The bind fails while the port is still held, and the error says so: the
+/// service exits, the manager starts it again, and the first start after
+/// the port is free answers. A listener that already has its port (every
+/// start where launchd's bind worked, and every systemd start) is left
+/// alone.
+fn bind_if_unbound(listener: &UdpSocket, hook: SocketAddrV4) -> Result<()> {
+    let local = listener
+        .local_addr()
+        .context("reading the listener's own address")?;
+    if local.port() != 0 {
+        return Ok(());
+    }
+    // SAFETY: sockaddr_in is plain old data; zeroed is a valid value.
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    #[cfg(target_os = "macos")]
+    {
+        addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    }
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = hook.port().to_be();
+    addr.sin_addr = libc::in_addr {
+        s_addr: u32::from(*hook.ip()).to_be(),
+    };
+    // SAFETY: bind reads the address, whose size is passed alongside it;
+    // the fd is borrowed for the call's life.
+    let rc = unsafe {
+        libc::bind(
+            listener.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        bail!(
+            "the service manager handed the answerer a listener with no address,              and UDP {hook} could not be bound ({error}): another program holds              the port box names are answered on. Stop that program; the service              answers on its next start"
+        );
+    }
+    eprintln!(
+        "minzoned: the service manager handed over a listener with no address;          bound UDP {hook} here"
+    );
+    Ok(())
 }
 
 /// The sockets the service manager hands the answerer over, by platform:
@@ -453,6 +512,68 @@ fn mark_cloexec(fd: BorrowedFd<'_>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A datagram socket with no address: what launchd hands over when its
+    /// own bind of the hook port failed.
+    fn unbound_listener() -> UdpSocket {
+        // SAFETY: socket(2) returns a new fd this test owns, or -1.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        assert!(fd >= 0, "socket(2) failed");
+        // SAFETY: the fd is new and owned by nothing else.
+        UdpSocket::from(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// A loopback port nothing holds: bound once, read, released.
+    fn free_port() -> SocketAddrV4 {
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("an ephemeral port");
+        let port = probe.local_addr().expect("its address").port();
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
+    }
+
+    /// The listener launchd could not bind is bound by the service, and
+    /// then receives.
+    #[test]
+    fn an_unbound_listener_is_bound_to_the_hook_port() {
+        let hook = free_port();
+        let listener = unbound_listener();
+        assert_eq!(listener.local_addr().expect("address").port(), 0);
+        bind_if_unbound(&listener, hook).expect("the free port binds");
+        assert_eq!(
+            listener.local_addr().expect("address"),
+            std::net::SocketAddr::V4(hook)
+        );
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a sender");
+        sender.send_to(b"q", hook).expect("sent");
+        listener
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("timeout");
+        let mut buf = [0u8; 4];
+        assert_eq!(listener.recv(&mut buf).expect("the datagram arrives"), 1);
+    }
+
+    /// A listener the manager bound keeps its address.
+    #[test]
+    fn a_bound_listener_is_left_alone() {
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bound");
+        let before = listener.local_addr().expect("address");
+        bind_if_unbound(&listener, free_port()).expect("nothing to do");
+        assert_eq!(listener.local_addr().expect("address"), before);
+    }
+
+    /// While another program holds the port, the bind fails and the error
+    /// names the port, so the service exits and the manager tries again.
+    #[test]
+    fn a_held_port_is_an_error_that_names_it() {
+        let holder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the holder");
+        let std::net::SocketAddr::V4(hook) = holder.local_addr().expect("address") else {
+            panic!("an IPv4 bind has an IPv4 address");
+        };
+        let error = bind_if_unbound(&unbound_listener(), hook).expect_err("the port is held");
+        assert!(
+            error.to_string().contains(&hook.to_string()),
+            "the error names the port: {error}"
+        );
+    }
 
     /// A socket without `LISTEN_FDS` is not an activation: the service
     /// starts only by socket activation, and the error says so.
