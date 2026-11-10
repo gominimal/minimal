@@ -100,8 +100,12 @@ encoding**.
     `port/proto`.
 - **Normal forms.** For specs these are EPOCH-002 and EPOCH-006 and
   nothing more. A spec's other lists and maps keep the order the spec
-  declares. The encoder orders a container's maps by key and sorts its
-  sets, as epoch 0 does.
+  declares, and that order is part of the spec's canonical form, as it
+  is in epoch 0: two recipes that list the same `build_args` in a
+  different order are two specs with two keys. The injectivity claim is
+  over that form, declared order included; normalizing these maps is a
+  later epoch's change (Non-goals). The encoder orders a container's maps
+  by key and sorts its sets, as epoch 0 does.
 - **Layout.** The encoding is a byte-tagged TLV. Each field is a one-byte
   tag and then its payload. Every string has a `u32` little-endian length
   prefix. Every list, set or map has a `u32` little-endian count prefix.
@@ -441,6 +445,11 @@ build-infra operator. Release manager.
 - Migrating historical epoch-0 artifacts: they stay valid for old pins
   (minimal#1246, decision 4)
 - Wire varint work: minimal#1109, set 2
+- Normalizing the order of a spec's `build_args`, `outputs` and
+  `abstract_deps`: epoch 0 keys on their declared order and so does this
+  epoch, whose scope is the nine witness classes. Sorting them by key, as
+  the container encoding does, would be a new canonical form for every
+  spec and belongs to an epoch of its own.
 - The slots feature: gominimal/inbox#350. This spec only guarantees that
   the name axis is sound.
 - Publishing OCI Archives to the Registry Build Cache with their index
