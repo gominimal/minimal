@@ -7671,8 +7671,16 @@ exit 0
     /// makes the answerer line or the answerer's reads vanish.
     #[tokio::test]
     async fn the_answerer_facts_ride_beside_a_down_proxy_sibling() {
+        // The holder's port is one this test holds and never answers on,
+        // not the answerer's real 7656: on a machine whose own daemon serves
+        // there, the liveness query would be answered and the read would
+        // say bound (gominimal/inbox#1232). The silent socket stays bound
+        // for the whole test, so nothing else can take the port meanwhile.
+        let silent = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("the silent holder binds");
+        let port = silent.local_addr().expect("the port is named").port();
         let reply = AnswererStatusReply {
-            answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+            answerer: ZoneAnswererStatus::Holder { port },
             proxy_down: Some(ProxyDown {
                 port: 19_911,
                 cause: ProxyDownCause::RedrawsRanOut,
@@ -7683,7 +7691,7 @@ exit 0
         let read = host_answerer_read(reply.clone()).await;
         assert_eq!(
             read.port,
-            Some(7_656),
+            Some(port),
             "a holder's port is named even while the proxy is down"
         );
         assert!(
@@ -7703,7 +7711,9 @@ exit 0
         // cause — the DNS SERVICE line names the holder.
         assert_eq!(
             vm_host_answerer_line(reply.answerer.clone()),
-            Some("this VM's host daemon answers its box names on 127.0.0.1:7656 (UDP)".to_string()),
+            Some(format!(
+                "this VM's host daemon answers its box names on 127.0.0.1:{port} (UDP)"
+            )),
             "the answerer line names the holder, cause or no cause"
         );
         // And the cause has a line of its own, naming neither surface as
