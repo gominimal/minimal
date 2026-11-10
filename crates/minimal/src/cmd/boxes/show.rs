@@ -83,8 +83,9 @@ pub(crate) fn not_found_remedy(host: &str, several_hosts: bool) -> String {
 
 /// Writes one box record as `Label: value` lines, with the `provider`
 /// and `host` it came from. A value the record does not carry prints as
-/// `-`. The live execs line prints only when
-/// the daemon names an exec, because today's daemon gives no exec an id.
+/// `-`. A `Live execs:` block follows when the box runs execs, with one
+/// row for each: its exec id, `terminal`, `detached` or `attached`, and its
+/// command.
 pub(crate) fn render_box_show(
     out: &mut impl std::io::Write,
     shown: &minimald_rpc::ShowBoxResponse,
@@ -125,19 +126,39 @@ pub(crate) fn render_box_show(
     lines.push(("Identity", identity.to_string()));
     lines.push(("Provider", provider.to_string()));
     lines.push(("Host", host.to_string()));
-    if !shown.live_execs.is_empty() {
-        let ids: Vec<&str> = shown
-            .live_execs
-            .iter()
-            .map(|exec| exec.id.as_str())
-            .collect();
-        lines.push(("Live execs", ids.join(", ")));
-    }
     for (label, value) in lines {
         let label = format!("{label}:");
         writeln!(out, "{label:<11} {value}")?;
     }
+    // BCLI-067: one row for each live exec, with its id, whether it holds a
+    // terminal, and its command.
+    if !shown.live_execs.is_empty() {
+        writeln!(out, "Live execs:")?;
+        for exec in &shown.live_execs {
+            let mode = match exec.mode {
+                minimald_rpc::exec::ExecMode::Tty => "terminal",
+                minimald_rpc::exec::ExecMode::Detached => "detached",
+                minimald_rpc::exec::ExecMode::Attached => "attached",
+            };
+            let command: Vec<String> = exec.argv.iter().map(|word| shell_word(word)).collect();
+            writeln!(out, "  {}  {mode:<8}  {}", exec.id, command.join(" "))?;
+        }
+    }
     Ok(())
+}
+
+/// `word` as a shell reads it back as one word: as it is when it holds only
+/// safe characters, and in single quotes otherwise.
+fn shell_word(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c));
+    if safe {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
 }
 
 /// Formats a disk figure in bytes in the largest binary unit that keeps it

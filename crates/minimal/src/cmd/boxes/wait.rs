@@ -201,13 +201,62 @@ pub(crate) async fn box_wait_on_hosts(
     }
 }
 
-/// `min box wait <box> [--timeout <d>]`: waits until the box ends, then
-/// exits with the box's exit code.
+/// Waits until the exec `exec_text` names in the box `target` names on
+/// `hosts` ends, and returns its retained exit code as BOX-149's wait gives
+/// it (BCLI-057). An exec that its own timeout ended is a
+/// [`BoxExecTimedOut`]. With `timeout`, the wait stops when the exec still
+/// runs after it, with a [`BoxTimedOut`], and leaves the exec running. The
+/// daemon's other words go to `err`.
+pub(crate) async fn box_wait_exec_on_hosts<E>(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    target: &str,
+    exec_text: &str,
+    timeout: Option<std::time::Duration>,
+    err: &mut E,
+) -> Result<i32, anyhow::Error>
+where
+    E: tokio::io::AsyncWrite + Unpin,
+{
+    const VERB: &str = "box wait";
+    let mut box_id = None;
+    let result = async {
+        let exec_id = exec_id_arg(target, exec_text)?;
+        let resolved = resolve_box_on_hosts(hosts, target, VERB).await?;
+        box_id = Some(resolved.box_id);
+        crate::output::record_box_id(&resolved.box_id.to_string());
+        let mut channels = exec_channels_of(&resolved, target).await?;
+        let waited = wait_exec_over(&mut channels, target, &exec_id, err);
+        match timeout {
+            None => waited.await,
+            Some(after) => match tokio::time::timeout(after, waited).await {
+                Ok(waited) => waited,
+                Err(_) => Err(BoxTimedOut::waited(
+                    target,
+                    &resolved.box_id.to_string(),
+                    &wait_label(after),
+                )
+                .into()),
+            },
+        }
+    }
+    .await;
+    record_exec_id_outcome(VERB, box_id, exec_text, &result);
+    result
+}
+
+/// `min box wait <box> [--timeout <d>] [--exec <id>]`: waits until the box,
+/// or the one exec `--exec` names, ends, then exits with its exit code.
 pub async fn cmd_box_wait(global: &GlobalArgs, args: BoxWaitArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
     let timeout = args.timeout.map(std::time::Duration::from_secs);
-    let code = box_wait_on_hosts(hosts, &args.target, timeout, POLL_INTERVAL).await?;
+    let code = match &args.exec {
+        Some(exec) => {
+            let mut err = tokio::io::stderr();
+            box_wait_exec_on_hosts(hosts, &args.target, exec, timeout, &mut err).await?
+        }
+        None => box_wait_on_hosts(hosts, &args.target, timeout, POLL_INTERVAL).await?,
+    };
     if code == 0 {
         Ok(())
     } else {

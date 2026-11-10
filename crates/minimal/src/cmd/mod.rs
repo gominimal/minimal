@@ -410,7 +410,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
             BoxCommand::Run(args) => task::cmd_box_run(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
-            BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
+            BoxCommand::Stop(args) => match args.exec.as_deref() {
+                Some(exec) => cmd_box_stop_exec(&cli.global_args, &args.target, exec).await,
+                None => cmd_box_stop(&cli.global_args, args).await,
+            },
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
             BoxCommand::Attach(args) => cmd_box_attach(&cli.global_args, args).await,
             BoxCommand::Exec(args) => cmd_box_exec(&cli.global_args, args).await,
@@ -419,7 +422,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
             BoxCommand::Rename(args) => cmd_box_rename(&cli.global_args, args).await,
             BoxCommand::Prune(args) => cmd_box_prune(&cli.global_args, args).await,
-            BoxCommand::Logs(args) => cmd_box_logs(&cli.global_args, args, None, "box logs").await,
+            BoxCommand::Logs(args) => match args.exec.as_deref() {
+                Some(exec) => cmd_box_logs_exec(&cli.global_args, &args.logs.target, exec).await,
+                None => cmd_box_logs(&cli.global_args, args.logs, None, "box logs").await,
+            },
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => {

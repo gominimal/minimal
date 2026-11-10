@@ -11686,7 +11686,10 @@ async fn type_noun_logs_follow() {
             })) => (args, Some(boxes::TASK_BOX_TYPE), "task logs"),
             Some(Command::Box(BoxArgs {
                 command: BoxCommand::Logs(args),
-            })) => (args, None, "box logs"),
+            })) => {
+                assert!(args.exec.is_none(), "no `--exec`");
+                (args.logs, None, "box logs")
+            }
             _ => panic!("expected `min {noun} logs`"),
         };
         assert_eq!(args.target, target);
