@@ -400,7 +400,7 @@ fn project_bep_and_grants(
 
 /// Where one field of a box's effective egress came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EgressSource {
+pub(crate) enum EgressSource {
     /// The project's `minimal.toml`.
     ProjectFile,
     /// A flag of the creating command.
@@ -410,18 +410,28 @@ enum EgressSource {
 /// A box's effective egress (NET-060): the policy, and the source of each
 /// field that one of them set, by the field's spec name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct EffectiveEgress {
-    policy: Option<boxes::EgressPolicy>,
-    sources: Vec<(&'static str, EgressSource)>,
+pub(crate) struct EffectiveEgress {
+    pub(crate) policy: Option<boxes::EgressPolicy>,
+    pub(crate) sources: Vec<(&'static str, EgressSource)>,
 }
 
 /// The `network.egress` table that the project's `minimal.toml` declares for
-/// a session box (NET-060), with the hint for each legacy spelling that the
-/// file uses.
+/// a session box or a task box (NET-060), with the hint for each legacy
+/// spelling that the file uses.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ProjectEgress {
-    policy: Option<boxes::EgressPolicy>,
-    hints: Vec<String>,
+pub(crate) struct ProjectEgress {
+    pub(crate) policy: Option<boxes::EgressPolicy>,
+    pub(crate) hints: Vec<String>,
+    /// The `network.mode` of the expanded entry, when a layer sets one.
+    /// `min task run` and `min box run` read it. `min session activate`
+    /// does not.
+    pub(crate) mode: Option<boxes::NetworkMode>,
+    /// The table whose `network` the expanded entry holds, as the file
+    /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
+    /// as `[tasks.build]`. A later layer replaces the whole `network` table
+    /// of an earlier one, so one table holds all of it. `None` when no
+    /// layer declares `network`.
+    pub(crate) layer: Option<String>,
 }
 
 /// The project's [`ProjectEgress`]. The layers are `[defaults]`,
@@ -433,13 +443,37 @@ struct ProjectEgress {
 /// never refuses an activation. The policy is `None` when there is no
 /// project file or no layer declares egress.
 fn project_egress(project: &camino::Utf8Path) -> anyhow::Result<ProjectEgress> {
+    match project_file_bytes(project)? {
+        Some(bytes) => project_egress_from(&bytes),
+        None => Ok(ProjectEgress::default()),
+    }
+}
+
+/// The [`ProjectEgress`] of task `task` in the project: as
+/// [`project_egress`] reads it for a session, with the layers `[defaults]`,
+/// `[defaults.task]` and the task's entry. The policy is `None` when there
+/// is no project file, the file declares no entry of type `task` named
+/// `task`, or no layer declares egress.
+pub(crate) fn task_project_egress(
+    project: &camino::Utf8Path,
+    task: &str,
+) -> anyhow::Result<ProjectEgress> {
+    match project_file_bytes(project)? {
+        Some(bytes) => task_egress_from(&bytes, task),
+        None => Ok(ProjectEgress::default()),
+    }
+}
+
+/// The bytes of the project's `minimal.toml`, or `None` when the project
+/// has none.
+fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u8>>> {
     let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
         Ok(file) => file,
-        Err(mfile::Error::NotFound) => return Ok(ProjectEgress::default()),
+        Err(mfile::Error::NotFound) => return Ok(None),
         Err(error) => return Err(ProjectFileInvalid { error }.into()),
     };
     let Some(root) = file.repo_path() else {
-        return Ok(ProjectEgress::default());
+        return Ok(None);
     };
     let Some(path) = [
         root.join(mfile::MFILE_NAME),
@@ -447,12 +481,12 @@ fn project_egress(project: &camino::Utf8Path) -> anyhow::Result<ProjectEgress> {
     ]
     .into_iter()
     .find(|path| path.is_file()) else {
-        return Ok(ProjectEgress::default());
+        return Ok(None);
     };
     let bytes = std::fs::read(&path).map_err(|e| ProjectFileInvalid {
         error: mfile::Error::IO("minimal file", path.clone(), e),
     })?;
-    project_egress_from(&bytes)
+    Ok(Some(bytes))
 }
 
 /// Whether any `network` key appears in `[defaults]`, in a
@@ -498,6 +532,30 @@ fn project_egress_from(bytes: &[u8]) -> anyhow::Result<ProjectEgress> {
         Err(_) if !declares_network(&file, &entries) => return Ok(ProjectEgress::default()),
         Err(undecided) => return Err(undecided.into()),
     };
+    entry_egress(&file, entry)
+}
+
+/// [`task_project_egress`] over the bytes of a `minimal.toml`.
+fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
+    let file: toml::Table = toml::from_slice(bytes).map_err(|e| ProjectFileInvalid {
+        error: mfile::Error::Format(e),
+    })?;
+    let entries =
+        mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?;
+    let Some(entry) = entries.into_iter().find(|entry| {
+        entry.name == task && entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE)
+    }) else {
+        return Ok(ProjectEgress::default());
+    };
+    entry_egress(&file, entry)
+}
+
+/// The egress of `entry` in the parsed `file`: its `[defaults]`,
+/// `[defaults.<type>]` and entry layers, read as [`project_egress`] says.
+fn entry_egress(
+    file: &toml::Table,
+    entry: mfile::entry::BoxEntry,
+) -> anyhow::Result<ProjectEgress> {
     let network_of = |table: &toml::Table| -> toml::Table {
         table
             .get("network")
@@ -520,23 +578,44 @@ fn project_egress_from(bytes: &[u8]) -> anyhow::Result<ProjectEgress> {
         body: network_of(&entry.body),
         ..entry
     };
-    if layers.defaults.is_empty() && layers.defaults_type.is_empty() && entry.body.is_empty() {
+    // The merge replaces a table whole, so the last layer that declares
+    // `network` holds the expanded entry's `network` table.
+    let layer = if !entry.body.is_empty() {
+        format!("[{}.{}]", entry.table.key(), entry.name)
+    } else if !layers.defaults_type.is_empty() {
+        format!(
+            "[defaults.{}]",
+            entry.box_type.as_deref().unwrap_or_default()
+        )
+    } else if !layers.defaults.is_empty() {
+        "[defaults]".to_owned()
+    } else {
         return Ok(ProjectEgress::default());
-    }
+    };
     let mut expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
     // The network module's own read: a malformed egress table refuses the
     // start with exit 3, as every invalid `minimal.toml` does.
     let hints = mfile::network::canonicalize(&mut expansion.spec)
         .map_err(|error| network_key_invalid(&expansion.spec, error))?;
-    let Some(egress) = expansion
-        .spec
-        .get("network")
-        .and_then(|network| network.get("egress"))
-    else {
+    let network = expansion.spec.get("network");
+    // `canonicalize` has rewritten a legacy spelling and refused a value
+    // that is not a mode, so the word is a current one.
+    let mode = match network
+        .and_then(|network| network.get("mode"))
+        .and_then(toml::Value::as_str)
+    {
+        Some("none") => Some(boxes::NetworkMode::NoNet),
+        Some("host_ip") => Some(boxes::NetworkMode::HostNet),
+        Some("own_ip") => Some(boxes::NetworkMode::OwnIp),
+        _ => None,
+    };
+    let Some(egress) = network.and_then(|network| network.get("egress")) else {
         return Ok(ProjectEgress {
             policy: None,
             hints,
+            mode,
+            layer: Some(layer),
         });
     };
     let mut egress: boxes::EgressPolicy =
@@ -551,6 +630,8 @@ fn project_egress_from(bytes: &[u8]) -> anyhow::Result<ProjectEgress> {
     Ok(ProjectEgress {
         policy: Some(egress),
         hints,
+        mode,
+        layer: Some(layer),
     })
 }
 
@@ -601,10 +682,17 @@ fn network_key_invalid(
     }
 }
 
-/// The box's effective egress: the project's declaration, with each field a
-/// flag names replaced by the flag's value. `--deny-all-egress` replaces
-/// the three allow lists, and the file's `deny_subnets` stays.
-fn effective_egress(
+/// The box's effective egress (arch#166): the project's declaration with
+/// the egress flags applied. `--allow-subnets`, `--allow-dns-hosts` and
+/// `--deny-subnets` add their values to the file's list, the file's values
+/// first and each value once. `--allow-protocols` replaces the file's list.
+/// `--deny-all-egress`, which never comes with an allow flag (the parse
+/// refuses the pair), can only narrow: it empties the file's
+/// `allow_subnets` and `allow_dns_hosts` and leaves the rest of the file's
+/// section in place (arch:1234). With no `allow_protocols` from the file or
+/// a flag, the section is [`boxes::EgressPolicy::deny_all`] (NET-140). The
+/// file's `deny_subnets` stay, and `--deny-subnets` adds to them.
+pub(crate) fn effective_egress(
     project: Option<boxes::EgressPolicy>,
     flags: Option<boxes::EgressPolicy>,
     deny_all_flag: bool,
@@ -615,64 +703,68 @@ fn effective_egress(
         "allow_protocols",
         "deny_subnets",
     ];
-    if deny_all_flag {
-        // `deny_all()` sets the three allow lists and leaves `deny_subnets`
-        // unset, so the file's deny ranges stay, under the file's name.
-        let deny_subnets = project.and_then(|project| project.deny_subnets);
-        let mut sources = FIELDS[..3]
-            .iter()
-            .map(|field| (*field, EgressSource::Flag))
-            .collect::<Vec<_>>();
-        if deny_subnets.is_some() {
-            sources.push((FIELDS[3], EgressSource::ProjectFile));
-        }
-        return EffectiveEgress {
-            policy: Some(boxes::EgressPolicy {
-                deny_subnets,
-                ..boxes::EgressPolicy::deny_all()
-            }),
-            sources,
-        };
-    }
-    if project.is_none() && flags.is_none() {
+    if project.is_none() && flags.is_none() && !deny_all_flag {
         return EffectiveEgress::default();
     }
     let project = project.unwrap_or_default();
     let flags = flags.unwrap_or_default();
     let mut sources = Vec::new();
-    let mut pick = |field: &'static str, flag_set: bool, file_set: bool| {
-        if flag_set {
-            sources.push((field, EgressSource::Flag));
-        } else if file_set {
+    // A list key: the file's values, then each flag value not already
+    // there.
+    let mut add = |field: &'static str,
+                   file: Option<Vec<String>>,
+                   flag: Option<Vec<String>>|
+     -> Option<Vec<String>> {
+        if file.is_some() {
             sources.push((field, EgressSource::ProjectFile));
         }
+        let Some(flag) = flag else {
+            return file;
+        };
+        sources.push((field, EgressSource::Flag));
+        let mut list = file.unwrap_or_default();
+        for value in flag {
+            if !list.contains(&value) {
+                list.push(value);
+            }
+        }
+        Some(list)
     };
-    pick(
-        FIELDS[0],
-        flags.allow_subnets.is_some(),
-        project.allow_subnets.is_some(),
-    );
-    pick(
-        FIELDS[1],
-        flags.allow_dns_hosts.is_some(),
-        project.allow_dns_hosts.is_some(),
-    );
-    pick(
-        FIELDS[2],
-        flags.allow_protocols.is_some(),
-        project.allow_protocols.is_some(),
-    );
-    pick(
-        FIELDS[3],
-        flags.deny_subnets.is_some(),
-        project.deny_subnets.is_some(),
-    );
+    let (allow_subnets, allow_dns_hosts) = if deny_all_flag {
+        (Some(Vec::new()), Some(Vec::new()))
+    } else {
+        (
+            add(FIELDS[0], project.allow_subnets, flags.allow_subnets),
+            add(FIELDS[1], project.allow_dns_hosts, flags.allow_dns_hosts),
+        )
+    };
+    let deny_subnets = add(FIELDS[3], project.deny_subnets, flags.deny_subnets);
+    // `--deny-all-egress` leaves the file's `allow_protocols` in place
+    // (arch:1234). With none from the file or a flag, the section is
+    // `deny_all()`, every allow list present and empty (NET-140).
+    let allow_protocols = if flags.allow_protocols.is_some() {
+        sources.push((FIELDS[2], EgressSource::Flag));
+        flags.allow_protocols
+    } else if project.allow_protocols.is_some() {
+        sources.push((FIELDS[2], EgressSource::ProjectFile));
+        project.allow_protocols
+    } else if deny_all_flag {
+        sources.push((FIELDS[2], EgressSource::Flag));
+        Some(Vec::new())
+    } else {
+        None
+    };
+    if deny_all_flag {
+        sources.push((FIELDS[0], EgressSource::Flag));
+        sources.push((FIELDS[1], EgressSource::Flag));
+    }
+    sources.sort_by_key(|(field, _)| FIELDS.iter().position(|f| f == field));
     EffectiveEgress {
         policy: Some(boxes::EgressPolicy {
-            allow_subnets: flags.allow_subnets.or(project.allow_subnets),
-            allow_dns_hosts: flags.allow_dns_hosts.or(project.allow_dns_hosts),
-            allow_protocols: flags.allow_protocols.or(project.allow_protocols),
-            deny_subnets: flags.deny_subnets.or(project.deny_subnets),
+            allow_subnets,
+            allow_dns_hosts,
+            allow_protocols,
+            deny_subnets,
         }),
         sources,
     }
@@ -1941,6 +2033,56 @@ fn ensure_registered_id(
     Err(anyhow::anyhow!(REGISTERED_ID_MISMATCH))
 }
 
+/// The egress section the egress flags declare, or `None` when no egress
+/// flag is given. `min session activate` and `min task run` both read their
+/// flags through it.
+///
+/// # Errors
+///
+/// An `--allow-protocols` value that is not a protocol.
+pub(crate) fn flag_egress(
+    args: &crate::EgressArgs,
+) -> Result<Option<boxes::EgressPolicy>, anyhow::Error> {
+    let mut allow_protocols = Vec::with_capacity(args.allow_protocols.len());
+    for spec in &args.allow_protocols {
+        allow_protocols.push(parse_egress_proto(spec)?);
+    }
+    // Any rule flag makes the declaration; a field with no values stays
+    // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
+    // records an allow-all policy that denies one range. `--deny-all-egress`
+    // is not a rule: [`effective_egress`] applies it to the file's lists.
+    let has_egress = !args.allow_subnets.is_empty()
+        || !allow_protocols.is_empty()
+        || !args.allow_dns_hosts.is_empty()
+        || !args.deny_subnets.is_empty();
+    Ok(has_egress.then_some(boxes::EgressPolicy {
+        allow_subnets: (!args.allow_subnets.is_empty())
+            .then(|| normalize_subnets(&args.allow_subnets)),
+        allow_dns_hosts: (!args.allow_dns_hosts.is_empty()).then(|| args.allow_dns_hosts.clone()),
+        allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
+        deny_subnets: (!args.deny_subnets.is_empty())
+            .then(|| normalize_subnets(&args.deny_subnets)),
+    }))
+}
+
+/// The line naming the masked network for each subnet flag that carries
+/// host bits, e.g. `--deny-subnets 10.0.0.1/8 is read as 10.0.0.0/8`.
+/// `min session activate`, `min task run` and `min box run` print them.
+pub(crate) fn subnet_notices(args: &crate::EgressArgs) -> Vec<String> {
+    let notices = |flag: &str, entries: &[String]| -> Vec<String> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                boxes::normalized_cidr(entry)
+                    .map(|normalized| format!("{flag} {entry} is read as {normalized}"))
+            })
+            .collect()
+    };
+    let mut lines = notices("--allow-subnets", &args.allow_subnets);
+    lines.extend(notices("--deny-subnets", &args.deny_subnets));
+    lines
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -1981,38 +2123,7 @@ pub(crate) async fn activate_box(
                 let mapping = parse_ingress_mapping(spec)?;
                 port_mappings.push(mapping);
             }
-            let mut allow_protocols = Vec::with_capacity(args.allow_protocols.len());
-            for spec in &args.allow_protocols {
-                allow_protocols.push(parse_egress_proto(spec)?);
-            }
-            // Any egress flag makes the declaration; a field with no values stays
-            // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
-            // records an allow-all policy that denies one range. `--deny-all-egress`
-            // is the whole declaration on its own: it maps to
-            // `boxes::EgressPolicy::deny_all()`, every allow list present and
-            // empty, rather than to four absent lists — a deny-all box declared by
-            // flag must read in the record exactly like one declared by file, which
-            // is the shape the host-address classifier decides its verdict on
-            // (NET-079) and the one `min session policy` names `deny-all`. The parse
-            // conflict (`cli.rs`) keeps it from combining with a rule flag, so the
-            // arms cannot both run.
-            let egress = if args.deny_all_egress {
-                Some(boxes::EgressPolicy::deny_all())
-            } else {
-                let has_egress = !args.allow_subnets.is_empty()
-                    || !allow_protocols.is_empty()
-                    || !args.allow_dns_hosts.is_empty()
-                    || !args.deny_subnets.is_empty();
-                has_egress.then_some(boxes::EgressPolicy {
-                    allow_subnets: (!args.allow_subnets.is_empty())
-                        .then(|| normalize_subnets(&args.allow_subnets)),
-                    allow_dns_hosts: (!args.allow_dns_hosts.is_empty())
-                        .then(|| args.allow_dns_hosts.clone()),
-                    allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
-                    deny_subnets: (!args.deny_subnets.is_empty())
-                        .then(|| normalize_subnets(&args.deny_subnets)),
-                })
-            };
+            let egress = flag_egress(&args.egress)?;
             Ok::<_, anyhow::Error>((utf8_path, abs_path, port_mappings, egress))
         })
         .await?;
@@ -2043,7 +2154,8 @@ pub(crate) async fn activate_box(
                     tracing::warn!(hint = %hint, "the project's network keys use a legacy spelling");
                 }
             }
-            let egress = effective_egress(project_egress.policy, egress, args.deny_all_egress);
+            let egress =
+                effective_egress(project_egress.policy, egress, args.egress.deny_all_egress);
             tracing::debug!(
                 egress = ?egress.policy,
                 sources = ?egress.sources,
@@ -2896,15 +3008,8 @@ pub(crate) async fn activate_box(
             // The notice is computed from the original flags, not the stored policy:
             // the policy now holds the normalized form, so reading it back would
             // print nothing.
-            for entry in &args.allow_subnets {
-                if let Some(normalized) = boxes::normalized_cidr(entry) {
-                    eprintln!("--allow-subnets {entry} is read as {normalized}");
-                }
-            }
-            for entry in &args.deny_subnets {
-                if let Some(normalized) = boxes::normalized_cidr(entry) {
-                    eprintln!("--deny-subnets {entry} is read as {normalized}");
-                }
+            for line in subnet_notices(&args.egress) {
+                eprintln!("{line}");
             }
             Ok::<_, anyhow::Error>(())
         })
@@ -3675,11 +3780,10 @@ mod tests {
             ingress: Vec::new(),
             dynamic_ingress: None,
             dynamic_range: None,
-            allow_subnets: Vec::new(),
-            allow_dns_hosts: vec!["github.com".into(), "api.github.com".into()],
-            allow_protocols: Vec::new(),
-            deny_subnets: Vec::new(),
-            deny_all_egress: false,
+            egress: crate::EgressArgs {
+                allow_dns_hosts: vec!["github.com".into(), "api.github.com".into()],
+                ..crate::EgressArgs::default()
+            },
             credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: true,
@@ -4098,11 +4202,7 @@ mod tests {
             ingress: Vec::new(),
             dynamic_ingress: None,
             dynamic_range: None,
-            allow_subnets: Vec::new(),
-            allow_dns_hosts: Vec::new(),
-            allow_protocols: Vec::new(),
-            deny_subnets: Vec::new(),
-            deny_all_egress: false,
+            egress: crate::EgressArgs::default(),
             credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: true,
@@ -5313,49 +5413,61 @@ mod tests {
         );
     }
 
-    /// NET-060: a flag replaces the project file's value for the field it
-    /// names, and leaves the other fields as the file declares them.
+    /// NET-060, arch#166: a list flag adds to the project file's list, the
+    /// file's values first and each value once, `--allow-protocols`
+    /// replaces the file's list, and the fields no flag names stay as the
+    /// file declares them. This is `min session activate`'s rule and the
+    /// run verbs'.
     #[test]
-    fn egress_flag_replaces_the_project_field() {
+    fn egress_flag_adds_to_the_project_list() {
         let project = project_egress_from(
             b"[defaults.network.egress]\n\
               allow_subnets = [\"10.0.0.0/8\"]\n\
               allow_dns_hosts = [\"github.com\"]\n\
+              allow_protocols = [\"udp\"]\n\
               deny_subnets = [\"169.254.169.254/32\"]\n",
         )
         .unwrap()
         .policy;
         let flags = boxes::EgressPolicy {
-            allow_subnets: Some(vec!["192.168.0.0/16".into()]),
+            allow_subnets: Some(vec!["192.168.0.0/16".into(), "10.0.0.0/8".into()]),
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+            deny_subnets: Some(vec!["172.16.0.0/12".into()]),
             ..boxes::EgressPolicy::default()
         };
         let effective = effective_egress(project.clone(), Some(flags), false);
         assert_eq!(
             effective.policy,
             Some(boxes::EgressPolicy {
-                allow_subnets: Some(vec!["192.168.0.0/16".into()]),
+                allow_subnets: Some(vec!["10.0.0.0/8".into(), "192.168.0.0/16".into()]),
                 allow_dns_hosts: Some(vec!["github.com".into()]),
-                allow_protocols: None,
-                deny_subnets: Some(vec!["169.254.169.254/32".into()]),
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                deny_subnets: Some(vec!["169.254.169.254/32".into(), "172.16.0.0/12".into()]),
             })
         );
         assert_eq!(
             effective.sources,
             [
+                ("allow_subnets", EgressSource::ProjectFile),
                 ("allow_subnets", EgressSource::Flag),
                 ("allow_dns_hosts", EgressSource::ProjectFile),
+                ("allow_protocols", EgressSource::Flag),
                 ("deny_subnets", EgressSource::ProjectFile),
+                ("deny_subnets", EgressSource::Flag),
             ]
         );
 
-        // `--deny-all-egress` replaces the three allow lists. It sets no
-        // deny range, so the file's `deny_subnets` stays, under the file.
-        let denied = effective_egress(project, None, true);
+        // `--deny-all-egress` alone empties the two destination lists and
+        // sets no deny range, so the file's `allow_protocols` and
+        // `deny_subnets` stay, under the file (arch:1234).
+        let denied = effective_egress(project.clone(), None, true);
         assert_eq!(
             denied.policy,
             Some(boxes::EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![boxes::IpProto::Udp]),
                 deny_subnets: Some(vec!["169.254.169.254/32".into()]),
-                ..boxes::EgressPolicy::deny_all()
             })
         );
         assert_eq!(
@@ -5363,9 +5475,36 @@ mod tests {
             [
                 ("allow_subnets", EgressSource::Flag),
                 ("allow_dns_hosts", EgressSource::Flag),
-                ("allow_protocols", EgressSource::Flag),
+                ("allow_protocols", EgressSource::ProjectFile),
                 ("deny_subnets", EgressSource::ProjectFile),
             ]
+        );
+        // With no file it is the deny-all section (NET-140).
+        assert_eq!(
+            effective_egress(None, None, true).policy,
+            Some(boxes::EgressPolicy::deny_all())
+        );
+
+        // `--deny-all-egress` only narrows: it empties the file's allow
+        // lists, `--allow-protocols` replaces the protocols, and
+        // `--deny-subnets` adds to the file's denies.
+        let narrowed = effective_egress(
+            project,
+            Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                deny_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..boxes::EgressPolicy::default()
+            }),
+            true,
+        );
+        assert_eq!(
+            narrowed.policy,
+            Some(boxes::EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                deny_subnets: Some(vec!["169.254.169.254/32".into(), "10.0.0.0/8".into()]),
+            })
         );
     }
 }
