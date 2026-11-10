@@ -1654,63 +1654,6 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
     );
 }
 
-/// `min session attach` with no session argument and `--no-input` errors cleanly when
-/// no sessions exist, rather than hanging or shelling out to ssh. The error
-/// surfaces before any ssh exec, so it is deterministic in a test environment.
-/// It also surfaces before the terminal check, because a script reads it.
-#[tokio::test]
-async fn attach_with_no_session_errors_when_no_sessions_exist() {
-    let (_daemon, mut global) = setup().await;
-    global.no_input = true;
-
-    let err = cmd_attach(&global, AttachArgs { session: None })
-        .await
-        .unwrap_err()
-        .to_string();
-    assert_eq!(
-        err, "No session box with a terminal in this project. Start one with min session start.",
-        "expected the 'no session box' refusal"
-    );
-}
-
-/// `min session attach` with no session argument and `--no-input` errors with a list
-/// of candidates when more than one session shares the current directory,
-/// rather than opening a picker. Both sessions are built from the same
-/// canonicalized tempdir so the cwd match is deterministic across platforms.
-/// The list surfaces before the terminal check, because a script reads it.
-#[tokio::test]
-async fn attach_with_no_session_errors_when_ambiguous_and_no_input() {
-    let (daemon, mut global) = setup().await;
-
-    // Two sessions built from the same directory make the choice ambiguous.
-    let cwd = tempfile::TempDir::new().unwrap();
-    let cwd_canon = cwd.path().canonicalize().unwrap();
-    let cwd_str = camino::Utf8PathBuf::from_path_buf(cwd_canon).unwrap();
-    let abs_path = paths::HostAbsPath::try_new(cwd_str).unwrap();
-    create_session_at(&daemon, "amb-1", abs_path.clone()).await;
-    create_session_at(&daemon, "amb-2", abs_path).await;
-
-    global.no_input = true;
-    // `--repo-dir` overrides the cwd used for matching; canonicalized by the
-    // resolver, it equals the sessions' project_path above.
-    global.repo_dir = Some(cwd.path().to_path_buf());
-
-    let err = cmd_attach(&global, AttachArgs { session: None })
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.starts_with("More than one session box in this project has a terminal:"),
-        "expected an ambiguity error, got: {err}"
-    );
-    assert!(err.contains("amb-1"), "candidates list names: {err}");
-    assert!(err.contains("amb-2"), "candidates list names: {err}");
-    assert!(
-        err.contains("min session attach <box>"),
-        "should suggest explicit attach, got: {err}"
-    );
-}
-
 // --- destroy ---
 
 #[tokio::test]

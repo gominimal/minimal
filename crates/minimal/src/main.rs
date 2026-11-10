@@ -1433,6 +1433,13 @@ mod tests {
                 2,
             ),
             (
+                minimal::BoxAttachRefusal::NotResumable {
+                    address: "web".to_owned(),
+                    state: "running".to_owned(),
+                },
+                2,
+            ),
+            (
                 minimal::BoxAttachRefusal::NameHeld {
                     address: "web".to_owned(),
                     name: "web".to_owned(),

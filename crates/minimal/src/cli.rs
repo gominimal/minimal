@@ -477,7 +477,8 @@ pub enum BoxCommand {
     Attach(BoxAttachArgs),
     /// Start a stopped or exited box that has a terminal again, from the
     /// spec it was created with, and attach this terminal to it. A box that
-    /// runs already is attached and not started again
+    /// is not stopped or exited is refused. Attach to a running box with
+    /// `min box attach`
     Resume(BoxResumeArgs),
     /// Create a box from an entry of the project. A box with a terminal
     /// attaches this terminal to it, unless `--detach` is given. Any other

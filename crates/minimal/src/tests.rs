@@ -9680,8 +9680,7 @@ async fn box_attach_reattaches_pty_box() {
 }
 
 /// BCLI-068: without a terminal on stdin the attach fails with exit 2
-/// after the box is chosen and before the hand-off, so a stopped box is
-/// not resumed and stays stopped.
+/// before any lookup, so a stopped box is not resumed and stays stopped.
 #[tokio::test]
 async fn box_attach_without_tty_exit2() {
     let alpha = AttachHost::start("alpha.local-minvmd0").await;
@@ -9706,6 +9705,20 @@ async fn box_attach_without_tty_exit2() {
         );
     }
     assert_eq!(address_state(&alpha.host, "web").await, "stopped");
+
+    // No host knows the box, or there is no host: the refusal is still the
+    // no-terminal one, because the check comes before any lookup.
+    for hosts in [vec![alpha.host.clone()], Vec::new()] {
+        let err = box_attach_on_hosts(hosts, Some("no-such-box"), None, false, no_attach)
+            .await
+            .expect_err("no terminal, no attach");
+        let (message, code) = attach_refusal(&err);
+        assert_eq!(code, 2, "{message}");
+        assert_eq!(
+            message,
+            "Cannot attach: stdin is not a terminal. Run `min box attach` from a terminal."
+        );
+    }
     // The check needs no host at all.
     assert!(ensure_box_attach_tty(true).is_ok());
 }
@@ -13162,6 +13175,60 @@ async fn attach_and_resume_verbs_resume_stopped_pty_box() {
     }
     // The attach here only records its target, so the box is not resumed.
     assert_eq!(address_state(&alpha.host, "web").await, "stopped");
+
+    // Arch C1: `min box resume` of a running box exits 2 and makes no
+    // attach call. `min box attach` and `min session attach` attach it.
+    let live = alpha.create("live", Some(true)).await;
+    let (message, code) = refused_by(AttachVerb::BoxResume, &hosts, Some("live"), None).await;
+    assert_eq!(code, 2, "{message}");
+    assert_eq!(
+        message,
+        "Cannot resume live: the box is running.\nAttach to it with min box attach live."
+    );
+    for verb in [AttachVerb::BoxAttach, AttachVerb::SessionAttach] {
+        let target = attached_by(verb, &hosts, Some("live"), None)
+            .await
+            .unwrap_or_else(|err| panic!("{verb:?}: {err:#}"));
+        assert_eq!(target.box_id, live, "{verb:?}");
+    }
+    assert_eq!(address_state(&alpha.host, "live").await, "running");
+}
+
+/// NET-058: a named attach finds a box that only another VM knows, with
+/// no `--vm`. The attach looks only on the VM that holds the box, and it
+/// runs there.
+#[tokio::test]
+async fn named_attach_finds_box_only_another_vm_knows() {
+    let (state, default_vm, alpha) = two_vms().await;
+    create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+    let global = vm_globals(state.path(), None);
+    let alpha_sock = state.path().join("providers/local-minvmd0/alpha/ssh.sock");
+    let hosts = local_hosts(&global).expect("the local hosts");
+    assert_eq!(hosts.len(), 2, "{hosts:?}");
+
+    for verb in [AttachVerb::SessionAttach, AttachVerb::BoxAttach] {
+        let on = named_attach_hosts(&global, hosts.clone(), verb, "web")
+            .await
+            .unwrap_or_else(|err| panic!("{verb:?}: {err:#}"));
+        assert_eq!(
+            on.iter().map(|h| h.sock.clone()).collect::<Vec<_>>(),
+            vec![alpha_sock.clone()],
+            "{verb:?}: only the VM that holds the box"
+        );
+        let target = attached_by(verb, &on, Some("web"), None)
+            .await
+            .unwrap_or_else(|err| panic!("{verb:?}: {err:#}"));
+        assert_eq!(target.box_id, web, "{verb:?}");
+        assert_eq!(target.host.sock, alpha_sock, "{verb:?}");
+    }
+
+    // A name no VM knows keeps every host, so the attach refuses the
+    // address.
+    let on = named_attach_hosts(&global, hosts.clone(), AttachVerb::BoxAttach, "nope")
+        .await
+        .expect("a name no VM knows is not an error here");
+    assert_eq!(on, hosts);
 }
 
 /// BCLI-007: a resume of a box with a terminal whose name a running box on

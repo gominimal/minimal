@@ -570,6 +570,13 @@ pub enum BoxAttachRefusal {
         /// `min box restart` starts it again. Else `min box run` does.
         until_stopped: bool,
     },
+    /// `min box resume` named a box that is not stopped or exited. Exit 2.
+    NotResumable {
+        /// The box as the caller named it.
+        address: String,
+        /// The box's state.
+        state: String,
+    },
     /// A running box on the same host holds the name of the stopped or
     /// exited box to resume. Exit 2.
     NameHeld {
@@ -636,6 +643,7 @@ impl BoxAttachRefusal {
             | Self::NoTerminalInBox { .. }
             | Self::NoTerminalInExec { .. }
             | Self::NoTerminalToResume { .. }
+            | Self::NotResumable { .. }
             | Self::NameHeld { .. }
             | Self::Ambiguous { .. }
             | Self::AmbiguousSessions { .. } => 2,
@@ -653,6 +661,7 @@ impl BoxAttachRefusal {
             Self::NoTerminal => "no client terminal",
             Self::NoTerminalInBox { .. } => "box has no terminal",
             Self::NoTerminalToResume { .. } => "box has no terminal to resume",
+            Self::NotResumable { .. } => "box not stopped",
             Self::NameHeld { .. } => "name held by a running box",
             Self::Ambiguous { .. } | Self::AmbiguousSessions { .. } => "ambiguous",
             Self::NoCandidate | Self::NoSessionCandidate => "no candidate",
@@ -709,6 +718,14 @@ impl std::fmt::Display for BoxAttachRefusal {
                     write!(f, "Restart it with min box restart {address}.")
                 } else {
                     write!(f, "Run it again with min box run <entry>.")
+                }
+            }
+            Self::NotResumable { address, state } => {
+                writeln!(f, "Cannot resume {address}: the box is {state}.")?;
+                if state == "running" {
+                    write!(f, "Attach to it with min box attach {address}.")
+                } else {
+                    write!(f, "Only a stopped or exited box can resume.")
                 }
             }
             // BCLI-007: names the running box, and the renames that free
@@ -879,7 +896,7 @@ pub(crate) enum BoxAfterAttach {
 }
 
 /// Refuses an attach from a caller with no terminal on stdin. It runs
-/// before the hand-off, so the box is not resumed and its state and events
+/// before any lookup, so the box is not resumed and its state and events
 /// do not change.
 pub(crate) fn ensure_box_attach_tty(stdin_is_tty: bool) -> Result<(), BoxAttachRefusal> {
     if stdin_is_tty {
@@ -896,6 +913,7 @@ pub(crate) fn ensure_box_attach_tty(stdin_is_tty: bool) -> Result<(), BoxAttachR
 /// after one line that names why the daemon ended the attach.
 pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<(), anyhow::Error> {
     let stdin_is_tty = std::io::stdin().is_terminal();
+    ensure_box_attach_tty(stdin_is_tty)?;
     if let Some(exec_id) = args.exec.as_deref() {
         // clap refuses `--exec` without a box (BCLI-068), so this holds.
         let address = args
@@ -924,7 +942,8 @@ pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<
 }
 
 /// `min box resume <box>`: attaches this terminal to the box, which
-/// resumes a stopped or exited box that has a terminal (BCLI-007).
+/// resumes a stopped or exited box that has a terminal (BCLI-007). A box
+/// in any other state is refused.
 pub async fn cmd_box_resume(global: &GlobalArgs, args: BoxResumeArgs) -> Result<(), anyhow::Error> {
     attach_command(global, AttachVerb::BoxResume, Some(&args.target)).await
 }
@@ -946,6 +965,7 @@ async fn attach_command(
     target: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     let stdin_is_tty = std::io::stdin().is_terminal();
+    ensure_box_attach_tty(stdin_is_tty)?;
     let scope = match target {
         Some(_) => None,
         None => {
@@ -955,6 +975,10 @@ async fn attach_command(
     };
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
+    let hosts = match target {
+        Some(address) => named_attach_hosts(global, hosts, verb, address).await?,
+        None => hosts,
+    };
     let kind = daemon_host_kind(global);
     let ending = attach_on_hosts(
         verb,
@@ -982,6 +1006,82 @@ async fn attach_command(
         eprintln!("{notice}");
     }
     Err(Handoff::Exit(ending.code).into())
+}
+
+/// The hosts a named attach of `verb` looks on (NET-058). For a name or an
+/// id with no `--vm`, the selected VM's daemon is asked first, and its
+/// answer is gated on the daemon's build. A name that a second VM also
+/// holds is refused as ambiguous. When the selected VM does not know the
+/// name, [`crate::attach::resolve_box_vm`] finds the VM that owns it. The
+/// process then acts on that VM, as `--vm` makes it, and the attach
+/// announces the VM. A box only a stopped VM holds is refused with the
+/// command that starts that VM. The attach then looks only on the host
+/// that holds the box. When no VM knows the name, every host stays, and
+/// [`attach_target`] refuses the address. A `provider/host/name` address
+/// names its host, so it keeps every host.
+pub(crate) async fn named_attach_hosts(
+    global: &GlobalArgs,
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    verb: AttachVerb,
+    address: &str,
+) -> Result<Vec<crate::cmd::list::LocalHost>, anyhow::Error> {
+    let BoxAddress::Unqualified(name) = parse_box_address(address) else {
+        return Ok(hosts);
+    };
+    if global.vm.is_some() {
+        return Ok(hosts);
+    }
+    let Some(selected) = hosts.iter().find(|h| h.selected).cloned() else {
+        return Ok(hosts);
+    };
+    let mut client = client::Client::connect(&selected.sock)
+        .await
+        .context("Failed to connect to minimald")?;
+    let sock = match resolve_session_version_gated(&mut client, name).await {
+        Ok(record) => {
+            // A second VM that holds the name makes it ambiguous.
+            ensure_selected_holds_box_alone(global, name, &record).await?;
+            selected.sock
+        }
+        Err(missed) => match crate::attach::resolve_box_vm(global, name).await? {
+            Some(resolved) => {
+                // From here the process acts on the owning VM, as `--vm`
+                // makes it. A second set is a no-op.
+                let _ = client::set_vm_name(&resolved.vm);
+                tracing::info!(
+                    verb = verb.name(),
+                    box_id = %resolved.record.id,
+                    vm = %resolved.vm,
+                    outcome = "resolved on another VM"
+                );
+                // The user did not choose the VM, so say which one it is.
+                if should_announce_box(global) {
+                    let noun = match verb {
+                        AttachVerb::SessionAttach => "session",
+                        AttachVerb::BoxAttach | AttachVerb::BoxResume => "box",
+                    };
+                    eprintln!(
+                        "Attaching to {noun} {} on VM {}",
+                        box_announce_label(&resolved.record.id, resolved.record.name.as_deref()),
+                        resolved.vm
+                    );
+                }
+                resolved.sock
+            }
+            // No VM knows the name: the address refusal of every host is
+            // the answer.
+            None if missed.downcast_ref::<crate::cmd::BoxNotFound>().is_some() => {
+                return Ok(hosts);
+            }
+            // The selected daemon's own failure, such as a version skew.
+            None => return Err(missed),
+        },
+    };
+    if hosts.iter().any(|h| h.sock == sock) {
+        Ok(hosts.into_iter().filter(|h| h.sock == sock).collect())
+    } else {
+        Ok(hosts)
+    }
 }
 
 /// What the box's records say of an exec id that `min box attach --exec`
@@ -1299,9 +1399,8 @@ pub(crate) fn ssh_exit_code(attached: Result<(), anyhow::Error>) -> Result<i32, 
 }
 
 /// An attach of `verb` over the local `hosts`: `min box attach`,
-/// `min box resume` or `min session attach`. It finds the box
-/// ([`attach_target`]), refuses a caller with no terminal, runs `attach`
-/// on the box, and
+/// `min box resume` or `min session attach`. It refuses a caller with no
+/// terminal, finds the box ([`attach_target`]), runs `attach` on it, and
 /// reads how the attach ended ([`attach_ending`]). `scope` is the current
 /// project's root, which the bare form reads.
 pub(crate) async fn attach_on_hosts<A>(
@@ -1316,11 +1415,8 @@ where
     A: AsyncFnOnce(&BoxAttachTarget) -> Result<i32, anyhow::Error>,
 {
     let name = verb.name();
-    // The address refusals come first, because a script without a terminal
-    // reads them: none is exit 4, ambiguous is exit 2. Only a chosen box
-    // meets the terminal check, and the box resumes only in `attach`.
-    let target = attach_target(verb, hosts, address, scope).await?;
     ensure_box_attach_tty(stdin_is_tty)?;
+    let target = attach_target(verb, hosts, address, scope).await?;
     tracing::info!(
         verb = name,
         box_id = %target.box_id,
@@ -1366,9 +1462,12 @@ where
 /// one, with the command that starts it again (BCLI-009). With no box
 /// named, the current project's running box with a terminal is the one,
 /// else its only stopped or exited box with a terminal. Every host must
-/// answer that lookup. A stopped or exited box with a terminal resumes in
-/// the attach, so it is refused here when a running box on its host holds
-/// its name (BCLI-007), after the terminal check, as the host checks.
+/// answer that lookup. `min box resume` of a named box that is not stopped
+/// or exited is refused before the box's terminal checks. A stopped or
+/// exited box with a terminal resumes in the attach, so it is refused here
+/// when a running box on its host holds its name (BCLI-007). That check
+/// comes after the box's terminal checks, as the host checks. The caller's
+/// terminal is checked before this lookup ([`attach_on_hosts`]).
 pub(crate) async fn attach_target(
     verb: AttachVerb,
     mut hosts: Vec<crate::cmd::list::LocalHost>,
@@ -1464,6 +1563,15 @@ pub(crate) async fn attach_target(
     };
     let record = shown.record;
     let retained = matches!(record.state.as_str(), "stopped" | "exited");
+    // Only a stopped or exited box resumes. This check comes before the
+    // box's terminal checks, so a running box is sent to `min box attach`.
+    if verb == AttachVerb::BoxResume && !retained {
+        let refusal = BoxAttachRefusal::NotResumable {
+            address: address.to_owned(),
+            state: record.state.clone(),
+        };
+        return Err(refuse(refusal, Some(box_id)));
+    }
     if !record.pty_enabled && record.state == "running" {
         let refusal = BoxAttachRefusal::NoTerminalInBox {
             address: address.to_owned(),
