@@ -29,6 +29,8 @@ mod policy;
 mod show;
 #[path = "boxes/vm_host.rs"]
 mod vm_host;
+#[path = "boxes/wait.rs"]
+mod wait;
 
 pub(crate) use address::*;
 pub use address::{AddressCandidate, BoxAddressRefusal};
@@ -45,6 +47,8 @@ pub use list::*;
 pub use policy::*;
 pub use show::*;
 pub(crate) use vm_host::*;
+pub use wait::BoxTimedOut;
+pub(crate) use wait::*;
 
 /// `min session logs`, `min task logs` and `min box logs` (BOX-155,
 /// BCLI-012): the `min box logs` verb, filtered to `box_type` under a type
