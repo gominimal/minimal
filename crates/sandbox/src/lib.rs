@@ -250,21 +250,25 @@ impl<C: Channel> Sandbox<C> {
         fs::create_dir_all(&rootfs)
             .map_err(|e| Error::IO("create rootfs dir", rootfs.clone(), e))?;
         let hardlinking_start = SystemTime::now();
-        let mut collisions = common::LinkCollisions::default();
+        // The record names each differing path with the layer that lost;
+        // the layers, in link order, are what finds the one that won
+        // (`log_rootfs_collisions`).
+        let mut collisions = common::LinkCollisions::recording();
+        let mut layers: Vec<PathBuf> = Vec::with_capacity(config.rootfs.len() + 2);
         for i in config.rootfs.iter() {
-            match i {
-                config::SandboxMapped::Dir(p) => {
-                    hardlink_dir_contents_counted(p, &rootfs, &mut collisions)?;
-                }
-                config::SandboxMapped::TempDir(td) => {
-                    hardlink_dir_contents_counted(td.path(), &rootfs, &mut collisions)?;
-                }
+            let layer = match i {
+                config::SandboxMapped::Dir(p) => p.as_path(),
+                config::SandboxMapped::TempDir(td) => td.path(),
                 config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
                     return Err(Error::MappedFile(p.clone()));
                 }
-            }
+            };
+            hardlink_dir_contents_counted(layer, &rootfs, &mut collisions)?;
+            layers.push(layer.to_path_buf());
         }
-        hardlink_dir_contents_counted(&base_dir.join("synth"), &rootfs, &mut collisions)?;
+        let synth = base_dir.join("synth");
+        hardlink_dir_contents_counted(&synth, &rootfs, &mut collisions)?;
+        layers.push(synth);
 
         // MINIMAL_INTERNAL_CS_BUILD bundle: when the env var is "1"
         // AND the convention path exists on host, hardlink that
@@ -287,9 +291,10 @@ impl<C: Channel> Sandbox<C> {
             let cs_mirror = Path::new("/root/.cache/minimal/cs-mirror");
             if cs_mirror.exists() {
                 hardlink_dir_contents_counted(cs_mirror, &rootfs, &mut collisions)?;
+                layers.push(cs_mirror.to_path_buf());
             }
         }
-        log_rootfs_collisions(&collisions);
+        log_rootfs_collisions(&collisions, &layers, &rootfs);
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
         // On aarch64, autotools/libtool defaults to installing libraries
@@ -2881,15 +2886,38 @@ fn hardlink_dir_contents_counted(
         .map_err(Error::HardlinkFailed)
 }
 
-/// One line for the paths that more than one rootfs layer shipped. It is
-/// INFO only when some of them differ (each of those also has its own
-/// WARN); an overlap where every path matches is the usual case, at debug.
-fn log_rootfs_collisions(c: &common::LinkCollisions) {
+/// The lines for the paths that more than one rootfs layer shipped. Each
+/// differing path on record gets a WARN naming both layers: the one whose
+/// file stays, found by the inode the assembled path carries among
+/// `layers` in link order, and the one whose copy was refused
+/// (gominimal/inbox#1226: the per-file line used to name the loser alone,
+/// and finding the pair meant re-assembling the box). The summary is INFO
+/// when some paths differ, and names the layers; an overlap where every
+/// path matches is the usual case, at debug.
+fn log_rootfs_collisions(c: &common::LinkCollisions, layers: &[PathBuf], rootfs: &Path) {
+    for d in &c.differing {
+        let winner = collision_winner(rootfs, layers, &d.rel);
+        tracing::warn!(
+            path = %d.rel.display(),
+            winner = winner.map(|w| w.display().to_string()).as_deref().unwrap_or("unknown"),
+            loser = %d.loser.display(),
+            why = d.why,
+            "rootfs: two layers ship this path with different contents; the \
+             first-linked file, the winner's, stays"
+        );
+    }
     if c.differ > 0 {
+        let kept = c.differing.len();
         tracing::info!(
             same = c.same,
             unchecked = c.unchecked,
             differ = c.differ,
+            named = kept,
+            layers = %layers
+                .iter()
+                .map(|l| l.file_name().map_or_else(|| l.display().to_string(), |n| n.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>()
+                .join(","),
             "rootfs: paths shipped by more than one layer; the first-linked file stays"
         );
     } else if c.total() > 0 {
@@ -2900,6 +2928,23 @@ fn log_rootfs_collisions(c: &common::LinkCollisions) {
             "rootfs: paths shipped by more than one layer; the first-linked file stays"
         );
     }
+}
+
+/// The layer whose file stands at `rel` in the assembled `rootfs`: the
+/// first of `layers`, in link order, whose own `rel` is the same inode as
+/// the assembled one (the link pass hardlinks, so the winner's file and
+/// the rootfs path are one). `None` when no layer holds that inode, as for
+/// a path the assembly copied across filesystems.
+fn collision_winner<'a>(rootfs: &Path, layers: &'a [PathBuf], rel: &Path) -> Option<&'a Path> {
+    use std::os::unix::fs::MetadataExt as _;
+    let placed = fs::symlink_metadata(rootfs.join(rel)).ok()?;
+    layers
+        .iter()
+        .find(|layer| {
+            fs::symlink_metadata(layer.join(rel))
+                .is_ok_and(|m| m.dev() == placed.dev() && m.ino() == placed.ino())
+        })
+        .map(PathBuf::as_path)
 }
 
 /// Logs a working input that was not placed at `dest` because something is
@@ -4153,6 +4198,51 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Two layers ship one path with different bytes: the record names the
+    /// loser, and the winner is the layer whose inode the assembled path
+    /// carries, found in link order (gominimal/inbox#1226).
+    #[test]
+    fn collision_winner_is_the_layer_whose_inode_the_rootfs_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let rootfs = tmp.path().join("rootfs");
+        for layer in [&a, &b] {
+            std::fs::create_dir_all(layer.join("usr/lib/node_modules/npm")).unwrap();
+        }
+        std::fs::write(
+            a.join("usr/lib/node_modules/npm/package.json"),
+            b"{\"v\":1}",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("usr/lib/node_modules/npm/package.json"),
+            b"{\"v\":22}",
+        )
+        .unwrap();
+        let mut counts = common::LinkCollisions::recording();
+        super::hardlink_dir_contents_counted(&a, &rootfs, &mut counts).unwrap();
+        super::hardlink_dir_contents_counted(&b, &rootfs, &mut counts).unwrap();
+        assert_eq!(counts.differ, 1);
+        let d = &counts.differing[0];
+        assert_eq!(
+            d.rel,
+            std::path::Path::new("usr/lib/node_modules/npm/package.json")
+        );
+        assert_eq!(d.loser, b);
+        assert_eq!(d.why, "different size");
+        let layers = [a.clone(), b.clone()];
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, &d.rel),
+            Some(a.as_path()),
+            "the first-linked layer's inode is the one the rootfs carries"
+        );
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, std::path::Path::new("usr/lib/none")),
+            None
+        );
+    }
+
     use super::*;
 
     /// gominimal/inbox#1219: a refused join of a box's leaf says why on the
