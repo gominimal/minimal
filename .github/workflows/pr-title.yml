@@ -33,6 +33,6 @@ jobs:
         run: |
           re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^()]+\))?!?: [^[:space:]]'
           if [[ ! "$TITLE" =~ $re ]]; then
-            echo "::error::Use a Conventional Commit subject: fix(boxes): summary, or feat(boxes): T102 — summary. See docs/commit-conventions.md."
+            echo "::error::Use a Conventional Commit subject: fix(boxes): summary, or feat(boxes): T102 — summary. A title from the Revert button needs retitling to revert: summary. See docs/commit-conventions.md."
             exit 1
           fi
