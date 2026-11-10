@@ -104,7 +104,7 @@ use std::time::Duration;
 use minimald_rpc::{
     AdmitPortRequest, BoxAddresses, BoxControlReply, BoxControlRequest, BoxRow, IpProto,
     PortReportSource, ProxyDownCause, ReadRowRequest, RegisterBoxRequest, RegisteredBox,
-    WithdrawBoxRequest, WithdrawPortRequest,
+    RenameBoxRequest, WithdrawBoxRequest, WithdrawPortRequest,
 };
 
 use crate::box_registry::{AllocationError, BoxRegistry, ClientBoxSpec};
@@ -1286,6 +1286,12 @@ fn serve_request(
             let reply = resume_reply(boxes, answerer, order, request);
             write_reply(stream, &reply)
         }
+        // A rename changes the zone the answerer answers from, so it takes
+        // its turn as a hold or a withdrawal does (#1116).
+        (BoxControlRequest::RenameBox(request), ControlDoor::Host) => {
+            let reply = order.apply(|| rename_box(boxes, &request));
+            write_reply(stream, &reply)
+        }
         // A read of the host's own table, like the row read: no ticket.
         // The table is this supervisor's, and a supervisor runs one VM and
         // binds this door for that VM's vsock bridge alone, so the answer
@@ -1991,6 +1997,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
     match request {
         BoxControlRequest::Register(_) => "register",
         BoxControlRequest::Withdraw(_) => "withdraw",
+        BoxControlRequest::RenameBox(_) => "rename_box",
         BoxControlRequest::HoldBoxName(_) => "hold_box_name",
         BoxControlRequest::ReleaseBoxName(_) => "release_box_name",
         BoxControlRequest::AdmitHostIpBox(_) => "admit_host_ip_box",
@@ -2418,6 +2425,59 @@ fn allocate_box_address_keeping(
             error: format!("could not give the box an address: {reason}"),
         }
     })
+}
+
+/// Serves a renamed session's rename of its box (#1116): the registry
+/// re-keys the row, its task rows and its creation to the new name
+/// ([`BoxRegistry::rename_client_box`]) and pings the table, so the zone
+/// answers the box's address under the new name and nothing under the old
+/// one. The answerer's book follows on the publish the ping sets off: the
+/// row carries the same address under the new name, and the book records
+/// the address against the name the row now has. Answered with the pair
+/// echoed; a refusal is an error sentence and moves nothing. One info line
+/// names both names and the pair.
+fn rename_box(boxes: &BoxRegistry, request: &RenameBoxRequest) -> BoxControlReply {
+    match boxes.rename_client_box(
+        &request.new_name,
+        request.switch_address,
+        request.loopback_address,
+        request.box_id.to_bytes(),
+    ) {
+        Ok(held) => {
+            match &held {
+                Some(held) => tracing::info!(
+                    box = %request.new_name,
+                    was = %held,
+                    asked_as = %request.name,
+                    switch_address = %request.switch_address,
+                    loopback_address = %request.loopback_address,
+                    "moved the renamed box's host row and its name to the new name"
+                ),
+                None => tracing::debug!(
+                    box = %request.new_name,
+                    asked_as = %request.name,
+                    switch_address = %request.switch_address,
+                    "no host row or creation held for the renamed box; nothing to move"
+                ),
+            }
+            BoxControlReply::Addresses(BoxAddresses {
+                switch_address: request.switch_address,
+                loopback_address: request.loopback_address,
+            })
+        }
+        Err(error) => {
+            tracing::info!(
+                box = %request.name,
+                new_name = %request.new_name,
+                switch_address = %request.switch_address,
+                error = %error,
+                "box rename refused; the host row stays under its name"
+            );
+            BoxControlReply::Error {
+                error: error.to_string(),
+            }
+        }
+    }
 }
 
 /// Remove the row the request's pair proves its client created, and build
@@ -3224,7 +3284,7 @@ fn audit_refused_egress(
     );
     let audited = take_guest_audit(
         audit_path,
-        record.name(),
+        &record.name(),
         GuestAuditKey::Switch(request.switch_address),
         &admission,
     );
@@ -5140,7 +5200,7 @@ mod tests {
         let row = table
             .by_source(record.switch_addr().octets())
             .expect("the registration filled the row the gate reads");
-        assert_eq!(row.name(), "web");
+        assert_eq!(&*row.name(), "web");
         assert_eq!(row.switch_addr(), record.switch_addr());
         assert_eq!(row.loopback_addr(), record.loopback_addr());
         assert_eq!(row.admitted_ports(), [8080]);
@@ -6803,6 +6863,124 @@ mod tests {
             .expect("the published address is released");
         assert_eq!(name, "web", "released by the name it was allocated under");
         assert!(address.is_some(), "the release freed the box's address");
+    }
+
+    /// #1116 over the control socket: the renamed creator's rename verb,
+    /// with the pair and the box id its registration handed back, moves the
+    /// row to the new name; another box's id is refused and moves nothing.
+    /// After the move the box is the new name's on the host: a lookup by
+    /// the new name finds it, the old name finds nothing, and a destroy
+    /// under the new name withdraws it without an id, the answerer
+    /// releasing the published address by the new name.
+    #[test]
+    fn a_rename_moves_the_row_and_the_destroy_releases_the_new_name() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        let (released, releases) = std::sync::mpsc::channel();
+        let answerer = AnswererStatus::allocating_for_tests_with(
+            "control-test-node",
+            || None,
+            move |name, address| {
+                let _ = released.send((name.to_string(), address));
+            },
+        );
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer,
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: 0,
+                    host_ip: false,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let rename_to_front = |box_id: minimald_rpc::BoxId| {
+            control(
+                &sock_path,
+                &BoxControlRequest::RenameBox(minimald_rpc::RenameBoxRequest {
+                    name: "web".to_string(),
+                    new_name: "front".to_string(),
+                    switch_address: web.switch_address,
+                    loopback_address: web.loopback_address,
+                    box_id,
+                }),
+            )
+            .expect("the rename is answered")
+        };
+
+        match rename_to_front(minimald_rpc::BoxId::mint()) {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("not the"),
+                "another box's id is refused: {error}"
+            ),
+            other => panic!("a rename by another box's id is refused, got {other:?}"),
+        }
+        assert!(
+            boxes.row_by_name("web").is_some(),
+            "the refusal moved nothing"
+        );
+
+        match rename_to_front(web.box_id) {
+            BoxControlReply::Addresses(echoed) => assert!(
+                echoed.switch_address == web.switch_address
+                    && echoed.loopback_address == web.loopback_address,
+                "the rename echoes the pair it went by: {echoed:?}"
+            ),
+            other => panic!("the creator's rename is answered, got {other:?}"),
+        }
+        let row = boxes
+            .row_by_name("front")
+            .expect("the row is the new name's");
+        assert_eq!(row.switch_addr(), web.switch_address);
+        assert!(
+            boxes.row_by_name("web").is_none(),
+            "the old name holds nothing"
+        );
+
+        match control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "front".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+                box_id: None,
+            }),
+        )
+        .expect("the withdrawal is answered")
+        {
+            BoxControlReply::Addresses(_) => {}
+            other => panic!("the destroy under the new name withdraws the row, got {other:?}"),
+        }
+        // The stand-in answerer's book is keyed by its allocations alone,
+        // so it holds the address under the old name; the real book moves
+        // it on the publish the rename's ping sets off (the answerer's
+        // `a_publish_under_a_new_name_moves_the_address_to_it`). What this
+        // pins is the name the release goes by.
+        let (name, _) = releases
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the published address is released");
+        assert_eq!(name, "front", "released by the name the row moved to");
     }
 
     /// A box created while the host lacked the box range was handed the
