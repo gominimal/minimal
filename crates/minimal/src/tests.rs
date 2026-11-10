@@ -9707,7 +9707,8 @@ async fn box_restart_not_until_stopped_exit2_hint_by_lifetime() {
         assert_eq!(refusal.exit_code, 2, "{state}");
         assert_eq!(
             refusal.to_string(),
-            "job runs to completion and cannot restart. \
+            "The spec of job does not set lifetime = \"until_stopped\", \
+             so min box restart cannot restart it. \
              Run it again with min box run <entry>.",
             "{state}"
         );

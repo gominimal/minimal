@@ -1104,15 +1104,18 @@ pub(crate) async fn restart_box_on_hosts_with(
 /// The daemon's answer to a `RestartBox` request.
 pub(crate) type RestartBoxAnswer = minimald_rpc::Errorable<minimald_rpc::RestartBoxResponse>;
 
-/// The refusal `min box restart` prints for a box that runs to completion
-/// (BCLI-074). It names `min box run`, the hint BCLI-009 chooses by
-/// `lifetime`.
+/// The refusal `min box restart` prints when the daemon answers
+/// `Lifetime` (BCLI-074): the box's stored spec does not set
+/// `lifetime = "until_stopped"`. That includes a box with no stored spec,
+/// so the text claims no more than that. It names `min box run`, the hint
+/// BCLI-009 chooses by `lifetime`.
 pub(crate) fn restart_lifetime_refusal(target: &str) -> minimald_rpc::RestartRefusal {
     minimald_rpc::RestartRefusal {
         kind: minimald_rpc::RestartRefusalKind::Lifetime,
         exit_code: 2,
         message: format!(
-            "{target} runs to completion and cannot restart. \
+            "The spec of {target} does not set lifetime = \"until_stopped\", \
+             so min box restart cannot restart it. \
              Run it again with min box run <entry>."
         ),
     }
