@@ -13,10 +13,10 @@ pub enum Error {
     IO(&'static str, PathBuf, #[source] std::io::Error),
     #[error("invalid TOML: {0}")]
     Format(#[source] toml::de::Error),
-    // Display renders the mfile error and its whole cause chain, and the
-    // variant returns no `source()`. A chain printer such as `{:#}` then
-    // shows each cause once, and `{}` keeps the TOML snippet too.
-    #[error("{prefix}: {}", MFileDisplay(.0), prefix = mfile::MFILE_NAME)]
+    // Every mfile error's Display already prints its cause: the TOML parse
+    // error, or the io error. So the variant returns no `source()`, and a
+    // chain printer such as `{:#}` shows each cause once.
+    #[error("{prefix}: {0}", prefix = mfile::MFILE_NAME)]
     MFile(mfile::Error),
     #[error("{}", GraphDisplay(.0))]
     Graph(Box<graph::Error>),
@@ -361,22 +361,6 @@ impl From<mfile::Error> for Error {
     }
 }
 
-/// Renders an mfile error and each error in its `source()` chain, joined
-/// with `: `, the same as anyhow's `{:#}`.
-struct MFileDisplay<'a>(&'a mfile::Error);
-
-impl fmt::Display for MFileDisplay<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)?;
-        let mut cause = std::error::Error::source(self.0);
-        while let Some(e) = cause {
-            write!(f, ": {e}")?;
-            cause = e.source();
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +400,20 @@ mod tests {
         assert_eq!(printed.matches("invalid TOML").count(), 1, "{printed}");
         assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
         assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
+    }
+
+    /// An unreadable minimal file prints its io error once under `{:#}`.
+    #[test]
+    fn mfile_io_error_prints_io_error_once() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let error = Error::MFile(mfile::Error::IO("minimal file", "p".into(), io));
+        let mut printed = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(e) = cause {
+            printed.push_str(&format!(": {e}"));
+            cause = e.source();
+        }
+        assert_eq!(printed.matches("denied").count(), 1, "{printed}");
     }
 
     /// A remote cache setup failure keeps its cause under `{:#}`, rendered
