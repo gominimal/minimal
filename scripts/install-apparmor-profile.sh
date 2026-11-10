@@ -61,6 +61,18 @@ done
 command -v apparmor_parser >/dev/null 2>&1 ||
     die "apparmor_parser not found; this host does not have AppArmor (nothing to install)"
 
+# The profile's one rule, `userns`, exists from AppArmor 4.0, the abi it
+# declares. An older parser (Debian 12 ships 3.0) cannot open that abi and
+# would refuse the file, and the kernel it serves does not restrict
+# unprivileged user namespaces, so there is nothing for the profile to
+# allow there: say so and install nothing (gominimal/inbox#1197). The
+# --uninstall path still runs, for a file an earlier run left.
+if [ "$mode" != uninstall ] && [ ! -e "$APPARMOR_D/abi/4.0" ]; then
+    note "this host's AppArmor has no abi/4.0 (parser: $(apparmor_parser --version 2>/dev/null | head -1)):"
+    note "it does not mediate user namespaces, so minimald needs no profile here; nothing installed"
+    exit 0
+fi
+
 # --check: parse the profile out of the source tree without touching the kernel
 # or the policy cache, so CI and pre-commit can run it unprivileged.
 if [ "$mode" = check ]; then
