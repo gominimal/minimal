@@ -449,8 +449,7 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
-            // A unit test's request, never sent: it checks the packages a
-            // session start reads from the `min init` scaffold (BCLI-017).
+            // A unit test's request, never sent: it checks the session spec's packages.
             "tests.rs::init_scaffolds_entry_shape_loads_and_starts_with_its_packages = asserts nothing",
             // A unit test's request, never sent: it checks the fresh instance.
             "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
