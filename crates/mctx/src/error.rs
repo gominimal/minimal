@@ -13,8 +13,11 @@ pub enum Error {
     IO(&'static str, PathBuf, #[source] std::io::Error),
     #[error("invalid TOML: {0}")]
     Format(#[source] toml::de::Error),
-    #[error("{prefix}: {0}", prefix = mfile::MFILE_NAME)]
-    MFile(#[from] mfile::Error),
+    // Display renders the mfile error and its whole cause chain, and the
+    // variant returns no `source()`. A chain printer such as `{:#}` then
+    // shows each cause once, and `{}` keeps the TOML snippet too.
+    #[error("{prefix}: {}", MFileDisplay(.0), prefix = mfile::MFILE_NAME)]
+    MFile(mfile::Error),
     #[error("{}", GraphDisplay(.0))]
     Graph(Box<graph::Error>),
 
@@ -352,6 +355,28 @@ pub fn remote_cache_setup_error(
     }
 }
 
+impl From<mfile::Error> for Error {
+    fn from(e: mfile::Error) -> Self {
+        Error::MFile(e)
+    }
+}
+
+/// Renders an mfile error and each error in its `source()` chain, joined
+/// with `: `, the same as anyhow's `{:#}`.
+struct MFileDisplay<'a>(&'a mfile::Error);
+
+impl fmt::Display for MFileDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut cause = std::error::Error::source(self.0);
+        while let Some(e) = cause {
+            write!(f, ": {e}")?;
+            cause = e.source();
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +391,31 @@ mod tests {
             Error::MFile(mfile::Error::NotFound).to_string(),
             "minimal.toml: not found",
         );
+    }
+
+    /// A minimal file that does not parse prints `invalid TOML` and the TOML
+    /// parse error once each under `{:#}`, with the snippet.
+    #[test]
+    fn mfile_format_error_prints_toml_error_once() {
+        let error = mfile::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("the file does not parse");
+        assert!(matches!(error, mfile::Error::Format(_)), "{error:?}");
+        // `Error` is not `Send`, so anyhow cannot hold it. Walk the chain the
+        // way anyhow's `{:#}` does.
+        let error = Error::MFile(error);
+        let mut printed = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(e) = cause {
+            printed.push_str(&format!(": {e}"));
+            cause = e.source();
+        }
+        assert!(
+            printed.starts_with("minimal.toml: invalid TOML: TOML parse error"),
+            "{printed}"
+        );
+        assert_eq!(printed.matches("invalid TOML").count(), 1, "{printed}");
+        assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
+        assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
     }
 
     /// A remote cache setup failure keeps its cause under `{:#}`, rendered
