@@ -1460,7 +1460,14 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // tree is installed is its own state, with its own remedy, so it gets
     // its own line beside the probe's: the probe reads it only as a table
     // whose effect could not be read.
-    if !guest && unplaced {
+    // A host without the step has no leaf to miss, and its own cause says
+    // so; the line is for a daemon outside an installed tree's leaf.
+    if !guest
+        && unplaced
+        && (daemon_leaf.is_dir()
+            || classifier_decision.cause()
+                == Some(minimald::net::classifier::Cause::DaemonNotPlaced))
+    {
         tracing::warn!(
             leaf = %daemon_leaf.display(),
             daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),

@@ -1840,6 +1840,21 @@ async fn deny_all_create_over_a_stale_unreadable_fact_answers_the_reread() {
     };
 
     // The daemon now stands in its leaf, so the table refuses the probe.
+    // The step's daemon leaf lists this process: only a daemon proven in
+    // its leaf keeps an unreadable probe as the table's.
+    let leaf = sandbox::classifier::daemon_leaf(
+        _reset
+            .0
+            .as_ref()
+            .expect("the tree is held until the reset")
+            .path(),
+    );
+    std::fs::create_dir_all(&leaf).expect("the step makes the daemon leaf");
+    std::fs::write(
+        leaf.join("cgroup.procs"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("the daemon leaf lists this daemon");
     held();
     crate::box_runtime::install_classifier_reading_standin(
         classifier::Reading::Refused(Vec::new()),
@@ -1893,14 +1908,6 @@ async fn deny_all_create_over_a_stale_unreadable_fact_answers_the_reread() {
     // The daemon stands outside its own leaf: the step's leaf is there and
     // this process is not among its members, so the unreadable re-read is
     // the daemon's placement, and the box it cannot place runs unenforced.
-    let leaf = sandbox::classifier::daemon_leaf(
-        _reset
-            .0
-            .as_ref()
-            .expect("the tree is held until the reset")
-            .path(),
-    );
-    std::fs::create_dir_all(&leaf).expect("the step makes the daemon leaf");
     std::fs::write(leaf.join("cgroup.procs"), "1\n")
         .expect("the daemon leaf's members omit this daemon");
     held();
@@ -1933,6 +1940,35 @@ async fn deny_all_create_over_a_stale_unreadable_fact_answers_the_reread() {
         Some("none"),
         "a deny-all box an unplaced daemon cannot place states no enforcement"
     );
+
+    // The daemon leaf is missing beside an installed tree (its subtrees and
+    // marker stand): a daemon not proven in its leaf is unplaced, so the
+    // reply says the box can still reach the network, never that it is
+    // refused (gominimal/minimal#3240).
+    std::fs::remove_file(leaf.join("cgroup.procs")).expect("drop the leaf's members");
+    std::fs::remove_dir(&leaf).expect("drop the daemon leaf");
+    held();
+    crate::box_runtime::install_classifier_reading_standin(classifier::Reading::Inconclusive {
+        because: "the injected reading stands in for a probe whose child \
+                  could not be placed"
+            .to_string(),
+    });
+    let no_leaf = client
+        .call::<CreateSession>(&deny_all("no-daemon-leaf"))
+        .await
+        .unwrap();
+    assert_eq!(
+        no_leaf.classifier_advisory.as_deref(),
+        Some(
+            classifier::advisory_text(
+                classifier::Cause::DaemonNotPlaced,
+                &EgressPolicy::deny_all()
+            )
+            .as_str()
+        ),
+        "a missing daemon leaf beside an installed tree is the daemon's placement"
+    );
+    assert_eq!(no_leaf.host_ip_enforcement.as_deref(), Some("none"));
 }
 
 /// NET-079: on a host that decides per box, a host-address box whose

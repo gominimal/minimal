@@ -3513,22 +3513,26 @@ pub fn daemon_in_leaf(root: &Path) -> std::io::Result<bool> {
 }
 
 /// Whether one read of the daemon leaf ([`daemon_in_leaf`]) counts this
-/// daemon as standing outside it. A leaf read whole without this process
-/// does. A tree without the leaf (`NotFound`) is the step not installed,
-/// its own cause, so it does not.
+/// daemon as standing outside it: every read but one that finds this
+/// process among the leaf's members does, on purpose.
 ///
-/// A leaf whose members could not be read proves no placement, and it
-/// counts as unplaced on purpose. The cause it re-spells is an unreadable
-/// probe, and the box that follows either runs unenforced (not placed) or
-/// is refused at launch (placed). Saying the box can still reach the
-/// network is wrong only in the second case, where the box is refused
-/// anyway. Keeping the probe's "refuses to start the box" would be wrong in
-/// the first, claiming a refusal for a box that has the network
-/// (gominimal/minimal#3240). The read error is logged.
+/// The only cause this re-spells is an unreadable probe
+/// ([`Decision::over_daemon_placement`]), which [`decide`] reaches only
+/// past its step checks, so a host without the step keeps
+/// [`Cause::StepNotInstalled`] whatever this says. Over an unreadable
+/// probe, the box that follows either runs unenforced (not placed) or is
+/// refused at launch (placed). Saying the box can still reach the network
+/// is wrong only in the second case, where the box is refused anyway.
+/// Keeping the probe's "refuses to start the box" would be wrong in the
+/// first, claiming a refusal for a box that has the network
+/// (gominimal/minimal#3240). So a daemon not proven in its leaf counts as
+/// unplaced: a leaf read whole without this process, a missing leaf beside
+/// an installed tree, and a leaf whose members could not be read. That
+/// last read error is logged.
 pub fn unplaced_over(in_leaf: &std::io::Result<bool>) -> bool {
     match in_leaf {
         Ok(in_leaf) => !in_leaf,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -10204,14 +10208,29 @@ mod tests {
         assert!(decided.can_decide_per_box(), "{decided:?}");
     }
 
-    /// Unplaced means the step's daemon leaf is there and this process is
-    /// not in it; a tree without the leaf is the step not installed.
+    /// A daemon is unplaced unless a read of its leaf finds it there; the
+    /// step not installed keeps its own cause, because only an unreadable
+    /// probe is re-spelled and the step checks come first.
     #[test]
-    fn a_daemon_is_unplaced_only_beside_a_leaf_it_is_not_in() {
+    fn a_daemon_is_unplaced_unless_its_leaf_lists_it() {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         assert!(
-            !daemon_unplaced(tree.path()),
-            "no leaf, no placement to miss"
+            daemon_unplaced(tree.path()),
+            "no leaf, so not proven in one"
+        );
+        assert_eq!(
+            Decision::undecidable(Cause::StepNotInstalled)
+                .over_daemon_placement(false, daemon_unplaced(tree.path()))
+                .cause(),
+            Some(Cause::StepNotInstalled),
+            "a host without the step keeps its cause"
+        );
+        assert_eq!(
+            Decision::undecidable(Cause::ProbeUnreadable)
+                .over_daemon_placement(false, daemon_unplaced(tree.path()))
+                .cause(),
+            Some(Cause::DaemonNotPlaced),
+            "an unreadable probe beside a missing daemon leaf is the placement"
         );
         let leaf = sandbox::classifier::daemon_leaf(tree.path());
         std::fs::create_dir_all(&leaf).expect("the daemon leaf");
