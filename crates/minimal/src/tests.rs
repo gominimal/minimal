@@ -13461,3 +13461,293 @@ async fn box_wait_exec_returns_exec_code() {
         )
     );
 }
+
+/// One command the end-to-end test ran, with what it wrote and how it
+/// ended, for the failure message.
+struct Ran {
+    command: String,
+    stdout: String,
+    stderr: String,
+    exit: String,
+}
+
+/// Every command the end-to-end test ran so far, in order.
+#[derive(Default)]
+struct Transcript(Vec<Ran>);
+
+impl Transcript {
+    fn push(&mut self, command: &str, stdout: &[u8], stderr: &[u8], exit: impl std::fmt::Display) {
+        self.0.push(Ran {
+            command: command.to_owned(),
+            stdout: String::from_utf8_lossy(stdout).into_owned(),
+            stderr: String::from_utf8_lossy(stderr).into_owned(),
+            exit: exit.to_string(),
+        });
+    }
+}
+
+impl std::fmt::Display for Transcript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "commands run so far:")?;
+        for ran in &self.0 {
+            writeln!(f, "$ {}", ran.command)?;
+            writeln!(f, "  stdout: {:?}", ran.stdout)?;
+            writeln!(f, "  stderr: {:?}", ran.stderr)?;
+            writeln!(f, "  exit: {}", ran.exit)?;
+        }
+        Ok(())
+    }
+}
+
+// T9 (S2; BCLI-010, BCLI-012, BCLI-013, BCLI-015): one task, end to end.
+// `min task run` and `min box run` parse, and a run of the task's box gives
+// back the entrypoint's output and exit code. `min task logs -f` follows the
+// task's output. `min box wait` returns when the task ends. `min task list`
+// shows the ended task until `min box prune` removes it, and the follow
+// ends then. The run half goes through the stand-in entrypoint, because a
+// harness daemon cannot start a real one. One span covers the run, the log
+// follow and the wait of the task. A failure prints each command run so far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_run_logs_wait_list_end_to_end() {
+    use clap::Parser as _;
+    use tracing::Instrument as _;
+
+    let mut ran = Transcript::default();
+
+    // Both run verbs parse to a run of the same entry.
+    for argv in [
+        ["min", "task", "run", "check"],
+        ["min", "box", "run", "check"],
+    ] {
+        let entry = match Cli::try_parse_from(argv).map(|cli| cli.command) {
+            Ok(Some(Command::Task(TaskArgs {
+                command: TaskCommand::Run(args),
+            }))) => args.task,
+            Ok(Some(Command::Box(BoxArgs {
+                command: BoxCommand::Run(args),
+            }))) => args.entry,
+            Ok(_) => panic!("`{}` is not a run", argv.join(" ")),
+            Err(e) => panic!("`{}` does not parse: {e}", argv.join(" ")),
+        };
+        assert_eq!(entry, "check", "`{}`", argv.join(" "));
+    }
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let id = create_configured_task(&mut daemon, "check", project).await;
+    let dir = box_store_dir(&state_path, id);
+
+    let span = tracing::info_span!("task_end_to_end", box_id = %id, task = "check");
+    let ran = &mut ran;
+    async move {
+        // The run: stdin reaches the entrypoint, stdout and stderr are the
+        // entrypoint's alone, and the command ends with its code.
+        let (_stand_in_dir, mut client, _log) = stand_in_daemon(3).await;
+        let channel = task::open_task_box_run(
+            &mut client,
+            id,
+            "check",
+            "",
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .await
+        .expect("the daemon takes the run");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            task::bridge_channel(
+                channel,
+                Some(Box::new(std::io::Cursor::new(&b"input\n"[..]))),
+                &mut out,
+                &mut err,
+            ),
+        )
+        .await
+        .expect("the run ends when the entrypoint returns")
+        .expect("the run bridges");
+        ran.push("min task run check", &out, &err, format!("{status:?}"));
+        assert_eq!(String::from_utf8_lossy(&out), "got:input\n", "{ran}");
+        assert_eq!(String::from_utf8_lossy(&err), "diag\n", "{ran}");
+        let run_exit = task::exit_outcome(status).expect_err("a non-zero code fails the run");
+        let run_code = match run_exit.downcast_ref::<task::TaskExit>() {
+            Some(&task::TaskExit(code)) => i32::from(code),
+            None => panic!("the run ends with a task exit, not {run_exit:#}\n{ran}"),
+        };
+        assert_eq!(run_code, 3, "{ran}");
+
+        // The task's box keeps what its entrypoint wrote.
+        append_box_output(&dir, b"first line\r\n");
+        let follow_args = BoxLogsArgs {
+            target: "check".to_owned(),
+            follow: true,
+        };
+        let followed = SharedOut::default();
+        let follow = {
+            let mut out = followed.clone();
+            let hosts = local_hosts(&global).unwrap();
+            let args = &follow_args;
+            async move {
+                box_logs_on_hosts(
+                    hosts,
+                    args,
+                    Some(boxes::TASK_BOX_TYPE),
+                    "task logs",
+                    &mut out,
+                )
+                .await
+            }
+            .in_current_span()
+        };
+
+        let drive = async {
+            followed.until_contains("first line\r\n").await;
+            append_box_output(&dir, b"second line\r\n");
+            followed.until_contains("second line\r\n").await;
+
+            // The wait returns once the task ends, with the code its record
+            // keeps.
+            let wait = box_wait_on_hosts(
+                local_hosts(&global).unwrap(),
+                "check",
+                None,
+                std::time::Duration::from_millis(20),
+            )
+            .in_current_span();
+            let stop = async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                stop_box_on_hosts(
+                    local_hosts(&global).unwrap(),
+                    &mut Vec::new(),
+                    "check",
+                    false,
+                )
+                .await
+            };
+            let (waited, stopped) = tokio::join!(wait, stop);
+            ran.push(
+                "min box stop check",
+                b"",
+                b"",
+                format!("{:?}", stopped.as_ref().map(|_| 0)),
+            );
+            ran.push("min box wait check", b"", b"", format!("{waited:?}"));
+            stopped.unwrap_or_else(|e| panic!("the task stops: {e:#}\n{ran}"));
+            let code = waited.unwrap_or_else(|e| panic!("the wait ends: {e:#}\n{ran}"));
+            let record = shown_record(&local_hosts(&global).unwrap()[0], id).await;
+            assert_eq!(
+                wait_exit(&record, "check"),
+                Some(Ok(code)),
+                "{record:?}\n{ran}"
+            );
+
+            // The record is filed here by hand, with the code the run ended
+            // with. The harness daemon cannot start a real entrypoint, so it
+            // never ends a task on its own. The daemon half, an entrypoint
+            // return filed as `exited` with its code, is pinned in minimald by
+            // `until_complete_ends_on_entrypoint_return_without_client_records_exited`.
+            // From here on, the wait and the list read that filed code.
+            let record_path = dir.join("record.json");
+            let mut record: serde_json_lenient::Value =
+                serde_json_lenient::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            record["status"] = "exited".into();
+            record["reason"] = "exit".into();
+            record["exit_code"] = run_code.into();
+            record["signal"] = serde_json_lenient::Value::Null;
+            std::fs::write(&record_path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+
+            // A wait on the ended task returns the code of its run.
+            let rewaited = box_wait_on_hosts(
+                local_hosts(&global).unwrap(),
+                "check",
+                Some(std::time::Duration::from_secs(10)),
+                std::time::Duration::from_millis(20),
+            )
+            .await;
+            ran.push("min box wait check", b"", b"", format!("{rewaited:?}"));
+            assert_eq!(
+                rewaited.unwrap_or_else(|e| panic!("the wait on the ended task: {e:#}\n{ran}")),
+                run_code,
+                "the wait returns the run's exit code\n{ran}"
+            );
+
+            let list = async |ran: &mut Transcript| {
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let listed = crate::task::task_list_on_hosts(
+                    local_hosts(&global).unwrap(),
+                    None,
+                    &mut out,
+                    &mut err,
+                )
+                .await;
+                ran.push(
+                    "min task list --all",
+                    &out,
+                    &err,
+                    format!("{:?}", listed.as_ref().map(|_| 0)),
+                );
+                listed.unwrap_or_else(|e| panic!("the task list: {e:#}\n{ran}"));
+                assert!(err.is_empty(), "nothing on stderr\n{ran}");
+                String::from_utf8(out).unwrap()
+            };
+            let text = list(ran).await;
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), 2, "a header and the one task\n{ran}");
+            assert!(lines[1].starts_with(&id.to_string()), "{ran}");
+            assert!(lines[1].contains("  check  "), "{ran}");
+            let exited = format!("exited (exit {run_code})");
+            assert!(lines[1].contains(&format!("  {exited}  ")), "{ran}");
+            assert!(lines[1].contains("  task  "), "{ran}");
+            assert!(
+                list(ran).await.contains(&exited),
+                "the ended task stays until a prune\n{ran}"
+            );
+
+            let mut pruned = Vec::new();
+            let prune = prune_hosts(
+                local_hosts(&global).unwrap(),
+                false,
+                box_prune_request(None, None),
+                PruneMode::Remove,
+                &mut pruned,
+            )
+            .await;
+            ran.push(
+                "min box prune",
+                &pruned,
+                b"",
+                format!("{:?}", prune.as_ref().map(|_| 0)),
+            );
+            prune.unwrap_or_else(|e| panic!("the prune: {e:#}\n{ran}"));
+            assert_eq!(
+                list(ran).await,
+                format!("{}\n", crate::cmd::EMPTY_HOST_LIST),
+                "the prune removes the task\n{ran}"
+            );
+        };
+
+        let (followed_result, ()) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                tokio::join!(follow, drive)
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the follow ends when the prune removes the task"));
+        ran.push(
+            "min task logs check -f",
+            followed.text().as_bytes(),
+            b"",
+            format!("{:?}", followed_result.as_ref().map(|_| 0)),
+        );
+        followed_result.unwrap_or_else(|e| panic!("the follow ends cleanly: {e:#}\n{ran}"));
+        assert!(
+            followed.text().starts_with("first line\r\nsecond line\r\n"),
+            "the follow writes the task's output in order, once\n{ran}"
+        );
+    }
+    .instrument(span)
+    .await;
+}
