@@ -109,7 +109,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   verify:   cargo nextest run -p minimal task_run_provided_hidden_run_removed
 
 - **BCLI-012** WHEN `min session logs <box> -f`, `min task logs <box> -f` or `min box logs <box> -f` runs THE SYSTEM SHALL follow the box's output as BOX-155 captures it.
-  <!-- event-driven; how much of the output the capture keeps is BOX-155's; gominimal/arch#159 decides the bound, and the interim cap keeps the newest 8 MiB with a drop mark -->
+  <!-- event-driven; how much of the output the capture keeps is BOX-155's; the architecture rules the bound (gominimal/arch#159, owner ruling 2026-11-06): a drop-oldest cap per log, a daemon default of 8 MiB that the operator can configure, with a drop mark where older output went -->
   tier:     T0
   verify:   cargo nextest run -p minimal type_noun_logs_follow
 
@@ -221,8 +221,8 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- event-driven; the architecture's Type nouns paragraph and layer 7 of its expansion order (gominimal/arch#166). Type constraints are checked after the layer, and the projection carries its result to Cedar, so no flag reaches past a type constraint, the egress ceiling or policy (BOX's checks, not this spec's) -->
   tier:     T0
   verify:   cargo nextest run -p minimal network_flags_override_stored_spec_and_projection
-  - THE SYSTEM SHALL provide one `[network]` override flag for each key of `[network]` and of its subtables. Each flag SHALL be named after its key: `--`, then the key's last dotted segment with each `_` written as `-`. The flag for `mode` SHALL be `--network`. `--deny-all-egress` SHALL be an override flag too, though it has no key of its own.
-    <!-- ubiquitous; the architecture names the flags by this rule (`--network <mode>`, `--ingress <port>`, `--allow-dns-hosts` for `egress.allow_dns_hosts`) and leaves the list of spellings to this spec, which states it as the rule so a key added to `[network]` gets its flag without a spec change -->
+  - THE SYSTEM SHALL provide one `[network]` override flag for each key of `[network]` and of `[network.egress]`. A key of `[network.bep]` SHALL get no flag from this rule. Each flag SHALL be named after its key: `--`, then the key's last dotted segment with each `_` written as `-`. The flag for `mode` SHALL be `--network`. `--deny-all-egress` SHALL be an override flag too, though it has no key of its own.
+    <!-- ubiquitous; the architecture names the flags by this rule (`--network <mode>`, `--ingress <port>`, `--allow-dns-hosts` for `egress.allow_dns_hosts`) and leaves the list of spellings to this spec, which states it as the rule so a key added to `[network]` or `[network.egress]` gets its flag without a spec change. `[network.bep]` is out of the rule because its `no_proxy` key would give `--no-proxy`, which in this grammar reads as a negation -->
     tier:   T0
     verify: cargo nextest run -p minimal network_override_flag_per_key_named_after_key
   - WHERE a `[network]` override flag names a list key THE SYSTEM SHALL add each value the flag gives to the list, as BOX-064 unions lists. Each use of the flag SHALL add one item. `--allow-protocols` is the exception.
@@ -236,11 +236,11 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal allow_protocols_flag_replaces_list
   - WHERE `--deny-all-egress` is given THE SYSTEM SHALL empty every allow list in `egress`: `egress.allow_dns_hosts`, `egress.allow_subnets` and `egress.allow_protocols`. A key that is not an allow list, such as `mode`, SHALL keep the value its own override flag or the layers below give it, so `--network own_ip --deny-all-egress` sets `mode = own_ip`.
-    <!-- optional-feature; NET-140 holds, as the owner ruled on 2026-11-09, and gominimal/arch#173 corrects the architecture's lines that named only two lists. The flag can only narrow, so a broker grant whose hosts it removes then fails validation (BEP-008, exit 3) -->
+    <!-- optional-feature; NET-140 holds for the lists the flag empties, as the owner ruled on 2026-11-09, and gominimal/arch#173 corrects the architecture's lines that named only two lists. Which flags can combine with it is the owner's later 2026-11-09 ruling (next two sub-bullets), and gominimal/minimal#3220 amends spec 18's NET-140 to match. The flag can only narrow, so a broker grant whose hosts it removes then fails validation (BEP-008, exit 3) -->
     tier:   T0
     verify: cargo nextest run -p minimal deny_all_egress_flag_empties_every_allow_list
   - IF `--deny-all-egress` is given together with `--allow-subnets` or `--allow-dns-hosts` THEN THE SYSTEM SHALL fail with exit 2, naming both flags. It SHALL create nothing and render nothing.
-    <!-- unwanted; NET-140 declares every allow list present and empty, so a flag that adds a destination contradicts it. The owner re-ruled on 2026-11-09, to match the ruling on gominimal/minimal#3159: `--deny-subnets` and `--allow-protocols` only narrow, so they still combine with `--deny-all-egress`, and so does a flag for a key that is not an egress list, such as `--network <mode>` -->
+    <!-- unwanted; NET-140 declares every allow list present and empty, so a flag that adds a destination contradicts it. Spec 18 on main refuses every `--allow-*` and `--deny-*` flag here, and gominimal/minimal#3220 amends it to this narrower rule (Rollout). The owner re-ruled on 2026-11-09, to match the ruling on gominimal/minimal#3159: `--deny-subnets` and `--allow-protocols` only narrow, so they still combine with `--deny-all-egress`, and so does a flag for a key that is not an egress list, such as `--network <mode>` -->
     tier:   T0
     verify: cargo nextest run -p minimal deny_all_egress_with_allow_subnets_or_dns_hosts_exit2_creates_nothing
   - WHERE `--deny-all-egress` is given together with `--allow-protocols` or `--deny-subnets` THE SYSTEM SHALL apply those flags after `--deny-all-egress` empties the allow lists. So `--deny-all-egress --allow-protocols tcp` empties `egress.allow_dns_hosts` and `egress.allow_subnets`, and sets `egress.allow_protocols` to `["tcp"]`.
@@ -261,8 +261,8 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- unwanted; the architecture: giving both is exit 2 -->
     tier:   T0
     verify: cargo nextest run -p minimal no_loadouts_with_loadout_exit2_creates_nothing
-  - WHERE an entry sets `loadout_mode = "open"`, WHEN `min box run` or `min task run` runs with `--loadout <l>` THE SYSTEM SHALL pass each loadout that `--loadout` names to BOX-064's selected-loadouts layer, as BCLI-073 does for `min box start`.
-    <!-- event-driven with a precondition; the architecture: every `start` and `run` takes `--loadout <l>`. This binds only the `open` case, as BCLI-073 does -->
+  - WHERE an entry sets `loadout_mode = "open"`, WHEN `min box run` or `min task run` runs with `--loadout <l>` THE SYSTEM SHALL pass each loadout that `--loadout` names to BOX-064's selected-loadouts layer.
+    <!-- event-driven with a precondition; the architecture: every `start` and `run` takes `--loadout <l>`. This binds only the `open` case that an entry sets. The effective mode and the sealed case are an open question (Open questions) -->
     tier:   T0
     verify: cargo nextest run -p minimal run_loadout_flag_selects_loadouts_layer
 
@@ -553,6 +553,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 - `--all-providers`, and `--provider` naming a remote provider: they select remote providers, which need a provider that BPA serves. The global `--provider` flag stays. It selects one of the well-known local providers (BCLI-046) for any `min` command, and the `min box` verbs and the type nouns take it from there.
 - The global flags and their environment variables, from `-o` and `--no-input` to `--host` and the `MIN_*` variables, belong to the architecture's Global flags table (L342). This spec neither adds a global flag nor removes one. Each global flag `min` has keeps its meaning.
 - `min box list --using <pkg>[@<ver>]`: it reads a box's SBOM, which the SBOM epic owns (gominimal/inbox#582).
+- `min box wait` on more than one box, and the list of how each ended box ended that the architecture's `wait_timeout` error carries in all mode: BCLI-013 waits on one box. They are deferred with `--parent` and `--any`, below.
 - `min box wait --parent <box|self> [--any]`, and `self` as the value of `--parent` on the verbs this spec specifies: they manage a box's children, which needs nesting. Nesting has no owner yet (Open questions).
 - `self` as the box argument of `min box spec`, `min box show` and `min box events`: only a `min` running inside a box can use it. The BOX spec leaves that out of scope, and these verbs take `self` with nesting. `min box audit` already takes `self` and `--parent self` (BEP-042), and this spec does not change that.
 - `min host create|pause|resume|rm` and `min provider show|add|rm|login|use`: they drive the operations BPA defines, and no spec or epic schedules their verbs yet (Open questions). The architecture reserves `min host snapshot`, and no provider serves it.
@@ -621,7 +622,9 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **BCLI-024 and BCLI-076 need a BOX-064 exception for the command-line layer.** BOX-064 unions lists in every layer and replaces tables wholesale. The architecture makes the command-line layer an exception (gominimal/arch#166). Each network flag changes only the key it names, and the rest of `[network]` stays in place. `--allow-protocols` replaces its list. `--deny-all-egress` empties every allow list in `egress` (NET-140, gominimal/arch#173). It refuses `--allow-subnets` and `--allow-dns-hosts`, and `--allow-protocols` and `--deny-subnets` apply after it. `--no-hooks` empties the composed lifecycle-hook list. Under BOX-064 as written, a list that the layer replaces or empties still holds the union of the layers below. An amendment to `docs/specs/29-spec-box-local-first` states these exceptions for the command-line layer. gominimal/minimal#3200 tracks it, and it is expected to land in the BOX spec PR gominimal/minimal#3177. BCLI-024's sub-bullets for `--allow-protocols` and `--deny-all-egress`, its key-only rule, and BCLI-076 depend on it.
 
-**BCLI-022's declarer column needs a BOX field.** The ruling on gominimal/minimal#2877 keeps each lifecycle hook's declarer in the stored spec. Today BOX-064 merges every layer's `lifecycle_hooks` into one list, and BOX-161 reports provenance only at expansion, by layer. An amendment to `docs/specs/29-spec-box-local-first` names the field that keeps the declarer, in its own PR. BCLI-022's hook rows depend on it.
+**Spec 18's NET-140 is amended to BCLI-024's `--deny-all-egress` rule.** NET-140's comment on main says the flag conflicts with every `--allow-*` and `--deny-*` flag. The owner ruled on 2026-11-09 that only `--allow-subnets` and `--allow-dns-hosts` conflict with it. `--allow-protocols` and `--deny-subnets` only narrow, and apply after it. gominimal/minimal#3220 amends spec 18 to that rule, so the two specs agree on main.
+
+**BCLI-022's declarer column needs a BOX field.** The ruling on gominimal/minimal#2877 keeps each lifecycle hook's declarer in the stored spec. Today BOX-064 merges every layer's `lifecycle_hooks` into one list, and BOX-161 reports provenance only at expansion, by layer. BOX-179 in gominimal/minimal#3177 names the field that keeps the declarer: a `declared_by` table in each stored hook. BCLI-022's hook rows depend on it.
 
 **T31 removes the old session verbs and moves their callers in the same PR.** T31 (gominimal/minimal#2917) removes the spellings BCLI-042 names. In the same PR it moves every requirement, script and doc below that uses one of them, so no caller meets an unknown command. `scripts/session-e2e.sh` is the VM lane's session proof, and BCLI-049's verify line runs it.
 
@@ -640,5 +643,6 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 ## Open questions
 
+- [NEEDS CLARIFICATION (MEDIUM): the run-verb `--loadout` rule (BCLI-075) binds only an entry that sets `loadout_mode = "open"`. A task gets its effective `loadout_mode` from any project layer, such as `[defaults]`, `[defaults.task]` or a project type, and not only from the entry. A named loadout that the mode seals out is exit 3 (BOX-173, proposed in gominimal/minimal#3069). Both wait on that PR.]
 - [NEEDS CLARIFICATION (MEDIUM): nesting has no owner. The BOX Non-goals name gominimal/inbox#568, which closed as a duplicate, and gominimal/inbox#572 closed as not planned. `min box wait --parent` and `--parent self` wait on whichever spec or epic takes nesting up.]
 - [NEEDS CLARIFICATION (MEDIUM): `min box sync`, `min box port`, `min box add`, `min host create|pause|resume|rm` and `min provider show|add|rm|login|use` have no owner. The architecture names them, BPA defines the provider operations under the host and provider verbs, and BPA names this spec for the grammar. gominimal/minimal#2868 decides which spec owns each verb and schedules them.]
