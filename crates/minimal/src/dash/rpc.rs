@@ -427,8 +427,9 @@ pub async fn destroy(host: &mut Host, id: SessionId) -> Result<(), anyhow::Error
     }
 }
 
-/// Renames the session; a `host_ip` box's zone hold moves with the name, as
-/// `min session rename` moves it.
+/// Renames the session; a `host_ip` box's zone hold and an own-address
+/// box's host row move with the name, as `min session rename` moves them
+/// (#1116).
 pub async fn rename(host: &mut Host, id: SessionId, new_name: &str) -> Result<(), anyhow::Error> {
     let record = record_of(host, id).await;
     match timed::<RenameSession>(
@@ -442,11 +443,20 @@ pub async fn rename(host: &mut Host, id: SessionId, new_name: &str) -> Result<()
     .context("RenameSession RPC failed")?
     {
         Errorable::Ok(_) => {
-            if let Some(record) = record.filter(crate::holds_name) {
-                if let Some(old_name) = record.name.as_deref() {
-                    hold_box_name(&host.sock, old_name, id, false).await;
+            if let Some(record) = record {
+                if crate::holds_name(&record) {
+                    if let Some(old_name) = record.name.as_deref() {
+                        hold_box_name(&host.sock, old_name, id, false).await;
+                    }
+                    hold_box_name(&host.sock, new_name, id, true).await;
+                } else {
+                    crate::rename_box_row_with_vm_host(
+                        crate::control_sock_beside(&host.sock),
+                        &record,
+                        new_name,
+                    )
+                    .await;
                 }
-                hold_box_name(&host.sock, new_name, id, true).await;
             }
             Ok(())
         }
