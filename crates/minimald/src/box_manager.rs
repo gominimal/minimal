@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, io::ErrorKind::NotFound};
 
 use crate::{
-    box_actor::{BoxActor, BoxActorConfig, BoxHandle},
+    box_actor::{BoxActor, BoxActorConfig, BoxHandle, RestartError},
     box_runtime::HostAttrs,
     store::{BoxRecordHandle, RecordPredicate, Store, StoreHandle},
 };
@@ -2891,6 +2891,62 @@ impl BoxManagerHandle {
             ),
         }
         Some(answer)
+    }
+
+    /// Restarts the box `id` (BOX-176), with the daemon's grace period
+    /// between SIGTERM and SIGKILL when the box runs. Answers whether the
+    /// box was running.
+    ///
+    /// # Errors
+    ///
+    /// [`RestartError::Refused`] when a check refused the restart and left
+    /// the box as it was. [`RestartError::Failed`] with `NotFound` for an id
+    /// no record names, `ConnectionRefused` while the daemon shuts down, or
+    /// the error the start ended on, which leaves the box `stopped`.
+    pub(crate) async fn restart_box(&self, id: SessionId) -> Result<bool, RestartError> {
+        self.restart_box_with_grace(id, crate::box_actor::STOP_GRACE)
+            .await
+    }
+
+    /// [`Self::restart_box`] with the grace period `grace`. The restart
+    /// resolves the box and hands it to the box's actor, which runs the
+    /// checks, the stop and the start in its message loop.
+    pub(crate) async fn restart_box_with_grace(
+        &self,
+        id: SessionId,
+        grace: std::time::Duration,
+    ) -> Result<bool, RestartError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(RestartError::Failed(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            )));
+        }
+        let unknown = || {
+            RestartError::Failed(std::io::Error::new(
+                NotFound,
+                format!(
+                    "{} `{}`",
+                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                    id.as_ref()
+                ),
+            ))
+        };
+        let record = self
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .map_err(RestartError::Failed)?
+            .ok_or_else(unknown)?;
+        // The user the box's processes run as, as a host launched with no
+        // client takes it.
+        let username = record.username.clone().unwrap_or_else(|| "user".into());
+        tracing::info!(session_id = %id, "restart: dispatching to the session");
+        let session = self
+            .get_session(BoxKeyPredicate::Id(id))
+            .await
+            .map_err(RestartError::Failed)?
+            .ok_or_else(unknown)?;
+        session.restart_box(username, grace).await
     }
 
     /// The state and directories of the box `id` when the box is stopped

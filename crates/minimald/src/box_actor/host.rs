@@ -1759,6 +1759,82 @@ impl BoxActor {
         Ok(host)
     }
 
+    /// Starts the box's entrypoint again for a restart (BOX-176), with no
+    /// client attached. The restart already set the record to `running`
+    /// from the stored spec.
+    ///
+    /// A host that the restart launched for `on_activate` (BOX-028) is kept
+    /// when the box starts its shell, and the shell starts when a client
+    /// attaches, as after an activation. It is replaced when the box starts
+    /// an argv, or the entrypoint never starts. A box that holds a host-side
+    /// row keeps its host, as an attach keeps it. The launch runs no
+    /// lifecycle hook (BOX-177).
+    pub(super) async fn restart_launch(
+        &mut self,
+        session_hnd: BoxHandle,
+        conn_username: String,
+    ) -> Result<(), AttachError> {
+        let holds_host_row = self
+            .record
+            .record()
+            .await
+            .map_err(AttachError::LoadoutFailed)?
+            .box_addresses
+            .is_some();
+        let live_hooks_host = matches!(
+            &self.inner,
+            BoxInner::Active { host: Some((h, _)), .. } if h.is_alive()
+        ) && self.host_origin == HostOrigin::Hooks;
+        if live_hooks_host {
+            if holds_host_row || !self.starts_argv().await {
+                tracing::info!(
+                    box_id = %self.record.id(),
+                    "restart: keeping the host launched for on_activate"
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                box_id = %self.record.id(),
+                "restart: replacing the host launched for on_activate with the box's entrypoint"
+            );
+        }
+        // A host left in the slot runs nothing the restart keeps.
+        if let BoxInner::Active {
+            host: slot @ Some(_),
+            ..
+        } = &mut self.inner
+        {
+            let (handle, mut join) = slot.take().expect("matched on Some");
+            Self::kill_and_stop_loop(&handle, &mut join, false).await;
+        }
+        #[cfg(test)]
+        if restart_launch_seam::fails(self.record.id()) {
+            return Err(AttachError::SpawnFailed(std::io::Error::other(
+                "the test failed this launch",
+            )));
+        }
+        let (_, launched) = self
+            .launch_host(
+                session_hnd,
+                conn_username,
+                UNATTACHED_WIN_SIZE,
+                box_runtime::AttachEnv::default(),
+                None,
+                LaunchPhase::Attached,
+                false,
+            )
+            .await?;
+        let BoxInner::Active { host: slot, .. } = &mut self.inner else {
+            return Err(AttachError::SessionPending);
+        };
+        *slot = Some(launched);
+        // No client attached: a later attach reuses this host, as it reuses
+        // one an exec launched.
+        self.host_origin = HostOrigin::Exec;
+        self.publish_host();
+        Ok(())
+    }
+
     /// Clears the record's `ends_with_run` mark once a task run started
     /// the box's entrypoint (T43, NET-131). Until then a daemon restart
     /// destroys the box, so a client lost before the task starts strands
@@ -3116,5 +3192,36 @@ mod quic443_cohort_tests {
             4,
             "no nft call for an add of a missing leaf"
         );
+    }
+}
+
+/// Test-only: fails the launch of a restart of a box (BOX-176), once,
+/// before it starts anything, so a test can see what a failed start leaves.
+/// Keyed by box id, so tests running beside each other keep their own.
+#[cfg(test)]
+pub(crate) mod restart_launch_seam {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+
+    static SEEDED: Mutex<Option<HashSet<SessionId>>> = Mutex::new(None);
+
+    /// Makes the next restart launch of `id` fail.
+    pub(crate) fn fail_next(id: SessionId) {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashSet::new)
+            .insert(id);
+    }
+
+    /// Whether this restart launch of `id` fails. Takes the seed.
+    pub(super) fn fails(id: &SessionId) -> bool {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .is_some_and(|seeded| seeded.remove(id))
     }
 }
