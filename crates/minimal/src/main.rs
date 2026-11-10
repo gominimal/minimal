@@ -1561,6 +1561,26 @@ mod tests {
         assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
     }
 
+    /// A project `minimal.toml` that cannot be read prints its io error
+    /// once, and the run ends with exit 3.
+    #[test]
+    fn invalid_project_file_prints_toml_error_once_for_io() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied here");
+        let error = mfile::Error::IO("minimal file", "/p/minimal.toml".into(), io);
+        let e = anyhow::Error::new(minimal::ProjectFileInvalid { error })
+            .context("activating the session");
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(printed.contains("/p/minimal.toml"), "{printed}");
+        assert_eq!(
+            printed.matches("access denied here").count(),
+            1,
+            "{printed}"
+        );
+    }
+
     /// A broken pipe anywhere in the error chain is classified as such, so
     /// `min version | head -1` can exit quietly instead of printing an error.
     #[test]
