@@ -67,6 +67,7 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
+        otel.status_message = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -325,9 +326,14 @@ where
     };
     span.record("outcome", outcome);
     // A failed command marks its root span as an error, whether or not the
-    // failure was expected. A hand-off is not a failure.
-    if outcome == "error" {
+    // failure was expected, and says why in the status itself, so a trace
+    // filter on failed commands reads the cause without opening the span's
+    // events (gominimal/minimal#3223). A hand-off is not a failure.
+    if let Err(e) = &result
+        && outcome == "error"
+    {
         span.record("otel.status_code", "ERROR");
+        span.record("otel.status_message", format!("{e:#}").as_str());
     }
     // Release every handle on the span, so it closes here.
     drop(slot);
@@ -1973,7 +1979,9 @@ mod handoff_tests {
 
     impl tracing::field::Visit for StatusField {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "otel.status_code" {
+            // The code and the message land on one span in that order; the
+            // log keeps the last, which is the message when there is one.
+            if field.name() == "otel.status_code" || field.name() == "otel.status_message" {
                 self.0 = Some(value.to_owned());
             }
         }
@@ -2128,7 +2136,13 @@ mod handoff_tests {
                 .with(closed.clone())
                 .with(statuses.clone()),
         );
-        let cmd = || tracing::info_span!("cmd", otel.status_code = tracing::field::Empty);
+        let cmd = || {
+            tracing::info_span!(
+                "cmd",
+                otel.status_code = tracing::field::Empty,
+                otel.status_message = tracing::field::Empty
+            )
+        };
         let ok = run_in_root(cmd(), async { Ok(()) }).await;
         assert!(matches!(ok, Ok(None)));
         let err = run_in_root(cmd(), async { Err(anyhow::anyhow!("no session found")) })
@@ -2140,6 +2154,10 @@ mod handoff_tests {
             .unwrap();
         assert!(matches!(handoff, Some(Handoff::Exit(1))), "{handoff:?}");
         assert_eq!(closed_names(&closed), ["cmd", "cmd", "cmd"]);
-        assert_eq!(statuses.all(), [None, Some("ERROR".to_owned()), None]);
+        // The failed command's status carries the error's text (#3223).
+        assert_eq!(
+            statuses.all(),
+            [None, Some("no session found".to_owned()), None]
+        );
     }
 }

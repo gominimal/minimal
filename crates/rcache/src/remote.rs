@@ -128,12 +128,14 @@ const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// (`FETCH_BACKOFF_BASE` doubling per attempt) between tries. `what` names
 /// the object in the log. The caller decides what a spent retry budget
 /// means (the index reports `Unavailable`; an artifact surfaces the error).
+/// A success comes back with the number of attempts it took, so a span can
+/// say whether a slow fetch was one long transfer or several.
 async fn retrying_transient<T, E, Fut>(
     what: &str,
     retries: u32,
     is_transient: impl Fn(&E) -> bool,
     mut once: impl FnMut() -> Fut,
-) -> Result<T, E>
+) -> Result<(T, u32), E>
 where
     E: std::fmt::Display,
     Fut: std::future::Future<Output = Result<T, E>>,
@@ -142,7 +144,7 @@ where
     loop {
         attempt += 1;
         match once().await {
-            Ok(v) => return Ok(v),
+            Ok(v) => return Ok((v, attempt)),
             Err(e) if attempt <= retries && is_transient(&e) => {
                 let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
                 tracing::warn!(
@@ -649,7 +651,8 @@ impl<B: FetchBackend> RemoteCache<B> {
                 Self::is_transient,
                 || Self::fetch_index_once(&backend, &url, &source, index_dir.as_deref(), &fetch_op),
             )
-            .await;
+            .await
+            .map(|(fetched, _attempts)| fetched);
             match fetched {
                 Ok(pair) => Ok(pair),
                 // The same class of failure artifact downloads already
@@ -885,7 +888,24 @@ impl<B: FetchBackend> RemoteCache<B> {
     /// Download the given spec hash into the local cache. Transient fetch
     /// failures are retried up to [`Self::with_fetch_retries`] times with
     /// exponential backoff; extraction is not retried.
-    #[tracing::instrument(skip_all, fields(span_name = %span_name), err)]
+    ///
+    /// The span says what the wait was (gominimal/minimal#3223): the
+    /// `source` it fetched from (scheme and host), the artifact's `bytes`,
+    /// how many `attempts` the fetch took, and the seconds the fetch and
+    /// the extraction each cost, so a long one reads as a large transfer, a
+    /// stalled connection that retried, or a slow extraction.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            span_name = %span_name,
+            source = %self.base.origin(),
+            bytes = tracing::field::Empty,
+            attempts = tracing::field::Empty,
+            fetch_s = tracing::field::Empty,
+            extract_s = tracing::field::Empty,
+        ),
+        err
+    )]
     pub async fn materialize(
         &self,
         spec_hash: &SpecHash,
@@ -905,13 +925,20 @@ impl<B: FetchBackend> RemoteCache<B> {
         });
 
         let start = Instant::now();
-        let mut tar_file = retrying_transient(
+        let (mut tar_file, attempts) = retrying_transient(
             &hex::encode(sha256),
             self.fetch_retries,
             Self::is_transient,
             || self.fetch_verified(sha256, &materialize_op),
         )
         .await?;
+        let span = tracing::Span::current();
+        span.record("attempts", attempts);
+        span.record("fetch_s", start.elapsed().as_secs_f64());
+        if let Ok(meta) = tar_file.metadata() {
+            span.record("bytes", meta.len());
+        }
+        let extract_start = Instant::now();
 
         tar_file
             .seek(std::io::SeekFrom::Start(0))
@@ -937,6 +964,7 @@ impl<B: FetchBackend> RemoteCache<B> {
         .map_err(Error::ArchiveError)?;
 
         materialize_op.set_done();
+        span.record("extract_s", extract_start.elapsed().as_secs_f64());
 
         Ok((Instant::now().duration_since(start), cache_hnd))
     }

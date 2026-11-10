@@ -196,6 +196,12 @@ pub trait FetchUrl: std::fmt::Debug + Clone {
     fn join(&self, input: &str) -> Result<Self, Self::JoinError>;
 
     fn filename(&self) -> String;
+
+    /// Where the URL points, for a span or a log line: the scheme and host
+    /// and nothing of the path or query, which may carry a token.
+    fn origin(&self) -> String {
+        format!("{self:?}")
+    }
 }
 
 impl FetchUrl for ReqwestUrl {
@@ -203,6 +209,9 @@ impl FetchUrl for ReqwestUrl {
 
     fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
         UpstreamReqwestUrl::join(&self.0, input).map(ReqwestUrl)
+    }
+    fn origin(&self) -> String {
+        format!("{}://{}", self.0.scheme(), self.0.host_str().unwrap_or(""))
     }
     fn filename(&self) -> String {
         let path = self.0.path();

@@ -675,6 +675,8 @@ pub(crate) fn launch_span(
         session = %session_name,
         entrypoint = entrypoint.log_name(),
         args = entrypoint.arg_count(),
+        otel.status_code = tracing::field::Empty,
+        otel.status_message = tracing::field::Empty,
     );
     tracing::info!(
         parent: &span,
@@ -1288,6 +1290,24 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // the box's spec, so the daemon log says what each launch started.
         let entrypoint = launcher.entrypoint()?;
         let launch_span = launch_span(session_id, &session_name, &entrypoint);
+        let launched = tracing::Instrument::instrument(
+            launcher.launch(
+                crate::guest::is_microvm_daemon(),
+                session_id,
+                name,
+                username,
+                paths,
+                sz,
+            ),
+            launch_span.clone(),
+        )
+        .await;
+        // A launch that failed marks its span and says why in the status
+        // (gominimal/minimal#3223), before the error goes up.
+        if let Err(e) = &launched {
+            launch_span.record("otel.status_code", "ERROR");
+            launch_span.record("otel.status_message", format!("{e:#}").as_str());
+        }
         let Launched {
             master,
             process,
@@ -1300,18 +1320,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             listen_plan,
             start_gate,
             pipes,
-        } = tracing::Instrument::instrument(
-            launcher.launch(
-                crate::guest::is_microvm_daemon(),
-                session_id,
-                name,
-                username,
-                paths,
-                sz,
-            ),
-            launch_span,
-        )
-        .await?;
+        } = launched?;
 
         // The listen-publication watcher (NET-016, NET-017): the plan this
         // launch gathered is the box's whole publication surface — its

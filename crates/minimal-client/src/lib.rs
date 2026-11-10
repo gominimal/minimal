@@ -520,7 +520,7 @@ impl Client {
         self.oneshot_rpc_within::<R>(request, deadline).await
     }
 
-    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty))]
+    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty, otel.status_message = tracing::field::Empty))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -581,7 +581,9 @@ impl Client {
             // response, and `SubmitVerdict` as a `Fault` step; the caller
             // still gets it as a response, and the span is marked failed.
             if daemon_refused(&resp_buf) {
-                tracing::Span::current().record("otel.status_code", "ERROR");
+                let span = tracing::Span::current();
+                span.record("otel.status_code", "ERROR");
+                span.record("otel.status_message", "the daemon refused the request");
             }
             Ok(response)
         };
@@ -590,10 +592,13 @@ impl Client {
             .await
             .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))
             .and_then(|r| r);
-        if result.is_err() {
+        if let Err(e) = &result {
             // A failed or timed-out RPC marks its span, so a daemon-side
-            // "rpc failed" has a failed client-side span to match.
-            tracing::Span::current().record("otel.status_code", "ERROR");
+            // "rpc failed" has a failed client-side span to match, and the
+            // status says what failed (gominimal/minimal#3223).
+            let span = tracing::Span::current();
+            span.record("otel.status_code", "ERROR");
+            span.record("otel.status_message", format!("{e:#}").as_str());
         }
         result
     }
