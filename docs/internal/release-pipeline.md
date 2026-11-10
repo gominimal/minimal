@@ -965,8 +965,10 @@ that fails only warns, so it never fails a release job. Dry runs send nothing.
 | `rollback` | A `rollback=true` promotion to `stable` ends, as success or failure | The week's handoff thread |
 | `nightly-failed` | A `nightly` run fails or is cancelled, with the `check`, `release` and `promote-nightly` results | Top level of the channel |
 
-A promotion that succeeds sends no `promote` event. release-ops posts it from
-the `release-promoted` event that `report-release` already sends.
+A promotion that succeeds sends no `promote` event. For a final `X.Y.Z` on
+`stable`, release-ops posts it from the `release-promoted` event that
+`report-release` already sends. A successful promotion to `unstable`, or of a
+candidate or nightly commit to `stable`, sends neither event, so nothing posts.
 
 ### merge-back.yml: merge a line into main
 
