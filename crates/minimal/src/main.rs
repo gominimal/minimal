@@ -256,7 +256,11 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), 124 when an exec ran past its own timeout
+/// is not running, 5 when its spec turns exec off), the code a start
+/// refusal carries (`minimal::StartEntryRefusal`: 4 when the start does not
+/// find the entry, 2 when it cannot pick or start it), 2 when a start needs a terminal
+/// it does not have (`minimal::StartNeedsTerminal`) or asks for a held name
+/// (`minimal::StartNameHeld`), 124 when an exec ran past its own timeout
 /// (`minimal::BoxExecTimedOut`) or a box ran past its own timeout or a
 /// `min box wait --timeout` ran out (`minimal::BoxTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
@@ -290,6 +294,18 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-005: `min box prune` off a terminal without `--yes`.
     if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
         return minimal::PruneNeedsYes::EXIT_CODE;
+    }
+    // BCLI-029: a start off a terminal of an entry with a terminal.
+    if e.downcast_ref::<minimal::StartNeedsTerminal>().is_some() {
+        return minimal::StartNeedsTerminal::EXIT_CODE;
+    }
+    // BCLI-071, BCLI-072: a start that cannot pick or start its entry.
+    if let Some(refusal) = e.downcast_ref::<minimal::StartEntryRefusal>() {
+        return refusal.exit_code();
+    }
+    // BCLI-069: a start whose name a running box holds.
+    if e.downcast_ref::<minimal::StartNameHeld>().is_some() {
+        return minimal::StartNameHeld::EXIT_CODE;
     }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
@@ -1142,6 +1158,58 @@ mod tests {
             ),
         ] {
             let err = anyhow::Error::from(refusal).context("showing the box");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    /// BCLI-071, BCLI-072: a start that does not find its entry exits 4,
+    /// not found. Every other start refusal exits 2.
+    #[test]
+    fn start_entry_refusals_exit_with_their_codes() {
+        use minimal::{StartEntryRefusal, StartVerb};
+        let entry = || "build".to_owned();
+        for (refusal, code) in [
+            (
+                StartEntryRefusal::Unknown {
+                    verb: StartVerb::Box,
+                    entry: entry(),
+                    entries: Vec::new(),
+                },
+                4,
+            ),
+            (
+                StartEntryRefusal::NotSession {
+                    entry: entry(),
+                    box_type: Some("task".to_owned()),
+                },
+                4,
+            ),
+            (
+                StartEntryRefusal::Several {
+                    verb: StartVerb::Session,
+                    entries: Vec::new(),
+                },
+                2,
+            ),
+            (StartEntryRefusal::DefaultBlocked { box_type: None }, 2),
+            (StartEntryRefusal::NameUnsupported { entry: entry() }, 2),
+            (StartEntryRefusal::TaskNotInTasks { entry: entry() }, 2),
+            (
+                StartEntryRefusal::UnsupportedType {
+                    entry: entry(),
+                    box_type: Some("agent".to_owned()),
+                },
+                2,
+            ),
+            (
+                StartEntryRefusal::NamedSessionUnsupported {
+                    verb: StartVerb::Session,
+                    entry: entry(),
+                },
+                2,
+            ),
+        ] {
+            let err = anyhow::Error::new(refusal);
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
         }
     }

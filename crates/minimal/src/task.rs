@@ -1256,7 +1256,7 @@ fn interactive_task_box_name(task: &str) -> String {
 /// canonical in-box `min task run <task>`, relay its exit code, and let the
 /// daemon end the session with the run (NET-131).
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
-    run_entry(global, args.into()).await
+    run_entry(global, args.into()).await.map(drop)
 }
 
 /// `min task list [--all]` (BCLI-015): the task boxes of the current
@@ -1333,15 +1333,18 @@ pub(crate) async fn task_list_on_hosts(
 /// `min box run <entry>`: the run of [`cmd_task_run`], from an entry the
 /// project declares. Both verbs share [`run_entry`].
 pub async fn cmd_box_run(global: &GlobalArgs, args: BoxRunArgs) -> Result<(), anyhow::Error> {
-    run_entry(global, args.into()).await
+    run_entry(global, args.into()).await.map(drop)
 }
 
 /// The one run path of `min task run` and `min box run` (BCLI-010,
 /// BCLI-035, BCLI-070): create a fresh instance of the entry's box, wire
 /// this command's stdin, stdout and stderr to its entrypoint, and end with
 /// the entrypoint's exit code. With `--detach`, print only the box's id
-/// and return.
-pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(), anyhow::Error> {
+/// and return. On success it returns the id of the box it created.
+pub(crate) async fn run_entry(
+    global: &GlobalArgs,
+    args: RunEntry,
+) -> Result<boxes::SessionId, anyhow::Error> {
     // A network flag typed after the task's first argument would reach the
     // task and leave the box's network unset, so the run refuses it.
     let typed = std::env::args_os()
@@ -1742,7 +1745,7 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
                 residency.keep();
             }
             drop(run_guard);
-            return detached;
+            return detached.map(|()| id);
         }
         eprintln!("Running task {} in box {session_name}...", args.entry);
         // What the run did with its box: only a box it removed gives up
@@ -1808,7 +1811,7 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
         )
         .await;
         drop(run_guard);
-        return run_outcome(outcome?, timed_out, &args.entry);
+        return run_outcome(outcome?, timed_out, &args.entry).map(|()| id);
     }
 
     eprintln!("Running task {} in session {session_name}...", args.entry);
@@ -1850,7 +1853,7 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
     .await;
     drop(run_guard);
 
-    exit_outcome(outcome?)
+    exit_outcome(outcome?).map(|()| id)
 }
 
 /// What a task run does with its box once the run's channel closed.

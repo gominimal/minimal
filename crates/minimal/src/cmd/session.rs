@@ -35,13 +35,125 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         .map_err(activate_refusal)
 }
 
+/// `min session start [<entry>]`: create a box from a session entry and
+/// attach this terminal to it, or print its id and return (BCLI-029).
+pub async fn cmd_session_start(
+    global: &GlobalArgs,
+    args: SessionStartArgs,
+) -> Result<(), anyhow::Error> {
+    start_entry(global, args.into()).await
+}
+
+/// The entry `min session start` starts (BCLI-071): the typed session
+/// entry, else the session entry named `default`, else the project's only
+/// session entry. The count includes the implicit `default` session entry.
+///
+/// The lookups of an explicit entry come first, in the order of
+/// `pick_session_entry` (`boxes/create.rs`): a typed project entry, then
+/// with no entry typed a project session entry named `default`.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided::TypeUnresolved`] when the typed entry's own
+/// type is unresolved, or from [`start_candidates`] when the pick depends
+/// on the implicit `default` or on the session count: an entry of a project
+/// Box Type can be a session. Else a [`StartEntryRefusal`] when no session
+/// entry can be picked.
+pub(crate) fn pick_session_start_entry(
+    entries: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    if let Some(typed) = typed {
+        if let Some(entry) = entries.iter().find(|entry| entry.name == typed) {
+            return if is_session_entry(entry) {
+                Ok(entry.clone())
+            } else if type_unresolved(entry) {
+                Err(type_unresolved_refusal(entry).into())
+            } else {
+                Err(StartEntryRefusal::NotSession {
+                    entry: entry.name.clone(),
+                    box_type: entry.box_type.clone(),
+                }
+                .into())
+            };
+        }
+        if typed != mfile::entry::DEFAULT_ENTRY_NAME {
+            return Err(StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: typed.to_string(),
+                entries: listed_entries(entries)
+                    .into_iter()
+                    .filter(is_session_entry)
+                    .map(|entry| entry.name)
+                    .collect(),
+            }
+            .into());
+        }
+    } else if let Some(default) = entries
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME && is_session_entry(entry))
+    {
+        return Ok(default.clone());
+    }
+    // Only the implicit `default` or the session count is left to decide.
+    let candidates = start_candidates(entries)?;
+    pick_session_candidate(entries, &candidates, typed).map_err(Into::into)
+}
+
+/// The pick of [`pick_session_start_entry`] from the `candidates` that
+/// [`start_candidates`] gives for `entries`.
+fn pick_session_candidate(
+    entries: &[mfile::entry::BoxEntry],
+    candidates: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, StartEntryRefusal> {
+    let sessions: Vec<&mfile::entry::BoxEntry> =
+        candidates.iter().filter(|e| is_session_entry(e)).collect();
+    let names = || sessions.iter().map(|entry| entry.name.clone()).collect();
+    if let Some(typed) = typed {
+        return match candidates.iter().find(|entry| entry.name == typed) {
+            Some(entry) if is_session_entry(entry) => Ok(entry.clone()),
+            Some(entry) => Err(StartEntryRefusal::NotSession {
+                entry: entry.name.clone(),
+                box_type: entry.box_type.clone(),
+            }),
+            None => Err(StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: typed.to_string(),
+                entries: names(),
+            }),
+        };
+    }
+    if let Some(default) = sessions
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok((*default).clone());
+    }
+    match sessions.as_slice() {
+        [only] => Ok((*only).clone()),
+        // No session entry and no implicit `default`: an entry of another
+        // type holds the name `default` (BOX-165).
+        [] => Err(StartEntryRefusal::DefaultBlocked {
+            box_type: entries
+                .iter()
+                .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+                .and_then(|entry| entry.box_type.clone()),
+        }),
+        _ => Err(StartEntryRefusal::Several {
+            verb: StartVerb::Session,
+            entries: names(),
+        }),
+    }
+}
+
 /// The error `min session activate` ends with (NET-144). When the daemon
 /// refused the activation because a declared host port is already in use,
 /// the refusal's own text replaces the whole chain: it names the port, its
 /// holder and the next step, and the stage and RPC context around it add
 /// nothing a person can act on. The activate cleanup has already destroyed
 /// the box by then. Any other error passes through as it is.
-fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
     let refusal = error
         .chain()
         .find_map(|cause| minimald_rpc::PortInUseRefusal::find_in(&cause.to_string()));
