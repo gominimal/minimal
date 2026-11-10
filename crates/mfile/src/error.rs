@@ -132,9 +132,9 @@ impl fmt::Display for Error {
             Error::IO(ctx, path, e) => {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
-            // `source()` returns the parse error, so a chain printer such as
-            // `{:#}` shows its snippet after this text, once.
-            Error::Format(_) => write!(f, "invalid TOML"),
+            // `Display` carries the parse error and `source()` returns none,
+            // so `{}` and `{:#}` each print its snippet once.
+            Error::Format(e) => write!(f, "invalid TOML: {}", e),
             Error::LinkConfig {
                 path, line, table, ..
             } => {
@@ -270,8 +270,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::IO(_, _, e) => Some(e),
-            Error::Format(e) => Some(e),
+            // `Display` carries the io error and the parse error, so a
+            // chain printer such as `{:#}` prints each of them once.
+            Error::IO(..) => None,
+            Error::Format(_) => None,
             // The serde error only restates serde's internal enum name,
             // which the Display above replaces; it stays for Debug.
             Error::LinkConfig { .. } => None,
@@ -285,5 +287,47 @@ impl std::error::Error for Error {
             Error::LegacyTable { .. } => None,
             Error::InteractiveTask(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::error::Error as _;
+    use std::path::PathBuf;
+
+    /// Renders an error the way anyhow's `{:#}` does: the error, then each
+    /// cause in its `source()` chain, joined with `": "`.
+    fn render_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut out = e.to_string();
+        let mut cur = e.source();
+        while let Some(cause) = cur {
+            out.push_str(": ");
+            out.push_str(&cause.to_string());
+            cur = cause.source();
+        }
+        out
+    }
+
+    #[test]
+    fn format_error_display_carries_toml_error_once() {
+        let err = crate::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("an unterminated table header must not parse");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+        let shown = err.to_string();
+        assert_eq!(shown.matches("TOML parse error").count(), 1, "{shown}");
+        assert_eq!(shown.matches("[boxes.dev").count(), 1, "{shown}");
+        assert!(err.source().is_none());
+        let chained = render_chain(&err);
+        assert_eq!(chained.matches("TOML parse error").count(), 1, "{chained}");
+    }
+
+    #[test]
+    fn io_error_chain_prints_io_error_once() {
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let io_text = io.to_string();
+        let err = Error::IO("minimal file", PathBuf::from("/p/minimal.toml"), io);
+        let chained = render_chain(&err);
+        assert_eq!(chained.matches(io_text.as_str()).count(), 1, "{chained}");
     }
 }
