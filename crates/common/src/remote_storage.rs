@@ -320,40 +320,126 @@ pub async fn source_hosts(sources: &[String]) -> std::collections::BTreeSet<Stri
 /// How long a build box's fetch waits between two reads of a body.
 const FETCH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many times a build box's fetch retries a transient failure, the first
+/// attempt not counted. It is the remote cache's default
+/// (`rcache::DEFAULT_FETCH_RETRIES`).
+const FETCH_RETRIES: u32 = 3;
+
+/// How long a build box's fetch waits before its first retry. The wait
+/// doubles before each retry after it, as the remote cache's does.
+const FETCH_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Downloads `url` to `out` and checks its sha256 (NET-155). This is the
 /// body of the fetch process inside a build box, so it follows redirects and
 /// resolves names in the namespace it runs in, and it holds no cache.
 ///
+/// A failure after the connection opened, a server error or a 429 status,
+/// or a body cut off is retried up to [`FETCH_RETRIES`] times, with a
+/// doubling wait between tries. A connection that is refused or gets no
+/// answer, a name that does not resolve, any other status, and a hash
+/// mismatch fail at once: retrying them gives the same answer later.
+///
 /// # Errors
 ///
 /// A connection or read failure, a non-success status, a hash mismatch, or a
-/// failed write of `out`.
+/// failed write of `out`. After retries, the last attempt's error.
 pub async fn fetch_to_file(url: &str, sha256: &str, out: &Path) -> Result<()> {
+    let client = fetch_client(CONNECT_TIMEOUT)?;
+    retrying_transient(FETCH_RETRIES, FETCH_BACKOFF_BASE, || {
+        fetch_once(&client, CONNECT_TIMEOUT, url, sha256, out)
+    })
+    .await
+}
+
+/// The client of a build box's fetch, whose connections open within `bound`.
+fn fetch_client(bound: std::time::Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(bound)
+        .read_timeout(FETCH_READ_TIMEOUT)
+        .build()?)
+}
+
+/// How one attempt of a build box's fetch failed.
+#[derive(Debug)]
+enum FetchAttempt {
+    /// A failure another attempt may not meet.
+    Transient(anyhow::Error),
+    /// A failure every attempt would meet.
+    Final(anyhow::Error),
+}
+
+/// Runs `once` until it succeeds, fails with [`FetchAttempt::Final`], or has
+/// failed `retries` times more than its first attempt. The wait before a
+/// retry is `backoff`, doubled for each retry before it.
+async fn retrying_transient<Fut>(
+    retries: u32,
+    backoff: std::time::Duration,
+    mut once: impl FnMut() -> Fut,
+) -> Result<()>
+where
+    Fut: std::future::Future<Output = Result<(), FetchAttempt>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match once().await {
+            Ok(()) => return Ok(()),
+            Err(FetchAttempt::Transient(_)) if attempt <= retries => {
+                tokio::time::sleep(backoff * 2u32.pow(attempt - 1)).await;
+            }
+            Err(FetchAttempt::Transient(e) | FetchAttempt::Final(e)) => return Err(e),
+        }
+    }
+}
+
+/// One attempt of [`fetch_to_file`].
+async fn fetch_once(
+    client: &reqwest::Client,
+    bound: std::time::Duration,
+    url: &str,
+    sha256: &str,
+    out: &Path,
+) -> Result<(), FetchAttempt> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(FETCH_READ_TIMEOUT)
-        .build()?;
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| connect_failure(e, CONNECT_TIMEOUT))?
-        .error_for_status()?;
-    let mut file = File::create(out)?;
+    let fail = |e: anyhow::Error| FetchAttempt::Final(e);
+    let response = client.get(url).send().await.map_err(|e| {
+        // A connect failure covers a refusal, no answer within `bound`, and
+        // a name the namespace's resolver does not answer, the rules'
+        // refusal included. A bad URL or a redirect loop stays bad.
+        if e.is_connect() || e.is_builder() || e.is_redirect() {
+            FetchAttempt::Final(connect_failure(e, bound))
+        } else {
+            FetchAttempt::Transient(e.into())
+        }
+    })?;
+    let status = response.status();
+    let mut response = response.error_for_status().map_err(|e| {
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            FetchAttempt::Transient(e.into())
+        } else {
+            FetchAttempt::Final(e.into())
+        }
+    })?;
+    let mut file = File::create(out).map_err(|e| fail(e.into()))?;
     let mut hasher = Sha256::new();
-    while let Some(chunk) = response.chunk().await? {
+    // A read that fails is a connection reset or a body cut off.
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| FetchAttempt::Transient(e.into()))?
+    {
         hasher.update(&chunk);
-        file.write_all(&chunk)?;
+        file.write_all(&chunk).map_err(|e| fail(e.into()))?;
     }
-    file.sync_all()?;
+    file.sync_all().map_err(|e| fail(e.into()))?;
     let got = hex::encode(hasher.finalize());
-    anyhow::ensure!(
-        got == sha256,
-        "the hash is {got}, and {sha256} was declared"
-    );
+    if got != sha256 {
+        return Err(fail(anyhow::anyhow!(
+            "the hash is {got}, and {sha256} was declared"
+        )));
+    }
     Ok(())
 }
 
@@ -474,6 +560,208 @@ mod connect_tests {
         assert!(
             text.starts_with(&format!("could not connect to {addr}: ")),
             "{text}"
+        );
+    }
+
+    /// A server that answers its `n`th connection with `replies[n]`, or the
+    /// last reply once they run out, and closes it. Returns its address and
+    /// the count of connections it took.
+    async fn scripted_server(
+        replies: Vec<Vec<u8>>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = taken.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let reply = replies[n.min(replies.len() - 1)].clone();
+                let mut request = [0u8; 2048];
+                let served = async {
+                    if stream.read(&mut request).await? == 0 {
+                        return Ok(());
+                    }
+                    stream.write_all(&reply).await?;
+                    stream.shutdown().await
+                };
+                // A client that hangs up first ends its connection early. The
+                // tests check the count of connections taken, not this.
+                if let Err(e) = served.await {
+                    eprintln!("a scripted connection ended early: {e}");
+                }
+            }
+        });
+        (addr, taken)
+    }
+
+    /// An HTTP reply with `status`, whose head declares `length` bytes of
+    /// body and whose body is `body`.
+    fn reply(status: &str, length: usize, body: &[u8]) -> Vec<u8> {
+        let mut reply =
+            format!("HTTP/1.1 {status}\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n")
+                .into_bytes();
+        reply.extend_from_slice(body);
+        reply
+    }
+
+    fn sha256_hex(body: &[u8]) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(body))
+    }
+
+    /// NET-155: a server error and a body cut off are transient, so the
+    /// fetch tries again and succeeds on the third connection.
+    #[tokio::test]
+    async fn a_transient_fetch_failure_is_retried_until_it_succeeds() {
+        let body = b"the source".to_vec();
+        let (addr, taken) = scripted_server(vec![
+            reply("503 Service Unavailable", 0, b""),
+            reply("200 OK", body.len(), &body[..3]),
+            reply("200 OK", body.len(), &body),
+        ])
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let client = fetch_client(CONNECT_TIMEOUT).unwrap();
+        let url = format!("http://{addr}/pkg.tar.gz");
+        let sha = sha256_hex(&body);
+
+        retrying_transient(3, std::time::Duration::from_millis(10), || {
+            fetch_once(&client, CONNECT_TIMEOUT, &url, &sha, &out)
+        })
+        .await
+        .expect("the third attempt succeeds");
+
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+    }
+
+    /// NET-155: a server error on every attempt gives up after the retries,
+    /// with the last attempt's error.
+    #[tokio::test]
+    async fn a_persistent_server_error_gives_up_after_the_retries() {
+        let (addr, taken) = scripted_server(vec![
+            reply("500 Internal Server Error", 0, b""),
+            reply("502 Bad Gateway", 0, b""),
+            reply("429 Too Many Requests", 0, b""),
+            reply("503 Service Unavailable", 0, b""),
+        ])
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let client = fetch_client(CONNECT_TIMEOUT).unwrap();
+        let url = format!("http://{addr}/pkg.tar.gz");
+
+        let e = retrying_transient(3, std::time::Duration::from_millis(10), || {
+            fetch_once(&client, CONNECT_TIMEOUT, &url, SHA, &out)
+        })
+        .await
+        .expect_err("every attempt fails");
+
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(e.to_string().contains("503 Service Unavailable"), "{e}");
+    }
+
+    /// NET-155: a client error status and a hash mismatch fail the first
+    /// attempt: another attempt would get the same answer.
+    #[tokio::test]
+    async fn a_client_error_or_a_hash_mismatch_is_not_retried() {
+        let backoff = std::time::Duration::from_secs(30);
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let client = fetch_client(CONNECT_TIMEOUT).unwrap();
+        for (status, body) in [("404 Not Found", &b""[..]), ("200 OK", &b"other bytes"[..])] {
+            let (addr, taken) = scripted_server(vec![reply(status, body.len(), body)]).await;
+            let url = format!("http://{addr}/pkg.tar.gz");
+            let started = std::time::Instant::now();
+
+            retrying_transient(3, backoff, || {
+                fetch_once(&client, CONNECT_TIMEOUT, &url, SHA, &out)
+            })
+            .await
+            .expect_err("the attempt fails");
+
+            assert_eq!(
+                taken.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{status}"
+            );
+            assert!(started.elapsed() < backoff, "{status}");
+        }
+    }
+
+    /// NET-155: a refused connection fails at once, with no retry, so a
+    /// source the box's rules refuse fails its build in seconds.
+    #[tokio::test]
+    async fn a_refused_connect_is_not_retried() {
+        let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let client = fetch_client(CONNECT_TIMEOUT).unwrap();
+        let url = format!("http://{addr}/pkg.tar.gz");
+        let backoff = std::time::Duration::from_secs(30);
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let started = std::time::Instant::now();
+        let e = retrying_transient(3, backoff, || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fetch_once(&client, CONNECT_TIMEOUT, &url, SHA, &out)
+        })
+        .await
+        .expect_err("the port is closed");
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(started.elapsed() < backoff);
+        assert!(
+            e.to_string()
+                .starts_with(&format!("could not connect to {addr}: ")),
+            "{e}"
+        );
+    }
+
+    /// NET-155: a connection that gets no answer fails at its bound, with no
+    /// retry.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unanswered_connect_is_not_retried() {
+        let (addr, _held, _listener) = dropping_port().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let bound = std::time::Duration::from_millis(300);
+        let client = fetch_client(bound).unwrap();
+        let url = format!("http://{addr}/pkg.tar.gz");
+        let backoff = std::time::Duration::from_secs(30);
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let started = std::time::Instant::now();
+        let e = retrying_transient(3, backoff, || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fetch_once(&client, bound, &url, SHA, &out)
+        })
+        .await
+        .expect_err("the address drops every packet");
+        let took = started.elapsed();
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(took < bound * 2, "took {took:?}");
+        assert_eq!(
+            e.to_string(),
+            format!("could not connect to {addr}: no answer after 300ms")
         );
     }
 

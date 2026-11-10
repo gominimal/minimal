@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/8640f85e193d11b8feb1ae64a0d4db287e67f064/specs/networking/deployment-and-egress-gateway.md
 arch_sha: "8640f85e193d11b8feb1ae64a0d4db287e67f064"
-updated: 2026-11-06
+updated: 2026-11-10
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -738,15 +738,24 @@ box that holds it returns to `running`. These terms follow the decision in
     verify: cargo nextest run -p op source_fetch_runs_in_the_build_box
     verify: cargo nextest run -p op gs_source_fetches_over_https_in_the_build_box
     <!-- event-driven; [#2802](https://github.com/gominimal/minimal/issues/2802): every source fetch of a box build runs in its build box. The fetch process is the daemon's own program, run as `__build-fetch` with one URL and one hash; it holds no session data and writes one file. A `gs://bucket/object` source is fetched anonymously from `https://storage.googleapis.com/bucket/object`, and `storage.googleapis.com` is the source's host for rules and display. The name query leaves from the build box, under the build box's rules (NET-141). The download cache and its re-hash on every read stay as they are. -->
-  - IF the fetch of a package's source cannot connect within 15 seconds THEN THE SYSTEM SHALL fail the build and name the package, the host and the reason.
+  - IF the fetch of a package's source cannot connect, or its connection does not get an answer within 15 seconds, THEN THE SYSTEM SHALL fail the build without a retry and name the package, the host and the reason.
     tier:   T0
     verify: cargo nextest run -p common a_failed_connect_names_the_host
+    verify: cargo nextest run -p common a_refused_connect_is_not_retried
+    verify: cargo nextest run -p common an_unanswered_connect_is_not_retried
     verify: cargo nextest run -p common an_unplaced_connect_to_a_dropping_address_times_out
     verify: cargo nextest run -p common a_failed_build_box_fetch_names_the_host
     verify: cargo nextest run -p common a_gs_source_fails_when_no_answer_comes
     verify: cargo nextest run -p common only_the_bounds_timeout_reads_as_no_answer
     verify: cargo nextest run -p op source_fetch_failure_strips_url_credentials
     verify: cargo nextest run -p minimald unreachable_source_names_the_package_and_the_host
+    <!-- unwanted; [#2802](https://github.com/gominimal/minimal/issues/2802): a source that the rules refuse fails its build in seconds, so a refusal, a name the build box's resolver does not answer, and a connection with no answer are never retried. -->
+  - IF a build box's fetch of a source fails after its connection opened, with a server error status, a 429 status or a body cut off, THEN THE SYSTEM SHALL fetch the source again, at most three more times with a wait that doubles before each, and fail the build with the last attempt's error when no attempt succeeds.
+    tier:   T0
+    verify: cargo nextest run -p common a_transient_fetch_failure_is_retried_until_it_succeeds
+    verify: cargo nextest run -p common a_persistent_server_error_gives_up_after_the_retries
+    verify: cargo nextest run -p common a_client_error_or_a_hash_mismatch_is_not_retried
+    <!-- unwanted; the remote cache retries a transient fetch with the same count and backoff (`rcache::DEFAULT_FETCH_RETRIES`). Any other status, and a hash mismatch, fail the first attempt, because another attempt gets the same answer. -->
   - IF a source's host is a literal address THEN THE SYSTEM SHALL state no command options and no `minimal.toml` setting in the refusal.
     tier:   T0
     verify: cargo nextest run -p minimald unreachable_source_names_the_package_and_the_host
