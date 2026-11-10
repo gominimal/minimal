@@ -338,7 +338,8 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
     }
-    // BCLI-068: `min box attach` refused, or its connection failed.
+    // BCLI-068, BCLI-007, BCLI-009, BCLI-032: `min box attach`, `min box
+    // resume` or `min session attach` refused, or its connection failed.
     if let Some(refused) = e.downcast_ref::<minimal::BoxAttachRefusal>() {
         return refused.exit_code();
     }
@@ -1405,6 +1406,41 @@ mod tests {
             ),
         ] {
             let err = anyhow::Error::new(refusal).context("copying the file");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    /// BCLI-007, BCLI-009, BCLI-032: the refusals of `min box resume` and
+    /// `min session attach` end the run with their exit codes.
+    #[test]
+    fn resume_and_session_attach_refusals_map_to_exit_codes() {
+        let id = boxes::SessionId::parse_str("0199f000-0000-7000-8000-000000000001").unwrap();
+        for (refusal, code) in [
+            (
+                minimal::BoxAttachRefusal::NoTerminalToResume {
+                    address: "web".to_owned(),
+                    until_stopped: true,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NameHeld {
+                    address: "web".to_owned(),
+                    name: "web".to_owned(),
+                    holder: id,
+                    box_id: id,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::AmbiguousSessions {
+                    candidates: Vec::new(),
+                },
+                2,
+            ),
+            (minimal::BoxAttachRefusal::NoSessionCandidate, 4),
+        ] {
+            let err = anyhow::Error::new(refusal);
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
         }
     }

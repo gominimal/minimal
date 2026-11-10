@@ -163,69 +163,12 @@ pub(crate) fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Attach to an existing session. Both interactive and `--command` paths
-/// shell out to `ssh` — the daemon's shell_request handler mints a PTY-backed
-/// session shell, and ssh handles termios/PTY management for us.
-///
-/// When `args.session` is `None`, the session is resolved from the current
-/// working directory (or the only existing session), opening an interactive
-/// picker when the choice is ambiguous; see [`attach::resolve_for_attach`]
-/// and [`resolve_smart_attach`].
-///
-/// When `args.session` names a box, the name alone decides where to look
-/// (NET-058): the selected VM's daemon first — the common case costs nothing
-/// beyond the one lookup it always made — and, when that daemon does not know
-/// the name, [`attach::resolve_box_vm`] resolves the VM that owns it across
-/// every VM's socket, so no global flag is needed to reach a box on another
-/// VM.
+/// `min session attach [<box>]`: `min box attach` that sees only boxes of
+/// type session (BCLI-032). A named box resolves among the session boxes,
+/// and with none named the project's session box with a terminal is the
+/// one. A stopped or exited box resumes as the attach starts (BCLI-007).
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
-
-    let mut client = client::Client::connect(&sock)
-        .await
-        .context("Failed to connect to minimald")?;
-    // Connects directly rather than through `connect_daemon` (it needs `sock`
-    // for the ssh hand-off), so the gate is applied by hand — with no session
-    // named, this path creates one, and a skewed activation is #1251 exactly.
-    // Both arms below gate on the build the daemon reports on the lookup they
-    // were already making, so the gate costs no round trip of its own.
-    let (id, name, sock) = match args.session {
-        Some(ref s) => {
-            let (record, sock) =
-                resolve_attach_target_version_gated(global, &mut client, sock, s).await?;
-            (record.id, record.name, sock)
-        }
-        None => match resolve_smart_attach(
-            &list_sessions_version_gated(&mut client).await?.sessions,
-            global,
-        )? {
-            SmartAttach::Attach(entry) => (entry.id, entry.name, sock),
-            SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
-            SmartAttach::NoSessions => {
-                bail!("no sessions exist; use 'min session activate' to create one")
-            }
-        },
-    };
-
-    tracing::info!(
-        session_id = %id,
-        session_name = ?name,
-        "found session"
-    );
-
-    let host_asks = host_asks_box(global, name.as_deref());
-    box_via_ssh(
-        daemon_host_kind(global),
-        &sock,
-        id,
-        None,
-        global.config_dir.as_deref(),
-        host_asks.as_deref(),
-    )
-    .await
+    cmd_session_attach(global, args.session.as_deref()).await
 }
 
 /// Executes a command in an existing session.
