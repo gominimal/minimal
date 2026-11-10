@@ -16,6 +16,9 @@ use super::primitives::{
     WireProvenancedHook, WireSessionPatch, WireSessionVar,
 };
 use crate::SessionId;
+use crate::core::lifecyclehook::LifecycleHook;
+use crate::core::primitives::{LenientVarEntry, Patches, StrictVarName, VarValue};
+use std::collections::BTreeMap;
 
 /// Snapshot format version for [`WireComposition`]. Bumped when the
 /// on-disk shape changes in a way older daemons can't tolerate.
@@ -49,6 +52,68 @@ pub struct WireContribution {
     /// that predate the field deserialize cleanly.
     #[serde(default)]
     pub orientation: WireOrientation,
+    /// The `minimal.toml` entry the box comes from, expanded by the client
+    /// over `[defaults]`, `[defaults.<type>]` and the entry's own table
+    /// (BOX-064). The daemon composes the project's part of the box from
+    /// it (BOX-068). `None` from a client that sends no entry: the daemon
+    /// then composes from the project's `[session]` table alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<Box<WireBoxEntry>>,
+}
+
+/// An expanded `minimal.toml` entry, as the client sends it with its
+/// contribution: the lists of the expanded spec that the daemon composes.
+///
+/// Each list is `None` when the client sends no such list. An absent list
+/// leaves the daemon's own project list for that kind of item as it is. A
+/// present list, empty or not, is the project's whole list of that kind,
+/// except `packages`, which adds to the daemon's (see
+/// [`SessionComposer::compose`](crate::daemon::composer::SessionComposer::compose)).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WireBoxEntry {
+    /// The entry's name: `default`, or the `<name>` of its table.
+    pub name: String,
+    /// The entry's Box Type, `session` or `task`.
+    pub box_type: String,
+    /// The project root on the client host. Every item the entry
+    /// contributes is the project's, from this directory.
+    pub project: paths::HostPath,
+    /// `packages`, in expansion order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packages: Option<Vec<String>>,
+    /// `vars`, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vars: Option<BTreeMap<StrictVarName, VarValue>>,
+    /// `vars_lenient`, in expansion order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vars_lenient: Option<Vec<LenientVarEntry>>,
+    /// `patches`, in expansion order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patches: Option<Patches>,
+    /// `lifecycle_hooks`, in expansion order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_hooks: Option<Vec<LifecycleHook>>,
+}
+
+impl WireBoxEntry {
+    /// The entry `name` of `box_type` from `project`, with no lists.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        box_type: impl Into<String>,
+        project: paths::HostPath,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            box_type: box_type.into(),
+            project,
+            packages: None,
+            vars: None,
+            vars_lenient: None,
+            patches: None,
+            lifecycle_hooks: None,
+        }
+    }
 }
 
 /// Persisted composition snapshot, written by the daemon as a sidecar
@@ -386,7 +451,35 @@ mod tests {
             orientation: WireOrientation {
                 loadouts_display: "default (built-in)".into(),
             },
+            entry: None,
         };
         assert_eq!(round_trip(&c), c);
+    }
+
+    /// The expanded entry round-trips. An absent list stays absent and an
+    /// empty one stays empty.
+    #[test]
+    fn contribution_entry_round_trips_keeping_absent_lists_apart() {
+        let mut entry = WireBoxEntry::new(
+            "default",
+            "session",
+            paths::HostAbsPath::try_new("/work/project").unwrap().into(),
+        );
+        entry.packages = Some(vec!["ripgrep".into()]);
+        entry.lifecycle_hooks = Some(Vec::new());
+        let c = WireContribution {
+            entry: Some(Box::new(entry)),
+            ..WireContribution::default()
+        };
+        let back = round_trip(&c);
+        assert_eq!(back, c);
+        let back = back.entry.unwrap();
+        assert_eq!(back.vars, None);
+        assert_eq!(back.lifecycle_hooks, Some(Vec::new()));
+
+        // A contribution from a client that sends no entry still reads.
+        let json = r#"{"vars":[],"patches":[],"lifecycle_hooks":[],"requested_packages":[]}"#;
+        let c: WireContribution = serde_json_lenient::from_str(json).unwrap();
+        assert_eq!(c.entry, None);
     }
 }
