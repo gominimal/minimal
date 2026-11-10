@@ -105,7 +105,9 @@ encoding**.
 - **Layout.** The encoding is a byte-tagged TLV. Each field is a one-byte
   tag and then its payload. Every string has a `u32` little-endian length
   prefix. Every list, set or map has a `u32` little-endian count prefix.
-  Keys take their 32 bytes, and flags take one byte. An optional value
+  A length or count the prefix cannot hold is refused, never truncated
+  (EPOCH-001's sub-bullet), so the prefix is the whole of a value's
+  framing. Keys take their 32 bytes, and flags take one byte. An optional value
   takes a present tag or an absent tag. The encoding emits every field the
   seal assigns, so an absence among them is always a tag (witness class 5).
   The one exception is a field added after the seal under a reserved tag
@@ -197,6 +199,12 @@ build-infra operator. Release manager.
     EPOCH-013's member keys. Strings and lists need less). The bound is
     the starting point. The codec PR measures the harness and records the
     bound it ran at
+  - IF a string's byte length or a list's, set's or map's element count
+    does not fit in the `u32` prefix THEN THE SYSTEM SHALL refuse the
+    encoding with an error that names the field, so no two distinct values
+    share a truncated prefix.
+    tier:   T0
+    verify: cargo nextest run -p graph epoch1_overlong_value_is_refused
 
 - **EPOCH-002** WHEN a permutation reorders a spec's edges, or an edge is
   listed more than once, THE SYSTEM SHALL produce an identical encoding.
