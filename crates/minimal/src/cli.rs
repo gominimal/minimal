@@ -480,6 +480,12 @@ pub enum BoxCommand {
     /// Create a box from an entry of the project, run it without a terminal
     /// and exit with its exit code. This command's stdin, stdout and stderr
     /// are the box's. `--detach` starts the box, prints its id and returns
+    ///
+    /// The box's network and egress come from `--network`, the egress flags
+    /// and the entry's `network` keys in minimal.toml, as for `min task
+    /// run`. This command's flags go before the entry's own arguments. A
+    /// network or egress flag after an entry argument is refused. An
+    /// argument that shares a flag's name goes after `--`.
     Run(BoxRunArgs),
     /// Run a command in a running box and exit with the command's exit
     /// code. `-t` gives the command a terminal, and `--detach` starts it
@@ -1009,6 +1015,21 @@ pub enum TaskCommand {
     /// command exits 130. For a task declared with `interactive = true`,
     /// Ctrl-C destroys its box instead. Use `min session attach` for
     /// interactive work.
+    ///
+    /// The box's network mode is `--network`, else the `network.mode`
+    /// minimal.toml declares for the task, else host_ip. Its egress rules
+    /// are the `network.egress` keys minimal.toml declares for the task, in
+    /// `[defaults]`, `[defaults.task]` or the task's own entry.
+    /// `--allow-subnets`, `--allow-dns-hosts` and `--deny-subnets` add to
+    /// the file's lists, and `--allow-protocols` replaces its list.
+    /// `--deny-all-egress` drops the file's `allow_subnets` and
+    /// `allow_dns_hosts`, and cannot be combined with `--allow-subnets` or
+    /// `--allow-dns-hosts`. On a host that runs boxes in a VM, which every
+    /// macOS host is, `own_ip` is refused.
+    ///
+    /// This command's flags go before the task's own arguments. A network
+    /// or egress flag after a task argument is refused. A task argument
+    /// that shares a flag's name goes after `--`.
     Run(TaskRunArgs),
     /// List the task boxes of the current project, in any state. A task
     /// that ended shows its exit code, as `exited (exit 3)`, until
@@ -1042,6 +1063,19 @@ pub struct TaskRunArgs {
     /// task name is a task argument, never a project path.
     #[arg(long)]
     pub path: Option<String>,
+    // The same values and parser as `min session activate --network`, with
+    // help worded for a task box. With no flag, the box takes the task's
+    // `network.mode` from minimal.toml, else `NETWORK_DEFAULT`.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        help = TASK_NETWORK_HELP,
+        long_help = TASK_NETWORK_LONG_HELP
+    )]
+    pub network: Option<CliNetworkMode>,
+    #[command(flatten)]
+    pub egress: EgressArgs,
     /// Start the box, print its id and return. The task gets no input.
     #[arg(long)]
     pub detach: bool,
@@ -1063,6 +1097,18 @@ pub struct BoxRunArgs {
     /// Start the box, print its id and return. The box gets no input
     #[arg(long)]
     pub detach: bool,
+    // `min task run`'s network flags, from the same definitions: both verbs
+    // run a declared task through one run path.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        help = TASK_NETWORK_HELP,
+        long_help = TASK_NETWORK_LONG_HELP
+    )]
+    pub network: Option<CliNetworkMode>,
+    #[command(flatten)]
+    pub egress: EgressArgs,
     /// Arguments to the entry, passed through to its declared `args`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
@@ -1251,22 +1297,6 @@ impl GlobalArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(
-    // The egress rule flags as one named set, so a declaration that admits
-    // no exceptions can conflict with them as a family: `--deny-all-egress`
-    // names this group in `conflicts_with`, which is how it comes to
-    // conflict with every `--allow-*`/`--deny-*` rule flag at parse without
-    // the four rules becoming mutually exclusive with each other — they
-    // still combine freely (`multiple`), the way the section they build
-    // combines its dimensions. The one place the egress flags appear is
-    // `ActivateArgs`, so this is the one shared definition.
-    group(
-        ArgGroup::new("egress-rules")
-            .args(["allow_subnets", "allow_dns_hosts", "allow_protocols", "deny_subnets"])
-            .required(false)
-            .multiple(true)
-    )
-)]
 pub struct ActivateArgs {
     /// Optional session name
     #[arg(long, short)]
@@ -1318,41 +1348,9 @@ pub struct ActivateArgs {
         requires = "dynamic_ingress"
     )]
     pub dynamic_range: Option<(u16, u16)>,
-    /// Allow outbound traffic to this destination subnet, in CIDR form,
-    /// e.g. `10.0.0.0/8`. Repeatable. Once any egress flag is given, an
-    /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
-    /// allows nothing, unless the host opts out: `--allow-dns-hosts
-    /// github.com` alone reaches no address directly, and `--allow-subnets
-    /// 0.0.0.0/0` writes allow-all out. The egress flags are accepted with
-    /// `--network own_ip` and `--network host_ip`, and only `own_ip`
-    /// enforces these rules: a `host_ip` box is refused at creation or, on
-    /// a host that cannot filter it, runs with the rules unenforced.
-    /// `--network none` rejects every egress flag. `min session policy`
-    /// shows the rules a box ended up with.
-    #[arg(long = "allow-subnets", value_name = "CIDR")]
-    pub allow_subnets: Vec<String>,
-    /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
-    /// Repeatable. Given without `--allow-subnets`, the box reaches the
-    /// named hosts by name and no address directly; see `--allow-subnets`.
-    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
-    pub allow_dns_hosts: Vec<String>,
-    /// Allow this outbound transport protocol: tcp, udp, or icmp.
-    /// Repeatable; unset allows every protocol. Narrows what the other
-    /// allow flags admit and admits nothing on its own.
-    #[arg(long = "allow-protocols", value_name = "PROTO")]
-    pub allow_protocols: Vec<String>,
-    /// Deny outbound traffic to this destination subnet, in CIDR form,
-    /// subtracted from what the allow flags admit. Repeatable; unset
-    /// denies nothing.
-    #[arg(long = "deny-subnets", value_name = "CIDR")]
-    pub deny_subnets: Vec<String>,
-    /// Declare deny-all egress: the box reaches no external address.
-    /// Cannot be combined with the `--allow-*` or `--deny-subnets` flags.
-    /// Unless the host opts out, a `--network own_ip` box with no egress
-    /// rules already gets this by default. With `--network host_ip` it is
-    /// enforced only on a host that can filter each box.
-    #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
-    pub deny_all_egress: bool,
+    // The egress flags are shared with `min task run`, from one definition.
+    #[command(flatten)]
+    pub egress: EgressArgs,
     /// Let the box reach the Box Egress Proxy, whatever its
     /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
     /// box sends to the proxy's address is dropped. Takes effect with
@@ -1405,6 +1403,64 @@ impl ActivateArgs {
             .expect("every activation flag has a default")
             .args
     }
+}
+
+// The egress flags of a box-creating command: `min session activate`,
+// `min task run` and `min box run` take them from this one definition.
+// `effective_egress` applies them to the egress minimal.toml declares
+// (arch#166, #3143): a list flag adds, `--allow-protocols` replaces, and
+// `--deny-all-egress` only narrows, so it refuses the two allow flags.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct EgressArgs {
+    /// Allow outbound traffic to this destination subnet, in CIDR form,
+    /// e.g. `10.0.0.0/8`. Repeatable. Adds to the `allow_subnets` that
+    /// minimal.toml declares for the box. Once any egress flag is given, an
+    /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
+    /// allows nothing, unless the host opts out: `--allow-dns-hosts
+    /// github.com` alone reaches no address directly, and `--allow-subnets
+    /// 0.0.0.0/0` writes allow-all out. The egress flags are accepted with
+    /// `--network own_ip` and `--network host_ip`, and only `own_ip`
+    /// enforces these rules: a `host_ip` box is refused at creation or, on
+    /// a host that cannot filter it, runs with the rules unenforced.
+    /// `--network none` rejects every egress flag. `min session policy`
+    /// shows the rules a box ended up with.
+    #[arg(long = "allow-subnets", value_name = "CIDR")]
+    pub allow_subnets: Vec<String>,
+    /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
+    /// Repeatable. Adds to the `allow_dns_hosts` that minimal.toml declares
+    /// for the box. Given without `--allow-subnets`, the box reaches the
+    /// named hosts by name and no address directly; see `--allow-subnets`.
+    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
+    pub allow_dns_hosts: Vec<String>,
+    /// Allow this outbound transport protocol: tcp, udp, or icmp.
+    /// Repeatable; unset allows every protocol. Replaces the
+    /// `allow_protocols` that minimal.toml declares for the box. Narrows
+    /// what the other allow flags admit and admits nothing on its own.
+    #[arg(long = "allow-protocols", value_name = "PROTO")]
+    pub allow_protocols: Vec<String>,
+    /// Deny outbound traffic to this destination subnet, in CIDR form,
+    /// subtracted from what the allow flags admit. Repeatable; unset
+    /// denies nothing. Adds to the `deny_subnets` that minimal.toml
+    /// declares for the box, so it never drops a range the file denies.
+    #[arg(long = "deny-subnets", value_name = "CIDR")]
+    pub deny_subnets: Vec<String>,
+    /// Declare deny-all egress: the box reaches no external address. Drops
+    /// every `allow_subnets` and `allow_dns_hosts` value minimal.toml
+    /// declares for the box. Cannot be combined with `--allow-subnets` or
+    /// `--allow-dns-hosts`. The file's `allow_protocols` and `deny_subnets`
+    /// stay, and `--deny-subnets` and `--allow-protocols` still apply.
+    /// Unless the
+    /// host opts out, a `--network own_ip` box with no egress rules already
+    /// reaches no external address. With `--network host_ip` it is enforced
+    /// only on a host that can filter each box.
+    #[arg(
+        long = "deny-all-egress",
+        conflicts_with_all = ["allow_subnets", "allow_dns_hosts"]
+    )]
+    pub deny_all_egress: bool,
 }
 
 /// Which daemon backend (box host) serves sessions, as `--provider` names it.
@@ -1474,6 +1530,33 @@ pub(crate) const NETWORK_HELP: &str = network_help!();
 pub(crate) const NETWORK_LONG_HELP: &str = concat!(
     network_help!(),
     ".\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
+
+/// The first paragraph of the `--network` help of `min task run` and `min
+/// box run`, as a literal so that [`TASK_NETWORK_LONG_HELP`] can extend it.
+/// Neither verb takes `--ingress` yet (#3163), so this names neither a
+/// session nor ingress.
+macro_rules! task_network_help {
+    () => {
+        "Network mode for the task box: `none` gives the box no network (every socket it opens \
+         to a destination outside itself fails), `host_ip` shares the host's network namespace, \
+         and `own_ip` gives the box its own IP address; unless the host opts out, an `own_ip` \
+         box with no egress rules can reach no external address. With no flag, the box takes \
+         the `network.mode` minimal.toml declares for the task, else `host_ip`"
+    };
+}
+
+/// The `--network` short help of `min task run` and `min box run`.
+pub(crate) const TASK_NETWORK_HELP: &str = task_network_help!();
+
+/// The `--network` long help of `min task run` and `min box run`: the short
+/// help, the VM-host refusal, and the legacy spellings.
+pub(crate) const TASK_NETWORK_LONG_HELP: &str = concat!(
+    task_network_help!(),
+    ".\n\n",
+    "On a host that runs boxes in a VM, `own_ip` is refused.\n\n",
     "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
      prints a one-line hint naming the current spelling."
 );
