@@ -5008,9 +5008,12 @@ async fn relay_switch_frames_to_guest(
         let permit = match guest.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
+                let addr = l4.as_ref().map(|pkt| pkt.dst.ip().octets());
+                let record = addr.and_then(|addr| table.by_source(addr));
                 limiter.warn_backpressure(
                     QueueDirection::TowardGuest,
-                    l4.as_ref().map(|pkt| pkt.dst.ip().octets()),
+                    addr,
+                    Who(record.as_deref()),
                 );
                 continue;
             }
@@ -5196,16 +5199,23 @@ async fn relay_frames_to_switch(
         }
         let admitted = match decided {
             Ok(admitted) => admitted,
+            // Every line below names the box the frame's source resolves to
+            // (its row as it is now, a rename moves it), beside the address
+            // the line already carried: the address alone means nothing once
+            // the box is gone (gominimal/inbox#1228).
             Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
-                limiter.warn_switch_surface(src, dst_port);
+                let record = table.by_source(src);
+                limiter.warn_switch_surface(src, Who(record.as_deref()), dst_port);
                 continue;
             }
             Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
-                limiter.warn_infrastructure(src, dst, dst_port);
+                let record = table.by_source(src);
+                limiter.warn_infrastructure(src, Who(record.as_deref()), dst, dst_port);
                 continue;
             }
             Err(GateDrop::HostAlias { src, dst_port, row }) => {
-                limiter.warn_host_alias(src, dst_port, row);
+                let record = table.by_source(src);
+                limiter.warn_host_alias(src, Who(record.as_deref()), dst_port, row);
                 continue;
             }
             Err(GateDrop::BoxName { src, dst, dst_port }) => {
@@ -5264,8 +5274,10 @@ async fn relay_frames_to_switch(
                 // address and the port the frame gave it, read off the frame
                 // the reason's own shape refuses — so a bundle's reader learns
                 // which reach was refused without cross-reading the rows.
+                let record = summary.source().and_then(|src| table.by_source(src));
                 limiter.warn_undeclared_subnet(
                     summary.source(),
+                    Who(record.as_deref()),
                     dst,
                     summary.destination_port(),
                     reason.rule(),
@@ -5273,7 +5285,8 @@ async fn relay_frames_to_switch(
                 continue;
             }
             Err(dropped) => {
-                limiter.emit(summary.source(), dropped.rule());
+                let record = summary.source().and_then(|src| table.by_source(src));
+                limiter.emit(summary.source(), Who(record.as_deref()), dropped.rule());
                 continue;
             }
         };
@@ -5348,7 +5361,12 @@ async fn relay_frames_to_switch(
         match switch.try_send(framed) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                limiter.warn_backpressure(QueueDirection::TowardSwitch, summary.source());
+                let record = summary.source().and_then(|src| table.by_source(src));
+                limiter.warn_backpressure(
+                    QueueDirection::TowardSwitch,
+                    summary.source(),
+                    Who(record.as_deref()),
+                );
                 continue;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -6925,6 +6943,24 @@ fn family_drop(family: FrameFamily) -> DropReason {
     }
 }
 
+/// The box a dropped frame's address resolved to, for the line that names
+/// the drop: its name and id as the row holds them now, or nothing for an
+/// address no row holds (gominimal/inbox#1228: the address alone means
+/// nothing once the box is gone).
+#[derive(Clone, Copy)]
+struct Who<'a>(Option<&'a crate::box_registry::BoxRecord>);
+
+impl Who<'_> {
+    fn name(self) -> Option<std::sync::Arc<str>> {
+        self.0.map(crate::box_registry::BoxRecord::name)
+    }
+
+    fn id(self) -> Option<tracing::field::DisplayValue<uuid::Uuid>> {
+        self.0
+            .map(|record| tracing::field::display(uuid::Uuid::from_bytes(record.box_id())))
+    }
+}
+
 impl DropLimiter {
     /// Emits the drop warning for one dropped frame if the rate limit allows:
     /// the source address the frame carried — `none` when the frame carried
@@ -6933,7 +6969,7 @@ impl DropLimiter {
     /// more distinct sources are dropping than the table keeps windows for,
     /// one line per rule naming the flood instead. Returns whether a line
     /// was written.
-    fn emit(&self, src: Option<[u8; 4]>, rule: &'static str) -> bool {
+    fn emit(&self, src: Option<[u8; 4]>, who: Who<'_>, rule: &'static str) -> bool {
         match self.should_warn_at(src, rule, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
@@ -6941,6 +6977,8 @@ impl DropLimiter {
                     src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
                 tracing::warn!(
                     source = %source,
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
                     rule_matched = rule,
                     "dropped a frame leaving the VM at the host-side egress gate",
                 );
@@ -6962,12 +7000,14 @@ impl DropLimiter {
     /// source and the rule, and naming the port the frame gave the gateway —
     /// the line a host reads to learn which port of the switch's control
     /// surface a box was reaching for. Returns whether a line was written.
-    fn warn_switch_surface(&self, src: [u8; 4], dst_port: u16) -> bool {
+    fn warn_switch_surface(&self, src: [u8; 4], who: Who<'_>, dst_port: u16) -> bool {
         match self.should_warn_at(Some(src), SWITCH_CONTROL_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
                     port = dst_port,
                     rule_matched = SWITCH_CONTROL_RULE,
                     "dropped a frame to the switch's own address; its control surface is not \
@@ -6996,7 +7036,12 @@ impl DropLimiter {
     /// the frame belongs to — the source of a frame toward the switch, the
     /// destination of one toward the guest — and `none` when the frame
     /// carries no IPv4 address to read. Returns whether a line was written.
-    fn warn_backpressure(&self, direction: QueueDirection, addr: Option<[u8; 4]>) -> bool {
+    fn warn_backpressure(
+        &self,
+        direction: QueueDirection,
+        addr: Option<[u8; 4]>,
+        who: Who<'_>,
+    ) -> bool {
         let rule = direction.rule();
         let toward = direction.toward();
         match self.should_warn_at(addr, rule, Instant::now()) {
@@ -7016,12 +7061,16 @@ impl DropLimiter {
                 match direction {
                     QueueDirection::TowardSwitch => tracing::warn!(
                         source = %addr,
+                        box = who.name().as_deref(),
+                        box_id = who.id(),
                         toward,
                         rule_matched = rule,
                         "{message}",
                     ),
                     QueueDirection::TowardGuest => tracing::warn!(
                         destination = %addr,
+                        box = who.name().as_deref(),
+                        box_id = who.id(),
                         toward,
                         rule_matched = rule,
                         "{message}",
@@ -7047,12 +7096,14 @@ impl DropLimiter {
     /// and the rule, and naming the destination and the port the frame gave
     /// it — the line a host reads to learn which piece of the host or the
     /// fabric a box was reaching for. Returns whether a line was written.
-    fn warn_infrastructure(&self, src: [u8; 4], dst: [u8; 4], dst_port: u16) -> bool {
+    fn warn_infrastructure(&self, src: [u8; 4], who: Who<'_>, dst: [u8; 4], dst_port: u16) -> bool {
         match self.should_warn_at(Some(src), INFRASTRUCTURE_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
                     destination = %Ipv4Addr::from(dst),
                     port = dst_port,
                     rule_matched = INFRASTRUCTURE_RULE,
@@ -7077,12 +7128,14 @@ impl DropLimiter {
     /// openings (NET-156): the same rate limit a drop's line answers to,
     /// keyed by the source and the rule, and naming the row and the port.
     /// Returns whether a line was written.
-    fn warn_host_alias(&self, src: [u8; 4], dst_port: u16, row: AliasRow) -> bool {
+    fn warn_host_alias(&self, src: [u8; 4], who: Who<'_>, dst_port: u16, row: AliasRow) -> bool {
         match self.should_warn_at(Some(src), HOST_ALIAS_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
                     row = row.as_str(),
                     port = dst_port,
                     rule_matched = HOST_ALIAS_RULE,
@@ -7349,6 +7402,7 @@ impl DropLimiter {
     fn warn_undeclared_subnet(
         &self,
         src: Option<[u8; 4]>,
+        who: Who<'_>,
         dst: [u8; 4],
         dst_port: u16,
         rule: &'static str,
@@ -7360,6 +7414,8 @@ impl DropLimiter {
                     src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
                 tracing::warn!(
                     source = %source,
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
                     destination = %Ipv4Addr::from(dst),
                     // The frame summary reads 0 when the protocol carries no
                     // L4 port (ICMP, say): name that rather than a port 0.
