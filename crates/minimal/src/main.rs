@@ -256,7 +256,10 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), the code a start
+/// is not running, 5 when its spec turns exec off), the code an `--exec
+/// <id>` refusal of `min box stop`, `logs` or `wait` carries
+/// (`minimal::BoxExecIdRefusal`: 2 for text that is not an exec id, 4 for an
+/// exec the box does not have), the code a start
 /// refusal carries (`minimal::StartEntryRefusal`: 4 when the start does not
 /// find the entry, 2 when it cannot pick or start it), 2 when a start needs a terminal
 /// it does not have (`minimal::StartNeedsTerminal`) or asks for a held name
@@ -346,6 +349,12 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-053: `min box exec -t` without a terminal, or into a box that is
     // not running (2), or whose spec turns exec off (5).
     if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-055, BCLI-056, BCLI-057: `--exec <id>` on `min box stop`, `logs`
+    // or `wait` with text that is not an exec id (2), or an exec id the box
+    // does not have (4).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxExecIdRefusal>() {
         return refused.exit_code();
     }
     // BCLI-053: an exec that its own timeout ended.
