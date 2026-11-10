@@ -1527,6 +1527,31 @@ mod tests {
         assert_eq!(failure_exit_code(&e), 3);
     }
 
+    /// An invalid project `minimal.toml` that does not parse prints its TOML
+    /// parse error once, and the run ends with exit 3.
+    #[test]
+    fn invalid_project_file_prints_toml_error_once() {
+        let error = mfile::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("the file does not parse");
+        assert!(matches!(error, mfile::Error::Format(_)), "{error:?}");
+        let e = anyhow::Error::new(minimal::ProjectFileInvalid { error })
+            .context("activating the session");
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(
+            printed.contains(
+                "Cannot start the box: the project's minimal.toml does not load: \
+                 invalid TOML: TOML parse error"
+            ),
+            "{printed}"
+        );
+        assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
+        assert_eq!(printed.matches("invalid TOML").count(), 1, "{printed}");
+        assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
+    }
+
     /// A broken pipe anywhere in the error chain is classified as such, so
     /// `min version | head -1` can exit quietly instead of printing an error.
     #[test]

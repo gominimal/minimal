@@ -94,11 +94,12 @@ pub struct ProjectFileInvalid {
 
 impl std::fmt::Display for ProjectFileInvalid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `source()` returns the mfile error, so the printer's `{:#}` shows
+        // it after this text, once.
         write!(
             f,
-            "Cannot start the box: the project's {name} does not load: {error}",
+            "Cannot start the box: the project's {name} does not load",
             name = mfile::MFILE_NAME,
-            error = self.error,
         )
     }
 }

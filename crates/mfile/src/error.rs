@@ -132,7 +132,9 @@ impl fmt::Display for Error {
             Error::IO(ctx, path, e) => {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
-            Error::Format(e) => write!(f, "invalid TOML: {}", e),
+            // `source()` returns the parse error, so a chain printer such as
+            // `{:#}` shows its snippet after this text, once.
+            Error::Format(_) => write!(f, "invalid TOML"),
             Error::LinkConfig {
                 path, line, table, ..
             } => {
