@@ -198,9 +198,13 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     verify: cargo nextest run -p minimal box_spec_entry_override_flags_match_start
 
 - **BCLI-077** WHEN `min box spec <entry>` renders an entry's `vars` and `vars_lenient` THE SYSTEM SHALL render each variable name once, in the table and with the value that BOX-180's merge gives it. Beside each name it SHALL name the layer that set it, as BOX-161 reports.
-  <!-- event-driven; BOX-180: up to and including the entry, the most specific layer that sets a name wins, and each selected loadout adds the names it sets. How a loadout's literal value is stored, and whether this render shows it or a reference, waits on gominimal/minimal#3210 (Open questions) -->
+  <!-- event-driven; BOX-180: up to and including the entry, the most specific layer that sets a name wins, and each selected loadout adds the names it sets -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_merged_vars_once_with_layer
+  - WHERE a selected loadout sets a variable's value THE SYSTEM SHALL render that value as withheld, mark it as set by that loadout, and point to gominimal/minimal#3210. It SHALL never render the loadout's literal value in clear. A value that the project's layers or the entry set SHALL keep the rendering of BCLI-077.
+    <!-- optional-feature; fails closed: nothing marks a loadout literal as a secret yet, and gominimal/minimal#3210 decides how one is stored and marked, so BCLI-063 holds with no exception (Open questions) -->
+    tier:   T0
+    verify: cargo nextest run -p minimal box_spec_withholds_loadout_set_var_values
 
 - **BCLI-078** IF expanding an entry fails under BOX-172, BOX-174, BOX-181, BOX-182, BOX-183 or BOX-184 THEN THE SYSTEM SHALL fail `min box spec <entry>`, `min box start`, `min box run`, `min session start` and `min task run` with exit 3, and print the error that requirement states. It SHALL create nothing and render nothing.
   <!-- unwanted; spec 29 states each refusal's content, and this requirement binds the commands that print it. What each error tells the person:
@@ -272,7 +276,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- unwanted; BOX-173 fixes what the refusal tells the person: the loadout, that the box's `loadout_mode` is `sealed` and the layer that set it, and the remedy of running without `--loadout`. Unless a Box Type constraint holds the mode, it also names setting `loadout_mode = "open"` in the entry, and otherwise it names that type. A named loadout never disappears silently (owner ruling 2026-11-05) -->
     tier:   T0
     verify: cargo nextest run -p minimal create_verbs_named_loadout_on_sealed_box_exit3
-  - WHERE the `loadout_mode` that BOX-064's layers up to and including the entry set is `sealed` THE SYSTEM SHALL create or render the box without reading any default loadout, and print nothing about the loadouts it skips.
+  - WHERE the `loadout_mode` that BOX-064's layers up to and including the entry set is `sealed`, WHEN a create verb or `min box spec <entry>` runs without `--loadout` THE SYSTEM SHALL create or render the box without reading any default loadout, and print nothing about the loadouts it skips.
     <!-- optional-feature; BOX-166, BOX-171 and BOX-175: a sealed box reads neither `default_loadouts` nor the `default` loadout, so a broken default loadout cannot fail a sealed task, and a healthy start prints nothing new -->
     tier:   T0
     verify: cargo nextest run -p minimal sealed_box_reads_no_default_loadout_and_prints_nothing
@@ -667,6 +671,6 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (MEDIUM): a loadout can set a variable to a literal value, and BOX-068 stores the expanded spec in the record. Whether that literal is stored, how a loadout marks it as a secret, and how BCLI-077 renders it are open with gominimal/minimal#3210. BCLI-063 renders a secret as a reference only, but nothing marks a loadout literal as one yet.]
+- [NEEDS CLARIFICATION (MEDIUM): when can BCLI-077 stop withholding a loadout-set variable value? A loadout can set a variable to a literal value, and BOX-068 stores the expanded spec in the record. Until gominimal/minimal#3210 decides whether that literal is stored and how a loadout marks it as a secret, BCLI-077 withholds every loadout-set value, so BCLI-063 holds. What #3210 must settle before BCLI-077 can render any loadout-set value in clear is open.]
 - [NEEDS CLARIFICATION (MEDIUM): nesting has no owner. The BOX Non-goals name gominimal/inbox#568, which closed as a duplicate, and gominimal/inbox#572 closed as not planned. `min box wait --parent` and `--parent self` wait on whichever spec or epic takes nesting up.]
 - [NEEDS CLARIFICATION (MEDIUM): `min box sync`, `min box port`, `min box add`, `min host create|pause|resume|rm` and `min provider show|add|rm|login|use` have no owner. The architecture names them, BPA defines the provider operations under the host and provider verbs, and BPA names this spec for the grammar. gominimal/minimal#2868 decides which spec owns each verb and schedules them.]
