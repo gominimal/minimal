@@ -792,21 +792,14 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
 
     match resp {
         minimald_rpc::Errorable::Ok(_) => {
-            // A `host_ip` box holds its name in the zone (NODATA) in place
-            // of a row: the hold moves with the name, so the old name no box
-            // owns answers NXDOMAIN again and the new one is the one the
-            // destroy releases.
-            if holds_name(&record) {
-                let control_sock =
-                    vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
-                move_held_box_name(
-                    control_sock,
-                    record.id,
-                    record.name.as_deref(),
-                    &args.new_name,
-                )
-                .await;
-            }
+            // The VM host keeps the box under the name it was registered
+            // by until it is told: a `host_ip` box's zone hold (NODATA) and
+            // an own-address box's row both move with the name, so the old
+            // name answers NXDOMAIN again and the new one is the one the
+            // box answers under and the destroy releases (#1116).
+            let control_sock =
+                vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+            rename_box_with_vm_host(control_sock, &record, &args.new_name).await;
             println!(
                 "Renamed session {} ({}) → {}",
                 record.id,
