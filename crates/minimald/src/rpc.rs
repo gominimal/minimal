@@ -1436,6 +1436,43 @@ async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
         .await
 }
 
+/// `RestartBox`: restarts a box whose spec sets `lifetime =
+/// "until_stopped"` (BOX-176). A box that a check refuses answers a typed
+/// [`minimald_rpc::RestartRefusal`] and is left as it was. A start that
+/// fails answers its error and leaves the box `stopped`.
+async fn serve_restart_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::RestartBox
+        .handle_channel(c, async |req: minimald_rpc::RestartBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            match mngr.restart_box(req.id).await {
+                Ok(was_running) => {
+                    tracing::info!(session_id = %req.id, was_running, "session restarted");
+                    Ok(Errorable::Ok(minimald_rpc::RestartBoxResponse::Restarted {
+                        was_running,
+                    }))
+                }
+                Err(crate::box_actor::RestartError::Refused(refusal)) => {
+                    tracing::info!(
+                        session_id = %req.id,
+                        refusal = refusal.kind.name(),
+                        exit_code = refusal.exit_code,
+                        "session restart refused"
+                    );
+                    Ok(Errorable::Ok(minimald_rpc::RestartBoxResponse::Refused(
+                        refusal,
+                    )))
+                }
+                Err(crate::box_actor::RestartError::Failed(error)) => {
+                    tracing::info!(session_id = %req.id, %error, "session restart failed");
+                    Ok(Errorable::Err {
+                        error: error.to_string(),
+                    })
+                }
+            }
+        })
+        .await
+}
+
 /// An RPC to stop one exec in a running box (BOX-151). The exec's process
 /// group gets SIGTERM, a wait, then SIGKILL. The box and its other execs
 /// keep running. The answer comes when the exec has ended.
@@ -3508,6 +3545,7 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | minimald_rpc::StopBox::NAME
+        | minimald_rpc::RestartBox::NAME
         | StopExec::NAME
         | minimald_rpc::ReapBox::NAME
         | minimald_rpc::PruneBoxes::NAME
@@ -3595,6 +3633,7 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
+        minimald_rpc::RestartBox::NAME => serve!(serve_restart_box(s, channel)),
         StopExec::NAME => serve!(serve_stop_exec(s, channel)),
         minimald_rpc::ReapBox::NAME => serve!(serve_reap_box(s, channel)),
         minimald_rpc::PruneBoxes::NAME => serve!(serve_prune_boxes(s, channel)),

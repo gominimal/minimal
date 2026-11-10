@@ -109,6 +109,857 @@ impl std::error::Error for ProjectFileInvalid {
     }
 }
 
+/// The session entry of the project's `minimal.toml` that egress is read from
+/// (NET-060): `[sessions.default]`, or `[boxes.default]` with
+/// `type = "session"`, else the only session entry, else the implicit
+/// default session entry. Every other case refuses the start, before the
+/// create request.
+fn pick_session_entry(
+    entries: &[mfile::entry::BoxEntry],
+) -> Result<mfile::entry::BoxEntry, SessionEntryUndecided> {
+    let candidates: Vec<&mfile::entry::BoxEntry> = entries
+        .iter()
+        .filter(|entry| entry.box_type.as_deref() == Some(boxes::SESSION_BOX_TYPE))
+        .collect();
+    if let Some(entry) = candidates
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok((*entry).clone());
+    }
+    // An entry whose type is not built in has a session root that only
+    // mfile can resolve, so the client cannot tell whether it is a session.
+    // gominimal/minimal#3140 tracks resolving a project Box Type's session
+    // root here. The refusal stays until then.
+    if let Some(entry) = entries.iter().find(|entry| {
+        entry
+            .box_type
+            .as_deref()
+            .is_none_or(|t| !mfile::expand::BUILTIN_BOX_TYPES.contains(&t))
+    }) {
+        return Err(SessionEntryUndecided::TypeUnresolved {
+            name: entry.name.clone(),
+            box_type: entry.box_type.clone(),
+        });
+    }
+    match candidates.as_slice() {
+        [only] => Ok((*only).clone()),
+        [] => mfile::entry::implicit_default_entry(entries, |t| {
+            mfile::expand::BUILTIN_BOX_TYPES
+                .into_iter()
+                .find(|builtin| *builtin == t)
+        })
+        .ok_or_else(|| SessionEntryUndecided::DefaultNotSession {
+            box_type: entries
+                .iter()
+                .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+                .and_then(|entry| entry.box_type.clone()),
+        }),
+        several => Err(SessionEntryUndecided::NoDefault {
+            candidates: several.iter().map(|entry| entry.name.clone()).collect(),
+        }),
+    }
+}
+
+/// A project `minimal.toml` whose session entry the start cannot pick. The
+/// activation refuses it before the create request, and the run ends with
+/// exit 2 (`main.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEntryUndecided {
+    /// Two or more session entries, and none is named `default`.
+    NoDefault {
+        /// The names of the session entries, in the order the file is read.
+        candidates: Vec<String>,
+    },
+    /// No session entry, and an entry named `default` that is not a
+    /// session, so no implicit default session entry applies.
+    DefaultNotSession {
+        /// The type of the `default` entry, when the file gives one.
+        box_type: Option<String>,
+    },
+    /// No session entry named `default`, and an entry whose type is not a
+    /// built-in Box Type, so the client cannot tell whether it is a session.
+    TypeUnresolved {
+        /// The name of the entry.
+        name: String,
+        /// The type of the entry, when the file gives one.
+        box_type: Option<String>,
+    },
+}
+
+impl std::fmt::Display for SessionEntryUndecided {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = mfile::MFILE_NAME;
+        match self {
+            SessionEntryUndecided::NoDefault { candidates } => write!(
+                f,
+                "Cannot start the box: the project's {file} declares the session entries \
+                 {names}. None of them is named \"default\", so the start cannot pick one. \
+                 Rename the entry to start to \"default\" in {file}.",
+                names = candidates.join(", "),
+            ),
+            SessionEntryUndecided::DefaultNotSession { box_type } => {
+                let kind = box_type.as_deref().map_or_else(
+                    || "no type".to_owned(),
+                    |t| format!("the type \"{}\"", printable(t)),
+                );
+                write!(
+                    f,
+                    "Cannot start the box: the project's {file} declares no session entry. \
+                     Its entry \"default\" has {kind}, so the start has no session entry \
+                     to use. Add a [sessions.<name>] entry to {file}."
+                )
+            }
+            SessionEntryUndecided::TypeUnresolved { name, box_type } => {
+                let kind = box_type.as_deref().map_or_else(
+                    || "no type".to_owned(),
+                    |t| format!("the type \"{}\"", printable(t)),
+                );
+                write!(
+                    f,
+                    "Cannot start the box: the project's {file} declares the entry \"{name}\" \
+                     with {kind}, so the start cannot tell whether it is a session entry. "
+                )?;
+                // An entry already holds the name `default`, so no other
+                // entry can take it.
+                if name == mfile::entry::DEFAULT_ENTRY_NAME {
+                    write!(
+                        f,
+                        "Set type = \"session\" in the entry \"{name}\", or rename that entry \
+                         and add a [sessions.default] entry to {file}."
+                    )
+                } else {
+                    write!(
+                        f,
+                        "If \"{name}\" is the session to start, set type = \"session\" in it. \
+                         Otherwise, name the session entry to start \"default\", or add a \
+                         [sessions.default] entry to {file}."
+                    )
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionEntryUndecided {}
+
+impl SessionEntryUndecided {
+    /// The exit code of the refused start.
+    pub const EXIT_CODE: u8 = 2;
+}
+
+/// The verb a start came from: `min box start` or `min session start`.
+/// Both share one start path ([`start_entry`]). The verb decides which
+/// entries the start counts, and it names the command in the refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartVerb {
+    Box,
+    Session,
+}
+
+impl StartVerb {
+    /// The command, as the person types it.
+    #[must_use]
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Box => "min box start",
+            Self::Session => "min session start",
+        }
+    }
+}
+
+/// What a start creates its box from, whichever verb typed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartEntry {
+    pub verb: StartVerb,
+    /// The entry the person typed, when they typed one.
+    pub entry: Option<String>,
+    /// `--name`: the box's `[box] name` (BCLI-069).
+    pub name: Option<String>,
+    /// `--new`: a fresh instance (BCLI-070).
+    pub new: bool,
+    /// `--detach`: print the id and return, never attach.
+    pub detach: bool,
+}
+
+impl From<BoxStartArgs> for StartEntry {
+    fn from(args: BoxStartArgs) -> Self {
+        Self {
+            verb: StartVerb::Box,
+            entry: args.entry,
+            name: args.name,
+            new: args.new,
+            detach: args.detach,
+        }
+    }
+}
+
+impl From<SessionStartArgs> for StartEntry {
+    fn from(args: SessionStartArgs) -> Self {
+        Self {
+            verb: StartVerb::Session,
+            entry: args.entry,
+            name: args.name,
+            new: args.new,
+            detach: args.detach,
+        }
+    }
+}
+
+/// The built-in root of a Box Type, for a built-in type. The client cannot
+/// resolve a project Box Type, so it has none here.
+fn builtin_root(box_type: &str) -> Option<&'static str> {
+    mfile::expand::BUILTIN_BOX_TYPES
+        .into_iter()
+        .find(|builtin| *builtin == box_type)
+}
+
+/// Whether the client cannot resolve `entry`'s type to a built-in root. Such
+/// an entry can be a session.
+/// <https://github.com/gominimal/minimal/issues/3140> tracks resolving a
+/// project Box Type's root here.
+pub(crate) fn type_unresolved(entry: &mfile::entry::BoxEntry) -> bool {
+    entry.box_type.as_deref().and_then(builtin_root).is_none()
+}
+
+/// The refusal for `entry`, whose type the client cannot resolve.
+pub(crate) fn type_unresolved_refusal(entry: &mfile::entry::BoxEntry) -> SessionEntryUndecided {
+    SessionEntryUndecided::TypeUnresolved {
+        name: entry.name.clone(),
+        box_type: entry.box_type.clone(),
+    }
+}
+
+/// The entries a refusal lists: the [`start_candidates`], else the
+/// project's own entries when a type is unresolved.
+pub(crate) fn listed_entries(entries: &[mfile::entry::BoxEntry]) -> Vec<mfile::entry::BoxEntry> {
+    start_candidates(entries).unwrap_or_else(|_| entries.to_vec())
+}
+
+/// The entries a start counts: the project's entries, and the implicit
+/// `default` session entry when the project needs one (BOX-165). A picker
+/// calls this only after its lookups of an explicit entry, when the pick
+/// depends on the implicit `default` or on the count.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided::TypeUnresolved`] when an entry's type does not
+/// resolve to a built-in root. Such an entry can be a session, so the start
+/// can tell neither which entries are sessions nor whether the implicit
+/// `default` applies. <https://github.com/gominimal/minimal/issues/3140>
+/// tracks resolving a project Box Type's root here. Remove this refusal
+/// when the client resolves that root.
+pub(crate) fn start_candidates(
+    entries: &[mfile::entry::BoxEntry],
+) -> Result<Vec<mfile::entry::BoxEntry>, SessionEntryUndecided> {
+    if let Some(entry) = entries.iter().find(|entry| type_unresolved(entry)) {
+        return Err(type_unresolved_refusal(entry));
+    }
+    let mut candidates = entries.to_vec();
+    if let Some(implicit) = mfile::entry::implicit_default_entry(entries, builtin_root) {
+        candidates.push(implicit);
+    }
+    Ok(candidates)
+}
+
+/// Whether `entry` is a session entry.
+pub(crate) fn is_session_entry(entry: &mfile::entry::BoxEntry) -> bool {
+    entry.box_type.as_deref() == Some(boxes::SESSION_BOX_TYPE)
+}
+
+/// The entry `min box start` starts (BCLI-072): the typed entry, else the
+/// entry named `default` of any type, else the project's only entry. The
+/// count includes the implicit `default` entry.
+///
+/// A typed project entry, and with no entry typed a project entry named
+/// `default`, is picked whatever its type. [`plan_start`] refuses a type
+/// that the start cannot serve.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided::TypeUnresolved`] from [`start_candidates`],
+/// only when the pick depends on the implicit `default` or on the count.
+/// Else a [`StartEntryRefusal`] when no entry can be picked.
+pub(crate) fn pick_box_start_entry(
+    entries: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    let wanted = typed.unwrap_or(mfile::entry::DEFAULT_ENTRY_NAME);
+    if let Some(entry) = entries.iter().find(|entry| entry.name == wanted) {
+        return Ok(entry.clone());
+    }
+    let unknown = |typed: &str| StartEntryRefusal::Unknown {
+        verb: StartVerb::Box,
+        entry: typed.to_string(),
+        entries: listed_entries(entries)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
+    };
+    if let Some(typed) = typed.filter(|typed| *typed != mfile::entry::DEFAULT_ENTRY_NAME) {
+        return Err(unknown(typed).into());
+    }
+    // Only the implicit `default` or the count is left to decide the pick.
+    let candidates = start_candidates(entries)?;
+    let names = || candidates.iter().map(|entry| entry.name.clone()).collect();
+    if let Some(default) = candidates
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok(default.clone());
+    }
+    if let Some(typed) = typed {
+        return Err(unknown(typed).into());
+    }
+    match candidates.as_slice() {
+        [only] => Ok(only.clone()),
+        _ => Err(StartEntryRefusal::Several {
+            verb: StartVerb::Box,
+            entries: names(),
+        }
+        .into()),
+    }
+}
+
+/// A start the project's `minimal.toml` cannot serve: the start cannot pick
+/// an entry, or the entry it names cannot start this way. The start refuses
+/// it before it creates anything, and the run ends with
+/// [`StartEntryRefusal::exit_code`] (`main.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartEntryRefusal {
+    /// No entry was typed, several entries count, and none is `default`.
+    Several {
+        verb: StartVerb,
+        /// The entries the start counted, in the order the file is read.
+        entries: Vec<String>,
+    },
+    /// The typed entry is not one the start counts.
+    Unknown {
+        verb: StartVerb,
+        entry: String,
+        /// The entries the start counted, in the order the file is read.
+        entries: Vec<String>,
+    },
+    /// `min session start` found no session entry, and the entry named
+    /// `default` has another type, so no implicit `default` applies.
+    DefaultBlocked {
+        /// The type of the `default` entry, when the file gives one.
+        box_type: Option<String>,
+    },
+    /// `min session start` named an entry that is not a session entry.
+    NotSession {
+        entry: String,
+        box_type: Option<String>,
+    },
+    /// `--name` for a task entry: its box runs through the run path, which
+    /// generates the box's name and takes no `--name`. This refusal is an
+    /// interim. <https://github.com/gominimal/minimal/issues/3196> tracks a
+    /// box name for `RunEntry`. Remove this refusal when `RunEntry` takes a
+    /// name.
+    NameUnsupported { entry: String },
+    /// A task entry declared as `[boxes.<name>]` with `type = "task"`: the
+    /// run path finds its task in `[tasks]` only. This refusal is an
+    /// interim. <https://github.com/gominimal/minimal/issues/3213> tracks
+    /// those entries. Remove this refusal when `declared_task` reads the
+    /// task entries of `[boxes]`.
+    TaskNotInTasks { entry: String },
+    /// `min box start` named an entry of a type it cannot start yet: an
+    /// agent, service or user-defined type. This refusal is an interim.
+    /// <https://github.com/gominimal/minimal/issues/3197> tracks the start
+    /// of those entries.
+    UnsupportedType {
+        entry: String,
+        box_type: Option<String>,
+    },
+    /// A typed session entry not named `default`. The box's spec would name
+    /// the entry, but its body still comes from the project's `[session]`
+    /// table, not from the entry (see [`stamp_session_spec_as`]). This
+    /// refusal is an interim.
+    /// <https://github.com/gominimal/minimal/issues/3204> tracks the entry's
+    /// own body. Remove this refusal when the start expands the typed
+    /// entry's body into its spec.
+    NamedSessionUnsupported { verb: StartVerb, entry: String },
+}
+
+impl StartEntryRefusal {
+    /// The exit code of the refused start, from the architecture's
+    /// exit-code table: 4, not found, for an entry the start does not find.
+    /// `min session start` searches only the session entries, so an entry
+    /// that is not a session is not found too. Every other refusal is a
+    /// usage refusal, 2.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Unknown { .. } | Self::NotSession { .. } => 4,
+            Self::Several { .. }
+            | Self::DefaultBlocked { .. }
+            | Self::NameUnsupported { .. }
+            | Self::TaskNotInTasks { .. }
+            | Self::UnsupportedType { .. }
+            | Self::NamedSessionUnsupported { .. } => 2,
+        }
+    }
+}
+
+/// The entry names of a refusal, each with its control characters escaped.
+fn printable_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| printable(name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The type of an entry, as a refusal names it.
+fn entry_kind(box_type: Option<&str>) -> String {
+    box_type.map_or_else(
+        || "no type".to_owned(),
+        |t| format!("the type \"{}\"", printable(t)),
+    )
+}
+
+impl std::fmt::Display for StartEntryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = mfile::MFILE_NAME;
+        let noun = |verb: &StartVerb| match verb {
+            StartVerb::Box => "entries",
+            StartVerb::Session => "session entries",
+        };
+        match self {
+            Self::Several { verb, entries } => write!(
+                f,
+                "Cannot pick an entry to start. The project's {file} declares the {noun} \
+                 {names}, and none of them is named \"default\". Run {command} <entry> \
+                 with one of them.",
+                noun = noun(verb),
+                names = printable_list(entries),
+                command = verb.command(),
+            ),
+            Self::Unknown {
+                verb,
+                entry,
+                entries,
+            } => {
+                let singular = match verb {
+                    StartVerb::Box => "entry",
+                    StartVerb::Session => "session entry",
+                };
+                write!(
+                    f,
+                    "Cannot start {entry}. The project's {file} declares no {singular} \
+                     named \"{entry}\".",
+                    entry = printable(entry),
+                )?;
+                if entries.is_empty() {
+                    Ok(())
+                } else {
+                    write!(
+                        f,
+                        " Its {noun} are {names}. Run {command} <entry> with one of them.",
+                        noun = noun(verb),
+                        names = printable_list(entries),
+                        command = verb.command(),
+                    )
+                }
+            }
+            Self::DefaultBlocked { box_type } => write!(
+                f,
+                "Cannot start a session. The project's {file} declares no session entry, \
+                 and its entry \"default\" has {kind}. Add a [sessions.<name>] entry to \
+                 {file}, or rename the entry \"default\".",
+                kind = entry_kind(box_type.as_deref()),
+            ),
+            Self::NotSession { entry, box_type } => {
+                write!(
+                    f,
+                    "Cannot start {entry} as a session. Its entry in {file} has {kind}.",
+                    entry = printable(entry),
+                    kind = entry_kind(box_type.as_deref()),
+                )?;
+                if box_type.as_deref() == Some(boxes::TASK_BOX_TYPE) {
+                    write!(f, " Run min box start {} to start it.", printable(entry))?;
+                }
+                Ok(())
+            }
+            Self::NameUnsupported { entry } => write!(
+                f,
+                "Cannot start {entry} with --name. A box from a task entry gets a \
+                 generated name. Run min box start {entry} without --name.",
+                entry = printable(entry),
+            ),
+            Self::TaskNotInTasks { entry } => write!(
+                f,
+                "Cannot start {entry}. min box start runs only the tasks declared as \
+                 [tasks.<name>] in {file}, and {entry} is declared as [boxes.{entry}]. \
+                 Declare it as [tasks.{entry}] to start it.",
+                entry = printable(entry),
+            ),
+            Self::UnsupportedType { entry, box_type } => write!(
+                f,
+                "Cannot start {entry}. Its entry in {file} has {kind}, and min box start \
+                 starts session and task entries only.",
+                entry = printable(entry),
+                kind = entry_kind(box_type.as_deref()),
+            ),
+            Self::NamedSessionUnsupported { verb, entry } => write!(
+                f,
+                "Cannot start {entry}. {command} cannot start a session entry by name \
+                 yet, except the entry named \"default\". Rename {entry} to \"default\" \
+                 in {file}, then run {command}.",
+                entry = printable(entry),
+                command = verb.command(),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartEntryRefusal {}
+
+/// The refusal of a start off a terminal for an entry whose box has a
+/// terminal, without `--detach` (BCLI-029). The start refuses it before it
+/// creates anything, and `main.rs` ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartNeedsTerminal {
+    entry: String,
+}
+
+impl StartNeedsTerminal {
+    /// The usage-refusal code of the architecture's exit-code table.
+    pub const EXIT_CODE: u8 = 2;
+
+    #[must_use]
+    pub fn new(entry: &str) -> Self {
+        Self {
+            entry: entry.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for StartNeedsTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} needs a terminal. Run it from a terminal, or pass --detach.",
+            printable(&self.entry)
+        )
+    }
+}
+
+impl std::error::Error for StartNeedsTerminal {}
+
+/// The refusal of a start whose box name a running box on the host holds
+/// (BCLI-069, BOX-163). It names the holder, and the two flags that create
+/// the box anyway. `main.rs` ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartNameHeld {
+    pub verb: StartVerb,
+    pub entry: String,
+    pub refusal: minimald_rpc::HeldNameRefusal,
+}
+
+impl StartNameHeld {
+    /// The exit code of the held-name refusal.
+    pub const EXIT_CODE: u8 = minimald_rpc::HeldNameRefusal::EXIT_CODE;
+}
+
+impl std::fmt::Display for StartNameHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let minimald_rpc::HeldNameRefusal {
+            name,
+            holder,
+            holder_name,
+        } = &self.refusal;
+        let entry = printable(&self.entry);
+        let name = printable(name);
+        let holder_name = printable(holder_name);
+        match holder {
+            Some(holder) => write!(
+                f,
+                "Cannot start {entry}. The running box {holder_name} ({holder}) holds the \
+                 name {name}.",
+            )?,
+            None => write!(
+                f,
+                "Cannot start {entry}. The running box {holder_name} holds the name {name}.",
+            )?,
+        }
+        write!(
+            f,
+            " Run {command} --new {entry} to create another box from the entry, or \
+             pass --name <name> to give the box another name.",
+            command = self.verb.command(),
+        )
+    }
+}
+
+impl std::error::Error for StartNameHeld {}
+
+/// The one stderr hint of a start that returns without attaching to a box
+/// that has no terminal (BCLI-029). The box's stdin is already closed.
+/// `box_id` is the id of the box the start created.
+#[must_use]
+pub fn unattached_start_hint(entry: &str, box_id: impl std::fmt::Display) -> String {
+    format!(
+        "{entry} started with no input. Run min box run {entry} to connect this \
+         terminal's input and output to a new box. Run min box logs {box_id} for its \
+         output, and min box wait {box_id} for its exit code."
+    )
+}
+
+/// How a start creates its box.
+#[derive(Debug)]
+pub(crate) enum StartPlan {
+    /// A session entry: the activation, which attaches unless `--detach`.
+    Session {
+        entry: String,
+        args: ActivateArgs,
+        options: ActivationOptions,
+    },
+    /// An entry whose box has no terminal: a detached run, which closes the
+    /// box's stdin and prints its id.
+    Detached {
+        entry: String,
+        run: crate::task::RunEntry,
+    },
+}
+
+impl StartPlan {
+    /// The entry the start picked.
+    #[must_use]
+    pub fn entry(&self) -> &str {
+        match self {
+            Self::Session { entry, .. } | Self::Detached { entry, .. } => entry,
+        }
+    }
+}
+
+/// Decides how `start` creates its box, from the project's `entries`, before
+/// anything is created. `has_terminal` says whether this command runs on a
+/// terminal that an attach can use.
+///
+/// # Errors
+///
+/// [`StartEntryRefusal`] when no entry can be picked or the entry cannot
+/// start, and [`StartNeedsTerminal`] for an entry whose box has a terminal,
+/// off a terminal, without `--detach`.
+pub(crate) fn plan_start(
+    start: &StartEntry,
+    entries: &[mfile::entry::BoxEntry],
+    has_terminal: bool,
+) -> Result<StartPlan, anyhow::Error> {
+    let entry = match start.verb {
+        StartVerb::Box => pick_box_start_entry(entries, start.entry.as_deref())?,
+        StartVerb::Session => {
+            crate::cmd::session::pick_session_start_entry(entries, start.entry.as_deref())?
+        }
+    };
+    match entry.box_type.as_deref() {
+        // A typed session entry other than `default` would get the body of
+        // the `[session]` table under its own name. That refusal is the
+        // #3204 interim: remove it when the start expands the entry's body.
+        // A bare start that picks the only session entry still starts it,
+        // as BCLI-071 requires.
+        Some(boxes::SESSION_BOX_TYPE)
+            if start.entry.is_some() && entry.name != mfile::entry::DEFAULT_ENTRY_NAME =>
+        {
+            Err(StartEntryRefusal::NamedSessionUnsupported {
+                verb: start.verb,
+                entry: entry.name,
+            }
+            .into())
+        }
+        // A session box has a terminal: its spec sets `pty_enabled`
+        // (`BoxSpec::for_session`).
+        Some(boxes::SESSION_BOX_TYPE) => {
+            if !start.detach && !has_terminal {
+                return Err(StartNeedsTerminal::new(&entry.name).into());
+            }
+            let mut args = ActivateArgs::unflagged();
+            args.name.clone_from(&start.name);
+            args.attach = !start.detach;
+            Ok(StartPlan::Session {
+                options: ActivationOptions {
+                    offer_scaffold: false,
+                    entry: Some(entry.name.clone()),
+                    box_name: start.name.clone(),
+                    fresh_instance: start.new,
+                },
+                entry: entry.name,
+                args,
+            })
+        }
+        // A task box never has a terminal (BOX-054), so the start detaches.
+        // `run_entry` calls `request_fresh_instance`, and the daemon names
+        // the box `<entry>-<n>` (BOX-163). So a task-entry start is always a
+        // fresh instance, and `--new` changes nothing for it. A plain start
+        // does not refuse a held name until gominimal/minimal#3196 lands.
+        // The run path takes no `--name`, so the start refuses that flag
+        // rather than drop it. That refusal is the #3196 interim: remove it
+        // when `RunEntry` takes a name.
+        //
+        // The run path finds its task in `[tasks]` only, so a `[boxes]`
+        // task entry is refused first. That refusal is the #3213 interim:
+        // remove it when `declared_task` reads the task entries of `[boxes]`.
+        Some(boxes::TASK_BOX_TYPE) if entry.table != mfile::entry::EntryTable::Tasks => {
+            Err(StartEntryRefusal::TaskNotInTasks { entry: entry.name }.into())
+        }
+        Some(boxes::TASK_BOX_TYPE) if start.name.is_some() => {
+            Err(StartEntryRefusal::NameUnsupported { entry: entry.name }.into())
+        }
+        Some(boxes::TASK_BOX_TYPE) => Ok(StartPlan::Detached {
+            run: crate::task::RunEntry {
+                verb: crate::task::RunVerb::Box,
+                entry: entry.name.clone(),
+                path: None,
+                detach: true,
+                args: Vec::new(),
+                network: None,
+                egress: crate::EgressArgs::default(),
+            },
+            entry: entry.name,
+        }),
+        // Agent, service and user-defined-type entries: an interim refusal
+        // until gominimal/minimal#3197 lets `min box start` start them.
+        box_type => Err(StartEntryRefusal::UnsupportedType {
+            box_type: box_type.map(str::to_owned),
+            entry: entry.name,
+        }
+        .into()),
+    }
+}
+
+/// The project directory of a command: `-C`/`--repo-dir`, else the current
+/// working directory.
+fn command_project_dir(global: &GlobalArgs) -> Result<camino::Utf8PathBuf, anyhow::Error> {
+    let effective_path = global
+        .repo_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let project_path = std::fs::canonicalize(&effective_path)
+        .with_context(|| format!("Cannot resolve project path '{}'", effective_path.display()))?;
+    camino::Utf8PathBuf::from_path_buf(project_path)
+        .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))
+}
+
+/// The bytes of the project's `minimal.toml` for `project`, or `None` when
+/// the project has none.
+fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
+        Ok(file) => file,
+        Err(mfile::Error::NotFound) => return Ok(None),
+        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+    };
+    let Some(root) = file.repo_path() else {
+        return Ok(None);
+    };
+    let Some(path) = [
+        root.join(mfile::MFILE_NAME),
+        root.join(".minimal").join(mfile::MFILE_NAME),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path).map_err(|e| ProjectFileInvalid {
+        error: mfile::Error::IO("minimal file", path.clone(), e),
+    })?;
+    Ok(Some(bytes))
+}
+
+/// The entries the project's `minimal.toml` declares. A project with no
+/// `minimal.toml` declares none.
+fn project_entries(project: &camino::Utf8Path) -> anyhow::Result<Vec<mfile::entry::BoxEntry>> {
+    match project_file_bytes(project)? {
+        Some(bytes) => {
+            mfile::entry::read_entries(&bytes).map_err(|error| ProjectFileInvalid { error }.into())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// `min box start [<entry>]`: create a box from an entry and attach this
+/// terminal to it, or print its id and return.
+pub async fn cmd_box_start(global: &GlobalArgs, args: BoxStartArgs) -> Result<(), anyhow::Error> {
+    start_entry(global, args.into()).await
+}
+
+/// The one start path of `min box start` and `min session start` (BCLI-029,
+/// BCLI-069, BCLI-070, BCLI-071, BCLI-072): pick the entry, refuse what
+/// cannot start before anything is created, then create the box. A box with
+/// a terminal attaches unless `--detach`. Any other box starts with its
+/// stdin closed, and the start prints one hint.
+pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), anyhow::Error> {
+    let project = command_project_dir(global)?;
+    let entries = project_entries(&project)?;
+    let has_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let plan = plan_start(&start, &entries, has_terminal).inspect_err(|error| {
+        tracing::info!(verb = start.verb.command(), %error, "the start was refused before it created a box");
+    })?;
+    tracing::info!(
+        verb = start.verb.command(),
+        entry = %plan.entry(),
+        typed_entry = ?start.entry,
+        name = ?start.name,
+        fresh_instance = start.new,
+        detach = start.detach,
+        "starting a box from the entry"
+    );
+    match plan {
+        StartPlan::Session {
+            entry,
+            args,
+            options,
+        } => activate_box(global, args, options)
+            .await
+            .map_err(|error| start_refusal(error, start.verb, &entry)),
+        StartPlan::Detached { entry, run } => {
+            let id = crate::task::run_entry(global, run).await?;
+            crate::output::record_box_id(&id.to_string());
+            eprintln!("{}", unattached_start_hint(&entry, id));
+            Ok(())
+        }
+    }
+}
+
+/// The error a start ends with, the same for `min box start` and `min
+/// session start`: a held name becomes [`StartNameHeld`], with its hint to
+/// `--new` and `--name`. A host port in use becomes the refusal's own text,
+/// with the port and its holder (NET-144). Any other error passes through.
+pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) -> anyhow::Error {
+    match error.downcast::<minimald_rpc::HeldNameRefusal>() {
+        Ok(refusal) => anyhow::Error::new(StartNameHeld {
+            verb,
+            entry: entry.to_string(),
+            refusal,
+        }),
+        Err(error) => crate::cmd::session::activate_refusal(error),
+    }
+}
+
+/// Settings of an activation that no `min session activate` flag carries.
+/// A `bool` converts to these settings with only the scaffold offer set, so
+/// a caller that passes `offer_scaffold` alone keeps its meaning.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivationOptions {
+    /// Offer to write a `minimal.toml` when the project has none.
+    pub offer_scaffold: bool,
+    /// The session entry the box is created from, when it is not `default`.
+    pub entry: Option<String>,
+    /// The `[box] name` of the box's spec (BCLI-069).
+    pub box_name: Option<String>,
+    /// Ask for a fresh instance, `<name>-<n>` (BCLI-070).
+    pub fresh_instance: bool,
+}
+
+impl From<bool> for ActivationOptions {
+    fn from(offer_scaffold: bool) -> Self {
+        Self {
+            offer_scaffold,
+            ..Self::default()
+        }
+    }
+}
+
 /// A grant the box cannot receive: a GitHub grant whose value cannot land
 /// in its environment (BEP-007), or a store reference that no rule admits
 /// (BEP-035). The creation is refused with exit 3, before the box exists.
@@ -257,6 +1108,365 @@ fn project_bep_and_grants(
             .map_or_else(Default::default, |n| (n.bep.unwrap_or_default(), n.quic443));
         (bep, session.secrets, spec_env, quic443)
     }))
+}
+
+/// Where one field of a box's effective egress came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EgressSource {
+    /// The project's `minimal.toml`.
+    ProjectFile,
+    /// A flag of the creating command.
+    Flag,
+}
+
+/// A box's effective egress (NET-060): the policy, and the source of each
+/// field that one of them set, by the field's spec name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EffectiveEgress {
+    pub(crate) policy: Option<boxes::EgressPolicy>,
+    pub(crate) sources: Vec<(&'static str, EgressSource)>,
+}
+
+/// The `network.egress` table that the project's `minimal.toml` declares for
+/// a session box or a task box (NET-060), with the hint for each legacy
+/// spelling that the file uses.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProjectEgress {
+    pub(crate) policy: Option<boxes::EgressPolicy>,
+    pub(crate) hints: Vec<String>,
+    /// The `network.mode` of the expanded entry, when a layer sets one.
+    /// `min task run` and `min box run` read it. `min session activate`
+    /// does not.
+    pub(crate) mode: Option<boxes::NetworkMode>,
+    /// The table whose `network` the expanded entry holds, as the file
+    /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
+    /// as `[tasks.build]`. A later layer replaces the whole `network` table
+    /// of an earlier one, so one table holds all of it. `None` when no
+    /// layer declares `network`.
+    pub(crate) layer: Option<String>,
+}
+
+/// The project's [`ProjectEgress`]. The layers are `[defaults]`,
+/// `[defaults.session]` and the session entry, and a later layer replaces an
+/// earlier one. The entry is `[sessions.default]` when the file declares it,
+/// or else the one `[sessions.<name>]` entry when the file declares exactly
+/// one. With no session entry, the implicit default entry applies. Only the
+/// `network` keys of the layers are read, so a key this read does not own
+/// never refuses an activation. The policy is `None` when there is no
+/// project file or no layer declares egress. A start passes the `entry` it
+/// picked, and that entry is the session entry here.
+pub(crate) fn project_egress(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+) -> anyhow::Result<ProjectEgress> {
+    match project_file_bytes(project)? {
+        Some(bytes) => project_egress_from(&bytes, entry),
+        None => Ok(ProjectEgress::default()),
+    }
+}
+
+/// The [`ProjectEgress`] of task `task` in the project: as
+/// [`project_egress`] reads it for a session, with the layers `[defaults]`,
+/// `[defaults.task]` and the task's entry. The policy is `None` when there
+/// is no project file, the file declares no entry of type `task` named
+/// `task`, or no layer declares egress.
+pub(crate) fn task_project_egress(
+    project: &camino::Utf8Path,
+    task: &str,
+) -> anyhow::Result<ProjectEgress> {
+    match project_file_bytes(project)? {
+        Some(bytes) => task_egress_from(&bytes, task),
+        None => Ok(ProjectEgress::default()),
+    }
+}
+
+/// Whether any `network` key appears in `[defaults]`, in a
+/// `[defaults.<type>]` table, in a `[box_types.<name>.defaults]` table, or
+/// in an entry of the file.
+fn declares_network(file: &toml::Table, entries: &[mfile::entry::BoxEntry]) -> bool {
+    let defaults = file.get("defaults").and_then(toml::Value::as_table);
+    let in_defaults = defaults.is_some_and(|defaults| {
+        defaults.contains_key("network")
+            || defaults
+                .values()
+                .filter_map(toml::Value::as_table)
+                .any(|table| table.contains_key("network"))
+    });
+    let in_type_defaults = file
+        .get("box_types")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|types| {
+            types
+                .values()
+                .filter_map(toml::Value::as_table)
+                .filter_map(|box_type| box_type.get("defaults").and_then(toml::Value::as_table))
+                .any(|defaults| defaults.contains_key("network"))
+        });
+    in_defaults
+        || in_type_defaults
+        || entries
+            .iter()
+            .any(|entry| entry.body.contains_key("network"))
+}
+
+/// [`project_egress`] over the bytes of a `minimal.toml`. A start that names
+/// its `entry` reads the egress of that entry (BCLI-069). The start already
+/// picked it, so no default is picked here. With no `entry`, or with a name
+/// that only the implicit default entry answers, the pick applies.
+fn project_egress_from(bytes: &[u8], entry: Option<&str>) -> anyhow::Result<ProjectEgress> {
+    let file: toml::Table = toml::from_slice(bytes).map_err(|e| ProjectFileInvalid {
+        error: mfile::Error::Format(e),
+    })?;
+    let entries =
+        mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?;
+    let typed = entry.and_then(|name| entries.iter().find(|entry| entry.name == name));
+    let picked = match typed {
+        Some(entry) => Ok(entry.clone()),
+        None => pick_session_entry(&entries),
+    };
+    let entry = match picked {
+        Ok(entry) => entry,
+        // A file that declares no egress does not need a session entry for
+        // it, so an undecided pick does not refuse its start.
+        Err(_) if !declares_network(&file, &entries) => return Ok(ProjectEgress::default()),
+        Err(undecided) => return Err(undecided.into()),
+    };
+    entry_egress(&file, entry)
+}
+
+/// [`task_project_egress`] over the bytes of a `minimal.toml`.
+fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
+    let file: toml::Table = toml::from_slice(bytes).map_err(|e| ProjectFileInvalid {
+        error: mfile::Error::Format(e),
+    })?;
+    let entries =
+        mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?;
+    let Some(entry) = entries.into_iter().find(|entry| {
+        entry.name == task && entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE)
+    }) else {
+        return Ok(ProjectEgress::default());
+    };
+    entry_egress(&file, entry)
+}
+
+/// The egress of `entry` in the parsed `file`: its `[defaults]`,
+/// `[defaults.<type>]` and entry layers, read as [`project_egress`] says.
+fn entry_egress(
+    file: &toml::Table,
+    entry: mfile::entry::BoxEntry,
+) -> anyhow::Result<ProjectEgress> {
+    let network_of = |table: &toml::Table| -> toml::Table {
+        table
+            .get("network")
+            .map(|network| toml::Table::from_iter([("network".to_owned(), network.clone())]))
+            .unwrap_or_default()
+    };
+    let defaults = file
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let mut layers = mfile::expand::Layers::default().with_file_defaults(
+        &defaults,
+        entry.box_type.as_deref(),
+        &std::collections::BTreeSet::new(),
+    );
+    layers.defaults = network_of(&layers.defaults);
+    layers.defaults_type = network_of(&layers.defaults_type);
+    let entry = mfile::entry::BoxEntry {
+        body: network_of(&entry.body),
+        ..entry
+    };
+    // The merge replaces a table whole, so the last layer that declares
+    // `network` holds the expanded entry's `network` table.
+    let layer = if !entry.body.is_empty() {
+        format!("[{}.{}]", entry.table.key(), entry.name)
+    } else if !layers.defaults_type.is_empty() {
+        format!(
+            "[defaults.{}]",
+            entry.box_type.as_deref().unwrap_or_default()
+        )
+    } else if !layers.defaults.is_empty() {
+        "[defaults]".to_owned()
+    } else {
+        return Ok(ProjectEgress::default());
+    };
+    let mut expansion =
+        mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
+    // The network module's own read: a malformed egress table refuses the
+    // start with exit 3, as every invalid `minimal.toml` does.
+    let hints = mfile::network::canonicalize(&mut expansion.spec)
+        .map_err(|error| network_key_invalid(&expansion.spec, error))?;
+    let network = expansion.spec.get("network");
+    // `canonicalize` has rewritten a legacy spelling and refused a value
+    // that is not a mode, so the word is a current one.
+    let mode = match network
+        .and_then(|network| network.get("mode"))
+        .and_then(toml::Value::as_str)
+    {
+        Some("none") => Some(boxes::NetworkMode::NoNet),
+        Some("host_ip") => Some(boxes::NetworkMode::HostNet),
+        Some("own_ip") => Some(boxes::NetworkMode::OwnIp),
+        _ => None,
+    };
+    let Some(egress) = network.and_then(|network| network.get("egress")) else {
+        return Ok(ProjectEgress {
+            policy: None,
+            hints,
+            mode,
+            layer: Some(layer),
+        });
+    };
+    let mut egress: boxes::EgressPolicy =
+        egress
+            .clone()
+            .try_into()
+            .map_err(|error| ProjectFileInvalid {
+                error: mfile::Error::Format(error),
+            })?;
+    egress.allow_subnets = egress.allow_subnets.as_deref().map(normalize_subnets);
+    egress.deny_subnets = egress.deny_subnets.as_deref().map(normalize_subnets);
+    Ok(ProjectEgress {
+        policy: Some(egress),
+        hints,
+        mode,
+        layer: Some(layer),
+    })
+}
+
+/// The refusal for a `[network]` key that the network module cannot read:
+/// an invalid spec key of `minimal.toml`, named by its dotted path.
+fn network_key_invalid(
+    spec: &toml::Table,
+    error: mfile::network::NetworkError,
+) -> ProjectFileInvalid {
+    use mfile::network::NetworkError;
+    // What the value at a dotted `key` of the spec is, as the message names it.
+    let found_at = |key: &str| -> &'static str {
+        let mut parts = key.split('.');
+        let first = parts.next().and_then(|part| spec.get(part));
+        match parts.try_fold(first, |value, part| Some(value?.get(part))) {
+            Some(Some(toml::Value::String(_))) => "a string",
+            Some(Some(toml::Value::Integer(_))) => "a whole number",
+            Some(Some(toml::Value::Float(_))) => "a decimal number",
+            Some(Some(toml::Value::Boolean(_))) => "a true or false value",
+            Some(Some(toml::Value::Datetime(_))) => "a date or time",
+            Some(Some(toml::Value::Array(_))) => "a list",
+            Some(Some(toml::Value::Table(_))) => "a table",
+            _ => "another kind of value",
+        }
+    };
+    const MODES: &str = "\"none\", \"host_ip\" or \"own_ip\"";
+    let (key, expected, found) = match error {
+        NetworkError::UnknownMode(_) => (
+            "network.mode".to_owned(),
+            MODES,
+            "a value that is not a network mode",
+        ),
+        NetworkError::ModeNotString => ("network.mode".to_owned(), MODES, found_at("network.mode")),
+        NetworkError::WrongShape { key, expected } => {
+            let found = found_at(&key);
+            (key, expected, found)
+        }
+        NetworkError::ModeNoneWithEgress { key } => {
+            (key, "no value while `network.mode` is \"none\"", "a value")
+        }
+    };
+    ProjectFileInvalid {
+        error: mfile::Error::InvalidSpecKey {
+            key,
+            layer: mfile::MFILE_NAME.to_owned(),
+            problem: mfile::SpecKeyProblem::WrongShape { expected, found },
+        },
+    }
+}
+
+/// The box's effective egress (arch#166): the project's declaration with
+/// the egress flags applied. `--allow-subnets`, `--allow-dns-hosts` and
+/// `--deny-subnets` add their values to the file's list, the file's values
+/// first and each value once. `--allow-protocols` replaces the file's list.
+/// `--deny-all-egress`, which never comes with an allow flag (the parse
+/// refuses the pair), can only narrow: it empties the file's
+/// `allow_subnets` and `allow_dns_hosts` and leaves the rest of the file's
+/// section in place (arch:1234). With no `allow_protocols` from the file or
+/// a flag, the section is [`boxes::EgressPolicy::deny_all`] (NET-140). The
+/// file's `deny_subnets` stay, and `--deny-subnets` adds to them.
+pub(crate) fn effective_egress(
+    project: Option<boxes::EgressPolicy>,
+    flags: Option<boxes::EgressPolicy>,
+    deny_all_flag: bool,
+) -> EffectiveEgress {
+    const FIELDS: [&str; 4] = [
+        "allow_subnets",
+        "allow_dns_hosts",
+        "allow_protocols",
+        "deny_subnets",
+    ];
+    if project.is_none() && flags.is_none() && !deny_all_flag {
+        return EffectiveEgress::default();
+    }
+    let project = project.unwrap_or_default();
+    let flags = flags.unwrap_or_default();
+    let mut sources = Vec::new();
+    // A list key: the file's values, then each flag value not already
+    // there.
+    let mut add = |field: &'static str,
+                   file: Option<Vec<String>>,
+                   flag: Option<Vec<String>>|
+     -> Option<Vec<String>> {
+        if file.is_some() {
+            sources.push((field, EgressSource::ProjectFile));
+        }
+        let Some(flag) = flag else {
+            return file;
+        };
+        sources.push((field, EgressSource::Flag));
+        let mut list = file.unwrap_or_default();
+        for value in flag {
+            if !list.contains(&value) {
+                list.push(value);
+            }
+        }
+        Some(list)
+    };
+    let (allow_subnets, allow_dns_hosts) = if deny_all_flag {
+        (Some(Vec::new()), Some(Vec::new()))
+    } else {
+        (
+            add(FIELDS[0], project.allow_subnets, flags.allow_subnets),
+            add(FIELDS[1], project.allow_dns_hosts, flags.allow_dns_hosts),
+        )
+    };
+    let deny_subnets = add(FIELDS[3], project.deny_subnets, flags.deny_subnets);
+    // `--deny-all-egress` leaves the file's `allow_protocols` in place
+    // (arch:1234). With none from the file or a flag, the section is
+    // `deny_all()`, every allow list present and empty (NET-140).
+    let allow_protocols = if flags.allow_protocols.is_some() {
+        sources.push((FIELDS[2], EgressSource::Flag));
+        flags.allow_protocols
+    } else if project.allow_protocols.is_some() {
+        sources.push((FIELDS[2], EgressSource::ProjectFile));
+        project.allow_protocols
+    } else if deny_all_flag {
+        sources.push((FIELDS[2], EgressSource::Flag));
+        Some(Vec::new())
+    } else {
+        None
+    };
+    if deny_all_flag {
+        sources.push((FIELDS[0], EgressSource::Flag));
+        sources.push((FIELDS[1], EgressSource::Flag));
+    }
+    sources.sort_by_key(|(field, _)| FIELDS.iter().position(|f| f == field));
+    EffectiveEgress {
+        policy: Some(boxes::EgressPolicy {
+            allow_subnets,
+            allow_dns_hosts,
+            allow_protocols,
+            deny_subnets,
+        }),
+        sources,
+    }
 }
 
 /// The box's credentialed-upstream declaration: the `--credentialed-upstream`
@@ -1018,6 +2228,26 @@ fn store_grants(
         .collect()
 }
 
+/// The authorities to register with the proxy as the box's declared egress
+/// (BEP-022). A box whose egress admits every name lists none, so a GitHub
+/// grant registers the module's hosts for it, or the proxy would refuse them.
+fn proxy_egress(
+    egress: Option<&boxes::EgressPolicy>,
+    network: boxes::NetworkMode,
+    github_grant: bool,
+) -> Vec<String> {
+    if github_grant && boxes::core::bep::egress_admits_every_name(network, egress) {
+        return bep::module::GITHUB
+            .hosts
+            .iter()
+            .map(|authority| authority.host.to_string())
+            .collect();
+    }
+    egress
+        .and_then(|egress| egress.allow_dns_hosts.clone())
+        .unwrap_or_default()
+}
+
 /// Mints the box's GitHub grants and its accepted store references for the
 /// box id `box_id` the registration handed back, and puts each grant's
 /// sealed value on the request for the box's launches to place (BEP-005,
@@ -1041,14 +2271,12 @@ async fn mint_into_request(
     let delivered = proxy_grant_names(github_grants, store_grants);
     let stored = github_grants.is_empty();
     let box_id = registered_id.map(|box_id| box_id.to_string());
-    let egress = request
-        .config
-        .policy
-        .egress
-        .as_ref()
-        .and_then(|egress| egress.allow_dns_hosts.clone())
-        .unwrap_or_default();
     let network = request.config.network;
+    let egress = proxy_egress(
+        request.config.policy.egress.as_ref(),
+        network,
+        !github_grants.is_empty(),
+    );
     // The mint blocks on the proxy's control socket and the host keychain,
     // so it runs off the runtime's workers.
     let minted = tokio::task::spawn_blocking(move || {
@@ -1271,6 +2499,16 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// Marks `request` as a fresh instance (BCLI-070, BOX-163). The daemon
+/// names the box `<name>-<n>`, with the smallest `n` no retained box uses,
+/// and never refuses it for a held name. The client invents no name, so the
+/// request carries none. `min task run` and `min box run` create every box
+/// this way.
+pub(crate) fn request_fresh_instance(request: &mut minimald_rpc::CreateSessionRequest) {
+    request.config.name = None;
+    request.fresh_instance = true;
+}
+
 /// The name the daemon gives the box `request` creates, when the create
 /// is not a fresh instance (BOX-163): the spec's `[box] name`, else the
 /// request's name, else the spec's entry as the daemon cleans it
@@ -1421,16 +2659,49 @@ pub(crate) fn registration_held_name_refusal(
 /// # Errors
 ///
 /// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+#[cfg(test)]
 pub(crate) fn stamp_session_spec(
     request: &mut minimald_rpc::CreateSessionRequest,
     dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    stamp_session_spec_as(request, dir, None, None)
+}
+
+/// [`stamp_session_spec`] for the session entry `entry`, when it is not
+/// `default`, with `name` as the spec's `[box] name` (BCLI-069).
+///
+/// The spec names the typed entry, but its body still comes from the
+/// project's `[session]` table through `BoxSpec::for_session`. The body of
+/// `[sessions.<entry>]` is not applied yet. That is the interim of
+/// gominimal/minimal#3204, and until then `plan_start` refuses a typed
+/// session entry other than `default`
+/// ([`StartEntryRefusal::NamedSessionUnsupported`]). A bare start of the
+/// only session entry still reaches this function with that entry's name.
+/// Flip it when box creation reads entries
+/// (gominimal/minimal#2418): then expand the typed entry's body into the
+/// spec through BOX-064's layers.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+pub(crate) fn stamp_session_spec_as(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+    entry: Option<&str>,
+    name: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     let session = match mfile::File::from_dir_recursive(dir.as_std_path()) {
         Ok(file) => file.session,
         Err(mfile::Error::NotFound) => None,
         Err(error) => return Err(ProjectFileInvalid { error }.into()),
     };
-    let spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    let mut spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    if let Some(entry) = entry {
+        spec.entry = entry.to_string();
+    }
+    if let Some(name) = name {
+        spec.name = Some(name.to_string());
+    }
     put_spec(request, &spec)
 }
 
@@ -1494,11 +2765,63 @@ fn ensure_registered_id(
     Err(anyhow::anyhow!(REGISTERED_ID_MISMATCH))
 }
 
+/// The egress section the egress flags declare, or `None` when no egress
+/// flag is given. `min session activate` and `min task run` both read their
+/// flags through it.
+///
+/// # Errors
+///
+/// An `--allow-protocols` value that is not a protocol.
+pub(crate) fn flag_egress(
+    args: &crate::EgressArgs,
+) -> Result<Option<boxes::EgressPolicy>, anyhow::Error> {
+    let mut allow_protocols = Vec::with_capacity(args.allow_protocols.len());
+    for spec in &args.allow_protocols {
+        allow_protocols.push(parse_egress_proto(spec)?);
+    }
+    // Any rule flag makes the declaration; a field with no values stays
+    // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
+    // records an allow-all policy that denies one range. `--deny-all-egress`
+    // is not a rule: [`effective_egress`] applies it to the file's lists.
+    let has_egress = !args.allow_subnets.is_empty()
+        || !allow_protocols.is_empty()
+        || !args.allow_dns_hosts.is_empty()
+        || !args.deny_subnets.is_empty();
+    Ok(has_egress.then_some(boxes::EgressPolicy {
+        allow_subnets: (!args.allow_subnets.is_empty())
+            .then(|| normalize_subnets(&args.allow_subnets)),
+        allow_dns_hosts: (!args.allow_dns_hosts.is_empty()).then(|| args.allow_dns_hosts.clone()),
+        allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
+        deny_subnets: (!args.deny_subnets.is_empty())
+            .then(|| normalize_subnets(&args.deny_subnets)),
+    }))
+}
+
+/// The line naming the masked network for each subnet flag that carries
+/// host bits, e.g. `--deny-subnets 10.0.0.1/8 is read as 10.0.0.0/8`.
+/// `min session activate`, `min task run` and `min box run` print them.
+pub(crate) fn subnet_notices(args: &crate::EgressArgs) -> Vec<String> {
+    let notices = |flag: &str, entries: &[String]| -> Vec<String> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                boxes::normalized_cidr(entry)
+                    .map(|normalized| format!("{flag} {entry} is read as {normalized}"))
+            })
+            .collect()
+    };
+    let mut lines = notices("--allow-subnets", &args.allow_subnets);
+    lines.extend(notices("--deny-subnets", &args.deny_subnets));
+    lines
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
-    offer_scaffold: bool,
+    options: impl Into<ActivationOptions>,
 ) -> Result<(), anyhow::Error> {
+    let options: ActivationOptions = options.into();
+    let offer_scaffold = options.offer_scaffold;
     let (utf8_path, abs_path, port_mappings, egress) = ActivationStep::CheckArguments
         .run(async {
             // Before anything is created, and before the daemon is spawned (a cold
@@ -1534,38 +2857,7 @@ pub(crate) async fn activate_box(
                 let mapping = parse_ingress_mapping(spec)?;
                 port_mappings.push(mapping);
             }
-            let mut allow_protocols = Vec::with_capacity(args.allow_protocols.len());
-            for spec in &args.allow_protocols {
-                allow_protocols.push(parse_egress_proto(spec)?);
-            }
-            // Any egress flag makes the declaration; a field with no values stays
-            // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
-            // records an allow-all policy that denies one range. `--deny-all-egress`
-            // is the whole declaration on its own: it maps to
-            // `boxes::EgressPolicy::deny_all()`, every allow list present and
-            // empty, rather than to four absent lists — a deny-all box declared by
-            // flag must read in the record exactly like one declared by file, which
-            // is the shape the host-address classifier decides its verdict on
-            // (NET-079) and the one `min session policy` names `deny-all`. The parse
-            // conflict (`cli.rs`) keeps it from combining with a rule flag, so the
-            // arms cannot both run.
-            let egress = if args.deny_all_egress {
-                Some(boxes::EgressPolicy::deny_all())
-            } else {
-                let has_egress = !args.allow_subnets.is_empty()
-                    || !allow_protocols.is_empty()
-                    || !args.allow_dns_hosts.is_empty()
-                    || !args.deny_subnets.is_empty();
-                has_egress.then_some(boxes::EgressPolicy {
-                    allow_subnets: (!args.allow_subnets.is_empty())
-                        .then(|| normalize_subnets(&args.allow_subnets)),
-                    allow_dns_hosts: (!args.allow_dns_hosts.is_empty())
-                        .then(|| args.allow_dns_hosts.clone()),
-                    allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
-                    deny_subnets: (!args.deny_subnets.is_empty())
-                        .then(|| normalize_subnets(&args.deny_subnets)),
-                })
-            };
+            let egress = flag_egress(&args.egress)?;
             Ok::<_, anyhow::Error>((utf8_path, abs_path, port_mappings, egress))
         })
         .await?;
@@ -1582,8 +2874,29 @@ pub(crate) async fn activate_box(
                 || args.dynamic_range.is_some();
             let (project_bep, project_secrets, project_env, project_quic443) =
                 project_bep_and_grants(&utf8_path)?;
+            // NET-060: the project's egress, with each field a flag names
+            // replaced by the flag.
+            let project_egress = project_egress(&utf8_path, options.entry.as_deref())?;
+            // A legacy key spelling still loads. A start with no terminal
+            // prints its hint, and an interactive start logs it, so no line
+            // prints before the box shell.
+            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+            for hint in &project_egress.hints {
+                if headless {
+                    eprintln!("{hint}");
+                } else {
+                    tracing::warn!(hint = %hint, "the project's network keys use a legacy spelling");
+                }
+            }
+            let egress =
+                effective_egress(project_egress.policy, egress, args.egress.deny_all_egress);
+            tracing::debug!(
+                egress = ?egress.policy,
+                sources = ?egress.sources,
+                "the create request's effective egress"
+            );
             let mut policy = boxes::BoxPolicy {
-                egress,
+                egress: egress.policy,
                 ingress: has_ingress.then_some(boxes::IngressPolicy {
                     port_mappings,
                     dynamic_allowed_range: args.dynamic_range,
@@ -1676,6 +2989,11 @@ pub(crate) async fn activate_box(
     let mut request =
         minimald_rpc::CreateSessionRequest::new(String::new(), abs_path.clone(), network, policy);
     request.config.name = request_name(args.name.as_deref());
+    // BCLI-070: `--new` asks for a fresh instance, `<name>-<n>`. The
+    // spec's `[box] name`, when `--name` gives one, is the base of the name.
+    if options.fresh_instance {
+        request_fresh_instance(&mut request);
+    }
     request.config.hooks_enabled = !args.no_hooks;
     request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
@@ -1778,7 +3096,12 @@ pub(crate) async fn activate_box(
             set_project_root(&mut request, project_root)?;
             // BOX-068: the box's spec, after every flag and the project's
             // policy are on the request.
-            stamp_session_spec(&mut request, &utf8_path)?;
+            stamp_session_spec_as(
+                &mut request,
+                &utf8_path,
+                options.entry.as_deref(),
+                options.box_name.as_deref(),
+            )?;
 
             let Some(root) = upload_root else {
                 return Ok::<_, anyhow::Error>(UploadPlan::Skip);
@@ -1991,7 +3314,8 @@ pub(crate) async fn activate_box(
     // BOX-163: a box the person did not name takes its entry's name. A
     // create under a name that a running box holds, the entry's name or a
     // `--name`, is refused: the command ends with exit 2, naming the
-    // holder. Only `min task run` asks for a fresh instance, `<name>-<n>`.
+    // holder. Only a run (`min task run`, `min box run`) asks for a fresh
+    // instance, `<name>-<n>` ([`request_fresh_instance`]).
     let created = ActivationStep::CreateSession
         .run(async {
             let created = {
@@ -2428,15 +3752,8 @@ pub(crate) async fn activate_box(
             // The notice is computed from the original flags, not the stored policy:
             // the policy now holds the normalized form, so reading it back would
             // print nothing.
-            for entry in &args.allow_subnets {
-                if let Some(normalized) = boxes::normalized_cidr(entry) {
-                    eprintln!("--allow-subnets {entry} is read as {normalized}");
-                }
-            }
-            for entry in &args.deny_subnets {
-                if let Some(normalized) = boxes::normalized_cidr(entry) {
-                    eprintln!("--deny-subnets {entry} is read as {normalized}");
-                }
+            for line in subnet_notices(&args.egress) {
+                eprintln!("{line}");
             }
             Ok::<_, anyhow::Error>(())
         })
@@ -2866,6 +4183,7 @@ pub(crate) async fn activate_box(
         .await?;
 
     println!("{id}");
+    crate::output::record_box_id(&id.to_string());
 
     // T126 (NET-138): a `host_ip` box on a VM host names each of its
     // mirrored ports that another program on the host holds. Printed only
@@ -2914,6 +4232,62 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use boxes::DynamicIngress;
+
+    /// A start refusal escapes the control characters of every entry name
+    /// it prints, so a name from `minimal.toml` cannot move the cursor.
+    #[test]
+    fn start_refusals_escape_entry_names() {
+        let bad = "dev\u{1b}[2K\n".to_owned();
+        let refusals = [
+            StartEntryRefusal::Several {
+                verb: StartVerb::Box,
+                entries: vec![bad.clone(), "ok".to_owned()],
+            },
+            StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: bad.clone(),
+                entries: vec![bad.clone()],
+            },
+            StartEntryRefusal::NotSession {
+                entry: bad.clone(),
+                box_type: Some(boxes::TASK_BOX_TYPE.to_owned()),
+            },
+            StartEntryRefusal::NameUnsupported { entry: bad.clone() },
+            StartEntryRefusal::TaskNotInTasks { entry: bad.clone() },
+            StartEntryRefusal::UnsupportedType {
+                entry: bad.clone(),
+                box_type: Some("agent".to_owned()),
+            },
+            StartEntryRefusal::NamedSessionUnsupported {
+                verb: StartVerb::Session,
+                entry: bad.clone(),
+            },
+        ];
+        let mut texts: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+        texts.push(StartNeedsTerminal::new(&bad).to_string());
+        for holder in [
+            None,
+            Some(boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap()),
+        ] {
+            texts.push(
+                StartNameHeld {
+                    verb: StartVerb::Box,
+                    entry: bad.clone(),
+                    refusal: minimald_rpc::HeldNameRefusal {
+                        name: bad.clone(),
+                        holder,
+                        holder_name: bad.clone(),
+                    },
+                }
+                .to_string(),
+            );
+        }
+        for text in texts {
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(!text.contains('\n'), "{text:?}");
+            assert!(text.contains("dev\\u{1b}[2K\\n"), "{text:?}");
+        }
+    }
 
     /// BOX-001: a create from `<root>/sub` sends `<root>`, the directory
     /// that holds `minimal.toml`, as the project root.
@@ -3207,11 +4581,10 @@ mod tests {
             ingress: Vec::new(),
             dynamic_ingress: None,
             dynamic_range: None,
-            allow_subnets: Vec::new(),
-            allow_dns_hosts: vec!["github.com".into(), "api.github.com".into()],
-            allow_protocols: Vec::new(),
-            deny_subnets: Vec::new(),
-            deny_all_egress: false,
+            egress: crate::EgressArgs {
+                allow_dns_hosts: vec!["github.com".into(), "api.github.com".into()],
+                ..crate::EgressArgs::default()
+            },
             credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: true,
@@ -3461,6 +4834,29 @@ mod tests {
         );
     }
 
+    /// BEP-022: a `host_ip` box with no `egress` section registers the GitHub
+    /// hosts for its grant. A box with a section registers what it lists.
+    #[test]
+    fn host_ip_grant_box_with_no_egress_section_registers_the_github_hosts() {
+        let hosts: Vec<String> = bep::module::GITHUB
+            .hosts
+            .iter()
+            .map(|authority| authority.host.to_string())
+            .collect();
+        assert_eq!(proxy_egress(None, boxes::NetworkMode::HostNet, true), hosts);
+        assert!(proxy_egress(None, boxes::NetworkMode::HostNet, false).is_empty());
+        assert!(proxy_egress(None, boxes::NetworkMode::OwnIp, true).is_empty());
+
+        let listed = boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec!["github.com".to_string()]),
+            ..boxes::EgressPolicy::default()
+        };
+        assert_eq!(
+            proxy_egress(Some(&listed), boxes::NetworkMode::HostNet, true),
+            ["github.com"]
+        );
+    }
+
     /// BEP-082: a `host_ip` grant box whose record takes another id than
     /// its registration's is refused with this text. A matching id, a box
     /// with no `host_ip` registration, and a registration with no id pass.
@@ -3607,11 +5003,7 @@ mod tests {
             ingress: Vec::new(),
             dynamic_ingress: None,
             dynamic_range: None,
-            allow_subnets: Vec::new(),
-            allow_dns_hosts: Vec::new(),
-            allow_protocols: Vec::new(),
-            deny_subnets: Vec::new(),
-            deny_all_egress: false,
+            egress: crate::EgressArgs::default(),
             credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: true,
@@ -4558,6 +5950,378 @@ mod tests {
             refused
                 .starts_with("Cannot create the box: it declares the GitHub grant GH_TOKEN, and "),
             "{refused}"
+        );
+    }
+
+    /// NET-060: the egress keys a project's `minimal.toml` declares become
+    /// the box policy's egress, and each field names the file as its source.
+    #[test]
+    fn project_egress_table_reaches_box_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n\
+             [defaults.network.egress]\n\
+             allow_subnets = [\"10.0.0.1/8\"]\n\
+             allow_protocols = [\"tcp\", \"udp\"]\n\
+             allow_dns_hosts = [\"github.com\"]\n\
+             deny_subnets = [\"169.254.169.254/32\"]\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let project = project_egress(&sub, None)
+            .expect("the project file loads")
+            .policy;
+        let effective = effective_egress(project, None, false);
+        let expected = boxes::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+            allow_dns_hosts: Some(vec!["github.com".into()]),
+            allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
+            deny_subnets: Some(vec!["169.254.169.254/32".into()]),
+        };
+        assert_eq!(effective.policy.as_ref(), Some(&expected));
+        assert_eq!(
+            effective.sources,
+            [
+                ("allow_subnets", EgressSource::ProjectFile),
+                ("allow_dns_hosts", EgressSource::ProjectFile),
+                ("allow_protocols", EgressSource::ProjectFile),
+                ("deny_subnets", EgressSource::ProjectFile),
+            ]
+        );
+
+        // The box spec records the policy that the create request carries.
+        let flags = mfile::spec::SpecFlags {
+            network: boxes::NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy::new(effective.policy, None),
+            hooks_enabled: true,
+        };
+        let spec = mfile::spec::BoxSpec::for_session(None, flags);
+        assert_eq!(spec.network.policy.egress, Some(expected));
+
+        // `[sessions.default]` replaces `[defaults]`, and the flat legacy key
+        // reads as its nested key.
+        let layered = project_egress_from(
+            b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
+              [sessions.default.network]\negress_allow_dns = [\"b.example\"]\n",
+            None,
+        )
+        .expect("the file loads");
+        assert_eq!(
+            layered.hints.len(),
+            1,
+            "the flat legacy key gives one hint: {:?}",
+            layered.hints
+        );
+        let layered = layered.policy.expect("egress is declared");
+        assert_eq!(layered.allow_dns_hosts, Some(vec!["b.example".to_owned()]));
+
+        // A file whose one session entry is `[sessions.dev]` gives that
+        // entry's egress, and `[sessions.default]` wins over another entry.
+        let only_dev = project_egress_from(
+            b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n",
+            None,
+        )
+        .unwrap()
+        .policy
+        .expect("the one entry declares egress");
+        assert_eq!(
+            only_dev.allow_dns_hosts,
+            Some(vec!["dev.example".to_owned()])
+        );
+        let with_default = project_egress_from(
+            b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n\n\
+              [sessions.default.network.egress]\nallow_dns_hosts = [\"d.example\"]\n",
+            None,
+        )
+        .unwrap()
+        .policy
+        .expect("the default entry declares egress");
+        assert_eq!(
+            with_default.allow_dns_hosts,
+            Some(vec!["d.example".to_owned()])
+        );
+
+        // A `[boxes.<name>]` entry with `type = "session"` is a session entry,
+        // the same as `[sessions.<name>]`.
+        let boxes_dev = project_egress_from(
+            b"[boxes.dev]\ntype = \"session\"\n\n\
+              [boxes.dev.network.egress]\nallow_dns_hosts = [\"box.example\"]\n",
+            None,
+        )
+        .unwrap()
+        .policy
+        .expect("the boxes entry declares egress");
+        assert_eq!(
+            boxes_dev.allow_dns_hosts,
+            Some(vec!["box.example".to_owned()])
+        );
+
+        // Two session entries and none named `default`: the start cannot
+        // pick one, and refuses with exit 2 before the create request.
+        let refusal = project_egress_from(
+            b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n\n\
+              [boxes.web]\ntype = \"session\"\n",
+            None,
+        )
+        .expect_err("two session entries and no default refuse the start");
+        let undecided = refusal
+            .downcast_ref::<SessionEntryUndecided>()
+            .expect("the refusal is an undecided session entry");
+        assert_eq!(SessionEntryUndecided::EXIT_CODE, 2);
+        assert_eq!(
+            undecided.to_string(),
+            "Cannot start the box: the project's minimal.toml declares the session entries \
+             web, dev. None of them is named \"default\", so the start cannot pick one. \
+             Rename the entry to start to \"default\" in minimal.toml."
+        );
+
+        // No session entry, and a `default` entry of another type: no
+        // implicit default session entry applies, so the start refuses.
+        let refusal = project_egress_from(
+            b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
+              [tasks.default]\ncommand = \"true\"\n",
+            None,
+        )
+        .expect_err("a task named default blocks the implicit session entry");
+        let undecided = refusal
+            .downcast_ref::<SessionEntryUndecided>()
+            .expect("the refusal is an undecided session entry");
+        assert_eq!(
+            undecided.to_string(),
+            "Cannot start the box: the project's minimal.toml declares no session entry. \
+             Its entry \"default\" has the type \"task\", so the start has no session entry \
+             to use. Add a [sessions.<name>] entry to minimal.toml."
+        );
+
+        // An entry whose type is not built in: the client cannot resolve its
+        // session root, so the start refuses rather than skip the entry.
+        let refusal = project_egress_from(
+            b"[boxes.dev]\ntype = \"devbox\"\n\n\
+              [boxes.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n",
+            None,
+        )
+        .expect_err("an entry of an unresolved type refuses the start");
+        let undecided = refusal
+            .downcast_ref::<SessionEntryUndecided>()
+            .expect("the refusal is an undecided session entry");
+        assert_eq!(
+            undecided.to_string(),
+            "Cannot start the box: the project's minimal.toml declares the entry \"dev\" \
+             with the type \"devbox\", so the start cannot tell whether it is a session entry. \
+             If \"dev\" is the session to start, set type = \"session\" in it. \
+             Otherwise, name the session entry to start \"default\", or add a \
+             [sessions.default] entry to minimal.toml."
+        );
+        let refusal = project_egress_from(
+            b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
+              [boxes.default]\ntype = \"devbox\"\n",
+            None,
+        )
+        .expect_err("a default entry of an unresolved type refuses the start");
+        let undecided = refusal
+            .downcast_ref::<SessionEntryUndecided>()
+            .expect("the refusal is an undecided session entry");
+        assert_eq!(
+            undecided.to_string(),
+            "Cannot start the box: the project's minimal.toml declares the entry \"default\" \
+             with the type \"devbox\", so the start cannot tell whether it is a session entry. \
+             Set type = \"session\" in the entry \"default\", or rename that entry \
+             and add a [sessions.default] entry to minimal.toml."
+        );
+
+        // The fix the refusal names works: a `[sessions.default]` entry
+        // beside the unresolved entry is picked, and gives the egress.
+        let fixed = project_egress_from(
+            b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
+              [boxes.dev]\ntype = \"devbox\"\n\n\
+              [sessions.default]\npackages = [\"git\"]\n",
+            None,
+        )
+        .expect("a [sessions.default] entry is picked over an unresolved entry")
+        .policy
+        .expect("the defaults layer declares egress");
+        assert_eq!(fixed.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
+
+        // Egress only in a project Box Type's defaults is still egress: an
+        // undecided pick refuses the start rather than drop it.
+        let refusal = project_egress_from(
+            b"[box_types.devbox]\nextends = \"session\"\n\n\
+              [box_types.devbox.defaults.network.egress]\nallow_dns_hosts = [\"t.example\"]\n\n\
+              [boxes.dev]\ntype = \"devbox\"\n",
+            None,
+        )
+        .expect_err("egress in a type's defaults refuses an undecided start");
+        assert!(
+            matches!(
+                refusal.downcast_ref::<SessionEntryUndecided>(),
+                Some(SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "dev"
+            ),
+            "{refusal:#}"
+        );
+
+        // The entry's type is any TOML string, so the refusal escapes it: a
+        // hostile file cannot write a terminal escape sequence to stderr.
+        let refusal = SessionEntryUndecided::TypeUnresolved {
+            name: "dev".to_owned(),
+            box_type: Some("dev\u{1b}[31mbox".to_owned()),
+        }
+        .to_string();
+        assert!(!refusal.contains('\u{1b}'), "{refusal:?}");
+        assert!(
+            refusal.contains("the type \"dev\\u{1b}[31mbox\""),
+            "{refusal:?}"
+        );
+
+        // A file that declares no egress starts with no project egress, even
+        // when its session entry cannot be picked.
+        let no_egress = project_egress_from(
+            b"[sessions.dev]\npackages = [\"git\"]\n\n[sessions.web]\npackages = [\"git\"]\n",
+            None,
+        )
+        .expect("a file without egress keys does not refuse the start");
+        assert_eq!(no_egress.policy, None);
+
+        // A bad egress value is an invalid `minimal.toml`: the refusal is a
+        // `ProjectFileInvalid`, which `main.rs` ends with exit 3.
+        let refusal = project_egress_from(
+            b"[defaults.network.egress]\nallow_protocols = [\"carrier-pigeon\"]\n",
+            None,
+        )
+        .expect_err("an unknown protocol refuses the start");
+        assert!(
+            matches!(
+                refusal.downcast_ref::<ProjectFileInvalid>(),
+                Some(ProjectFileInvalid {
+                    error: mfile::Error::Format(_)
+                })
+            ),
+            "{refusal:?}"
+        );
+        let refusal = project_egress_from(
+            b"[defaults.network]\nmode = \"none\"\n\n\
+              [defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n",
+            None,
+        )
+        .expect_err("egress with mode none refuses the start");
+        let refusal = refusal
+            .downcast_ref::<ProjectFileInvalid>()
+            .expect("the refusal is an invalid project file");
+        assert!(
+            matches!(
+                &refusal.error,
+                mfile::Error::InvalidSpecKey { key, .. } if key.starts_with("network.egress.")
+            ),
+            "{refusal:?}"
+        );
+
+        // No egress keys, and no project file, declare nothing.
+        assert_eq!(
+            project_egress_from(b"[session]\npackages = [\"git\"]\n", None).unwrap(),
+            ProjectEgress::default()
+        );
+        assert_eq!(
+            effective_egress(None, None, false),
+            EffectiveEgress::default()
+        );
+    }
+
+    /// NET-060, arch#166: a list flag adds to the project file's list, the
+    /// file's values first and each value once, `--allow-protocols`
+    /// replaces the file's list, and the fields no flag names stay as the
+    /// file declares them. This is `min session activate`'s rule and the
+    /// run verbs'.
+    #[test]
+    fn egress_flag_adds_to_the_project_list() {
+        let project = project_egress_from(
+            b"[defaults.network.egress]\n\
+              allow_subnets = [\"10.0.0.0/8\"]\n\
+              allow_dns_hosts = [\"github.com\"]\n\
+              allow_protocols = [\"udp\"]\n\
+              deny_subnets = [\"169.254.169.254/32\"]\n",
+            None,
+        )
+        .unwrap()
+        .policy;
+        let flags = boxes::EgressPolicy {
+            allow_subnets: Some(vec!["192.168.0.0/16".into(), "10.0.0.0/8".into()]),
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+            deny_subnets: Some(vec!["172.16.0.0/12".into()]),
+            ..boxes::EgressPolicy::default()
+        };
+        let effective = effective_egress(project.clone(), Some(flags), false);
+        assert_eq!(
+            effective.policy,
+            Some(boxes::EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".into(), "192.168.0.0/16".into()]),
+                allow_dns_hosts: Some(vec!["github.com".into()]),
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                deny_subnets: Some(vec!["169.254.169.254/32".into(), "172.16.0.0/12".into()]),
+            })
+        );
+        assert_eq!(
+            effective.sources,
+            [
+                ("allow_subnets", EgressSource::ProjectFile),
+                ("allow_subnets", EgressSource::Flag),
+                ("allow_dns_hosts", EgressSource::ProjectFile),
+                ("allow_protocols", EgressSource::Flag),
+                ("deny_subnets", EgressSource::ProjectFile),
+                ("deny_subnets", EgressSource::Flag),
+            ]
+        );
+
+        // `--deny-all-egress` alone empties the two destination lists and
+        // sets no deny range, so the file's `allow_protocols` and
+        // `deny_subnets` stay, under the file (arch:1234).
+        let denied = effective_egress(project.clone(), None, true);
+        assert_eq!(
+            denied.policy,
+            Some(boxes::EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![boxes::IpProto::Udp]),
+                deny_subnets: Some(vec!["169.254.169.254/32".into()]),
+            })
+        );
+        assert_eq!(
+            denied.sources,
+            [
+                ("allow_subnets", EgressSource::Flag),
+                ("allow_dns_hosts", EgressSource::Flag),
+                ("allow_protocols", EgressSource::ProjectFile),
+                ("deny_subnets", EgressSource::ProjectFile),
+            ]
+        );
+        // With no file it is the deny-all section (NET-140).
+        assert_eq!(
+            effective_egress(None, None, true).policy,
+            Some(boxes::EgressPolicy::deny_all())
+        );
+
+        // `--deny-all-egress` only narrows: it empties the file's allow
+        // lists, `--allow-protocols` replaces the protocols, and
+        // `--deny-subnets` adds to the file's denies.
+        let narrowed = effective_egress(
+            project,
+            Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                deny_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..boxes::EgressPolicy::default()
+            }),
+            true,
+        );
+        assert_eq!(
+            narrowed.policy,
+            Some(boxes::EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                deny_subnets: Some(vec!["169.254.169.254/32".into(), "10.0.0.0/8".into()]),
+            })
         );
     }
 }

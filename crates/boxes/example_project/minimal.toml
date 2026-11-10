@@ -1,7 +1,7 @@
-# A minimal.toml built for demoing `[session]` composition. The
-# `[session]` block contributes three packages plus a handful of
-# project-level vars chosen to exercise every branch of the user-
-# policy prompt logic.
+# A minimal.toml built for demoing `[defaults.session]` composition.
+# The `[defaults.session]` block contributes three packages plus a
+# handful of project-level vars chosen to exercise every branch of
+# the user-policy prompt logic.
 #
 # Try it:
 #   cargo build -p minimal -p minimald
@@ -21,8 +21,8 @@
 #   # this file.
 #   echo "$GOCACHE $GOMODCACHE"     # /state/gocache /state/gomodcache
 #
-# Demo punchline: comment out the `[session]` block, re-activate,
-# re-run — every command breaks. `mermaid-ascii` is `command not
+# Demo punchline: comment out the `[defaults.session]` block,
+# re-activate, re-run — every command breaks. `mermaid-ascii` is `command not
 # found`; `$DIAGRAM`/`$GOCACHE`/`$GOMODCACHE` are all unset.
 # Composition is doing real work.
 #
@@ -76,7 +76,7 @@ locked_commit = "c854d6b1e0fdc67efd84fc664251079c0719987d"
 [stack]
 use = "shell"
 
-[session]
+[defaults.session]
 # Unioned with the launcher baseline (`base`, `coreutils`, `socat`)
 # and with anything a client loadout adds.
 #
@@ -89,7 +89,7 @@ use = "shell"
 # through.
 packages = ["mermaid-ascii", "go"]
 
-[session.vars]
+[defaults.session.vars]
 # Hardcoded literal — auto-approves at the gate because
 # `carries_user_data` is false (no env lookup happened, so nothing
 # from the host is crossing into the sandbox). The user's policy
@@ -140,7 +140,7 @@ TZ = { inherit = true, default = "UTC" }
 #
 # `min session hooks <session>` lists these back, showing where
 # each was declared and what will actually run.
-[[session.lifecycle_hooks]]
+[[defaults.session.lifecycle_hooks]]
 description = "print at each transition"
 on_activate = { type = "inline", value = "touch /home/alpha.txt" }
 on_attach   = { type = "inline", value = "echo \"beta\"" }

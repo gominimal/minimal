@@ -2760,6 +2760,96 @@ impl OneshotSshRpc for StopBox {
     type Response = Errorable<StopBoxResponse>;
 }
 
+/// An RPC to restart a box whose spec sets `lifetime = "until_stopped"`
+/// (BOX-176).
+///
+/// The daemon checks the box first: its lifetime, then its name, its stored
+/// spec and its volumes, in the order a resume checks them. A check that
+/// fails answers [`RestartBoxResponse::Refused`] and changes nothing. A box
+/// that passes is stopped as [`StopBox`] stops it, when it runs, and then
+/// started again from the spec stored at its creation, under the same id
+/// and name. A start that fails leaves the box `stopped` and answers the
+/// start's error.
+pub struct RestartBox;
+
+/// The request for a [`RestartBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestartBoxRequest {
+    /// The box to restart.
+    pub id: SessionId,
+}
+
+/// The response for a [`RestartBox`] RPC: the box runs again, or a check
+/// refused the restart and the box is as it was.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RestartBoxResponse {
+    /// The box runs again, from its stored spec.
+    Restarted {
+        /// The box was running, and the restart stopped it first.
+        was_running: bool,
+    },
+    /// A check refused the restart before it stopped anything.
+    Refused(RestartRefusal),
+}
+
+/// Why a [`RestartBox`] was refused (BOX-176). The box's state is
+/// unchanged, and a running box still runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestartRefusal {
+    /// Which check refused.
+    pub kind: RestartRefusalKind,
+    /// The exit code a client ends with on this refusal.
+    pub exit_code: u8,
+    /// The refusal for the user: what was refused, why, and the next step.
+    pub message: String,
+}
+
+impl std::fmt::Display for RestartRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RestartRefusal {}
+
+/// The check that refused a [`RestartBox`], in the order the daemon runs
+/// them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartRefusalKind {
+    /// The box's spec does not set `lifetime = "until_stopped"`. Exit 2.
+    Lifetime,
+    /// Another running box holds the box's name. Exit 2.
+    Name,
+    /// This daemon cannot start the box from its stored spec. Exit 3.
+    Spec,
+    /// An upload into the box's workspace is in flight. Exit 2.
+    Upload,
+    /// A refusal kind this client does not know, from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RestartRefusalKind {
+    /// The kind's name, as the daemon log spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lifetime => "lifetime",
+            Self::Name => "name",
+            Self::Spec => "spec",
+            Self::Upload => "upload",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl OneshotSshRpc for RestartBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RestartBox");
+    type Request<'a> = RestartBoxRequest;
+    type Response = Errorable<RestartBoxResponse>;
+}
+
 /// An RPC to list the box records this host keeps, in any state
 /// (BOX-158).
 pub struct ListBoxes;
@@ -2849,6 +2939,20 @@ pub enum BoxIdentity {
     Unknown,
 }
 
+/// One exec running in a box, as a read of the box's record lists it
+/// (BOX-159): the fields its `exec_started` event records (BOX-152).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveExec {
+    /// The exec's id, which a wait, a stop or an attach takes.
+    pub id: String,
+    /// The exec's argv, as the client sent it.
+    pub argv: Vec<String>,
+    /// How the exec meets its client: `tty` for an exec that holds a PTY,
+    /// `detached` for one that runs without a client, `attached` for one
+    /// whose stdio is a client's pipes.
+    pub mode: exec::ExecMode,
+}
+
 /// The response for a [`ShowBox`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShowBoxResponse {
@@ -2857,14 +2961,10 @@ pub struct ShowBoxResponse {
     /// The identity the box runs under.
     #[serde(default)]
     pub identity: BoxIdentity,
-    /// The exec id of each exec running in the box now.
-    ///
-    /// The daemon does not give an exec an id yet (BOX-149), so this
-    /// list is always empty. An empty list does not mean that no process
-    /// runs in the box. The list fills when each exec has an id:
-    /// <https://github.com/gominimal/minimal/issues/2404> (T30, BOX-149).
+    /// Each exec running in the box now, in exec id order (BOX-159). An
+    /// exec leaves the list when it ends.
     #[serde(default)]
-    pub live_execs: Vec<String>,
+    pub live_execs: Vec<LiveExec>,
     /// The bytes on disk that a reap of the box frees: the box's
     /// directory, with its filesystem, record, events and log. The daemon
     /// gives it for a `stopped` or `exited` box only. It is absent for a
@@ -3973,6 +4073,46 @@ mod stop_box_tests {
 }
 
 #[cfg(test)]
+mod restart_box_tests {
+    use super::*;
+
+    /// BOX-176: a restart's answer and its typed refusal read back as sent,
+    /// and an error reply reads back as an error, not as an answer.
+    #[test]
+    fn restart_box_reply_round_trips() {
+        let responses = [
+            RestartBoxResponse::Restarted { was_running: true },
+            RestartBoxResponse::Refused(RestartRefusal {
+                kind: RestartRefusalKind::Name,
+                exit_code: 2,
+                message: "refused".to_string(),
+            }),
+        ];
+        for response in responses {
+            let wire: Errorable<RestartBoxResponse> = Errorable::Ok(response.clone());
+            let bytes = serde_json_lenient::to_vec(&wire).unwrap();
+            let back: Errorable<RestartBoxResponse> =
+                serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(back, Errorable::Ok(response));
+        }
+        let error: Errorable<RestartBoxResponse> =
+            serde_json_lenient::from_str(r#"{"error":"it failed"}"#).unwrap();
+        assert_eq!(
+            error,
+            Errorable::Err {
+                error: "it failed".to_string()
+            }
+        );
+        let newer: RestartRefusalKind = serde_json_lenient::from_str(r#""quota""#).unwrap();
+        assert_eq!(newer, RestartRefusalKind::Unknown);
+        assert_eq!(
+            RestartBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RestartBox")
+        );
+    }
+}
+
+#[cfg(test)]
 mod box_listing_tests {
     use super::*;
 
@@ -4033,7 +4173,11 @@ mod box_listing_tests {
         let show = ShowBoxResponse {
             record: stopped,
             identity: BoxIdentity::None,
-            live_execs: vec!["exec-1".to_string()],
+            live_execs: vec![LiveExec {
+                id: "exec-1".to_string(),
+                argv: vec!["sleep".to_string(), "60".to_string()],
+                mode: crate::exec::ExecMode::Detached,
+            }],
             disk_bytes: Some(4096),
         };
         let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
