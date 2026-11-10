@@ -11492,7 +11492,7 @@ async fn box_wait_timeout_flag_returns_124_box_runs_on() {
     assert_eq!(timed_out.code(), "wait_timeout");
     assert_eq!(
         timed_out.to_string(),
-        format!("Stopped waiting after 300ms. web ({id}) is still running.")
+        format!("Stopped waiting after 300ms. web ({id}) has not ended.")
     );
     assert_eq!(
         timed_out.hint(),
@@ -11500,7 +11500,7 @@ async fn box_wait_timeout_flag_returns_124_box_runs_on() {
     );
     assert_eq!(
         BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s").to_string(),
-        "Stopped waiting after 30s. web (0190a3c4-0000-7000-8000-000000000000) is still running."
+        "Stopped waiting after 30s. web (0190a3c4-0000-7000-8000-000000000000) has not ended."
     );
 
     let record = shown_record(&alpha.host, id).await;

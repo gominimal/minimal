@@ -43,15 +43,15 @@ impl BoxTimedOut {
         }
     }
 
-    /// The wait for `target` stopped after `after`, with the box still
-    /// running. `id` is the box id the wait resolved, so that a script can
+    /// The wait for `target` stopped after `after`, before the box ended.
+    /// `id` is the box id the wait resolved, so that a script can
     /// address the box by it.
     #[must_use]
     pub fn waited(target: &str, id: &str, after: &str) -> Self {
         Self {
             code: "wait_timeout",
             // The `diagnostics:` wording, with the id, split into two sentences.
-            message: format!("Stopped waiting after {after}. {target} ({id}) is still running."),
+            message: format!("Stopped waiting after {after}. {target} ({id}) has not ended."),
             hint: format!(
                 "Run `min box wait {id}` to wait again, or `min box stop {id}` to stop it."
             ),
