@@ -291,6 +291,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
         return minimal::BoxRenameRefusal::EXIT_CODE;
     }
+    // BCLI-074: `min box restart` refused, such as for a box that runs to
+    // completion (exit 2). The refusal carries its own code, never 0.
+    if let Some(refusal) = e.downcast_ref::<minimald_rpc::RestartRefusal>() {
+        return refusal.exit_code.max(1);
+    }
     // BCLI-005: `min box prune` off a terminal without `--yes`.
     if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
         return minimal::PruneNeedsYes::EXIT_CODE;

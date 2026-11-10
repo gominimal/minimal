@@ -469,6 +469,11 @@ pub enum BoxCommand {
     /// files. A running box is refused unless `--force` is given, which
     /// stops the box at once and then removes it
     Rm(BoxRmArgs),
+    /// Stop a box that runs until it is stopped, if it runs, and start it
+    /// again from the settings it was created with. The box keeps its id,
+    /// its name and its files. A box that runs to completion cannot
+    /// restart: run it again with `min box run`
+    Restart(BoxRestartArgs),
     /// Attach this terminal to a box's terminal. With no box named, attach
     /// to this project's running box that has a terminal, else to its only
     /// stopped or exited one, which starts again
@@ -668,6 +673,14 @@ pub struct BoxStopArgs {
     /// Kill every process in the box at once, with no grace period
     #[arg(long)]
     pub force: bool,
+}
+
+// BOX-176 (BCLI-074): `min box restart <box>`.
+#[derive(Debug, Args)]
+pub struct BoxRestartArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
 }
 
 // BCLI-068: `min box attach [<box>] [--exec <id>]`.
