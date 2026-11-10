@@ -55,14 +55,28 @@ pub struct WireContribution {
     /// The `minimal.toml` entry the box comes from, expanded by the client
     /// over `[defaults]`, `[defaults.<type>]` and the entry's own table
     /// (BOX-064). The daemon composes the project's part of the box from
-    /// it (BOX-068). `None` from a client that sends no entry: the daemon
-    /// then composes from the project's `[session]` table alone.
+    /// it (BOX-068). When an entry is present, the daemon does not read the
+    /// project's `[session]` table. `None` from a client that sends no
+    /// entry, or for a project with no entry tables: the daemon then
+    /// composes from the project's `[session]` table alone.
+    ///
+    /// Gap: the entry carries only the five composed lists (`packages`,
+    /// `vars`, `vars_lenient`, `patches`, `lifecycle_hooks`), not the
+    /// whole expanded Box Spec. The daemon still reads the project's
+    /// `[stack]` itself. Sending and storing the full expanded spec, as
+    /// BOX-068 asks, is tracked in gominimal/minimal#3257.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<Box<WireBoxEntry>>,
 }
 
 /// An expanded `minimal.toml` entry, as the client sends it with its
 /// contribution: the lists of the expanded spec that the daemon composes.
+///
+/// This is not the expanded Box Spec. It carries only five lists
+/// (`packages`, `vars`, `vars_lenient`, `patches`, `lifecycle_hooks`), and
+/// the daemon still reads the project's `[stack]` itself. Sending and
+/// storing the full expanded spec (BOX-068) is tracked in
+/// gominimal/minimal#3257.
 ///
 /// Each list is `None` when the client sends no such list. An absent list
 /// leaves the daemon's own project list for that kind of item as it is. A
