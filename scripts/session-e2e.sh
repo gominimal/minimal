@@ -7999,11 +7999,12 @@ relay_sid="$(printf '%s\n' "$relay_sid" | tail -n1 | tr -d '\r')"
 # counts the stream as quiet: under load the sandbox can take longer than
 # two seconds to mint, and the chord then left before a line ran. What is
 # asserted is unchanged: the size the session reports is the resized one.
-# The typed line is quoted so the pty's echo of it never contains the marker:
-# only the shell's output does, once it has run the command.
+# The typed line builds the marker with printf, as the helper's own default
+# stream does, so the pty's echo of the typed text never contains it: only the
+# shell's output does, once it has run the command.
 # shellcheck disable=SC2016 # `$(stty size)` must run in the SESSION's shell.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-relay_out="$(E2E_PTY_COMMANDS='echo RELAY_"READY"' E2E_PTY_READY='RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
+relay_out="$(E2E_PTY_COMMANDS='printf "RELAY_%s\n" READY' E2E_PTY_READY='RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
   E2E_PTY_AFTER='for _ in $(seq 1 40); do s=$(stty size); [ "$s" = "41 117" ] && break; printf .; sleep 0.25; done; printf "\nRELAY_SIZE[%s]\n" "$s"' E2E_PTY_DETACH=1 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-resize.err")" || {

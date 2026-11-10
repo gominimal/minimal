@@ -32,6 +32,11 @@ to fire `on_detach`):
                     for the second stage or the chord: a sandbox that takes
                     longer than two seconds to mint under load would
                     otherwise be detached before its shell ran a line.
+                    The marker must not appear in the typed text itself:
+                    the pty echoes what is typed into the transcript before
+                    the shell runs it, so build it (printf "RELAY_%s\n"
+                    READY), never type it.
+
   E2E_PTY_ASK       answer a runtime port-publish ask the attached human is
                     shown: `allow` selects Allow (Down then Enter — Deny
                     stands highlighted), `deny` takes the highlighted Deny
