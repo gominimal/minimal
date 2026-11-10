@@ -2683,9 +2683,21 @@ struct NodePortAssignment {
 /// answerer port would be an admitted port with nothing behind it.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn assign_node_proxy_port(dir: &std::path::Path) -> Result<NodePortAssignment> {
+    assign_node_proxy_port_from(dir, NODE_DEFAULT_PROXY_PORT)
+}
+
+/// [`assign_node_proxy_port`] with the preferred port passed in. The
+/// supervisor passes [`NODE_DEFAULT_PROXY_PORT`]; a unit test passes a port
+/// it holds itself, so the draw never binds or dials the host's real 7654,
+/// which a running daemon or a session e2e beside the test may own.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn assign_node_proxy_port_from(
+    dir: &std::path::Path,
+    preferred: u16,
+) -> Result<NodePortAssignment> {
     let proxy = match node_port_override(crate::vm::NODE_PROXY_PORT_ENV)? {
         Some(proxy) => configured_node_port(dir, proxy)?,
-        None => assign_node_port(dir, NODE_DEFAULT_PROXY_PORT, false)?,
+        None => assign_node_port(dir, preferred, false)?,
     };
     log_node_port_assignment(&proxy);
     Ok(proxy)
@@ -4192,14 +4204,27 @@ mod tests {
         // the TCP probe refuses nothing that is actually free, so a lone VM
         // still lands on the default proxy port — the case the session e2e's
         // hardcoded 7654 depends on.
-        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let free = freed.local_addr().unwrap().port();
-        drop(freed);
+        // The port is released before the draw probes it, so another
+        // process on the host can take it in between (#2653): a skip is
+        // that lost race only while the port is held again, so the draw
+        // asks for a fresh port then, and a skip of a port nothing holds
+        // fails at once.
+        let mut handed = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
+            if assigned.port == free || super::tcp_bind_probe(free).is_ok() {
+                handed = Some((free, assigned));
+                break;
+            }
+        }
+        let (free, assigned) = handed.expect("a released port stays free for one draw");
         assert!(
             !super::loopback_answers(free),
             "the loopback probe leaves a free port alone"
         );
-        let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
         assert_eq!(
             assigned.port, free,
             "a free preferred port is handed unchanged"
@@ -4214,11 +4239,22 @@ mod tests {
         );
 
         // The answerer's UDP probe is unchanged by the TCP probe's second
-        // check: a free UDP port is handed as asked.
-        let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-        let free_udp = freed_udp.local_addr().unwrap().port();
-        drop(freed_udp);
-        let assigned_udp = super::assign_node_port(ports.path(), free_udp, true).unwrap();
+        // check: a free UDP port is handed as asked, under the same race.
+        let mut handed_udp = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+            let free_udp = freed_udp.local_addr().unwrap().port();
+            drop(freed_udp);
+            let assigned_udp = super::assign_node_port(ports.path(), free_udp, true).unwrap();
+            if assigned_udp.port == free_udp
+                || std::net::UdpSocket::bind(("0.0.0.0", free_udp)).is_ok()
+            {
+                handed_udp = Some((free_udp, assigned_udp));
+                break;
+            }
+        }
+        let (free_udp, assigned_udp) =
+            handed_udp.expect("a released UDP port stays free for one draw");
         assert_eq!(
             assigned_udp.port, free_udp,
             "a free UDP preferred port is handed unchanged"
@@ -4374,8 +4410,15 @@ mod tests {
         // whatever the host picked, it is a real port the guest can bind as
         // handed (the cmdline and bind halves are the vm.rs and minimald
         // tests of the same name).
-        let assigned = super::assign_node_proxy_port(ports.path()).unwrap();
+        // Preferred at the port this test still holds, never the real
+        // default: a running daemon or a session e2e may own 7654 on this
+        // host, and the draw's probes would bind and dial it.
+        let assigned = super::assign_node_proxy_port_from(ports.path(), busy).unwrap();
         assert!(assigned.port != 0, "the node's proxy port is assigned");
+        assert_ne!(
+            assigned.port, busy,
+            "the proxy assignment skips a held preferred port like any draw"
+        );
 
         // The answerer's probe is the same default-first over UDP, held on
         // the same wildcard the UDP probe addresses.
@@ -4513,22 +4556,35 @@ mod tests {
     /// e2e lanes check it.
     #[test]
     fn node_port_draw_skips_a_held_preferred_port_and_hands_it_back_once_released() {
-        // The preferred port: hold it on the loopback the TCP probe
-        // addresses, so the first draw sees it refused.
-        let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let default = stale.local_addr().unwrap().port();
         let ports = tempfile::tempdir().expect("a test reservation dir");
-        let drawn_before = super::assign_node_port(ports.path(), default, false).unwrap();
-        assert_eq!(drawn_before.preferred, default);
-        assert_eq!(drawn_before.skipped, Some(super::SKIP_BIND_REFUSED));
-        assert_ne!(
-            drawn_before.port, default,
-            "the held default is not handed to the proxy"
-        );
+        // Released, the port is anyone's on the host until the second draw
+        // probes it (#2653): a second draw that skips a port something holds
+        // again lost that race, so the whole round runs again on a fresh
+        // port. A skip of a port nothing holds fails at once.
+        let mut handed_back = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            // The preferred port: hold it on the loopback the TCP probe
+            // addresses, so the first draw sees it refused.
+            let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let default = stale.local_addr().unwrap().port();
+            let drawn_before = super::assign_node_port(ports.path(), default, false).unwrap();
+            assert_eq!(drawn_before.preferred, default);
+            assert_eq!(drawn_before.skipped, Some(super::SKIP_BIND_REFUSED));
+            assert_ne!(
+                drawn_before.port, default,
+                "the held default is not handed to the proxy"
+            );
 
-        // Release the holder, and the same draw hands the port back.
-        drop(stale);
-        let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
+            // Release the holder, and the same draw hands the port back.
+            drop(stale);
+            let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
+            if drawn_after.port == default || super::tcp_bind_probe(default).is_ok() {
+                handed_back = Some((default, drawn_after));
+                break;
+            }
+        }
+        let (default, drawn_after) =
+            handed_back.expect("a released preferred port stays free for one draw");
         assert_eq!(drawn_after.port, default);
         assert_eq!(drawn_after.skipped, None);
     }

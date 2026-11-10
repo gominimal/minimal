@@ -1,0 +1,81 @@
+name: 'Send a release event'
+description: >-
+  Send a `release-event` repository_dispatch to gominimal/release-ops, which
+  posts it in Slack #releases. The payload is the fixed contract release-ops
+  reads: nine string keys, any of them empty (GitHub allows ten). A failed send
+  only warns: a missing Slack post must never fail a release job.
+inputs:
+  token:
+    description: 'Token that can dispatch to gominimal/release-ops (contents: write on it)'
+    required: true
+  event:
+    description: 'stage | approval-requested | promote | rollback | nightly-failed'
+    required: true
+  outcome:
+    description: 'success | failure | refused | timed_out | cancelled'
+    required: true
+  version:
+    description: 'Version, or a nightly commit; empty when unknown'
+    required: false
+    default: ''
+  line:
+    description: 'Release line, e.g. release/0.7.x'
+    required: false
+    default: ''
+  sha:
+    description: 'Full commit sha'
+    required: false
+    default: ''
+  run_url:
+    description: 'Link to the run; defaults to this run'
+    required: false
+    default: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  actor:
+    description: 'GitHub login of the person who started the run'
+    required: false
+    default: ''
+  detail:
+    description: 'Short text, cut to 300 characters, e.g. the failed job'
+    required: false
+    default: ''
+  url:
+    description: 'An extra link, e.g. the approval issue'
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      env:
+        # All via env, never inline in `run:`, so no value can inject shell.
+        GH_TOKEN: ${{ inputs.token }}
+        EVENT: ${{ inputs.event }}
+        OUTCOME: ${{ inputs.outcome }}
+        VERSION: ${{ inputs.version }}
+        LINE: ${{ inputs.line }}
+        SHA: ${{ inputs.sha }}
+        RUN_URL: ${{ inputs.run_url }}
+        ACTOR: ${{ inputs.actor }}
+        DETAIL: ${{ inputs.detail }}
+        URL: ${{ inputs.url }}
+      run: |
+        set -uo pipefail
+        # The token step upstream may have failed under continue-on-error.
+        if [ -z "$GH_TOKEN" ]; then
+          echo "::warning::no release-ops token; release event $EVENT/$OUTCOME not sent"
+          exit 0
+        fi
+        # jq builds the JSON, so a quote or newline in any value stays data.
+        if jq -n \
+          --arg event "$EVENT" --arg outcome "$OUTCOME" --arg version "$VERSION" \
+          --arg line "$LINE" --arg sha "$SHA" --arg run_url "$RUN_URL" \
+          --arg actor "$ACTOR" --arg detail "$DETAIL" --arg url "$URL" \
+          '{event_type: "release-event", client_payload: {
+              event: $event, outcome: $outcome, version: $version, line: $line,
+              sha: $sha, run_url: $run_url, actor: $actor,
+              detail: $detail[0:300], url: $url}}' \
+          | gh api repos/gominimal/release-ops/dispatches --input - --silent; then
+          echo "sent release event $EVENT/$OUTCOME${VERSION:+ for $VERSION} to gominimal/release-ops"
+        else
+          echo "::warning::could not send release event $EVENT/$OUTCOME to gominimal/release-ops; no Slack post for it"
+        fi

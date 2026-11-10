@@ -458,6 +458,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
+            // A test's request, sent only to the in-process test daemon,
+            // which is this build: it checks the start's override flags.
+            "tests.rs::planned_session_request = asserts nothing",
             // A unit test's request, never sent: it checks the fresh instance.
             "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
         ]
@@ -2287,6 +2290,7 @@ fn typed_start(verb: StartVerb, entry: Option<&str>) -> StartEntry {
         name: None,
         new: false,
         detach: false,
+        overrides: StartOverrideArgs::default(),
     }
 }
 
@@ -2422,6 +2426,7 @@ async fn start_off_tty_exit2_names_detach() {
                 name: None,
                 new: false,
                 detach: false,
+                overrides: StartOverrideArgs::default(),
             },
         )
         .await
@@ -2435,6 +2440,7 @@ async fn start_off_tty_exit2_names_detach() {
                 name: None,
                 new: false,
                 detach: false,
+                overrides: StartOverrideArgs::default(),
             },
         )
         .await
@@ -13473,6 +13479,365 @@ async fn session_attach_without_address_ambiguous_exit2_lists() {
              Name one with `min session attach <box>`.",
             lines[0], lines[1]
         )
+    );
+}
+
+/// The start `argv` types, as `min box start` or `min session start`.
+fn parsed_start(argv: &[&str]) -> StartEntry {
+    match Cli::try_parse_from(argv).expect("the start parses").command {
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Start(args),
+        })) => StartEntry::from(args),
+        Some(Command::Session(SessionArgs {
+            command: SessionCommand::Start(args),
+        })) => StartEntry::from(args),
+        _ => panic!("not a start: {argv:?}"),
+    }
+}
+
+/// A native in-process daemon that the client commands of `global` reach,
+/// with a state directory of its own.
+async fn show_network_daemon() -> (
+    tempfile::TempDir,
+    GlobalArgs,
+    minimald::test_harness::TestServer,
+) {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .expect("the native daemon's socket path");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the native daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    (state, global, server)
+}
+
+/// The create request of [`planned_session_request`].
+type PlannedRequest = minimald_rpc::CreateSessionRequest;
+
+/// The create request that the activation of a planned session start
+/// sends for the project in `root`: the network mode, the ingress and the
+/// effective egress, built by the functions `activate_box` calls, and the
+/// spec stamped on it. The request is built with its constructor.
+fn planned_session_request(
+    args: &ActivateArgs,
+    options: &ActivationOptions,
+    root: &camino::Utf8Path,
+) -> PlannedRequest {
+    let (port_mappings, flags) = flag_network_overrides(args).expect("the flags parse");
+    let project = project_egress(root, options.entry.as_deref()).expect("the project loads");
+    let egress = effective_egress(project.policy, flags, args.egress.deny_all_egress);
+    let policy = network_override_policy(args, port_mappings, egress.policy);
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        args.network.into(),
+        policy,
+    );
+    request.config.name = minimal_client::box_name::request_name(None);
+    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    // Each create in a test is a fresh instance, so no name is held.
+    request_fresh_instance(&mut request);
+    request
+}
+
+// BCLI-024: the `[network]` override flags of `min box start` and `min
+// session start` reach the command-line layer. Each flag changes only its
+// own key, the rest of the entry's `[network]` table stays, and the stored
+// spec and the record the daemon keeps hold the overridden values.
+#[tokio::test]
+async fn network_flags_override_stored_spec_and_projection() {
+    let toml = "[sessions.default.network.egress]\n\
+                allow_dns_hosts = [\"a.example\"]\n\
+                allow_protocols = [\"tcp\"]\n";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, global, server) = show_network_daemon().await;
+    let mut daemon = server.connect().await;
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+
+    for verb in ["box", "session"] {
+        let start = parsed_start(&[
+            "min",
+            verb,
+            "start",
+            "--network",
+            "own_ip",
+            "--ingress",
+            "8080:80",
+            "--allow-dns-hosts",
+            "b.example",
+            "--deny-subnets",
+            "10.9.0.0/16",
+        ]);
+        let StartPlan::Session { args, options, .. } =
+            plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+        else {
+            panic!("{verb}: the default entry is a session");
+        };
+        assert_eq!(args.network, CliNetworkMode::OwnIp, "{verb}");
+        assert_eq!(args.ingress, vec!["8080:80".to_owned()], "{verb}");
+        assert_eq!(args.egress.allow_dns_hosts, vec!["b.example".to_owned()]);
+        assert_eq!(args.egress.deny_subnets, vec!["10.9.0.0/16".to_owned()]);
+
+        let request = planned_session_request(&args, &options, root);
+        let spec: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+        assert_eq!(spec.network.mode, boxes::NetworkMode::OwnIp, "{verb}");
+        let egress = spec
+            .network
+            .policy
+            .egress
+            .clone()
+            .expect("egress is declared");
+        // A list flag adds to the entry's list, and a key no flag names
+        // keeps the entry's value.
+        assert_eq!(
+            egress.allow_dns_hosts,
+            Some(vec!["a.example".to_owned(), "b.example".to_owned()]),
+            "{verb}"
+        );
+        assert_eq!(egress.deny_subnets, Some(vec!["10.9.0.0/16".to_owned()]));
+        assert_eq!(
+            egress.allow_protocols,
+            Some(vec![boxes::IpProto::Tcp]),
+            "{verb}: the entry's allow_protocols stays"
+        );
+        let ingress = spec.network.policy.ingress.clone().expect("ingress is set");
+        assert_eq!(
+            ingress.port_mappings,
+            vec![parse_ingress_mapping("8080:80").unwrap()]
+        );
+
+        // The daemon keeps the overridden values on the box's record.
+        let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+            minimald_rpc::Errorable::Ok(created) => created.id,
+            minimald_rpc::Errorable::Err { error } => panic!("{verb}: the create failed: {error}"),
+        };
+        let record = stored_box_record(&mut client, id)
+            .await
+            .expect("the record is read")
+            .expect("the box has a record");
+        assert_eq!(record.network, boxes::NetworkMode::OwnIp, "{verb}");
+        assert_eq!(record.policy, spec.network.policy, "{verb}");
+    }
+
+    // A flag that is not given leaves the activation's value in place.
+    let StartPlan::Session { args, .. } =
+        plan_start(&parsed_start(&["min", "session", "start"]), &[], true).unwrap()
+    else {
+        panic!("the implicit default entry is a session");
+    };
+    assert_eq!(args.network, ActivateArgs::unflagged().network);
+    assert!(args.ingress.is_empty());
+    assert_eq!(args.egress, EgressArgs::default());
+
+    // `--network own_ip --deny-all-egress` sets the mode and empties the
+    // entry's allow lists.
+    let start = parsed_start(&[
+        "min",
+        "session",
+        "start",
+        "--network",
+        "own_ip",
+        "--deny-all-egress",
+    ]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &start_entries(toml), true).unwrap()
+    else {
+        panic!("the default entry is a session");
+    };
+    let request = planned_session_request(&args, &options, root);
+    assert_eq!(request.config.network, boxes::NetworkMode::OwnIp);
+    let egress = request.config.policy.egress.clone().unwrap();
+    assert_eq!(egress.allow_dns_hosts, Some(vec![]));
+
+    // A mapping that does not parse fails the activation's flag step.
+    let mut args = args;
+    args.ingress = vec!["not-a-port".to_owned()];
+    assert!(flag_network_overrides(&args).is_err());
+
+    // A task entry's box takes `--network` and the egress flags through
+    // the run path, as `min box run` does.
+    let tasks = start_entries("[tasks.build]\necho = 'x'\n");
+    let start = parsed_start(&[
+        "min",
+        "box",
+        "start",
+        "build",
+        "--network",
+        "none",
+        "--deny-all-egress",
+    ]);
+    let StartPlan::Detached { run, .. } = plan_start(&start, &tasks, true).unwrap() else {
+        panic!("a task box starts detached");
+    };
+    assert_eq!(run.network, Some(CliNetworkMode::NoNet));
+    assert!(run.egress.deny_all_egress);
+
+    // The run path takes no `--ingress`, so the start refuses it with exit
+    // 2 before it creates anything.
+    let start = parsed_start(&["min", "box", "start", "build", "--ingress", "8080:80"]);
+    let error = plan_start(&start, &tasks, true).expect_err("--ingress is refused");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("a start refusal");
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot start build with --ingress. A box from a task entry does not take \
+         --ingress. Run min box start build without --ingress."
+    );
+}
+
+// BCLI-073: `--loadout` on `min box start` and `min session start` selects
+// each loadout it names for the selected-loadouts layer, in place of the
+// client config's `default_loadouts`.
+#[test]
+fn start_loadout_flag_selects_loadouts_layer() {
+    for verb in ["box", "session"] {
+        let start = parsed_start(&["min", verb, "start", "--loadout", "rust", "--loadout", "ai"]);
+        let StartPlan::Session { args, .. } =
+            plan_start(&start, &[], true).expect("the start is planned")
+        else {
+            panic!("{verb}: the implicit default entry is a session");
+        };
+        assert_eq!(args.loadout, vec!["rust".to_owned(), "ai".to_owned()]);
+        assert_eq!(
+            start_loadout_selection(&args),
+            loadouts::LoadoutSelection::Cli(vec!["rust".to_owned(), "ai".to_owned()]),
+            "{verb}"
+        );
+
+        // With no `--loadout`, the config's defaults apply, as before.
+        let StartPlan::Session { args, .. } =
+            plan_start(&parsed_start(&["min", verb, "start"]), &[], true).unwrap()
+        else {
+            panic!("{verb}: the implicit default entry is a session");
+        };
+        assert_eq!(
+            start_loadout_selection(&args),
+            loadouts::LoadoutSelection::Defaults
+        );
+    }
+
+    // The run path takes no `--loadout`, so a task entry's start refuses
+    // it with exit 2 before it creates anything.
+    let tasks = start_entries("[tasks.build]\necho = 'x'\n");
+    let start = parsed_start(&["min", "box", "start", "build", "--loadout", "rust"]);
+    let error = plan_start(&start, &tasks, true).expect_err("--loadout is refused");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("a start refusal");
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot start build with --loadout. A box from a task entry does not take \
+         --loadout. Run min box start build without --loadout."
+    );
+}
+
+// BCLI-025: `min box show <box> --network` renders the `[network]` section
+// the box's record stores, with the creating command's overrides in it.
+#[tokio::test]
+async fn box_show_network_renders_effective() {
+    let (_state, global, server) = show_network_daemon().await;
+    let mut daemon = server.connect().await;
+    let project = tempfile::tempdir().unwrap();
+    let mut request = minimald::test_harness::create_session_req(
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    );
+    request.config.network = boxes::NetworkMode::OwnIp;
+    request.config.policy = boxes::BoxPolicy {
+        egress: Some(boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec!["a.example".to_owned(), "b.example".to_owned()]),
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+            ..boxes::EgressPolicy::default()
+        }),
+        ingress: Some(boxes::IngressPolicy {
+            port_mappings: vec![parse_ingress_mapping("8080:80").unwrap()],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        }),
+        ..boxes::BoxPolicy::default()
+    };
+    let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+        minimald_rpc::Errorable::Ok(created) => created.id,
+        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+    };
+
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+    // `min box show --network` reads the record from the daemon and
+    // writes its network section.
+    let mut out = Vec::new();
+    show_stored_network(&mut out, &mut client, id, "web")
+        .await
+        .expect("the section is shown");
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text,
+        "[network]\n\
+         mode = \"own_ip\"\n\
+         \n\
+         [network.egress]\n\
+         allow_dns_hosts = [\"a.example\", \"b.example\"]\n\
+         allow_protocols = [\"tcp\"]\n\
+         \n\
+         [[network.ingress.port_mappings]]\n\
+         external_port = 8080\n\
+         internal_port = 80\n\
+         proto = \"tcp\"\n"
+    );
+    let parsed: toml::Table = toml::from_str(&text).expect("the section is TOML");
+    let network = parsed["network"].as_table().expect("a [network] table");
+    assert_eq!(network["mode"].as_str(), Some("own_ip"), "{text}");
+    let egress = network["egress"].as_table().expect("an egress table");
+    assert_eq!(
+        egress["allow_dns_hosts"],
+        toml::Value::from(vec!["a.example", "b.example"]),
+        "{text}"
+    );
+    assert!(text.contains("8080"), "{text}");
+    assert_eq!(parsed.len(), 1, "only the network section\n{text}");
+
+    // A box with no network prints its mode and nothing it cannot have.
+    let mut out = Vec::new();
+    write_stored_network(
+        &mut out,
+        boxes::NetworkMode::NoNet,
+        &boxes::BoxPolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "[network]\nmode = \"none\"\n"
+    );
+
+    // A box the host does not have prints nothing and fails.
+    let mut out = Vec::new();
+    show_stored_network(
+        &mut out,
+        &mut client,
+        boxes::SessionId::from_bytes([7; 16]),
+        "gone",
+    )
+    .await
+    .expect_err("the host has no such box");
+    assert!(out.is_empty());
+
+    assert!(
+        Cli::try_parse_from(["min", "box", "show", "web", "--network"]).is_ok(),
+        "min box show takes --network"
     );
 }
 

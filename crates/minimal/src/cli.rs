@@ -461,7 +461,8 @@ pub enum BoxCommand {
     /// lists the boxes of every project
     List(BoxListArgs),
     /// Show one box: its id, name, type, parent, project, state, how it
-    /// ended, the identity it runs under, and its provider and host
+    /// ended, the identity it runs under, and its provider and host.
+    /// `--network` shows the box's network section in its place
     Show(BoxShowArgs),
     /// Stop a running box and keep it: its record, its events and its
     /// files stay until `min box rm` removes them. `--force` kills every
@@ -672,12 +673,17 @@ pub enum BoxListOutputFormat {
     Json,
 }
 
-// BOX-159 (BCLI-003): `min box show <box>`.
+// BOX-159 (BCLI-003): `min box show <box>`, and BCLI-025's `--network`.
 #[derive(Debug, Args)]
 pub struct BoxShowArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
     pub target: String,
+    /// Show only the box's `[network]` section, as the box was created
+    /// with it: its network mode, ingress and egress, with the flags of
+    /// the command that created it applied
+    #[arg(long)]
+    pub network: bool,
 }
 
 // BOX-013 (BCLI-059), BOX-151 (BCLI-055):
@@ -1228,7 +1234,8 @@ pub struct BoxRunArgs {
     pub args: Vec<String>,
 }
 
-// BCLI-029, BCLI-069, BCLI-070, BCLI-072:
+// BCLI-029, BCLI-069, BCLI-070, BCLI-072, and the override flags of
+// BCLI-024 and BCLI-073:
 // `min box start [<entry>] [--name <name>] [--new] [--detach]`.
 #[derive(Debug, Args)]
 pub struct BoxStartArgs {
@@ -1246,9 +1253,12 @@ pub struct BoxStartArgs {
     /// attached to the box
     #[arg(long)]
     pub detach: bool,
+    #[command(flatten)]
+    pub overrides: StartOverrideArgs,
 }
 
-// BCLI-029, BCLI-069, BCLI-070, BCLI-071:
+// BCLI-029, BCLI-069, BCLI-070, BCLI-071, and the override flags of
+// BCLI-024 and BCLI-073:
 // `min session start [<entry>] [--name <name>] [--new] [--detach]`.
 #[derive(Debug, Args)]
 pub struct SessionStartArgs {
@@ -1267,6 +1277,41 @@ pub struct SessionStartArgs {
     /// attached to the box
     #[arg(long)]
     pub detach: bool,
+    #[command(flatten)]
+    pub overrides: StartOverrideArgs,
+}
+
+// The override flags of `min box start` and `min session start` (BCLI-024,
+// BCLI-073). Each `[network]` flag replaces or adds to the key it names, in
+// the command-line layer that applies last. The egress flags are the ones
+// `min session activate` and `min task run` take, from the same definition.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct StartOverrideArgs {
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        help = START_NETWORK_HELP,
+        long_help = START_NETWORK_LONG_HELP
+    )]
+    pub network: Option<CliNetworkMode>,
+    /// Publish a port of the box: `EXT:INT[/PROTO]`, with PROTO `tcp` or
+    /// `udp` (default `tcp`). Repeatable. Each use adds one port mapping to
+    /// the box's `network.ingress`. Requires `--network own_ip`. A task
+    /// entry does not take it
+    #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
+    pub ingress: Vec<String>,
+    #[command(flatten)]
+    pub egress: EgressArgs,
+    /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
+    /// Repeatable. With any `--loadout`, the client config's
+    /// `[loadouts].default_loadouts` are not applied. A task entry does not
+    /// take it
+    #[arg(long = "loadout", value_name = "NAME")]
+    pub loadout: Vec<String>,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
@@ -1671,6 +1716,34 @@ pub(crate) const TASK_NETWORK_LONG_HELP: &str = concat!(
     task_network_help!(),
     ".\n\n",
     "On a host that runs boxes in a VM, `own_ip` is refused.\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
+
+/// The first paragraph of the `--network` help of `min box start` and `min
+/// session start`, as a literal so that [`START_NETWORK_LONG_HELP`] can
+/// extend it.
+macro_rules! start_network_help {
+    () => {
+        "Network mode for the box: `none` gives the box no network (every socket it opens to a \
+         destination outside itself fails), `host_ip` shares the host's network namespace, and \
+         `own_ip` gives the box its own IP address, so `--ingress` can publish ports. The flag \
+         replaces the entry's `network.mode`. With no flag, a task entry's box takes the \
+         `network.mode` minimal.toml declares for it, else `host_ip`, and a session box is \
+         `host_ip`"
+    };
+}
+
+/// The `--network` short help of `min box start` and `min session start`.
+pub(crate) const START_NETWORK_HELP: &str = start_network_help!();
+
+/// The `--network` long help of `min box start` and `min session start`:
+/// the short help, the VM-host refusal of a task entry, and the legacy
+/// spellings.
+pub(crate) const START_NETWORK_LONG_HELP: &str = concat!(
+    start_network_help!(),
+    ".\n\n",
+    "On a host that runs boxes in a VM, `own_ip` is refused for a task entry.\n\n",
     "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
      prints a one-line hint naming the current spelling."
 );
