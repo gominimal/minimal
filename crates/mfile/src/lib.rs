@@ -985,6 +985,19 @@ pub struct File {
 /// The entry keys that `[session]` and a task keep among their unknown
 /// fields but that a box spec reads (BOX-049), so they are not reported
 /// as unknown.
+///
+/// An entry's `network` table as a whole is readable, but a task box
+/// consumes only its `mode` and `egress`: `task_box_network` builds the
+/// create request's policy from those two alone, so a task that declares
+/// `network.quic443` (or `bep`, `ingress`, …) has that sub-key silently
+/// dropped — `quic443` never reaches the daemon, which resolves the
+/// stance to `auto` without a credentialed upstream and so never blocks.
+/// A sub-key warning cannot live here either: which sub-keys are read
+/// differs per box type, and enumerating them in mfile would duplicate
+/// reader knowledge the minimal crate owns (and fork the treatment of
+/// `[session]` entries, whose `quic443` is read from the typed session
+/// table, from tasks). The projection of a `[network]` table onto a
+/// given box type's settings belongs in the BOX spec, not here.
 const SPEC_READ_ENTRY_KEYS: &[&str] = &["network", "timeout"];
 
 /// An entry's unknown fields, in key order, less the ones a box spec reads.
