@@ -614,7 +614,9 @@ impl BoxManagerHandle {
                 .filter(|(record, _)| {
                     project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
                 })
-                .map(|(record, traits)| box_listing_entry(record, traits.pty, traits.lifetime.clone()))
+                .map(|(record, traits)| {
+                    box_listing_entry(record, traits.pty, traits.lifetime.clone())
+                })
                 .collect();
             boxes.sort_by_key(|entry| entry.box_id);
             tracing::Span::current().record("count", boxes.len());
