@@ -18928,27 +18928,27 @@ mod tests {
         );
         // a cut never lands inside an escape: a value of quotes (two bytes each, escaped) keeps whole pairs,
         // and the token still ends at its own quote before the marker
+        assert!(
+            named.starts_with("\"aaa"),
+            "the cut keeps the name's head: {named:?}"
+        );
         let quotes = "\"".repeat(MAX_LOGGED_WHAT);
-        let named = loggable_what(&quotes);
-        let body = named
+        let quoted = loggable_what(&quotes);
+        let body = quoted
             .strip_suffix(&format!("\"... ({} bytes in all)", quotes.len()))
             .expect("marked");
         assert!(
             body.starts_with('"') && body.len() <= MAX_LOGGED_WHAT,
-            "{named:?}"
+            "{quoted:?}"
         );
         assert!(
             !body.ends_with('\\') || body.ends_with("\\\\"),
-            "no dangling backslash before the closing quote: {named:?}"
+            "no dangling backslash before the closing quote: {quoted:?}"
         );
         assert_eq!(
             (body.len() - 1) % 2,
             0,
-            "whole escape pairs only: {named:?}"
-        );
-        assert!(
-            named.starts_with("\"aaa"),
-            "the cut keeps the name's head: {named:?}"
+            "whole escape pairs only: {quoted:?}"
         );
 
         // A cut inside a multi-byte character lands on its boundary, at every
