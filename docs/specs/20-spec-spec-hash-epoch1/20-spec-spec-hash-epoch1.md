@@ -455,7 +455,7 @@ build-infra operator. Release manager.
   epoch-0 defect catalog issue, minimal#1246
 - Migrating historical epoch-0 artifacts: they stay valid for old pins
   (minimal#1246, decision 4)
-- Wire varint work: minimal#1109, set 2
+- Wire varint work: the decode harness, minimal#3260
 - Normalizing the order of a spec's `build_args`, `outputs` and
   `abstract_deps`: epoch 0 keys on their declared order and so does this
   epoch, whose scope is the nine witness classes. Sorting them by key, as
@@ -466,8 +466,8 @@ build-infra operator. Release manager.
 - Publishing OCI Archives to the Registry Build Cache with their index
   records, Container Provenance and Container SBOM: build-servers#371. This
   spec fixes the container key those records use, and nothing more.
-- The Lean proof of EPOCH-001: minimal#1109, harness set 6. Kani holds the
-  property at T2, and the theorem is an open question below.
+- The Lean proof of EPOCH-001: minimal#3261. Kani holds the property at
+  T2, and the theorem is an open question below.
 - Signing the epoch an index declares: the index's Sigstore bundle covers
   the sealed bytes, and client-side bundle verification is minimal#2736.
 - Gating the signing of release attestations on epoch 1, and retiring
