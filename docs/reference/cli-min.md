@@ -231,6 +231,7 @@ The command refuses these starts before it creates a box:
 |---------|-----------|
 | `ENTRY` names no entry in `minimal.toml` | 4 |
 | `ENTRY` names an entry that is not a session entry | 4 |
+| `ENTRY` names a session entry other than `default`. The command cannot start one by name yet | 2 |
 | Without `ENTRY`: several session entries, and none of them is named `default` | 2 |
 | Without `ENTRY`: no session entry, and an entry of another type is named `default` | 2 |
 | An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |

@@ -471,6 +471,14 @@ pub enum StartEntryRefusal {
         entry: String,
         box_type: Option<String>,
     },
+    /// A typed session entry not named `default`. The box's spec would name
+    /// the entry, but its body still comes from the project's `[session]`
+    /// table, not from the entry (see [`stamp_session_spec_as`]). This
+    /// refusal is an interim.
+    /// <https://github.com/gominimal/minimal/issues/3204> tracks the entry's
+    /// own body. Remove this refusal when the start expands the typed
+    /// entry's body into its spec.
+    NamedSessionUnsupported { verb: StartVerb, entry: String },
 }
 
 impl StartEntryRefusal {
@@ -487,7 +495,8 @@ impl StartEntryRefusal {
             | Self::DefaultBlocked { .. }
             | Self::NameUnsupported { .. }
             | Self::TaskNotInTasks { .. }
-            | Self::UnsupportedType { .. } => 2,
+            | Self::UnsupportedType { .. }
+            | Self::NamedSessionUnsupported { .. } => 2,
         }
     }
 }
@@ -591,6 +600,14 @@ impl std::fmt::Display for StartEntryRefusal {
                  starts session and task entries only.",
                 entry = printable(entry),
                 kind = entry_kind(box_type.as_deref()),
+            ),
+            Self::NamedSessionUnsupported { verb, entry } => write!(
+                f,
+                "Cannot start {entry}. {command} cannot start a session entry by name \
+                 yet, except the entry named \"default\". Rename {entry} to \"default\" \
+                 in {file}, then run {command}.",
+                entry = printable(entry),
+                command = verb.command(),
             ),
         }
     }
@@ -741,6 +758,20 @@ pub(crate) fn plan_start(
         }
     };
     match entry.box_type.as_deref() {
+        // A typed session entry other than `default` would get the body of
+        // the `[session]` table under its own name. That refusal is the
+        // #3204 interim: remove it when the start expands the entry's body.
+        // A bare start that picks the only session entry still starts it,
+        // as BCLI-071 requires.
+        Some(boxes::SESSION_BOX_TYPE)
+            if start.entry.is_some() && entry.name != mfile::entry::DEFAULT_ENTRY_NAME =>
+        {
+            Err(StartEntryRefusal::NamedSessionUnsupported {
+                verb: start.verb,
+                entry: entry.name,
+            }
+            .into())
+        }
         // A session box has a terminal: its spec sets `pty_enabled`
         // (`BoxSpec::for_session`).
         Some(boxes::SESSION_BOX_TYPE) => {
@@ -2561,7 +2592,11 @@ pub(crate) fn stamp_session_spec(
 /// The spec names the typed entry, but its body still comes from the
 /// project's `[session]` table through `BoxSpec::for_session`. The body of
 /// `[sessions.<entry>]` is not applied yet. That is the interim of
-/// gominimal/minimal#3204. Flip it when box creation reads entries
+/// gominimal/minimal#3204, and until then `plan_start` refuses a typed
+/// session entry other than `default`
+/// ([`StartEntryRefusal::NamedSessionUnsupported`]). A bare start of the
+/// only session entry still reaches this function with that entry's name.
+/// Flip it when box creation reads entries
 /// (gominimal/minimal#2418): then expand the typed entry's body into the
 /// spec through BOX-064's layers.
 ///
@@ -4128,6 +4163,10 @@ mod tests {
             StartEntryRefusal::UnsupportedType {
                 entry: bad.clone(),
                 box_type: Some("agent".to_owned()),
+            },
+            StartEntryRefusal::NamedSessionUnsupported {
+                verb: StartVerb::Session,
+                entry: bad.clone(),
             },
         ];
         let mut texts: Vec<String> = refusals.iter().map(ToString::to_string).collect();

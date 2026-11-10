@@ -1165,6 +1165,13 @@ mod tests {
                 },
                 2,
             ),
+            (
+                StartEntryRefusal::NamedSessionUnsupported {
+                    verb: StartVerb::Session,
+                    entry: entry(),
+                },
+                2,
+            ),
         ] {
             let err = anyhow::Error::new(refusal);
             assert_eq!(failure_exit_code(&err), code, "{err:#}");

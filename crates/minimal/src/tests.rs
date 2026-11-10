@@ -2543,37 +2543,96 @@ fn session_start_egress(argv: &[&str], toml: &str) -> anyhow::Result<Option<boxe
     Ok(project_egress(root, options.entry.as_deref())?.policy)
 }
 
-// BCLI-069: a typed session entry starts with its own egress, not with the
-// egress of the `default` entry. With no `default`, a typed entry still
-// starts when every session entry declares egress.
+/// The egress the activation reads for the session entry `entry` of a
+/// project with `toml` as its `minimal.toml`.
+fn entry_egress(toml: &str, entry: &str) -> Option<boxes::EgressPolicy> {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    project_egress(root, Some(entry)).unwrap().policy
+}
+
+// BCLI-069: a session entry starts with its own egress, not with the egress
+// of the `default` entry. A typed session entry other than `default` is
+// refused until gominimal/minimal#3204 gives the box that entry's body, so
+// the activation's egress lookup of a named entry is checked directly.
 #[test]
 fn session_start_typed_entry_reads_its_own_egress() {
     let with_default = "[sessions.default]\n\
                         [sessions.default.network.egress]\n\
                         allow_dns_hosts = [\"example.com\"]\n\n\
                         [sessions.ci]\n";
-    let ci =
-        session_start_egress(&["min", "session", "start", "ci"], with_default).expect("ci starts");
+    let ci = entry_egress(with_default, "ci");
     assert!(
         !format!("{ci:?}").contains("example.com"),
         "ci gets the egress of default: {ci:?}"
     );
-    let default = session_start_egress(&["min", "session", "start"], with_default)
-        .expect("default starts")
-        .expect("default declares egress");
-    assert_eq!(
-        default.allow_dns_hosts,
-        Some(vec!["example.com".to_owned()])
-    );
+    for argv in [
+        &["min", "session", "start"][..],
+        &["min", "session", "start", "default"][..],
+    ] {
+        let default = session_start_egress(argv, with_default)
+            .expect("default starts")
+            .expect("default declares egress");
+        assert_eq!(
+            default.allow_dns_hosts,
+            Some(vec!["example.com".to_owned()])
+        );
+    }
 
     let no_default = "[sessions.a.network.egress]\n\
                       allow_dns_hosts = [\"a.example\"]\n\n\
                       [sessions.b.network.egress]\n\
                       allow_dns_hosts = [\"b.example\"]\n";
-    let a = session_start_egress(&["min", "session", "start", "a"], no_default)
-        .expect("a typed entry needs no default")
+    let a = entry_egress(no_default, "a").expect("a declares egress");
+    assert_eq!(a.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
+
+    // The only session entry, picked by a bare start, reads its own egress.
+    let sole = "[sessions.a.network.egress]\nallow_dns_hosts = [\"a.example\"]\n";
+    let a = session_start_egress(&["min", "session", "start"], sole)
+        .expect("the only session entry starts")
         .expect("a declares egress");
     assert_eq!(a.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
+}
+
+// BCLI-069: until gominimal/minimal#3204, both verbs refuse a typed session
+// entry other than `default` with exit 2, before anything is created. A
+// typed `default` and a bare start of the only session entry still start.
+#[test]
+fn start_typed_session_entry_other_than_default_exit2_until_its_body_applies() {
+    let entries = start_entries("[sessions.default]\n[sessions.ci]\n");
+    for verb in [StartVerb::Session, StartVerb::Box] {
+        let error = plan_start(&typed_start(verb, Some("ci")), &entries, true)
+            .expect_err("a typed session entry other than default is refused");
+        let refusal = error
+            .downcast_ref::<StartEntryRefusal>()
+            .expect("a start refusal");
+        assert_eq!(
+            refusal,
+            &StartEntryRefusal::NamedSessionUnsupported {
+                verb,
+                entry: "ci".into()
+            }
+        );
+        assert_eq!(refusal.exit_code(), 2);
+        assert!(matches!(
+            plan_start(&typed_start(verb, Some("default")), &entries, true),
+            Ok(StartPlan::Session { ref entry, .. }) if entry == "default"
+        ));
+    }
+    assert_eq!(
+        plan_start(&typed_start(StartVerb::Session, Some("ci")), &entries, true)
+            .unwrap_err()
+            .to_string(),
+        "Cannot start ci. min session start cannot start a session entry by name yet, \
+         except the entry named \"default\". Rename ci to \"default\" in minimal.toml, \
+         then run min session start."
+    );
+    let entries = start_entries("[boxes.dev]\ntype = \"session\"\n");
+    assert!(matches!(
+        plan_start(&typed_start(StartVerb::Session, None), &entries, true),
+        Ok(StartPlan::Session { ref entry, .. }) if entry == "dev"
+    ));
 }
 
 // BCLI-069: a start without `--new` whose name a running box holds exits
@@ -2738,6 +2797,17 @@ fn session_start_without_entry_blocked_default_exit2_names_fix() {
             .name,
         "default"
     );
+    // The whole plan of each start, not only its pick: `min session start`
+    // and `min box start` start the explicit `default` session entry.
+    for verb in [StartVerb::Session, StartVerb::Box] {
+        assert!(
+            matches!(
+                plan_start(&typed_start(verb, None), &entries, true),
+                Ok(StartPlan::Session { ref entry, .. }) if entry == "default"
+            ),
+            "{verb:?}"
+        );
+    }
     let entries = start_entries("[tasks.build]\necho = 'x'\n\n[boxes.dev]\ntype = \"mydev\"\n");
     assert_eq!(
         pick_box_start_entry(&entries, Some("build"))
@@ -2745,6 +2815,11 @@ fn session_start_without_entry_blocked_default_exit2_names_fix() {
             .name,
         "build"
     );
+    // `min box start build` plans the task's detached run.
+    assert!(matches!(
+        plan_start(&typed_start(StartVerb::Box, Some("build")), &entries, false),
+        Ok(StartPlan::Detached { ref entry, .. }) if entry == "build"
+    ));
     // A typed name that names no project entry is unknown, exit 4.
     let error = pick_session_start_entry(&entries, Some("nope")).expect_err("no such entry");
     let refusal = error
