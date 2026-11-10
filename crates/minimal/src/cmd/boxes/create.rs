@@ -2864,6 +2864,57 @@ pub(crate) fn subnet_notices(args: &crate::EgressArgs) -> Vec<String> {
     lines
 }
 
+/// The `--ingress` mappings and the egress flags of an activation, parsed
+/// (BCLI-024). Each flag overrides only its own key of the entry's
+/// `[network]` table.
+///
+/// # Errors
+///
+/// Fails when an `--ingress` mapping or an egress flag does not parse.
+pub(crate) fn flag_network_overrides(
+    args: &ActivateArgs,
+) -> Result<(Vec<boxes::PortMapping>, Option<boxes::EgressPolicy>), anyhow::Error> {
+    let mut port_mappings = Vec::with_capacity(args.ingress.len());
+    for spec in &args.ingress {
+        port_mappings.push(parse_ingress_mapping(spec)?);
+    }
+    let egress = flag_egress(&args.egress)?;
+    Ok((port_mappings, egress))
+}
+
+/// The egress and ingress half of an activation's create policy: the
+/// effective `egress` and the parsed `--ingress` mappings (BCLI-024). The
+/// other fields keep their defaults, for the caller to set.
+///
+/// NET-043: any dynamic declaration makes the ingress policy too. A stance
+/// alone (with no range, no static mapping) still names how dynamic
+/// requests are decided. Nothing set keeps `None`: the deny-all default,
+/// which the policy module evaluates the same as an explicit deny.
+pub(crate) fn network_override_policy(
+    args: &ActivateArgs,
+    port_mappings: Vec<boxes::PortMapping>,
+    egress: Option<boxes::EgressPolicy>,
+) -> boxes::BoxPolicy {
+    let has_ingress =
+        !port_mappings.is_empty() || args.dynamic_ingress.is_some() || args.dynamic_range.is_some();
+    boxes::BoxPolicy {
+        egress,
+        ingress: has_ingress.then_some(boxes::IngressPolicy {
+            port_mappings,
+            dynamic_allowed_range: args.dynamic_range,
+            dynamic_ingress: args.dynamic_ingress,
+        }),
+        ..boxes::BoxPolicy::default()
+    }
+}
+
+/// The loadouts an activation resolves (BCLI-073): each `--loadout` in
+/// place of the client config's `default_loadouts`, or none under
+/// `--no-loadouts`.
+pub(crate) fn start_loadout_selection(args: &ActivateArgs) -> loadouts::LoadoutSelection {
+    loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts)
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -2901,26 +2952,12 @@ pub(crate) async fn activate_box(
             let abs_path =
                 paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-            let mut port_mappings = Vec::with_capacity(args.ingress.len());
-            for spec in &args.ingress {
-                let mapping = parse_ingress_mapping(spec)?;
-                port_mappings.push(mapping);
-            }
-            let egress = flag_egress(&args.egress)?;
+            let (port_mappings, egress) = flag_network_overrides(&args)?;
             Ok::<_, anyhow::Error>((utf8_path, abs_path, port_mappings, egress))
         })
         .await?;
-    // NET-043: any dynamic declaration makes the ingress policy too — a
-    // stance alone (with no range, no static mapping) still names how
-    // dynamic requests are decided, and a range without a stance cannot
-    // reach the create (the flag requires its mode). Nothing set keeps
-    // `None`: the deny-all default, which the policy module evaluates the
-    // same as an explicit deny.
     let (policy, github_grants, store_grants) = ActivationStep::CheckProject
         .run(async {
-            let has_ingress = !port_mappings.is_empty()
-                || args.dynamic_ingress.is_some()
-                || args.dynamic_range.is_some();
             let (project_bep, project_secrets, project_env, project_quic443) =
                 project_bep_and_grants(&utf8_path)?;
             // NET-060: the project's egress, with each field a flag names
@@ -2945,12 +2982,6 @@ pub(crate) async fn activate_box(
                 "the create request's effective egress"
             );
             let mut policy = boxes::BoxPolicy {
-                egress: egress.policy,
-                ingress: has_ingress.then_some(boxes::IngressPolicy {
-                    port_mappings,
-                    dynamic_allowed_range: args.dynamic_range,
-                    dynamic_ingress: args.dynamic_ingress,
-                }),
                 // NET-134: the lane is the box's own declaration, never a default —
                 // a box that did not ask for a credentialed upstream keeps every
                 // frame it sends to the proxy's address refused at the host-side
@@ -2964,6 +2995,7 @@ pub(crate) async fn activate_box(
                 // or not, so a declared `block` reaches the gate of a box with
                 // no credentialed upstream.
                 quic443: project_quic443,
+                ..network_override_policy(&args, port_mappings, egress.policy)
             };
 
             // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
@@ -3088,7 +3120,7 @@ pub(crate) async fn activate_box(
             // sizes the finalize hook budget, so `min session activate`,
             // `min task run`, and the dashboard share it.
             let policy_path = config::user_policy_path(global);
-            let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
+            let selection = start_loadout_selection(&args);
             // The project root the upload will carry, so the project's own
             // hooks are checked and its `[session]` timeouts size the finalize
             // budget; a subdirectory invocation must not look empty.

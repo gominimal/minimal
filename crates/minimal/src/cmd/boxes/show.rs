@@ -37,26 +37,45 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
     };
     if args.network {
         // BCLI-025: the network section the box was created with.
-        let record = stored_box_record(&mut client, id)
-            .await
-            .inspect_err(|error| {
-                tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "error", "{error}");
-            })?
-            .ok_or_else(|| {
-                // The box was removed after the address resolved.
-                tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "not found");
-                BoxAddressRefusal::NotFound {
-                    address: args.target.clone(),
-                }
-            })?;
+        let mut section = Vec::new();
+        show_stored_network(&mut section, &mut client, id, &args.target).await?;
         tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "ok", host = %host.host);
-        let mut out = std::io::stdout().lock();
-        return write_stored_network(&mut out, record.network, &record.policy);
+        std::io::Write::write_all(&mut std::io::stdout().lock(), &section)?;
+        return Ok(());
     }
     tracing::info!(verb = "box show", box_id = %id, outcome = "ok", host = %host.host);
     let mut out = std::io::stdout().lock();
     render_box_show(&mut out, &shown, host.provider, &host.host)?;
     Ok(())
+}
+
+/// Writes the `[network]` section that box `id` stores on the host `client`
+/// talks to (BCLI-025), overrides included. `target` is the address the
+/// caller gave, for the refusal when the host has no such box.
+///
+/// # Errors
+///
+/// Fails when the record cannot be read, the host has no box `id`, or
+/// `out` fails.
+pub(crate) async fn show_stored_network(
+    out: &mut impl std::io::Write,
+    client: &mut client::Client,
+    id: boxes::SessionId,
+    target: &str,
+) -> Result<(), anyhow::Error> {
+    let record = stored_box_record(client, id)
+        .await
+        .inspect_err(|error| {
+            tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "error", "{error}");
+        })?
+        .ok_or_else(|| {
+            // The box was removed after the address resolved.
+            tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "not found");
+            BoxAddressRefusal::NotFound {
+                address: target.to_owned(),
+            }
+        })?;
+    write_stored_network(out, record.network, &record.policy)
 }
 
 /// The record box `id` has on the host `client` talks to, with the network

@@ -13057,30 +13057,17 @@ type PlannedRequest = minimald_rpc::CreateSessionRequest;
 
 /// The create request that the activation of a planned session start
 /// sends for the project in `root`: the network mode, the ingress and the
-/// effective egress, built the way `activate_box` builds them, and the
+/// effective egress, built by the functions `activate_box` calls, and the
 /// spec stamped on it. The request is built with its constructor.
 fn planned_session_request(
     args: &ActivateArgs,
     options: &ActivationOptions,
     root: &camino::Utf8Path,
 ) -> PlannedRequest {
-    let port_mappings: Vec<boxes::PortMapping> = args
-        .ingress
-        .iter()
-        .map(|spec| parse_ingress_mapping(spec).expect("the mapping parses"))
-        .collect();
-    let flags = flag_egress(&args.egress).expect("the egress flags parse");
+    let (port_mappings, flags) = flag_network_overrides(args).expect("the flags parse");
     let project = project_egress(root, options.entry.as_deref()).expect("the project loads");
     let egress = effective_egress(project.policy, flags, args.egress.deny_all_egress);
-    let policy = boxes::BoxPolicy {
-        egress: egress.policy,
-        ingress: (!port_mappings.is_empty()).then_some(boxes::IngressPolicy {
-            port_mappings,
-            dynamic_allowed_range: None,
-            dynamic_ingress: None,
-        }),
-        ..boxes::BoxPolicy::default()
-    };
+    let policy = network_override_policy(args, port_mappings, egress.policy);
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
@@ -13206,18 +13193,10 @@ async fn network_flags_override_stored_spec_and_projection() {
     let egress = request.config.policy.egress.clone().unwrap();
     assert_eq!(egress.allow_dns_hosts, Some(vec![]));
 
-    // The activation builds its request from these arguments.
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
-    let body = function_body(&text, "activate_box").expect("create.rs defines activate_box");
-    for step in [
-        "for spec in &args.ingress {",
-        "flag_egress(&args.egress)",
-        "effective_egress(project_egress.policy, egress, args.egress.deny_all_egress)",
-        "let network: boxes::NetworkMode = args.network.into();",
-    ] {
-        assert!(body.contains(step), "activate_box does not do {step}");
-    }
+    // A mapping that does not parse fails the activation's flag step.
+    let mut args = args;
+    args.ingress = vec!["not-a-port".to_owned()];
+    assert!(flag_network_overrides(&args).is_err());
 
     // A task entry's box takes `--network` and the egress flags through
     // the run path, as `min box run` does.
@@ -13266,7 +13245,7 @@ fn start_loadout_flag_selects_loadouts_layer() {
         };
         assert_eq!(args.loadout, vec!["rust".to_owned(), "ai".to_owned()]);
         assert_eq!(
-            loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts),
+            start_loadout_selection(&args),
             loadouts::LoadoutSelection::Cli(vec!["rust".to_owned(), "ai".to_owned()]),
             "{verb}"
         );
@@ -13278,16 +13257,10 @@ fn start_loadout_flag_selects_loadouts_layer() {
             panic!("{verb}: the implicit default entry is a session");
         };
         assert_eq!(
-            loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts),
+            start_loadout_selection(&args),
             loadouts::LoadoutSelection::Defaults
         );
     }
-
-    // The activation resolves the loadouts it was given.
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
-    let body = function_body(&text, "activate_box").expect("create.rs defines activate_box");
-    assert!(body.contains("LoadoutSelection::from_flags(&args.loadout, args.no_loadouts)"));
 
     // The run path takes no `--loadout`, so a task entry's start refuses
     // it with exit 2 before it creates anything.
@@ -13336,12 +13309,12 @@ async fn box_show_network_renders_effective() {
     };
 
     let mut client = connect_daemon(&global).await.expect("the daemon answers");
-    let record = stored_box_record(&mut client, id)
-        .await
-        .expect("the record is read")
-        .expect("the box has a record");
+    // `min box show --network` reads the record from the daemon and
+    // writes its network section.
     let mut out = Vec::new();
-    write_stored_network(&mut out, record.network, &record.policy).unwrap();
+    show_stored_network(&mut out, &mut client, id, "web")
+        .await
+        .expect("the section is shown");
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text,
@@ -13382,17 +13355,18 @@ async fn box_show_network_renders_effective() {
         "[network]\nmode = \"none\"\n"
     );
 
-    // `min box show --network` prints that section, from the same record.
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/show.rs")).unwrap();
-    let body = function_body(&text, "cmd_box_show").expect("show.rs defines cmd_box_show");
-    for step in [
-        "if args.network {",
-        "stored_box_record(&mut client, id)",
-        "write_stored_network(&mut out, record.network, &record.policy)",
-    ] {
-        assert!(body.contains(step), "cmd_box_show does not do {step}");
-    }
+    // A box the host does not have prints nothing and fails.
+    let mut out = Vec::new();
+    show_stored_network(
+        &mut out,
+        &mut client,
+        boxes::SessionId::from_bytes([7; 16]),
+        "gone",
+    )
+    .await
+    .expect_err("the host has no such box");
+    assert!(out.is_empty());
+
     assert!(
         Cli::try_parse_from(["min", "box", "show", "web", "--network"]).is_ok(),
         "min box show takes --network"
