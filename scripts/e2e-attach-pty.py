@@ -308,7 +308,7 @@ try:
         quiet = 0 if chunk else quiet + 1
         # With a ready marker, nothing is quiet until the shell printed it:
         # the stream has not started, only paused, while the sandbox mints.
-        if READY_BYTES is not None and READY_BYTES not in bytes(buf):
+        if READY_BYTES is not None and READY_BYTES not in buf:
             quiet = 0
         if not staged and quiet >= 2:
             second_stage()
