@@ -201,7 +201,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- event-driven; BOX-180: up to and including the entry, the most specific layer that sets a name wins, and each selected loadout adds the names it sets -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_merged_vars_once_with_layer
-  - WHERE a selected loadout sets a variable's value THE SYSTEM SHALL withhold that value. The render SHALL tell the person that the variable is set by that loadout, named, and that its value is withheld. It SHALL never render the loadout's literal value in clear, and it SHALL name no issue. A value that the project's layers or the entry set SHALL keep the rendering of BCLI-077.
+  - WHERE a selected loadout sets a variable's value THE SYSTEM SHALL withhold that value. The render SHALL tell the person which loadout sets the variable, and that its value is withheld. It SHALL never render the loadout's literal value in clear, and it SHALL name no issue. A value that the project's layers or the entry set SHALL keep the rendering of BCLI-077.
     <!-- optional-feature; fails closed: nothing marks a loadout literal as a secret yet, and gominimal/minimal#3210 decides how one is stored and marked, so BCLI-063 holds with no exception (Open questions) -->
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_withholds_loadout_set_var_values
