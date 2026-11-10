@@ -3502,10 +3502,9 @@ pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
 }
 
 /// Whether this process is among the members of its daemon leaf's
-/// `cgroup.procs`, read once. `Err` is a leaf that is not there or whose
-/// members could not be read, which says nothing about where this daemon
-/// stands, so callers keep it apart from `Ok(false)`, a leaf read whole
-/// without this process in it.
+/// `cgroup.procs`, read once. `Err` is a leaf that is not there
+/// (`NotFound`) or one whose members could not be read; [`unplaced_over`]
+/// keeps the two apart.
 pub fn daemon_in_leaf(root: &Path) -> std::io::Result<bool> {
     let members = std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE))?;
     Ok(members
@@ -3513,13 +3512,33 @@ pub fn daemon_in_leaf(root: &Path) -> std::io::Result<bool> {
         .any(|member| member.trim().parse::<u32>() == Ok(std::process::id())))
 }
 
-/// Whether one read of the daemon leaf ([`daemon_in_leaf`]) says this
-/// daemon stands outside it: only a leaf read whole without this process
-/// does. A tree without the leaf is the step not installed, its own cause,
-/// and a leaf whose members could not be read proves no placement either
-/// way, so neither reads as unplaced: the decision keeps the cause it read.
+/// Whether one read of the daemon leaf ([`daemon_in_leaf`]) counts this
+/// daemon as standing outside it. A leaf read whole without this process
+/// does. A tree without the leaf (`NotFound`) is the step not installed,
+/// its own cause, so it does not.
+///
+/// A leaf whose members could not be read proves no placement, and it
+/// counts as unplaced on purpose. The cause it re-spells is an unreadable
+/// probe, and the box that follows either runs unenforced (not placed) or
+/// is refused at launch (placed). Saying the box can still reach the
+/// network is wrong only in the second case, where the box is refused
+/// anyway. Keeping the probe's "refuses to start the box" would be wrong in
+/// the first, claiming a refusal for a box that has the network
+/// (gominimal/minimal#3240). The read error is logged.
 pub fn unplaced_over(in_leaf: &std::io::Result<bool>) -> bool {
-    matches!(in_leaf, Ok(false))
+    match in_leaf {
+        Ok(in_leaf) => !in_leaf,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "reading this daemon's classifier leaf membership failed, so \
+                 it counts as unplaced: its host-address boxes are said to run \
+                 unenforced"
+            );
+            true
+        }
+    }
 }
 
 /// Whether this daemon stands outside a daemon leaf the step installed,
@@ -10207,13 +10226,19 @@ mod tests {
         )
         .expect("this process as a member");
         assert!(!daemon_unplaced(tree.path()), "a leaf this process is in");
-        // A leaf whose members cannot be read proves no placement, so it
-        // does not read as unplaced.
+        // A leaf whose members cannot be read proves no placement, and it
+        // counts as unplaced, so the advisory never claims a refusal for a
+        // box that may run unenforced.
         std::fs::remove_file(leaf.join(PROCS_FILE)).expect("drop the members file");
         std::fs::create_dir(leaf.join(PROCS_FILE)).expect("an unreadable members file");
-        assert!(daemon_in_leaf(tree.path()).is_err());
+        let read = daemon_in_leaf(tree.path());
         assert!(
-            !daemon_unplaced(tree.path()),
+            read.as_ref()
+                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound),
+            "{read:?}"
+        );
+        assert!(
+            daemon_unplaced(tree.path()),
             "a leaf whose members cannot be read"
         );
     }
