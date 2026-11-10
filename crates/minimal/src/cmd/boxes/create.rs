@@ -94,6 +94,9 @@ pub struct ProjectFileInvalid {
 
 impl std::fmt::Display for ProjectFileInvalid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cause is in this text and `source()` returns none, so `{}`
+        // and the printer's `{:#}` each show it once. The mfile error's own
+        // cause (the io error of `Error::IO`) is in its Display already.
         write!(
             f,
             "Cannot start the box: the project's {name} does not load: {error}",
@@ -103,11 +106,7 @@ impl std::fmt::Display for ProjectFileInvalid {
     }
 }
 
-impl std::error::Error for ProjectFileInvalid {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
+impl std::error::Error for ProjectFileInvalid {}
 
 /// The session entry of the project's `minimal.toml` that egress is read from
 /// (NET-060): `[sessions.default]`, or `[boxes.default]` with
