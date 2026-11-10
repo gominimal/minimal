@@ -3323,6 +3323,7 @@ async fn show_returns_record_state_identity_and_live_execs() {
             signal: None,
             // A session filed with no spec has a terminal.
             pty_enabled: true,
+            lifetime: None,
         }
     );
     assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
@@ -3440,6 +3441,59 @@ async fn box_listing_and_show_carry_pty_enabled() {
             .unwrap()
             .expect("the box is retained");
         assert_eq!(shown.record.pty_enabled, pty, "read: {:?}", shown.record);
+        assert_eq!(&shown.record, listed, "the read and the listing agree");
+    }
+}
+
+/// BCLI-009: the listing and the read carry the `lifetime` the box's
+/// stored spec sets, so a client can choose its hint by it. A spec that
+/// sets no lifetime, and a box filed with no spec, carry none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_and_list_replies_carry_lifetime() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = |lifetime: Option<&str>| match lifetime {
+        Some(lifetime) => serde_json_lenient::json!({
+            "v": 1,
+            "io": {"pty_enabled": false},
+            "box": {"lifetime": lifetime},
+        }),
+        None => serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": false}}),
+    };
+    let mut boxes = Vec::new();
+    for (name, lifetime) in [
+        ("agent", Some("until_stopped")),
+        ("job", Some("until_exit")),
+        ("plain", None),
+    ] {
+        let id = mngr
+            .create_box_with_spec(
+                rooted_config(name, "/home/dev/proj"),
+                Some(spec(lifetime)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        boxes.push((id, lifetime));
+    }
+    let unspecced = mngr
+        .create_session(rooted_config("unspecced", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    boxes.push((unspecced, None));
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    for (id, lifetime) in boxes {
+        let listed = listing
+            .iter()
+            .find(|entry| entry.box_id == id)
+            .unwrap_or_else(|| panic!("the listing holds {id}"));
+        assert_eq!(listed.lifetime.as_deref(), lifetime, "listing: {listed:?}");
+        let shown = mngr
+            .show_box(id)
+            .await
+            .unwrap()
+            .expect("the box is retained");
         assert_eq!(&shown.record, listed, "the read and the listing agree");
     }
 }

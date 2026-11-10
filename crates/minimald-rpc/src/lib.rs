@@ -2900,6 +2900,12 @@ pub struct BoxListingEntry {
     /// sends none, and the box reads as one with no terminal.
     #[serde(default)]
     pub pty_enabled: bool,
+    /// The `lifetime` the box's stored spec sets, such as `until_stopped`,
+    /// so a client can name the command that starts the box again
+    /// (BCLI-009). `None` for a spec that sets none, a box filed with no
+    /// spec, and a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
 }
 
 /// The response for a [`ListBoxes`] RPC.

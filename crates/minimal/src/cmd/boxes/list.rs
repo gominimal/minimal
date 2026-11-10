@@ -330,6 +330,7 @@ mod tests {
             exit_code: None,
             signal: None,
             pty_enabled: true,
+            lifetime: None,
         }
     }
 
