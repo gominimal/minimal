@@ -459,6 +459,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
+            // A test's request, sent only to the in-process test daemon,
+            // which is this build: it checks the start's override flags.
+            "tests.rs::planned_session_request = asserts nothing",
             // A unit test's request, never sent: it checks the fresh instance.
             "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
         ]
