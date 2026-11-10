@@ -108,7 +108,11 @@ impl RemoteStorage {
         // (`ConnectingTcpRemote::new`, hyper-util 0.1.20). The connector
         // carries no unused time forward, so an address after one that
         // refused at once still gets only its even share.
-        let client = reqwest::Client::builder().connect_timeout(bound).build()?;
+        // The client says who it is (inbox#1218): ftp.gnu.org answers a request
+        // without a `User-Agent` 403.
+        let client = crate::fetchers::web_client_builder()
+            .connect_timeout(bound)
+            .build()?;
         let backend = (&client, &self.cache);
         backend
             .download(ReqwestUrl::try_from(url)?, sha256, op)
@@ -353,7 +357,7 @@ pub async fn fetch_to_file(url: &str, sha256: &str, out: &Path) -> Result<()> {
 
 /// The client of a build box's fetch, whose connections open within `bound`.
 fn fetch_client(bound: std::time::Duration) -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    Ok(crate::fetchers::web_client_builder()
         .connect_timeout(bound)
         .read_timeout(FETCH_READ_TIMEOUT)
         .build()?)
@@ -446,6 +450,64 @@ async fn fetch_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `body` to one HTTP request on a loopback port, and hands back
+    /// the head of that request.
+    async fn serve_once(
+        body: &'static [u8],
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = conn.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "the request head ends");
+                head.extend_from_slice(&buf[..n]);
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            conn.write_all(reply.as_bytes()).await.unwrap();
+            conn.write_all(body).await.unwrap();
+            String::from_utf8_lossy(&head).to_string()
+        });
+        (addr, served)
+    }
+
+    /// inbox#1218: a web source fetch says who it is. ftp.gnu.org answers a
+    /// request without a `User-Agent` 403, so a GNU tarball could not build.
+    #[tokio::test]
+    async fn a_web_source_fetch_sends_the_user_agent() {
+        use sha2::Digest;
+        let body: &'static [u8] = b"the source archive";
+        let sha = hex::encode(sha2::Sha256::digest(body));
+        let (addr, served) = serve_once(body).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
+            .await
+            .unwrap();
+        let url = format!("http://{addr}/pkg-1.0.tar.gz");
+
+        let fetched = storage
+            .download_web_with_verification_and_caching(&url, &sha, &OpTracker::new_root())
+            .await
+            .expect("the download succeeds");
+        assert_eq!(std::fs::read(&fetched).unwrap(), body);
+
+        let head = served.await.unwrap().to_ascii_lowercase();
+        let agent = format!(
+            "\r\nuser-agent: {}\r\n",
+            crate::fetchers::user_agent().to_ascii_lowercase()
+        );
+        assert!(head.contains(&agent), "{agent:?} in {head}");
+    }
 
     /// NET-155: a `gs://` source is the public object at
     /// `storage.googleapis.com`, under the cache name the client's read

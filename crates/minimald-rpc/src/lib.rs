@@ -973,6 +973,37 @@ pub struct WithdrawBoxRequest {
     pub box_id: Option<BoxId>,
 }
 
+/// A renamed session's request that the VM host daemon move its box to
+/// the new name ([`BoxControlRequest::RenameBox`], #1116). A rename is a
+/// session RPC to the in-VM daemon; the host keeps the box's row, its
+/// creation and its published address under the name the box was
+/// registered by until its creator says otherwise. This is that word: the
+/// host re-keys the row and its creation to `new_name`, so the new name
+/// answers the box's address and the old one answers nothing.
+///
+/// The pair and the box id prove the creator, as a withdrawal's do
+/// ([`WithdrawBoxRequest`]); the id is required, because a rename is the
+/// one verb where the name the row is under is not the name the client
+/// holds. A row at the pair under another id is another box's, and the
+/// rename is refused with [`BoxControlReply::Error`]; so is a new name
+/// another box's row holds. A pair the host holds nothing for (no row, no
+/// creation of the id) is answered as the echo: there is nothing to move.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenameBoxRequest {
+    /// The name the session had before the rename, for the host's log
+    /// line. The host finds the box by the id, never by this.
+    pub name: String,
+    /// The session's name now: the name the row moves to.
+    pub new_name: String,
+    /// The switch address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The loopback address the registration handed back.
+    pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the registration handed back.
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
+}
+
 /// A creator's request for its box's row back
 /// ([`BoxControlRequest::ResumeBox`], NET-138): the session that registered
 /// the box presenting the pair — and the id, when it holds one — the
@@ -1682,6 +1713,12 @@ pub enum BoxControlRequest {
     /// Withdraw the row a registration filled: the destroyed or failed
     /// session's creator presenting the pair the registration handed back.
     Withdraw(WithdrawBoxRequest),
+    /// Move a renamed session's box row to its new name
+    /// ([`RenameBoxRequest`], #1116): the creator presenting the pair and
+    /// the box id its registration handed back. Served on the host's
+    /// control socket only, answered with [`BoxControlReply::Addresses`]
+    /// echoing the pair.
+    RenameBox(RenameBoxRequest),
     /// Read the machine's zone-answerer status (see [`ZoneAnswererStatus`])
     /// — the read-only verb: no row is touched, no state changes, the reply
     /// is the status the answerer's acquisition last left.
@@ -3068,7 +3105,7 @@ pub struct BoxListingEntry {
     pub build_boxes: Vec<RunningBuildBox>,
 }
 
-/// A build box running for a box (NET-171). It keeps no record (BOX-167), so
+/// A build box running for a box (NET-171). It keeps no record (BOX-186), so
 /// a client sees it only here, while it runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunningBuildBox {
@@ -4447,3 +4484,31 @@ mod mint_box_id_tests {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod rename_box_tests {
+    use super::*;
+
+    /// #1116: the host-side rename verb survives the wire under its own
+    /// tag, and a request without the box id is no rename: the id is the
+    /// proof, so a line that lacks it does not decode.
+    #[test]
+    fn rename_box_request_round_trips_and_requires_the_box_id() {
+        let request = BoxControlRequest::RenameBox(RenameBoxRequest {
+            name: "web".to_string(),
+            new_name: "front".to_string(),
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 7),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 3),
+            box_id: BoxId::mint(),
+        });
+        let line = serde_json_lenient::to_string(&request).unwrap();
+        assert!(line.contains(r#""verb":"rename_box""#), "{line}");
+        let back: BoxControlRequest = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(back, request);
+
+        let without_id = r#"{"verb":"rename_box","name":"web","new_name":"front",
+            "switch_address":"100.64.0.7","loopback_address":"127.0.64.3"}"#;
+        serde_json_lenient::from_str::<BoxControlRequest>(without_id)
+            .expect_err("a rename without the box id is refused at the parse");
+    }
+}

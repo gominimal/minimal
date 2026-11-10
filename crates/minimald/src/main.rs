@@ -1451,8 +1451,29 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // The placement is read once, for both the fact and the log lines: the
     // placement unit answers asynchronously, so two reads could disagree.
     let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
-    let placed = minimald::net::classifier::daemon_fetch_leaf(tree_root).is_some();
-    let unplaced = daemon_leaf.is_dir() && !placed;
+    let in_leaf = minimald::net::classifier::daemon_in_leaf(tree_root);
+    // A membership read that failed for another reason than a missing leaf
+    // proves neither placement nor absence: it gets its own line, and never
+    // the absence line below.
+    let membership_unknown = matches!(
+        &in_leaf,
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound
+    );
+    if !guest
+        && let Err(e) = &in_leaf
+        && membership_unknown
+    {
+        tracing::warn!(
+            error = %e,
+            leaf = %daemon_leaf.display(),
+            "reading this daemon's classifier leaf membership failed, so whether \
+             it stands in its leaf is unknown. It counts as unplaced: a probe that \
+             cannot read the table is then reported as the daemon's placement, \
+             and a placed deny-all box is still refused"
+        );
+    }
+    let placed = matches!(in_leaf, Ok(true));
+    let unplaced = minimald::net::classifier::unplaced_over(&in_leaf);
     // An unreadable probe read by a daemon outside its own leaf is that
     // daemon's placement, not the table's: it places no box, so it refuses
     // none, and its fact says so (gominimal/minimal#3067).
@@ -1470,7 +1491,15 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // tree is installed is its own state, with its own remedy, so it gets
     // its own line beside the probe's: the probe reads it only as a table
     // whose effect could not be read.
-    if !guest && unplaced {
+    // A host without the step has no leaf to miss, and its own cause says
+    // so; the line is for a daemon outside an installed tree's leaf.
+    if !guest
+        && unplaced
+        && !membership_unknown
+        && (daemon_leaf.is_dir()
+            || classifier_decision.cause()
+                == Some(minimald::net::classifier::Cause::DaemonNotPlaced))
+    {
         tracing::warn!(
             leaf = %daemon_leaf.display(),
             daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),

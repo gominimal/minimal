@@ -459,6 +459,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
+            // A test's request, sent only to the in-process test daemon,
+            // which is this build: it checks the start's override flags.
+            "tests.rs::planned_session_request = asserts nothing",
             // A unit test's request, never sent: it checks the fresh instance.
             "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
         ]
@@ -2288,6 +2291,7 @@ fn typed_start(verb: StartVerb, entry: Option<&str>) -> StartEntry {
         name: None,
         new: false,
         detach: false,
+        overrides: StartOverrideArgs::default(),
     }
 }
 
@@ -2423,6 +2427,7 @@ async fn start_off_tty_exit2_names_detach() {
                 name: None,
                 new: false,
                 detach: false,
+                overrides: StartOverrideArgs::default(),
             },
         )
         .await
@@ -2436,6 +2441,7 @@ async fn start_off_tty_exit2_names_detach() {
                 name: None,
                 new: false,
                 detach: false,
+                overrides: StartOverrideArgs::default(),
             },
         )
         .await
@@ -11083,8 +11089,14 @@ fn exec_failure_code(error: &anyhow::Error) -> u8 {
     if let Some(refusal) = error.downcast_ref::<BoxExecRefusal>() {
         return refusal.exit_code();
     }
+    if let Some(refusal) = error.downcast_ref::<BoxExecIdRefusal>() {
+        return refusal.exit_code();
+    }
     if error.downcast_ref::<BoxExecTimedOut>().is_some() {
         return BoxExecTimedOut::EXIT_CODE;
+    }
+    if error.downcast_ref::<BoxTimedOut>().is_some() {
+        return BoxTimedOut::EXIT_CODE;
     }
     if let Some(refusal) = error.downcast_ref::<BoxAddressRefusal>() {
         return refusal.exit_code();
@@ -12765,7 +12777,10 @@ async fn type_noun_logs_follow() {
             })) => (args, Some(boxes::TASK_BOX_TYPE), "task logs"),
             Some(Command::Box(BoxArgs {
                 command: BoxCommand::Logs(args),
-            })) => (args, None, "box logs"),
+            })) => {
+                assert!(args.exec.is_none(), "no `--exec`");
+                (args.logs, None, "box logs")
+            }
             _ => panic!("expected `min {noun} logs`"),
         };
         assert_eq!(args.target, target);
@@ -13006,6 +13021,810 @@ async fn task_list_shows_exited_until_pruned() {
     assert_eq!(
         list(None).await,
         format!("{}\n", crate::cmd::EMPTY_HOST_LIST)
+    );
+}
+
+/// The start `argv` types, as `min box start` or `min session start`.
+fn parsed_start(argv: &[&str]) -> StartEntry {
+    match Cli::try_parse_from(argv).expect("the start parses").command {
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Start(args),
+        })) => StartEntry::from(args),
+        Some(Command::Session(SessionArgs {
+            command: SessionCommand::Start(args),
+        })) => StartEntry::from(args),
+        _ => panic!("not a start: {argv:?}"),
+    }
+}
+
+/// A native in-process daemon that the client commands of `global` reach,
+/// with a state directory of its own.
+async fn show_network_daemon() -> (
+    tempfile::TempDir,
+    GlobalArgs,
+    minimald::test_harness::TestServer,
+) {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .expect("the native daemon's socket path");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the native daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    (state, global, server)
+}
+
+/// The create request of [`planned_session_request`].
+type PlannedRequest = minimald_rpc::CreateSessionRequest;
+
+/// The create request that the activation of a planned session start
+/// sends for the project in `root`: the network mode, the ingress and the
+/// effective egress, built by the functions `activate_box` calls, and the
+/// spec stamped on it. The request is built with its constructor.
+fn planned_session_request(
+    args: &ActivateArgs,
+    options: &ActivationOptions,
+    root: &camino::Utf8Path,
+) -> PlannedRequest {
+    let (port_mappings, flags) = flag_network_overrides(args).expect("the flags parse");
+    let project = project_egress(root, options.entry.as_deref()).expect("the project loads");
+    let egress = effective_egress(project.policy, flags, args.egress.deny_all_egress);
+    let policy = network_override_policy(args, port_mappings, egress.policy);
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        args.network.into(),
+        policy,
+    );
+    request.config.name = minimal_client::box_name::request_name(None);
+    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    // Each create in a test is a fresh instance, so no name is held.
+    request_fresh_instance(&mut request);
+    request
+}
+
+// BCLI-024: the `[network]` override flags of `min box start` and `min
+// session start` reach the command-line layer. Each flag changes only its
+// own key, the rest of the entry's `[network]` table stays, and the stored
+// spec and the record the daemon keeps hold the overridden values.
+#[tokio::test]
+async fn network_flags_override_stored_spec_and_projection() {
+    let toml = "[sessions.default.network.egress]\n\
+                allow_dns_hosts = [\"a.example\"]\n\
+                allow_protocols = [\"tcp\"]\n";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, global, server) = show_network_daemon().await;
+    let mut daemon = server.connect().await;
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+
+    for verb in ["box", "session"] {
+        let start = parsed_start(&[
+            "min",
+            verb,
+            "start",
+            "--network",
+            "own_ip",
+            "--ingress",
+            "8080:80",
+            "--allow-dns-hosts",
+            "b.example",
+            "--deny-subnets",
+            "10.9.0.0/16",
+        ]);
+        let StartPlan::Session { args, options, .. } =
+            plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+        else {
+            panic!("{verb}: the default entry is a session");
+        };
+        assert_eq!(args.network, CliNetworkMode::OwnIp, "{verb}");
+        assert_eq!(args.ingress, vec!["8080:80".to_owned()], "{verb}");
+        assert_eq!(args.egress.allow_dns_hosts, vec!["b.example".to_owned()]);
+        assert_eq!(args.egress.deny_subnets, vec!["10.9.0.0/16".to_owned()]);
+
+        let request = planned_session_request(&args, &options, root);
+        let spec: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+        assert_eq!(spec.network.mode, boxes::NetworkMode::OwnIp, "{verb}");
+        let egress = spec
+            .network
+            .policy
+            .egress
+            .clone()
+            .expect("egress is declared");
+        // A list flag adds to the entry's list, and a key no flag names
+        // keeps the entry's value.
+        assert_eq!(
+            egress.allow_dns_hosts,
+            Some(vec!["a.example".to_owned(), "b.example".to_owned()]),
+            "{verb}"
+        );
+        assert_eq!(egress.deny_subnets, Some(vec!["10.9.0.0/16".to_owned()]));
+        assert_eq!(
+            egress.allow_protocols,
+            Some(vec![boxes::IpProto::Tcp]),
+            "{verb}: the entry's allow_protocols stays"
+        );
+        let ingress = spec.network.policy.ingress.clone().expect("ingress is set");
+        assert_eq!(
+            ingress.port_mappings,
+            vec![parse_ingress_mapping("8080:80").unwrap()]
+        );
+
+        // The daemon keeps the overridden values on the box's record.
+        let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+            minimald_rpc::Errorable::Ok(created) => created.id,
+            minimald_rpc::Errorable::Err { error } => panic!("{verb}: the create failed: {error}"),
+        };
+        let record = stored_box_record(&mut client, id)
+            .await
+            .expect("the record is read")
+            .expect("the box has a record");
+        assert_eq!(record.network, boxes::NetworkMode::OwnIp, "{verb}");
+        assert_eq!(record.policy, spec.network.policy, "{verb}");
+    }
+
+    // A flag that is not given leaves the activation's value in place.
+    let StartPlan::Session { args, .. } =
+        plan_start(&parsed_start(&["min", "session", "start"]), &[], true).unwrap()
+    else {
+        panic!("the implicit default entry is a session");
+    };
+    assert_eq!(args.network, ActivateArgs::unflagged().network);
+    assert!(args.ingress.is_empty());
+    assert_eq!(args.egress, EgressArgs::default());
+
+    // `--network own_ip --deny-all-egress` sets the mode and empties the
+    // entry's allow lists.
+    let start = parsed_start(&[
+        "min",
+        "session",
+        "start",
+        "--network",
+        "own_ip",
+        "--deny-all-egress",
+    ]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &start_entries(toml), true).unwrap()
+    else {
+        panic!("the default entry is a session");
+    };
+    let request = planned_session_request(&args, &options, root);
+    assert_eq!(request.config.network, boxes::NetworkMode::OwnIp);
+    let egress = request.config.policy.egress.clone().unwrap();
+    assert_eq!(egress.allow_dns_hosts, Some(vec![]));
+
+    // A mapping that does not parse fails the activation's flag step.
+    let mut args = args;
+    args.ingress = vec!["not-a-port".to_owned()];
+    assert!(flag_network_overrides(&args).is_err());
+
+    // A task entry's box takes `--network` and the egress flags through
+    // the run path, as `min box run` does.
+    let tasks = start_entries("[tasks.build]\necho = 'x'\n");
+    let start = parsed_start(&[
+        "min",
+        "box",
+        "start",
+        "build",
+        "--network",
+        "none",
+        "--deny-all-egress",
+    ]);
+    let StartPlan::Detached { run, .. } = plan_start(&start, &tasks, true).unwrap() else {
+        panic!("a task box starts detached");
+    };
+    assert_eq!(run.network, Some(CliNetworkMode::NoNet));
+    assert!(run.egress.deny_all_egress);
+
+    // The run path takes no `--ingress`, so the start refuses it with exit
+    // 2 before it creates anything.
+    let start = parsed_start(&["min", "box", "start", "build", "--ingress", "8080:80"]);
+    let error = plan_start(&start, &tasks, true).expect_err("--ingress is refused");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("a start refusal");
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot start build with --ingress. A box from a task entry does not take \
+         --ingress. Run min box start build without --ingress."
+    );
+}
+
+// BCLI-073: `--loadout` on `min box start` and `min session start` selects
+// each loadout it names for the selected-loadouts layer, in place of the
+// client config's `default_loadouts`.
+#[test]
+fn start_loadout_flag_selects_loadouts_layer() {
+    for verb in ["box", "session"] {
+        let start = parsed_start(&["min", verb, "start", "--loadout", "rust", "--loadout", "ai"]);
+        let StartPlan::Session { args, .. } =
+            plan_start(&start, &[], true).expect("the start is planned")
+        else {
+            panic!("{verb}: the implicit default entry is a session");
+        };
+        assert_eq!(args.loadout, vec!["rust".to_owned(), "ai".to_owned()]);
+        assert_eq!(
+            start_loadout_selection(&args),
+            loadouts::LoadoutSelection::Cli(vec!["rust".to_owned(), "ai".to_owned()]),
+            "{verb}"
+        );
+
+        // With no `--loadout`, the config's defaults apply, as before.
+        let StartPlan::Session { args, .. } =
+            plan_start(&parsed_start(&["min", verb, "start"]), &[], true).unwrap()
+        else {
+            panic!("{verb}: the implicit default entry is a session");
+        };
+        assert_eq!(
+            start_loadout_selection(&args),
+            loadouts::LoadoutSelection::Defaults
+        );
+    }
+
+    // The run path takes no `--loadout`, so a task entry's start refuses
+    // it with exit 2 before it creates anything.
+    let tasks = start_entries("[tasks.build]\necho = 'x'\n");
+    let start = parsed_start(&["min", "box", "start", "build", "--loadout", "rust"]);
+    let error = plan_start(&start, &tasks, true).expect_err("--loadout is refused");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("a start refusal");
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot start build with --loadout. A box from a task entry does not take \
+         --loadout. Run min box start build without --loadout."
+    );
+}
+
+// BCLI-025: `min box show <box> --network` renders the `[network]` section
+// the box's record stores, with the creating command's overrides in it.
+#[tokio::test]
+async fn box_show_network_renders_effective() {
+    let (_state, global, server) = show_network_daemon().await;
+    let mut daemon = server.connect().await;
+    let project = tempfile::tempdir().unwrap();
+    let mut request = minimald::test_harness::create_session_req(
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    );
+    request.config.network = boxes::NetworkMode::OwnIp;
+    request.config.policy = boxes::BoxPolicy {
+        egress: Some(boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec!["a.example".to_owned(), "b.example".to_owned()]),
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+            ..boxes::EgressPolicy::default()
+        }),
+        ingress: Some(boxes::IngressPolicy {
+            port_mappings: vec![parse_ingress_mapping("8080:80").unwrap()],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        }),
+        ..boxes::BoxPolicy::default()
+    };
+    let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+        minimald_rpc::Errorable::Ok(created) => created.id,
+        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+    };
+
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+    // `min box show --network` reads the record from the daemon and
+    // writes its network section.
+    let mut out = Vec::new();
+    show_stored_network(&mut out, &mut client, id, "web")
+        .await
+        .expect("the section is shown");
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text,
+        "[network]\n\
+         mode = \"own_ip\"\n\
+         \n\
+         [network.egress]\n\
+         allow_dns_hosts = [\"a.example\", \"b.example\"]\n\
+         allow_protocols = [\"tcp\"]\n\
+         \n\
+         [[network.ingress.port_mappings]]\n\
+         external_port = 8080\n\
+         internal_port = 80\n\
+         proto = \"tcp\"\n"
+    );
+    let parsed: toml::Table = toml::from_str(&text).expect("the section is TOML");
+    let network = parsed["network"].as_table().expect("a [network] table");
+    assert_eq!(network["mode"].as_str(), Some("own_ip"), "{text}");
+    let egress = network["egress"].as_table().expect("an egress table");
+    assert_eq!(
+        egress["allow_dns_hosts"],
+        toml::Value::from(vec!["a.example", "b.example"]),
+        "{text}"
+    );
+    assert!(text.contains("8080"), "{text}");
+    assert_eq!(parsed.len(), 1, "only the network section\n{text}");
+
+    // A box with no network prints its mode and nothing it cannot have.
+    let mut out = Vec::new();
+    write_stored_network(
+        &mut out,
+        boxes::NetworkMode::NoNet,
+        &boxes::BoxPolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "[network]\nmode = \"none\"\n"
+    );
+
+    // A box the host does not have prints nothing and fails.
+    let mut out = Vec::new();
+    show_stored_network(
+        &mut out,
+        &mut client,
+        boxes::SessionId::from_bytes([7; 16]),
+        "gone",
+    )
+    .await
+    .expect_err("the host has no such box");
+    assert!(out.is_empty());
+
+    assert!(
+        Cli::try_parse_from(["min", "box", "show", "web", "--network"]).is_ok(),
+        "min box show takes --network"
+    );
+}
+
+/// The state dir of box `id` under the daemon state dir `state`.
+fn exec_box_dir(state: &std::path::Path, id: boxes::SessionId) -> std::path::PathBuf {
+    std::fs::read_dir(state.join("sessions"))
+        .expect("the daemon's sessions dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("record.json"))
+                .is_ok_and(|record| record.contains(&id.to_string()))
+        })
+        .expect("the box's state dir")
+}
+
+/// `min box show <target>` against `host`, as the command renders it.
+async fn box_show_text(host: &LocalHost, target: &str) -> String {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let ResolvedBox { host, box_id: id } =
+        resolve_box_on_hosts(vec![host.clone()], target, "box show")
+            .await
+            .expect("the box resolves");
+    let mut client = box_host_client(&host).await.expect("a client on the host");
+    let shown = match client
+        .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
+        .await
+        .expect("the ShowBox RPC")
+    {
+        Errorable::Ok(shown) => shown,
+        Errorable::Err { error } => panic!("ShowBox failed: {error}"),
+    };
+    let mut out = Vec::new();
+    render_box_show(&mut out, &shown, host.provider, &host.host).expect("the render");
+    String::from_utf8(out).expect("UTF-8 text")
+}
+
+/// The `Live execs:` block of a `min box show` text, empty when it has none.
+fn live_exec_rows(text: &str) -> Vec<String> {
+    text.lines()
+        .skip_while(|line| *line != "Live execs:")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Two exec ids as the daemon mints them, in exec id order.
+const FIRST_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4b01";
+const SECOND_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4b02";
+
+// BCLI-067: `min box show <box>` lists each live exec of the box, one row
+// each, with its exec id, `terminal` or `detached`, and its command. An
+// exec that ends leaves the list, and a box with no live exec prints no
+// block.
+#[tokio::test]
+async fn box_show_lists_live_execs() {
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    assert_eq!(
+        live_exec_rows(&box_show_text(&alpha.host, "web").await),
+        Vec::<String>::new()
+    );
+
+    let shell = alpha
+        .server
+        .list_running_exec(web, FIRST_EXEC_ID, &["sh", "-i"], true);
+    let _job = alpha.server.list_running_exec(
+        web,
+        SECOND_EXEC_ID,
+        &["sh", "-c", "sleep 600; echo done"],
+        false,
+    );
+    let text = box_show_text(&alpha.host, "web").await;
+    assert_eq!(
+        live_exec_rows(&text),
+        [
+            "Live execs:".to_owned(),
+            format!("  {FIRST_EXEC_ID}  terminal  sh -i"),
+            format!("  {SECOND_EXEC_ID}  detached  sh -c 'sleep 600; echo done'"),
+        ],
+        "{text}"
+    );
+
+    shell.end();
+    let text = box_show_text(&alpha.host, "web").await;
+    assert_eq!(
+        live_exec_rows(&text),
+        [
+            "Live execs:".to_owned(),
+            format!("  {SECOND_EXEC_ID}  detached  sh -c 'sleep 600; echo done'"),
+        ],
+        "the ended exec leaves the list\n{text}"
+    );
+}
+
+/// `min box stop`, `logs` or `wait` with `--exec`, parsed as the CLI parses
+/// it.
+fn box_exec_id_command(words: &[&str]) -> BoxCommand {
+    let mut line = vec!["min", "box"];
+    line.extend_from_slice(words);
+    match Cli::try_parse_from(&line).unwrap_or_else(|e| panic!("{line:?}: {e}")) {
+        Cli {
+            command: Some(Command::Box(BoxArgs { command })),
+            ..
+        } => command,
+        _ => panic!("{line:?} is not a `min box` command"),
+    }
+}
+
+/// The message and the exit code of an `--exec` refusal.
+fn exec_id_refusal(error: &anyhow::Error) -> (String, u8) {
+    let refusal = error
+        .downcast_ref::<BoxExecIdRefusal>()
+        .unwrap_or_else(|| panic!("an exec id refusal, not {error:#}"));
+    (refusal.to_string(), refusal.exit_code())
+}
+
+// BCLI-055: `min box stop <box> --exec <id>` stops that exec as BOX-151
+// defines, through the daemon's exec stop, and waits for its end. The box
+// and its other execs keep running. An exec id the box does not have is
+// refused with exit 4, and text that is not an exec id with exit 2.
+#[tokio::test]
+async fn box_stop_exec_stops_that_exec() {
+    let log = minimald::test_harness::captured_log();
+    match box_exec_id_command(&["stop", "web", "--exec", FIRST_EXEC_ID]) {
+        BoxCommand::Stop(args) => {
+            assert_eq!(args.target, "web");
+            assert_eq!(args.exec.as_deref(), Some(FIRST_EXEC_ID));
+            assert!(!args.force);
+        }
+        _ => panic!("not `min box stop`"),
+    }
+    assert!(
+        Cli::try_parse_from([
+            "min",
+            "box",
+            "stop",
+            "web",
+            "--force",
+            "--exec",
+            FIRST_EXEC_ID
+        ])
+        .is_err(),
+        "--force and --exec do not go together"
+    );
+
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    let stopped = alpha
+        .server
+        .list_running_exec(web, FIRST_EXEC_ID, &["sleep", "600"], false);
+    let _other = alpha
+        .server
+        .list_running_exec(web, SECOND_EXEC_ID, &["sleep", "600"], false);
+
+    // The harness exec has no process, so it ends when the test ends it.
+    // The stop returns only after that end.
+    let mut out = Vec::new();
+    let stop = box_stop_exec_on_hosts(vec![alpha.host.clone()], &mut out, "web", FIRST_EXEC_ID);
+    let end = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stopped.end();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(stop, end)
+    })
+    .await
+    .expect("the stop returns when the exec ends");
+    result.expect("the exec stop succeeds");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!(
+            "Exec {FIRST_EXEC_ID} in web ended before the stop, so the stop changed nothing.\n"
+        )
+    );
+    let mut line = Vec::new();
+    write_exec_stop_line(&mut line, "web", FIRST_EXEC_ID, false).unwrap();
+    assert_eq!(
+        String::from_utf8(line).unwrap(),
+        format!("Stopped exec {FIRST_EXEC_ID} in web.\n")
+    );
+
+    // The box runs on, with its other exec.
+    let text = box_show_text(&alpha.host, "web").await;
+    assert!(
+        text.lines().any(|line| line == "State:      running"),
+        "{text}"
+    );
+    assert_eq!(
+        live_exec_rows(&text),
+        [
+            "Live execs:".to_owned(),
+            format!("  {SECOND_EXEC_ID}  detached  sleep 600"),
+        ],
+        "{text}"
+    );
+
+    // An exec id the box does not have, and text that is not an exec id.
+    for (exec_id, message, code) in [
+        (
+            AN_EXEC_ID,
+            format!(
+                "web has no exec {AN_EXEC_ID}. \
+                 Run `min box show web` to see the commands that run in the box now."
+            ),
+            4,
+        ),
+        (
+            "not-an-exec-id",
+            "`not-an-exec-id` is not an exec id. \
+             Run `min box show web` to see the commands that run in the box now."
+                .to_owned(),
+            2,
+        ),
+    ] {
+        let mut out = Vec::new();
+        let error = box_stop_exec_on_hosts(vec![alpha.host.clone()], &mut out, "web", exec_id)
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{exec_id}: the stop is refused, not {:?}",
+                    String::from_utf8_lossy(&out)
+                )
+            });
+        assert_eq!(exec_id_refusal(&error), (message, code), "{exec_id}");
+        assert!(out.is_empty(), "{exec_id}: no line");
+    }
+
+    let log = log.contents();
+    for outcome in ["ok", "no such exec", "not an exec id"] {
+        assert!(
+            log.lines().any(|line| line.contains("verb=\"box stop\"")
+                && line.contains(&format!("outcome=\"{outcome}\""))),
+            "a `{outcome}` event\n{log}"
+        );
+    }
+    assert!(
+        log.lines()
+            .any(|line| line.contains("verb=\"box stop\"")
+                && line.contains(&format!("box_id={web}"))),
+        "the event names the box\n{log}"
+    );
+}
+
+// BCLI-056: `min box logs <box> --exec <id>` prints the output that exec
+// captured, as BOX-149's output read gives it, and nothing else. An exec
+// id the box does not have is refused with exit 4. Only `min box logs`
+// takes `--exec`, and not with `-f`.
+#[tokio::test]
+async fn box_logs_exec_prints_exec_output() {
+    match box_exec_id_command(&["logs", "web", "--exec", FIRST_EXEC_ID]) {
+        BoxCommand::Logs(args) => {
+            assert_eq!(args.logs.target, "web");
+            assert!(!args.logs.follow);
+            assert_eq!(args.exec.as_deref(), Some(FIRST_EXEC_ID));
+        }
+        _ => panic!("not `min box logs`"),
+    }
+    for line in [
+        &["min", "box", "logs", "web", "-f", "--exec", FIRST_EXEC_ID][..],
+        &["min", "session", "logs", "web", "--exec", FIRST_EXEC_ID],
+        &["min", "task", "logs", "web", "--exec", FIRST_EXEC_ID],
+    ] {
+        assert!(Cli::try_parse_from(line).is_err(), "{line:?} is refused");
+    }
+
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        FIRST_EXEC_ID,
+        false,
+    );
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecExited,
+        FIRST_EXEC_ID,
+        false,
+    );
+    let box_dir =
+        camino::Utf8PathBuf::from_path_buf(exec_box_dir(&state, web)).expect("a UTF-8 path");
+    let transcript = boxes::store::exec_transcript_path(&box_dir, FIRST_EXEC_ID);
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, b"hello from the exec\nsecond line\n").unwrap();
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = box_logs_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        FIRST_EXEC_ID,
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("the exec's output is read");
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "hello from the exec\nsecond line\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&err), "");
+
+    let mut out = Vec::new();
+    let error = box_logs_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        SECOND_EXEC_ID,
+        &mut out,
+        &mut Vec::new(),
+    )
+    .await
+    .expect_err("an exec the box does not have is refused");
+    assert_eq!(
+        exec_id_refusal(&error),
+        (
+            format!(
+                "web has no exec {SECOND_EXEC_ID}. \
+                 Run `min box show web` to see the commands that run in the box now."
+            ),
+            4
+        )
+    );
+    assert!(out.is_empty());
+}
+
+// BCLI-057: `min box wait <box> --exec <id>` waits for that exec to end and
+// returns its retained exit code, as BOX-149's wait gives it. An exec that
+// its own timeout ended returns 124. With `--timeout`, a wait that runs out
+// returns 124 and leaves the exec running. An exec id with no known end is
+// refused with exit 4.
+#[tokio::test]
+async fn box_wait_exec_returns_exec_code() {
+    use minimald_rpc::exec::{ExecId, ExecRequest};
+
+    match box_exec_id_command(&["wait", "web", "--exec", FIRST_EXEC_ID, "--timeout", "5s"]) {
+        BoxCommand::Wait(args) => {
+            assert_eq!(args.target, "web");
+            assert_eq!(args.exec.as_deref(), Some(FIRST_EXEC_ID));
+            assert_eq!(args.timeout, Some(5));
+        }
+        _ => panic!("not `min box wait`"),
+    }
+
+    // The daemon's wait answers the exec's code, and the wait returns it.
+    let id = ExecId::parse(FIRST_EXEC_ID).unwrap();
+    let mut channels = ScriptedChannels {
+        opened: Vec::new(),
+        scripts: vec![answer(b"", b"", 7)].into(),
+    };
+    let code = cmd::wait_exec_over(&mut channels, "web", &id, &mut Vec::new())
+        .await
+        .expect("the wait returns the code");
+    assert_eq!(code, 7);
+    assert_eq!(
+        channels.opened,
+        [ExecRequest::ExecWait(id.clone()).encode()],
+        "one wait, by the exec id"
+    );
+
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+
+    // A live exec: the wait returns when it ends, with its code.
+    let live = alpha
+        .server
+        .list_running_exec(web, FIRST_EXEC_ID, &["sleep", "600"], false);
+    let mut err = Vec::new();
+    let wait = box_wait_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        FIRST_EXEC_ID,
+        None,
+        &mut err,
+    );
+    let end = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        live.end();
+    };
+    let (code, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(wait, end)
+    })
+    .await
+    .expect("the wait returns when the exec ends");
+    assert_eq!(code.expect("the wait succeeds"), 0);
+    assert_eq!(String::from_utf8_lossy(&err), "");
+
+    // `--timeout` runs out on an exec that still runs.
+    let _running = alpha
+        .server
+        .list_running_exec(web, SECOND_EXEC_ID, &["sleep", "600"], false);
+    let error = box_wait_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        SECOND_EXEC_ID,
+        Some(std::time::Duration::from_millis(300)),
+        &mut Vec::new(),
+    )
+    .await
+    .expect_err("the wait runs out");
+    let timed_out = error
+        .downcast_ref::<BoxTimedOut>()
+        .unwrap_or_else(|| panic!("a wait timeout, not {error:#}"));
+    assert_eq!(timed_out.code(), "wait_timeout");
+    assert_eq!(
+        timed_out.to_string(),
+        format!("Stopped waiting after 300ms. Exec {SECOND_EXEC_ID} in web has not ended.")
+    );
+    assert_eq!(
+        timed_out.hint(),
+        format!(
+            "Run `min box wait {web} --exec {SECOND_EXEC_ID}` to wait again, \
+             or `min box stop {web} --exec {SECOND_EXEC_ID}` to stop it."
+        )
+    );
+    assert_eq!(exec_failure_code(&error), 124);
+    let text = box_show_text(&alpha.host, "web").await;
+    assert!(
+        text.contains(SECOND_EXEC_ID),
+        "the exec runs on after the wait\n{text}"
+    );
+
+    // An exec id with no known end.
+    let error = box_wait_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        None,
+        &mut Vec::new(),
+    )
+    .await
+    .expect_err("no exit code is known");
+    assert_eq!(
+        exec_id_refusal(&error),
+        (
+            format!(
+                "No exit code is known for exec {AN_EXEC_ID} in web. \
+                 Run `min box show web` to see the commands that run in the box now."
+            ),
+            4
+        )
     );
 }
 

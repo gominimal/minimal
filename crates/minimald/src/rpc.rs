@@ -1117,6 +1117,7 @@ async fn serve_answerer_control(
                 }
                 BoxControlRequest::Register(_)
                 | BoxControlRequest::Withdraw(_)
+                | BoxControlRequest::RenameBox(_)
                 | BoxControlRequest::HoldBoxName(_)
                 | BoxControlRequest::ReleaseBoxName(_)
                 | BoxControlRequest::AdmitHostIpBox(_)

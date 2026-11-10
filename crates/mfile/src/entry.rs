@@ -133,7 +133,7 @@ pub fn implicit_default_entry(
 
 impl BoxEntry {
     /// Why this entry cannot be created, for a refusal that ends with exit
-    /// 3, or `None` when it can (BOX-063, BOX-166). The file's other entries
+    /// 3, or `None` when it can (BOX-063, BOX-185). The file's other entries
     /// stay usable either way.
     #[must_use]
     pub fn creation_refusal(&self) -> Option<String> {
@@ -523,7 +523,7 @@ mod tests {
         assert!(refusal("image").unwrap().contains("type container-build"));
     }
 
-    /// BOX-166: a hand-written `build` entry validates, and its creation is
+    /// BOX-185: a hand-written `build` entry validates, and its creation is
     /// refused: it names no package to derive from.
     #[test]
     fn hand_written_build_entry_validates_and_refuses_creation() {

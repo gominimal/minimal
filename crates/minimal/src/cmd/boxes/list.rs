@@ -370,7 +370,7 @@ mod tests {
         }
     }
 
-    /// NET-171, BOX-167: a running build box lists under its requesting box
+    /// NET-171, BOX-186: a running build box lists under its requesting box
     /// with its type, its parent and its package, as a row and as JSON.
     #[test]
     fn build_box_listed_while_it_runs() {
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(json[1]["parent"], "0199e0a0-0000-7000-8000-000000000001");
     }
 
-    /// BOX-166: a build box has no record, so no box verb can name it, by its
+    /// BOX-185: a build box has no record, so no box verb can name it, by its
     /// package or otherwise.
     #[test]
     fn build_box_is_no_target_of_a_box_verb() {
@@ -600,7 +600,8 @@ Disk:       -
 Identity:   unknown
 Provider:   local
 Host:       local0
-Live execs: exec-1
+Live execs:
+  exec-1  detached  sleep 60
 "
         );
 

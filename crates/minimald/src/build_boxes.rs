@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, OnceLock, PoisonError};
 use tokio::sync::Mutex;
 
 /// The build boxes running now, by requesting box id then package. A build
-/// box keeps no record (BOX-167), so this is all that lists it (NET-171).
+/// box keeps no record (BOX-186), so this is all that lists it (NET-171).
 static RUNNING: LazyLock<
     std::sync::Mutex<HashMap<String, BTreeMap<String, minimald_rpc::RunningBuildBox>>>,
 > = LazyLock::new(Default::default);

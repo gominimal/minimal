@@ -719,7 +719,7 @@ box that holds it returns to `running`. These terms follow the decision in
   tier:     T0
   verify:   cargo nextest run -p op box_build_never_gets_the_host_plan
   verify:   cargo nextest run -p minimald box_package_build_runs_in_a_build_box
-  <!-- event-driven; a build box is a box of the `build` Box Type (BOX-166); the build's sandbox has no route but the build box's own, so the build box's egress decides every connection the build opens, whatever the requesting box's network mode. `mip`, which runs outside any box, keeps its host network plan. A build box that needs no network stays in an empty network namespace (the first sub-requirement). A build box with a network has an address of its own, never the host's. Which rules the build box has is NET-165's and NET-169's. -->
+  <!-- event-driven; a build box is a box of the `build` Box Type (BOX-185); the build's sandbox has no route but the build box's own, so the build box's egress decides every connection the build opens, whatever the requesting box's network mode. `mip`, which runs outside any box, keeps its host network plan. A build box that needs no network stays in an empty network namespace (the first sub-requirement). A build box with a network has an address of its own, never the host's. Which rules the build box has is NET-165's and NET-169's. -->
   - WHILE a package's build steps declare neither `needs.dns` nor `needs.internet`, on the package or in its dependencies, THE SYSTEM SHALL run the build steps in an empty network namespace, even when the build box has a network for its source fetch.
     tier:   T0
     verify: cargo nextest run -p op build_that_needs_no_network_stays_in_an_empty_namespace

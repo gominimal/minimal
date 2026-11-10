@@ -221,6 +221,22 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
 | `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
 | `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
+| `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box is `host_ip` |
+| `--ingress <EXT:INT[/PROTO]>` | Override of the entry's `network.ingress`: each use adds one port mapping, `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Requires `--network own_ip` |
+| `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | Overrides of the entry's `network.egress` keys, as on [`session activate`](#session-activate): a list flag adds to the entry's list, `--allow-protocols` replaces it, and `--deny-all-egress` empties the allow lists |
+| `--loadout <NAME>` | Apply the named loadout. Repeatable. With any `--loadout`, the config file's `default_loadouts` are not applied |
+
+Each override flag changes only the key it names. The other
+`network.egress` keys of the entry stay as the entry declares them. A session
+box does not take the entry's `network.mode` or `network.ingress` yet
+([#3238](https://github.com/gominimal/minimal/issues/3238)). The box keeps the
+result: `min box show <box> --network` prints the `[network]` section that
+the box was created with.
+
+`min box start [ENTRY]` takes the same flags. For a task entry, it takes
+`--network` and the egress flags, and with no `--network` the box takes the
+entry's `network.mode`. A task entry refuses `--ingress` and `--loadout` with
+exit code 2.
 
 Without `ENTRY`, the command starts the session entry named `default`. When
 no session entry has that name, it starts the project's only session entry. A

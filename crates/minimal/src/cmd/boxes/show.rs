@@ -35,10 +35,62 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
             bail!("{error}")
         }
     };
+    if args.network {
+        // BCLI-025: the network section the box was created with.
+        let mut section = Vec::new();
+        show_stored_network(&mut section, &mut client, id, &args.target).await?;
+        tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "ok", host = %host.host);
+        std::io::Write::write_all(&mut std::io::stdout().lock(), &section)?;
+        return Ok(());
+    }
     tracing::info!(verb = "box show", box_id = %id, outcome = "ok", host = %host.host);
     let mut out = std::io::stdout().lock();
     render_box_show(&mut out, &shown, host.provider, &host.host)?;
     Ok(())
+}
+
+/// Writes the `[network]` section that box `id` stores on the host `client`
+/// talks to (BCLI-025), overrides included. `target` is the address the
+/// caller gave, for the refusal when the host has no such box.
+///
+/// # Errors
+///
+/// Fails when the record cannot be read, the host has no box `id`, or
+/// `out` fails.
+pub(crate) async fn show_stored_network(
+    out: &mut impl std::io::Write,
+    client: &mut client::Client,
+    id: boxes::SessionId,
+    target: &str,
+) -> Result<(), anyhow::Error> {
+    let record = stored_box_record(client, id)
+        .await
+        .inspect_err(|error| {
+            tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "error", "{error}");
+        })?
+        .ok_or_else(|| {
+            // The box was removed after the address resolved.
+            tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "not found");
+            BoxAddressRefusal::NotFound {
+                address: target.to_owned(),
+            }
+        })?;
+    write_stored_network(out, record.network, &record.policy)
+}
+
+/// The record box `id` has on the host `client` talks to, with the network
+/// mode and the policy it was created with. `None` when the host has no box
+/// with that id.
+pub(crate) async fn stored_box_record(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+) -> Result<Option<boxes::Record>, anyhow::Error> {
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+    let response = client
+        .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+        .await
+        .context("GetSessionRecord RPC failed")?;
+    Ok(response.record)
 }
 
 /// The id of the box `target` names in one host's `listing`, as
@@ -83,8 +135,9 @@ pub(crate) fn not_found_remedy(host: &str, several_hosts: bool) -> String {
 
 /// Writes one box record as `Label: value` lines, with the `provider`
 /// and `host` it came from. A value the record does not carry prints as
-/// `-`. The live execs line prints only when
-/// the daemon names an exec, because today's daemon gives no exec an id.
+/// `-`. A `Live execs:` block follows when the box runs execs, with one
+/// row for each: its exec id, `terminal`, `detached` or `attached`, and its
+/// command.
 pub(crate) fn render_box_show(
     out: &mut impl std::io::Write,
     shown: &minimald_rpc::ShowBoxResponse,
@@ -125,17 +178,23 @@ pub(crate) fn render_box_show(
     lines.push(("Identity", identity.to_string()));
     lines.push(("Provider", provider.to_string()));
     lines.push(("Host", host.to_string()));
-    if !shown.live_execs.is_empty() {
-        let ids: Vec<&str> = shown
-            .live_execs
-            .iter()
-            .map(|exec| exec.id.as_str())
-            .collect();
-        lines.push(("Live execs", ids.join(", ")));
-    }
     for (label, value) in lines {
         let label = format!("{label}:");
         writeln!(out, "{label:<11} {value}")?;
+    }
+    // BCLI-067: one row for each live exec, with its id, whether it holds a
+    // terminal, and its command.
+    if !shown.live_execs.is_empty() {
+        writeln!(out, "Live execs:")?;
+        for exec in &shown.live_execs {
+            let mode = match exec.mode {
+                minimald_rpc::exec::ExecMode::Tty => "terminal",
+                minimald_rpc::exec::ExecMode::Detached => "detached",
+                minimald_rpc::exec::ExecMode::Attached => "attached",
+            };
+            let command: Vec<String> = exec.argv.iter().map(|word| shell_word(word)).collect();
+            writeln!(out, "  {}  {mode:<8}  {}", exec.id, command.join(" "))?;
+        }
     }
     write_build_boxes(out, &record.build_boxes)
 }
@@ -171,6 +230,45 @@ pub(crate) fn write_build_boxes(
         writeln!(out, "  {}: {}", build.package, build_box_reach(build))?;
     }
     Ok(())
+}
+
+/// `word` as a shell reads it back as one word: as it is when it holds only
+/// safe characters, in single quotes when its other characters print, and
+/// in `$'...'` with escapes when it holds a control character. So a newline
+/// or a terminal escape in an exec's argv never breaks the row or reaches
+/// the terminal raw.
+fn shell_word(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c));
+    if safe {
+        return word.to_owned();
+    }
+    if !word.chars().any(char::is_control) {
+        return format!("'{}'", word.replace('\'', r"'\''"));
+    }
+    let mut quoted = String::from("$'");
+    for c in word.chars() {
+        match c {
+            '\\' => quoted.push_str(r"\\"),
+            '\'' => quoted.push_str(r"\'"),
+            '\n' => quoted.push_str(r"\n"),
+            '\t' => quoted.push_str(r"\t"),
+            '\r' => quoted.push_str(r"\r"),
+            c if c.is_control() => {
+                let code = u32::from(c);
+                if code <= 0xff {
+                    quoted.push_str(&format!(r"\x{code:02x}"));
+                } else {
+                    quoted.push_str(&format!(r"\u{code:04x}"));
+                }
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Formats a disk figure in bytes in the largest binary unit that keeps it
@@ -241,5 +339,20 @@ mod build_box_tests {
         let mut none = Vec::new();
         write_build_boxes(&mut none, &[]).unwrap();
         assert!(none.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shell_word_tests {
+    use super::shell_word;
+
+    #[test]
+    fn box_show_exec_command_escapes_control_characters() {
+        assert_eq!(shell_word("ls"), "ls");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("a\nb"), r"$'a\nb'");
+        assert_eq!(shell_word("\u{1b}[2J"), r"$'\x1b[2J'");
+        assert_eq!(shell_word("x\\'\u{7f}"), r"$'x\\\'\x7f'");
     }
 }
