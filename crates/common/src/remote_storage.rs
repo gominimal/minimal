@@ -539,17 +539,28 @@ mod tests {
 mod connect_tests {
     use super::*;
 
+    /// A loopback address that refuses every connection for as long as the
+    /// returned socket lives: the socket holds the port bound and never
+    /// listens, so a connect is refused, and no other process on the host
+    /// can bind the port meanwhile. A port probed free and then released is
+    /// not that: a parallel test or any daemon can take it and accept the
+    /// connection the test expects refused.
+    fn refusing_addr() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        (socket, addr)
+    }
+
     const SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     /// A download that could not connect names the host and the socket's
     /// reason, in the text the daemon reads the host from.
     #[tokio::test]
     async fn a_failed_connect_names_the_host() {
-        let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let addr = closed.local_addr().unwrap();
-        drop(closed);
+        let (_closed, addr) = refusing_addr();
         let tmp = tempfile::tempdir().unwrap();
         let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
             .await
@@ -604,11 +615,7 @@ mod connect_tests {
     /// A build box's fetch that could not connect names the host the same way.
     #[tokio::test]
     async fn a_failed_build_box_fetch_names_the_host() {
-        let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let addr = closed.local_addr().unwrap();
-        drop(closed);
+        let (_closed, addr) = refusing_addr();
         let tmp = tempfile::tempdir().unwrap();
 
         let e = fetch_to_file(
@@ -767,11 +774,7 @@ mod connect_tests {
     /// source the box's rules refuse fails its build in seconds.
     #[tokio::test]
     async fn a_refused_connect_is_not_retried() {
-        let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let addr = closed.local_addr().unwrap();
-        drop(closed);
+        let (_closed, addr) = refusing_addr();
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("fetched");
         let client = fetch_client(CONNECT_TIMEOUT).unwrap();
