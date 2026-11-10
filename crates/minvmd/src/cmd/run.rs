@@ -4490,22 +4490,28 @@ mod tests {
             crate::control::PublishDecision::FailStart { port, .. } if port == pin
         ));
         // Once the holder exits, the watcher's check passes and takes the
-        // reservation. Another test in the process can take the released
-        // port before the check probes it: the check then correctly answers
-        // Skip, so release a fresh pin and ask again.
+        // reservation. The pin is the first question: a regression in
+        // reclaiming a just-released pin fails here. Another test in the
+        // process can take the released pin before the check probes it, and
+        // the check then correctly answers Skip; only then does the test fall
+        // back to fresh freed ports for the remaining attempts, which prove
+        // the same reclaim on a port nothing raced for.
         drop(held);
-        let mut reclaimed = None;
-        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+        let check = |port| super::proxy_reclaim_check(ports.path().to_path_buf())(port);
+        let mut reclaimed = check(pin);
+        let mut fresh_attempts = 0;
+        while reclaimed.is_none() && fresh_attempts < NODE_PORT_RACE_ATTEMPTS {
+            fresh_attempts += 1;
             let freed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let free = freed.local_addr().unwrap().port();
             drop(freed);
-            if let Some(reservation) = super::proxy_reclaim_check(ports.path().to_path_buf())(free)
-            {
-                reclaimed = Some(reservation);
-                break;
-            }
+            reclaimed = check(free);
         }
-        assert!(reclaimed.is_some(), "the watcher takes a freed pin");
+        assert!(
+            reclaimed.is_some(),
+            "the watcher takes neither the released pin {pin} (another test took it in \
+             the window) nor any of {fresh_attempts} fresh freed ports after it"
+        );
 
         let reserved = crate::net::answerer::DEFAULT_ANSWERER_PORT;
         let err = super::configured_node_port(ports.path(), reserved)
