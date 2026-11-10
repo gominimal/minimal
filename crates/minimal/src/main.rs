@@ -232,7 +232,9 @@ fn answer_failure(
 /// codes ("Exit codes"): 2 when a running box holds the name a create
 /// asked for (`minimald_rpc::HeldNameRefusal`) or a removal without
 /// `--force` finds the box running (`minimal::BoxRunningRefusal`) or a run
-/// names an entry with a terminal (`minimal::task::RunNeedsTerminal`), 3
+/// names an entry with a terminal (`minimal::task::RunNeedsTerminal`) or
+/// puts one of its network flags among the task's arguments
+/// (`minimal::task::RunFlagMisplaced`), 3
 /// when the activation refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
 /// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
@@ -262,6 +264,13 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
         .is_some()
     {
         return minimal::task::RunNeedsTerminal::EXIT_CODE;
+    }
+    // `min task run` or `min box run` with a network flag among the task's
+    // arguments: a usage error.
+    if e.downcast_ref::<minimal::task::RunFlagMisplaced>()
+        .is_some()
+    {
+        return minimal::task::RunFlagMisplaced::EXIT_CODE;
     }
     // BCLI-058: `min box rename` to a name BOX-010 refuses.
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
@@ -1110,6 +1119,17 @@ mod tests {
             let err = anyhow::Error::from(refusal).context("showing the box");
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
         }
+    }
+
+    /// A run with one of its network flags among the task's arguments is a
+    /// usage error: it ends with 2.
+    #[test]
+    fn misplaced_run_flag_exits_2() {
+        let err = anyhow::Error::new(minimal::task::RunFlagMisplaced::new(
+            "build",
+            "--deny-all-egress",
+        ));
+        assert_eq!(failure_exit_code(&err), 2, "{err:#}");
     }
 
     /// BCLI-053: an exec that its own timeout ended ends the run with 124

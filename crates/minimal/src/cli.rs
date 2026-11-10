@@ -1327,8 +1327,9 @@ pub struct EgressArgs {
     /// Declare deny-all egress: the box reaches no external address. Drops
     /// every `allow_subnets` and `allow_dns_hosts` value minimal.toml
     /// declares for the box. Cannot be combined with `--allow-subnets` or
-    /// `--allow-dns-hosts`. The file's `deny_subnets` stay, and
-    /// `--deny-subnets` and `--allow-protocols` still apply. Unless the
+    /// `--allow-dns-hosts`. The file's `allow_protocols` and `deny_subnets`
+    /// stay, and `--deny-subnets` and `--allow-protocols` still apply.
+    /// Unless the
     /// host opts out, a `--network own_ip` box with no egress rules already
     /// reaches no external address. With `--network host_ip` it is enforced
     /// only on a host that can filter each box.

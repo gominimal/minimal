@@ -295,17 +295,47 @@ pub(crate) fn misplaced_run_flag<'a>(typed: &[String], args: &'a [String]) -> Op
         .map(String::as_str)
 }
 
-/// The refusal for a run flag among the task's arguments
-/// ([`misplaced_run_flag`]).
-fn misplaced_run_flag_refusal(entry: &str, arg: &str) -> anyhow::Error {
-    let flag = arg.split_once('=').map_or(arg, |(name, _)| name);
-    anyhow::anyhow!(
-        "Cannot run {entry}: {flag} comes after the task's first argument, so it would reach \
-         the task as an argument and not set the box's network. Put {flag} before {entry} to \
-         set the box's network, or put -- between {entry} and its arguments to pass it to the \
-         task."
-    )
+/// The refusal of a run with one of its own network flags among the
+/// task's arguments ([`misplaced_run_flag`]): a usage error, which
+/// `main.rs` ends with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunFlagMisplaced {
+    entry: String,
+    flag: String,
 }
+
+impl RunFlagMisplaced {
+    /// The usage-refusal code of the architecture's exit-code table.
+    pub const EXIT_CODE: u8 = 2;
+
+    /// The refusal for `arg`, a flag alone or as `<flag>=<value>`, among
+    /// the arguments of `entry`.
+    #[must_use]
+    pub fn new(entry: &str, arg: &str) -> Self {
+        Self {
+            entry: entry.to_string(),
+            flag: arg
+                .split_once('=')
+                .map_or(arg, |(name, _)| name)
+                .to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for RunFlagMisplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { entry, flag } = self;
+        write!(
+            f,
+            "Cannot run {entry}: {flag} comes after the task's first argument, so it would \
+             reach the task as an argument and not set the box's network. Put {flag} before \
+             {entry} to set the box's network, or put -- between {entry} and its arguments to \
+             pass it to the task."
+        )
+    }
+}
+
+impl std::error::Error for RunFlagMisplaced {}
 
 /// Writes what a run prints once its box exists, as `min session activate`
 /// prints it: the classifier advisory the create reply carries (NET-079),
@@ -1061,7 +1091,7 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     if let Some(arg) = misplaced_run_flag(&typed, &args.args) {
-        return Err(misplaced_run_flag_refusal(&args.entry, arg));
+        return Err(RunFlagMisplaced::new(&args.entry, arg).into());
     }
     // Same project-path resolution as `cmd_activate`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
@@ -3333,7 +3363,8 @@ mod tests {
             ),
             None
         );
-        let error = misplaced_run_flag_refusal("build", "--network=none");
+        let error = RunFlagMisplaced::new("build", "--network=none");
+        assert_eq!(RunFlagMisplaced::EXIT_CODE, 2);
         assert_eq!(
             error.to_string(),
             "Cannot run build: --network comes after the task's first argument, so it would \
