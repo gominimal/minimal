@@ -3230,6 +3230,71 @@ async fn show_returns_record_state_identity_and_live_execs() {
     assert_eq!(running.identity, minimald_rpc::BoxIdentity::None);
     // No exec runs in the box.
     assert!(running.live_execs.is_empty(), "{:?}", running.live_execs);
+
+    // A detached and a tty exec run in it: each is listed with its id, argv
+    // and PTY flag, in id order, and an ended one leaves the list.
+    let start = |exec_id: &str, mode, argv: &[&str]| {
+        let entry = std::sync::Arc::new(crate::exec::ExecEntry::new(
+            minimald_rpc::exec::ExecId::parse(exec_id).unwrap(),
+            id,
+            mode,
+            argv.iter().map(|word| (*word).to_owned()).collect(),
+            camino::Utf8PathBuf::from("/nonexistent/execs").join(exec_id),
+            None,
+        ));
+        crate::exec::register_exec(std::sync::Arc::clone(&entry));
+        entry
+    };
+    let detached = start(
+        "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        minimald_rpc::exec::ExecMode::Detached,
+        &["sleep", "60"],
+    );
+    let tty = start(
+        "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c",
+        minimald_rpc::exec::ExecMode::Tty,
+        &["bash"],
+    );
+    let live = |rows: &[minimald_rpc::LiveExec]| -> Vec<(String, Vec<String>, minimald_rpc::exec::ExecMode)> {
+        rows.iter()
+            .map(|exec| (exec.id.clone(), exec.argv.clone(), exec.mode))
+            .collect()
+    };
+    let shown = mngr.show_box(id).await.unwrap().expect("retained");
+    assert_eq!(
+        live(&shown.live_execs),
+        vec![
+            (
+                "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b".to_owned(),
+                vec!["sleep".to_owned(), "60".to_owned()],
+                minimald_rpc::exec::ExecMode::Detached
+            ),
+            (
+                "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c".to_owned(),
+                vec!["bash".to_owned()],
+                minimald_rpc::exec::ExecMode::Tty
+            ),
+        ]
+    );
+    detached.finish(crate::exec::ExecExit {
+        code: Some(0),
+        reason: crate::exec::ExecExitReason::Exited,
+    });
+    let shown = mngr.show_box(id).await.unwrap().expect("retained");
+    assert_eq!(
+        live(&shown.live_execs),
+        vec![(
+            "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c".to_owned(),
+            vec!["bash".to_owned()],
+            minimald_rpc::exec::ExecMode::Tty
+        )],
+        "the ended exec left the list"
+    );
+    // A stop ends every exec in the box (BOX-013).
+    tty.finish(crate::exec::ExecExit {
+        code: None,
+        reason: crate::exec::ExecExitReason::Exited,
+    });
     drop(mngr);
 
     set_record_state(
@@ -3605,6 +3670,82 @@ fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
     spec.entry = entry.to_string();
     spec.name = name.map(str::to_string);
     serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// BOX-076: a spec with sections the daemon does not enforce is stored
+/// whole, the box is created, and the daemon log warns once for each such
+/// section, naming it. A spec with none of them warns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unenforced_sections_warn_once_each_naming_section() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    let mut spec = task_spec("lint", None);
+    let object = spec.as_object_mut().expect("a spec is an object");
+    for key in ["file_imports", "file_exports", "github_imports"] {
+        object.insert(
+            key.to_string(),
+            serde_json_lenient::json!([{ "src": "a", "dst": "/a" }]),
+        );
+    }
+    object.insert(
+        "otel".to_string(),
+        serde_json_lenient::json!({ "endpoint": "http://localhost:4317" }),
+    );
+    object["network"]
+        .as_object_mut()
+        .expect("a spec has a network table")
+        .insert(
+            "vpn_network_names".to_string(),
+            serde_json_lenient::json!(["corp"]),
+        );
+    let id = mngr
+        .create_box_with_spec(unnamed_config(), Some(spec.clone()), None, None)
+        .await
+        .expect("a spec with unenforced sections creates its box");
+
+    let spec_path = mngr.box_events(id).await.unwrap().object.spec_path();
+    let bytes = std::fs::read(spec_path.as_utf8_path()).expect("the spec is stored");
+    let stored: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&bytes).expect("the stored spec is JSON");
+    assert_eq!(stored, spec, "the stored spec carries every section");
+
+    let plain = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("fmt", None)), None, None)
+        .await
+        .expect("a plain spec creates its box");
+
+    let logged = log.contents();
+    let warnings = |id: SessionId| -> Vec<String> {
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("WARN")
+                    && line.contains("a section this daemon does not enforce")
+                    && line.contains(&id.to_string())
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let warned = warnings(id);
+    for section in [
+        "[[file_imports]]",
+        "[[file_exports]]",
+        "[[github_imports]]",
+        "[otel]",
+        "[network] vpn_network_names",
+    ] {
+        let naming = warned
+            .iter()
+            .filter(|line| line.contains(&format!("section=\"{section}\"")))
+            .count();
+        assert_eq!(naming, 1, "one warning names {section}:\n{logged}");
+    }
+    assert_eq!(warned.len(), 5, "one warning per section:\n{logged}");
+    assert!(
+        warnings(plain).is_empty(),
+        "a spec with no unenforced section warns nothing:\n{logged}"
+    );
 }
 
 /// The name the record of box `id` carries.
@@ -5397,6 +5538,283 @@ async fn host_ip_create_rereads_a_stale_unreadable_fact() {
     );
 }
 
+/// Resets the process-global classifier stand-ins, the fact and the cgroup
+/// it was read in on drop, a failed assert included, before the fact
+/// window's lock is released. A watch still running is aborted first. The
+/// tree drops after the reset, so no stand-in names a removed path.
+struct ResetClassifierStandins(Option<TempDir>, Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for ResetClassifierStandins {
+    fn drop(&mut self) {
+        if let Some(watch) = self.1.take() {
+            watch.abort();
+        }
+        *CREATE_CLASSIFIER_TREE_STANDIN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        *CREATE_OWN_CGROUP_STANDIN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        crate::box_runtime::clear_classifier_reading_standin();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_fact_cgroup();
+        drop(self.0.take());
+    }
+}
+
+/// A watch the test started, stopped and awaited, so the recorded cgroup's
+/// lock is free before the next phase.
+async fn stop_watch(reset: &mut ResetClassifierStandins) {
+    if let Some(watch) = reset.1.take() {
+        watch.abort();
+        let _ = watch.await;
+    }
+}
+
+/// gominimal/inbox#1054: the daemon's start-up wiring
+/// (`read_fact_and_watch_placement`, as `main` calls it). A guest daemon
+/// reads no cgroup and starts no watch, nor does a host whose cgroup is
+/// unreadable. A native daemon records the cgroup it stood in *before* its
+/// start-up reading, so a placement that lands while the reading runs is
+/// still a move; then its watch re-reads the classifier fact when it moves
+/// into its leaf, so the creates that follow answer over the host as it is
+/// now and not with the cause read before the move. The same cgroup, or an
+/// unreadable one, is no move and re-reads nothing.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the fact is process-global, so the guard must span the awaited watch it is set for"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
+    use crate::net::classifier::{Cause, Decision, Reading};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let capture = crate::test_harness::captured_log();
+    let (tree, root, mountinfo) = stand_in_classifier_tree();
+    let mut reset = ResetClassifierStandins(Some(tree), None);
+    // The table refuses once the daemon can place the probe.
+    crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    const BEFORE: &str = "/user.slice/user-1000.slice";
+    const LEAF: &str = "/minimald.slice/daemon";
+    let cgroup = Arc::new(Mutex::new(Some(BEFORE.to_string())));
+    let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let own_cgroup = {
+        let cgroup = Arc::clone(&cgroup);
+        let calls = Arc::clone(&calls);
+        move || {
+            calls.lock().unwrap().push("cgroup");
+            cgroup.lock().unwrap().clone()
+        }
+    };
+    // What the running daemon read at start, before the install.
+    let start_reading = |moves_to: Option<&'static str>| {
+        let cgroup = Arc::clone(&cgroup);
+        let calls = Arc::clone(&calls);
+        move || {
+            calls.lock().unwrap().push("read");
+            crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+                Cause::StepNotInstalled,
+            ));
+            if let Some(leaf) = moves_to {
+                *cgroup.lock().unwrap() = Some(leaf.to_string());
+            }
+        }
+    };
+    let poll = Duration::from_millis(10);
+    let wait_for_re_read = || async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box() {
+            assert!(
+                Instant::now() < deadline,
+                "the moved daemon re-read the fact within the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The fact is set inside the re-read, but the watch still logs and
+        // records the move after it, holding the recorded cgroup's lock
+        // until then; taking the lock waits for that, so a watch stopped
+        // next has already logged and recorded the move.
+        let _ = crate::box_runtime::fact_cgroup().await;
+    };
+
+    // A guest daemon: the reading runs, and nothing else.
+    let watch = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        true,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(watch.is_none(), "a guest daemon starts no watch");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["read"],
+        "a guest daemon reads no cgroup"
+    );
+    assert_eq!(crate::box_runtime::fact_cgroup().await, None);
+
+    // A native daemon whose cgroup is unreadable: nothing to compare.
+    calls.lock().unwrap().clear();
+    *cgroup.lock().unwrap() = None;
+    let watch = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(watch.is_none(), "an unreadable cgroup starts no watch");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["cgroup", "read"],
+        "the cgroup is read before the start-up reading"
+    );
+    assert_eq!(crate::box_runtime::fact_cgroup().await, None);
+
+    // A native daemon, not moved by its reading.
+    *cgroup.lock().unwrap() = Some(BEFORE.to_string());
+    reset.1 = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(reset.1.is_some(), "a native daemon watches its cgroup");
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(BEFORE)
+    );
+    // Not moved, then unreadable: neither is a move.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    *cgroup.lock().unwrap() = None;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::StepNotInstalled),
+        "a daemon that did not move keeps the fact it read"
+    );
+    // The install's placement moves the daemon into its leaf.
+    *cgroup.lock().unwrap() = Some(LEAF.to_string());
+    wait_for_re_read().await;
+    assert_eq!(crate::box_runtime::host_ip_enforcement_fact().cause, None);
+    stop_watch(&mut reset).await;
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(LEAF)
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line
+            .contains("this daemon moved to another cgroup, so it re-read the classifier fact")
+            && line.contains(LEAF)
+            && line.contains("the cgroup watch")),
+        "the move is one line naming the cgroup it moved to:\n{logged}"
+    );
+
+    // A placement that lands while the start-up reading runs: the cgroup
+    // recorded is the one read before it, so the watch still sees a move.
+    *cgroup.lock().unwrap() = Some(BEFORE.to_string());
+    reset.1 = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(Some(LEAF)),
+    )
+    .await;
+    wait_for_re_read().await;
+    stop_watch(&mut reset).await;
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(LEAF)
+    );
+}
+
+/// gominimal/inbox#1054: a host-address create that finds the daemon in
+/// another cgroup than the one its fact was read in re-reads the fact
+/// itself, so a create in the second after `min finalize-install` placed
+/// the daemon does not wait for the cgroup watch's next poll. The move is
+/// recorded, so the next create in the same cgroup answers as stored.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the fact is process-global, so the guard must span the awaited \
+              creates it is set for"
+)]
+#[tokio::test]
+async fn a_host_address_create_after_a_move_re_reads_the_classifier_fact() {
+    use crate::net::classifier::{Cause, Decision, Reading};
+    let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (_state, _cache, mngr) = manager().await;
+    let capture = crate::test_harness::captured_log();
+    let (tree, root, mountinfo) = stand_in_classifier_tree();
+    let _reset = ResetClassifierStandins(Some(tree), None);
+    *CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((root, mountinfo));
+    crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    let host_ip = |name: &str| {
+        let mut config = sample_config();
+        config.name = Some(name.to_string());
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy = boxes::BoxPolicy::new(Some(boxes::EgressPolicy::deny_all()), None);
+        config
+    };
+    // The daemon read the host outside its leaf, before the install, and
+    // the install has since placed it.
+    crate::box_runtime::set_fact_cgroup(Some("/user.slice/user-1000.slice".to_string())).await;
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::StepNotInstalled,
+    ));
+    *CREATE_OWN_CGROUP_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some("/minimald.slice/daemon".to_string());
+    mngr.create_session(host_ip("moved"), None)
+        .await
+        .expect("a deny-all host-address box is created");
+    let fact = crate::box_runtime::host_ip_enforcement_fact();
+    assert!(
+        fact.can_decide_per_box() && fact.cause.is_none(),
+        "the create re-read the host after the move"
+    );
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some("/minimald.slice/daemon"),
+        "the create recorded the cgroup it re-read in"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.contains("host-address create re-read the classifier fact because the daemon")
+            && logged.contains("a host-address create"),
+        "the create says it re-read because the daemon moved:\n{logged}"
+    );
+
+    // No move since: the next create answers as stored.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::StepNotInstalled,
+    ));
+    mngr.create_session(host_ip("not-moved"), None)
+        .await
+        .expect("a create over a stored cause is not refused at create");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::StepNotInstalled),
+        "a create in the cgroup the fact was read in does not re-read"
+    );
+}
+
 /// The directory of box `id` and its workspace, through a store over
 /// `state_dir`, with the workspace made when the box has none yet.
 async fn box_dir_and_tree(
@@ -5718,4 +6136,195 @@ async fn show_reports_disk_a_reap_frees() {
 
     let logged = log.contents();
     assert!(logged.contains("read a box record"), "{logged}");
+}
+
+/// The client trace the request in the tests below adopts.
+#[cfg(target_os = "linux")]
+const CLIENT_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+
+/// An `rpc` span that adopted a client's `TRACEPARENT`, as the RPC handler's
+/// does: the request a test makes a hand-over or a publish move from.
+#[cfg(target_os = "linux")]
+fn request_span() -> tracing::Span {
+    let request = tracing::info_span!(
+        "rpc",
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    let traceparent = format!("00-{CLIENT_TRACE}-b7ad6b7169203331-01");
+    let ctx = minimald_rpc::trace::TraceContext::parse_traceparent(&traceparent);
+    crate::exec::adopt_trace(&request, ctx);
+    request
+}
+
+/// The one span named `name` whose `field` is `value`, once a task the
+/// test does not await has opened it.
+#[cfg(target_os = "linux")]
+async fn logged(
+    log: &crate::test_harness::SpanLog,
+    name: &str,
+    field: &str,
+    value: &str,
+) -> crate::test_harness::LoggedSpan {
+    let turn = std::time::Duration::from_millis(10);
+    for _ in 0..500 {
+        if !log.find(name, field, value).is_empty() {
+            break;
+        }
+        tokio::time::sleep(turn).await;
+    }
+    log.one(name, field, value)
+}
+
+/// The one span named `name`.
+#[cfg(target_os = "linux")]
+fn only(log: &crate::test_harness::SpanLog, name: &str) -> crate::test_harness::LoggedSpan {
+    let mut found = log.spans();
+    found.retain(|s| s.name == name);
+    assert_eq!(found.len(), 1, "{name}: {found:?}");
+    found.remove(0)
+}
+
+/// Two boxes publish port 8080 at `node`. `first` published it first and
+/// holds it until its next publish drops the port, which hands the port to
+/// `second` (NET-129).
+#[cfg(target_os = "linux")]
+fn hand_over_8080(
+    mngr: &BoxManagerHandle,
+    node: std::net::Ipv4Addr,
+    first: SessionId,
+    second: SessionId,
+) {
+    let ports = std::collections::BTreeSet::from([8080u16]);
+    let registry = mngr.hostnames();
+    let mut registry = registry.write().expect("registry lock");
+    for (session, name) in [(first, "first"), (second, "second")] {
+        registry.publish_own_address(session, name, node, ports.clone());
+        registry.register_own_ip(session, name, ports.clone());
+    }
+    assert!(registry.holds_shared_port(first, node, 8080));
+    let ports = std::collections::BTreeSet::from([9090u16]);
+    registry.publish_own_address(first, "first", node, ports);
+    assert!(registry.holds_shared_port(second, node, 8080));
+}
+
+/// TEL-030, TEL-022: the manager's lifetime loops run under its root, and
+/// the work the daemon does by itself joins the root's trace: the boot
+/// resume, sent from no span as `Server::run` sends it, and a hand-over no
+/// request made. Each was a root of its own, a stray trace in every
+/// telemetry-on lab run (`sessions.hand_overs`, `sessions.publish_moves`,
+/// `sessions.manager.message` ResumeActive; lab job 01958).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_managers_own_work_runs_in_its_root_trace() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let (_state, _cache, mngr) = manager().await;
+
+    let root = only(&log, "sessions.manager");
+    assert!(
+        root.parent.is_none(),
+        "the manager's span is a root: {root:?}"
+    );
+    let root_trace = root.field("trace_id").expect("the root's ids");
+    let root_span = root.field("span_id").expect("the root's ids");
+    for name in ["sessions.hand_overs", "sessions.publish_moves"] {
+        let found = only(&log, name);
+        let parent = log.parent_of(&found).expect("a loop's parent");
+        assert_eq!(parent.name, "sessions.manager", "{name}");
+    }
+
+    assert_eq!(mngr.resume_active_sessions().await.unwrap(), 0);
+    let resume = log.one("sessions.manager.message", "kind", "ResumeActive");
+    assert_eq!(resume.field("trace_id"), Some(root_trace));
+    assert_eq!(resume.field("parent_span_id"), Some(root_span));
+
+    let node = std::net::Ipv4Addr::new(127, 0, 64, 200);
+    hand_over_8080(&mngr, node, SessionId::mint(), SessionId::mint());
+    let hand_over = logged(&log, "sessions.hand_over", "port", "8080").await;
+    assert_eq!(hand_over.field("trace_id"), Some(root_trace));
+    assert_eq!(hand_over.field("parent_span_id"), Some(root_span));
+}
+
+/// TEL-030: the manager's root closes when its mainloop ends, and so do
+/// the hand-over and publish-move loops under it. A loop that outlived the
+/// mainloop held the root open until the runtime's drop, so a daemon whose
+/// drop came after its last flush never exported the root, and the boot
+/// work in its trace read as orphans instead of joined spans.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_managers_root_closes_when_its_mainloop_ends() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let (_state, _cache, mngr) = manager().await;
+    assert_eq!(mngr.resume_active_sessions().await.unwrap(), 0);
+    assert!(!only(&log, "sessions.manager").closed, "open while serving");
+
+    // The last handle gone, the mainloop's receiver ends.
+    drop(mngr);
+    let names = [
+        "sessions.manager",
+        "sessions.hand_overs",
+        "sessions.publish_moves",
+    ];
+    let turn = std::time::Duration::from_millis(10);
+    for _ in 0..500 {
+        if names.iter().all(|name| only(&log, name).closed) {
+            break;
+        }
+        tokio::time::sleep(turn).await;
+    }
+    for name in names {
+        let span = only(&log, name);
+        assert!(span.closed, "{name} outlives the mainloop: {span:?}");
+    }
+}
+
+/// TEL-022: a hand-over and a publish move are handled in the trace of the
+/// request that made them, as children of its span, and the manager
+/// messages their handling sends are children of theirs: not in the
+/// manager's lifetime trace, and not in a trace of their own.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_hand_over_and_a_publish_move_join_the_requests_trace() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let (_state, _cache, mngr) = manager().await;
+    let request = request_span();
+    let rpc = log.one("rpc", "trace_id", CLIENT_TRACE);
+
+    let node = std::net::Ipv4Addr::new(127, 0, 64, 200);
+    let (first, second) = (SessionId::mint(), SessionId::mint());
+    request.in_scope(|| hand_over_8080(&mngr, node, first, second));
+    let hand_over = logged(&log, "sessions.hand_over", "port", "8080").await;
+    assert_eq!(hand_over.field("trace_id"), Some(CLIENT_TRACE));
+    assert_eq!(hand_over.field("parent_span_id"), rpc.field("span_id"));
+    assert!(
+        hand_over.parent.is_none(),
+        "the hand-over's span is not held under the loop's: {hand_over:?}"
+    );
+    let lookup = logged(&log, "sessions.manager.message", "kind", "GetSession").await;
+    assert_eq!(lookup.field("trace_id"), Some(CLIENT_TRACE));
+    assert_eq!(lookup.field("parent_span_id"), hand_over.field("span_id"));
+
+    let mover = SessionId::mint();
+    let to = std::net::Ipv4Addr::new(127, 0, 64, 201);
+    let from = std::net::Ipv4Addr::LOCALHOST;
+    {
+        let registry = mngr.hostnames();
+        let mut registry = registry.write().expect("registry lock");
+        let ports = std::collections::BTreeSet::from([7070u16]);
+        registry.publish_own_address(mover, "mover", to, ports);
+        let moved = request.in_scope(|| registry.hand_over_moved_publish(mover, from));
+        assert_eq!(moved.len(), 1, "{moved:?}");
+    }
+    let moved = logged(&log, "sessions.publish_move", "trace_id", CLIENT_TRACE).await;
+    assert_eq!(moved.field("parent_span_id"), rpc.field("span_id"));
+    let lookup = logged(&log, "sessions.manager.message", "kind", "GetRunning").await;
+    assert_eq!(lookup.field("trace_id"), Some(CLIENT_TRACE));
+    assert_eq!(lookup.field("parent_span_id"), moved.field("span_id"));
 }

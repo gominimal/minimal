@@ -1791,7 +1791,10 @@ async fn host_ip_enforcement_follows_the_launch_reread() {
 /// its leaf (gominimal/inbox#1205). When the fresh reading decides, the
 /// reply carries no advisory and states `per_box`. When the fresh reading
 /// still cannot read the table, the reply carries the advisory that says
-/// the box is refused, and states no enforcement.
+/// the box is refused, and states no enforcement. When the daemon stands
+/// outside its own leaf, the same unreadable re-read is its placement
+/// (gominimal/minimal#3067): the reply's advisory says the box runs
+/// unenforced, and it states `none`.
 // The guard is taken before the server is even built and held across the
 // awaited creates on purpose: the fact and the stand-ins are
 // process-global, so another test's create in the window would read them.
@@ -1885,6 +1888,50 @@ async fn deny_all_create_over_a_stale_unreadable_fact_answers_the_reread() {
     assert_eq!(
         undecided.host_ip_enforcement, None,
         "a deny-all box on a host whose table cannot be read states no enforcement"
+    );
+
+    // The daemon stands outside its own leaf: the step's leaf is there and
+    // this process is not among its members, so the unreadable re-read is
+    // the daemon's placement, and the box it cannot place runs unenforced.
+    let leaf = sandbox::classifier::daemon_leaf(
+        _reset
+            .0
+            .as_ref()
+            .expect("the tree is held until the reset")
+            .path(),
+    );
+    std::fs::create_dir_all(&leaf).expect("the step makes the daemon leaf");
+    std::fs::write(leaf.join("cgroup.procs"), "1\n")
+        .expect("the daemon leaf's members omit this daemon");
+    held();
+    crate::box_runtime::install_classifier_reading_standin(classifier::Reading::Inconclusive {
+        because: "the injected reading stands in for a probe whose child \
+                  could not be placed"
+            .to_string(),
+    });
+    let unplaced = client
+        .call::<CreateSession>(&deny_all("unplaced-daemon"))
+        .await
+        .unwrap();
+    let advisory = unplaced
+        .classifier_advisory
+        .expect("a create over an unplaced daemon carries the advisory");
+    assert_eq!(
+        advisory,
+        classifier::advisory_text(
+            classifier::Cause::DaemonNotPlaced,
+            &EgressPolicy::deny_all()
+        ),
+        "the advisory is the daemon placement's"
+    );
+    assert!(
+        advisory.contains("so the box can still reach the network"),
+        "the advisory says the deny-all box runs unenforced: {advisory}"
+    );
+    assert_eq!(
+        unplaced.host_ip_enforcement.as_deref(),
+        Some("none"),
+        "a deny-all box an unplaced daemon cannot place states no enforcement"
     );
 }
 

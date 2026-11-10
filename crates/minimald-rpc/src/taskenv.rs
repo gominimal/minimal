@@ -41,6 +41,27 @@ pub const TASK_ENV_PREFIX: &str = "MINIMAL_TASK_ENV_";
 /// task as a variable called `DROP`.
 pub const TASK_ENV_DROP: &str = "MINIMAL_TASK_DROP";
 
+/// Channel env var saying the client resolved the task's `env_vars` itself,
+/// so the daemon must not resolve a remaining `inherit` against its own
+/// environment: it refuses the run instead.
+///
+/// `min session run` sends it (inbox#778). That client reads the task's
+/// declaration from the project on its own host, while the daemon runs the
+/// session's copy, taken at activation. An `inherit` only the session's
+/// copy declares never passed the user's `[vars]` policy, so it must not be
+/// answered from the daemon's environment either.
+///
+/// Not under [`TASK_ENV_PREFIX`], for the reason [`TASK_ENV_DROP`] is not.
+pub const TASK_ENV_RESOLVED: &str = "MINIMAL_TASK_RESOLVED";
+
+/// Whether a client set [`TASK_ENV_RESOLVED`] on the channel. Only `1`
+/// counts. Absent, as from every client but `min session run`, the daemon
+/// keeps its older fallback.
+#[must_use]
+pub fn resolved_from_channel_env(env_vars: &BTreeMap<String, String>) -> bool {
+    env_vars.get(TASK_ENV_RESOLVED).map(String::as_str) == Some("1")
+}
+
 /// The channel env var name carrying task variable `name`.
 #[must_use]
 pub fn wire_name(name: &str) -> String {
@@ -228,6 +249,21 @@ mod tests {
                 "{k} must never reach a box"
             );
         }
+    }
+
+    /// Only `min session run` marks a channel resolved, and only `1` counts.
+    /// The marker is not a task variable: it is outside the prefix, so it
+    /// never reaches the task's environment.
+    #[test]
+    fn the_resolved_marker_is_read_only_as_one_and_is_no_task_var() {
+        let mut channel = BTreeMap::new();
+        assert!(!resolved_from_channel_env(&channel), "absent is unresolved");
+        channel.insert(TASK_ENV_RESOLVED.to_string(), "0".to_string());
+        assert!(!resolved_from_channel_env(&channel), "only `1` counts");
+        channel.insert(TASK_ENV_RESOLVED.to_string(), "1".to_string());
+        assert!(resolved_from_channel_env(&channel));
+        assert!(!TASK_ENV_RESOLVED.starts_with(TASK_ENV_PREFIX));
+        assert!(from_channel_env(&channel).is_empty());
     }
 
     /// A client that sends no task env yields an empty map — the signal

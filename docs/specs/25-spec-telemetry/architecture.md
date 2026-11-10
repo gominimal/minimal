@@ -24,6 +24,8 @@ they install their tracing subscriber. Each then adds `span_layer()` and
 | `minimald` (native or guest) | `rpc` per request, and `exec`, `attach`, `forward`, `git_receive` per channel | the `TRACEPARENT` the CLI sends in the channel environment, or in the `direct-tcpip` originator field for a forward |
 | `minimald` actors | `sessions.manager.message` and `session.message` per mailbox message | the sender's trace ids, carried in the message |
 | `minimald` long-lived tasks | `session.actor`, `session.host`, `binding`, `net.relay`, `session.env`, `sessions.manager`, `store`, `maintenance` | none: each is a root with a `follows_from` link to the span that spawned it |
+| `minimald` manager loops | `sessions.hand_overs`, `sessions.publish_moves` | the `sessions.manager` root |
+| `minimald` hostname registry | `sessions.hand_over` (`port`) and `sessions.publish_move`, one per hand-over or move the registry sends | the ids of the span that made it, carried with it, else the `sessions.manager` root's |
 | `minimald` maintenance | `maintenance.clean` (`trigger` = `tick` or `request`) | the `maintenance` root |
 | `minimald` checkouts | `checkouts.update`, `checkouts.update_remote`, `checkouts.checkout_of` | the request's span |
 | `minvmd` | `minvmd` root per process (`cmd` = the subcommand) | an inherited `TRACEPARENT`, adopted only while exporting |

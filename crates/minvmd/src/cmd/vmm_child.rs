@@ -48,7 +48,7 @@ fn run_vmm() -> Result<()> {
     use anyhow::Context as _;
 
     use crate::cmd::{MARKER_SOCK_ENV, VSOCK_MARKER_PORT};
-    use crate::image::{resolve_initramfs_path, resolve_kernel_path, resolve_rootfs_path};
+    use crate::image::resolve_boot_images;
     use crate::krun::Context;
     use crate::vm::VmConfig;
 
@@ -62,9 +62,9 @@ fn run_vmm() -> Result<()> {
         tracing::warn!(error = %e, "cannot raise RLIMIT_NOFILE; the VM keeps its inherited limit");
     }
 
-    let kernel = resolve_kernel_path().context("resolving kernel path")?;
-    let rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
-    let initramfs = resolve_initramfs_path().context("resolving initramfs path")?;
+    // One lookup for the three images, so they come from one data directory.
+    let (kernel, rootfs, initramfs) =
+        resolve_boot_images().context("resolving boot image paths")?;
     let marker_sock = std::env::var(MARKER_SOCK_ENV).with_context(|| {
         format!("reading {MARKER_SOCK_ENV}: VMM child must be spawned by `minvmd boot`")
     })?;
