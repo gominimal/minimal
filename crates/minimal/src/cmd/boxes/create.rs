@@ -669,17 +669,18 @@ impl std::fmt::Display for StartNameHeld {
             holder,
             holder_name,
         } = &self.refusal;
+        let entry = printable(&self.entry);
+        let name = printable(name);
+        let holder_name = printable(holder_name);
         match holder {
             Some(holder) => write!(
                 f,
                 "Cannot start {entry}. The running box {holder_name} ({holder}) holds the \
                  name {name}.",
-                entry = self.entry,
             )?,
             None => write!(
                 f,
                 "Cannot start {entry}. The running box {holder_name} holds the name {name}.",
-                entry = self.entry,
             )?,
         }
         write!(
@@ -687,7 +688,6 @@ impl std::fmt::Display for StartNameHeld {
             " Run {command} --new {entry} to create another box from the entry, or \
              pass --name <name> to give the box another name.",
             command = self.verb.command(),
-            entry = self.entry,
         )
     }
 }
@@ -4171,6 +4171,23 @@ mod tests {
         ];
         let mut texts: Vec<String> = refusals.iter().map(ToString::to_string).collect();
         texts.push(StartNeedsTerminal::new(&bad).to_string());
+        for holder in [
+            None,
+            Some(boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap()),
+        ] {
+            texts.push(
+                StartNameHeld {
+                    verb: StartVerb::Box,
+                    entry: bad.clone(),
+                    refusal: minimald_rpc::HeldNameRefusal {
+                        name: bad.clone(),
+                        holder,
+                        holder_name: bad.clone(),
+                    },
+                }
+                .to_string(),
+            );
+        }
         for text in texts {
             assert!(!text.contains('\u{1b}'), "{text:?}");
             assert!(!text.contains('\n'), "{text:?}");
