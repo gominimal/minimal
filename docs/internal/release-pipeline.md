@@ -874,8 +874,10 @@ version number or a nightly commit hash. When you leave it empty, the
 workflow uses the newest staged nightly build, so an empty `version` works
 only for `unstable`.
 
-**Approval.** The `gate` job opens an approval issue, posts to Slack, and
-waits. Any member of the `@gominimal/minimalists` team can approve, except
+**Approval.** The `gate` job opens an approval issue, sends an
+`approval-requested` event to release-ops (see
+[Slack notifications](#slack-notifications)), and waits. If no approver
+decides within 350 minutes, the gate stops, just before its six-hour limit. Any member of the `@gominimal/minimalists` team can approve, except
 the person who started the run. The workflow reads the team once, when the
 gate opens. A change to the team's membership applies from the next
 promotion, not to one already waiting. If the workflow cannot read the team,
@@ -945,6 +947,26 @@ workflow there appends the version to `releases` in `rotation.yaml`, with a
 commit to `main`. It skips a version that it already logged, so a rerun or a
 rollback changes nothing. A nightly commit hash is not reported. Do not edit
 `releases` by hand.
+
+### Slack notifications
+
+The workflows do not post to Slack themselves. They send a `release-event`
+`repository_dispatch` to `gominimal/release-ops`, through the
+[`release-event`](../../.github/actions/release-event/action.yml) action, and
+release-ops posts it in `#releases`. The token comes from the
+`minimal-backporter` App, whose key is in the `release` environment. A send
+that fails only warns, so it never fails a release job. Dry runs send nothing.
+
+| Event | When | Where it posts |
+| --- | --- | --- |
+| `stage` | A `stage-release` run ends: success, failure (with the job that failed), or cancelled | The week's handoff thread |
+| `approval-requested` | `promote` opens its approval issue, with a link to it | The week's handoff thread |
+| `promote` | A promotion does not go through: refused (an approver denied, or the issue was closed), timed out (no decision in 350 minutes), failed, or cancelled | The week's handoff thread |
+| `rollback` | A `rollback=true` promotion to `stable` ends, as success or failure | The week's handoff thread |
+| `nightly-failed` | A `nightly` run fails or is cancelled, with the `check`, `release` and `promote-nightly` results | Top level of the channel |
+
+A promotion that succeeds sends no `promote` event. release-ops posts it from
+the `release-promoted` event that `report-release` already sends.
 
 ### merge-back.yml: merge a line into main
 
