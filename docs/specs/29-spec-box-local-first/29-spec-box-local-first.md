@@ -5,7 +5,7 @@ owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/823f45faf5a48349611f35d8e93e2d4695a61d4e/architecture.md
 arch_sha: "823f45faf5a48349611f35d8e93e2d4695a61d4e"
-updated: 2026-10-27
+updated: 2026-11-09
 ---
 
 # BOX — Box — one record and one spec for every session and task on a stock install
@@ -201,6 +201,27 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p minimald resume_non_pty_box_refuses_keeps_state
 
+- **BOX-176** WHEN a box whose spec sets `lifetime = "until_stopped"` is restarted THE SYSTEM SHALL stop its processes as BOX-013 states if they are running, then start them again from the spec stored at its creation (BOX-068), carrying no change made to the spec while it ran, and from its retained filesystem, under the same `box_id` and name.
+  tier:     T0
+  verify:   cargo nextest run -p minimald restart_until_stopped_box_from_stored_spec_same_id_and_name
+  - IF a restart targets a box whose spec does not set `lifetime = "until_stopped"` THEN THE SYSTEM SHALL refuse the restart with exit 2 and leave the box's state unchanged.
+    tier:   T0
+    verify: cargo nextest run -p minimald restart_refuses_box_not_until_stopped_keeps_state
+  - IF a restart meets one of the refusals BOX-025 states for a resume (the name check, which a running box's own name does not trip, the unsatisfiable-spec check, or BVOL-013's volume-hold check, which the box's own volume holds do not trip) THEN THE SYSTEM SHALL refuse the restart with that refusal's exit code and leave the box's state unchanged, a running box still running, evaluating the lifetime check above first and then those three refusals in BOX-025's order, all before the restart stops any process, and never applying BOX-030's PTY check, which a restart of a box without `pty_enabled` exists to pass.
+    tier:   T0
+    verify: cargo nextest run -p minimald restart_takes_resume_refusals_before_it_stops_anything
+  - IF a restart's start fails after the restart has stopped the box's processes THEN THE SYSTEM SHALL leave the box `stopped` with the `exited` event its stop recorded (BOX-013), record no `started` event, and fail the restart with the start's error, leaving no other change to the record.
+    tier:   T0
+    verify: cargo nextest run -p minimald restart_start_failure_leaves_box_stopped_with_its_stop_recorded
+
+- **BOX-177** WHEN a restart starts a box's processes again THE SYSTEM SHALL run only the lifecycle hooks that BOX-027 and BOX-028 run on resume.
+  tier:     T0
+  verify:   cargo nextest run -p minimald restart_runs_only_resume_hooks
+
+- **BOX-178** WHEN a box is restarted THE SYSTEM SHALL record the `exited` event BOX-013 states if the restart stops running processes, an `exec_exited` event as BOX-152 states for each exec that stop ends, then the `started` event BOX-040 states when the entrypoint starts again, and no event type of the restart's own.
+  tier:     T0
+  verify:   cargo nextest run -p minimald restart_records_exited_then_started_only
+
 - **BOX-037** IF a box whose spec sets `lifetime = "until_complete"` runs past its declared `timeout` THEN THE SYSTEM SHALL send SIGTERM to every process in the box as BOX-013 defines them, running execs included, wait, then send SIGKILL to those still running, and end the box with `exited.reason = "timeout"`.
   tier:     T0
   verify:   cargo nextest run -p minimald until_complete_timeout_terms_then_kills_box_and_execs_reason_timeout
@@ -243,7 +264,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p minimald list_scoped_to_project_reads_project_root
 
-- **BOX-159** WHEN one box record is read THE SYSTEM SHALL return its `box_id`, name, `box_type`, `parent`, project root, state with the `reason`, `exit_code` and `signal` BOX-011 defines, its identity as BOX-140 reports it, and the exec id of each live exec in it (BOX-149).
+- **BOX-159** WHEN one box record is read THE SYSTEM SHALL return its `box_id`, name, `box_type`, `parent`, project root, state with the `reason`, `exit_code` and `signal` BOX-011 defines, its identity as BOX-140 reports it, and, for each live exec in it (BOX-149), the exec id, the argv and the one mode the exec was started in (BOX-149): `tty` for an exec started with a PTY, whether or not a client is attached to it now, `detached` for one started with no PTY and no client, or `attached` for one started on a client's pipes.
   tier:     T0
   verify:   cargo nextest run -p minimald show_returns_record_state_identity_and_live_execs
   - WHEN the record of a box in the `stopped` or `exited` state is read THE SYSTEM SHALL also return the bytes on disk a reap of the box frees, the same figure a prune preview lists for it, and return no figure, never zero, where it cannot measure them.
@@ -331,10 +352,25 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p mfile other_builtin_type_entry_refused_exit3_other_entries_usable
 
-- **BOX-064** THE SYSTEM SHALL expand an entry in the order `[upstream]`, type defaults, `[defaults]`, `[defaults.<type>]`, entry, selected loadouts, then command-line overrides where BCLI provides them, unioning lists in that order and replacing scalars and tables wholesale.
+- **BOX-064** THE SYSTEM SHALL expand an entry in the order `[upstream]`, type defaults, `[defaults]`, `[defaults.<type>]`, entry, selected loadouts, then command-line overrides where BCLI provides them, unioning lists in that order and replacing scalars and tables wholesale, except that the command-line override layer merges as the sub-bullets below state.
   tier:     T1
   verify:   cargo nextest run -p mfile expansion_order_and_merge_rules
-  property: For every set of layers, expansion equals the fold of the merge rule over the layers in the stated order.
+  property: For every set of layers, expansion equals the fold of the merge rule over the layers before the command-line overrides in the stated order, followed by the command-line override rules below.
+  - WHERE the command-line override layer sets one or more `[network]` keys THE SYSTEM SHALL apply every one of those overrides, each to the key it names in the expanded `[network]` table, adding an override's values to a list key other than `egress.allow_protocols`, which the next sub-bullet replaces, and replacing a scalar key's value, and leave each `[network]` key that no override names with the value the earlier layers set.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_network_override_changes_only_its_key
+  - WHERE the command-line override layer sets `egress.allow_protocols` THE SYSTEM SHALL replace that list with the override's values.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_allow_protocols_override_replaces_list
+  - WHERE the command-line override layer denies all egress THE SYSTEM SHALL empty every allow list of the expanded spec's `egress` section, `egress.allow_dns_hosts`, `egress.allow_subnets` and `egress.allow_protocols`, and leave each present (NET-140), before it applies the layer's other overrides, so an `egress.allow_protocols`, `egress.deny_subnets` or `network.mode` override of the same layer then sets its key as the sub-bullets above state.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_deny_all_egress_empties_allow_lists_then_applies_the_rest
+  - IF the command-line override layer both denies all egress and has a separate override of `egress.allow_dns_hosts` or `egress.allow_subnets` THEN THE SYSTEM SHALL refuse the expansion with exit 2, naming both overrides and telling the person to drop one of them.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_deny_all_egress_with_allow_list_override_exit2
+  - WHERE the command-line override layer turns hooks off THE SYSTEM SHALL empty the expanded spec's composed `lifecycle_hooks`.
+    tier:   T0
+    verify: cargo nextest run -p mfile command_line_no_hooks_empties_lifecycle_hooks
 
 - **BOX-065** THE SYSTEM SHALL produce an expanded spec whose serialization is byte-identical across two runs over one file, one set of command-line overrides and one client `[secret-store-rules]` set.
   tier:     T1
@@ -355,6 +391,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-068** WHEN a box is created THE SYSTEM SHALL send the daemon the expanded spec rather than the entry and store it in the record.
   tier:     T0
   verify:   cargo nextest run -p minimald-rpc create_sends_expanded_spec_and_stores_it
+
+- **BOX-179** WHEN an entry is expanded THE SYSTEM SHALL write into each table of the expanded spec's `lifecycle_hooks` a `declared_by` table naming who declared the hook: `{ kind = "loadout", name = "<loadout name>" }` for a hook that a selected loadout declares, and `{ kind = "project" }` with no host path for a hook that the project's `minimal.toml` declares in any of its layers (`[defaults]`, `[defaults.<type>]`, a project Box Type's defaults, or the entry), keeping one table for each declaration, so a hook that two declarers declare appears once for each.
+  tier:     T0
+  verify:   cargo nextest run -p mfile expanded_lifecycle_hooks_carry_declared_by
 
 - **BOX-071** WHEN a box is created THE SYSTEM SHALL compute, in both the client and the daemon, the Gatehouse §6.3.2 Box Spec projection of the expanded spec, exactly the §6.3.2 field set (`v`; `type.name`, `type.source`, `type.root`, and `type.registry` when the source is `org`; `network.mode`, `egress_dns`, `egress_subnets`, `egress_deny_subnets`, `ingress_ports` and `quic443`; `bep.steering`; `registry_pinned`; `registry_commit`; `loadout_mode`; `pty_enabled`; `lifetime`; the `[nesting]` bounds; `secret_grants`), under §6.3.2's field names, taking `network.egress_dns` from the spec's `egress.allow_dns_hosts`, `network.egress_subnets` from its `egress.allow_subnets` and `network.egress_deny_subnets` from its `egress.deny_subnets`, and projecting `egress.allow_protocols` nowhere, since the node enforces it unprojected; and digest it as SHA-256 over its RFC 8785 JCS bytes, encoded base64url.
   tier:     T1
@@ -488,7 +528,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 
 ### O5 Un-enrolled
 
-- **BOX-140** WHILE no identity plane is configured THE SYSTEM SHALL perform creation, stop, resume, rename, exec, reaping, pruning, listing and reading records, reading a box's events and reading a stopped box's files over the local socket's file-mode trust, omit `identity.sock` from the box, and report `identity: none` in the box's record.
+- **BOX-140** WHILE no identity plane is configured THE SYSTEM SHALL perform creation, stop, resume, restart, rename, exec, reaping, pruning, listing and reading records, reading a box's events and reading a stopped box's files over the local socket's file-mode trust, omit `identity.sock` from the box, and report `identity: none` in the box's record.
   tier:     T0
   verify:   cargo nextest run -p minimald unenrolled_operations_over_file_mode_trust
 
@@ -513,7 +553,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 - Choosing the entry a bare start creates from, the entry named `default` else the sole entry, and its exit 2 when a non-session entry named `default` blocks the implicit one: `docs/specs/28-spec-box-cli` (BCLI). This spec supplies the implicit entry (BOX-165).
 - Credentialed egress, the node-local egress proxy, `[network.bep]`, `[secrets]` resolution, `min auth`, `min secret`, and `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP), and gominimal/minimal#1501.
 - Entries of type `agent`, `service`, `build` and `container-build`, including their expansion and validation, the `[agents.<name>]` and `[services.<name>]` tables, and their type-specific behaviour (the agent harness, hermetic builds): the Agent Box epic gominimal/inbox#678 and successors. BOX-063 refuses each such entry when it is expanded or created, until that epic's spec lands; BOX-059 keeps all six built-in types as data.
-- Two attribute rules, which follow the attribute on any type that sets it rather than any one type (architecture design principle 8): what ends a box whose spec sets `lifetime = "until_stopped"`, what happens when its entrypoint returns, and the `[execution] restart` policy that applies to it; and the gate that applies selected loadouts only where the spec's `loadout_mode` permits them (BOX-064 places the loadout layer in the order and does not gate it). Both go to the Agent Box epic gominimal/inbox#678 or its successor. This spec accepts, expands and projects both keys (BOX-071) and enforces neither.
+- Two attribute rules, which follow the attribute on any type that sets it rather than any one type (architecture design principle 8): what ends a box whose spec sets `lifetime = "until_stopped"`, what happens when its entrypoint returns, and the `[execution] restart` policy that applies to it; and the gate that applies selected loadouts only where the spec's `loadout_mode` permits them (BOX-064 places the loadout layer in the order and does not gate it). Both go to the Agent Box epic gominimal/inbox#678 or its successor. This spec accepts, expands and projects both keys (BOX-071) and enforces neither. A restart that a client asks for is not the `[execution] restart` policy: BOX-176 defines it.
 - Changing a running box's spec: `min add` and any other runtime change, with the `package_added`, `port_exposed` and `file_exported` events it writes: a follow-up spec, not yet filed. A box here resumes from its creation-time spec (BOX-025).
 - Organization Box Types: resolving a type from an organization registry, and refusing a project type that redefines an organization type's name: the Gatehouse directory work, gominimal/inbox#579. Until it lands, BOX-059 resolves only built-in and project types, and `type.source` in the projection (BOX-071) is `builtin` or `project`.
 - Spec sections this spec accepts and carries but does not enforce, each warned of at creation (BOX-076): `[[file_imports]]` and `[[file_exports]]`, whose schema validation the Agent Box epic gominimal/inbox#678 owns while the copy itself is unowned, a follow-up; `[[github_imports]]`, unowned, a follow-up (the clone is the broker's creation-time mint under Gatehouse §6.3); `[otel]`, the observability epic gominimal/inbox#515 and the Agent Box epic gominimal/inbox#678's telemetry receiver; and `[network] vpn_network_names`, the mesh spec MRF (gominimal/minimal#1420). A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are not carried: BOX-076 leaves them out with a warning, as BEP-037 does for the first.
@@ -558,7 +598,15 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 
 **A rename cannot collide, and ambiguity across hosts is refused.** The owner decided on 2026-09-28 that a rename to a name a running box on the same host holds, or to `self`, is refused with exit 2 naming the holder (BOX-010), which is what makes BOX-004's per-host uniqueness hold over rename; and that BOX-005 resolves per host, refusing with exit 2 and a candidate list when running boxes of the name sit on more than one host, the architecture's Addressing rule and the path BCLI-002 renders. The alternatives were letting a rename make two running boxes share a name, which leaves resolution ambiguous on one host, and letting resolution pick one of two hosts' running boxes silently. The same refusal applies when no box of the name is running and records of it are retained on more than one host (BOX-005's second sub-bullet), because the architecture's Addressing makes any unqualified ambiguous name an error listing the candidates; picking the most recent creation across hosts was the alternative, rejected because a stock Linux install has both local hosts present and the pick would depend on timing the developer cannot see.
 
-**Resume here restarts processes; enrolled identity is Gatehouse's.** BOX-025 and BOX-030 restart a stopped or exited box's processes from its stored spec, and refuse that for a box without `pty_enabled` (its restart is a new `run`). Under an identity plane, re-establishing a box's identity after a stop or a host resume is Gatehouse §6.3.3's, for any box including a non-PTY one; it composes with this rather than contradicting it, and on an un-enrolled host there is no identity to re-establish.
+**Resume here restarts processes; enrolled identity is Gatehouse's.** BOX-025 and BOX-030 restart a stopped or exited box's processes from its stored spec, and refuse that for a box without `pty_enabled`. A box without `pty_enabled` whose spec sets `lifetime = "until_stopped"` restarts through BOX-176, and any other box's restart is a new `run`. Under an identity plane, re-establishing a box's identity after a stop or a host resume is Gatehouse §6.3.3's, for any box including a non-PTY one; it composes with this rather than contradicting it, and on an un-enrolled host there is no identity to re-establish.
+
+**An `until_stopped` box restarts from its stored spec, as a resume does.** Decided on 2026-11-09 (gominimal/minimal#2761): BCLI-074's `min box restart` needs a daemon operation for a box whose spec sets `lifetime = "until_stopped"`, which BOX-030 does not resume unless it sets `pty_enabled`. A restart stops the box's processes as a stop does if they run, then starts them from the creation-time spec and the retained filesystem under the same id and name (BOX-176). It takes a resume's refusals in a resume's order, except BOX-030's PTY check, which would refuse the very box a restart is for. It runs a resume's hooks (BOX-177), and records the existing `exited`, `exec_exited` and `started` events (BOX-178), so a restart and a resume cannot drift apart and a reader of the events needs no new case. A box with any other lifetime is refused with exit 2, because a box that runs to completion gets a new run instead. The alternatives were a `restarted` event, rejected because the `exited` and `started` pair already records both halves, and running `on_activate` on every restart, rejected because `hooks_on_resume` already lets an entry ask for that. A restart is an operation a client asks for. The `[execution] restart` policy, which restarts a box by itself, stays with the Agent Box epic under Non-goals.
+
+**Each stored hook keeps who declared it.** Decided on 2026-11-09 (gominimal/minimal#2877): `min session hooks` names the loadout or project that declared each hook (`docs/specs/11-spec-lifecycle-hooks`), and BCLI-022's `min box spec` can show that column only if the stored spec carries it. BOX-064 merges every layer's `lifecycle_hooks` into one list, and BOX-161's provenance sits beside the spec and names a layer, not a loadout, so neither keeps the declarer. BOX-179 writes a `declared_by` table into each hook, under the name the client's hook code already uses. A project hook names no host path, so the same `minimal.toml` still expands to the same bytes on every host (BOX-065, BOX-145). A loadout hook names the loadout, which is what the hooks listing shows today. No other source declares a hook: `[upstream]` brings packages, whose hooks spec 11 denies outright, and no built-in Box Type's defaults set `lifecycle_hooks`. So every hook in the expanded spec is a loadout's or the project's, whichever of the project's layers declared it. The field changes no projection field, because `lifecycle_hooks` is outside the §6.3.2 field set (BOX-071). The alternative, keeping the declarer beside the spec as BOX-161 does, was rejected because the record stores the spec (BOX-068), so a read after a daemon restart can show only what the spec carries.
+
+**The command-line layer changes only what it names.** The architecture at gominimal/arch@9495216 (#166) gives the command-line override layer its own merge rule (gominimal/minimal#3200). Each create-time network flag changes only the key it names, so the rest of the expanded `[network]` table stays in place. Under BOX-064's wholesale table replacement, a flag that sets one key would drop the others. A flag for a list key adds to the list, as the layers merge, but `--allow-protocols` replaces its list, because that key restricts protocols. `--deny-all-egress` has no key of its own. It empties every allow list in `egress`, `allow_protocols` included, as NET-140 states. The owner ruled on 2026-11-09 that NET-140 is right, and gominimal/arch#173 corrects the architecture's narrower wording. The owner ruled on 2026-11-09 that deny-all is refused only beside an override of `allow_dns_hosts` or `allow_subnets`: those ask to open destinations that deny-all closes, so one of them would be dropped silently. It combines with `--deny-subnets`, `--allow-protocols` and `--network` (gominimal/minimal#3219, #3220). The owner ruled on 2026-11-10 that deny-all applies first in its layer, and then the layer's other overrides apply. So `--allow-protocols` then sets its list, `--deny-subnets` adds to its list, and `--network` sets the mode. The stored spec shows what the person typed. Reachability does not change, because `allow_protocols` only filters what the destination lists grant, and those are empty (NET-074, NET-140). The refusal needs an override separate from deny-all, because deny-all itself sets the allow lists empty. `--no-hooks` empties the composed hook list, so the stored spec carries no hook and a resume runs none. BOX-064's sub-bullets state these rules in terms of the spec's keys, so a client other than the CLI gets the same result. BCLI names the flags. Type constraints are still checked after this layer (BOX-061), so no override reaches past one.
+
+**A box read lists each live exec whole.** Decided on 2026-11-09 (gominimal/minimal#3205): BCLI-067's `min box show` shows each live exec's id, argv and whether it holds a PTY or runs detached, so BOX-159 returns the id, the argv and the exec's mode rather than the id alone. A PTY flag alone cannot tell a detached exec from an attached one, so the mode is returned whole. The mode is the one the exec was started in, a single value that the daemon holds for the exec's life, so a PTY exec that no client is attached to now is still `tty`, and no exec has two modes. The argv is the one BOX-152's `exec_started` event already records, and the events and a box read have the same readers (BOX-140's local socket trust), so the read shows no reader an argv the events do not. Neither redacts it. The alternative, ids only with the client reading each exec's `exec_started` event, was rejected because it makes one show into several reads for a value the daemon holds while the exec runs.
 
 **Expander version skew reports and continues.** The projection digest comparison (BOX-072) and the daemon's admission check (BOX-160) are the checks that refuse; a version difference is reported so an operator can act, but compatible skews across an upgrade are not blocked. BOX-074 states the reported version rather than how the expander is built, so a second implementation meets it without sharing code.
 

@@ -1280,7 +1280,20 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
 
         tracing::info!("Started listening on {}", cli.listen_on());
         request_daemon_placement(tree_root).await;
-        read_host_ip_enforcement_fact(tree_root);
+        // gominimal/inbox#1054: a native daemon re-reads the fact each time
+        // its own cgroup changes, so a placement that lands after the
+        // start-up reading (`min finalize-install` under a running daemon, a
+        // late placer) reaches the creates that follow. The tree the daemon
+        // answers over, and its own mount table read live (no knob).
+        minimald::box_runtime::read_fact_and_watch_placement(
+            tree_root.to_path_buf(),
+            None,
+            minimald::guest::is_microvm_daemon(),
+            minimald::box_runtime::OWN_CGROUP_POLL,
+            sandbox::classifier::own_cgroup_path,
+            || read_host_ip_enforcement_fact(tree_root),
+        )
+        .await;
         let (opts, ssh_name) = cli.ssh_args();
         tracing::info!(
             "Run the following to debug the socket:\n\nssh \\\n\t{} \\\n\t{}",
@@ -1424,11 +1437,20 @@ async fn request_daemon_placement(tree_root: &std::path::Path) {
 /// ends it when one exists, and what this host does with the boxes.
 fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     let guest = minimald::guest::is_microvm_daemon();
+    // The placement is read once, for both the fact and the log lines: the
+    // placement unit answers asynchronously, so two reads could disagree.
+    let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
+    let placed = minimald::net::classifier::daemon_fetch_leaf(tree_root).is_some();
+    let unplaced = daemon_leaf.is_dir() && !placed;
+    // An unreadable probe read by a daemon outside its own leaf is that
+    // daemon's placement, not the table's: it places no box, so it refuses
+    // none, and its fact says so (gominimal/minimal#3067).
     let classifier_decision = minimald::net::classifier::decide_now(
         tree_root,
         sandbox::classifier::own_mountinfo().as_deref(),
         guest,
-    );
+    )
+    .over_daemon_placement(guest, unplaced);
     // The daemon's node half of per-box egress enforcement: seeded here, so
     // the daemon's first create answer already names this host, and
     // refreshed by each host-address launch's own re-read.
@@ -1437,9 +1459,7 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // tree is installed is its own state, with its own remedy, so it gets
     // its own line beside the probe's: the probe reads it only as a table
     // whose effect could not be read.
-    let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
-    let placed = minimald::net::classifier::daemon_fetch_leaf(tree_root).is_some();
-    if !guest && !placed && daemon_leaf.is_dir() {
+    if !guest && unplaced {
         tracing::warn!(
             leaf = %daemon_leaf.display(),
             daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),

@@ -310,6 +310,21 @@ pub enum Cause {
     /// what failed to be read, and a person reading it decides what to look
     /// at.
     ProbeUnreadable,
+    /// The step is installed, but this native daemon is not in its own
+    /// leaf: the placement unit is missing or out of date, or a start
+    /// outran it (gominimal/inbox#1206). A daemon outside the tree cannot
+    /// migrate a box into a leaf, so no box it launches is placed, and an
+    /// unplaced box is never refused on a probe cause (the launch's
+    /// `refused_unenforced_host_address_box`): every host-address box, a
+    /// deny-all one included, runs unenforced. Its probe reads only as a
+    /// table whose effect could not be read, so the decision is re-spelled
+    /// over the daemon's placement ([`Decision::over_daemon_placement`]),
+    /// and the advisory says what the launch does instead of what a placed
+    /// daemon would. `min finalize-install` reinstalls the placement unit,
+    /// which places the daemon at its next start, so the install command
+    /// is named. Native only: a guest daemon outside its tree refuses every
+    /// host-address box on that ground itself.
+    DaemonNotPlaced,
 }
 
 impl Cause {
@@ -339,6 +354,10 @@ impl Cause {
                  own control connection or the probe's placement failed, so \
                  whether the table is refusing is unknown"
             }
+            Self::DaemonNotPlaced => {
+                "this daemon is not in its classifier leaf, so it cannot place a \
+                 host-address box in one"
+            }
         }
     }
 
@@ -365,11 +384,13 @@ impl Cause {
     /// decided while nothing refuses it, so the launch refuses it and the
     /// boxes that need no verdict enforced still run. The match stays
     /// exhaustive over causes, never claiming a host kind that cannot
-    /// produce it.
+    /// produce it. [`Cause::DaemonNotPlaced`] is native only; its guest arm
+    /// is the guest's own unplaced state, where no box can be placed and
+    /// every host-address box is refused.
     pub fn host_ip_box_outcome(self, guest: bool) -> &'static str {
         if guest {
             return match self {
-                Self::CannotConfine => {
+                Self::CannotConfine | Self::DaemonNotPlaced => {
                     "its host-address boxes are refused: it cannot place one in a \
                      leaf that confines"
                 }
@@ -383,9 +404,10 @@ impl Cause {
             };
         }
         match self {
-            Self::StepNotInstalled | Self::CannotConfine | Self::GuestTableNotLoaded => {
-                "its host-address boxes run unenforced"
-            }
+            Self::StepNotInstalled
+            | Self::CannotConfine
+            | Self::GuestTableNotLoaded
+            | Self::DaemonNotPlaced => "its host-address boxes run unenforced",
             Self::TableNotEffective | Self::ProbeUnreadable => {
                 "its deny-all host-address boxes are refused and its other \
                  host-address boxes run unenforced"
@@ -402,10 +424,14 @@ impl Cause {
     /// the marker vouches for but the probe does not names nothing either:
     /// the marker is what the install's item reads, so with it present the
     /// install is a no-op, not a reload. A probe that could not read the
-    /// table names nothing: no command is known to make a probe run.
+    /// table names nothing: no command is known to make a probe run. A
+    /// daemon outside its leaf names the install, which reinstalls the unit
+    /// that places the daemon at its next start.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled => Some(sandbox::classifier::install_hint()),
+            Self::StepNotInstalled | Self::DaemonNotPlaced => {
+                Some(sandbox::classifier::install_hint())
+            }
             Self::CannotConfine
             | Self::GuestTableNotLoaded
             | Self::TableNotEffective
@@ -429,7 +455,9 @@ impl Cause {
 /// the box declares egress. The two probe causes refuse a deny-all box at
 /// placement rather than run it unenforced ([`Cause::host_ip_box_outcome`]),
 /// so over those the line says the box is refused instead of claiming it
-/// runs. The install is named only where running it enforces the
+/// runs. A daemon outside its leaf places no box, so nothing is refused
+/// there ([`Cause::DaemonNotPlaced`]): the box runs, and the line says
+/// so. The install is named only where running it enforces the
 /// declaration: a cause no install ends names the own-address start alone
 /// and says why the install cannot help, and a declaration the classifier
 /// cannot enforce on a host address names the own-address start alone too,
@@ -514,6 +542,27 @@ impl Decision {
             decided: false,
             cause: Some(cause),
             carve_out: None,
+        }
+    }
+
+    /// This decision as an unplaced native daemon reads it: a
+    /// [`Cause::ProbeUnreadable`] read by a daemon outside its own leaf is
+    /// re-spelled [`Cause::DaemonNotPlaced`], because such a daemon's probe
+    /// child cannot be placed, so it reads only as a table it could not
+    /// read, while the launch that follows places no box and so refuses
+    /// none. [`Cause::TableNotEffective`] is kept as read: that reading needs
+    /// a probe child placed in the deny leaf, which proves this daemon can
+    /// place a box whatever its own leaf says, and its remedy is the
+    /// table's, not the placement's. The other causes already say the boxes
+    /// run unenforced, and a decided host, a placed daemon and the guest
+    /// keep their decision as read.
+    #[must_use]
+    pub fn over_daemon_placement(self, guest: bool, daemon_unplaced: bool) -> Self {
+        match self.cause {
+            Some(Cause::ProbeUnreadable) if !guest && daemon_unplaced => {
+                Self::undecidable(Cause::DaemonNotPlaced)
+            }
+            _ => self,
         }
     }
 
@@ -3453,6 +3502,14 @@ pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
         .lines()
         .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
         .then_some(sandbox::classifier::DAEMON_LEAF)
+}
+
+/// Whether this daemon stands outside a daemon leaf the step installed: the
+/// leaf is there and [`daemon_fetch_leaf`] does not find this process in it.
+/// A tree without the leaf is the step not installed, its own cause, so it
+/// does not read as unplaced here.
+pub fn daemon_unplaced(root: &Path) -> bool {
+    sandbox::classifier::daemon_leaf(root).is_dir() && daemon_fetch_leaf(root).is_none()
 }
 
 /// How long a daemon waits for the placer to finish: the placer scans every
@@ -6819,6 +6876,117 @@ mod tests {
         );
     }
 
+    /// Whether an nft older than 1.0.9 loads a base chain of the inet family
+    /// at `priority` on `hook`. A number loads on every hook. A standard
+    /// name loads only where nft's family and hook matrix pairs it with the
+    /// hook: up to 1.0.8, `dstnat` (-100) on prerouting alone and `srcnat`
+    /// (100) on postrouting alone, so either name on another hook is
+    /// refused with "invalid priority expression value in this context".
+    /// 1.0.9 (nftables commit 8beafab7) added output to `dstnat` and input
+    /// to `srcnat`; Debian 12 ships 1.0.6 and Ubuntu 22.04 ships 1.0.2,
+    /// and one refused chain fails the classifier's whole transaction.
+    fn pre_1_0_9_nft_takes_priority(hook: &str, priority: &str) -> bool {
+        if priority.parse::<i32>().is_ok() {
+            return true;
+        }
+        // `name`, or `name + n` / `name - n`: the name is what is checked.
+        match priority.split_whitespace().next().unwrap_or_default() {
+            "raw" | "mangle" | "filter" | "security" => true,
+            "dstnat" => hook == "prerouting",
+            "srcnat" => hook == "postrouting",
+            _ => false,
+        }
+    }
+
+    /// Every base chain a rendered table declares, as (chain, type, hook,
+    /// priority), read off its `type … hook … priority …;` line.
+    fn base_chains(ruleset: &str) -> Vec<(String, String, String, String)> {
+        let mut chains = Vec::new();
+        let mut chain = String::new();
+        for line in ruleset.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("chain ") {
+                chain = rest.trim_end_matches('{').trim().to_owned();
+                continue;
+            }
+            let Some(decl) = line.strip_prefix("type ") else {
+                continue;
+            };
+            let decl = decl.split(';').next().unwrap_or_default();
+            let words: Vec<&str> = decl.split_whitespace().collect();
+            match words.as_slice() {
+                [kind, "hook", hook, "priority", priority @ ..] if !priority.is_empty() => {
+                    chains.push((
+                        chain.clone(),
+                        (*kind).to_owned(),
+                        (*hook).to_owned(),
+                        priority.join(" "),
+                    ));
+                }
+                _ => panic!("a base chain declaration nft would read: {line:?}"),
+            }
+        }
+        chains
+    }
+
+    /// The matrix the check below holds the table to, pinned on its own:
+    /// the refused spelling of inbox#1196 and its accepted equivalent.
+    #[test]
+    fn pre_1_0_9_nft_priority_matrix() {
+        assert!(!pre_1_0_9_nft_takes_priority("output", "dstnat"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "-100"));
+        assert!(pre_1_0_9_nft_takes_priority("prerouting", "dstnat"));
+        assert!(!pre_1_0_9_nft_takes_priority("input", "srcnat"));
+        assert!(pre_1_0_9_nft_takes_priority("postrouting", "srcnat"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "mangle"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "filter"));
+        assert!(pre_1_0_9_nft_takes_priority("postrouting", "mangle"));
+        assert!(!pre_1_0_9_nft_takes_priority("output", "dstnat + 5"));
+        assert!(!pre_1_0_9_nft_takes_priority("output", "nonsense"));
+    }
+
+    /// The table loads on the oldest nft a supported host ships, not only
+    /// on 1.0.9 and later: every base chain of the native render and of
+    /// the guest's names its priority in a form nft 1.0.2 through 1.0.8
+    /// accept on its hook. The dstnat chain, the one that once spelled
+    /// `priority dstnat` on output and so loaded nowhere before 1.0.9
+    /// (inbox#1196), is a nat chain on output at -100, dstnat's value.
+    #[test]
+    fn every_base_chain_loads_on_nft_before_1_0_9() {
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let renders = [
+            ("native", rendered_ruleset()),
+            (
+                "guest",
+                String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+                    .expect("the guest's render is text"),
+            ),
+        ];
+        for (which, ruleset) in &renders {
+            let chains = base_chains(ruleset);
+            assert!(
+                chains.len() >= 5,
+                "the {which} render declares its base chains: {chains:?}"
+            );
+            for (chain, _, hook, priority) in &chains {
+                assert!(
+                    pre_1_0_9_nft_takes_priority(hook, priority),
+                    "the {which} render's {chain} chain says `hook {hook} priority \
+                     {priority}`, which nft before 1.0.9 refuses: {ruleset}"
+                );
+            }
+            let dstnat: Vec<_> = chains
+                .iter()
+                .filter(|(chain, ..)| chain == "dstnat")
+                .map(|(_, kind, hook, priority)| (kind.as_str(), hook.as_str(), priority.as_str()))
+                .collect();
+            assert_eq!(
+                dstnat,
+                [("nat", "output", "-100")],
+                "the {which} render steers at output's nat hook, at dstnat's -100: {ruleset}"
+            );
+        }
+    }
+
     /// The guest's table writes the sender's cgroup into every packet it
     /// sends: the boxes cohort's connections leave with the box mark, and
     /// every other packet with the field cleared, so the VM host's gate
@@ -9933,5 +10101,95 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(error.to_string().contains("no such table"), "{error}");
+    }
+
+    /// gominimal/minimal#3067: a native daemon outside its leaf places no
+    /// box, so its deny-all box runs unenforced. The advisory, the start-up
+    /// outcome and the remedy say that, in the words the issue binds.
+    #[test]
+    fn an_unplaced_daemon_says_its_deny_all_box_runs_unenforced() {
+        let deny_all = boxes::EgressPolicy::deny_all();
+        assert_eq!(
+            advisory_text(Cause::DaemonNotPlaced, &deny_all),
+            "note: you asked this box for no network access, but this machine can't \
+             enforce it yet, so the box can still reach the network.\n  Enforce it: \
+             min finalize-install   (or start the box with --network own_ip, which \
+             enforces it now)"
+        );
+        assert_eq!(
+            Cause::DaemonNotPlaced.host_ip_box_outcome(false),
+            "its host-address boxes run unenforced"
+        );
+        assert_eq!(
+            Cause::DaemonNotPlaced.install_command(),
+            Some(sandbox::classifier::install_hint())
+        );
+        // A placed daemon's probe causes still refuse a deny-all box.
+        for cause in [Cause::TableNotEffective, Cause::ProbeUnreadable] {
+            assert!(
+                advisory_text(cause, &deny_all).contains("so it refuses to start the box"),
+                "{cause:?}"
+            );
+        }
+    }
+
+    /// Only an unreadable probe read by an unplaced native daemon is
+    /// re-spelled; every other decision keeps what it read.
+    #[test]
+    fn a_probe_cause_over_an_unplaced_native_daemon_is_its_placement() {
+        let read = Decision::undecidable(Cause::ProbeUnreadable);
+        assert_eq!(
+            read.clone().over_daemon_placement(false, true).cause(),
+            Some(Cause::DaemonNotPlaced),
+            "ProbeUnreadable, native, unplaced"
+        );
+        assert_eq!(
+            read.clone().over_daemon_placement(false, false).cause(),
+            Some(Cause::ProbeUnreadable)
+        );
+        assert_eq!(
+            read.over_daemon_placement(true, true).cause(),
+            Some(Cause::ProbeUnreadable)
+        );
+        // A table that read as not in force placed its probe child, so this
+        // daemon can place a box: the cause and its remedy stay the table's.
+        for kept in [
+            Cause::TableNotEffective,
+            Cause::StepNotInstalled,
+            Cause::CannotConfine,
+        ] {
+            assert_eq!(
+                Decision::undecidable(kept)
+                    .over_daemon_placement(false, true)
+                    .cause(),
+                Some(kept)
+            );
+        }
+        let decided = Decision::decided().over_daemon_placement(false, true);
+        assert!(decided.can_decide_per_box(), "{decided:?}");
+    }
+
+    /// Unplaced means the step's daemon leaf is there and this process is
+    /// not in it; a tree without the leaf is the step not installed.
+    #[test]
+    fn a_daemon_is_unplaced_only_beside_a_leaf_it_is_not_in() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        assert!(
+            !daemon_unplaced(tree.path()),
+            "no leaf, no placement to miss"
+        );
+        let leaf = sandbox::classifier::daemon_leaf(tree.path());
+        std::fs::create_dir_all(&leaf).expect("the daemon leaf");
+        std::fs::write(leaf.join(PROCS_FILE), "1\n").expect("another member");
+        assert!(
+            daemon_unplaced(tree.path()),
+            "a leaf this process is not in"
+        );
+        std::fs::write(
+            leaf.join(PROCS_FILE),
+            format!("1\n{}\n", std::process::id()),
+        )
+        .expect("this process as a member");
+        assert!(!daemon_unplaced(tree.path()), "a leaf this process is in");
     }
 }

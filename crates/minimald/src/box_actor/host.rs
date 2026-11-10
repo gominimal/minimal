@@ -84,40 +84,30 @@ impl crate::net::classifier::CgroupMoves for HostMoves {
     }
 
     fn add_blocked_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
-        run_quic443_leaf_helper(
-            std::path::Path::new("sudo"),
-            std::path::Path::new(QUIC443_LEAF_HELPER),
-            "add",
-            leaf,
-        )
+        change_leaf_set("add", leaf)
     }
 
     fn remove_blocked_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
-        run_quic443_leaf_helper(
-            std::path::Path::new("sudo"),
-            std::path::Path::new(QUIC443_LEAF_HELPER),
-            "remove",
-            leaf,
-        )
+        change_leaf_set("remove", leaf)
     }
 
     // BEP-083: the lane set changes through the helper's lane verbs.
     fn add_lane_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
-        change_lane_set("lane-add", leaf)
+        change_leaf_set("lane-add", leaf)
     }
 
     fn remove_lane_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
-        change_lane_set("lane-remove", leaf)
+        change_leaf_set("lane-remove", leaf)
     }
 }
 
-/// Changes the guest table's lane set for the box leaf `leaf` (BEP-083):
-/// `verb` is the helper's `lane-add` or `lane-remove`. A daemon that does
-/// not run as root runs the helper through `sudo -n`, as it does for the
-/// blocked-leaves set. A daemon that runs as root, as the VM guest's does,
-/// has no helper and no `sudo` to run, so it hands `nft` the element the
-/// helper would.
-fn change_lane_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
+/// Changes one of the table's leaf sets for the box leaf `leaf`: `verb` is
+/// the helper's `add` or `remove` for the blocked-leaves set (BEP-018), or
+/// its `lane-add` or `lane-remove` for the lane set (BEP-083). A daemon
+/// that does not run as root runs the helper through `sudo -n`. A daemon
+/// that runs as root, as the VM guest's does, has no helper and no `sudo`
+/// to run, so it hands `nft` the element the helper would.
+fn change_leaf_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         return run_quic443_leaf_helper(
@@ -127,7 +117,7 @@ fn change_lane_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
             leaf,
         );
     }
-    run_lane_nft(
+    run_leaf_set_nft(
         std::path::Path::new(crate::net::classifier::GUEST_NFT),
         std::path::Path::new(sandbox::classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT),
         verb,
@@ -135,24 +125,27 @@ fn change_lane_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
     )
 }
 
-/// The root daemon's half of [`change_lane_set`]: runs `nft` to add or
+/// The root daemon's half of [`change_leaf_set`]: runs `nft` to add or
 /// delete the element for `leaf`, spelled as its path below the cgroup2
-/// mount `mount`, in the table's lane set. A refusal is logged with what
-/// `nft` said, and returned.
-fn run_lane_nft(
+/// mount `mount`, in the set the helper's `verb` names. A refusal is logged
+/// with what `nft` said, and returned.
+fn run_leaf_set_nft(
     nft: &std::path::Path,
     mount: &std::path::Path,
     verb: &str,
     leaf: &std::path::Path,
 ) -> std::io::Result<()> {
     // The helper refuses a verb it does not know, and so does this path.
-    let nft_verb = match verb {
-        "lane-add" => "add",
-        "lane-remove" => "delete",
+    use crate::net::classifier::{PROXY_LANE_SET, QUIC443_LEAF_SET};
+    let (nft_verb, set) = match verb {
+        "add" => ("add", QUIC443_LEAF_SET),
+        "remove" => ("delete", QUIC443_LEAF_SET),
+        "lane-add" => ("add", PROXY_LANE_SET),
+        "lane-remove" => ("delete", PROXY_LANE_SET),
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("{other} is not a lane verb"),
+                format!("{other} is not a leaf-set verb"),
             ));
         }
     };
@@ -162,12 +155,20 @@ fn run_lane_nft(
             format!("{} is not below {}", leaf.display(), mount.display()),
         )
     })?;
+    // The helper adds only a leaf that is a real directory, and so does
+    // this path. A remove still runs for a leaf that is gone.
+    if nft_verb == "add" && !leaf.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", leaf.display()),
+        ));
+    }
     let ran = std::process::Command::new(nft)
         .arg(nft_verb)
         .arg("element")
         .arg("inet")
         .arg(crate::net::classifier::TABLE_NAME)
-        .arg(crate::net::classifier::PROXY_LANE_SET)
+        .arg(set)
         .arg(format!("{{ \"{}\" }}", rel.display()))
         .stdin(std::process::Stdio::null())
         .output();
@@ -187,8 +188,9 @@ fn run_lane_nft(
     tracing::warn!(
         leaf = %leaf.display(),
         verb,
+        set,
         %error,
-        "nft refused a change to the set of leaves that can connect to the proxy's address"
+        "nft refused a change to a set of box leaves in the guest table"
     );
     Err(error)
 }
@@ -608,6 +610,15 @@ pub(crate) fn entry_run_as_entrypoint(spec: &mfile::spec::BoxSpec) -> Option<&st
     let runs = spec.lifetime == mfile::spec::Lifetime::UntilComplete
         && matches!(spec.entrypoint, mfile::spec::Entrypoint::Exec(_));
     runs.then_some(spec.entry.as_str())
+}
+
+/// The `timeout` of a box that ends at it (BOX-037), in whole seconds: the
+/// spec sets `lifetime = "until_complete"` and a timeout. A box that runs
+/// until it is stopped runs past its timeout.
+pub(super) fn timeout_of(spec: &mfile::spec::BoxSpec) -> Option<u64> {
+    (spec.lifetime == mfile::spec::Lifetime::UntilComplete)
+        .then_some(spec.timeout)
+        .flatten()
 }
 
 /// Watches a host's runtime loop `task` for the box's actor. When the loop
@@ -1106,6 +1117,18 @@ impl BoxActor {
         // BOX-013: a stop ended the box's processes and could not set its
         // record to `stopped`. The record still says running, so no launch
         // starts new processes in the box before the retried stop.
+        // BOX-037: the same for a timeout that ended the box's processes and
+        // could not set its record to `exited`.
+        if let Some(ending) = self.unrecorded_exit {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                ending = ?ending,
+                "launch refused: the timeout ended the box and its record is not exited yet"
+            );
+            return Err(AttachError::LaunchRecordUnwritable(std::io::Error::other(
+                "this session ran past its timeout and ended, and its exited state is not saved yet",
+            )));
+        }
         if let Some(ending) = self.unrecorded_stop {
             tracing::warn!(
                 box_id = %self.record.id(),
@@ -1175,6 +1198,12 @@ impl BoxActor {
             .then(|| spec.spec.as_deref().and_then(entry_run_as_entrypoint))
             .flatten()
             .map(str::to_string);
+        // BOX-037: a launch that starts the entrypoint of an `until_complete`
+        // box with a timeout arms the deadline. A hook launch starts no
+        // entrypoint and leaves the deadline as it is.
+        let timeout_secs = (!for_hooks)
+            .then(|| spec.spec.as_deref().and_then(timeout_of))
+            .flatten();
         let launcher = self
             .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
             .await?;
@@ -1367,6 +1396,9 @@ impl BoxActor {
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
         let (task, watch) = watch_entrypoint_exit(task, record.id, box_name, entry);
         self.entrypoint_watch = Some(watch);
+        if let Some(secs) = timeout_secs {
+            self.arm_timeout(secs);
+        }
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
         #[cfg(target_os = "linux")]
@@ -1727,6 +1759,100 @@ impl BoxActor {
         Ok(host)
     }
 
+    /// Starts the box's entrypoint again for a restart (BOX-176), with no
+    /// client attached. The restart already set the record to `running`
+    /// from the stored spec.
+    ///
+    /// A host that the restart launched for `on_activate` (BOX-028) is kept
+    /// when the box starts its shell, and the shell starts when a client
+    /// attaches, as after an activation. It is replaced when the box starts
+    /// an argv, or the entrypoint never starts. A box that holds a host-side
+    /// row keeps its host, as an attach keeps it. The launch runs no
+    /// lifecycle hook (BOX-177).
+    pub(super) async fn restart_launch(
+        &mut self,
+        session_hnd: BoxHandle,
+        conn_username: String,
+    ) -> Result<(), AttachError> {
+        let holds_host_row = self
+            .record
+            .record()
+            .await
+            .map_err(AttachError::LoadoutFailed)?
+            .box_addresses
+            .is_some();
+        let live_hooks_host = matches!(
+            &self.inner,
+            BoxInner::Active { host: Some((h, _)), .. } if h.is_alive()
+        ) && self.host_origin == HostOrigin::Hooks;
+        if live_hooks_host {
+            let starts_argv = self.starts_argv().await;
+            if holds_host_row && starts_argv {
+                // As `ensure_host` refuses it: replacing the hook shell would
+                // end the box's host-side row, and keeping it never starts
+                // the entrypoint (BOX-176, BOX-178).
+                // Known gap: a restart of such a box fails closed. Tracked by
+                // https://github.com/gominimal/minimal/issues/3231. It flips
+                // when the hook shell can be replaced without ending the
+                // host-side row (#3042).
+                tracing::warn!(
+                    box_id = %self.record.id(),
+                    "restart: refused the start: replacing the hook-launched shell would end \
+                     the box's host-side row, so the box's entrypoint cannot start"
+                );
+                return Err(AttachError::SpawnFailed(std::io::Error::other(
+                    EntrypointBehindHookShell,
+                )));
+            }
+            if !starts_argv {
+                tracing::info!(
+                    box_id = %self.record.id(),
+                    "restart: keeping the host launched for on_activate"
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                box_id = %self.record.id(),
+                "restart: replacing the host launched for on_activate with the box's entrypoint"
+            );
+        }
+        // A host left in the slot runs nothing the restart keeps.
+        if let BoxInner::Active {
+            host: slot @ Some(_),
+            ..
+        } = &mut self.inner
+        {
+            let (handle, mut join) = slot.take().expect("matched on Some");
+            Self::kill_and_stop_loop(&handle, &mut join, false).await;
+        }
+        #[cfg(test)]
+        if restart_launch_seam::fails(self.record.id()) {
+            return Err(AttachError::SpawnFailed(std::io::Error::other(
+                "the test failed this launch",
+            )));
+        }
+        let (_, launched) = self
+            .launch_host(
+                session_hnd,
+                conn_username,
+                UNATTACHED_WIN_SIZE,
+                box_runtime::AttachEnv::default(),
+                None,
+                LaunchPhase::Attached,
+                false,
+            )
+            .await?;
+        let BoxInner::Active { host: slot, .. } = &mut self.inner else {
+            return Err(AttachError::SessionPending);
+        };
+        *slot = Some(launched);
+        // No client attached: a later attach reuses this host, as it reuses
+        // one an exec launched.
+        self.host_origin = HostOrigin::Exec;
+        self.publish_host();
+        Ok(())
+    }
+
     /// Clears the record's `ends_with_run` mark once a task run started
     /// the box's entrypoint (T43, NET-131). Until then a daemon restart
     /// destroys the box, so a client lost before the task starts strands
@@ -2021,6 +2147,22 @@ fn stop_signal_name(signal: i32) -> &'static str {
     }
 }
 
+/// The names of `signals`, in order, for the log and the span.
+pub(super) fn signal_names(signals: &[i32]) -> Vec<&'static str> {
+    signals.iter().map(|s| stop_signal_name(*s)).collect()
+}
+
+/// The grace period between the SIGTERM and the SIGKILL a timeout sends
+/// (BOX-037): the stop's [`STOP_GRACE`]. A test can shorten it per box.
+fn timeout_grace(box_id: &boxes::SessionId) -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(grace) = super::timeout_grace_seam::grace(box_id) {
+        return grace;
+    }
+    let _ = box_id;
+    STOP_GRACE
+}
+
 /// What a stop's signals did to the box (BOX-013).
 #[derive(Debug)]
 pub(crate) struct StopOutcome {
@@ -2232,6 +2374,14 @@ impl BoxActor {
             BoxInner::Draft { .. } => None,
         };
         self.publish_host();
+        // BOX-037: the timeout ended the processes and could not write the
+        // `exited` record. `launch_host` refuses while it is unrecorded, so
+        // no process runs, and this stop writes the timeout's ending.
+        if launched.is_none()
+            && let Some(ending) = self.unrecorded_exit
+        {
+            return self.write_kept_exit(ending).await;
+        }
         let ending = match (self.unrecorded_stop, launched) {
             // An earlier stop ended the processes and could not write the
             // record. This one writes how they ended then. `launch_host`
@@ -2334,6 +2484,133 @@ impl BoxActor {
             );
         }
         Ok(ending)
+    }
+
+    /// Arms the deadline of an `until_complete` box whose spec sets a
+    /// timeout of `secs` seconds (BOX-037), from now. A timeout too large
+    /// for the clock arms nothing: the box never reaches it.
+    pub(super) fn arm_timeout(&mut self, secs: u64) {
+        let at = tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(secs));
+        self.timeout_deadline = at.map(|at| super::TimeoutDeadline { at, secs });
+        tracing::info!(
+            box_id = %self.record.id(),
+            timeout_secs = secs,
+            armed = self.timeout_deadline.is_some(),
+            "timeout: the box's entrypoint started; the box ends when it runs past its timeout"
+        );
+    }
+
+    /// Signals every process in a box that ran past its timeout (BOX-037),
+    /// execs included, as a graceful stop does: SIGTERM, the grace period,
+    /// then SIGKILL to what still runs. Then tears the host down, sets the
+    /// record to `exited` with `reason = "timeout"` and no exit code, and
+    /// records the `exited` event. Answers the signals sent, in order.
+    ///
+    /// A record write that fails returns the error. The processes are gone
+    /// then, and the actor keeps hosting the box, so a `min box stop` can
+    /// still set its record.
+    pub(super) async fn time_out_box(
+        &mut self,
+        timeout_secs: u64,
+    ) -> Result<Vec<i32>, std::io::Error> {
+        let box_id = *self.record.id();
+        tracing::info!(
+            box_id = %box_id,
+            timeout_secs,
+            "timeout: the box ran past its timeout; ending it"
+        );
+        // The loop ends on these signals, and the exit is then nobody's:
+        // the box ends with `reason = "timeout"`, not with the code.
+        self.entrypoint_watch = None;
+        let launched = match &mut self.inner {
+            BoxInner::Active { host, .. } => host.take(),
+            BoxInner::Draft { .. } => None,
+        };
+        self.publish_host();
+        let sent = match launched {
+            Some((host, task)) => {
+                let container_pid = probe_host(host.get_attrs())
+                    .await
+                    .and_then(|attrs| attrs.container_pid);
+                if container_pid.is_none() {
+                    tracing::warn!(
+                        box_id = %box_id,
+                        "timeout: the host did not name its container; the host kill ends the box"
+                    );
+                }
+                let outcome = stop_box_processes(
+                    box_id,
+                    container_pid.map(box_runtime::BoxProcesses::of_container),
+                    task,
+                    false,
+                    timeout_grace(&box_id),
+                    &self.weak_self.3,
+                )
+                .await;
+                if let Some(mut task) = outcome.unfinished {
+                    Self::kill_and_stop_loop(&host, &mut task, false).await;
+                }
+                outcome.sent
+            }
+            None => {
+                tracing::info!(box_id = %box_id, "timeout: the box has no process to signal");
+                Vec::new()
+            }
+        };
+        // A forced stop sent meanwhile has had its effect.
+        self.weak_self
+            .3
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            box_id = %box_id,
+            timeout_secs,
+            signals = ?signal_names(&sent),
+            "timeout: the box's processes ended"
+        );
+        self.stop_running(false).await;
+        self.mark_name_stopped().await;
+
+        let ending = boxes::core::record::ExitEnding::Timeout;
+        // Kept until the write succeeds, as a stop keeps `unrecorded_stop`.
+        self.unrecorded_exit = Some(ending);
+        self.write_exited_record(ending).await?;
+        self.unrecorded_exit = None;
+        tracing::info!(
+            box_id = %box_id,
+            timeout_secs,
+            signals = ?signal_names(&sent),
+            reason = boxes::core::record::EndReason::Timeout.name(),
+            "box exited: it ran past its timeout"
+        );
+        self.write_exited_event(ending).await;
+        Ok(sent)
+    }
+
+    /// Writes the `exited` record and event that a timeout (BOX-037) kept
+    /// on the actor when its own write failed. On success the box is
+    /// `exited`, not `stopped`, so this answers an error, and the stop's
+    /// caller answers from the record that the box already exited.
+    async fn write_kept_exit(
+        &mut self,
+        ending: boxes::core::record::ExitEnding,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        let box_id = *self.record.id();
+        tracing::info!(
+            box_id = %box_id,
+            ending = ?ending,
+            "stop: the timeout ended the processes earlier; writing its exited record"
+        );
+        self.write_exited_record(ending).await?;
+        self.unrecorded_exit = None;
+        tracing::info!(
+            box_id = %box_id,
+            ending = ?ending,
+            "box exited: it ran past its timeout"
+        );
+        self.write_exited_event(ending).await;
+        Err(std::io::Error::other(
+            "the session already ended at its timeout",
+        ))
     }
 
     /// Sets the box's record to `stopped` with `ending`.
@@ -2859,12 +3136,14 @@ mod quic443_cohort_tests {
         plain_task.abort();
     }
 
-    /// BEP-083 on the root daemon's path: `run_lane_nft` hands `nft` the
-    /// element for the leaf's path below the mount, in the table's lane set.
-    /// It refuses a leaf that is not below the mount, and a verb that is not
-    /// a lane verb, without running `nft`.
+    /// BEP-018 and BEP-083 on the root daemon's path: `run_leaf_set_nft`
+    /// hands `nft` the element for the leaf's path below the mount, in the
+    /// lane set for a lane verb and in the blocked-leaves set for `add` and
+    /// `remove`. It refuses a leaf that is not below the mount, a verb the
+    /// helper does not know, and an add of a leaf that is not a directory,
+    /// without running `nft`.
     #[test]
-    fn root_lane_change_runs_nft_on_the_lane_set() {
+    fn root_leaf_set_change_runs_nft_on_the_named_set() {
         use crate::net::classifier::{nft_calls, recording_nft};
         let stub = tempfile::tempdir().unwrap();
         let nft = recording_nft(stub.path(), &[]);
@@ -2872,48 +3151,95 @@ mod quic443_cohort_tests {
         let id = BoxId::mint().to_string();
         let root = mount.path().join("minimald.slice");
         let leaf = sandbox::classifier::box_leaf(&root, &id, Verdict::Allow);
+        std::fs::create_dir_all(&leaf).unwrap();
         let element = format!("{{ \"minimald.slice/boxes/allow/{id}\" }}");
-        let argv = |verb: &str| -> Vec<String> {
-            [
-                verb,
-                "element",
-                "inet",
-                "minimal_class",
-                "bep_lane_leaves",
-                &element,
-            ]
-            .iter()
-            .map(|arg| arg.to_string())
-            .collect()
+        let argv = |verb: &str, set: &str| -> Vec<String> {
+            [verb, "element", "inet", "minimal_class", set, &element]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect()
         };
 
-        super::run_lane_nft(&nft, mount.path(), "lane-add", &leaf).expect("lane-add runs nft");
-        super::run_lane_nft(&nft, mount.path(), "lane-remove", &leaf)
+        super::run_leaf_set_nft(&nft, mount.path(), "lane-add", &leaf).expect("lane-add runs nft");
+        super::run_leaf_set_nft(&nft, mount.path(), "lane-remove", &leaf)
             .expect("lane-remove runs nft");
+        super::run_leaf_set_nft(&nft, mount.path(), "add", &leaf).expect("add runs nft");
+        super::run_leaf_set_nft(&nft, mount.path(), "remove", &leaf).expect("remove runs nft");
         let calls: Vec<Vec<String>> = nft_calls(stub.path())
             .into_iter()
             .map(|(argv, _)| argv)
             .collect();
-        assert_eq!(calls, vec![argv("add"), argv("delete")]);
+        assert_eq!(
+            calls,
+            vec![
+                argv("add", "bep_lane_leaves"),
+                argv("delete", "bep_lane_leaves"),
+                argv("add", "quic443_blocked_leaves"),
+                argv("delete", "quic443_blocked_leaves"),
+            ]
+        );
 
         let elsewhere = tempfile::tempdir().unwrap();
         let outside = sandbox::classifier::box_leaf(elsewhere.path(), &id, Verdict::Allow);
-        let refused = super::run_lane_nft(&nft, mount.path(), "lane-add", &outside)
+        let refused = super::run_leaf_set_nft(&nft, mount.path(), "lane-add", &outside)
             .expect_err("a leaf outside the mount is refused");
         assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             nft_calls(stub.path()).len(),
-            2,
+            4,
             "no nft call for the refusal"
         );
 
-        let unknown = super::run_lane_nft(&nft, mount.path(), "lane-flush", &leaf)
+        let unknown = super::run_leaf_set_nft(&nft, mount.path(), "lane-flush", &leaf)
             .expect_err("an unknown verb is refused");
         assert_eq!(unknown.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             nft_calls(stub.path()).len(),
-            2,
+            4,
             "no nft call for the unknown verb"
         );
+
+        let missing = sandbox::classifier::box_leaf(&root, "no-such-box", Verdict::Allow);
+        for verb in ["add", "lane-add"] {
+            let refused = super::run_leaf_set_nft(&nft, mount.path(), verb, &missing)
+                .expect_err("an add of a leaf that is not a directory is refused");
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            nft_calls(stub.path()).len(),
+            4,
+            "no nft call for an add of a missing leaf"
+        );
+    }
+}
+
+/// Test-only: fails the launch of a restart of a box (BOX-176), once,
+/// before it starts anything, so a test can see what a failed start leaves.
+/// Keyed by box id, so tests running beside each other keep their own.
+#[cfg(test)]
+pub(crate) mod restart_launch_seam {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+
+    static SEEDED: Mutex<Option<HashSet<SessionId>>> = Mutex::new(None);
+
+    /// Makes the next restart launch of `id` fail.
+    pub(crate) fn fail_next(id: SessionId) {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashSet::new)
+            .insert(id);
+    }
+
+    /// Whether this restart launch of `id` fails. Takes the seed.
+    pub(super) fn fails(id: &SessionId) -> bool {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .is_some_and(|seeded| seeded.remove(id))
     }
 }

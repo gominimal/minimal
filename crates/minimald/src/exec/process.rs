@@ -33,6 +33,12 @@ pub struct TaskExec {
     /// daemon's own environment — the very indirection #585 removes. A
     /// dropped name has to be named.
     pub drop_env: BTreeSet<String>,
+    /// The client resolved the task's `env_vars` itself and said so
+    /// ([`minimald_rpc::taskenv::TASK_ENV_RESOLVED`]), as `min session run`
+    /// does (inbox#778). An `inherit` that [`Self::env`] and
+    /// [`Self::drop_env`] leave in the task's declarations then refuses the
+    /// run: the daemon's own environment never answers it.
+    pub client_resolved: bool,
     /// The client's invocation directory relative to the uploaded tree,
     /// already refused by [`minimald_rpc::exec::ExecRequest::parse`] if it
     /// is absolute or holds a `..`. A task that declares `inherit_cwd`
@@ -307,6 +313,95 @@ pub(crate) fn task_build_refusal(
     Ok(())
 }
 
+/// Applies the client's resolution of a task's `env_vars` over the task's
+/// own declarations: the names the client dropped go, then the values it
+/// resolved are set.
+///
+/// When the client said it resolved them ([`TaskExec::client_resolved`]),
+/// an `inherit` left over refuses the run with [`UnansweredInherit`],
+/// where the task's sandbox would otherwise read the daemon's environment
+/// for it. The client read the task from the session's project on the
+/// host, and the session runs its own copy of the project, so the name
+/// never passed the user's `[vars]` policy (inbox#778).
+pub(super) fn overlay_client_env(
+    exec: &TaskExec,
+    vars: &mut BTreeMap<String, mfile::EnvVarValue>,
+) -> Result<(), UnansweredInherit> {
+    // Removals first. The two sets are disjoint, so the order is not
+    // load-bearing, but reading it in policy order — drop, then apply —
+    // matches how the client decided.
+    for name in &exec.drop_env {
+        vars.remove(name);
+    }
+    for (name, value) in &exec.env {
+        vars.insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
+    }
+    if exec.client_resolved
+        && let Some((name, _)) = vars
+            .iter()
+            .find(|(_, value)| matches!(value, mfile::EnvVarValue::Inherit))
+    {
+        return Err(UnansweredInherit {
+            task: exec.task.clone(),
+            var: name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// A resolved run's `inherit` that the client sent no value for: the
+/// session's copy of the project declares it, and the copy the client read
+/// on the host does not.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct UnansweredInherit {
+    pub task: String,
+    pub var: String,
+}
+
+impl UnansweredInherit {
+    /// The refusal the person running `min session run` sees, for the
+    /// session `id`, named `name` if it has one, of the project at
+    /// `project` on the host.
+    ///
+    /// It names what was refused, the two ways the client can miss a
+    /// variable the session's copy declares (that copy predates a change
+    /// on the host, or a stack provides the task, which the client cannot
+    /// read), and the commands that replace the session with one of the
+    /// project as it is now. A second `min session activate` alone would
+    /// leave this session in place and still out of date.
+    pub(super) fn refusal(&self, name: Option<&str>, id: &str, project: &str) -> String {
+        let Self { task, var } = self;
+        let project = shell_word(project);
+        let destroy = format!("min session destroy {}", shell_word(name.unwrap_or(id)));
+        let activate = match name.map(shell_word) {
+            Some(name) => format!("min session activate --name {name} {project}"),
+            None => format!("min session activate {project}"),
+        };
+        format!(
+            "refused to run task '{task}': the session's copy of the project declares \
+             `env_vars.{var} = {{ inherit = true }}` for it, and `min session run` sent \
+             no value for {var}. `min` reads the task from the minimal.toml of {project} \
+             on the host, which does not declare {var} for this task. Either that file \
+             changed after the session was activated, or a stack provides the task, and \
+             `min session run` cannot pass an inherited variable to a stack's task. If \
+             the file changed, run `{destroy}`, then `{activate}`."
+        )
+    }
+}
+
+/// `s` as one word a POSIX shell reads back unchanged: as it is when every
+/// character is plain, single-quoted otherwise.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r#"'\''"#))
+    }
+}
+
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -387,17 +482,14 @@ pub(super) async fn task_producer(
         // reaches (#585). An entry the client did not send keeps whatever
         // the task declared, so the daemon-side path still serves in-box
         // `min run` and older clients.
-        // Removals first. The two sets are disjoint, so the order is not
-        // load-bearing, but reading it in policy order — drop, then apply —
-        // matches how the client decided.
-        for name in &exec.drop_env {
-            task.vars.remove(name);
-        }
-        for (name, value) in &exec.env {
-            task.vars
-                .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
-        }
         let record = session.record().await?;
+        overlay_client_env(&exec, &mut task.vars).map_err(|unanswered| {
+            io::Error::other(unanswered.refusal(
+                record.name.as_deref(),
+                &record.id.to_string(),
+                record.project_path.as_ref(),
+            ))
+        })?;
         let switch = session.net_switch().await?;
         ensure_task_rows_stand(&record, &switch).await?;
         let network = task_network(
@@ -543,6 +635,12 @@ pub struct HakoniwaProcess {
     /// A line the daemon shows ahead of the child's own stderr, such as the
     /// `inherit_cwd` fallback notice (see [`task_start_dir`]).
     pub(super) stderr_notice: Option<String>,
+    /// hakoniwa's account of a sandbox that failed, for the client's
+    /// stderr ([`Process::exit_notice`]).
+    pub(super) failure: Option<String>,
+    /// Set by [`Process::start_kill`]: the daemon ended this task, so its
+    /// status is not read as a sandbox failure.
+    pub(super) killed: bool,
 }
 
 /// The release of a task's network, owed once its process is gone.
@@ -618,6 +716,8 @@ impl HakoniwaProcess {
             state: WaitState::Spawned(Box::new(child)),
             net: NetRelease::new(net_guard),
             stderr_notice: None,
+            failure: None,
+            killed: false,
         }
     }
 }
@@ -659,7 +759,13 @@ impl Process for HakoniwaProcess {
                 // signal death), so a SIGKILL reports 137 rather than 1. The
                 // `exit_code` field is `None` for signals and would collapse
                 // to 1 downstream; `code` is what the session path reports too.
-                Ok(Ok(status)) => WaitState::Exited(Some(status.code)),
+                Ok(Ok(status)) => {
+                    self.failure = sandbox_failure(&status, self.killed);
+                    if let Some(reason) = &self.failure {
+                        tracing::warn!(pid = self.pid, %reason, "task: the sandbox failed");
+                    }
+                    WaitState::Exited(Some(status.code))
+                }
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
         }
@@ -685,8 +791,49 @@ impl Process for HakoniwaProcess {
         // invariants beyond the pid being a valid `pid_t`, which we
         // captured from `Child::id()` at construction time.
         unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        self.killed = true;
         Ok(())
     }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        self.failure
+            .take()
+            .map(|reason| sandbox_failure_notice(&reason))
+    }
+}
+
+/// hakoniwa's exit code for a container that failed itself, rather than a
+/// command that ran (`ExitStatus::FAILURE`).
+pub(super) const SANDBOX_FAILURE_CODE: i32 = 125;
+
+/// hakoniwa's reason for a container that a SIGKILL ended. It reports that
+/// as [`SANDBOX_FAILURE_CODE`] with no inner exit code, the same shape as a
+/// sandbox failure, whether or not the command had started.
+pub(super) const CONTAINER_SIGKILL_REASON: &str = "container received signal SIGKILL";
+
+/// The reason a task's sandbox failed, or `None` for any other end of the
+/// task. hakoniwa reports a sandbox failure as code 125 with no inner
+/// exit code. A command that itself exits 125 carries its own exit code, and
+/// a signalled one reports `128 + signo`, so neither is taken for it. A
+/// container that was killed, by the daemon (`killed`) or by anything else,
+/// is not a sandbox failure either.
+pub(super) fn sandbox_failure(status: &hakoniwa::ExitStatus, killed: bool) -> Option<String> {
+    (!killed
+        && status.code == SANDBOX_FAILURE_CODE
+        && status.exit_code.is_none()
+        && status.reason != CONTAINER_SIGKILL_REASON)
+        .then(|| status.reason.clone())
+}
+
+/// The line on the client's stderr for a task whose sandbox failed: the
+/// command's own output may be empty, so this is the only account of why the
+/// task ended with 125. The reason can quote a path the box chose, so its
+/// control characters are escaped and it stays one line.
+pub(super) fn sandbox_failure_notice(reason: &str) -> String {
+    format!(
+        "the task's sandbox failed: {}\n",
+        crate::env::one_line(reason)
+    )
 }
 
 /// The [`Process`] produced by a [`TaskExec`]: either a real sandboxed child
@@ -735,6 +882,15 @@ impl Process for TaskProcess {
             TaskProcess::Echo(p) => p.start_kill(),
             TaskProcess::Entrypoint(p) => p.start_kill(),
             TaskProcess::Refused(p) => p.start_kill(),
+        }
+    }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        match self {
+            TaskProcess::Sandbox(p) => p.exit_notice(),
+            TaskProcess::Echo(p) => p.exit_notice(),
+            TaskProcess::Entrypoint(p) => p.exit_notice(),
+            TaskProcess::Refused(p) => p.exit_notice(),
         }
     }
 }
@@ -1844,6 +2000,7 @@ pub(super) fn start_managed_exec_within(
         id.clone(),
         exec_box.record.id,
         mode,
+        facts.argv.clone(),
         transcript_path,
         terminal,
     ));
@@ -2374,6 +2531,9 @@ impl<P: Process> Process for TimedProcess<P> {
 
     fn start_kill(&mut self) -> io::Result<()> {
         self.inner.start_kill()
+    }
+    fn exit_notice(&mut self) -> Option<String> {
+        self.inner.exit_notice()
     }
 }
 

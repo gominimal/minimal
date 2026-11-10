@@ -136,16 +136,19 @@ the current directory).
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
-| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. Boxes have no IPv6 path yet, so `::/0` is the forward-compatible spelling and grants nothing today. The opt-out below keeps the old allow-all meaning of an unset flag. An own-address (`--network own_ip`) or host-address (`--network host_ip`) box accepts the rule flags, and only an own-address box enforces them. A host that decides egress per box refuses to create a host-address box that carries them. Any other host runs that box with the rules unenforced. A `--network none` box rejects the whole egress declaration |
-| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
-| `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant |
-| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
-| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box gets deny-all by default when it does not declare egress by flag or in its `minimal.toml` (see below). Conflicts with every `--allow-*`/`--deny-*` rule flag |
+| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. Adds to the `allow_subnets` that `minimal.toml` declares. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. Boxes have no IPv6 path yet, so `::/0` is the forward-compatible spelling and grants nothing today. The opt-out below keeps the old allow-all meaning of an unset flag. An own-address (`--network own_ip`) or host-address (`--network host_ip`) box accepts the rule flags, and only an own-address box enforces them. A host that decides egress per box refuses to create a host-address box that carries them. Any other host runs that box with the rules unenforced. A `--network none` box rejects the whole egress declaration |
+| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Adds to the `allow_dns_hosts` that `minimal.toml` declares. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
+| `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant. Replaces the `allow_protocols` that `minimal.toml` declares |
+| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. Adds to the `deny_subnets` that `minimal.toml` declares, so it never drops a range the file denies. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
+| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Drops every `allow_subnets` and `allow_dns_hosts` value that `minimal.toml` declares. The file's `allow_protocols` and `deny_subnets` stay. With no `allow_protocols` from the file or `--allow-protocols`, it writes the deny-all `egress` section, every allow list present and empty. Combines with `--deny-subnets` and `--allow-protocols`, which only narrow, and conflicts with `--allow-subnets` and `--allow-dns-hosts`. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box gets deny-all by default when it does not declare egress by flag or in its `minimal.toml` (see below) |
 
 Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
 declaration. Naming one of them stores it on the session, and `min session
-policy` shows what the session ended up with. `--deny-all-egress` declares
-the whole section in one flag and cannot combine with them.
+policy` shows what the session ended up with. The flags apply to the
+`network.egress` keys that `minimal.toml` declares for the box: a list flag
+adds its values to the file's list, and `--allow-protocols` replaces it.
+`--deny-all-egress` can only narrow, so it cannot combine with
+`--allow-subnets` or `--allow-dns-hosts`.
 
 An unset `--allow-subnets` or `--allow-dns-hosts` inside a declaration
 grants nothing, whatever the box's network mode. This changes
@@ -201,6 +204,44 @@ declining leaves your directory untouched. When prompts are skipped
 without writing anything to `PATH` — the daemon fabricates a default config
 inside the session's own workspace instead. `--loadout` is resolved before any
 of this, so an unknown loadout name errors even in a directory with no config.
+
+### `session start`
+
+```
+min session start [OPTIONS] [ENTRY]
+```
+
+Creates a box from a session entry in the project's `minimal.toml`, and
+attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
+`[boxes.<name>]` entry with `type = "session"`.
+
+| Argument or flag | Description |
+|------------------|-------------|
+| `ENTRY` | The session entry to start. Optional |
+| `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
+| `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
+| `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
+
+Without `ENTRY`, the command starts the session entry named `default`. When
+no session entry has that name, it starts the project's only session entry. A
+project with no session entry and no entry named `default` gets a `default`
+session entry with no settings of its own. A project with no `minimal.toml`
+gets that entry too.
+
+The command refuses these starts before it creates a box:
+
+| Refusal | Exit code |
+|---------|-----------|
+| `ENTRY` names no entry in `minimal.toml` | 4 |
+| `ENTRY` names an entry that is not a session entry | 4 |
+| `ENTRY` names a session entry other than `default`. The command cannot start one by name yet | 2 |
+| Without `ENTRY`: several session entries, and none of them is named `default` | 2 |
+| Without `ENTRY`: no session entry, and an entry of another type is named `default` | 2 |
+| An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |
+| No terminal, and no `--detach` | 2 |
+| A running box holds the box's name. Pass `--new` or `--name` to create the box | 2 |
+
+An invalid `minimal.toml` ends the command with exit code 3.
 
 ### `session attach`
 
@@ -312,6 +353,10 @@ already have.
 Because the task is named as a task rather than inferred from a command string,
 a task may share a name with a daemon subcommand or with a program on the
 session's `PATH`.
+
+The task's `env_vars` are resolved against your shell and checked against
+your `[vars]` policy before the task runs, as for `min task run`; see
+[Tasks](./tasks.md#env_vars).
 
 ### `session destroy`
 
@@ -678,7 +723,13 @@ anything other than the `kvm` group membership ends with
 `Running boxes pick this up on their next start.`. A run that added you to
 the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
-When both apply, both lines print, the login line last. On a host that needs nothing it prints
+When both apply, both lines print, the login line last. When the step that
+enforces deny-all egress installs while a daemon is running, on a host with
+systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress, restart the daemon: min stop (it refuses while boxes are live: stop them first, or min stop --force ends them), and your next min command starts it again.`
+A daemon of this release reads the machine again once the step places it, so
+the restart is for a daemon started by an earlier release. Without systemd no
+unit places a restarted daemon, so the script does not advise a restart.
+On a host that needs nothing it prints
 `Every part of the install is finished on this machine; there is nothing to run.`
 and exits 0. It lists a fact that no script can change, such as cgroup2
 mounted without `nsdelegate`, under `can't do on this machine:`. The other
@@ -801,7 +852,7 @@ Prints important directories and file paths for debugging.
 ### `bug`
 
 ```
-min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--endpoint <URL>]]
+min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--security] [--endpoint <URL>]]
 ```
 
 Collects a diagnostic bundle (logs, state, config) to send to the minimal
@@ -870,11 +921,25 @@ starts it there. The report URL does not contain the delete token, so
 you can share the URL. To remove the bundle sooner, run the `Delete:`
 line. See [`diag`](#diag).
 
+`--security` sends the bundle as a security report, for a suspected
+vulnerability. It needs `--upload`. Only portal owners can read the
+report. Its description is never public, it is never filed to public
+GitHub, and the results go to a private channel. `bug` prints these
+lines instead:
+
+```
+Received privately as a security report. Only the minimal team's portal owners can read it.
+Receipt: https://agents.minimal.farm/diag/<id>
+That page only confirms receipt. It shows nothing else and will not change.
+Expires: <date>
+Delete:  min diag delete <id> <token>
+```
+
 ### `diag`
 
 ```
 min diag collect [<bug options>]
-min diag upload <PATH> [--context <TEXT>] [--endpoint <URL>]
+min diag upload <PATH> [--context <TEXT>] [--security] [--endpoint <URL>]
 min diag delete <ID> <TOKEN> [--endpoint <URL>]
 ```
 
@@ -883,7 +948,8 @@ options.
 
 `diag upload` sends a bundle that you collected earlier. Use it for a
 bundle someone gave you, or for one you collected while the portal was
-unreachable. It prints the same lines as `bug --upload`.
+unreachable. It prints the same lines as `bug --upload`, and takes
+`--security` the same way.
 
 `diag delete` deletes an uploaded bundle before it expires. Give it the
 id and the delete token that the upload printed. The portal deletes the
