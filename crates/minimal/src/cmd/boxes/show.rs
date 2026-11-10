@@ -35,10 +35,43 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
             bail!("{error}")
         }
     };
+    if args.network {
+        // BCLI-025: the network section the box was created with.
+        let record = stored_box_record(&mut client, id)
+            .await
+            .inspect_err(|error| {
+                tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "error", "{error}");
+            })?
+            .ok_or_else(|| {
+                // The box was removed after the address resolved.
+                tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "not found");
+                BoxAddressRefusal::NotFound {
+                    address: args.target.clone(),
+                }
+            })?;
+        tracing::info!(verb = "box show", box_id = %id, network = true, outcome = "ok", host = %host.host);
+        let mut out = std::io::stdout().lock();
+        return write_stored_network(&mut out, record.network, &record.policy);
+    }
     tracing::info!(verb = "box show", box_id = %id, outcome = "ok", host = %host.host);
     let mut out = std::io::stdout().lock();
     render_box_show(&mut out, &shown, host.provider, &host.host)?;
     Ok(())
+}
+
+/// The record box `id` has on the host `client` talks to, with the network
+/// mode and the policy it was created with. `None` when the host has no box
+/// with that id.
+pub(crate) async fn stored_box_record(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+) -> Result<Option<boxes::Record>, anyhow::Error> {
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+    let response = client
+        .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+        .await
+        .context("GetSessionRecord RPC failed")?;
+    Ok(response.record)
 }
 
 /// The id of the box `target` names in one host's `listing`, as
