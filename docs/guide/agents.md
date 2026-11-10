@@ -4,15 +4,15 @@ description: Run AI coding agents like Claude Code inside an isolated session wi
 
 # Agent shell
 
-Minimal can sandbox AI coding agents the same way it sandboxes your dev tools: an agent runs inside a [session](./dev-shell.md), with access to your source code and only the tools and host state you declare.
+Minimal runs an AI coding agent inside a [session](./dev-shell.md). The agent sees your source code. It gets only the tools and host state you declare.
 
 ## Example: Claude Code
 
-This documentation site is itself built and maintained using Claude Code inside a Minimal session. Add the agent's package to the project's `[defaults.session]` table:
+This documentation site is itself built and maintained using Claude Code inside a Minimal session. Add the `claude` package to the project's `[defaults.session]` table. It installs Claude Code and its Minimal plugin:
 
 ```toml
 [defaults.session]
-packages = ["claude-code", "base"]
+packages = ["claude", "base"]
 ```
 
 Then activate the session and run the agent inside it:
@@ -22,9 +22,9 @@ $ min session activate --attach .
 $ claude
 ```
 
-Claude Code launches inside the session with your project's source code and a read-only system containing the `claude-code` binary and core utilities from `base`. The session has no additional access to anything on your host system unless you explicitly declare it.
+Claude Code starts inside the session with your project's source code. The read-only system holds Claude Code, its Minimal plugin, and core utilities from `base`. The session has no additional access to anything on your host system unless you explicitly declare it.
 
-Note that sessions are driven interactively: attaching needs a terminal. Launch the agent from inside an attached shell as shown above, rather than scripting it from the host.
+You attach to a session from a terminal. Start the agent from inside the attached shell, not from a script on the host.
 
 ## Adding more tools
 
@@ -32,7 +32,7 @@ Agents often need additional tools to be effective. Add packages to the `[defaul
 
 ```toml
 [defaults.session]
-packages = ["claude-code", "base", "git", "curl"]
+packages = ["claude", "base", "git", "curl"]
 ```
 
 ## Passing through host credentials
@@ -41,28 +41,27 @@ Use `patches` to give the agent access to host files it needs, like authenticati
 
 ```toml
 [defaults.session]
-packages = ["claude-code", "base", "git"]
+packages = ["claude", "base", "git"]
 patches = [
     { source = "~/.gitconfig", dest = "~/.gitconfig" },
     { source = "~/.ssh",       dest = "~/.ssh" },
 ]
 ```
 
-Environment variables can be inherited from the host as well, under `[defaults.session.vars]`:
+To pass an environment variable from the host, set `inherit` under `[defaults.session.vars]`:
 
 ```toml
 [defaults.session.vars]
 ANTHROPIC_API_KEY = { inherit = true }
 ```
 
-Anything you pass through is available to the agent and to any code it runs: a
-patched `~/.ssh` means the agent can use your SSH keys, and an inherited
-`ANTHROPIC_API_KEY` is readable by every process in the session. Pass through
-the minimum the agent needs, and prefer scoped or short-lived credentials over
-long-lived ones. Activation helps you hold this line: each value inherited from
-your environment and each file patch is gated against your user policy, and
-anything your policy cannot decide is surfaced for approval before it enters
-the session.
+The agent and any code it runs can use anything you pass through. With a
+patched `~/.ssh`, the agent can use your SSH keys. Every process in the session
+can read an inherited `ANTHROPIC_API_KEY`. Pass through the minimum the agent
+needs. Prefer scoped or short-lived credentials over long-lived ones.
+Activation checks each inherited value and each file patch against your user
+policy. When your policy cannot decide one, activation asks you before that
+value or file enters the session.
 
 ## Why sandbox agents?
 
