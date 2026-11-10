@@ -237,8 +237,17 @@ while [ "$i" -lt 20 ]; do
     i=$((i + 1))
 done
 if ! { [ -S "$run/answerer.sock" ] && running; }; then
-    echo "minimal: the DNS service did not start within 5 s (launchctl print system/dev.gominimal.zone)" >&2
-    exit 1
+    # Another program holding the service's port is the one cause the service
+    # recovers from without help: it exits while the port is held, launchd
+    # starts it again, and the first start after the port is free answers.
+    # The install stands; the admin is told which program to stop.
+    holder="$(/usr/sbin/lsof -nP -iUDP:7656 2>/dev/null \
+        | awk 'NR > 1 && $1 != "launchd" && $1 != "minzoned" { print $1 " (pid " $2 ")"; exit }')"
+    if [ -z "$holder" ]; then
+        echo "minimal: the DNS service did not start within 5 s (launchctl print system/dev.gominimal.zone)" >&2
+        exit 1
+    fi
+    echo "minimal: $holder holds UDP port 7656, which the DNS service for boxes answers on; box names (<box>.min.internal) will not resolve until that program stops, and need nothing more after it does" >&2
 fi
 
 # 6. Users who installed with curl keep an older min at ~/.local/bin/min,
