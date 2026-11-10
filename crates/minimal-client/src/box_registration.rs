@@ -495,9 +495,10 @@ pub async fn register_box_with_vm_host(
 /// on; the daemon restarting between registration and withdrawal answers
 /// the withdrawal as already gone, which is the goal state either way.
 /// `box_id` is the id the registration handed back beside the pair, where
-/// the caller still holds it — an activation failing after it registered —
-/// so the withdrawal removes only that box; a destroy, reading the pair
-/// from the session record, has none and passes `None`.
+/// the caller still holds it — an activation failing after it registered,
+/// or a destroy reading it off the session record — so the withdrawal
+/// removes only that box. It also proves a session renamed since its
+/// registration, whose row the host keeps under the old name (#1116).
 pub async fn withdraw_box_row(
     control_sock: Option<PathBuf>,
     name: Option<&str>,

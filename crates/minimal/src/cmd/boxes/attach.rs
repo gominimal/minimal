@@ -229,6 +229,31 @@ pub(crate) async fn box_via_ssh(
     config_dir: Option<&std::path::Path>,
     host_asks_for: Option<&str>,
 ) -> Result<(), anyhow::Error> {
+    box_via_ssh_with(kind, sock, id, wire, config_dir, host_asks_for, None).await
+}
+
+/// [`box_via_ssh`] for `min session run`: the exec `wire` of a task, with
+/// the task's `env_vars` resolved by this client
+/// ([`minimal_client::attach::task_run_command`]) (inbox#778).
+pub(crate) async fn task_via_ssh(
+    kind: paths::HostKind,
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    wire: String,
+    task_env: &minimald_rpc::taskenv::TaskEnv,
+) -> Result<(), anyhow::Error> {
+    box_via_ssh_with(kind, sock, id, Some(wire), None, None, Some(task_env)).await
+}
+
+async fn box_via_ssh_with(
+    kind: paths::HostKind,
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    wire: Option<String>,
+    config_dir: Option<&std::path::Path>,
+    host_asks_for: Option<&str>,
+    task_env: Option<&minimald_rpc::taskenv::TaskEnv>,
+) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow. The interactive path resolves the
     // session-key config from `config_dir` and forwards it per channel; the
@@ -238,8 +263,17 @@ pub(crate) async fn box_via_ssh(
     } else {
         None
     };
-    let mut ssh =
-        minimal_client::attach::attach_command(sock, id, wire.as_deref(), session_keys.as_ref())?;
+    let mut ssh = match (task_env, wire.as_deref()) {
+        (Some(task_env), Some(wire)) => {
+            minimal_client::attach::task_run_command(sock, id, wire, task_env)?
+        }
+        _ => minimal_client::attach::attach_command(
+            sock,
+            id,
+            wire.as_deref(),
+            session_keys.as_ref(),
+        )?,
+    };
 
     // The session's record, read before the attach or the exec on a
     // VM-backed host — one with a VM host daemon's control socket beside
@@ -272,14 +306,18 @@ pub(crate) async fn box_via_ssh(
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
-        // The pair the box's row was registered with, read before the
-        // attach: an attach that ends in a daemon-side destroy leaves no
-        // record to read it from, and the row is still this client's to
-        // withdraw.
-        let box_addresses = match host_asks_for {
-            Some(_) => record.and_then(|record| record.box_addresses),
+        // The pair the box's row was registered with, and the box id beside
+        // it, read before the attach: an attach that ends in a daemon-side
+        // destroy leaves no record to read them from, and the row is still
+        // this client's to withdraw. The id proves a box renamed since its
+        // registration (#1116); it goes only with a pair.
+        let box_row = match host_asks_for {
+            Some(_) => {
+                record.and_then(|record| record.box_addresses.map(|pair| (pair, record.box_id)))
+            }
             None => None,
         };
+        let box_addresses = box_row.map(|(pair, _)| pair);
         let host_asks = host_asks_target(
             control_sock_beside(sock),
             host_asks_for,
@@ -315,7 +353,7 @@ pub(crate) async fn box_via_ssh(
         // destroy made daemon-side: withdraw the row an own-address box
         // registered, or release the name a `host_ip` box held.
         if let Some(name) = host_asks_for {
-            release_held_name_after_attach(sock, id, name, box_addresses).await;
+            release_held_name_after_attach(sock, id, name, box_row).await;
         }
         // Terminate with ssh's own status, exactly as the `exec()` this
         // replaced did: `min` has nothing of its own left to say after an

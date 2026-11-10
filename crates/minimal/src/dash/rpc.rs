@@ -344,7 +344,7 @@ pub async fn record_of(host: &mut Host, id: SessionId) -> Option<boxes::Record> 
 pub async fn prepare_attach(
     sock: &Path,
     record: Option<boxes::Record>,
-) -> anyhow::Result<Option<boxes::BoxAddresses>> {
+) -> anyhow::Result<Option<(boxes::BoxAddresses, Option<boxes::BoxId>)>> {
     minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
     // A `host_ip` box's egress, re-admitted as `min session attach` re-admits
     // it: a VM host daemon that restarted holds none, and its gate then drops
@@ -371,7 +371,10 @@ pub async fn prepare_attach(
         )
         .await;
     }
-    Ok(record.and_then(|record| record.box_addresses))
+    // The pair and the box id beside it, for the after-attach withdrawal:
+    // the id proves a box renamed since its registration (#1116), and goes
+    // only with a pair.
+    Ok(record.and_then(|record| record.box_addresses.map(|pair| (pair, record.box_id))))
 }
 
 /// Settles what destroyed session `id` held on the VM host daemon beside
@@ -393,7 +396,7 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record
         return;
     };
     if let Some(addresses) = record.box_addresses {
-        crate::withdraw_box_row_with_vm_host(sock, name, addresses).await;
+        crate::withdraw_box_row_with_vm_host(sock, name, addresses, record.box_id).await;
     } else if crate::holds_name(record) {
         hold_box_name(sock, name, id, false).await;
     }
@@ -1231,7 +1234,11 @@ mod tests {
         let pair = prepare_attach(&ssh_sock, Some(record))
             .await
             .expect("the VM host answers the resume");
-        assert_eq!(pair, Some(addresses), "the attach keeps the pair it read");
+        assert_eq!(
+            pair,
+            Some((addresses, None)),
+            "the attach keeps the pair it read"
+        );
         let lines = server.join().unwrap();
         assert_eq!(lines.len(), 1, "one resume before the attach");
         let request: minimald_rpc::BoxControlRequest =
@@ -1281,8 +1288,9 @@ mod tests {
 
     /// T66's dashboard destroy: a destroyed own-address box's row is
     /// withdrawn on the control socket beside the daemon's ssh socket — one
-    /// withdraw line naming the box and the pair off its record, with no
-    /// box id, which the record does not carry.
+    /// withdraw line naming the box, the pair off its record and the box id
+    /// beside it, which proves a box renamed since its registration
+    /// (#1116).
     #[tokio::test]
     async fn tui_destroy_withdraws_box_row() {
         use std::io::{BufRead as _, Write as _};
@@ -1330,7 +1338,7 @@ mod tests {
             task_addresses: Vec::new(),
             box_addresses: Some(handed),
             host_ip_enforcement: None,
-            box_id: None,
+            box_id: Some(SessionId::from_bytes([9; 16])),
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             ends_with_run: false,
@@ -1351,7 +1359,11 @@ mod tests {
         assert_eq!(request.name, "web");
         assert_eq!(request.switch_address, handed.switch_address);
         assert_eq!(request.loopback_address, handed.loopback_address);
-        assert_eq!(request.box_id, None, "the record carries no box id");
+        assert_eq!(
+            request.box_id,
+            Some(SessionId::from_bytes([9; 16])),
+            "the withdrawal carries the record's box id"
+        );
     }
 
     /// BEP-082: the dashboard's destroy of a `host_ip` box retires the box
