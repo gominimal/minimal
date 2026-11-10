@@ -148,17 +148,42 @@ pub(crate) fn render_box_show(
 }
 
 /// `word` as a shell reads it back as one word: as it is when it holds only
-/// safe characters, and in single quotes otherwise.
+/// safe characters, in single quotes when its other characters print, and
+/// in `$'...'` with escapes when it holds a control character. So a newline
+/// or a terminal escape in an exec's argv never breaks the row or reaches
+/// the terminal raw.
 fn shell_word(word: &str) -> String {
     let safe = !word.is_empty()
         && word
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c));
     if safe {
-        word.to_owned()
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
+        return word.to_owned();
     }
+    if !word.chars().any(char::is_control) {
+        return format!("'{}'", word.replace('\'', r"'\''"));
+    }
+    let mut quoted = String::from("$'");
+    for c in word.chars() {
+        match c {
+            '\\' => quoted.push_str(r"\\"),
+            '\'' => quoted.push_str(r"\'"),
+            '\n' => quoted.push_str(r"\n"),
+            '\t' => quoted.push_str(r"\t"),
+            '\r' => quoted.push_str(r"\r"),
+            c if c.is_control() => {
+                let code = u32::from(c);
+                if code <= 0xff {
+                    quoted.push_str(&format!(r"\x{code:02x}"));
+                } else {
+                    quoted.push_str(&format!(r"\u{code:04x}"));
+                }
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Formats a disk figure in bytes in the largest binary unit that keeps it
@@ -181,4 +206,19 @@ pub(crate) fn format_disk(bytes: u64) -> String {
         unit = next;
     }
     format!("{value:.1} {unit}")
+}
+
+#[cfg(test)]
+mod shell_word_tests {
+    use super::shell_word;
+
+    #[test]
+    fn box_show_exec_command_escapes_control_characters() {
+        assert_eq!(shell_word("ls"), "ls");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("a\nb"), r"$'a\nb'");
+        assert_eq!(shell_word("\u{1b}[2J"), r"$'\x1b[2J'");
+        assert_eq!(shell_word("x\\'\u{7f}"), r"$'x\\\'\x7f'");
+    }
 }
