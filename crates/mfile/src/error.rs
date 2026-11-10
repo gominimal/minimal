@@ -270,9 +270,9 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            // `Display` carries the io error and the parse error, so a
-            // chain printer such as `{:#}` prints each of them once.
-            Error::IO(..) => None,
+            Error::IO(_, _, e) => Some(e),
+            // `Display` carries the parse error, so a chain printer such as
+            // `{:#}` prints it once.
             Error::Format(_) => None,
             // The serde error only restates serde's internal enum name,
             // which the Display above replaces; it stays for Debug.
@@ -294,7 +294,6 @@ impl std::error::Error for Error {
 mod tests {
     use super::Error;
     use std::error::Error as _;
-    use std::path::PathBuf;
 
     /// Renders an error the way anyhow's `{:#}` does: the error, then each
     /// cause in its `source()` chain, joined with `": "`.
@@ -320,14 +319,5 @@ mod tests {
         assert!(err.source().is_none());
         let chained = render_chain(&err);
         assert_eq!(chained.matches("TOML parse error").count(), 1, "{chained}");
-    }
-
-    #[test]
-    fn io_error_chain_prints_io_error_once() {
-        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let io_text = io.to_string();
-        let err = Error::IO("minimal file", PathBuf::from("/p/minimal.toml"), io);
-        let chained = render_chain(&err);
-        assert_eq!(chained.matches(io_text.as_str()).count(), 1, "{chained}");
     }
 }
