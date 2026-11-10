@@ -107,7 +107,8 @@ encoding**.
   later epoch's change (Non-goals). The encoder orders a container's maps
   by key and sorts its sets, as epoch 0 does.
 - **Layout.** The encoding is a byte-tagged TLV. Each field is a one-byte
-  tag and then its payload. Every string has a `u32` little-endian length
+  tag and then its payload; the first tag names the kind encoded, a spec, a
+  subset or a container (EPOCH-022). Every string has a `u32` little-endian length
   prefix. Every list, set or map has a `u32` little-endian count prefix.
   A length or count the prefix cannot hold is refused, never truncated
   (EPOCH-001's sub-bullet), so the prefix is the whole of a value's
@@ -449,6 +450,19 @@ build-infra operator. Release manager.
   tier:     T0
   verify:   cargo nextest run -p graph epoch1_absent_field_is_byte_identical
 
+- **EPOCH-022** THE SYSTEM SHALL begin the encoding of each kind it keys,
+  a spec, a subset and a container, with a tag of that kind's own, so no
+  two kinds' encodings are the same byte string and no key of one kind is
+  a key of another under the one epoch-1 context. Epoch 0 leads with
+  `build spec`, `subset` and `container`; epoch 1 keeps one leading tag per
+  kind, and the three injectivity requirements (EPOCH-001, EPOCH-013,
+  EPOCH-017) then compose across kinds.
+  tier:     T1
+  verify:   cargo nextest run -p graph epoch1_kinds_lead_with_distinct_tags
+  property: for all specs s, subsets u, containers c: lead(encode(s)),
+    lead(encode(u)) and lead(encode(c)) are pairwise distinct, so no two
+    of encode(s), encode(u), encode(c) are equal
+
 ## Non-goals
 
 - Changing the hash's size or algorithm: the interaction inventory in the
@@ -504,8 +518,8 @@ in the formal-verification path.
 
 D3.1 has four commitments, and each maps to requirements:
 
-- injective over the closure's meaning: EPOCH-001, EPOCH-002, EPOCH-004
-  and EPOCH-013
+- injective over the closure's meaning: EPOCH-001, EPOCH-002, EPOCH-004,
+  EPOCH-013 and, across kinds, EPOCH-022
 - epochs by domain-separated context at a fixed 32 bytes, declared by the
   index and followed by consumers: EPOCH-005, EPOCH-009, EPOCH-012,
   EPOCH-014, EPOCH-015 and EPOCH-019
