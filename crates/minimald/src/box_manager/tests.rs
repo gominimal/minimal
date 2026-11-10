@@ -3230,6 +3230,71 @@ async fn show_returns_record_state_identity_and_live_execs() {
     assert_eq!(running.identity, minimald_rpc::BoxIdentity::None);
     // No exec runs in the box.
     assert!(running.live_execs.is_empty(), "{:?}", running.live_execs);
+
+    // A detached and a tty exec run in it: each is listed with its id, argv
+    // and PTY flag, in id order, and an ended one leaves the list.
+    let start = |exec_id: &str, mode, argv: &[&str]| {
+        let entry = std::sync::Arc::new(crate::exec::ExecEntry::new(
+            minimald_rpc::exec::ExecId::parse(exec_id).unwrap(),
+            id,
+            mode,
+            argv.iter().map(|word| (*word).to_owned()).collect(),
+            camino::Utf8PathBuf::from("/nonexistent/execs").join(exec_id),
+            None,
+        ));
+        crate::exec::register_exec(std::sync::Arc::clone(&entry));
+        entry
+    };
+    let detached = start(
+        "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        minimald_rpc::exec::ExecMode::Detached,
+        &["sleep", "60"],
+    );
+    let tty = start(
+        "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c",
+        minimald_rpc::exec::ExecMode::Tty,
+        &["bash"],
+    );
+    let live = |rows: &[minimald_rpc::LiveExec]| -> Vec<(String, Vec<String>, minimald_rpc::exec::ExecMode)> {
+        rows.iter()
+            .map(|exec| (exec.id.clone(), exec.argv.clone(), exec.mode))
+            .collect()
+    };
+    let shown = mngr.show_box(id).await.unwrap().expect("retained");
+    assert_eq!(
+        live(&shown.live_execs),
+        vec![
+            (
+                "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b".to_owned(),
+                vec!["sleep".to_owned(), "60".to_owned()],
+                minimald_rpc::exec::ExecMode::Detached
+            ),
+            (
+                "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c".to_owned(),
+                vec!["bash".to_owned()],
+                minimald_rpc::exec::ExecMode::Tty
+            ),
+        ]
+    );
+    detached.finish(crate::exec::ExecExit {
+        code: Some(0),
+        reason: crate::exec::ExecExitReason::Exited,
+    });
+    let shown = mngr.show_box(id).await.unwrap().expect("retained");
+    assert_eq!(
+        live(&shown.live_execs),
+        vec![(
+            "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c".to_owned(),
+            vec!["bash".to_owned()],
+            minimald_rpc::exec::ExecMode::Tty
+        )],
+        "the ended exec left the list"
+    );
+    // A stop ends every exec in the box (BOX-013).
+    tty.finish(crate::exec::ExecExit {
+        code: None,
+        reason: crate::exec::ExecExitReason::Exited,
+    });
     drop(mngr);
 
     set_record_state(
