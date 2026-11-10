@@ -1441,6 +1441,18 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // placement unit answers asynchronously, so two reads could disagree.
     let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
     let in_leaf = minimald::net::classifier::daemon_in_leaf(tree_root);
+    if !guest
+        && let Err(e) = &in_leaf
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            error = %e,
+            leaf = %daemon_leaf.display(),
+            "reading this daemon's classifier leaf membership failed, so it \
+             counts as unplaced: its host-address boxes are said to run \
+             unenforced, and a placed deny-all box is still refused"
+        );
+    }
     let placed = matches!(in_leaf, Ok(true));
     let unplaced = minimald::net::classifier::unplaced_over(&in_leaf);
     // An unreadable probe read by a daemon outside its own leaf is that

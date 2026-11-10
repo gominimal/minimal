@@ -3527,22 +3527,17 @@ pub fn daemon_in_leaf(root: &Path) -> std::io::Result<bool> {
 /// first, claiming a refusal for a box that has the network
 /// (gominimal/minimal#3240). So a daemon not proven in its leaf counts as
 /// unplaced: a leaf read whole without this process, a missing leaf beside
-/// an installed tree, and a leaf whose members could not be read. That
-/// last read error is logged.
+/// an installed tree, and a leaf whose members could not be read. Pure:
+/// start-up logs that read error once, and a launch's re-read does not.
+///
+/// Counting the daemon unplaced never changes a launch's outcome: the
+/// launcher places a box by its own migration probe
+/// (`create_session_leaf`), and the gate refuses a placed deny-all box over
+/// [`Cause::DaemonNotPlaced`] as it does over [`Cause::ProbeUnreadable`].
+/// Only the words of a box that is not placed change, to the ones that are
+/// true of it.
 pub fn unplaced_over(in_leaf: &std::io::Result<bool>) -> bool {
-    match in_leaf {
-        Ok(in_leaf) => !in_leaf,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "reading this daemon's classifier leaf membership failed, so \
-                 it counts as unplaced: its host-address boxes are said to run \
-                 unenforced"
-            );
-            true
-        }
-    }
+    !matches!(in_leaf, Ok(true))
 }
 
 /// Whether this daemon stands outside a daemon leaf the step installed,

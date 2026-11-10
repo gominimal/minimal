@@ -380,7 +380,7 @@ pub(crate) async fn re_read_classifier_fact(
         // unreadable probe is re-spelled as its placement, so the fact and the
         // advisory say the box runs unenforced (gominimal/minimal#3067). The
         // placement is read once, before the probe whose reading it re-spells.
-        let unplaced = crate::net::classifier::daemon_unplaced(&root);
+        let unplaced = !guest && crate::net::classifier::daemon_unplaced(&root);
         let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
             classifier_reading(&root, guest)
         })
