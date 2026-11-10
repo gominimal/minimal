@@ -38,10 +38,6 @@ pub enum VmError {
     #[error("krun_start_enter returned {ret} but libkrun's docs say it only returns on error")]
     StartEnterReturnedUnexpectedly { ret: i32 },
 
-    /// A required environment variable was unset or empty.
-    #[error("required environment variable {var} is unset or empty")]
-    MissingEnv { var: &'static str },
-
     /// The `MINVMD_KRUN_LOG` environment variable was set to a value that is
     /// not a recognised libkrun log level (a name `off`/`error`/`warn`/`info`/
     /// `debug`/`trace` or the numeric level `0`–`5`). `value` is the offending
@@ -52,11 +48,17 @@ pub enum VmError {
     )]
     InvalidLogLevel { value: String },
 
-    /// A required image could not be located: the override env var was unset or
-    /// empty, and no file exists at the default install location. `var` names
-    /// the override; `default` is the path that was checked.
-    #[error("{var} is unset and no file exists at the default location {}", default.display())]
-    MissingImage { var: &'static str, default: PathBuf },
+    /// The guest images could not be located: no data directory, the user's
+    /// own or a system one, holds every image whose override is unset. `var`
+    /// names the override of the image being resolved; `unset` names every
+    /// override that is unset (so every image the lookup needed); `searched`
+    /// lists each directory looked in, in order, with the files it lacked.
+    #[error("{}", missing_image_text(unset, searched))]
+    MissingImage {
+        var: &'static str,
+        unset: Vec<&'static str>,
+        searched: Vec<SearchedDir>,
+    },
 
     /// An I/O error outside the libkrun FFI boundary (e.g. creating or
     /// checking the socket directory, R3.2).
@@ -82,6 +84,41 @@ pub enum VmError {
          {cidr:?} is not a valid CIDR prefix"
     )]
     InvalidEgressSubnet { cidr: String },
+}
+
+/// A directory the guest image lookup looked in, and the image files it
+/// lacked there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchedDir {
+    pub dir: PathBuf,
+    pub missing: Vec<&'static str>,
+}
+
+/// The text of [`VmError::MissingImage`]: where the lookup looked, what each
+/// directory lacked, and what the person can do about it.
+fn missing_image_text(unset: &[&'static str], searched: &[SearchedDir]) -> String {
+    let looked = if searched.is_empty() {
+        "There was no directory to look in: neither XDG_DATA_HOME nor HOME is set, \
+         and XDG_DATA_DIRS has no absolute entry."
+            .to_owned()
+    } else {
+        let dirs = searched
+            .iter()
+            .map(|s| format!("{} (no {})", s.dir.display(), s.missing.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("Looked in {dirs}.")
+    };
+    let files = if unset.len() == 1 {
+        "the image file"
+    } else {
+        "the image files"
+    };
+    let vars = unset.join(", ");
+    format!(
+        "no data directory holds the guest images this boot needs. {looked} \
+         Reinstall minimal, or set {vars} to {files}."
+    )
 }
 
 #[cfg(test)]

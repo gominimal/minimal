@@ -109,6 +109,139 @@ fn task_start_dir_honours_inherit_cwd() {
     assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
 }
 
+/// A task run carrying the client's resolution of its `env_vars`.
+fn task_exec_with(env: &[(&str, &str)], drop_env: &[&str], client_resolved: bool) -> TaskExec {
+    TaskExec {
+        task: "t778".to_string(),
+        args: Vec::new(),
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        drop_env: drop_env.iter().map(|n| n.to_string()).collect(),
+        client_resolved,
+        cwd: String::new(),
+    }
+}
+
+/// A task's declared `env_vars`, as the session's copy of the project has
+/// them.
+fn declared_vars(
+    vars: &[(&str, Option<&str>)],
+) -> std::collections::BTreeMap<String, mfile::EnvVarValue> {
+    vars.iter()
+        .map(|(name, value)| {
+            let value = match value {
+                Some(v) => mfile::EnvVarValue::Value(v.to_string()),
+                None => mfile::EnvVarValue::Inherit,
+            };
+            (name.to_string(), value)
+        })
+        .collect()
+}
+
+/// The client's values replace the task's `inherit` declarations, and the
+/// names it dropped are gone, whether or not it marked the run resolved.
+#[test]
+fn the_client_env_answers_inherit_and_drops_names() {
+    use super::overlay_client_env;
+
+    for client_resolved in [false, true] {
+        let exec = task_exec_with(&[("X778", "from-client")], &["IGNORED"], client_resolved);
+        let mut vars =
+            declared_vars(&[("X778", None), ("IGNORED", None), ("LITERAL", Some("lit"))]);
+        overlay_client_env(&exec, &mut vars).expect("every inherit is answered");
+        assert_eq!(
+            vars,
+            declared_vars(&[("X778", Some("from-client")), ("LITERAL", Some("lit"))]),
+        );
+    }
+}
+
+/// inbox#778: a client that resolved the task itself (`min session run`)
+/// read the project on its own host. An `inherit` only the session's copy
+/// declares never passed the user's `[vars]` policy there, so the run is
+/// refused, naming the task and the variable, and the daemon's own
+/// environment is never read for it.
+#[test]
+fn a_resolved_run_refuses_an_inherit_the_client_did_not_answer() {
+    use super::{UnansweredInherit, overlay_client_env};
+
+    let exec = task_exec_with(&[("X778", "from-client")], &[], true);
+    let mut vars = declared_vars(&[("X778", None), ("ONLY_IN_SESSION", None)]);
+    let err = overlay_client_env(&exec, &mut vars)
+        .expect_err("an unanswered inherit must refuse the run");
+    assert_eq!(
+        err,
+        UnansweredInherit {
+            task: "t778".to_string(),
+            var: "ONLY_IN_SESSION".to_string(),
+        }
+    );
+}
+
+/// The refusal says what was refused and both causes, without asserting
+/// one, and names the commands that work: destroy this session, then
+/// activate the project again under the same name. It never offers a bare
+/// "re-activate", which would leave this session in place (PR #3128).
+#[test]
+fn the_unanswered_inherit_refusal_names_both_causes_and_the_commands() {
+    let refused = super::UnansweredInherit {
+        task: "t778".to_string(),
+        var: "ONLY_IN_SESSION".to_string(),
+    };
+
+    let msg = refused.refusal(Some("dev"), "0b5e", "/home/me/proj");
+    assert!(msg.starts_with("refused to run task 't778': "), "{msg}");
+    assert!(
+        msg.contains("`env_vars.ONLY_IN_SESSION = { inherit = true }`"),
+        "names the declaration: {msg}"
+    );
+    assert!(
+        msg.contains("the minimal.toml of /home/me/proj on the host"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("changed after the session was activated"),
+        "{msg}"
+    );
+    assert!(msg.contains("a stack provides the task"), "{msg}");
+    assert!(
+        msg.ends_with(
+            "run `min session destroy dev`, then `min session activate --name dev /home/me/proj`."
+        ),
+        "names the commands: {msg}"
+    );
+    assert!(!msg.contains("re-activate"), "{msg}");
+    assert!(!msg.contains("where `min` ran"), "{msg}");
+    assert_eq!(msg.lines().count(), 1, "one line: {msg:?}");
+
+    // An unnamed session is destroyed by id, and a path a shell would split
+    // is quoted so both commands paste as they are.
+    let msg = refused.refusal(None, "0b5e", "/home/me/it's mine");
+    assert!(
+        msg.contains("run `min session destroy 0b5e`, then "),
+        "{msg}"
+    );
+    assert!(
+        msg.ends_with(r#"`min session activate '/home/me/it'\''s mine'`."#),
+        "{msg}"
+    );
+}
+
+/// A client that did not mark the run resolved, as every caller but
+/// `min session run`, keeps the older behaviour: an inherit it did not
+/// answer stays for the sandbox to resolve.
+#[test]
+fn an_unmarked_run_leaves_an_unanswered_inherit_as_before() {
+    use super::overlay_client_env;
+
+    let exec = task_exec_with(&[], &[], false);
+    let mut vars = declared_vars(&[("ONLY_IN_SESSION", None)]);
+    overlay_client_env(&exec, &mut vars).expect("no refusal without the marker");
+    assert_eq!(vars, declared_vars(&[("ONLY_IN_SESSION", None)]));
+}
+
 /// A session record carrying `mode`, with everything else at its default.
 #[cfg(target_os = "linux")]
 fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
@@ -3731,6 +3864,7 @@ mod managed {
             id.clone(),
             box_id,
             ExecMode::Detached,
+            Vec::new(),
             transcript.clone(),
             None,
         ));
@@ -3750,6 +3884,7 @@ mod managed {
             mint_exec_id(),
             box_id,
             ExecMode::Detached,
+            Vec::new(),
             transcript,
             None,
         ));

@@ -5283,6 +5283,63 @@ mod tests {
         assert_eq!(held, vec![Some(live)], "the zone answers the live box");
     }
 
+    /// #1116 on the machine's service: once a box is renamed on its node,
+    /// the node's next publish carries the row under the new name at the
+    /// address it had, and the service's book moves the address to that
+    /// name. The service answers the new name with the address and the old
+    /// one with NXDOMAIN, and the destroy's release by the new name frees
+    /// the address, where a release by the old name frees nothing.
+    #[test]
+    fn a_publish_under_a_new_name_moves_the_address_to_it() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(crate::box_registry::ClientBoxSpec {
+                name: "web".into(),
+                ingress_ports: vec![],
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the box");
+        let registered = Arc::new(RegisteredTables::new());
+        registered
+            .book()
+            .claim("a-node", &box_zone_name("web"), web.loopback_addr())
+            .expect("the allocation handed the box its address");
+        let first = registered.install_validated(1, "a-node", zone_rows(&registry), &[]);
+        assert!(first.refused.is_empty(), "{:?}", first.refused);
+
+        registry
+            .rename_client_box(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                web.box_id(),
+            )
+            .expect("the creator's rename moves the row");
+        let second = registered.install_validated(1, "a-node", zone_rows(&registry), &[]);
+        assert!(second.refused.is_empty(), "{:?}", second.refused);
+
+        let service = HostAnswerer::for_service(Arc::clone(&registered));
+        assert_eq!(a_answer(&ask_a(&service, "front")), web.loopback_addr());
+        assert_eq!(
+            ask_a(&service, "web").metadata.response_code,
+            ResponseCode::NXDomain,
+            "the old name answers nothing"
+        );
+        assert_eq!(
+            registered.release_address("a-node", &box_zone_name("web")),
+            None,
+            "the old name holds no address"
+        );
+        assert_eq!(
+            registered.release_address("a-node", &box_zone_name("front")),
+            Some(web.loopback_addr()),
+            "the release by the new name frees the box's address"
+        );
+    }
+
     // NET-027 (minimal#2629): a second VM host daemon that finds the
     // answerer port held waits for the holder's channel and registers into
     // it, and two daemons that start together end with exactly one holder.

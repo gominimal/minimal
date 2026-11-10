@@ -79,6 +79,22 @@ pub(crate) fn box_build_leaf(
 }
 
 /// The network the package builds of the box `record` attach to, when the
+/// box has no classifier leaf (NET-155). A box with no network gets
+/// [`op::BuildNetwork::none`], so its builds never take the daemon's network
+/// or the daemon's fetch. A host-address box gets `None`, because a box with
+/// no leaf of that kind has no per-box enforcement.
+pub(crate) fn box_build_network(
+    record: &boxes::Record,
+    switch: &Arc<Mutex<crate::net::SwitchClient>>,
+    deny_all_opt_out: bool,
+) -> Option<op::BuildNetwork> {
+    match record.network {
+        boxes::NetworkMode::NoNet => Some(op::BuildNetwork::none()),
+        _ => own_address_build_network(record, switch, deny_all_opt_out),
+    }
+}
+
+/// The network the package builds of the box `record` attach to, when the
 /// box has a network namespace of its own and so no classifier leaf: an
 /// own-address box (NET-155). Each build gets the network a task of the box
 /// gets ([`crate::exec::task_network`]): a task address of the box's own,
@@ -101,6 +117,7 @@ pub(crate) fn own_address_build_network(
     );
     let denies_all =
         crate::net::classifier::verdict_of(egress.as_ref()) == sandbox::config::Verdict::Deny;
+    let admits_name = move |host: &str| crate::net::dns_gate::admits_name(egress.as_ref(), host);
     let record = record.clone();
     let switch = Arc::clone(switch);
     Some(
@@ -116,7 +133,8 @@ pub(crate) fn own_address_build_network(
                 switch: Arc::clone(&switch),
             }) as Arc<dyn sandbox::Network>
         })
-        .with_denies_all(denies_all),
+        .with_denies_all(denies_all)
+        .with_admits_name(admits_name),
     )
 }
 
@@ -978,7 +996,7 @@ impl BoxActor {
         })?;
         let network = match leaf {
             Some(_) => None,
-            None => own_address_build_network(&record, &self.net_switch, self.deny_all_opt_out),
+            None => box_build_network(&record, &self.net_switch, self.deny_all_opt_out),
         };
         Ok(crate::box_ops::BuildPlacement {
             box_name,
@@ -1344,7 +1362,7 @@ impl BoxActor {
         // NET-155: an own-address box has no classifier leaf. Every package
         // build its context starts, the activation launch's among them,
         // attaches to a network of the box's own, under the box's egress
-        // rules.
+        // rules. A box with no network has none to give them.
         let record = self
             .record
             .record()
@@ -1366,7 +1384,7 @@ impl BoxActor {
                 .to_path_buf(),
         );
         Ok(
-            match own_address_build_network(&record, &self.net_switch, self.deny_all_opt_out) {
+            match box_build_network(&record, &self.net_switch, self.deny_all_opt_out) {
                 Some(network) => ctx.with_box_network(network),
                 None => ctx,
             },

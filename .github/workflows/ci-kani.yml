@@ -60,10 +60,16 @@ jobs:
                   filters: |
                       kani:
                         - "crates/rcache/**"
-                        - "crates/sessions/**"
-                        # The same crate after its rename to `boxes`; both
-                        # paths match until the old one is dropped.
+                        # `sessions`, renamed `boxes`; the old path is gone.
                         - "crates/boxes/**"
+                        # The rule: this filter lists every crate that has an
+                        # `expect <crate> <n>` line in scripts/kani.sh (boxes,
+                        # rcache, mlog, minvmd, bep today). A crate that gains a
+                        # harness gets a path here in the same change, or a PR
+                        # touching only that crate merges with its proofs
+                        # unrun, as mlog and minvmd once did (#3117).
+                        - "crates/mlog/**"
+                        - "crates/minvmd/**"
                         # The Box Egress Proxy's redemption decision and
                         # audit chain (docs/specs/24, BEP-019 to BEP-025,
                         # BEP-031, BEP-049, BEP-058, BEP-064) are proved

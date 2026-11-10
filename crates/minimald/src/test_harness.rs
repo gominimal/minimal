@@ -367,6 +367,35 @@ impl TestServer {
         });
     }
 
+    /// Lists an exec of id `exec_id` as running in the box `box_id`, as the
+    /// daemon lists an exec it started (BOX-159), with no process behind
+    /// it. A read of the box returns it until [`ListedExec::end`].
+    #[must_use]
+    pub fn list_running_exec(
+        &self,
+        box_id: boxes::SessionId,
+        exec_id: &str,
+        argv: &[&str],
+        pty: bool,
+    ) -> ListedExec {
+        let id = minimald_rpc::exec::ExecId::parse(exec_id).expect("an exec id the daemon mints");
+        let mode = if pty {
+            minimald_rpc::exec::ExecMode::Tty
+        } else {
+            minimald_rpc::exec::ExecMode::Detached
+        };
+        let entry = std::sync::Arc::new(crate::exec::ExecEntry::new(
+            id,
+            box_id,
+            mode,
+            argv.iter().map(|word| (*word).to_owned()).collect(),
+            camino::Utf8PathBuf::from("/nonexistent/execs").join(exec_id),
+            None,
+        ));
+        crate::exec::register_exec(std::sync::Arc::clone(&entry));
+        ListedExec(entry)
+    }
+
     /// Bring a session up (make it "live") by looking it up in the
     /// sessions manager. A persisted session is not "live" until
     /// `get_session` is called, which starts the session actor.
@@ -454,6 +483,20 @@ fn config_in(temp: &TempDir, deny_all_opt_out: bool) -> Config {
 /// into `Connection::from_stream`, this drives a real `UnixStream` against a
 /// server's `UnixListener` — so it exercises the actual `Server::run` accept
 /// loop, which is what the shutdown-drain tests need.
+/// An exec that [`TestServer::list_running_exec`] lists as running.
+pub struct ListedExec(std::sync::Arc<crate::exec::ExecEntry>);
+
+impl ListedExec {
+    /// Ends the exec with exit code 0, so a read of its box no longer lists
+    /// it.
+    pub fn end(&self) {
+        self.0.finish(crate::exec::ExecExit {
+            code: Some(0),
+            reason: crate::exec::ExecExitReason::Exited,
+        });
+    }
+}
+
 pub async fn connect_uds(sock: &Path) -> TestClient {
     let stream = UnixStream::connect(sock).await.unwrap();
     let client_config = Arc::new(russh::client::Config::default());
