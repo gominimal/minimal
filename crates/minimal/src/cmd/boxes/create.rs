@@ -248,6 +248,718 @@ impl SessionEntryUndecided {
     pub const EXIT_CODE: u8 = 2;
 }
 
+/// The verb a start came from: `min box start` or `min session start`.
+/// Both share one start path ([`start_entry`]). The verb decides which
+/// entries the start counts, and it names the command in the refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartVerb {
+    Box,
+    Session,
+}
+
+impl StartVerb {
+    /// The command, as the person types it.
+    #[must_use]
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Box => "min box start",
+            Self::Session => "min session start",
+        }
+    }
+}
+
+/// What a start creates its box from, whichever verb typed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartEntry {
+    pub verb: StartVerb,
+    /// The entry the person typed, when they typed one.
+    pub entry: Option<String>,
+    /// `--name`: the box's `[box] name` (BCLI-069).
+    pub name: Option<String>,
+    /// `--new`: a fresh instance (BCLI-070).
+    pub new: bool,
+    /// `--detach`: print the id and return, never attach.
+    pub detach: bool,
+}
+
+impl From<BoxStartArgs> for StartEntry {
+    fn from(args: BoxStartArgs) -> Self {
+        Self {
+            verb: StartVerb::Box,
+            entry: args.entry,
+            name: args.name,
+            new: args.new,
+            detach: args.detach,
+        }
+    }
+}
+
+impl From<SessionStartArgs> for StartEntry {
+    fn from(args: SessionStartArgs) -> Self {
+        Self {
+            verb: StartVerb::Session,
+            entry: args.entry,
+            name: args.name,
+            new: args.new,
+            detach: args.detach,
+        }
+    }
+}
+
+/// The built-in root of a Box Type, for a built-in type. The client cannot
+/// resolve a project Box Type, so it has none here.
+fn builtin_root(box_type: &str) -> Option<&'static str> {
+    mfile::expand::BUILTIN_BOX_TYPES
+        .into_iter()
+        .find(|builtin| *builtin == box_type)
+}
+
+/// Whether the client cannot resolve `entry`'s type to a built-in root. Such
+/// an entry can be a session.
+/// <https://github.com/gominimal/minimal/issues/3140> tracks resolving a
+/// project Box Type's root here.
+pub(crate) fn type_unresolved(entry: &mfile::entry::BoxEntry) -> bool {
+    entry.box_type.as_deref().and_then(builtin_root).is_none()
+}
+
+/// The refusal for `entry`, whose type the client cannot resolve.
+pub(crate) fn type_unresolved_refusal(entry: &mfile::entry::BoxEntry) -> SessionEntryUndecided {
+    SessionEntryUndecided::TypeUnresolved {
+        name: entry.name.clone(),
+        box_type: entry.box_type.clone(),
+    }
+}
+
+/// The entries a refusal lists: the [`start_candidates`], else the
+/// project's own entries when a type is unresolved.
+pub(crate) fn listed_entries(entries: &[mfile::entry::BoxEntry]) -> Vec<mfile::entry::BoxEntry> {
+    start_candidates(entries).unwrap_or_else(|_| entries.to_vec())
+}
+
+/// The entries a start counts: the project's entries, and the implicit
+/// `default` session entry when the project needs one (BOX-165). A picker
+/// calls this only after its lookups of an explicit entry, when the pick
+/// depends on the implicit `default` or on the count.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided::TypeUnresolved`] when an entry's type does not
+/// resolve to a built-in root. Such an entry can be a session, so the start
+/// can tell neither which entries are sessions nor whether the implicit
+/// `default` applies. <https://github.com/gominimal/minimal/issues/3140>
+/// tracks resolving a project Box Type's root here. Remove this refusal
+/// when the client resolves that root.
+pub(crate) fn start_candidates(
+    entries: &[mfile::entry::BoxEntry],
+) -> Result<Vec<mfile::entry::BoxEntry>, SessionEntryUndecided> {
+    if let Some(entry) = entries.iter().find(|entry| type_unresolved(entry)) {
+        return Err(type_unresolved_refusal(entry));
+    }
+    let mut candidates = entries.to_vec();
+    if let Some(implicit) = mfile::entry::implicit_default_entry(entries, builtin_root) {
+        candidates.push(implicit);
+    }
+    Ok(candidates)
+}
+
+/// Whether `entry` is a session entry.
+pub(crate) fn is_session_entry(entry: &mfile::entry::BoxEntry) -> bool {
+    entry.box_type.as_deref() == Some(boxes::SESSION_BOX_TYPE)
+}
+
+/// The entry `min box start` starts (BCLI-072): the typed entry, else the
+/// entry named `default` of any type, else the project's only entry. The
+/// count includes the implicit `default` entry.
+///
+/// A typed project entry, and with no entry typed a project entry named
+/// `default`, is picked whatever its type. [`plan_start`] refuses a type
+/// that the start cannot serve.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided::TypeUnresolved`] from [`start_candidates`],
+/// only when the pick depends on the implicit `default` or on the count.
+/// Else a [`StartEntryRefusal`] when no entry can be picked.
+pub(crate) fn pick_box_start_entry(
+    entries: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    let wanted = typed.unwrap_or(mfile::entry::DEFAULT_ENTRY_NAME);
+    if let Some(entry) = entries.iter().find(|entry| entry.name == wanted) {
+        return Ok(entry.clone());
+    }
+    let unknown = |typed: &str| StartEntryRefusal::Unknown {
+        verb: StartVerb::Box,
+        entry: typed.to_string(),
+        entries: listed_entries(entries)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
+    };
+    if let Some(typed) = typed.filter(|typed| *typed != mfile::entry::DEFAULT_ENTRY_NAME) {
+        return Err(unknown(typed).into());
+    }
+    // Only the implicit `default` or the count is left to decide the pick.
+    let candidates = start_candidates(entries)?;
+    let names = || candidates.iter().map(|entry| entry.name.clone()).collect();
+    if let Some(default) = candidates
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok(default.clone());
+    }
+    if let Some(typed) = typed {
+        return Err(unknown(typed).into());
+    }
+    match candidates.as_slice() {
+        [only] => Ok(only.clone()),
+        _ => Err(StartEntryRefusal::Several {
+            verb: StartVerb::Box,
+            entries: names(),
+        }
+        .into()),
+    }
+}
+
+/// A start the project's `minimal.toml` cannot serve: the start cannot pick
+/// an entry, or the entry it names cannot start this way. The start refuses
+/// it before it creates anything, and the run ends with
+/// [`StartEntryRefusal::exit_code`] (`main.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartEntryRefusal {
+    /// No entry was typed, several entries count, and none is `default`.
+    Several {
+        verb: StartVerb,
+        /// The entries the start counted, in the order the file is read.
+        entries: Vec<String>,
+    },
+    /// The typed entry is not one the start counts.
+    Unknown {
+        verb: StartVerb,
+        entry: String,
+        /// The entries the start counted, in the order the file is read.
+        entries: Vec<String>,
+    },
+    /// `min session start` found no session entry, and the entry named
+    /// `default` has another type, so no implicit `default` applies.
+    DefaultBlocked {
+        /// The type of the `default` entry, when the file gives one.
+        box_type: Option<String>,
+    },
+    /// `min session start` named an entry that is not a session entry.
+    NotSession {
+        entry: String,
+        box_type: Option<String>,
+    },
+    /// `--name` for a task entry: its box runs through the run path, which
+    /// generates the box's name and takes no `--name`. This refusal is an
+    /// interim. <https://github.com/gominimal/minimal/issues/3196> tracks a
+    /// box name for `RunEntry`. Remove this refusal when `RunEntry` takes a
+    /// name.
+    NameUnsupported { entry: String },
+    /// A task entry declared as `[boxes.<name>]` with `type = "task"`: the
+    /// run path finds its task in `[tasks]` only. This refusal is an
+    /// interim. <https://github.com/gominimal/minimal/issues/3213> tracks
+    /// those entries. Remove this refusal when `declared_task` reads the
+    /// task entries of `[boxes]`.
+    TaskNotInTasks { entry: String },
+    /// `min box start` named an entry of a type it cannot start yet: an
+    /// agent, service or user-defined type. This refusal is an interim.
+    /// <https://github.com/gominimal/minimal/issues/3197> tracks the start
+    /// of those entries.
+    UnsupportedType {
+        entry: String,
+        box_type: Option<String>,
+    },
+    /// A typed session entry not named `default`. The box's spec would name
+    /// the entry, but its body still comes from the project's `[session]`
+    /// table, not from the entry (see [`stamp_session_spec_as`]). This
+    /// refusal is an interim.
+    /// <https://github.com/gominimal/minimal/issues/3204> tracks the entry's
+    /// own body. Remove this refusal when the start expands the typed
+    /// entry's body into its spec.
+    NamedSessionUnsupported { verb: StartVerb, entry: String },
+}
+
+impl StartEntryRefusal {
+    /// The exit code of the refused start, from the architecture's
+    /// exit-code table: 4, not found, for an entry the start does not find.
+    /// `min session start` searches only the session entries, so an entry
+    /// that is not a session is not found too. Every other refusal is a
+    /// usage refusal, 2.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Unknown { .. } | Self::NotSession { .. } => 4,
+            Self::Several { .. }
+            | Self::DefaultBlocked { .. }
+            | Self::NameUnsupported { .. }
+            | Self::TaskNotInTasks { .. }
+            | Self::UnsupportedType { .. }
+            | Self::NamedSessionUnsupported { .. } => 2,
+        }
+    }
+}
+
+/// The entry names of a refusal, each with its control characters escaped.
+fn printable_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| printable(name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The type of an entry, as a refusal names it.
+fn entry_kind(box_type: Option<&str>) -> String {
+    box_type.map_or_else(
+        || "no type".to_owned(),
+        |t| format!("the type \"{}\"", printable(t)),
+    )
+}
+
+impl std::fmt::Display for StartEntryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = mfile::MFILE_NAME;
+        let noun = |verb: &StartVerb| match verb {
+            StartVerb::Box => "entries",
+            StartVerb::Session => "session entries",
+        };
+        match self {
+            Self::Several { verb, entries } => write!(
+                f,
+                "Cannot pick an entry to start. The project's {file} declares the {noun} \
+                 {names}, and none of them is named \"default\". Run {command} <entry> \
+                 with one of them.",
+                noun = noun(verb),
+                names = printable_list(entries),
+                command = verb.command(),
+            ),
+            Self::Unknown {
+                verb,
+                entry,
+                entries,
+            } => {
+                let singular = match verb {
+                    StartVerb::Box => "entry",
+                    StartVerb::Session => "session entry",
+                };
+                write!(
+                    f,
+                    "Cannot start {entry}. The project's {file} declares no {singular} \
+                     named \"{entry}\".",
+                    entry = printable(entry),
+                )?;
+                if entries.is_empty() {
+                    Ok(())
+                } else {
+                    write!(
+                        f,
+                        " Its {noun} are {names}. Run {command} <entry> with one of them.",
+                        noun = noun(verb),
+                        names = printable_list(entries),
+                        command = verb.command(),
+                    )
+                }
+            }
+            Self::DefaultBlocked { box_type } => write!(
+                f,
+                "Cannot start a session. The project's {file} declares no session entry, \
+                 and its entry \"default\" has {kind}. Add a [sessions.<name>] entry to \
+                 {file}, or rename the entry \"default\".",
+                kind = entry_kind(box_type.as_deref()),
+            ),
+            Self::NotSession { entry, box_type } => {
+                write!(
+                    f,
+                    "Cannot start {entry} as a session. Its entry in {file} has {kind}.",
+                    entry = printable(entry),
+                    kind = entry_kind(box_type.as_deref()),
+                )?;
+                if box_type.as_deref() == Some(boxes::TASK_BOX_TYPE) {
+                    write!(f, " Run min box start {} to start it.", printable(entry))?;
+                }
+                Ok(())
+            }
+            Self::NameUnsupported { entry } => write!(
+                f,
+                "Cannot start {entry} with --name. A box from a task entry gets a \
+                 generated name. Run min box start {entry} without --name.",
+                entry = printable(entry),
+            ),
+            Self::TaskNotInTasks { entry } => write!(
+                f,
+                "Cannot start {entry}. min box start runs only the tasks declared as \
+                 [tasks.<name>] in {file}, and {entry} is declared as [boxes.{entry}]. \
+                 Declare it as [tasks.{entry}] to start it.",
+                entry = printable(entry),
+            ),
+            Self::UnsupportedType { entry, box_type } => write!(
+                f,
+                "Cannot start {entry}. Its entry in {file} has {kind}, and min box start \
+                 starts session and task entries only.",
+                entry = printable(entry),
+                kind = entry_kind(box_type.as_deref()),
+            ),
+            Self::NamedSessionUnsupported { verb, entry } => write!(
+                f,
+                "Cannot start {entry}. {command} cannot start a session entry by name \
+                 yet, except the entry named \"default\". Rename {entry} to \"default\" \
+                 in {file}, then run {command}.",
+                entry = printable(entry),
+                command = verb.command(),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartEntryRefusal {}
+
+/// The refusal of a start off a terminal for an entry whose box has a
+/// terminal, without `--detach` (BCLI-029). The start refuses it before it
+/// creates anything, and `main.rs` ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartNeedsTerminal {
+    entry: String,
+}
+
+impl StartNeedsTerminal {
+    /// The usage-refusal code of the architecture's exit-code table.
+    pub const EXIT_CODE: u8 = 2;
+
+    #[must_use]
+    pub fn new(entry: &str) -> Self {
+        Self {
+            entry: entry.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for StartNeedsTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} needs a terminal. Run it from a terminal, or pass --detach.",
+            printable(&self.entry)
+        )
+    }
+}
+
+impl std::error::Error for StartNeedsTerminal {}
+
+/// The refusal of a start whose box name a running box on the host holds
+/// (BCLI-069, BOX-163). It names the holder, and the two flags that create
+/// the box anyway. `main.rs` ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartNameHeld {
+    pub verb: StartVerb,
+    pub entry: String,
+    pub refusal: minimald_rpc::HeldNameRefusal,
+}
+
+impl StartNameHeld {
+    /// The exit code of the held-name refusal.
+    pub const EXIT_CODE: u8 = minimald_rpc::HeldNameRefusal::EXIT_CODE;
+}
+
+impl std::fmt::Display for StartNameHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let minimald_rpc::HeldNameRefusal {
+            name,
+            holder,
+            holder_name,
+        } = &self.refusal;
+        let entry = printable(&self.entry);
+        let name = printable(name);
+        let holder_name = printable(holder_name);
+        match holder {
+            Some(holder) => write!(
+                f,
+                "Cannot start {entry}. The running box {holder_name} ({holder}) holds the \
+                 name {name}.",
+            )?,
+            None => write!(
+                f,
+                "Cannot start {entry}. The running box {holder_name} holds the name {name}.",
+            )?,
+        }
+        write!(
+            f,
+            " Run {command} --new {entry} to create another box from the entry, or \
+             pass --name <name> to give the box another name.",
+            command = self.verb.command(),
+        )
+    }
+}
+
+impl std::error::Error for StartNameHeld {}
+
+/// The one stderr hint of a start that returns without attaching to a box
+/// that has no terminal (BCLI-029). The box's stdin is already closed.
+/// `box_id` is the id of the box the start created.
+#[must_use]
+pub fn unattached_start_hint(entry: &str, box_id: impl std::fmt::Display) -> String {
+    format!(
+        "{entry} started with no input. Run min box run {entry} to connect this \
+         terminal's input and output to a new box. Run min box logs {box_id} for its \
+         output, and min box wait {box_id} for its exit code."
+    )
+}
+
+/// How a start creates its box.
+#[derive(Debug)]
+pub(crate) enum StartPlan {
+    /// A session entry: the activation, which attaches unless `--detach`.
+    Session {
+        entry: String,
+        args: ActivateArgs,
+        options: ActivationOptions,
+    },
+    /// An entry whose box has no terminal: a detached run, which closes the
+    /// box's stdin and prints its id.
+    Detached {
+        entry: String,
+        run: crate::task::RunEntry,
+    },
+}
+
+impl StartPlan {
+    /// The entry the start picked.
+    #[must_use]
+    pub fn entry(&self) -> &str {
+        match self {
+            Self::Session { entry, .. } | Self::Detached { entry, .. } => entry,
+        }
+    }
+}
+
+/// Decides how `start` creates its box, from the project's `entries`, before
+/// anything is created. `has_terminal` says whether this command runs on a
+/// terminal that an attach can use.
+///
+/// # Errors
+///
+/// [`StartEntryRefusal`] when no entry can be picked or the entry cannot
+/// start, and [`StartNeedsTerminal`] for an entry whose box has a terminal,
+/// off a terminal, without `--detach`.
+pub(crate) fn plan_start(
+    start: &StartEntry,
+    entries: &[mfile::entry::BoxEntry],
+    has_terminal: bool,
+) -> Result<StartPlan, anyhow::Error> {
+    let entry = match start.verb {
+        StartVerb::Box => pick_box_start_entry(entries, start.entry.as_deref())?,
+        StartVerb::Session => {
+            crate::cmd::session::pick_session_start_entry(entries, start.entry.as_deref())?
+        }
+    };
+    match entry.box_type.as_deref() {
+        // A typed session entry other than `default` would get the body of
+        // the `[session]` table under its own name. That refusal is the
+        // #3204 interim: remove it when the start expands the entry's body.
+        // A bare start that picks the only session entry still starts it,
+        // as BCLI-071 requires.
+        Some(boxes::SESSION_BOX_TYPE)
+            if start.entry.is_some() && entry.name != mfile::entry::DEFAULT_ENTRY_NAME =>
+        {
+            Err(StartEntryRefusal::NamedSessionUnsupported {
+                verb: start.verb,
+                entry: entry.name,
+            }
+            .into())
+        }
+        // A session box has a terminal: its spec sets `pty_enabled`
+        // (`BoxSpec::for_session`).
+        Some(boxes::SESSION_BOX_TYPE) => {
+            if !start.detach && !has_terminal {
+                return Err(StartNeedsTerminal::new(&entry.name).into());
+            }
+            let mut args = ActivateArgs::unflagged();
+            args.name.clone_from(&start.name);
+            args.attach = !start.detach;
+            Ok(StartPlan::Session {
+                options: ActivationOptions {
+                    offer_scaffold: false,
+                    entry: Some(entry.name.clone()),
+                    box_name: start.name.clone(),
+                    fresh_instance: start.new,
+                },
+                entry: entry.name,
+                args,
+            })
+        }
+        // A task box never has a terminal (BOX-054), so the start detaches.
+        // `run_entry` calls `request_fresh_instance`, and the daemon names
+        // the box `<entry>-<n>` (BOX-163). So a task-entry start is always a
+        // fresh instance, and `--new` changes nothing for it. A plain start
+        // does not refuse a held name until gominimal/minimal#3196 lands.
+        // The run path takes no `--name`, so the start refuses that flag
+        // rather than drop it. That refusal is the #3196 interim: remove it
+        // when `RunEntry` takes a name.
+        //
+        // The run path finds its task in `[tasks]` only, so a `[boxes]`
+        // task entry is refused first. That refusal is the #3213 interim:
+        // remove it when `declared_task` reads the task entries of `[boxes]`.
+        Some(boxes::TASK_BOX_TYPE) if entry.table != mfile::entry::EntryTable::Tasks => {
+            Err(StartEntryRefusal::TaskNotInTasks { entry: entry.name }.into())
+        }
+        Some(boxes::TASK_BOX_TYPE) if start.name.is_some() => {
+            Err(StartEntryRefusal::NameUnsupported { entry: entry.name }.into())
+        }
+        Some(boxes::TASK_BOX_TYPE) => Ok(StartPlan::Detached {
+            run: crate::task::RunEntry {
+                verb: crate::task::RunVerb::Box,
+                entry: entry.name.clone(),
+                path: None,
+                detach: true,
+                args: Vec::new(),
+                network: None,
+                egress: crate::EgressArgs::default(),
+            },
+            entry: entry.name,
+        }),
+        // Agent, service and user-defined-type entries: an interim refusal
+        // until gominimal/minimal#3197 lets `min box start` start them.
+        box_type => Err(StartEntryRefusal::UnsupportedType {
+            box_type: box_type.map(str::to_owned),
+            entry: entry.name,
+        }
+        .into()),
+    }
+}
+
+/// The project directory of a command: `-C`/`--repo-dir`, else the current
+/// working directory.
+fn command_project_dir(global: &GlobalArgs) -> Result<camino::Utf8PathBuf, anyhow::Error> {
+    let effective_path = global
+        .repo_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let project_path = std::fs::canonicalize(&effective_path)
+        .with_context(|| format!("Cannot resolve project path '{}'", effective_path.display()))?;
+    camino::Utf8PathBuf::from_path_buf(project_path)
+        .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))
+}
+
+/// The bytes of the project's `minimal.toml` for `project`, or `None` when
+/// the project has none.
+fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
+        Ok(file) => file,
+        Err(mfile::Error::NotFound) => return Ok(None),
+        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+    };
+    let Some(root) = file.repo_path() else {
+        return Ok(None);
+    };
+    let Some(path) = [
+        root.join(mfile::MFILE_NAME),
+        root.join(".minimal").join(mfile::MFILE_NAME),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path).map_err(|e| ProjectFileInvalid {
+        error: mfile::Error::IO("minimal file", path.clone(), e),
+    })?;
+    Ok(Some(bytes))
+}
+
+/// The entries the project's `minimal.toml` declares. A project with no
+/// `minimal.toml` declares none.
+fn project_entries(project: &camino::Utf8Path) -> anyhow::Result<Vec<mfile::entry::BoxEntry>> {
+    match project_file_bytes(project)? {
+        Some(bytes) => {
+            mfile::entry::read_entries(&bytes).map_err(|error| ProjectFileInvalid { error }.into())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// `min box start [<entry>]`: create a box from an entry and attach this
+/// terminal to it, or print its id and return.
+pub async fn cmd_box_start(global: &GlobalArgs, args: BoxStartArgs) -> Result<(), anyhow::Error> {
+    start_entry(global, args.into()).await
+}
+
+/// The one start path of `min box start` and `min session start` (BCLI-029,
+/// BCLI-069, BCLI-070, BCLI-071, BCLI-072): pick the entry, refuse what
+/// cannot start before anything is created, then create the box. A box with
+/// a terminal attaches unless `--detach`. Any other box starts with its
+/// stdin closed, and the start prints one hint.
+pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), anyhow::Error> {
+    let project = command_project_dir(global)?;
+    let entries = project_entries(&project)?;
+    let has_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let plan = plan_start(&start, &entries, has_terminal).inspect_err(|error| {
+        tracing::info!(verb = start.verb.command(), %error, "the start was refused before it created a box");
+    })?;
+    tracing::info!(
+        verb = start.verb.command(),
+        entry = %plan.entry(),
+        typed_entry = ?start.entry,
+        name = ?start.name,
+        fresh_instance = start.new,
+        detach = start.detach,
+        "starting a box from the entry"
+    );
+    match plan {
+        StartPlan::Session {
+            entry,
+            args,
+            options,
+        } => activate_box(global, args, options)
+            .await
+            .map_err(|error| start_refusal(error, start.verb, &entry)),
+        StartPlan::Detached { entry, run } => {
+            let id = crate::task::run_entry(global, run).await?;
+            crate::output::record_box_id(&id.to_string());
+            eprintln!("{}", unattached_start_hint(&entry, id));
+            Ok(())
+        }
+    }
+}
+
+/// The error a start ends with, the same for `min box start` and `min
+/// session start`: a held name becomes [`StartNameHeld`], with its hint to
+/// `--new` and `--name`. A host port in use becomes the refusal's own text,
+/// with the port and its holder (NET-144). Any other error passes through.
+pub(crate) fn start_refusal(error: anyhow::Error, verb: StartVerb, entry: &str) -> anyhow::Error {
+    match error.downcast::<minimald_rpc::HeldNameRefusal>() {
+        Ok(refusal) => anyhow::Error::new(StartNameHeld {
+            verb,
+            entry: entry.to_string(),
+            refusal,
+        }),
+        Err(error) => crate::cmd::session::activate_refusal(error),
+    }
+}
+
+/// Settings of an activation that no `min session activate` flag carries.
+/// A `bool` converts to these settings with only the scaffold offer set, so
+/// a caller that passes `offer_scaffold` alone keeps its meaning.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivationOptions {
+    /// Offer to write a `minimal.toml` when the project has none.
+    pub offer_scaffold: bool,
+    /// The session entry the box is created from, when it is not `default`.
+    pub entry: Option<String>,
+    /// The `[box] name` of the box's spec (BCLI-069).
+    pub box_name: Option<String>,
+    /// Ask for a fresh instance, `<name>-<n>` (BCLI-070).
+    pub fresh_instance: bool,
+}
+
+impl From<bool> for ActivationOptions {
+    fn from(offer_scaffold: bool) -> Self {
+        Self {
+            offer_scaffold,
+            ..Self::default()
+        }
+    }
+}
+
 /// A grant the box cannot receive: a GitHub grant whose value cannot land
 /// in its environment (BEP-007), or a store reference that no rule admits
 /// (BEP-035). The creation is refused with exit 3, before the box exists.
@@ -441,10 +1153,14 @@ pub(crate) struct ProjectEgress {
 /// one. With no session entry, the implicit default entry applies. Only the
 /// `network` keys of the layers are read, so a key this read does not own
 /// never refuses an activation. The policy is `None` when there is no
-/// project file or no layer declares egress.
-fn project_egress(project: &camino::Utf8Path) -> anyhow::Result<ProjectEgress> {
+/// project file or no layer declares egress. A start passes the `entry` it
+/// picked, and that entry is the session entry here.
+pub(crate) fn project_egress(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+) -> anyhow::Result<ProjectEgress> {
     match project_file_bytes(project)? {
-        Some(bytes) => project_egress_from(&bytes),
+        Some(bytes) => project_egress_from(&bytes, entry),
         None => Ok(ProjectEgress::default()),
     }
 }
@@ -462,31 +1178,6 @@ pub(crate) fn task_project_egress(
         Some(bytes) => task_egress_from(&bytes, task),
         None => Ok(ProjectEgress::default()),
     }
-}
-
-/// The bytes of the project's `minimal.toml`, or `None` when the project
-/// has none.
-fn project_file_bytes(project: &camino::Utf8Path) -> anyhow::Result<Option<Vec<u8>>> {
-    let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
-        Ok(file) => file,
-        Err(mfile::Error::NotFound) => return Ok(None),
-        Err(error) => return Err(ProjectFileInvalid { error }.into()),
-    };
-    let Some(root) = file.repo_path() else {
-        return Ok(None);
-    };
-    let Some(path) = [
-        root.join(mfile::MFILE_NAME),
-        root.join(".minimal").join(mfile::MFILE_NAME),
-    ]
-    .into_iter()
-    .find(|path| path.is_file()) else {
-        return Ok(None);
-    };
-    let bytes = std::fs::read(&path).map_err(|e| ProjectFileInvalid {
-        error: mfile::Error::IO("minimal file", path.clone(), e),
-    })?;
-    Ok(Some(bytes))
 }
 
 /// Whether any `network` key appears in `[defaults]`, in a
@@ -518,14 +1209,22 @@ fn declares_network(file: &toml::Table, entries: &[mfile::entry::BoxEntry]) -> b
             .any(|entry| entry.body.contains_key("network"))
 }
 
-/// [`project_egress`] over the bytes of a `minimal.toml`.
-fn project_egress_from(bytes: &[u8]) -> anyhow::Result<ProjectEgress> {
+/// [`project_egress`] over the bytes of a `minimal.toml`. A start that names
+/// its `entry` reads the egress of that entry (BCLI-069). The start already
+/// picked it, so no default is picked here. With no `entry`, or with a name
+/// that only the implicit default entry answers, the pick applies.
+fn project_egress_from(bytes: &[u8], entry: Option<&str>) -> anyhow::Result<ProjectEgress> {
     let file: toml::Table = toml::from_slice(bytes).map_err(|e| ProjectFileInvalid {
         error: mfile::Error::Format(e),
     })?;
     let entries =
         mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?;
-    let entry = match pick_session_entry(&entries) {
+    let typed = entry.and_then(|name| entries.iter().find(|entry| entry.name == name));
+    let picked = match typed {
+        Some(entry) => Ok(entry.clone()),
+        None => pick_session_entry(&entries),
+    };
+    let entry = match picked {
         Ok(entry) => entry,
         // A file that declares no egress does not need a session entry for
         // it, so an undecided pick does not refuse its start.
@@ -1960,16 +2659,49 @@ pub(crate) fn registration_held_name_refusal(
 /// # Errors
 ///
 /// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+#[cfg(test)]
 pub(crate) fn stamp_session_spec(
     request: &mut minimald_rpc::CreateSessionRequest,
     dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    stamp_session_spec_as(request, dir, None, None)
+}
+
+/// [`stamp_session_spec`] for the session entry `entry`, when it is not
+/// `default`, with `name` as the spec's `[box] name` (BCLI-069).
+///
+/// The spec names the typed entry, but its body still comes from the
+/// project's `[session]` table through `BoxSpec::for_session`. The body of
+/// `[sessions.<entry>]` is not applied yet. That is the interim of
+/// gominimal/minimal#3204, and until then `plan_start` refuses a typed
+/// session entry other than `default`
+/// ([`StartEntryRefusal::NamedSessionUnsupported`]). A bare start of the
+/// only session entry still reaches this function with that entry's name.
+/// Flip it when box creation reads entries
+/// (gominimal/minimal#2418): then expand the typed entry's body into the
+/// spec through BOX-064's layers.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+pub(crate) fn stamp_session_spec_as(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+    entry: Option<&str>,
+    name: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     let session = match mfile::File::from_dir_recursive(dir.as_std_path()) {
         Ok(file) => file.session,
         Err(mfile::Error::NotFound) => None,
         Err(error) => return Err(ProjectFileInvalid { error }.into()),
     };
-    let spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    let mut spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    if let Some(entry) = entry {
+        spec.entry = entry.to_string();
+    }
+    if let Some(name) = name {
+        spec.name = Some(name.to_string());
+    }
     put_spec(request, &spec)
 }
 
@@ -2086,8 +2818,10 @@ pub(crate) fn subnet_notices(args: &crate::EgressArgs) -> Vec<String> {
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
-    offer_scaffold: bool,
+    options: impl Into<ActivationOptions>,
 ) -> Result<(), anyhow::Error> {
+    let options: ActivationOptions = options.into();
+    let offer_scaffold = options.offer_scaffold;
     let (utf8_path, abs_path, port_mappings, egress) = ActivationStep::CheckArguments
         .run(async {
             // Before anything is created, and before the daemon is spawned (a cold
@@ -2142,7 +2876,7 @@ pub(crate) async fn activate_box(
                 project_bep_and_grants(&utf8_path)?;
             // NET-060: the project's egress, with each field a flag names
             // replaced by the flag.
-            let project_egress = project_egress(&utf8_path)?;
+            let project_egress = project_egress(&utf8_path, options.entry.as_deref())?;
             // A legacy key spelling still loads. A start with no terminal
             // prints its hint, and an interactive start logs it, so no line
             // prints before the box shell.
@@ -2255,6 +2989,11 @@ pub(crate) async fn activate_box(
     let mut request =
         minimald_rpc::CreateSessionRequest::new(String::new(), abs_path.clone(), network, policy);
     request.config.name = request_name(args.name.as_deref());
+    // BCLI-070: `--new` asks for a fresh instance, `<name>-<n>`. The
+    // spec's `[box] name`, when `--name` gives one, is the base of the name.
+    if options.fresh_instance {
+        request_fresh_instance(&mut request);
+    }
     request.config.hooks_enabled = !args.no_hooks;
     request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
@@ -2357,7 +3096,12 @@ pub(crate) async fn activate_box(
             set_project_root(&mut request, project_root)?;
             // BOX-068: the box's spec, after every flag and the project's
             // policy are on the request.
-            stamp_session_spec(&mut request, &utf8_path)?;
+            stamp_session_spec_as(
+                &mut request,
+                &utf8_path,
+                options.entry.as_deref(),
+                options.box_name.as_deref(),
+            )?;
 
             let Some(root) = upload_root else {
                 return Ok::<_, anyhow::Error>(UploadPlan::Skip);
@@ -3439,6 +4183,7 @@ pub(crate) async fn activate_box(
         .await?;
 
     println!("{id}");
+    crate::output::record_box_id(&id.to_string());
 
     // T126 (NET-138): a `host_ip` box on a VM host names each of its
     // mirrored ports that another program on the host holds. Printed only
@@ -3487,6 +4232,62 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use boxes::DynamicIngress;
+
+    /// A start refusal escapes the control characters of every entry name
+    /// it prints, so a name from `minimal.toml` cannot move the cursor.
+    #[test]
+    fn start_refusals_escape_entry_names() {
+        let bad = "dev\u{1b}[2K\n".to_owned();
+        let refusals = [
+            StartEntryRefusal::Several {
+                verb: StartVerb::Box,
+                entries: vec![bad.clone(), "ok".to_owned()],
+            },
+            StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: bad.clone(),
+                entries: vec![bad.clone()],
+            },
+            StartEntryRefusal::NotSession {
+                entry: bad.clone(),
+                box_type: Some(boxes::TASK_BOX_TYPE.to_owned()),
+            },
+            StartEntryRefusal::NameUnsupported { entry: bad.clone() },
+            StartEntryRefusal::TaskNotInTasks { entry: bad.clone() },
+            StartEntryRefusal::UnsupportedType {
+                entry: bad.clone(),
+                box_type: Some("agent".to_owned()),
+            },
+            StartEntryRefusal::NamedSessionUnsupported {
+                verb: StartVerb::Session,
+                entry: bad.clone(),
+            },
+        ];
+        let mut texts: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+        texts.push(StartNeedsTerminal::new(&bad).to_string());
+        for holder in [
+            None,
+            Some(boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap()),
+        ] {
+            texts.push(
+                StartNameHeld {
+                    verb: StartVerb::Box,
+                    entry: bad.clone(),
+                    refusal: minimald_rpc::HeldNameRefusal {
+                        name: bad.clone(),
+                        holder,
+                        holder_name: bad.clone(),
+                    },
+                }
+                .to_string(),
+            );
+        }
+        for text in texts {
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(!text.contains('\n'), "{text:?}");
+            assert!(text.contains("dev\\u{1b}[2K\\n"), "{text:?}");
+        }
+    }
 
     /// BOX-001: a create from `<root>/sub` sends `<root>`, the directory
     /// that holds `minimal.toml`, as the project root.
@@ -5171,7 +5972,9 @@ mod tests {
         let sub = root.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
 
-        let project = project_egress(&sub).expect("the project file loads").policy;
+        let project = project_egress(&sub, None)
+            .expect("the project file loads")
+            .policy;
         let effective = effective_egress(project, None, false);
         let expected = boxes::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".into()]),
@@ -5204,6 +6007,7 @@ mod tests {
         let layered = project_egress_from(
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [sessions.default.network]\negress_allow_dns = [\"b.example\"]\n",
+            None,
         )
         .expect("the file loads");
         assert_eq!(
@@ -5219,6 +6023,7 @@ mod tests {
         // entry's egress, and `[sessions.default]` wins over another entry.
         let only_dev = project_egress_from(
             b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n",
+            None,
         )
         .unwrap()
         .policy
@@ -5230,6 +6035,7 @@ mod tests {
         let with_default = project_egress_from(
             b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n\n\
               [sessions.default.network.egress]\nallow_dns_hosts = [\"d.example\"]\n",
+            None,
         )
         .unwrap()
         .policy
@@ -5244,6 +6050,7 @@ mod tests {
         let boxes_dev = project_egress_from(
             b"[boxes.dev]\ntype = \"session\"\n\n\
               [boxes.dev.network.egress]\nallow_dns_hosts = [\"box.example\"]\n",
+            None,
         )
         .unwrap()
         .policy
@@ -5258,6 +6065,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n\n\
               [boxes.web]\ntype = \"session\"\n",
+            None,
         )
         .expect_err("two session entries and no default refuse the start");
         let undecided = refusal
@@ -5276,6 +6084,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [tasks.default]\ncommand = \"true\"\n",
+            None,
         )
         .expect_err("a task named default blocks the implicit session entry");
         let undecided = refusal
@@ -5293,6 +6102,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[boxes.dev]\ntype = \"devbox\"\n\n\
               [boxes.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n",
+            None,
         )
         .expect_err("an entry of an unresolved type refuses the start");
         let undecided = refusal
@@ -5309,6 +6119,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [boxes.default]\ntype = \"devbox\"\n",
+            None,
         )
         .expect_err("a default entry of an unresolved type refuses the start");
         let undecided = refusal
@@ -5328,6 +6139,7 @@ mod tests {
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [boxes.dev]\ntype = \"devbox\"\n\n\
               [sessions.default]\npackages = [\"git\"]\n",
+            None,
         )
         .expect("a [sessions.default] entry is picked over an unresolved entry")
         .policy
@@ -5340,6 +6152,7 @@ mod tests {
             b"[box_types.devbox]\nextends = \"session\"\n\n\
               [box_types.devbox.defaults.network.egress]\nallow_dns_hosts = [\"t.example\"]\n\n\
               [boxes.dev]\ntype = \"devbox\"\n",
+            None,
         )
         .expect_err("egress in a type's defaults refuses an undecided start");
         assert!(
@@ -5367,6 +6180,7 @@ mod tests {
         // when its session entry cannot be picked.
         let no_egress = project_egress_from(
             b"[sessions.dev]\npackages = [\"git\"]\n\n[sessions.web]\npackages = [\"git\"]\n",
+            None,
         )
         .expect("a file without egress keys does not refuse the start");
         assert_eq!(no_egress.policy, None);
@@ -5375,6 +6189,7 @@ mod tests {
         // `ProjectFileInvalid`, which `main.rs` ends with exit 3.
         let refusal = project_egress_from(
             b"[defaults.network.egress]\nallow_protocols = [\"carrier-pigeon\"]\n",
+            None,
         )
         .expect_err("an unknown protocol refuses the start");
         assert!(
@@ -5389,6 +6204,7 @@ mod tests {
         let refusal = project_egress_from(
             b"[defaults.network]\nmode = \"none\"\n\n\
               [defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n",
+            None,
         )
         .expect_err("egress with mode none refuses the start");
         let refusal = refusal
@@ -5404,7 +6220,7 @@ mod tests {
 
         // No egress keys, and no project file, declare nothing.
         assert_eq!(
-            project_egress_from(b"[session]\npackages = [\"git\"]\n").unwrap(),
+            project_egress_from(b"[session]\npackages = [\"git\"]\n", None).unwrap(),
             ProjectEgress::default()
         );
         assert_eq!(
@@ -5426,6 +6242,7 @@ mod tests {
               allow_dns_hosts = [\"github.com\"]\n\
               allow_protocols = [\"udp\"]\n\
               deny_subnets = [\"169.254.169.254/32\"]\n",
+            None,
         )
         .unwrap()
         .policy;

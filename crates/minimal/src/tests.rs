@@ -451,6 +451,10 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_box_on = asserts",
             // Not a client path: the mint unit tests' create-request fixture.
             "tests.rs::create_request = asserts",
+            // Two unit test requests, never sent: they check the name a
+            // start's `--name` and entry give the box (BCLI-069).
+            "tests.rs::create_verbs_name_flag_overrides_box_name = asserts nothing",
+            "tests.rs::create_verbs_name_flag_overrides_box_name = asserts nothing",
             // A unit test's request, never sent: it checks the box's name.
             "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
@@ -2217,8 +2221,8 @@ async fn run_style_propagates_entrypoint_exit() {
 
 // BCLI-070: `min task run` and `min box run` share one run path, and its
 // create asks for a fresh instance under no name of the client's, so the
-// daemon names the box `<name>-<n>`. This branch has no `min box start` and
-// no `--new` on `min session start` yet, so only the runs request one.
+// daemon names the box `<name>-<n>`. `min box start --new` and `min session
+// start --new` ask for one through `ActivationOptions::fresh_instance`.
 #[test]
 fn run_and_start_new_request_fresh_instance() {
     let mut request = minimald_rpc::CreateSessionRequest::new(
@@ -2269,6 +2273,833 @@ fn run_and_start_new_request_fresh_instance() {
         .find("oneshot_rpc::<CreateSession>")
         .expect("the run sends its create");
     assert!(marked < sent, "the run marks its create before it sends it");
+}
+
+/// The entries of a `minimal.toml` that holds `toml`.
+fn start_entries(toml: &str) -> Vec<mfile::entry::BoxEntry> {
+    mfile::entry::read_entries(toml.as_bytes()).expect("the test file loads")
+}
+
+/// A start of `entry` (none when `None`) by `verb`, with no flag.
+fn typed_start(verb: StartVerb, entry: Option<&str>) -> StartEntry {
+    StartEntry {
+        verb,
+        entry: entry.map(str::to_owned),
+        name: None,
+        new: false,
+        detach: false,
+    }
+}
+
+/// The entry a start with no entry picks from `toml`, or its refusal.
+fn picked(verb: StartVerb, toml: &str) -> Result<String, StartEntryRefusal> {
+    let entries = start_entries(toml);
+    match verb {
+        StartVerb::Box => pick_box_start_entry(&entries, None),
+        StartVerb::Session => pick_session_start_entry(&entries, None),
+    }
+    .map(|entry| entry.name)
+    .map_err(|error| {
+        error
+            .downcast::<StartEntryRefusal>()
+            .expect("a start refusal")
+    })
+}
+
+// BCLI-029: a start creates the box. A session box has a terminal, so the
+// start attaches this terminal to it, unless `--detach` is given. A task
+// box has none, so the start prints its id and returns.
+#[test]
+fn start_attaches_pty_box_unless_detached() {
+    for verb in [StartVerb::Box, StartVerb::Session] {
+        let start = typed_start(verb, None);
+        let plan = plan_start(&start, &[], true).expect("the start is planned");
+        let StartPlan::Session {
+            entry,
+            args,
+            options,
+        } = plan
+        else {
+            panic!("{verb:?}: the implicit default entry is a session: {plan:?}");
+        };
+        assert_eq!(entry, "default");
+        assert!(
+            args.attach,
+            "{verb:?}: a session box attaches this terminal"
+        );
+        assert_eq!(options.entry.as_deref(), Some("default"));
+        assert!(!options.offer_scaffold, "a start never prompts first");
+
+        let detached = StartEntry {
+            detach: true,
+            ..start
+        };
+        // `--detach` works off a terminal too.
+        for has_terminal in [true, false] {
+            let StartPlan::Session { args, .. } =
+                plan_start(&detached, &[], has_terminal).expect("the start is planned")
+            else {
+                panic!("the implicit default entry is a session");
+            };
+            assert!(!args.attach, "{verb:?}: --detach prints the id and returns");
+        }
+    }
+
+    let entries = start_entries("[tasks.build]\necho = 'x'\n");
+    let plan = plan_start(&typed_start(StartVerb::Box, Some("build")), &entries, true)
+        .expect("the start is planned");
+    let StartPlan::Detached { entry, run } = plan else {
+        panic!("a task box has no terminal to attach: {plan:?}");
+    };
+    assert_eq!(entry, "build");
+    assert!(run.detach, "a task box is never attached");
+
+    // Both verbs parse, with `--detach`.
+    let cli = Cli::try_parse_from(["min", "box", "start", "--detach"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Start(BoxStartArgs {
+                entry: None,
+                detach: true,
+                ..
+            })
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "session", "start", "dev"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Session(SessionArgs {
+            command: SessionCommand::Start(SessionStartArgs {
+                entry: Some(ref entry),
+                detach: false,
+                ..
+            })
+        })) if entry == "dev"
+    ));
+}
+
+// BCLI-029: off a terminal and without `--detach`, the start of an entry
+// whose box has a terminal fails with exit 2, names `--detach`, and creates
+// nothing.
+// On a terminal, this test checks only the plan-level half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_off_tty_exit2_names_detach() {
+    for verb in [StartVerb::Box, StartVerb::Session] {
+        let error = plan_start(&typed_start(verb, None), &[], false)
+            .expect_err("a terminal box is refused off a terminal");
+        assert!(error.downcast_ref::<StartNeedsTerminal>().is_some());
+        assert_eq!(
+            error.to_string(),
+            "default needs a terminal. Run it from a terminal, or pass --detach."
+        );
+    }
+    assert_eq!(StartNeedsTerminal::EXIT_CODE, 2);
+
+    use std::io::IsTerminal as _;
+    // The whole command, when this test runs off a terminal: it refuses
+    // before it creates a box.
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return;
+    }
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), b"[sessions.dev]\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        minimal_dir: Some(state.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+    let refusals = [
+        cmd_box_start(
+            &global,
+            BoxStartArgs {
+                entry: None,
+                name: None,
+                new: false,
+                detach: false,
+            },
+        )
+        .await
+        .expect_err("the start is refused off a terminal"),
+        cmd_session_start(
+            &global,
+            SessionStartArgs {
+                // A bare start picks the only session entry, `dev`. A typed
+                // `dev` is refused until gominimal/minimal#3204.
+                entry: None,
+                name: None,
+                new: false,
+                detach: false,
+            },
+        )
+        .await
+        .expect_err("the start is refused off a terminal"),
+    ];
+    for error in refusals {
+        assert!(
+            error.downcast_ref::<StartNeedsTerminal>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "dev needs a terminal. Run it from a terminal, or pass --detach."
+        );
+    }
+    let listed = server
+        .connect()
+        .await
+        .call::<minimald_rpc::ListSessions>(&())
+        .await;
+    assert!(
+        listed.sessions.is_empty(),
+        "the refused starts created no box"
+    );
+}
+
+// BCLI-029: a start that returns unattached from a box with no terminal
+// closes the box's stdin as it creates the box, and prints one hint naming
+// `min box run`, `min box logs` and `min box wait`. A session box keeps its
+// terminal input for a later attach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
+    let entries = start_entries("[tasks.build]\necho = 'x'\n");
+    let StartPlan::Detached { run, .. } =
+        plan_start(&typed_start(StartVerb::Box, Some("build")), &entries, false)
+            .expect("the start is planned")
+    else {
+        panic!("a task box starts detached");
+    };
+    assert_eq!(
+        run,
+        task::RunEntry {
+            verb: task::RunVerb::Box,
+            entry: "build".into(),
+            path: None,
+            detach: true,
+            args: vec![],
+            network: None,
+            egress: crate::EgressArgs::default(),
+        },
+        "the start takes the detached run, which closes the box's stdin"
+    );
+
+    // The detached run prints the id and closes the box's stdin, with no
+    // input sent on it.
+    let (_dir, mut client, log) = stand_in_daemon(0).await;
+    let id = boxes::SessionId::mint();
+    let channel = task::open_task_box_run(
+        &mut client,
+        id,
+        "build",
+        "",
+        &minimald_rpc::taskenv::TaskEnv::default(),
+    )
+    .await
+    .expect("the daemon takes the run");
+    let mut out = Vec::new();
+    task::detach_run(channel, id, &mut out)
+        .await
+        .expect("the run detaches");
+    assert_eq!(String::from_utf8(out).unwrap(), format!("{id}\n"));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while log.lock().unwrap().len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the box's stdin never closed: {:?}",
+            log.lock().unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(log.lock().unwrap()[1], "stdin closed after 0 bytes");
+
+    let hint = unattached_start_hint("build", id);
+    // The start takes the id of the box from the run, records it on the
+    // command's span and names it in the hint.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
+    let body = function_body(&text, "start_entry").expect("create.rs defines start_entry");
+    for step in [
+        "let id = crate::task::run_entry(global, run).await?;",
+        "crate::output::record_box_id(&id.to_string());",
+        "unattached_start_hint(&entry, id)",
+    ] {
+        assert!(body.contains(step), "start_entry does not do {step}");
+    }
+
+    // The hint names the box the start created, by its id.
+    assert_eq!(
+        hint,
+        format!(
+            "build started with no input. Run min box run build to connect this \
+             terminal's input and output to a new box. Run min box logs {id} for its \
+             output, and min box wait {id} for its exit code."
+        )
+    );
+    assert_eq!(hint.lines().count(), 1, "one hint line");
+
+    // A session box started with `--detach` is not attached, and nothing
+    // closes its terminal input.
+    let detached = StartEntry {
+        detach: true,
+        ..typed_start(StartVerb::Session, None)
+    };
+    assert!(matches!(
+        plan_start(&detached, &[], false),
+        Ok(StartPlan::Session { ref args, .. }) if !args.attach
+    ));
+}
+
+// BCLI-069: `--name` on `min box start` and `min session start` becomes the
+// box's `[box] name`, which names the box. With `--new`, the name is the
+// base of the fresh instance's `<name>-<n>`.
+#[test]
+fn create_verbs_name_flag_overrides_box_name() {
+    for (verb, argv) in [
+        (StartVerb::Box, ["min", "box", "start", "--name", "api"]),
+        (
+            StartVerb::Session,
+            ["min", "session", "start", "--name", "api"],
+        ),
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let start = match cli.command {
+            Some(Command::Box(BoxArgs {
+                command: BoxCommand::Start(args),
+            })) => StartEntry::from(args),
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Start(args),
+            })) => StartEntry::from(args),
+            _ => panic!("not a start"),
+        };
+        assert_eq!(start.verb, verb);
+        assert_eq!(start.name.as_deref(), Some("api"));
+        let StartPlan::Session { args, options, .. } =
+            plan_start(&start, &[], true).expect("the start is planned")
+        else {
+            panic!("the implicit default entry is a session");
+        };
+        assert_eq!(args.name.as_deref(), Some("api"));
+        assert_eq!(options.box_name.as_deref(), Some("api"));
+
+        let project = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(project.path()).unwrap();
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+        request.config.name = minimal_client::box_name::request_name(args.name.as_deref());
+        stamp_session_spec_as(
+            &mut request,
+            root,
+            options.entry.as_deref(),
+            options.box_name.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(created_box_name(&request).as_deref(), Some("api"));
+
+        // `--new`: no name of the client's on the request, and the spec's
+        // `[box] name` is the base the daemon numbers.
+        request_fresh_instance(&mut request);
+        assert_eq!(request.config.name, None);
+        let spec: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+        assert_eq!(spec.name.as_deref(), Some("api"));
+
+        // A planned start with `--new` asks the activation for a fresh
+        // instance. A start without it does not.
+        assert!(!options.fresh_instance);
+        let fresh = StartEntry { new: true, ..start };
+        let StartPlan::Session { options, .. } =
+            plan_start(&fresh, &[], true).expect("the start is planned")
+        else {
+            panic!("the implicit default entry is a session");
+        };
+        assert!(
+            options.fresh_instance,
+            "{verb:?}: --new asks for a fresh instance"
+        );
+    }
+    // The activation marks its create request as a fresh instance when its
+    // options ask for one, before it sends the request.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
+    let body = function_body(&text, "activate_box").expect("create.rs defines activate_box");
+    let asked = body
+        .find("if options.fresh_instance {")
+        .expect("the activation reads the fresh-instance option");
+    let marked = body[asked..]
+        .find("request_fresh_instance(&mut request)")
+        .map(|at| asked + at)
+        .expect("the activation marks its create as a fresh instance");
+    let sent = body
+        .find("oneshot_rpc::<CreateSession>")
+        .expect("the activation sends its create");
+    assert!(
+        marked < sent,
+        "the activation marks its create before it sends it"
+    );
+
+    // Without `--name`, a named session entry names the box.
+    let entries = start_entries("[sessions.dev]\n");
+    let StartPlan::Session { options, .. } =
+        plan_start(&typed_start(StartVerb::Session, None), &entries, true).unwrap()
+    else {
+        panic!("dev is a session entry");
+    };
+    let project = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = minimal_client::box_name::request_name(None);
+    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    assert_eq!(created_box_name(&request).as_deref(), Some("dev"));
+
+    // A task entry's box takes a generated name, so `--name` is refused
+    // before anything is created, not dropped.
+    let entries = start_entries("[tasks.build]\necho = 'x'\n");
+    let mut start = typed_start(StartVerb::Box, Some("build"));
+    start.name = Some("x".to_owned());
+    let error = plan_start(&start, &entries, true).expect_err("--name is refused");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("a start refusal, which exits 2");
+    assert_eq!(
+        refusal,
+        &StartEntryRefusal::NameUnsupported {
+            entry: "build".to_owned()
+        }
+    );
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot start build with --name. A box from a task entry gets a generated \
+         name. Run min box start build without --name."
+    );
+}
+
+/// The egress that `argv`, a `min session start` in a project with
+/// `toml` as its `minimal.toml`, puts on its create request. No egress flag
+/// is set, so the request carries the project's egress as read here.
+fn session_start_egress(argv: &[&str], toml: &str) -> anyhow::Result<Option<boxes::EgressPolicy>> {
+    let cli = Cli::try_parse_from(argv).unwrap();
+    let Some(Command::Session(SessionArgs {
+        command: SessionCommand::Start(args),
+    })) = cli.command
+    else {
+        panic!("not a session start");
+    };
+    let StartPlan::Session { options, .. } =
+        plan_start(&StartEntry::from(args), &start_entries(toml), true)?
+    else {
+        panic!("a session entry starts a session");
+    };
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    Ok(project_egress(root, options.entry.as_deref())?.policy)
+}
+
+/// The egress the activation reads for the session entry `entry` of a
+/// project with `toml` as its `minimal.toml`.
+fn entry_egress(toml: &str, entry: &str) -> Option<boxes::EgressPolicy> {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    project_egress(root, Some(entry)).unwrap().policy
+}
+
+// BCLI-069: a session entry starts with its own egress, not with the egress
+// of the `default` entry. A typed session entry other than `default` is
+// refused until gominimal/minimal#3204 gives the box that entry's body, so
+// the activation's egress lookup of a named entry is checked directly.
+#[test]
+fn session_start_typed_entry_reads_its_own_egress() {
+    let with_default = "[sessions.default]\n\
+                        [sessions.default.network.egress]\n\
+                        allow_dns_hosts = [\"example.com\"]\n\n\
+                        [sessions.ci]\n";
+    let ci = entry_egress(with_default, "ci");
+    assert!(
+        !format!("{ci:?}").contains("example.com"),
+        "ci gets the egress of default: {ci:?}"
+    );
+    for argv in [
+        &["min", "session", "start"][..],
+        &["min", "session", "start", "default"][..],
+    ] {
+        let default = session_start_egress(argv, with_default)
+            .expect("default starts")
+            .expect("default declares egress");
+        assert_eq!(
+            default.allow_dns_hosts,
+            Some(vec!["example.com".to_owned()])
+        );
+    }
+
+    let no_default = "[sessions.a.network.egress]\n\
+                      allow_dns_hosts = [\"a.example\"]\n\n\
+                      [sessions.b.network.egress]\n\
+                      allow_dns_hosts = [\"b.example\"]\n";
+    let a = entry_egress(no_default, "a").expect("a declares egress");
+    assert_eq!(a.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
+
+    // The only session entry, picked by a bare start, reads its own egress.
+    let sole = "[sessions.a.network.egress]\nallow_dns_hosts = [\"a.example\"]\n";
+    let a = session_start_egress(&["min", "session", "start"], sole)
+        .expect("the only session entry starts")
+        .expect("a declares egress");
+    assert_eq!(a.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
+}
+
+// BCLI-069: until gominimal/minimal#3204, both verbs refuse a typed session
+// entry other than `default` with exit 2, before anything is created. A
+// typed `default` and a bare start of the only session entry still start.
+#[test]
+fn start_typed_session_entry_other_than_default_exit2_until_its_body_applies() {
+    let entries = start_entries("[sessions.default]\n[sessions.ci]\n");
+    for verb in [StartVerb::Session, StartVerb::Box] {
+        let error = plan_start(&typed_start(verb, Some("ci")), &entries, true)
+            .expect_err("a typed session entry other than default is refused");
+        let refusal = error
+            .downcast_ref::<StartEntryRefusal>()
+            .expect("a start refusal");
+        assert_eq!(
+            refusal,
+            &StartEntryRefusal::NamedSessionUnsupported {
+                verb,
+                entry: "ci".into()
+            }
+        );
+        assert_eq!(refusal.exit_code(), 2);
+        assert!(matches!(
+            plan_start(&typed_start(verb, Some("default")), &entries, true),
+            Ok(StartPlan::Session { ref entry, .. }) if entry == "default"
+        ));
+    }
+    assert_eq!(
+        plan_start(&typed_start(StartVerb::Session, Some("ci")), &entries, true)
+            .unwrap_err()
+            .to_string(),
+        "Cannot start ci. min session start cannot start a session entry by name yet, \
+         except the entry named \"default\". Rename ci to \"default\" in minimal.toml, \
+         then run min session start."
+    );
+    let entries = start_entries("[boxes.dev]\ntype = \"session\"\n");
+    assert!(matches!(
+        plan_start(&typed_start(StartVerb::Session, None), &entries, true),
+        Ok(StartPlan::Session { ref entry, .. }) if entry == "dev"
+    ));
+}
+
+// BCLI-069: a start without `--new` whose name a running box holds exits
+// 2, names the holder, and names `--new` and `--name`.
+#[test]
+fn create_name_held_exit2_names_holder_hints_name_flag() {
+    let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
+    let reply = minimald_rpc::HeldNameRefusal {
+        name: "default".to_string(),
+        holder: Some(holder),
+        holder_name: "default".to_string(),
+    }
+    .to_string();
+
+    let error = start_refusal(create_refusal(reply), StartVerb::Box, "default");
+    let held = error
+        .downcast_ref::<StartNameHeld>()
+        .expect("main.rs maps this error to exit 2");
+    assert_eq!(StartNameHeld::EXIT_CODE, 2);
+    assert_eq!(held.refusal.holder, Some(holder));
+    assert_eq!(
+        format!("{error:#}"),
+        "Cannot start default. The running box default \
+         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds the name default. Run \
+         min box start --new default to create another box from the entry, or pass \
+         --name <name> to give the box another name."
+    );
+
+    let unread = start_refusal(
+        registration_held_name_refusal("dev", "dev", None),
+        StartVerb::Session,
+        "dev",
+    );
+    assert!(unread.downcast_ref::<StartNameHeld>().is_some());
+    assert_eq!(
+        format!("{unread:#}"),
+        "Cannot start dev. The running box dev holds the name dev. Run \
+         min session start --new dev to create another box from the entry, or pass \
+         --name <name> to give the box another name."
+    );
+
+    let other = start_refusal(anyhow::anyhow!("boom"), StartVerb::Box, "dev");
+    assert!(other.downcast_ref::<StartNameHeld>().is_none());
+    assert_eq!(format!("{other:#}"), "boom");
+
+    // NET-144: both verbs print a host port in use as the port and its
+    // holder, not the raw error chain.
+    let port = minimald_rpc::PortInUseRefusal {
+        port: 8080,
+        box_port: 80,
+        holder: minimald_rpc::PortHolder::Box("web".to_string()),
+    };
+    for verb in [StartVerb::Box, StartVerb::Session] {
+        let from_daemon = anyhow::anyhow!("could not finish activating the session: {port}")
+            .context("Finalize failed");
+        let printed = format!("{:#}", start_refusal(from_daemon, verb, "dev"));
+        assert_eq!(printed, port.to_string(), "{verb:?}");
+    }
+}
+
+// BCLI-071: a bare `min session start` starts the `default` session entry,
+// else the only session entry. The implicit `default` counts.
+#[test]
+fn session_start_without_entry_picks_default_else_sole() {
+    let session = StartVerb::Session;
+    assert_eq!(picked(session, "").as_deref(), Ok("default"), "implicit");
+    assert_eq!(
+        picked(session, "[tasks.build]\necho = 'x'\n").as_deref(),
+        Ok("default"),
+        "a task does not block the implicit default"
+    );
+    assert_eq!(
+        picked(session, "[sessions.dev]\n[tasks.build]\necho = 'x'\n").as_deref(),
+        Ok("dev"),
+        "the only session entry"
+    );
+    assert_eq!(
+        picked(session, "[sessions.dev]\n[sessions.default]\n").as_deref(),
+        Ok("default"),
+        "default wins over the others"
+    );
+}
+
+// BCLI-071: several session entries and none named `default`: exit 2,
+// listing them, with a hint naming `min session start <entry>`.
+#[test]
+fn session_start_without_entry_ambiguous_exit2_lists_entries() {
+    let refusal = picked(
+        StartVerb::Session,
+        "[sessions.api]\n[sessions.web]\n[tasks.build]\necho = 'x'\n",
+    )
+    .expect_err("no session entry is the default");
+    assert_eq!(
+        refusal,
+        StartEntryRefusal::Several {
+            verb: StartVerb::Session,
+            entries: vec!["api".into(), "web".into()],
+        }
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot pick an entry to start. The project's minimal.toml declares the session \
+         entries api, web, and none of them is named \"default\". Run min session start \
+         <entry> with one of them."
+    );
+}
+
+// BCLI-071: no session entry, and a task named `default` blocks the
+// implicit default: exit 2, naming that entry and both fixes.
+#[test]
+fn session_start_without_entry_blocked_default_exit2_names_fix() {
+    let refusal = picked(StartVerb::Session, "[tasks.default]\necho = 'x'\n")
+        .expect_err("no session entry applies");
+    assert_eq!(
+        refusal,
+        StartEntryRefusal::DefaultBlocked {
+            box_type: Some("task".into()),
+        }
+    );
+    let error = anyhow::Error::new(refusal);
+    assert!(error.downcast_ref::<StartEntryRefusal>().is_some());
+    assert_eq!(
+        error.to_string(),
+        "Cannot start a session. The project's minimal.toml declares no session entry, \
+         and its entry \"default\" has the type \"task\". Add a [sessions.<name>] entry \
+         to minimal.toml, or rename the entry \"default\"."
+    );
+
+    // An entry of a project Box Type can be a session, so it can block the
+    // implicit default too. The client cannot tell, so both verbs refuse
+    // with exit 2, and neither starts `default`.
+    let entries = start_entries("[boxes.dev]\ntype = \"mydev\"\n");
+    for verb in [StartVerb::Session, StartVerb::Box] {
+        for typed in [None, Some("default")] {
+            let error = plan_start(&typed_start(verb, typed), &entries, true)
+                .expect_err("a project Box Type is refused");
+            assert_eq!(
+                error.downcast_ref::<SessionEntryUndecided>(),
+                Some(&SessionEntryUndecided::TypeUnresolved {
+                    name: "dev".into(),
+                    box_type: Some("mydev".into()),
+                }),
+                "{verb:?} {typed:?}: {error:#}"
+            );
+        }
+    }
+    assert_eq!(SessionEntryUndecided::EXIT_CODE, 2);
+
+    // The refusal applies only when the pick must count the entries. An
+    // explicit `default` entry, or a typed entry, needs no unresolved type.
+    let entries = start_entries("[sessions.default]\n\n[boxes.dev]\ntype = \"mydev\"\n");
+    assert_eq!(
+        pick_box_start_entry(&entries, None)
+            .expect("the explicit default")
+            .name,
+        "default"
+    );
+    assert_eq!(
+        pick_session_start_entry(&entries, None)
+            .expect("the explicit default session")
+            .name,
+        "default"
+    );
+    // The whole plan of each start, not only its pick: `min session start`
+    // and `min box start` start the explicit `default` session entry.
+    for verb in [StartVerb::Session, StartVerb::Box] {
+        assert!(
+            matches!(
+                plan_start(&typed_start(verb, None), &entries, true),
+                Ok(StartPlan::Session { ref entry, .. }) if entry == "default"
+            ),
+            "{verb:?}"
+        );
+    }
+    let entries = start_entries("[tasks.build]\necho = 'x'\n\n[boxes.dev]\ntype = \"mydev\"\n");
+    assert_eq!(
+        pick_box_start_entry(&entries, Some("build"))
+            .expect("the typed entry")
+            .name,
+        "build"
+    );
+    // `min box start build` plans the task's detached run.
+    assert!(matches!(
+        plan_start(&typed_start(StartVerb::Box, Some("build")), &entries, false),
+        Ok(StartPlan::Detached { ref entry, .. }) if entry == "build"
+    ));
+    // A typed name that names no project entry is unknown, exit 4.
+    let error = pick_session_start_entry(&entries, Some("nope")).expect_err("no such entry");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("an unknown entry");
+    assert!(
+        matches!(refusal, StartEntryRefusal::Unknown { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.exit_code(), 4);
+    // A typed entry whose own type is unresolved still refuses, exit 2.
+    let error = pick_session_start_entry(&entries, Some("dev")).expect_err("type unresolved");
+    assert!(
+        matches!(
+            error.downcast_ref::<SessionEntryUndecided>(),
+            Some(SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "dev"
+        ),
+        "{error:#}"
+    );
+}
+
+// BCLI-072: a bare `min box start` starts the `default` entry of any type,
+// else the only entry. The implicit `default` counts.
+#[test]
+fn box_start_without_entry_picks_default_else_sole() {
+    let verb = StartVerb::Box;
+    assert_eq!(picked(verb, "").as_deref(), Ok("default"), "implicit");
+    assert_eq!(
+        picked(verb, "[tasks.default]\necho = 'x'\n[sessions.dev]\n").as_deref(),
+        Ok("default"),
+        "default of any type"
+    );
+    assert_eq!(
+        picked(verb, "[tasks.build]\necho = 'x'\n").as_deref(),
+        Ok("default"),
+        "the implicit default counts beside a task"
+    );
+    assert_eq!(
+        picked(verb, "[sessions.dev]\n").as_deref(),
+        Ok("dev"),
+        "the only entry"
+    );
+
+    // The picked task entry starts detached.
+    let entries = start_entries("[tasks.default]\necho = 'x'\n");
+    assert!(matches!(
+        plan_start(&typed_start(verb, None), &entries, false),
+        Ok(StartPlan::Detached { ref entry, .. }) if entry == "default"
+    ));
+
+    // A task entry declared under `[boxes]` is refused with exit 2, before
+    // anything is created: the run finds its task in `[tasks]` only.
+    let entries = start_entries("[boxes.build]\ntype = \"task\"\necho = 'x'\n");
+    let error = plan_start(&typed_start(verb, Some("build")), &entries, false)
+        .expect_err("a [boxes] task entry is refused");
+    let refusal = error
+        .downcast_ref::<StartEntryRefusal>()
+        .expect("a start refusal");
+    assert_eq!(
+        refusal,
+        &StartEntryRefusal::TaskNotInTasks {
+            entry: "build".into()
+        }
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot start build. min box start runs only the tasks declared as [tasks.<name>] \
+         in minimal.toml, and build is declared as [boxes.build]. Declare it as \
+         [tasks.build] to start it."
+    );
+    assert_eq!(refusal.to_string().lines().count(), 1, "one line");
+}
+
+// BCLI-072: several entries and none named `default`: exit 2, listing
+// them, with a hint naming `min box start <entry>`.
+#[test]
+fn box_start_without_entry_ambiguous_exit2_lists_entries() {
+    let refusal = picked(
+        StartVerb::Box,
+        "[sessions.dev]\n[tasks.build]\necho = 'x'\n",
+    )
+    .expect_err("no entry is the default");
+    assert_eq!(
+        refusal,
+        StartEntryRefusal::Several {
+            verb: StartVerb::Box,
+            entries: vec!["dev".into(), "build".into()],
+        }
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    assert_eq!(
+        refusal.to_string(),
+        "Cannot pick an entry to start. The project's minimal.toml declares the entries \
+         dev, build, and none of them is named \"default\". Run min box start <entry> \
+         with one of them."
+    );
+
+    // An entry the start does not find exits 4, not found. For `min
+    // session start`, an entry that is not a session is not found too.
+    let entries = start_entries("[sessions.dev]\n[tasks.build]\necho = 'x'\n");
+    for (verb, typed) in [
+        (StartVerb::Box, "web"),
+        (StartVerb::Session, "web"),
+        (StartVerb::Session, "build"),
+    ] {
+        let error = plan_start(&typed_start(verb, Some(typed)), &entries, true)
+            .expect_err("the entry is not found");
+        let refusal = error
+            .downcast_ref::<StartEntryRefusal>()
+            .expect("a start refusal");
+        assert_eq!(refusal.exit_code(), 4, "{verb:?} {typed}: {refusal}");
+    }
 }
 
 #[test]
