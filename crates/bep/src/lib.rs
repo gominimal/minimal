@@ -16,6 +16,7 @@ pub mod boxes;
 pub mod ca;
 pub mod control;
 pub mod forward;
+pub mod h2relay;
 pub mod handle;
 pub mod http;
 pub mod inject;

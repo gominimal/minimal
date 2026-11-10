@@ -30,6 +30,10 @@ time = "0.3"
 rustls-pki-types = "1"
 # The proxy's TLS legs (BEP-073) and its sockets.
 rustls = "0.23"
+# The experimental h2 relay (h2relay.rs). Both are already in the lockfile.
+bytes.workspace = true
+h2 = "0.4"
+http = "1"
 rustls-native-certs = "0.8"
 tokio = { workspace = true }
 tokio-rustls = "0.26"
