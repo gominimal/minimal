@@ -872,6 +872,37 @@ pub struct WithdrawBoxRequest {
     pub box_id: Option<BoxId>,
 }
 
+/// A renamed session's request that the VM host daemon move its box to
+/// the new name ([`BoxControlRequest::RenameBox`], #1116). A rename is a
+/// session RPC to the in-VM daemon; the host keeps the box's row, its
+/// creation and its published address under the name the box was
+/// registered by until its creator says otherwise. This is that word: the
+/// host re-keys the row and its creation to `new_name`, so the new name
+/// answers the box's address and the old one answers nothing.
+///
+/// The pair and the box id prove the creator, as a withdrawal's do
+/// ([`WithdrawBoxRequest`]); the id is required, because a rename is the
+/// one verb where the name the row is under is not the name the client
+/// holds. A row at the pair under another id is another box's, and the
+/// rename is refused with [`BoxControlReply::Error`]; so is a new name
+/// another box's row holds. A pair the host holds nothing for (no row, no
+/// creation of the id) is answered as the echo: there is nothing to move.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenameBoxRequest {
+    /// The name the session had before the rename, for the host's log
+    /// line. The host finds the box by the id, never by this.
+    pub name: String,
+    /// The session's name now: the name the row moves to.
+    pub new_name: String,
+    /// The switch address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The loopback address the registration handed back.
+    pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the registration handed back.
+    #[serde(with = "boxes::box_id_hex")]
+    pub box_id: BoxId,
+}
+
 /// A creator's request for its box's row back
 /// ([`BoxControlRequest::ResumeBox`], NET-138): the session that registered
 /// the box presenting the pair — and the id, when it holds one — the
@@ -1581,6 +1612,12 @@ pub enum BoxControlRequest {
     /// Withdraw the row a registration filled: the destroyed or failed
     /// session's creator presenting the pair the registration handed back.
     Withdraw(WithdrawBoxRequest),
+    /// Move a renamed session's box row to its new name
+    /// ([`RenameBoxRequest`], #1116): the creator presenting the pair and
+    /// the box id its registration handed back. Served on the host's
+    /// control socket only, answered with [`BoxControlReply::Addresses`]
+    /// echoing the pair.
+    RenameBox(RenameBoxRequest),
     /// Read the machine's zone-answerer status (see [`ZoneAnswererStatus`])
     /// — the read-only verb: no row is touched, no state changes, the reply
     /// is the status the answerer's acquisition last left.
@@ -2758,6 +2795,96 @@ impl OneshotSshRpc for StopBox {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopBox");
     type Request<'a> = StopBoxRequest;
     type Response = Errorable<StopBoxResponse>;
+}
+
+/// An RPC to restart a box whose spec sets `lifetime = "until_stopped"`
+/// (BOX-176).
+///
+/// The daemon checks the box first: its lifetime, then its name, its stored
+/// spec and its volumes, in the order a resume checks them. A check that
+/// fails answers [`RestartBoxResponse::Refused`] and changes nothing. A box
+/// that passes is stopped as [`StopBox`] stops it, when it runs, and then
+/// started again from the spec stored at its creation, under the same id
+/// and name. A start that fails leaves the box `stopped` and answers the
+/// start's error.
+pub struct RestartBox;
+
+/// The request for a [`RestartBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestartBoxRequest {
+    /// The box to restart.
+    pub id: SessionId,
+}
+
+/// The response for a [`RestartBox`] RPC: the box runs again, or a check
+/// refused the restart and the box is as it was.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RestartBoxResponse {
+    /// The box runs again, from its stored spec.
+    Restarted {
+        /// The box was running, and the restart stopped it first.
+        was_running: bool,
+    },
+    /// A check refused the restart before it stopped anything.
+    Refused(RestartRefusal),
+}
+
+/// Why a [`RestartBox`] was refused (BOX-176). The box's state is
+/// unchanged, and a running box still runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestartRefusal {
+    /// Which check refused.
+    pub kind: RestartRefusalKind,
+    /// The exit code a client ends with on this refusal.
+    pub exit_code: u8,
+    /// The refusal for the user: what was refused, why, and the next step.
+    pub message: String,
+}
+
+impl std::fmt::Display for RestartRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RestartRefusal {}
+
+/// The check that refused a [`RestartBox`], in the order the daemon runs
+/// them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartRefusalKind {
+    /// The box's spec does not set `lifetime = "until_stopped"`. Exit 2.
+    Lifetime,
+    /// Another running box holds the box's name. Exit 2.
+    Name,
+    /// This daemon cannot start the box from its stored spec. Exit 3.
+    Spec,
+    /// An upload into the box's workspace is in flight. Exit 2.
+    Upload,
+    /// A refusal kind this client does not know, from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RestartRefusalKind {
+    /// The kind's name, as the daemon log spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lifetime => "lifetime",
+            Self::Name => "name",
+            Self::Spec => "spec",
+            Self::Upload => "upload",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl OneshotSshRpc for RestartBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RestartBox");
+    type Request<'a> = RestartBoxRequest;
+    type Response = Errorable<RestartBoxResponse>;
 }
 
 /// An RPC to list the box records this host keeps, in any state
@@ -3983,6 +4110,46 @@ mod stop_box_tests {
 }
 
 #[cfg(test)]
+mod restart_box_tests {
+    use super::*;
+
+    /// BOX-176: a restart's answer and its typed refusal read back as sent,
+    /// and an error reply reads back as an error, not as an answer.
+    #[test]
+    fn restart_box_reply_round_trips() {
+        let responses = [
+            RestartBoxResponse::Restarted { was_running: true },
+            RestartBoxResponse::Refused(RestartRefusal {
+                kind: RestartRefusalKind::Name,
+                exit_code: 2,
+                message: "refused".to_string(),
+            }),
+        ];
+        for response in responses {
+            let wire: Errorable<RestartBoxResponse> = Errorable::Ok(response.clone());
+            let bytes = serde_json_lenient::to_vec(&wire).unwrap();
+            let back: Errorable<RestartBoxResponse> =
+                serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(back, Errorable::Ok(response));
+        }
+        let error: Errorable<RestartBoxResponse> =
+            serde_json_lenient::from_str(r#"{"error":"it failed"}"#).unwrap();
+        assert_eq!(
+            error,
+            Errorable::Err {
+                error: "it failed".to_string()
+            }
+        );
+        let newer: RestartRefusalKind = serde_json_lenient::from_str(r#""quota""#).unwrap();
+        assert_eq!(newer, RestartRefusalKind::Unknown);
+        assert_eq!(
+            RestartBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RestartBox")
+        );
+    }
+}
+
+#[cfg(test)]
 mod box_listing_tests {
     use super::*;
 
@@ -4137,3 +4304,31 @@ mod mint_box_id_tests {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod rename_box_tests {
+    use super::*;
+
+    /// #1116: the host-side rename verb survives the wire under its own
+    /// tag, and a request without the box id is no rename: the id is the
+    /// proof, so a line that lacks it does not decode.
+    #[test]
+    fn rename_box_request_round_trips_and_requires_the_box_id() {
+        let request = BoxControlRequest::RenameBox(RenameBoxRequest {
+            name: "web".to_string(),
+            new_name: "front".to_string(),
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 7),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 3),
+            box_id: BoxId::mint(),
+        });
+        let line = serde_json_lenient::to_string(&request).unwrap();
+        assert!(line.contains(r#""verb":"rename_box""#), "{line}");
+        let back: BoxControlRequest = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(back, request);
+
+        let without_id = r#"{"verb":"rename_box","name":"web","new_name":"front",
+            "switch_address":"100.64.0.7","loopback_address":"127.0.64.3"}"#;
+        serde_json_lenient::from_str::<BoxControlRequest>(without_id)
+            .expect_err("a rename without the box id is refused at the parse");
+    }
+}

@@ -229,7 +229,11 @@ impl RemoteStorage {
         // (`ConnectingTcpRemote::new`, hyper-util 0.1.20). Unlike the placed
         // relay, the connector carries no unused time forward, so an address
         // after one that refused at once still gets only its even share.
-        let client = reqwest::Client::builder().connect_timeout(bound).build()?;
+        // The client says who it is (inbox#1218): ftp.gnu.org answers a request
+        // without a `User-Agent` 403.
+        let client = crate::fetchers::web_client_builder()
+            .connect_timeout(bound)
+            .build()?;
         let backend = (&client, &self.cache);
         backend
             .download(ReqwestUrl::try_from(url)?, sha256, op)
@@ -441,7 +445,7 @@ mod placed {
             .custom_http_auth(reqwest::header::HeaderValue::from_str(&auth)?);
         // No idle connection is kept, so a plain-HTTP connection to the
         // relay is never reused for another destination.
-        let client = reqwest::Client::builder()
+        let client = crate::fetchers::web_client_builder()
             .proxy(proxy)
             .pool_max_idle_per_host(0)
             .build()?;
@@ -1285,6 +1289,22 @@ mod placed {
     mod tests {
         use super::*;
 
+        /// A loopback address that refuses every connection for as long as
+        /// the returned socket lives: the socket holds the port bound and
+        /// never listens, so a connect is refused, and no other process on
+        /// the host can bind the port meanwhile. A port probed free and then
+        /// released is not that: a parallel test or any daemon can take it
+        /// and accept the connection the test expects refused.
+        #[cfg(target_os = "linux")]
+        fn refusing_addr() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket
+                .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .unwrap();
+            let addr = socket.local_addr().unwrap();
+            (socket, addr)
+        }
+
         /// Serves `body` to every HTTP request on a loopback port.
         async fn serve_body(body: &'static [u8]) -> std::net::SocketAddr {
             let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1312,6 +1332,12 @@ mod placed {
                         assert!(
                             !head.to_ascii_lowercase().contains("proxy-authorization"),
                             "the relay's credential never reaches the origin: {head}"
+                        );
+                        let agent = crate::fetchers::user_agent().to_ascii_lowercase();
+                        let agent = format!("\r\nuser-agent: {agent}\r\n");
+                        assert!(
+                            head.to_ascii_lowercase().contains(&agent),
+                            "a placed fetch sends the user agent (inbox#1218): {head}"
                         );
                         let reply = format!(
                             "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -1367,11 +1393,7 @@ mod placed {
             assert_eq!(std::fs::read_to_string(&procs).unwrap(), "");
 
             // A destination the placed socket cannot reach names itself.
-            let closed = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let closed_addr = closed.local_addr().unwrap();
-            drop(closed);
+            let (_closed, closed_addr) = refusing_addr();
             let refused = download(
                 &cache,
                 &format!("http://{closed_addr}/other-1.0.tar.gz"),
@@ -1914,11 +1936,7 @@ mod placed {
             let relay_addr = listener.local_addr().unwrap();
             let _serving = AbortOnDrop(tokio::spawn(serve(listener, relay.clone())));
 
-            let closed = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let closed_addr = closed.local_addr().unwrap();
-            drop(closed);
+            let (_closed, closed_addr) = refusing_addr();
             assert_eq!(
                 tunnel_status(relay_addr, closed_addr).await,
                 "HTTP/1.1 502 Bad Gateway"
@@ -2078,6 +2096,69 @@ mod placed {
             assert!(took >= bound, "it waited {took:?}");
             assert!(took < bound * 10, "it waited {took:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `body` to one HTTP request on a loopback port, and hands back
+    /// the head of that request.
+    async fn serve_once(
+        body: &'static [u8],
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = conn.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "the request head ends");
+                head.extend_from_slice(&buf[..n]);
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            conn.write_all(reply.as_bytes()).await.unwrap();
+            conn.write_all(body).await.unwrap();
+            String::from_utf8_lossy(&head).to_string()
+        });
+        (addr, served)
+    }
+
+    /// inbox#1218: a web source fetch says who it is. ftp.gnu.org answers a
+    /// request without a `User-Agent` 403, so a GNU tarball could not build.
+    #[tokio::test]
+    async fn a_web_source_fetch_sends_the_user_agent() {
+        use sha2::Digest;
+        let body: &'static [u8] = b"the source archive";
+        let sha = hex::encode(sha2::Sha256::digest(body));
+        let (addr, served) = serve_once(body).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
+            .await
+            .unwrap();
+        let url = format!("http://{addr}/pkg-1.0.tar.gz");
+
+        let fetched = storage
+            .download_web_with_verification_and_caching(&url, &sha, None, &OpTracker::new_root())
+            .await
+            .expect("the download succeeds");
+        assert_eq!(std::fs::read(&fetched).unwrap(), body);
+
+        let head = served.await.unwrap().to_ascii_lowercase();
+        let agent = format!(
+            "\r\nuser-agent: {}\r\n",
+            crate::fetchers::user_agent().to_ascii_lowercase()
+        );
+        assert!(head.contains(&agent), "{agent:?} in {head}");
     }
 }
 

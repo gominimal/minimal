@@ -7757,13 +7757,11 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
         .expect("the daemon walks the range through the forwarder");
     assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
 
-    // The box's table is this test process's network namespace, which every
-    // concurrently running test shares: another test's listener on the any
-    // address inside the range is the box's listener too. The watcher moves
-    // its forwards one port at a time, so such a port can still stand at the
-    // interim when this test's own two have moved. Its move is awaited; this
-    // test's own ports are held to the assertion below at once.
-    let ours = [exposed, listened];
+    // Every row is this test's: the mock box's leader is a host child, so its
+    // table is the host's, but under test the watcher keeps it to the
+    // listeners this test process holds (`box_listening_ports`) — a listener
+    // another process opens inside the range is never the box's, so it is
+    // never published at the interim for the move to leave behind.
     let rows = listed_once(&handle, |rows| {
         rows.exposed
             .iter()
@@ -7772,12 +7770,6 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
                 .listened
                 .iter()
                 .any(|row| row.local == at(handed, listened))
-            && rows
-                .exposed
-                .iter()
-                .chain(&rows.listened)
-                .filter(|row| !ours.contains(&row.internal_port))
-                .all(|row| !row.local.starts_with("127.0.0.1:"))
     })
     .await;
     assert!(
@@ -14605,6 +14597,90 @@ async fn box_build_web_source_under_box_verdict() {
     );
 }
 
+/// NET-155 (T124): a box's launch builds the packages it lacks in the box's
+/// classifier leaf. When a deny-all box's launch build is refused its web
+/// source, the error names the source host and the box on one line, before
+/// the build's own error, as the build side operation's does. The box is
+/// named as `min ls` shows it, not by the id its leaf is named after. A box
+/// whose leaf allows the host, and a build that succeeds, are reported as
+/// before.
+#[tokio::test]
+async fn box_launch_build_refused_web_source_names_host_and_box() {
+    use crate::box_ops::BuildPlacement;
+    use crate::env::tapped_build;
+    use sandbox::config::{ClassifierLeaf, Verdict};
+
+    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
+    let box_id = "01a1b338-491b-766a-9c29-43184470ccf3";
+    let placement = |verdict| BuildPlacement {
+        box_name: "d876x1".to_string(),
+        leaf: Some(ClassifierLeaf::under(root, box_id, verdict)),
+        network: None,
+    };
+    let refused = "could not connect to deb.debian.org:443: the egress rules admit no destination";
+    // The line the package's spec build writes when its fetch fails, and the
+    // error the launch's build returns.
+    let output = format!(
+        "could not fetch the source \
+         https://deb.debian.org/debian/pool/main/m/minisat2/minisat2_2.2.1.orig.tar.gz: \
+         other: {refused}"
+    );
+    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
+        "fetch876".to_string(),
+        op::Error::Other(anyhow::anyhow!("{refused}")),
+    ))
+    .to_string();
+    let launch = |placement: BuildPlacement, failure: Option<String>| {
+        let output = output.clone();
+        async move {
+            let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
+            let build = async move {
+                for event in build_events("fetch876", &[output.as_str()]) {
+                    log_tx.unbounded_send(event).unwrap();
+                }
+                failure
+            };
+            tapped_build(build, log_rx, &placement).await
+        }
+    };
+
+    let denied = launch(placement(Verdict::Deny), Some(failed.clone()))
+        .await
+        .expect_err("the deny-all box's launch build fails");
+    // The refusal line leads, in the words of the box's own refusal (the
+    // remedy sentence after it is `egress_rules_refuse`'s, not this
+    // branch's), and the build's own error follows on the next line.
+    let (first, rest) = denied.split_once('\n').expect("two lines");
+    assert!(
+        first.starts_with(
+            "the build of fetch876 could not reach deb.debian.org: \
+             the egress rules of box d876x1 do not allow it"
+        ),
+        "{denied}"
+    );
+    assert_eq!(rest, failed);
+    assert!(
+        denied
+            .lines()
+            .any(|line| line.contains("deb.debian.org") && line.contains("d876x1")),
+        "{denied}"
+    );
+    assert!(!denied.contains(box_id), "{denied}");
+
+    // A box its rules allow the host is never reported as refused: its
+    // failure is the line any build's connect failure gets (NET-155,
+    // `unreachable_source`), with no refusal ahead of it.
+    let allowed = launch(placement(Verdict::Allow), Some(failed.clone()))
+        .await
+        .expect_err("the allowed box's launch build fails");
+    assert_eq!(
+        allowed,
+        crate::env::unreachable_source(&failed, "d876x1").expect("a connect failure is named")
+    );
+    assert!(!allowed.contains("do not allow it"), "{allowed}");
+    assert_eq!(launch(placement(Verdict::Deny), None).await, Ok(()));
+}
+
 /// NET-155: a web source that redirects to another host fails on that
 /// host, and the refusal names the host the download could not connect to.
 /// When the failure names no host, the source's own host stands in.
@@ -17924,4 +18000,557 @@ async fn timeout_record_write_failure_refuses_resume_and_stop_keeps_timeout() {
     let exited = exited_events(&server, id).await;
     assert_eq!(exited.len(), 1, "{exited:?}");
     assert_eq!(exited[0].data["reason"], "timeout");
+}
+
+/// A session spec as a create sends it (BOX-068) for a box that runs until
+/// it is stopped, with `pty_enabled` as given.
+fn until_stopped_spec(pty_enabled: bool) -> serde_json_lenient::Value {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.pty_enabled = pty_enabled;
+    serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// How long a restart in these tests waits between SIGTERM and SIGKILL.
+const RESTART_GRACE: Duration = Duration::from_secs(2);
+
+/// Launches a headless host for the running box `id`, so a restart has
+/// processes to stop.
+async fn launch_host_for(server: &TestServer, id: SessionId) {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the session resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+}
+
+/// Restarts `id` through the manager, with [`RESTART_GRACE`].
+async fn restart_box_in(server: &TestServer, id: SessionId) -> Result<bool, super::RestartError> {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .restart_box_with_grace(id, RESTART_GRACE)
+        .await
+}
+
+/// The refusal a restart of `id` answers. Panics when it was not refused.
+async fn restart_refusal(server: &TestServer, id: SessionId) -> minimald_rpc::RestartRefusal {
+    match restart_box_in(server, id).await {
+        Err(super::RestartError::Refused(refusal)) => refusal,
+        other => panic!("the restart was not refused: {other:?}"),
+    }
+}
+
+/// The types of the events of `id`, in the order they were written.
+async fn event_types(server: &TestServer, id: SessionId) -> Vec<boxes::events::BoxEventType> {
+    event_kinds(server, id)
+        .await
+        .into_iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+/// BOX-176: a restart of an until_stopped box stops it when it runs, and
+/// starts it again from the spec stored at its creation, from its retained
+/// files, under the same id and name. A change made to the record's
+/// settings while the box ran does not carry into the restart. A stopped
+/// box restarts through the `RestartBox` RPC, and its shell answers after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_until_stopped_box_from_stored_spec_same_id_and_name() {
+    use boxes::core::record::RecordState;
+    use minimald_rpc::{Errorable, RestartBox, RestartBoxRequest, RestartBoxResponse};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("restart-box"),
+        "/uwu",
+        Some(until_stopped_spec(true)),
+    )
+    .await;
+    let paths = session_paths(&server, id).await;
+    let kept = std::path::Path::new(paths.working.as_str()).join("kept.txt");
+    std::fs::write(&kept, "still here").unwrap();
+    // A change while the box runs: the stored spec has hooks on.
+    rewrite_record(&server, id, |record| record.hooks_enabled = false).await;
+    launch_host_for(&server, id).await;
+
+    let was_running = restart_box_in(&server, id)
+        .await
+        .expect("a running until_stopped box restarts");
+    assert!(was_running, "the restart stopped a running box");
+    let record = read_record(&server, id).await;
+    assert_eq!(record.id, id, "the box keeps its id");
+    assert_eq!(
+        record.name.as_deref(),
+        Some("restart-box"),
+        "the box keeps its name"
+    );
+    assert_eq!(record.state().unwrap(), RecordState::Running);
+    assert_eq!(
+        (record.reason.is_none(), record.exit_code, record.signal),
+        (true, None, None)
+    );
+    assert!(
+        record.hooks_enabled,
+        "the box restarts from its stored spec, not the record's change"
+    );
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "still here");
+
+    // A stopped box restarts too, through the RPC, and was not running.
+    let ending = stop_through_daemon(&server, id).await;
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(ending)
+    );
+    let reply = client.call::<RestartBox>(&RestartBoxRequest { id }).await;
+    assert_eq!(
+        reply,
+        Errorable::Ok(RestartBoxResponse::Restarted { was_running: false })
+    );
+    let record = read_record(&server, id).await;
+    assert_eq!(
+        (record.id, record.name.as_deref()),
+        (id, Some("restart-box"))
+    );
+    assert_eq!(record.state().unwrap(), RecordState::Running);
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "still here");
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the restarted box's shell answers");
+}
+
+/// BOX-176: a restart of a box whose spec does not set
+/// `lifetime = "until_stopped"` is refused with exit 2, whether the box
+/// runs or is stopped, and the box is left as it was. The lifetime check
+/// comes first, before the spec check. A box filed with no spec runs until
+/// its entrypoint returns, so it is refused too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_refuses_box_not_until_stopped_keeps_state() {
+    use boxes::core::record::RecordState;
+    use minimald_rpc::{
+        Errorable, RestartBox, RestartBoxRequest, RestartBoxResponse, RestartRefusalKind,
+    };
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("until-complete"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    launch_host_for(&server, id).await;
+    // Also unsatisfiable, so the refusal shows which check decides.
+    let mut spec = resume_spec(true);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, id, &spec).await;
+    let before = event_types(&server, id).await;
+
+    let reply = client.call::<RestartBox>(&RestartBoxRequest { id }).await;
+    let Errorable::Ok(RestartBoxResponse::Refused(refusal)) = reply else {
+        panic!("the restart was not refused: {reply:?}");
+    };
+    assert_eq!(refusal.kind, RestartRefusalKind::Lifetime);
+    assert_eq!(refusal.exit_code, 2);
+    for words in [
+        "Session `until-complete` cannot restart.",
+        "It stays running.",
+        "`[box] lifetime` is `until_stopped`",
+    ] {
+        assert!(
+            refusal.message.contains(words),
+            "{words:?} not in {refusal}"
+        );
+    }
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running,
+        "a refused restart leaves a running box running"
+    );
+    assert_eq!(
+        event_types(&server, id).await,
+        before,
+        "a refused restart records no event"
+    );
+
+    // A stopped box is refused the same way, and stays stopped.
+    rewrite_spec(&server, id, &resume_spec(true)).await;
+    let ending = stop_through_daemon(&server, id).await;
+    let before = event_types(&server, id).await;
+    let refusal = restart_refusal(&server, id).await;
+    assert_eq!(
+        (refusal.kind, refusal.exit_code),
+        (RestartRefusalKind::Lifetime, 2)
+    );
+    assert!(refusal.message.contains("It stays stopped."), "{refusal}");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(ending)
+    );
+    assert_eq!(event_types(&server, id).await, before);
+
+    // A box filed with no spec.
+    let bare = create_session_with_spec(&mut client, Some("bare"), "/bare", None).await;
+    let refusal = restart_refusal(&server, bare).await;
+    assert_eq!(refusal.kind, RestartRefusalKind::Lifetime);
+    assert_eq!(
+        read_record(&server, bare).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
+/// BOX-176: a restart meets a resume's refusals before it stops anything,
+/// and leaves the box as it was, a running box still running. The name
+/// check comes before the spec check, and the box's own name does not trip
+/// it. The terminal check of a resume does not apply: a box with no
+/// terminal restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_takes_resume_refusals_before_it_stops_anything() {
+    use boxes::core::record::RecordState;
+    use minimald_rpc::RestartRefusalKind;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    // The name: two running boxes answer to `pair`. A create and a launch
+    // refuse a held name, so the first box takes it in its record after
+    // both run.
+    let first = create_session_with_spec(
+        &mut client,
+        Some("pair-first"),
+        "/a/x",
+        Some(until_stopped_spec(false)),
+    )
+    .await;
+    launch_host_for(&server, first).await;
+    let holder = create_session_with_spec(
+        &mut client,
+        Some("pair"),
+        "/b/y",
+        Some(until_stopped_spec(false)),
+    )
+    .await;
+    rewrite_record(&server, first, |record| {
+        record.name = Some("pair".to_string());
+    })
+    .await;
+    // Also unsatisfiable, so the refusal shows which check decides.
+    let mut spec = until_stopped_spec(false);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, first, &spec).await;
+    let before = event_types(&server, first).await;
+    let refusal = restart_refusal(&server, first).await;
+    assert_eq!(
+        (refusal.kind, refusal.exit_code),
+        (RestartRefusalKind::Name, 2),
+        "{refusal}"
+    );
+    for words in [
+        "It stays running.",
+        "The running session `pair` holds the name `pair`.",
+        &format!("min session rename {holder} <new-name>"),
+    ] {
+        assert!(
+            refusal.message.contains(words),
+            "{words:?} not in {refusal}"
+        );
+    }
+    assert_eq!(
+        read_record(&server, first).await.state().unwrap(),
+        RecordState::Running,
+        "a refused restart stops nothing"
+    );
+    assert_eq!(event_types(&server, first).await, before);
+
+    // The spec: the box's own name does not trip the name check, and a
+    // stored spec this daemon cannot start from is refused with exit 3.
+    let alone = create_session_with_spec(
+        &mut client,
+        Some("alone"),
+        "/c/alone",
+        Some(until_stopped_spec(false)),
+    )
+    .await;
+    launch_host_for(&server, alone).await;
+    let mut spec = until_stopped_spec(false);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, alone, &spec).await;
+    let before = event_types(&server, alone).await;
+    let refusal = restart_refusal(&server, alone).await;
+    assert_eq!(
+        (refusal.kind, refusal.exit_code),
+        (RestartRefusalKind::Spec, 3),
+        "{refusal}"
+    );
+    for words in [
+        "It stays running.",
+        "version 99",
+        "min session destroy alone",
+    ] {
+        assert!(
+            refusal.message.contains(words),
+            "{words:?} not in {refusal}"
+        );
+    }
+    assert_eq!(
+        read_record(&server, alone).await.state().unwrap(),
+        RecordState::Running,
+        "a refused restart stops nothing"
+    );
+    assert_eq!(event_types(&server, alone).await, before);
+
+    // With the spec it was created with, the box with no terminal restarts.
+    rewrite_spec(&server, alone, &until_stopped_spec(false)).await;
+    assert!(
+        restart_box_in(&server, alone)
+            .await
+            .expect("a box with no terminal restarts")
+    );
+    assert_eq!(
+        read_record(&server, alone).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
+/// BOX-176: a restart whose start fails after its stop leaves the box
+/// `stopped` with the `exited` event the stop recorded, records no
+/// `started` event, fails with the start's error, and makes no other
+/// change to the record. The next restart starts the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_start_failure_leaves_box_stopped_with_its_stop_recorded() {
+    use boxes::core::record::RecordState;
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("start-fails"),
+        "/uwu",
+        Some(until_stopped_spec(false)),
+    )
+    .await;
+    // A setting the stored spec changes on a start: the stored spec has
+    // hooks on. A failed start keeps the record as the stop left it.
+    rewrite_record(&server, id, |record| record.hooks_enabled = false).await;
+    launch_host_for(&server, id).await;
+    let before = event_types(&server, id).await;
+
+    crate::box_actor::restart_launch_seam::fail_next(id);
+    let error = match restart_box_in(&server, id).await {
+        Err(super::RestartError::Failed(error)) => error,
+        other => panic!("the restart did not fail: {other:?}"),
+    };
+    let text = error.to_string();
+    assert!(
+        text.contains("Session `start-fails` did not start again. It is stopped now."),
+        "{text}"
+    );
+    assert!(text.contains("the test failed this launch"), "{text}");
+
+    let record = read_record(&server, id).await;
+    let RecordState::Stopped(_) = record.state().unwrap() else {
+        panic!("a failed start leaves the box stopped: {record:?}");
+    };
+    assert!(
+        !record.hooks_enabled,
+        "a failed start makes no other change to the record"
+    );
+    let events = event_kinds(&server, id).await;
+    let added: Vec<_> = events[before.len()..].iter().map(|e| e.kind).collect();
+    assert_eq!(added, [BoxEventType::Exited], "{added:?}");
+    assert_eq!(events[before.len()].data["reason"], "stopped");
+
+    // The actor ended with the box, and the next restart starts it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let restarted = loop {
+        match restart_box_in(&server, id).await {
+            Err(super::RestartError::Failed(error))
+                if error
+                    .to_string()
+                    .contains("ended before its restart finished")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => break other,
+        }
+    };
+    assert!(!restarted.expect("the next restart starts the box"));
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
+/// BOX-177: a restart runs only the hooks a resume runs. `on_activate`,
+/// which ran at activation, does not run again, and no `on_detach` or
+/// `on_destroy` runs. A spec that sets `hooks_on_resume` runs `on_activate`
+/// again on a restart (BOX-028).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_runs_only_resume_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let activated = dir.path().join("activated");
+    let detached = dir.path().join("detached");
+    let destroyed = dir.path().join("destroyed");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = until_stopped_session_with_hook(
+        &mut client,
+        "restart-hooks",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(format!("echo ran >> {}", activated.display()))),
+            on_detach: Some(inline(format!("echo ran >> {}", detached.display()))),
+            on_destroy: Some(inline(format!("echo ran >> {}", destroyed.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&activated).unwrap(), "ran\n");
+
+    restart_box_in(&server, id)
+        .await
+        .expect("the until_stopped box restarts");
+    assert_eq!(
+        std::fs::read_to_string(&activated).unwrap(),
+        "ran\n",
+        "on_activate ran again on a restart without hooks_on_resume"
+    );
+    assert!(!detached.exists(), "on_detach ran on a restart");
+    assert!(!destroyed.exists(), "on_destroy ran on a restart");
+
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.hooks_on_resume = true;
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    rewrite_spec(&server, id, &spec).await;
+    restart_box_in(&server, id)
+        .await
+        .expect("the until_stopped box restarts");
+    assert_eq!(
+        std::fs::read_to_string(&activated).unwrap(),
+        "ran\nran\n",
+        "on_activate did not run again on a restart with hooks_on_resume"
+    );
+    assert!(!detached.exists(), "on_detach ran on a restart");
+    assert!(!destroyed.exists(), "on_destroy ran on a restart");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        boxes::core::record::RecordState::Running
+    );
+}
+
+/// BOX-178: a restart of a running box records the `exited` event of its
+/// stop, then the `started` event of its start, and no event type of its
+/// own. A restart of a stopped box stops nothing and records `started`
+/// alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_records_exited_then_started_only() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("restart-events"),
+        "/uwu",
+        Some(until_stopped_spec(true)),
+    )
+    .await;
+    launch_host_for(&server, id).await;
+    let before = event_kinds(&server, id).await.len();
+
+    restart_box_in(&server, id)
+        .await
+        .expect("the running box restarts");
+    let events = event_kinds(&server, id).await;
+    let added: Vec<_> = events[before..].iter().map(|e| e.kind).collect();
+    assert_eq!(
+        added,
+        [BoxEventType::Exited, BoxEventType::Started],
+        "{added:?}"
+    );
+    assert_eq!(events[before].data["reason"], "stopped");
+    assert_eq!(events[before + 1].box_id, id);
+
+    stop_through_daemon(&server, id).await;
+    let before = event_kinds(&server, id).await.len();
+    restart_box_in(&server, id)
+        .await
+        .expect("the stopped box restarts");
+    let added: Vec<_> = event_kinds(&server, id).await[before..]
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(added, [BoxEventType::Started], "{added:?}");
+}
+
+/// BOX-176, BOX-178: an argv until_stopped box that holds a host-side row
+/// and sets `hooks_on_resume` cannot start its entrypoint behind the shell
+/// its `on_activate` hooks run in. Its restart fails after the stop: the
+/// box stays `stopped` with the stop's `exited` event, and no `started`
+/// event follows it. #3231 tracks the restart of such a box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_argv_box_behind_hook_shell_with_host_row_fails_stopped() {
+    use boxes::core::record::RecordState;
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = until_stopped_session_with_hook(
+        &mut client,
+        "argv-behind-hooks",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline("true".to_string())),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.hooks_on_resume = true;
+    spec.entrypoint =
+        mfile::spec::Entrypoint::Exec(vec!["/bin/sleep".to_string(), "600".to_string()]);
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    rewrite_spec(&server, id, &spec).await;
+    rewrite_record(&server, id, |record| {
+        record.box_addresses = Some(boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 31),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 31),
+        });
+    })
+    .await;
+    let before = event_kinds(&server, id).await.len();
+
+    match restart_box_in(&server, id).await {
+        Err(super::RestartError::Failed(error)) => {
+            let text = error.to_string();
+            assert!(
+                text.contains(
+                    "Session `argv-behind-hooks` did not start again. It is stopped now."
+                ),
+                "{text}"
+            );
+        }
+        other => panic!("the restart did not fail: {other:?}"),
+    }
+
+    let record = read_record(&server, id).await;
+    let RecordState::Stopped(_) = record.state().unwrap() else {
+        panic!("a failed start leaves the box stopped: {record:?}");
+    };
+    let events = event_kinds(&server, id).await;
+    let added: Vec<_> = events[before..].iter().map(|e| e.kind).collect();
+    assert_eq!(added, [BoxEventType::Exited], "{added:?}");
+    assert_eq!(events[before].data["reason"], "stopped");
 }

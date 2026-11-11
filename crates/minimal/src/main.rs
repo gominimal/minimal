@@ -256,7 +256,14 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), 124 when an exec ran past its own timeout
+/// is not running, 5 when its spec turns exec off), the code an `--exec
+/// <id>` refusal of `min box stop`, `logs` or `wait` carries
+/// (`minimal::BoxExecIdRefusal`: 2 for text that is not an exec id, 4 for an
+/// exec the box does not have), the code a start
+/// refusal carries (`minimal::StartEntryRefusal`: 4 when the start does not
+/// find the entry, 2 when it cannot pick or start it), 2 when a start needs a terminal
+/// it does not have (`minimal::StartNeedsTerminal`) or asks for a held name
+/// (`minimal::StartNameHeld`), 124 when an exec ran past its own timeout
 /// (`minimal::BoxExecTimedOut`) or a box ran past its own timeout or a
 /// `min box wait --timeout` ran out (`minimal::BoxTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
@@ -287,9 +294,26 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
         return minimal::BoxRenameRefusal::EXIT_CODE;
     }
+    // BCLI-074: `min box restart` refused, such as for a box that runs to
+    // completion (exit 2). The refusal carries its own code, never 0.
+    if let Some(refusal) = e.downcast_ref::<minimald_rpc::RestartRefusal>() {
+        return refusal.exit_code.max(1);
+    }
     // BCLI-005: `min box prune` off a terminal without `--yes`.
     if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
         return minimal::PruneNeedsYes::EXIT_CODE;
+    }
+    // BCLI-029: a start off a terminal of an entry with a terminal.
+    if e.downcast_ref::<minimal::StartNeedsTerminal>().is_some() {
+        return minimal::StartNeedsTerminal::EXIT_CODE;
+    }
+    // BCLI-071, BCLI-072: a start that cannot pick or start its entry.
+    if let Some(refusal) = e.downcast_ref::<minimal::StartEntryRefusal>() {
+        return refusal.exit_code();
+    }
+    // BCLI-069: a start whose name a running box holds.
+    if e.downcast_ref::<minimal::StartNameHeld>().is_some() {
+        return minimal::StartNameHeld::EXIT_CODE;
     }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
@@ -329,6 +353,12 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-053: `min box exec -t` without a terminal, or into a box that is
     // not running (2), or whose spec turns exec off (5).
     if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-055, BCLI-056, BCLI-057: `--exec <id>` on `min box stop`, `logs`
+    // or `wait` with text that is not an exec id (2), or an exec id the box
+    // does not have (4).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxExecIdRefusal>() {
         return refused.exit_code();
     }
     // BCLI-053: an exec that its own timeout ended.
@@ -1146,6 +1176,58 @@ mod tests {
         }
     }
 
+    /// BCLI-071, BCLI-072: a start that does not find its entry exits 4,
+    /// not found. Every other start refusal exits 2.
+    #[test]
+    fn start_entry_refusals_exit_with_their_codes() {
+        use minimal::{StartEntryRefusal, StartVerb};
+        let entry = || "build".to_owned();
+        for (refusal, code) in [
+            (
+                StartEntryRefusal::Unknown {
+                    verb: StartVerb::Box,
+                    entry: entry(),
+                    entries: Vec::new(),
+                },
+                4,
+            ),
+            (
+                StartEntryRefusal::NotSession {
+                    entry: entry(),
+                    box_type: Some("task".to_owned()),
+                },
+                4,
+            ),
+            (
+                StartEntryRefusal::Several {
+                    verb: StartVerb::Session,
+                    entries: Vec::new(),
+                },
+                2,
+            ),
+            (StartEntryRefusal::DefaultBlocked { box_type: None }, 2),
+            (StartEntryRefusal::NameUnsupported { entry: entry() }, 2),
+            (StartEntryRefusal::TaskNotInTasks { entry: entry() }, 2),
+            (
+                StartEntryRefusal::UnsupportedType {
+                    entry: entry(),
+                    box_type: Some("agent".to_owned()),
+                },
+                2,
+            ),
+            (
+                StartEntryRefusal::NamedSessionUnsupported {
+                    verb: StartVerb::Session,
+                    entry: entry(),
+                },
+                2,
+            ),
+        ] {
+            let err = anyhow::Error::new(refusal);
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
     /// A run with one of its network flags among the task's arguments is a
     /// usage error: it ends with 2.
     #[test]
@@ -1457,6 +1539,51 @@ mod tests {
         };
         let e = anyhow::Error::new(invalid).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// An invalid project `minimal.toml` that does not parse prints its TOML
+    /// parse error once, and the run ends with exit 3.
+    #[test]
+    fn invalid_project_file_prints_toml_error_once() {
+        let error = mfile::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("the file does not parse");
+        assert!(matches!(error, mfile::Error::Format(_)), "{error:?}");
+        let e = anyhow::Error::new(minimal::ProjectFileInvalid { error })
+            .context("activating the session");
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(
+            printed.contains(
+                "Cannot start the box: the project's minimal.toml does not load: \
+                 invalid TOML: TOML parse error"
+            ),
+            "{printed}"
+        );
+        assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
+        assert_eq!(printed.matches("invalid TOML").count(), 1, "{printed}");
+        assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
+    }
+
+    /// A project `minimal.toml` that cannot be read prints its io error
+    /// once, and the run ends with exit 3.
+    #[test]
+    fn invalid_project_file_prints_toml_error_once_for_io() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied here");
+        let error = mfile::Error::IO("minimal file", "/p/minimal.toml".into(), io);
+        let e = anyhow::Error::new(minimal::ProjectFileInvalid { error })
+            .context("activating the session");
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(printed.contains("/p/minimal.toml"), "{printed}");
+        assert_eq!(
+            printed.matches("access denied here").count(),
+            1,
+            "{printed}"
+        );
     }
 
     /// A broken pipe anywhere in the error chain is classified as such, so

@@ -205,6 +205,60 @@ without writing anything to `PATH` — the daemon fabricates a default config
 inside the session's own workspace instead. `--loadout` is resolved before any
 of this, so an unknown loadout name errors even in a directory with no config.
 
+### `session start`
+
+```
+min session start [OPTIONS] [ENTRY]
+```
+
+Creates a box from a session entry in the project's `minimal.toml`, and
+attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
+`[boxes.<name>]` entry with `type = "session"`.
+
+| Argument or flag | Description |
+|------------------|-------------|
+| `ENTRY` | The session entry to start. Optional |
+| `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
+| `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
+| `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
+| `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box is `host_ip` |
+| `--ingress <EXT:INT[/PROTO]>` | Override of the entry's `network.ingress`: each use adds one port mapping, `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Requires `--network own_ip` |
+| `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | Overrides of the entry's `network.egress` keys, as on [`session activate`](#session-activate): a list flag adds to the entry's list, `--allow-protocols` replaces it, and `--deny-all-egress` empties the allow lists |
+| `--loadout <NAME>` | Apply the named loadout. Repeatable. With any `--loadout`, the config file's `default_loadouts` are not applied |
+
+Each override flag changes only the key it names. The other
+`network.egress` keys of the entry stay as the entry declares them. A session
+box does not take the entry's `network.mode` or `network.ingress` yet
+([#3238](https://github.com/gominimal/minimal/issues/3238)). The box keeps the
+result: `min box show <box> --network` prints the `[network]` section that
+the box was created with.
+
+`min box start [ENTRY]` takes the same flags. For a task entry, it takes
+`--network` and the egress flags, and with no `--network` the box takes the
+entry's `network.mode`. A task entry refuses `--ingress` and `--loadout` with
+exit code 2.
+
+Without `ENTRY`, the command starts the session entry named `default`. When
+no session entry has that name, it starts the project's only session entry. A
+project with no session entry and no entry named `default` gets a `default`
+session entry with no settings of its own. A project with no `minimal.toml`
+gets that entry too.
+
+The command refuses these starts before it creates a box:
+
+| Refusal | Exit code |
+|---------|-----------|
+| `ENTRY` names no entry in `minimal.toml` | 4 |
+| `ENTRY` names an entry that is not a session entry | 4 |
+| `ENTRY` names a session entry other than `default`. The command cannot start one by name yet | 2 |
+| Without `ENTRY`: several session entries, and none of them is named `default` | 2 |
+| Without `ENTRY`: no session entry, and an entry of another type is named `default` | 2 |
+| An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |
+| No terminal, and no `--detach` | 2 |
+| A running box holds the box's name. Pass `--new` or `--name` to create the box | 2 |
+
+An invalid `minimal.toml` ends the command with exit code 3.
+
 ### `session attach`
 
 ```
