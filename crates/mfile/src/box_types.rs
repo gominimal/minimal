@@ -10,6 +10,14 @@
 //! type, when it has no `extends`, when its chain forms a cycle, when its
 //! chain names a type that does not exist, or when it takes a built-in
 //! name. A redefinition names both definitions.
+//!
+//! A type's `constraints` only narrow. Each key of the table holds a value
+//! the spec's key must take: a list admits each of its items, a table
+//! constrains each of its own keys, and any other value admits itself. A
+//! derived type whose constraint admits a value that its parent type's
+//! constraint excludes fails with exit 3 (BOX-156). A constraint is a
+//! check, never a layer: it sets nothing in a spec, so it never adds a
+//! package, a port or an egress entry (BOX-062).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -110,6 +118,40 @@ pub enum BoxTypeError {
         box_type: String,
         root: &'static str,
     },
+    /// A derived type's constraint admits a value that its parent type's
+    /// constraint on the same key excludes (BOX-156). Carries the type,
+    /// the key path, the parent, and the value when one value shows it.
+    Loosening {
+        name: String,
+        key: String,
+        parent: String,
+        value: Option<String>,
+    },
+    /// An expanded spec carries a value that its type's constraints
+    /// exclude (BOX-061). Carries the type, the key path, the value, the
+    /// values the type allows and the layer that set the value, each as
+    /// the message names it, and whether the value is a list item.
+    ConstraintBroken {
+        box_type: String,
+        key: String,
+        value: String,
+        allowed: String,
+        layer: String,
+        item: bool,
+    },
+}
+
+/// A Box Type as a message names it: its table for a project type.
+struct TypeWords<'a>(&'a str);
+
+impl fmt::Display for TypeWords<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if builtin(self.0).is_some() {
+            write!(f, "the built-in type `{}`", self.0)
+        } else {
+            write!(f, "`[{BOX_TYPES_TABLE}.{}]`", self.0)
+        }
+    }
 }
 
 impl BoxTypeError {
@@ -209,6 +251,57 @@ impl fmt::Display for BoxTypeError {
                      The other entries of minimal.toml are not affected."
                 )
             }
+            BoxTypeError::Loosening {
+                name,
+                key,
+                parent,
+                value,
+            } => {
+                match value {
+                    Some(value) => write!(
+                        f,
+                        "`[{BOX_TYPES_TABLE}.{name}]` allows `{value}` for `{key}` \
+                         in `constraints`, but its parent type {} does not.",
+                        TypeWords(parent)
+                    )?,
+                    None => write!(
+                        f,
+                        "`[{BOX_TYPES_TABLE}.{name}]` allows values for `{key}` \
+                         in `constraints` that its parent type {} does not allow.",
+                        TypeWords(parent)
+                    )?,
+                }
+                write!(
+                    f,
+                    " A type can only narrow the constraints of the type it extends. \
+                     Change `{key}` in the `constraints` of `[{BOX_TYPES_TABLE}.{name}]`."
+                )
+            }
+            BoxTypeError::ConstraintBroken {
+                box_type,
+                key,
+                value,
+                allowed,
+                layer,
+                item,
+            } => {
+                let verb = if *item { "adds" } else { "sets" };
+                let (first, second) = if *item {
+                    (format!("`{value}`"), format!("`{key}`"))
+                } else {
+                    (format!("`{key}`"), format!("`{value}`"))
+                };
+                let mut words = TypeWords(box_type).to_string();
+                if let Some(first) = words.get_mut(..1) {
+                    first.make_ascii_uppercase();
+                }
+                write!(
+                    f,
+                    "{layer} {verb} {first} to {second}. \
+                     {words} allows {allowed} {} `{key}`. Change the value.",
+                    if *item { "in" } else { "for" }
+                )
+            }
         }
     }
 }
@@ -295,6 +388,7 @@ impl BoxTypes {
             defaults.push(((*t).to_owned(), project.defaults.clone()));
             constraints.push(((*t).to_owned(), project.constraints.clone()));
         }
+        check_narrowing(&constraints)?;
         Ok(ResolvedType {
             name: name.to_owned(),
             root,
@@ -326,6 +420,131 @@ impl BoxTypes {
             });
         }
         self.resolve(box_type)
+    }
+}
+
+/// Checks that each type of a chain, root first, only narrows the
+/// constraints of the type before it (BOX-156).
+fn check_narrowing(chain: &[(String, toml::Table)]) -> Result<(), BoxTypeError> {
+    // The resolved constraint of each key: the last one the chain set. Each
+    // one is checked to admit no more than the one before it, so the last
+    // one admits no more than any of them.
+    let mut resolved: BTreeMap<&str, &toml::Value> = BTreeMap::new();
+    for (i, (name, table)) in chain.iter().enumerate() {
+        for (key, derived) in table {
+            if let Some(parent) = resolved.get(key.as_str())
+                && let Some((key, value)) = loosening(key, derived, parent)
+            {
+                return Err(BoxTypeError::Loosening {
+                    name: name.clone(),
+                    key,
+                    parent: chain[i.saturating_sub(1)].0.clone(),
+                    value: value.map(|v| inline(&v)),
+                });
+            }
+            resolved.insert(key, derived);
+        }
+    }
+    Ok(())
+}
+
+/// The values a constraint that is not a table admits: a list's items, or
+/// the value itself.
+pub(crate) fn admitted(constraint: &toml::Value) -> &[toml::Value] {
+    match constraint {
+        toml::Value::Array(items) => items,
+        other => std::slice::from_ref(other),
+    }
+}
+
+/// Where `derived` admits a value that `parent` excludes: the key path
+/// under `path`, and a value that shows it when one does. `None` when
+/// `derived` admits no more than `parent`.
+fn loosening(
+    path: &str,
+    derived: &toml::Value,
+    parent: &toml::Value,
+) -> Option<(String, Option<toml::Value>)> {
+    match (derived, parent) {
+        (toml::Value::Table(d), toml::Value::Table(p)) => p.iter().find_map(|(k, pv)| {
+            let sub = format!("{path}.{k}");
+            match d.get(k) {
+                None => Some((sub, None)),
+                Some(dv) => loosening(&sub, dv, pv),
+            }
+        }),
+        // A table admits tables without end. A list of values does not hold
+        // them all.
+        (toml::Value::Table(_), _) => Some((path.to_owned(), None)),
+        (_, parent) => admitted(derived)
+            .iter()
+            .find(|v| excluded(path, parent, v).is_some())
+            .map(|v| (path.to_owned(), Some(v.clone()))),
+    }
+}
+
+/// The part of a spec value that a constraint excludes.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Excluded {
+    /// The key path of the excluded value.
+    pub key: String,
+    /// The excluded value, or the excluded item of a list.
+    pub value: toml::Value,
+    /// For a list item, its index in the list.
+    pub item: Option<usize>,
+    /// The constraint that excludes it.
+    pub constraint: toml::Value,
+}
+
+/// The first part of `value`, at key path `path`, that `constraint` does
+/// not admit. A table constrains only the keys it names, and only where
+/// the value sets them. A list value is checked item by item.
+pub(crate) fn excluded(
+    path: &str,
+    constraint: &toml::Value,
+    value: &toml::Value,
+) -> Option<Excluded> {
+    let exclude = |value: &toml::Value, item| Excluded {
+        key: path.to_owned(),
+        value: value.clone(),
+        item,
+        constraint: constraint.clone(),
+    };
+    match (constraint, value) {
+        (toml::Value::Table(c), toml::Value::Table(v)) => c.iter().find_map(|(k, cv)| {
+            v.get(k)
+                .and_then(|vv| excluded(&format!("{path}.{k}"), cv, vv))
+        }),
+        (toml::Value::Table(_), _) => Some(exclude(value, None)),
+        (_, toml::Value::Array(items)) => {
+            let allowed = admitted(constraint);
+            items
+                .iter()
+                .position(|item| !allowed.contains(item))
+                .map(|i| exclude(&items[i], Some(i)))
+        }
+        (_, _) => (!admitted(constraint).contains(value)).then(|| exclude(value, None)),
+    }
+}
+
+/// A TOML value as one line, the way minimal.toml writes it inline.
+pub(crate) fn inline(value: &toml::Value) -> String {
+    value.to_string()
+}
+
+/// The values a constraint allows, as a message names them.
+pub(crate) fn allowed_words(constraint: &toml::Value) -> String {
+    if constraint.is_table() {
+        return "only a table".to_owned();
+    }
+    let values: Vec<String> = admitted(constraint)
+        .iter()
+        .map(|v| format!("`{}`", inline(v)))
+        .collect();
+    match values.as_slice() {
+        [] => "no value".to_owned(),
+        [one] => format!("only {one}"),
+        [rest @ .., last] => format!("only {} or {last}", rest.join(", ")),
     }
 }
 
@@ -588,6 +807,146 @@ mod tests {
             prop_assert_eq!(err.exit_code(), 3);
             let msg = err.to_string();
             prop_assert!(msg.starts_with(&format!("`[box_types.{name}]`")), "{}", msg);
+        }
+    }
+
+    // BOX-156: a derived type whose constraint admits a value that its
+    // parent type's constraint on the same key excludes fails with exit 3
+    // naming the type, the key and the parent.
+    #[test]
+    fn derived_type_loosening_constraint_exit3_names_type_key_parent() {
+        let base = r#"
+            [box_types.ci]
+            extends = "task"
+            constraints = { pty_enabled = false, restart = ["never", "on-failure"], network = { mode = "none" } }
+        "#;
+        // Narrowing, repeating, or constraining a new key resolves.
+        types(&format!(
+            "{base}[box_types.ci-small]\nextends = \"ci\"\n\
+             constraints = {{ pty_enabled = false, restart = \"never\", \
+             network = {{ mode = \"none\", egress = {{ allow_dns_hosts = [] }} }}, \
+             packages = [\"git\"] }}\n\
+             [box_types.ci-tiny]\nextends = \"ci-small\"\nconstraints = {{ restart = [] }}\n"
+        ))
+        .expect("each type only narrows");
+
+        for (constraints, key, msg) in [
+            (
+                "pty_enabled = [false, true]",
+                "pty_enabled",
+                "`[box_types.ci-loose]` allows `true` for `pty_enabled` in `constraints`, \
+                 but its parent type `[box_types.ci]` does not.",
+            ),
+            (
+                "restart = \"always\"",
+                "restart",
+                "`[box_types.ci-loose]` allows `\"always\"` for `restart` in `constraints`, \
+                 but its parent type `[box_types.ci]` does not.",
+            ),
+            (
+                "network = { mode = \"open\" }",
+                "network.mode",
+                "`[box_types.ci-loose]` allows `\"open\"` for `network.mode` in `constraints`, \
+                 but its parent type `[box_types.ci]` does not.",
+            ),
+            (
+                "network = { egress = {} }",
+                "network.mode",
+                "`[box_types.ci-loose]` allows values for `network.mode` in `constraints` \
+                 that its parent type `[box_types.ci]` does not allow.",
+            ),
+        ] {
+            let src = format!(
+                "{base}[box_types.ci-loose]\nextends = \"ci\"\nconstraints = {{ {constraints} }}\n"
+            );
+            let err = types(&src).expect_err(constraints);
+            assert_eq!(err.exit_code(), 3);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "{msg} A type can only narrow the constraints of the type it extends. \
+                     Change `{key}` in the `constraints` of `[box_types.ci-loose]`."
+                )
+            );
+        }
+
+        // The parent's resolved constraint holds through a type that does
+        // not repeat it: the parent named is the type extended.
+        let err = types(&format!(
+            "{base}[box_types.mid]\nextends = \"ci\"\n\
+             [box_types.leaf]\nextends = \"mid\"\nconstraints = {{ pty_enabled = true }}\n"
+        ))
+        .expect_err("loosens through mid");
+        assert_eq!(
+            err,
+            BoxTypeError::Loosening {
+                name: "leaf".into(),
+                key: "pty_enabled".into(),
+                parent: "mid".into(),
+                value: Some("true".into()),
+            }
+        );
+    }
+
+    fn small_constraint() -> impl Strategy<Value = Option<Vec<u8>>> {
+        prop::option::of(prop::collection::vec(0u8..3, 0..3))
+    }
+
+    proptest! {
+        // BOX-156 property: a chain resolves iff no derived type's
+        // constraint admits a value its parent's resolved constraint
+        // excludes, so every resolved constraint is a subset of its
+        // parent's.
+        #[test]
+        fn derived_type_loosening_constraint_exit3_names_type_key_parent_property(
+            chain in prop::collection::vec(small_constraint(), 1..5),
+        ) {
+            let mut src = String::new();
+            for (i, c) in chain.iter().enumerate() {
+                let extends = if i == 0 { "task".to_owned() } else { format!("t{}", i - 1) };
+                src.push_str(&format!("[box_types.t{i}]\nextends = \"{extends}\"\n"));
+                if let Some(c) = c {
+                    let items: Vec<String> = c.iter().map(|v| format!("\"v{v}\"")).collect();
+                    src.push_str(&format!("constraints = {{ restart = [{}] }}\n", items.join(", ")));
+                }
+            }
+            // Brute force over the domain: the first type whose set is not
+            // inside the last set before it.
+            let mut resolved: Option<Vec<u8>> = None;
+            let mut loose = None;
+            for (i, c) in chain.iter().enumerate() {
+                if let Some(c) = c {
+                    if let Some(p) = &resolved && c.iter().any(|v| !p.contains(v)) {
+                        loose = Some(i);
+                        break;
+                    }
+                    resolved = Some(c.clone());
+                }
+            }
+            match (types(&src), loose) {
+                (Ok(t), None) => {
+                    for i in 0..chain.len() {
+                        let name = format!("t{i}");
+                        prop_assert!(t.resolve(&name).is_ok());
+                    }
+                }
+                (Err(err), Some(i)) => {
+                    prop_assert_eq!(err.exit_code(), 3);
+                    prop_assert_eq!(
+                        err,
+                        BoxTypeError::Loosening {
+                            name: format!("t{i}"),
+                            key: "restart".into(),
+                            parent: format!("t{}", i - 1),
+                            value: chain[i].as_ref().and_then(|c| {
+                                let p = resolved.as_ref()?;
+                                c.iter().find(|v| !p.contains(v)).map(|v| format!("\"v{v}\""))
+                            }),
+                        }
+                    );
+                }
+                (got, want) => prop_assert!(false, "{:?} vs loosening at {:?}", got, want),
+            }
         }
     }
 }
