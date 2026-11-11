@@ -837,6 +837,12 @@ pub fn build_box_egress(
     }
 }
 
+/// How long the in-VM daemon waits for its ask for a build grant
+/// ([`BoxControlRequest::OpenBuildGrant`]) to be answered. The VM host daemon
+/// opens no grant it could only answer later than this, because the asker
+/// has given up and could never close it.
+pub const BUILD_GRANT_ASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// `min` files a box's build grant table with the host-side creator
 /// ([`BoxControlRequest::FileBuildTable`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

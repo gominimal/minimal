@@ -1300,9 +1300,29 @@ fn serve_request(
         // NET-165: the guest names a spec hash, and the table decides. The
         // sources' redirects are read before the ticket, so no turn waits
         // on a remote host.
+        // A grant whose reply cannot be delivered ends at once: its asker
+        // could never close it.
         (BoxControlRequest::OpenBuildGrant(request), ControlDoor::GuestReports) => {
-            let reply = open_build_grant(boxes, answerer, order, audit_path, &request);
-            write_reply(stream, &reply)
+            let reply = open_build_grant(
+                boxes,
+                answerer,
+                order,
+                audit_path,
+                &request,
+                std::time::Instant::now(),
+            );
+            let written = write_reply(stream, &reply);
+            if written.is_err()
+                && let BoxControlReply::BuildGrantOpened(opened) = &reply
+                && let Some(withdrawal) = boxes.build_grants().take(&opened.grant_row)
+            {
+                tracing::info!(
+                    row = %opened.grant_row,
+                    "a build grant's reply could not be delivered; the grant ends now"
+                );
+                order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+            }
+            written
         }
         // A guest signal ends a grant early. Only a row a grant opened ends
         // here: no other row can be named.
@@ -1770,15 +1790,23 @@ fn registration_reply(
     }
 }
 
-/// Opens the grant `request` asks for (NET-165): the table decides, and the
-/// build box gets a row of its own. A hash the table does not hold, or a grant
-/// past the cap, opens nothing, and the build follows the box's own rules.
+/// The part of the asker's deadline a grant must open within, so its reply
+/// still arrives in time.
+const BUILD_GRANT_OPEN_WITHIN: std::time::Duration =
+    minimald_rpc::BUILD_GRANT_ASK_DEADLINE.saturating_sub(std::time::Duration::from_secs(10));
+
+/// Opens the grant `request`, read at `asked_at`, asks for (NET-165): the
+/// table decides, and the build box gets a row of its own. A hash the table
+/// does not hold, or a grant past the cap, opens nothing, and the build
+/// follows the box's own rules. A grant that opens too late for its asker to
+/// still be waiting ends at once and opens nothing either.
 fn open_build_grant(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     order: &Arc<ApplyOrder>,
     audit_path: &Path,
     request: &minimald_rpc::OpenBuildGrantRequest,
+    asked_at: std::time::Instant,
 ) -> BoxControlReply {
     let no_grant = BoxControlReply::NoBuildGrant {
         no_build_grant: true,
@@ -1836,6 +1864,17 @@ fn open_build_grant(
             "the box's table ended while its grant opened; the grant ends now"
         );
         order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+        return no_grant;
+    }
+    if asked_at.elapsed() >= BUILD_GRANT_OPEN_WITHIN {
+        tracing::warn!(
+            session = %request.session_id,
+            row = %row,
+            "a build grant opened after its asker stopped waiting; the grant ends now"
+        );
+        if let Some(withdrawal) = grants.take(&row) {
+            order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+        }
         return no_grant;
     }
     let (sweep_boxes, sweep_answerer, sweep_order, sweep_audit) = (
@@ -9289,6 +9328,44 @@ mod tests {
         assert!(
             matches!(again, BoxControlReply::NoBuildGrant { .. }),
             "{again:?}"
+        );
+    }
+
+    /// NET-165: a grant that opens after its asker stopped waiting ends at
+    /// once, so no row stands that nobody could close.
+    #[test]
+    fn a_grant_too_late_for_its_asker_opens_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let session_id = boxes::SessionId::mint();
+        let first = open_a_grant(&sock_path, session_id);
+        assert_eq!(first.grant_row, format!("build-{session_id}-1"));
+        let Some(asked_at) =
+            std::time::Instant::now().checked_sub(minimald_rpc::BUILD_GRANT_ASK_DEADLINE)
+        else {
+            return;
+        };
+        let reply = open_build_grant(
+            &registry,
+            &answerer,
+            &Arc::new(ApplyOrder::default()),
+            &dir.path().join("audit.log"),
+            &minimald_rpc::OpenBuildGrantRequest {
+                session_id,
+                spec_hash: "aa".to_string(),
+            },
+            asked_at,
+        );
+        assert!(
+            matches!(reply, BoxControlReply::NoBuildGrant { .. }),
+            "{reply:?}"
+        );
+        assert!(
+            registry
+                .row_by_name(&format!("build-{session_id}-2"))
+                .is_none(),
+            "its row is withdrawn"
         );
     }
 

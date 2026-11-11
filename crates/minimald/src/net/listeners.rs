@@ -171,8 +171,8 @@ const REPORT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How long the VM host daemon has to open a build grant: it reads the
 /// sources' redirects first. One attempt, because a second could open a
-/// second grant.
-const BUILD_GRANT_DEADLINE: Duration = Duration::from_secs(60);
+/// second grant. The VM host daemon opens no grant past it.
+const BUILD_GRANT_DEADLINE: Duration = minimald_rpc::BUILD_GRANT_ASK_DEADLINE;
 
 /// The one deadline every attempt of a *withdrawn*-port report shares: the
 /// withdrawal is teardown, so it is given up on sooner than a publish. A
