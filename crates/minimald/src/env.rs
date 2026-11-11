@@ -2062,10 +2062,21 @@ impl BoxChannel {
 
         // NET-155: a patched build's spec is one the box can change, so it
         // runs in a build box on the box's own rules and looks up nothing
-        // (NET-169).
-        let build_box = ctx
-            .build_boxes()
-            .map(|boxes| boxes.build_box(pkg_name, None));
+        // (NET-169). It lists while it runs (NET-171), and the run ends it on
+        // every way out of the build.
+        let build_box = ctx.build_boxes().map(|boxes| {
+            boxes.build_box(
+                pkg_name,
+                op::build_box::declared_packages(&graph, &bsr),
+                None,
+            )
+        });
+        let run = op::BuildBoxRun::start(
+            ctx.build_boxes().cloned(),
+            build_box.clone(),
+            pkg_name,
+            graph.spec_hash(&bsr),
+        );
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
             let remote_cache = if ctx.use_remote_cache() {
@@ -2107,6 +2118,7 @@ impl BoxChannel {
             Ok(())
         }
         .await;
+        run.end().await;
 
         if let Err(e) = result {
             // NET-155: a build the box's rules refused names the source's

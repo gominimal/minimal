@@ -3122,6 +3122,11 @@ pub struct RunningBuildBox {
     /// The host side granted it its reach (NET-165). Otherwise it follows
     /// the requesting box's rules (NET-169).
     pub granted: bool,
+    /// Its network has ended: what is left of the build runs with no
+    /// address, whatever `egress` says. Distinct from `egress: None`, which
+    /// allows everything.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_network: bool,
 }
 
 /// The response for a [`ListBoxes`] RPC.

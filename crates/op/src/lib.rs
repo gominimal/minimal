@@ -49,7 +49,8 @@ mod sources;
 pub use sources::{SourceFetcher, SourceLoad};
 pub mod build_box;
 pub use build_box::{
-    BuildBox, BuildBoxes, BuildNetwork, BuildReach, NEEDS_NETWORK, NEEDS_NETWORK_RULES, ReachFuture,
+    BuildBox, BuildBoxRun, BuildBoxes, BuildNetwork, BuildReach, NEEDS_NETWORK,
+    NEEDS_NETWORK_RULES, ReachFuture,
 };
 mod specs;
 pub use specs::{SpecBuild, SpecBuildResult};

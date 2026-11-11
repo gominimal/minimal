@@ -1587,7 +1587,12 @@ mod tests {
         struct NoBoxes;
         impl op::BuildBoxes for NoBoxes {
             #[expect(clippy::unreachable, reason = "this test builds nothing")]
-            fn build_box(&self, _: &str, _: Option<&common::SpecHash>) -> op::BuildBox {
+            fn build_box(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: Option<&common::SpecHash>,
+            ) -> op::BuildBox {
                 unreachable!("nothing builds here")
             }
         }

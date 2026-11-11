@@ -201,15 +201,24 @@ pub(crate) fn render_box_show(
 
 /// What one build box may reach, in a person's words (NET-171).
 fn build_box_reach(build: &minimald_rpc::RunningBuildBox) -> String {
+    if build.no_network {
+        return "no network".to_string();
+    }
     if !build.granted {
         return "follows this box's rules".to_string();
     }
     let Some(egress) = &build.egress else {
         return "the internet".to_string();
     };
+    let internet = egress
+        .allow_subnets
+        .as_ref()
+        .is_some_and(|subnets| subnets.iter().any(|subnet| subnet == "0.0.0.0/0"));
     let hosts = egress.allow_dns_hosts.clone().unwrap_or_default();
-    if hosts.is_empty() {
+    if internet {
         "the internet".to_string()
+    } else if hosts.is_empty() {
+        "no destination".to_string()
     } else {
         hosts.join(", ")
     }
@@ -313,10 +322,21 @@ mod build_box_tests {
             allow_protocols: None,
             deny_subnets: None,
         };
+        let nothing = boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(Vec::new()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
         let running = |package: &str, egress, granted| minimald_rpc::RunningBuildBox {
             package: package.to_string(),
             egress,
             granted,
+            no_network: false,
+        };
+        let ended = minimald_rpc::RunningBuildBox {
+            no_network: true,
+            ..running("fetched", Some(nothing.clone()), true)
         };
         let mut out = Vec::new();
         write_build_boxes(
@@ -325,6 +345,8 @@ mod build_box_tests {
                 running("bucket", Some(declared), true),
                 running("tooling", Some(internet), true),
                 running("mine", None, false),
+                running("unlisted", Some(nothing), true),
+                ended,
             ],
         )
         .unwrap();
@@ -333,7 +355,9 @@ mod build_box_tests {
             "build boxes (their own reach, not this box's)\n  \
              bucket: storage.googleapis.com\n  \
              tooling: the internet\n  \
-             mine: follows this box's rules\n"
+             mine: follows this box's rules\n  \
+             unlisted: no destination\n  \
+             fetched: no network\n"
         );
 
         let mut none = Vec::new();

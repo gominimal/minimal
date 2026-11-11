@@ -44,18 +44,57 @@ fn table_path(state_dir: &Path, id: boxes::SessionId) -> PathBuf {
     state_dir.join("build-tables").join(format!("{id}.json"))
 }
 
-/// Files a box's table on a host with no VM.
+/// Files a box's table on a host with no VM. The table is written to a
+/// file of its own beside it, readable by this user alone, and renamed into
+/// place, so a lookup reads the old table or the new one, whole.
 pub(crate) fn file_table(
     state_dir: &Path,
     id: boxes::SessionId,
     table: &minimald_rpc::BuildGrantTable,
 ) -> std::io::Result<()> {
+    use std::io::Write as _;
+
     let path = table_path(state_dir, id);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    let dir = path.parent().unwrap_or(state_dir);
+    std::fs::create_dir_all(dir)?;
     let bytes = serde_json_lenient::to_vec(table).map_err(std::io::Error::other)?;
-    std::fs::write(path, bytes)
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(&bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(&path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Reads the table filed for the box `id` on a host with no VM: `None` when
+/// none was filed. A table that cannot be read or parsed is said as a warn
+/// line and reads as none, so the build follows the box's own rules.
+fn read_table(state_dir: &Path, id: boxes::SessionId) -> Option<minimald_rpc::BuildGrantTable> {
+    let path = table_path(state_dir, id);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(
+                box_id = %id,
+                path = %path.display(),
+                %error,
+                "could not read the box's build table; its builds follow its own rules"
+            );
+            return None;
+        }
+    };
+    match serde_json_lenient::from_slice(&bytes) {
+        Ok(table) => Some(table),
+        Err(error) => {
+            tracing::warn!(
+                box_id = %id,
+                path = %path.display(),
+                %error,
+                "the box's build table does not parse; its builds follow its own rules"
+            );
+            None
+        }
+    }
 }
 
 /// Ends a box's table: the box is gone.
@@ -176,9 +215,7 @@ impl Shared {
             )),
             crate::net::listeners::BuildGrantAnswer::NoGrant => None,
             crate::net::listeners::BuildGrantAnswer::NoDoor => {
-                let bytes = std::fs::read(table_path(&self.state_dir, self.record.id)).ok()?;
-                let table: minimald_rpc::BuildGrantTable =
-                    serde_json_lenient::from_slice(&bytes).ok()?;
+                let table = read_table(&self.state_dir, self.record.id)?;
                 let grant = table.get(spec_hash)?;
                 let hosts = if grant.internet {
                     std::collections::BTreeSet::new()
@@ -207,6 +244,8 @@ fn record_name(record: &boxes::Record) -> String {
 struct BoxReach {
     shared: Arc<Shared>,
     package: String,
+    /// The build's declared dependencies, for its Box Spec.
+    packages: Vec<String>,
     spec_hash: Option<String>,
     granted: OnceLock<Granted>,
 }
@@ -240,15 +279,17 @@ impl op::BuildReach for BoxReach {
                 Some(spec_hash) => self.shared.ask_host(spec_hash).await,
                 None => None,
             };
-            tracing::info!(
-                box_name = %self.shared.box_name(),
-                package = %self.package,
-                granted = answer.is_some(),
-                "opening the network of a build box",
-            );
             let Some((granted, addresses)) = answer else {
-                return self.shared.requester_network();
+                let network = self.shared.requester_network();
+                let egress = if network.is_some() {
+                    self.shared.requester_egress()
+                } else {
+                    Some(no_egress())
+                };
+                self.log_spec(false, egress);
+                return network;
             };
+            self.log_spec(true, Some(granted.egress.clone()));
             note_reach(&self.shared.record.id.to_string(), &self.package, &granted);
             let network = self.granted_network(granted.egress.clone(), addresses);
             drop(self.granted.set(granted));
@@ -267,12 +308,36 @@ impl op::BuildReach for BoxReach {
 
     fn close(&self) -> op::ReachFuture<'_, ()> {
         Box::pin(async move {
+            note_no_network(&self.shared.record.id.to_string(), &self.package);
             let Some(granted) = self.granted.get().filter(|granted| !granted.row.is_empty()) else {
                 return;
             };
             let control = crate::box_actor::switch_control_of(&self.shared.switch).await;
             crate::net::listeners::close_build_grant(&control, &granted.row).await;
         })
+    }
+}
+
+/// An egress that admits no destination.
+fn no_egress() -> boxes::EgressPolicy {
+    minimald_rpc::build_box_egress(&std::collections::BTreeSet::new(), false)
+}
+
+impl BoxReach {
+    /// Logs the build box's Box Spec, with the reach the host side decided.
+    fn log_spec(&self, granted: bool, egress: Option<boxes::EgressPolicy>) {
+        let spec = boxes::BuildBoxSpec::derive(
+            self.shared.record.id,
+            self.package.clone(),
+            self.packages.clone(),
+            egress,
+        );
+        tracing::info!(
+            box_name = %self.shared.box_name(),
+            granted,
+            ?spec,
+            "opened the network of a build box",
+        );
     }
 }
 
@@ -285,13 +350,28 @@ fn note_reach(box_id: &str, package: &str, granted: &Granted) {
     }
 }
 
+/// Shows that a running build box has no network from here on (NET-171): its
+/// steps run with no address.
+fn note_no_network(box_id: &str, package: &str) {
+    let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(running) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(package)) {
+        running.no_network = true;
+    }
+}
+
 impl op::BuildBoxes for BoxBuildBoxes {
-    fn build_box(&self, package: &str, spec_hash: Option<&common::SpecHash>) -> op::BuildBox {
+    fn build_box(
+        &self,
+        package: &str,
+        packages: Vec<String>,
+        spec_hash: Option<&common::SpecHash>,
+    ) -> op::BuildBox {
         op::BuildBox::new(
             fetch_program(),
             Arc::new(BoxReach {
                 shared: Arc::clone(&self.0),
                 package: package.to_string(),
+                packages,
                 spec_hash: spec_hash.map(|hash| hash.0.to_hex().to_string()),
                 granted: OnceLock::new(),
             }),
@@ -302,20 +382,14 @@ impl op::BuildBoxes for BoxBuildBoxes {
         let box_id = self.0.record.id.to_string();
         let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
         if running {
-            let egress = self.0.requester_egress();
-            let spec = boxes::BuildBoxSpec::derive(
-                self.0.record.id,
-                package.to_string(),
-                Vec::new(),
-                egress.clone(),
-            );
-            tracing::info!(box_name = %self.0.box_name(), ?spec, "a build box started");
+            tracing::info!(box_name = %self.0.box_name(), package, "a build box started");
             all.entry(box_id).or_default().insert(
                 package.to_string(),
                 minimald_rpc::RunningBuildBox {
                     package: package.to_string(),
-                    egress,
+                    egress: self.0.requester_egress(),
                     granted: false,
+                    no_network: false,
                 },
             );
         } else if let Some(running) = all.get_mut(&box_id) {

@@ -119,8 +119,8 @@ pub trait BuildReach: Send + Sync + std::fmt::Debug {
     fn has_no_network(&self) -> bool {
         false
     }
-    /// Ends the build box's network. A grant stops here when the fetch stops
-    /// or the build ends, whichever comes first for it.
+    /// Ends the build box's network, opened or not. A grant stops here when
+    /// the fetch stops or the build ends, whichever comes first for it.
     fn close(&self) -> ReachFuture<'_, ()>;
 }
 
@@ -154,12 +154,96 @@ pub struct BuildBox {
 
 /// The build boxes of one box (NET-155, NET-169).
 pub trait BuildBoxes: Send + Sync + std::fmt::Debug {
-    /// The build box for the build of `package`. `spec_hash` is the hash the
-    /// host side looks up. `None` never looks: a patched build's spec is one
-    /// the box can change, so the box's own rules decide it.
-    fn build_box(&self, package: &str, spec_hash: Option<&SpecHash>) -> BuildBox;
+    /// The build box for the build of `package`, whose declared dependencies
+    /// are `packages`. `spec_hash` is the hash the host side looks up. `None`
+    /// never looks: a patched build's spec is one the box can change, so the
+    /// box's own rules decide it.
+    fn build_box(
+        &self,
+        package: &str,
+        packages: Vec<String>,
+        spec_hash: Option<&SpecHash>,
+    ) -> BuildBox;
     /// Tells the box's listing that this build started or ended.
     fn note_running(&self, _package: &str, _spec_hash: &SpecHash, _running: bool) {}
+}
+
+/// A build running in its build box, listed while it runs. [`Self::end`]
+/// ends it: the build box's network, then its listing. Dropped before that,
+/// as a task that is aborted drops it, it still ends: the listing at once,
+/// and the network on a task of its own.
+#[derive(Debug)]
+pub struct BuildBoxRun {
+    boxes: Option<Arc<dyn BuildBoxes>>,
+    build_box: Option<BuildBox>,
+    package: String,
+    spec_hash: SpecHash,
+}
+
+impl BuildBoxRun {
+    /// Lists the build of `package` as running in `build_box`.
+    #[must_use]
+    pub fn start(
+        boxes: Option<Arc<dyn BuildBoxes>>,
+        build_box: Option<BuildBox>,
+        package: &str,
+        spec_hash: SpecHash,
+    ) -> Self {
+        if let Some(boxes) = &boxes {
+            boxes.note_running(package, &spec_hash, true);
+        }
+        Self {
+            boxes,
+            build_box,
+            package: package.to_string(),
+            spec_hash,
+        }
+    }
+
+    /// Ends the build box's network, then its listing.
+    pub async fn end(mut self) {
+        if let Some(build_box) = self.build_box.take() {
+            build_box.close().await;
+        }
+        self.unlist();
+    }
+
+    fn unlist(&mut self) {
+        if let Some(boxes) = self.boxes.take() {
+            boxes.note_running(&self.package, &self.spec_hash, false);
+        }
+    }
+}
+
+impl Drop for BuildBoxRun {
+    fn drop(&mut self) {
+        self.unlist();
+        if let Some(build_box) = self.build_box.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move { build_box.close().await });
+        }
+    }
+}
+
+/// The names of the packages `spec` declares it depends on: its build and
+/// runtime dependencies, each once, by name.
+#[must_use]
+pub fn declared_packages(graph: &Graph, spec: &BuildSpecRef) -> Vec<String> {
+    let build = graph.get(spec).expect("a member of the graph");
+    let refs = build
+        .build_deps
+        .iter()
+        .filter_map(|dep| match dep {
+            BuildDep::Build(bsr) => Some(bsr),
+            BuildDep::Subset(subset) => Some(&subset.from),
+            BuildDep::Source(_) | BuildDep::Local { .. } => None,
+        })
+        .chain(build.runtime_deps.iter().map(|dep| dep.bsr()));
+    let names: BTreeSet<String> = refs
+        .filter_map(|bsr| graph.get(bsr).map(|dep| dep.name.clone()))
+        .collect();
+    names.into_iter().collect()
 }
 
 impl BuildBox {
@@ -195,11 +279,10 @@ impl BuildBox {
         self.opened.get().and_then(Option::as_ref)
     }
 
-    /// Ends the build box's network.
+    /// Ends the build box's network. From here on its processes run with
+    /// none, whether it ever opened one or not.
     pub async fn close(&self) {
-        if self.opened.initialized() {
-            self.reach.close().await;
-        }
+        self.reach.close().await;
     }
 
     /// The error of a build that needs the network this build box does not

@@ -88,7 +88,8 @@ async fn box_package_build_runs_in_a_build_box() {
             op::NEEDS_NETWORK_RULES,
         ),
     ] {
-        let build_box = boxes_of(mode, egress, state.path()).build_box("pkg", Some(&hash(1)));
+        let build_box =
+            boxes_of(mode, egress, state.path()).build_box("pkg", Vec::new(), Some(&hash(1)));
         assert!(build_box.network().await.is_none(), "{mode:?}");
         assert_eq!(
             build_box.needs_network().to_string(),
@@ -103,11 +104,11 @@ async fn box_package_build_runs_in_a_build_box() {
 async fn workspace_build_box_follows_the_requester() {
     let state = tempfile::tempdir().unwrap();
     let open = boxes_of(boxes::NetworkMode::OwnIp, Some(open_egress()), state.path());
-    let build_box = open.build_box("pkg", Some(&hash(1)));
+    let build_box = open.build_box("pkg", Vec::new(), Some(&hash(1)));
     assert!(build_box.network().await.is_some());
 
     let none = boxes_of(boxes::NetworkMode::NoNet, None, state.path());
-    let build_box = none.build_box("pkg", Some(&hash(1)));
+    let build_box = none.build_box("pkg", Vec::new(), Some(&hash(1)));
     assert!(build_box.network().await.is_none());
 }
 
@@ -118,7 +119,7 @@ async fn workspace_build_refused_in_deny_all_box() {
     let state = tempfile::tempdir().unwrap();
     for egress in [Some(boxes::EgressPolicy::deny_all()), None] {
         let sealed = boxes_of(boxes::NetworkMode::OwnIp, egress, state.path());
-        let build_box = sealed.build_box("pkg", Some(&hash(1)));
+        let build_box = sealed.build_box("pkg", Vec::new(), Some(&hash(1)));
         assert!(build_box.network().await.is_none());
     }
 }
@@ -132,10 +133,10 @@ async fn install_through_minenv_sock_takes_the_same_lookup() {
     let sealed = boxes_of(boxes::NetworkMode::OwnIp, None, state.path());
     super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
 
-    let added = sealed.build_box("claude-code", Some(&hash(1)));
+    let added = sealed.build_box("claude-code", Vec::new(), Some(&hash(1)));
     assert!(added.network().await.is_some());
 
-    let patched = sealed.build_box("claude-code", None);
+    let patched = sealed.build_box("claude-code", Vec::new(), None);
     assert!(patched.network().await.is_none());
 }
 
@@ -147,13 +148,13 @@ async fn grant_applies_only_to_the_expanded_spec_hash() {
     let sealed = boxes_of(boxes::NetworkMode::OwnIp, None, state.path());
     super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
 
-    let other = sealed.build_box("pkg", Some(&hash(2)));
+    let other = sealed.build_box("pkg", Vec::new(), Some(&hash(2)));
     assert!(other.network().await.is_none());
-    let granted = sealed.build_box("another-name", Some(&hash(1)));
+    let granted = sealed.build_box("another-name", Vec::new(), Some(&hash(1)));
     assert!(granted.network().await.is_some());
 
     super::drop_table(state.path(), boxes::SessionId::nil(), &switch()).await;
-    let ended = sealed.build_box("pkg", Some(&hash(1)));
+    let ended = sealed.build_box("pkg", Vec::new(), Some(&hash(1)));
     assert!(ended.network().await.is_none());
 }
 
@@ -173,6 +174,7 @@ async fn a_box_refuses_a_source_host_it_does_not_list() {
     let reach = |egress: Option<boxes::EgressPolicy>, spec_hash: Option<String>| super::BoxReach {
         shared: Arc::clone(&boxes_of(boxes::NetworkMode::OwnIp, egress, state.path()).0),
         package: "pkg".to_string(),
+        packages: Vec::new(),
         spec_hash,
         granted: std::sync::OnceLock::new(),
     };
@@ -208,14 +210,36 @@ async fn a_running_build_box_lists_until_its_build_ends() {
     assert_eq!(running[0].package, "pkg");
     assert!(!running[0].granted, "it has not asked yet");
 
-    let build_box = boxes.build_box("pkg", Some(&expanded));
+    let build_box = boxes.build_box("pkg", Vec::new(), Some(&expanded));
     assert!(build_box.network().await.is_some());
     let running = super::running_build_boxes(&box_id);
     assert!(running[0].granted);
     assert_eq!(running[0].egress, Some(open_egress()));
 
+    build_box.close().await;
+    let running = super::running_build_boxes(&box_id);
+    assert!(running[0].no_network, "its steps run with no address now");
+
     boxes.note_running("pkg", &expanded, false);
     assert!(super::running_build_boxes(&box_id).is_empty());
+}
+
+/// NET-165: a table that does not parse reads as none, so the build follows
+/// the box's own rules: in a deny-all box, no network. A table filed again
+/// replaces it whole.
+#[tokio::test]
+async fn an_unreadable_table_grants_nothing() {
+    let state = tempfile::tempdir().unwrap();
+    let sealed = boxes_of(boxes::NetworkMode::OwnIp, None, state.path());
+    let path = super::table_path(state.path(), boxes::SessionId::nil());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"{ not json").unwrap();
+    let build_box = sealed.build_box("pkg", Vec::new(), Some(&hash(1)));
+    assert!(build_box.network().await.is_none());
+
+    super::file_table(state.path(), boxes::SessionId::nil(), &table_of(&hash(1))).unwrap();
+    let build_box = sealed.build_box("pkg", Vec::new(), Some(&hash(1)));
+    assert!(build_box.network().await.is_some());
 }
 
 /// NET-155: `__build-fetch` takes a URL, a hash and a file, and says so.

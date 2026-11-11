@@ -224,18 +224,24 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 cpu_weight: Some(
                     ((3 * cost + 60 + depended_on_by * cost.max(1) * 25) as u64).min(10000),
                 ),
-                build_box: shared
-                    .backend
-                    .build_boxes
-                    .as_ref()
-                    .map(|boxes| boxes.build_box(&name, Some(&spec_hash))),
+                build_box: shared.backend.build_boxes.as_ref().map(|boxes| {
+                    boxes.build_box(
+                        &name,
+                        op::build_box::declared_packages(&shared.graph, &bsr),
+                        Some(&spec_hash),
+                    )
+                }),
                 patched: false,
             };
 
-            let build_boxes = shared.backend.build_boxes.clone();
-            if let Some(boxes) = &build_boxes {
-                boxes.note_running(&name, &spec_hash, true);
-            }
+            // The run ends the build box when the build ends, and also when
+            // this task is aborted before then.
+            let run = op::BuildBoxRun::start(
+                shared.backend.build_boxes.clone(),
+                b.build_box.clone(),
+                &name,
+                spec_hash.clone(),
+            );
             let res = b
                 .run(&op::Options {
                     cache: shared.cache.clone(),
@@ -245,12 +251,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     daemon_id: shared.daemon_id.clone(),
                 })
                 .await;
-            if let Some(build_box) = &b.build_box {
-                build_box.close().await;
-            }
-            if let Some(boxes) = &build_boxes {
-                boxes.note_running(&name, &spec_hash, false);
-            }
+            run.end().await;
             log_sink.as_ref().iter().for_each(|s| {
                 s.unbounded_send(BuildEvent {
                     idx: dr.inner_idx(),

@@ -384,6 +384,7 @@ mod tests {
             package: "claude-code".to_string(),
             egress: None,
             granted: true,
+            no_network: false,
         }];
         let listed = [local(parent)];
         let mut table = Vec::new();
@@ -422,6 +423,7 @@ mod tests {
             package: "claude-code".to_string(),
             egress: None,
             granted: true,
+            no_network: false,
         }];
         assert!(
             find_listed_box(&[parent], "claude-code", "local0", "").is_err(),
