@@ -1327,6 +1327,11 @@ pub struct StartOverrideArgs {
 // are the rest of activate's `[network]` flags, `--no-loadouts` and
 // `--no-hooks`.
 //
+// Not yet every `[network]` key has its flag here. BCLI-024's rule also
+// gives `--quic443` and `--vpn-network-names`, and neither verb takes them
+// yet. `min session activate` does not take them either. They need a
+// follow-up issue of their own.
+//
 // Deliberately NOT a doc comment: clap propagates a flattened struct's doc
 // comment into the parent command's long_about.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
