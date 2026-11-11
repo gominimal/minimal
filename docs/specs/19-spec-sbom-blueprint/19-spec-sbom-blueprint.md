@@ -3,9 +3,9 @@ id: SBOM
 title: box SBOM + CycloneDX Blueprint
 owner: bryan-minimal
 epic: gominimal/inbox#582
-arch: https://github.com/gominimal/arch/blob/3dab1097cda11652ad24282969ed8dfe61d0d497/architecture.md
-arch_sha: "3dab1097cda11652ad24282969ed8dfe61d0d497"
-updated: 2026-11-10
+arch: https://github.com/gominimal/arch/blob/15b603e6afb8dd2ebf6fc15f2ec1cac1fb57a0ec/architecture.md
+arch_sha: "15b603e6afb8dd2ebf6fc15f2ec1cac1fb57a0ec"
+updated: 2026-11-11
 ---
 
 # SBOM — box SBOM + CycloneDX Blueprint
@@ -64,11 +64,16 @@ verification fails closed.
 
 A box's **posture** is what its expanded Box Spec declares it can reach,
 read, write, inherit or expose: `[network]` (mode, `[network.egress]`,
-`ingress`, `dynamic_ingress`, `quic443`, `[network.bep]`), `[secrets]`
+`ingress`, `dynamic_ingress`, `quic443`, `[network.bep]`),
+`[host-exposures]` (the host loopback ports a box may reach), `[secrets]`
 references, `[env_vars]` and `[loadouts.vars]` with their `inherit` flags,
+`[params]` (the values the entrypoint reads from `$MINIMAL_PARAMS`),
 `[[file_imports]]`, `[[file_exports]]`, `[[github_imports]]`, `volumes`,
 `[[loadouts]]` with their patches and lifecycle hooks, `[machine]` and
-`[execution]`, `[io]`, `lifetime`, `[nesting]` and `[otel]`. Each axis has
+`[execution]`, `[io]`, `lifetime`, `[nesting]` and `[otel]`. A package
+build for the box runs in a build box of its own, whose egress the host
+side grants from a table the client filed; that reach is the build box's,
+not an axis of the box's posture, and the Blueprint does not state it. Each axis has
 one of three **labels**. An axis is **enforced** when the daemon or host
 refuses what it does not allow. It is **declared** when the spec accepts and
 records it with enforcement unowned or in flight (BOX-076 warns once at
@@ -272,11 +277,21 @@ developer running agent boxes, build-infra operator, and auditor.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_env_assets_carry_name_and_provenance_only
     property: for all serializers s: every environment asset in parse_s(emit_s(c)) carries only name and provenance fields
-  - THE SYSTEM SHALL record a `[secrets]` reference by its name and its
-    `source` kind only, never its value.
+  - THE SYSTEM SHALL record a `[secrets]` reference by its name, its
+    `source` kind and the upstream authorities its grant names (the
+    `upstream` the expanded spec carries for a store reference, BOX-071:
+    host and port, which say where the secret may go), never its value and
+    never its injection form.
     tier:   T1
-    verify: cargo nextest run -p sbom sbom_secrets_carry_name_and_source_kind_only
-    property: for all serializers s: every secret in parse_s(emit_s(c)) carries only name and source kind
+    verify: cargo nextest run -p sbom sbom_secrets_carry_name_source_kind_and_upstreams_only
+    property: for all serializers s: every secret in parse_s(emit_s(c)) carries only name, source kind and upstream authorities
+  - THE SYSTEM SHALL record `[params]` by its keys alone, never a value.
+    The architecture makes `[params]` plain spec data and no place for a
+    secret, but that is a rule on the author the emitter cannot check, and
+    a value can be anything the entrypoint reads.
+    tier:   T1
+    verify: cargo nextest run -p sbom sbom_params_carry_keys_only
+    property: for all serializers s: every params asset in parse_s(emit_s(c)) carries a key and no value
   - THE SYSTEM SHALL record a `[[github_imports]]` location and the
     `[otel]` endpoint reduced to scheme, host and port. Those three parts
     are an allowlist, so userinfo, path, query, fragment and headers are
@@ -716,10 +731,16 @@ egress proxy, file and volume transfers and the `[otel]` exporter are flows.
 The entrypoint, lifecycle hooks, `lifetime`, `restart`, `timeout`,
 `pty_enabled`, `exec_enabled`, `dynamic_ingress` and `dynamic_providers` are
 behaviors. Runtime outcomes (dynamic ingress decisions, public exposure),
-host-asserted facts (the egress pin, whether `[machine]` limits are enforced)
-and client-side consent rules (the three `*-file-rules` and
-`[secret-store-rules]` tables, which never enter the spec) are undeclarable
-from the spec and stay schema-TODO.
+host-asserted facts (the egress pin, whether `[machine]` limits are enforced,
+the egress a build box was granted for the box's package builds) and
+client-side consent rules (the three `*-file-rules` and
+`[secret-store-rules]` tables, which never enter the spec; what a
+secret-store rule registers for a reference, its upstream authorities and
+injection form, does enter the expanded spec, and SBOM-008 says which of
+those the document carries) are undeclarable from the spec and stay
+schema-TODO. A box's build boxes are zones of their own, with the reach
+the host side granted; the Blueprint names the build box as a zone and
+leaves its reach to the host's record.
 
 ## Security considerations
 
@@ -781,6 +802,19 @@ from the spec and stay schema-TODO.
   `min box spec`, whose `-o` formats and `min/v1/spec` schema a CycloneDX
   document cannot satisfy. The ruling is the architecture's, and the
   requirements bind either answer, so the spec names no command.]
+- [NEEDS CLARIFICATION (HIGH): the per-artifact release attestation
+  direction under D3.1, which replaces the per-commit closure object with a
+  Sigstore-signed statement per package keyed by its Build Spec Hash, and
+  the per-commit index with registry snapshots over one HTTP layout. If it
+  is adopted, the pin's closure object (Context) becomes the set of
+  attestations the pinned commit's tree names, SBOM-004's "resolvable
+  through the signed closure object" becomes "named by a verified
+  attestation", SBOM-013's sealed-map state becomes the attestation's own
+  presence, and SBOM-014's stored closure becomes the stored attestations.
+  No requirement's verdict changes: a component still has a digest or a
+  gap, and an unverifiable document still marks the composition partial.
+  This spec follows D3.1 as the architecture states it when the first slice
+  is cut.]
 - [NEEDS CLARIFICATION (HIGH): is a composed box document signed in its own
   right, or a verifiable derivation over signed per-package inputs it
   references? A derivation is the better answer: it calls for no per-box
