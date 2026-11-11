@@ -5323,20 +5323,44 @@ impl BoxRegistry {
     }
 
     /// Withdraws the row a host-address box's builds attach under, with its
-    /// task rows, when the box retires (NET-169). A box with no such row is
-    /// left alone.
-    pub fn withdraw_build_row(&self, name: &str) {
-        let Some(record) = self.row_by_name(name) else {
-            return;
-        };
-        let withdrawn = self.withdraw_client_box(
+    /// task rows, when the box retires (NET-169). Only a row registered to
+    /// stay detached is a build row: an ordinary box under the same name is
+    /// left alone. With no build row, the withdrawal still counts, under the
+    /// row lock, so a registration of the name in flight cannot land after
+    /// it. Returns the name the row was held under and its switch address,
+    /// when one was withdrawn, for the release of its published address.
+    pub fn withdraw_build_row(&self, name: &str) -> Option<(String, Ipv4Addr)> {
+        let record = {
+            let rows = self
+                .rows
+                .write()
+                .expect("the row lock is never held across a panic, so it cannot be poisoned");
+            let asked = canonical_box_name(name);
+            let found = rows
+                .values()
+                .filter(|record| {
+                    !record.is_task_row()
+                        && record.liveness().stays_detached
+                        && canonical_box_name(&record.name()) == asked
+                })
+                .max_by_key(|record| record.box_id())
+                .cloned();
+            if found.is_none() {
+                self.bump_withdrawal_generation(name);
+            }
+            found
+        }?;
+        match self.withdraw_client_box_held(
             name,
             record.switch_addr,
             record.loopback_addr,
             Some(record.box_id),
-        );
-        if let Err(error) = withdrawn {
-            tracing::warn!(box = %name, ?error, "could not withdraw a box's build row");
+        ) {
+            Ok((_, held)) => Some((held, record.switch_addr)),
+            Err(error) => {
+                tracing::warn!(box = %name, ?error, "could not withdraw a box's build row");
+                None
+            }
         }
     }
 
@@ -9994,9 +10018,42 @@ mod tests {
         assert!(registry.withdraw_expired_detached().is_empty());
         assert!(registry.row_by_name("build-1").is_some());
 
-        registry.withdraw_build_row("build-1");
+        assert!(registry.withdraw_build_row("build-1").is_some());
         assert!(registry.row_by_name("build-1").is_none());
-        registry.withdraw_build_row("build-1");
+        assert!(registry.withdraw_build_row("build-1").is_none());
+    }
+
+    /// NET-169: a box's retirement withdraws only a build row. An ordinary
+    /// box under the build row's name stays.
+    #[test]
+    fn a_retirement_leaves_an_ordinary_box_under_the_build_rows_name() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry
+            .register_client_box(client_spec("build-1"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw_build_row("build-1").is_none());
+        assert!(registry.row_by_name("build-1").is_some());
+    }
+
+    /// NET-169: a retirement that finds no build row still counts as a
+    /// withdrawal, so a registration of the row in flight cannot land after
+    /// it.
+    #[test]
+    fn a_retirement_refuses_a_build_row_registration_in_flight() {
+        let registry = BoxRegistry::new(SUBNET);
+        let claim = registry.begin_registration("build-1");
+        assert!(registry.withdraw_build_row("build-1").is_none());
+        assert!(
+            registry
+                .register_client_box_since(
+                    client_spec("build-1"),
+                    Ipv4Addr::LOCALHOST,
+                    0,
+                    claim.generation(),
+                )
+                .is_err(),
+            "the registration began before the retirement"
+        );
     }
 
     /// The registry a test persists at `dir`, under its default plan.

@@ -1403,7 +1403,18 @@ fn serve_request(
             let box_name = no_switch_box_name(boxes, request.session_id)
                 .unwrap_or_else(|| request.session_id.to_string());
             boxes.retire_host_ip_box(request.session_id, request.end);
-            boxes.withdraw_build_row(&minimald_rpc::requester_build_row_name(request.session_id));
+            // The row its builds attach under goes with it (NET-169), in its
+            // turn as any withdrawal, and its published address returns to
+            // the range unless a live row or a registration owns it.
+            order.apply(|| {
+                let name = minimald_rpc::requester_build_row_name(request.session_id);
+                if let Some((held, switch_address)) = boxes.withdraw_build_row(&name) {
+                    boxes.release_withdrawn_unless_owned(&held, || {
+                        answerer.release_address(&held);
+                    });
+                    flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
+                }
+            });
             // A host-address box has no switch: its audit window, filed by
             // its box id, ends with it (NET-046).
             flush_guest_audit(
