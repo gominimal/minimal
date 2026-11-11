@@ -1691,7 +1691,7 @@ pub(crate) async fn run_entry(
         id,
         request.config.network,
         request.config.policy.egress.as_ref(),
-        false,
+        created.deny_all_opt_out == Some(true),
     )
     .await;
     crate::prepare_build_boxes(
