@@ -20,6 +20,7 @@ use serde::Serialize;
 
 use crate::{GlobalArgs, TypeShowArgs};
 
+use super::box_audit::printable;
 use super::output::{ObjectType, OutputMode, Rendered, write_object};
 
 /// Where a type comes from.
@@ -106,13 +107,13 @@ pub fn type_rows(types: &BoxTypes) -> Vec<TypeRow> {
 pub fn write_type_list(out: &mut dyn Write, rows: &[TypeRow]) -> std::io::Result<()> {
     let width = rows
         .iter()
-        .map(|r| r.name.len())
+        .map(|r| printable(&r.name).len())
         .chain(["NAME".len()])
         .max()
         .unwrap_or_default();
     let parent_width = rows
         .iter()
-        .map(|r| r.extends.as_deref().unwrap_or("-").len())
+        .map(|r| printable(r.extends.as_deref().unwrap_or("-")).len())
         .chain(["EXTENDS".len()])
         .max()
         .unwrap_or_default();
@@ -125,9 +126,9 @@ pub fn write_type_list(out: &mut dyn Write, rows: &[TypeRow]) -> std::io::Result
         writeln!(
             out,
             "{:<width$}  {:<7}  {:<parent_width$}  {}",
-            row.name,
+            printable(&row.name),
             row.source.as_str(),
-            row.extends.as_deref().unwrap_or("-"),
+            printable(row.extends.as_deref().unwrap_or("-")),
             row.root,
         )?;
     }
@@ -219,15 +220,15 @@ fn write_values(out: &mut dyn Write, values: &[TypeValue]) -> std::io::Result<()
     }
     let width = values
         .iter()
-        .map(|v| v.key.len() + v.value.len() + 3)
+        .map(|v| printable(&v.key).len() + printable(&v.value).len() + 3)
         .max()
         .unwrap_or_default();
     for v in values {
-        let setting = format!("{} = {}", v.key, v.value);
+        let setting = format!("{} = {}", printable(&v.key), printable(&v.value));
         writeln!(
             out,
             "  {setting:<width$}  from {} ({})",
-            v.set_by,
+            printable(&v.set_by),
             v.source.as_str()
         )?;
     }
@@ -238,10 +239,10 @@ impl Rendered for TypeDetail {
     const TYPE: ObjectType = ObjectType::Type;
 
     fn text(&self, out: &mut dyn Write) -> std::io::Result<()> {
-        writeln!(out, "Name:           {}", self.name)?;
+        writeln!(out, "Name:           {}", printable(&self.name))?;
         writeln!(out, "Source:         {}", self.source.as_str())?;
         if let Some(extends) = &self.extends {
-            writeln!(out, "Extends:        {extends}")?;
+            writeln!(out, "Extends:        {}", printable(extends))?;
         }
         writeln!(out, "Built-in type:  {}", self.root)?;
         writeln!(out)?;
@@ -253,23 +254,34 @@ impl Rendered for TypeDetail {
     }
 }
 
-/// The directory the commands look for the project in: the global
-/// `--repo-dir`, else the current one.
-fn project_dir(global: &GlobalArgs) -> PathBuf {
-    global
-        .repo_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."))
+/// The directory the commands look for the project in, and whether the
+/// search walks up from it. `--repo-dir` names the project root, as
+/// `min init` reads it, so the search stays there. Without it the search
+/// walks up from the current directory.
+fn project_dir(global: &GlobalArgs) -> (PathBuf, bool) {
+    match &global.repo_dir {
+        Some(dir) => (dir.clone(), false),
+        None => (PathBuf::from("."), true),
+    }
 }
 
 /// The box types of the project in `dir`, or only the built-in types when
-/// no `minimal.toml` is found there or above it.
+/// no `minimal.toml` is found there, or above it when `search_ancestors`.
 ///
 /// # Errors
 /// A `minimal.toml` that does not load, or whose `[box_types]` does not
 /// resolve. `doing` names the command in the message.
-pub fn load_types(dir: &std::path::Path, doing: &str) -> anyhow::Result<BoxTypes> {
-    let file = match mfile::File::from_dir_recursive(dir) {
+pub fn load_types(
+    dir: &std::path::Path,
+    search_ancestors: bool,
+    doing: &str,
+) -> anyhow::Result<BoxTypes> {
+    let loaded = if search_ancestors {
+        mfile::File::from_dir_recursive(dir)
+    } else {
+        mfile::File::from_dir(dir)
+    };
+    let file = match loaded {
         Ok(file) => file,
         Err(mfile::Error::NotFound) => {
             tracing::debug!(dir = %dir.display(), "no project file: built-in types only");
@@ -306,7 +318,8 @@ pub fn load_types(dir: &std::path::Path, doing: &str) -> anyhow::Result<BoxTypes
 /// # Errors
 /// As [`load_types`], or the writer's error.
 pub fn cmd_type_list(global: &GlobalArgs, out: &mut dyn Write) -> anyhow::Result<()> {
-    let types = load_types(&project_dir(global), "list the box types")?;
+    let (dir, search_ancestors) = project_dir(global);
+    let types = load_types(&dir, search_ancestors, "list the box types")?;
     write_type_list(out, &type_rows(&types)).context("failed to write to stdout")?;
     out.flush().context("failed to write to stdout")
 }
@@ -320,11 +333,12 @@ pub fn cmd_type_show(
     args: &TypeShowArgs,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let types = load_types(&project_dir(global), "show the box type")?;
+    let (dir, search_ancestors) = project_dir(global);
+    let types = load_types(&dir, search_ancestors, "show the box type")?;
     if !types.contains(&args.name) {
         anyhow::bail!(
             "No box type is named `{}`. Run `min type list` to see the box types.",
-            args.name
+            printable(&args.name)
         );
     }
     let resolved = types

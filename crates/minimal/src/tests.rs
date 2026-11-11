@@ -15077,6 +15077,29 @@ fn type_list_shows_builtin_and_project_types_with_source() {
     );
     assert!(!text.contains("project"), "{text}");
 
+    // `--repo-dir` names the project root: a directory under a project, with
+    // no `minimal.toml` of its own, does not read the parent's types.
+    let nested = project.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(&type_globals(&nested), &mut out).expect("the list renders");
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("project"), "{text}");
+
+    // A type name with a control character prints escaped, so a cloned
+    // `minimal.toml` cannot send terminal control sequences.
+    let hostile = tempfile::tempdir().unwrap();
+    std::fs::write(
+        hostile.path().join(mfile::MFILE_NAME),
+        "[box_types.\"evil\\u001b[2J\"]\nextends = \"session\"\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(&type_globals(hostile.path()), &mut out).expect("the list renders");
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(text.contains("evil\\u{1b}[2J"), "{text}");
+
     // The source enum reserves `org` for organization types.
     assert_eq!(cmd::types::TypeSource::Org.to_string(), "org");
     assert_eq!(
