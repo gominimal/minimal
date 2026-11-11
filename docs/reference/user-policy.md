@@ -6,7 +6,7 @@ description: "The user_policy.toml reference: the vars/patches allow-deny-ignore
 # User policy
 
 Your **user policy** constrains which environment variables and file patches
-may enter a session. When [`min session activate`](./cli-min.md#session-activate)
+may enter a session. When [`min session start`](./cli-min.md#session-start)
 composes a session, it gathers the variables and patches contributed by your
 [loadouts](./loadouts.md) and the project's
 [`minimal.toml`](./minimal-dot-toml.md) and evaluates each against

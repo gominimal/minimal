@@ -27,7 +27,7 @@ DIAG hakoniwa container/process exited non-zero code=125 exit_code=None
   reason=write("/proc/self/uid_map", ..) => Operation not permitted (os error 1)
 ```
 
-On such a host `min session activate` fails before any session exists.
+On such a host `min session start` fails before any session exists.
 The daemon checks the namespace on every create and refuses with the
 cause and its fix, which `min` prints as its error. `mip` prints the
 same cause and the fix for its own binary when a task starts. Make sure
@@ -60,8 +60,8 @@ $ min finalize-install --show
 $ min finalize-install
 ```
 
-The profile takes effect when the daemon next starts. Run `min stop`,
-then your command again. To remove the profile run:
+The profile takes effect when the daemon next starts. Run `min host stop <host>`,
+then your command again. `min host list` prints the host names. To remove the profile run:
 
 ```console
 $ min finalize-install --undo

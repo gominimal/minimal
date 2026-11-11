@@ -616,7 +616,9 @@ impl BoxManagerHandle {
                 .filter(|(record, _)| {
                     project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
                 })
-                .map(|(record, pty)| box_listing_entry(record, *pty))
+                .map(|(record, traits)| {
+                    box_listing_entry(record, traits.pty, traits.lifetime.clone())
+                })
                 .collect();
             boxes.sort_by_key(|entry| entry.box_id);
             tracing::Span::current().record("count", boxes.len());
@@ -658,7 +660,7 @@ impl BoxManagerHandle {
                 .or_else(|| records.iter().find(|(record, _)| record.id == id));
             tracing::Span::current().record("found", record.is_some());
             tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
-            let Some((record, pty)) = record else {
+            let Some((record, traits)) = record else {
                 return Ok(None);
             };
             // BOX-159: the disk a reap frees, for a box a reap can take.
@@ -669,7 +671,7 @@ impl BoxManagerHandle {
             };
             tracing::Span::current().record("disk", disk_bytes.is_some());
             Ok(Some(minimald_rpc::ShowBoxResponse {
-                record: box_listing_entry(record, *pty),
+                record: box_listing_entry(record, traits.pty, traits.lifetime.clone()),
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
                 identity: minimald_rpc::BoxIdentity::None,
@@ -865,7 +867,7 @@ impl BoxManagerHandle {
                     .ok_or_else(|| unknown_box(key))?;
             }
             // The reaped box has no terminal left to attach to.
-            let reaped = box_listing_entry(&record, false);
+            let reaped = box_listing_entry(&record, false, None);
             let (send, recv) = Responder::channel();
             // A send error means the manager is gone: the recv fails as well.
             let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
@@ -1123,7 +1125,7 @@ impl BoxManagerHandle {
                 let disk_bytes = self.box_disk_bytes(&record).await;
                 reply.matched.push(minimald_rpc::PrunePreviewEntry {
                     // As a prune reports a reaped box: no terminal is left.
-                    record: box_listing_entry(&record, false),
+                    record: box_listing_entry(&record, false, None),
                     disk_bytes,
                 });
             }
@@ -1196,7 +1198,11 @@ fn unknown_box(id: SessionId) -> BoxManagerError {
 /// ending is not a row of the BOX-011 table reports its status with the
 /// stored `reason`, `exit_code` and `signal` as they are.
 /// `pty_enabled` is whether the box has a terminal ([`record_has_pty`]).
-fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc::BoxListingEntry {
+fn box_listing_entry(
+    record: &boxes::Record,
+    pty_enabled: bool,
+    lifetime: Option<String>,
+) -> minimald_rpc::BoxListingEntry {
     let (state, reason, exit_code, signal) = match record.state() {
         Ok(state) => (
             state.name(),
@@ -1231,6 +1237,7 @@ fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc:
         exit_code,
         signal,
         pty_enabled,
+        lifetime,
     }
 }
 
@@ -1246,6 +1253,26 @@ pub(crate) fn record_has_pty(record: &boxes::Record, stored_spec: Option<&[u8]>)
             .as_deref()
             .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
     }
+}
+
+/// What a listing reads from a box's stored spec beside its record.
+#[derive(Debug, Clone)]
+pub(crate) struct ListedTraits {
+    /// Whether the box has a terminal ([`record_has_pty`]).
+    pub pty: bool,
+    /// The `box.lifetime` its stored spec sets ([`stored_spec_lifetime`]).
+    pub lifetime: Option<String>,
+}
+
+/// The `box.lifetime` a box's stored spec sets, such as `until_stopped`
+/// (BCLI-009). `None` for a box filed with no spec, a spec that sets none,
+/// and bytes that are not a JSON object.
+pub(crate) fn stored_spec_lifetime(stored_spec: Option<&[u8]>) -> Option<String> {
+    let spec = serde_json_lenient::from_slice::<serde_json_lenient::Value>(stored_spec?).ok()?;
+    spec.get("box")?
+        .get("lifetime")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// The bytes the daemon stores for a box's spec (BOX-068): the spec the
@@ -1425,7 +1452,7 @@ enum ManagerMessage {
     Records(Responder<Vec<boxes::Record>>),
     /// [`Self::Records`], each record with whether its box has a terminal
     /// ([`record_has_pty`]), for the listing and the read (BCLI-068).
-    Listing(Responder<Vec<(boxes::Record, bool)>>),
+    Listing(Responder<Vec<(boxes::Record, ListedTraits)>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
@@ -4364,8 +4391,11 @@ impl BoxManager {
                                 None
                             }
                         };
-                        let pty = record_has_pty(&record, stored.as_deref());
-                        records.push((record, pty));
+                        let traits = ListedTraits {
+                            pty: record_has_pty(&record, stored.as_deref()),
+                            lifetime: stored_spec_lifetime(stored.as_deref()),
+                        };
+                        records.push((record, traits));
                     }
                     Ok::<_, BoxManagerError>(records)
                 })
