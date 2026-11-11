@@ -1305,6 +1305,56 @@ fn unenforced_sections(spec: &serde_json_lenient::Value) -> Vec<&'static str> {
         .collect()
 }
 
+/// The identity every box on this daemon runs under, as the create span
+/// records it (BOX-140). No host this daemon runs on has an identity
+/// plane, so the mode is always `none`.
+pub(crate) const IDENTITY_MODE_NONE: &str = "none";
+
+/// The names of the `[secrets]` entries of `spec` that set
+/// `source = "broker"`, in name order.
+fn brokered_secrets(spec: &serde_json_lenient::Value) -> Vec<String> {
+    let Some(secrets) = spec.get("secrets").and_then(|s| s.as_object()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = secrets
+        .iter()
+        .filter(|(_, entry)| entry.get("source").and_then(|s| s.as_str()) == Some("broker"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The refusal of a create whose spec carries a brokered secret while no
+/// identity plane is configured and no node-local proxy serves the box
+/// (BOX-081). `proxy_serves` says whether the request carries the proxy's
+/// root certificate, which a client sets only from an identity that a
+/// node-local proxy published. A `source = "store"` secret is never
+/// refused here (BOX-141).
+fn unenrolled_broker_refusal(
+    spec: &serde_json_lenient::Value,
+    proxy_serves: bool,
+) -> Option<boxes::core::bep::ActivationRefused> {
+    let grants = brokered_secrets(spec);
+    if grants.is_empty() || proxy_serves {
+        return None;
+    }
+    Some(boxes::core::bep::unenrolled_node(
+        grants,
+        false,
+        boxes::core::bep::ProxyAbsence::NotServed,
+    ))
+}
+
+/// The un-enrolled refusal an error from a create carries, if any.
+pub(crate) fn unenrolled_refusal(
+    error: &std::io::Error,
+) -> Option<&boxes::core::bep::ActivationRefused> {
+    error
+        .get_ref()?
+        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+}
+
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     /// Every retained record, in any state (BOX-158). Read-only against
@@ -3688,6 +3738,8 @@ impl BoxManager {
             spec_bytes = tracing::field::Empty,
             name_given = tracing::field::Empty,
             name = tracing::field::Empty,
+            // BOX-140: the identity the box runs under.
+            identity = IDENTITY_MODE_NONE,
             fresh,
         )
     )]
@@ -3792,6 +3844,28 @@ impl BoxManager {
         // BOX-076: the sections the daemon carries but does not enforce,
         // read before the spec becomes its stored bytes.
         let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
+        // BOX-081: no identity plane is configured on this host, so a
+        // brokered secret is refused unless a node-local proxy serves the
+        // box. The refusal comes before the record exists, so it leaves no
+        // record, id or name behind.
+        if let Some((refusal, grants)) = spec.as_ref().and_then(|spec| {
+            unenrolled_broker_refusal(spec, config.root_certificate.is_some())
+                .map(|refusal| (refusal, brokered_secrets(spec)))
+        }) {
+            tracing::info!(
+                session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                identity = IDENTITY_MODE_NONE,
+                secrets = ?grants,
+                code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                exit_code = refusal.exit_code(),
+                "refused a create: the spec carries a brokered secret, no identity plane \
+                 is configured, and no node-local proxy serves the box"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                refusal,
+            ));
+        }
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {

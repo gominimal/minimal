@@ -677,6 +677,23 @@ async fn serve_create_session(
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
                     error: e.to_string(),
                 },
+                // BOX-081: a brokered secret on a host with no identity
+                // plane (identity none) and no node-local proxy. The reply
+                // carries the refusal's text, so the client reads the cause
+                // and not a closed channel.
+                Err(e) if crate::box_manager::unenrolled_refusal(&e).is_some() => {
+                    let refusal = crate::box_manager::unenrolled_refusal(&e)
+                        .expect("the guard matched an un-enrolled refusal");
+                    tracing::info!(
+                        identity = crate::box_manager::IDENTITY_MODE_NONE,
+                        code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                        exit_code = refusal.exit_code(),
+                        "create refused: a brokered secret on a host with no identity plane"
+                    );
+                    Errorable::Err {
+                        error: refusal.to_string(),
+                    }
+                }
                 // BOX-002: a create minvmd gave no id is refused with a
                 // reply. The internal arm below closes the channel, and the
                 // client then reads an empty reply with no cause in it.

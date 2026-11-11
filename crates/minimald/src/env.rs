@@ -215,6 +215,36 @@ pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox::SESSION_
 /// can name on the daemon's side.
 pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox::SESSION_HOME);
 
+/// The file name of the per-box identity socket that a host with an
+/// identity plane puts in a box. No host this daemon runs on has an
+/// identity plane, so the daemon puts no file of this name in any box
+/// (BOX-140). Only the tests that check the box for it read the name.
+#[cfg(test)]
+pub(crate) const IDENTITY_SOCKET_NAME: &str = "identity.sock";
+
+/// The first file named [`IDENTITY_SOCKET_NAME`] under any of `roots`, or
+/// `None` when no root holds one. A root that does not exist holds none.
+/// Symbolic links are not followed.
+#[cfg(test)]
+pub(crate) fn find_identity_socket(roots: &[&Path]) -> Option<PathBuf> {
+    let mut pending: Vec<PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name() == IDENTITY_SOCKET_NAME {
+                return Some(path);
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path);
+            }
+        }
+    }
+    None
+}
+
 /// The parameters used to construct an [`Env`].
 ///
 /// Built with [`EnvArgs::new`] plus the `with_*` setters. `state_base_dir` is the
