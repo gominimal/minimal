@@ -13380,6 +13380,35 @@ async fn type_noun_verbs_alias_box_forms() {
         );
     }
 
+    // With `--exec`, the exec stop reaches the box the type noun resolved.
+    // A task box that holds, as its name, the start of the session box's id
+    // is not the box the exec stop reads.
+    let web_start: String = web.simple().to_string().chars().take(8).collect();
+    let decoy = create_configured_task(&mut daemon, &web_start, project).await;
+    let mut out = Vec::new();
+    let exec_stop = BoxStopArgs {
+        target: web_start.clone(),
+        force: false,
+        exec: Some(FIRST_EXEC_ID.to_owned()),
+    };
+    let err = cmd::typed_box_stop_on_hosts(hosts(), &mut out, &exec_stop, session, "stop")
+        .await
+        .expect_err("the session box runs no such exec");
+    match err.downcast_ref::<BoxExecIdRefusal>() {
+        Some(BoxExecIdRefusal::Unknown { target, .. }) => {
+            assert_eq!(
+                target,
+                &web.to_string(),
+                "the exec stop read the session box"
+            );
+        }
+        other => panic!("an unknown exec in the session box, not {other:?}: {err:#}"),
+    }
+    assert!(out.is_empty());
+    cmd::typed_box_rm_on_hosts(hosts(), &rm(&decoy.to_string()), task, "rm")
+        .await
+        .expect("the decoy task box goes");
+
     // Under its own noun, each box stops with the line of `min box stop`,
     // and then goes, as `min box rm` removes it.
     for (box_type, name, id) in [(session, "web", web), (task, "build", build)] {
