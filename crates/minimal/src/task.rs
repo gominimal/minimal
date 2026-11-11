@@ -90,7 +90,7 @@ fn entrypoint_run_request(task: &str, cwd: &str) -> minimald_rpc::exec::ExecRequ
 /// spec, with the arguments the user typed after the task name appended to
 /// its entrypoint, `min task run <task> <args...>`. `None` for an
 /// interactive task, whose type denies a terminal.
-fn task_box_spec(
+pub(crate) fn task_box_spec(
     task: &str,
     declared: &mfile::Task,
     flags: mfile::spec::SpecFlags,
@@ -606,7 +606,10 @@ pub(crate) async fn detach_run(
 /// The declaration comes back rather than being discarded because the
 /// client needs its `env_vars` to resolve them here — see
 /// [`resolve_task_env`].
-fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyhow::Error> {
+pub(crate) fn declared_task(
+    dir: &camino::Utf8Path,
+    task: &str,
+) -> Result<mfile::Task, anyhow::Error> {
     // Rejected before any lookup: the daemon trims the task name out of the
     // exec command string, so a name with leading/trailing whitespace can
     // never round-trip into the box — even if minimal.toml declares it.

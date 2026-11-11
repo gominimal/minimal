@@ -470,6 +470,9 @@ fn every_create_session_asserts_the_daemon_build() {
             // A unit test's request, never sent: it checks the run path's
             // `--quic443` and `--vpn-network-names` on the spec.
             "tests.rs::start_and_run_take_every_network_key_flag = asserts nothing",
+            // A unit test's request, never sent: it checks the run path's
+            // `--no-hooks` on the stored spec.
+            "tests.rs::start_no_hooks_stores_no_hooks = asserts nothing",
             // A unit test's request, never sent: it checks that
             // `--vpn-network-names` is refused when the request has no spec.
             "tests.rs::vpn_network_names_without_a_spec_is_refused = asserts nothing",
@@ -13992,11 +13995,38 @@ async fn start_no_hooks_stores_no_hooks() {
         panic!("a task box starts detached");
     };
     assert!(run.other.no_hooks);
+    let task_project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        task_project.path().join(mfile::MFILE_NAME),
+        "[tasks.build]\necho = 'x'\n",
+    )
+    .unwrap();
+    let task_root = camino::Utf8Path::from_path(task_project.path()).unwrap();
     for verb in ["task", "box"] {
+        let run = parsed_run(&["min", verb, "run", "--no-hooks", "build"]);
+        assert!(run.other.no_hooks, "{verb}");
+        // The request and spec as `task::run_entry` builds them.
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(task_root.to_owned()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+        request.config.hooks_enabled = !run.other.no_hooks;
+        let declared = task::declared_task(task_root, &run.entry).expect("the task is declared");
+        let spec = task::task_box_spec(
+            &run.entry,
+            &declared,
+            crate::spec_flags(&request),
+            &run.args,
+        )
+        .expect("a non-interactive task has a spec");
+        crate::put_spec(&mut request, &spec).expect("the spec encodes");
+        let stored: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
         assert!(
-            parsed_run(&["min", verb, "run", "--no-hooks", "build"])
-                .other
-                .no_hooks
+            !stored.hooks_enabled,
+            "{verb}: the stored spec runs no hook"
         );
     }
 }
