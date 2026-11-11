@@ -3018,6 +3018,35 @@ impl OneshotSshRpc for ShowBox {
     type Response = Errorable<ShowBoxResponse>;
 }
 
+/// An RPC to read the spec a box was created with: the stored copy beside
+/// its record (BOX-068), for `min box spec <box>` (BCLI-022).
+pub struct GetBoxSpec;
+
+/// The request for a [`GetBoxSpec`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBoxSpecRequest {
+    /// The box to read, as a listing reports its id.
+    pub id: SessionId,
+}
+
+/// The response for a [`GetBoxSpec`] RPC. An id that no retained record
+/// names is the [`Errorable::Err`] that starts with
+/// [`UNKNOWN_SESSION_ID_LEAD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GetBoxSpecResponse {
+    /// The stored spec, as its creating client sent it. `None` for a box
+    /// with no stored spec: one created before specs were stored, or by a
+    /// client that sent none.
+    #[serde(default)]
+    pub spec: Option<serde_json_lenient::Value>,
+}
+
+impl OneshotSshRpc for GetBoxSpec {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetBoxSpec");
+    type Request<'a> = GetBoxSpecRequest;
+    type Response = Errorable<GetBoxSpecResponse>;
+}
+
 /// An RPC to reap one box: delete its record, its events and its
 /// filesystem (BOX-019, BOX-045).
 ///
