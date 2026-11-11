@@ -289,22 +289,25 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
 
 /// Checks a finished expansion of `entry` against the constraints of its
 /// type, `box_type`: the final step of expansion, after the command-line
-/// override layer (BOX-061). Every type of the chain is checked, root
-/// first, each key in key order.
+/// override layer (BOX-061). Every type of the chain is checked, the
+/// entry's own type first, each key in key order. A type only narrows the
+/// type it extends (BOX-156), so the first failing constraint is the
+/// tightest one that holds the key.
 ///
 /// The check reads the expansion and never changes it (BOX-062).
 ///
 /// # Errors
 ///
 /// [`BoxTypeError::ConstraintBroken`] for the first value that a
-/// constraint excludes. It names `box_type`, the key and the layer that
+/// constraint excludes. It names the type of the chain whose
+/// `constraints` table holds that constraint, the key and the layer that
 /// set the value, and exits 3.
 pub fn check_constraints(
     entry: &BoxEntry,
     expansion: &Expansion,
     box_type: &ResolvedType,
 ) -> Result<(), BoxTypeError> {
-    for (_, constraints) in &box_type.constraints {
+    for (type_name, constraints) in box_type.constraints.iter().rev() {
         for (key, constraint) in constraints {
             let Some(value) = expansion.spec.get(key) else {
                 continue;
@@ -319,7 +322,7 @@ pub fn check_constraints(
                 (origin, _) => origin.and_then(ValueOrigin::first),
             };
             return Err(BoxTypeError::ConstraintBroken {
-                box_type: box_type.name.clone(),
+                box_type: type_name.clone(),
                 key: bad.key,
                 value: inline(&bad.value),
                 allowed: allowed_words(&bad.constraint),
@@ -1764,6 +1767,10 @@ mod tests {
         type = "ci-small"
         restart = "never"
         packages = ["curl"]
+
+        [boxes.small-always]
+        type = "ci-small"
+        restart = "always"
     "#;
 
     // BOX-061: the expanded spec is checked against the type's constraints
@@ -1802,14 +1809,25 @@ mod tests {
              Change the value."
         );
 
-        // A nested key names its path.
+        // The error names the type whose table holds the failing
+        // constraint. A derived type narrows its parent, so its own
+        // constraint is checked first.
+        let (_, checked) = expand_checked(CONSTRAINED_FILE, "small-always", "", "");
+        assert_eq!(
+            checked.expect_err("restart = always").to_string(),
+            "`[boxes.small-always]` in minimal.toml sets `restart` to `\"always\"`. \
+             `[box_types.ci-small]` allows only `\"never\"` for `restart`. \
+             Change the value."
+        );
+
+        // A nested key names its path, and the parent type that constrains it.
         let (_, checked) =
             expand_checked(CONSTRAINED_FILE, "ok", "", "network = { mode = \"open\" }");
         let err = checked.expect_err("network.mode = open");
         assert_eq!(
             err.to_string(),
             "a command-line flag sets `network.mode` to `\"open\"`. \
-             `[box_types.ci-small]` allows only `\"none\"` for `network.mode`. \
+             `[box_types.ci]` allows only `\"none\"` for `network.mode`. \
              Change the value."
         );
 
