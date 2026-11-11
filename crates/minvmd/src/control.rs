@@ -1292,14 +1292,6 @@ fn serve_request(
             let reply = order.apply(|| rename_box(boxes, &request));
             write_reply(stream, &reply)
         }
-        // A read of the host's own table, like the row read: no ticket.
-        // The table is this supervisor's, and a supervisor runs one VM and
-        // binds this door for that VM's vsock bridge alone, so the answer
-        // is only ever about the asking VM's own rows. A map lookup: it
-        // changes no row, no liveness and no attribution. The read is
-        // answered for the box id it names alone: a row another box was
-        // handed the address under is not the asking box's row, and a read
-        // that names no id is answered as no row, fail-closed.
         // NET-165: `min` files a box's table with the host-side creator.
         (BoxControlRequest::FileBuildTable(request), ControlDoor::Host) => {
             boxes.build_grants().file(request.session_id, request.table);
@@ -1309,21 +1301,33 @@ fn serve_request(
         // sources' redirects are read before the ticket, so no turn waits
         // on a remote host.
         (BoxControlRequest::OpenBuildGrant(request), ControlDoor::GuestReports) => {
-            let reply = open_build_grant(boxes, answerer, order, &request);
+            let reply = open_build_grant(boxes, answerer, order, audit_path, &request);
             write_reply(stream, &reply)
         }
         // A guest signal ends a grant early. Only a row a grant opened ends
         // here: no other row can be named.
         (BoxControlRequest::CloseBuildGrant(request), ControlDoor::GuestReports) => {
             if let Some(withdrawal) = boxes.build_grants().take(&request.grant_row) {
-                order.apply(|| withdraw_box(boxes, answerer, withdrawal));
+                order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
             }
             write_reply(stream, &BoxControlReply::BuildTable { build_table: true })
         }
+        // The box is gone: its table ends, and so does every grant still
+        // open for it.
         (BoxControlRequest::DropBuildTable(request), ControlDoor::GuestReports) => {
-            boxes.build_grants().drop_table(request.session_id);
+            for withdrawal in boxes.build_grants().drop_table(request.session_id) {
+                order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+            }
             write_reply(stream, &BoxControlReply::BuildTable { build_table: true })
         }
+        // A read of the host's own table, like the row read: no ticket.
+        // The table is this supervisor's, and a supervisor runs one VM and
+        // binds this door for that VM's vsock bridge alone, so the answer
+        // is only ever about the asking VM's own rows. A map lookup: it
+        // changes no row, no liveness and no attribution. The read is
+        // answered for the box id it names alone: a row another box was
+        // handed the address under is not the asking box's row, and a read
+        // that names no id is answered as no row, fail-closed.
         (BoxControlRequest::RowStanding(request), ControlDoor::GuestReports) => {
             let reply = BoxControlReply::RowStanding {
                 switch_address: request.switch_address,
@@ -1773,6 +1777,7 @@ fn open_build_grant(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     order: &Arc<ApplyOrder>,
+    audit_path: &Path,
     request: &minimald_rpc::OpenBuildGrantRequest,
 ) -> BoxControlReply {
     let no_grant = BoxControlReply::NoBuildGrant {
@@ -1813,31 +1818,43 @@ fn open_build_grant(
         },
     );
     let BoxControlReply::Registered(registered) = registered else {
+        grants.unreserve(&row);
         tracing::warn!(session = %request.session_id, reply = ?registered, "no grant opened");
         return no_grant;
     };
-    grants.opened(
-        WithdrawBoxRequest {
-            name: row.clone(),
-            switch_address: registered.switch_address,
-            loopback_address: registered.loopback_address,
-            box_id: Some(registered.box_id),
-        },
-        crate::build_grants::grant_deadline(std::time::Instant::now(), grant.internet),
+    let withdrawal = WithdrawBoxRequest {
+        name: row.clone(),
+        switch_address: registered.switch_address,
+        loopback_address: registered.loopback_address,
+        box_id: Some(registered.box_id),
+    };
+    let deadline = crate::build_grants::grant_deadline(std::time::Instant::now(), grant.internet);
+    if !grants.opened(withdrawal.clone(), deadline) {
+        tracing::info!(
+            session = %request.session_id,
+            row = %row,
+            "the box's table ended while its grant opened; the grant ends now"
+        );
+        order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+        return no_grant;
+    }
+    let (sweep_boxes, sweep_answerer, sweep_order, sweep_audit) = (
+        boxes.clone(),
+        answerer.clone(),
+        Arc::clone(order),
+        audit_path.to_path_buf(),
     );
-    let (sweep_boxes, sweep_answerer, sweep_order) =
-        (boxes.clone(), answerer.clone(), Arc::clone(order));
     grants.start_sweep(move || {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(crate::build_grants::GRANT_SWEEP_INTERVAL);
-                for withdrawal in sweep_boxes
-                    .build_grants()
-                    .take_expired(std::time::Instant::now())
-                {
-                    tracing::info!(row = %withdrawal.name, "a build grant reached its deadline");
-                    sweep_order.apply(|| withdraw_box(&sweep_boxes, &sweep_answerer, withdrawal));
-                }
+                sweep_grant_deadlines(
+                    &sweep_boxes,
+                    &sweep_answerer,
+                    &sweep_order,
+                    &sweep_audit,
+                    std::time::Instant::now(),
+                );
             }
         });
     });
@@ -1855,6 +1872,37 @@ fn open_build_grant(
         egress,
         internet: grant.internet,
     }))
+}
+
+/// Ends every grant past its deadline at `now`, each in its turn.
+fn sweep_grant_deadlines(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    audit_path: &Path,
+    now: std::time::Instant,
+) {
+    for withdrawal in boxes.build_grants().take_expired(now) {
+        tracing::info!(row = %withdrawal.name, "a build grant reached its deadline");
+        order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+    }
+}
+
+/// Withdraws a grant's row, in the caller's turn, and ends its audit window
+/// as any box's withdrawal does, so the count of the records it suppressed
+/// lands now and a later row at its address starts a window of its own.
+fn withdraw_grant_row(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    audit_path: &Path,
+    withdrawal: WithdrawBoxRequest,
+) -> BoxControlReply {
+    let switch_address = withdrawal.switch_address;
+    let (reply, held) = withdraw_box(boxes, answerer, withdrawal);
+    if let Some(held) = held {
+        flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
+    }
+    reply
 }
 
 /// The hosts a grant's fetch reaches, read from this host (NET-167).
@@ -9173,6 +9221,94 @@ mod tests {
         close("another-box");
         assert!(registry.row_by_name(&opened.grant_row).is_some());
         close(&opened.grant_row);
+        assert!(registry.row_by_name(&opened.grant_row).is_none());
+    }
+
+    /// A filed table and an open grant on it, through the server at
+    /// `sock_path`: the grant the guest opened.
+    fn open_a_grant(
+        sock_path: &std::path::Path,
+        session_id: boxes::SessionId,
+    ) -> minimald_rpc::OpenedBuildGrant {
+        let filed = control(
+            sock_path,
+            &BoxControlRequest::FileBuildTable(minimald_rpc::FileBuildTableRequest {
+                session_id,
+                table: std::collections::BTreeMap::from([(
+                    "aa".to_string(),
+                    minimald_rpc::BuildGrant {
+                        sources: Vec::new(),
+                        internet: true,
+                    },
+                )]),
+            }),
+        )
+        .expect("the host door answers");
+        assert!(matches!(filed, BoxControlReply::BuildTable { .. }));
+        let opened = control(
+            &sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE),
+            &BoxControlRequest::OpenBuildGrant(minimald_rpc::OpenBuildGrantRequest {
+                session_id,
+                spec_hash: "aa".to_string(),
+            }),
+        )
+        .expect("the guest door answers");
+        let BoxControlReply::BuildGrantOpened(opened) = opened else {
+            panic!("the table holds the hash: {opened:?}");
+        };
+        *opened
+    }
+
+    /// NET-165: a box's table ends with the box, and so does every grant
+    /// open for it: its row goes, and its hash opens nothing more.
+    #[test]
+    fn a_dropped_table_ends_its_grants() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let session_id = boxes::SessionId::mint();
+        let opened = open_a_grant(&sock_path, session_id);
+        assert!(registry.row_by_name(&opened.grant_row).is_some());
+
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let dropped = control(
+            &guest,
+            &BoxControlRequest::DropBuildTable(minimald_rpc::DropBuildTableRequest { session_id }),
+        )
+        .expect("the guest door answers");
+        assert!(matches!(dropped, BoxControlReply::BuildTable { .. }));
+        assert!(registry.row_by_name(&opened.grant_row).is_none());
+        let again = control(
+            &guest,
+            &BoxControlRequest::OpenBuildGrant(minimald_rpc::OpenBuildGrantRequest {
+                session_id,
+                spec_hash: "aa".to_string(),
+            }),
+        )
+        .expect("the guest door answers");
+        assert!(
+            matches!(again, BoxControlReply::NoBuildGrant { .. }),
+            "{again:?}"
+        );
+    }
+
+    /// NET-165: the sweep withdraws a grant's row at its host-side deadline,
+    /// and leaves a grant before it.
+    #[test]
+    fn the_sweep_ends_a_grant_at_its_deadline() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let opened = open_a_grant(&sock_path, boxes::SessionId::mint());
+        let order = Arc::new(ApplyOrder::default());
+        let audit = dir.path().join("audit.log");
+        let now = std::time::Instant::now();
+
+        sweep_grant_deadlines(&registry, &answerer, &order, &audit, now);
+        assert!(registry.row_by_name(&opened.grant_row).is_some());
+
+        let past = crate::build_grants::grant_deadline(now, true);
+        sweep_grant_deadlines(&registry, &answerer, &order, &audit, past);
         assert!(registry.row_by_name(&opened.grant_row).is_none());
     }
 

@@ -19,8 +19,9 @@ use minimald_rpc::{BuildGrant, BuildGrantTable, WithdrawBoxRequest};
 /// that outlives the VM host daemon keeps its table.
 pub(crate) const BUILD_TABLES_FILE: &str = "build-tables.json";
 
-/// The persisted tables' format version. A file of any other version is set
-/// aside as no tables, and those boxes' builds follow their own rules.
+/// The persisted tables' format version. A file of any other version, or one
+/// that cannot be read, is set aside as no tables, and those boxes' builds
+/// follow their own rules.
 const BUILD_TABLES_FILE_VERSION: u32 = 1;
 
 /// The longest a source fetch keeps its grant.
@@ -55,6 +56,8 @@ struct BuildTablesFile {
 
 #[derive(Debug)]
 struct OpenGrant {
+    /// The box the grant opened for, whose table's end ends it too.
+    session_id: boxes::SessionId,
     deadline: Instant,
     withdrawal: WithdrawBoxRequest,
 }
@@ -63,6 +66,10 @@ struct OpenGrant {
 struct State {
     tables: BTreeMap<boxes::SessionId, BuildGrantTable>,
     open: BTreeMap<String, OpenGrant>,
+    /// The rows [`BuildGrants::next_row`] named whose registration has not
+    /// ended yet, by row, with the box each is for. They count toward the
+    /// cap as open grants do.
+    reserved: BTreeMap<String, boxes::SessionId>,
     /// Counts grants, so each row has a name of its own.
     opened: u64,
 }
@@ -72,18 +79,25 @@ struct State {
 pub struct BuildGrants {
     state: Arc<Mutex<State>>,
     persisted_at: Option<Arc<PathBuf>>,
+    /// Serializes a table change with its write, so the last write to land
+    /// is of the newest tables.
+    persist_turn: Arc<Mutex<()>>,
     sweeping: Arc<AtomicBool>,
 }
 
 impl BuildGrants {
-    /// The same grants, reading and keeping their tables at `path`.
+    /// The same grants, reading and keeping their tables at `path`. A file
+    /// that cannot be read, does not parse or is of another version is set
+    /// aside, said as a warn line, and no table reloads. When it cannot be
+    /// set aside, this process persists no table, so the file stays as it is.
     pub(crate) fn persisting_to(mut self, path: PathBuf) -> Self {
-        let file = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json_lenient::from_slice::<BuildTablesFile>(&bytes).ok())
-            .filter(|file| file.version == BUILD_TABLES_FILE_VERSION);
-        if let Some(file) = file {
-            self.lock().tables = file.tables;
+        match read_tables_file(&path) {
+            Ok(tables) => self.lock().tables = tables,
+            Err(why) => {
+                if !set_aside_tables_file(&path, &why) {
+                    return self;
+                }
+            }
         }
         self.persisted_at = Some(Arc::new(path));
         self
@@ -93,7 +107,20 @@ impl BuildGrants {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn persist(&self, tables: BTreeMap<boxes::SessionId, BuildGrantTable>) {
+    /// Changes the tables with `change` and writes them, both in one persist
+    /// turn. `change` answers whether it changed anything to write.
+    fn change_tables(&self, change: impl FnOnce(&mut State) -> bool) {
+        let _turn = self
+            .persist_turn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let tables = {
+            let mut state = self.lock();
+            if !change(&mut state) {
+                return;
+            }
+            state.tables.clone()
+        };
         let Some(path) = &self.persisted_at else {
             return;
         };
@@ -109,24 +136,36 @@ impl BuildGrants {
     /// Files `table` for the box `session_id`, beside what it already holds:
     /// a table too long for one request line comes in parts.
     pub fn file(&self, session_id: boxes::SessionId, table: BuildGrantTable) {
-        let tables = {
-            let mut state = self.lock();
+        self.change_tables(|state| {
             state.tables.entry(session_id).or_default().extend(table);
-            state.tables.clone()
-        };
-        self.persist(tables);
+            true
+        });
     }
 
-    /// Ends the table of the box `session_id`, which is gone.
-    pub fn drop_table(&self, session_id: boxes::SessionId) {
-        let tables = {
-            let mut state = self.lock();
-            if state.tables.remove(&session_id).is_none() {
-                return;
-            }
-            state.tables.clone()
-        };
-        self.persist(tables);
+    /// Ends the table of the box `session_id`, which is gone, and every grant
+    /// open for it, handing back their withdrawals. A grant whose
+    /// registration is still running ends when it lands
+    /// ([`Self::opened`]).
+    pub fn drop_table(&self, session_id: boxes::SessionId) -> Vec<WithdrawBoxRequest> {
+        let mut withdrawals = Vec::new();
+        self.change_tables(|state| {
+            state
+                .reserved
+                .retain(|_, reserved_for| *reserved_for != session_id);
+            let ended: Vec<String> = state
+                .open
+                .iter()
+                .filter(|(_, grant)| grant.session_id == session_id)
+                .map(|(row, _)| row.clone())
+                .collect();
+            withdrawals = ended
+                .iter()
+                .filter_map(|row| state.open.remove(row))
+                .map(|grant| grant.withdrawal)
+                .collect();
+            state.tables.remove(&session_id).is_some()
+        });
+        withdrawals
     }
 
     /// What the box's table holds for `spec_hash`.
@@ -134,25 +173,42 @@ impl BuildGrants {
         self.lock().tables.get(&session_id)?.get(spec_hash).cloned()
     }
 
-    /// The name of the next grant's row, or `None` at the cap.
+    /// Reserves the next grant's row and names it, or `None` at the cap. The
+    /// reservation counts toward the cap until [`Self::opened`] or
+    /// [`Self::unreserve`] ends it.
     pub(crate) fn next_row(&self, session_id: boxes::SessionId) -> Option<String> {
         let mut state = self.lock();
-        if state.open.len() >= MAX_OPEN_GRANTS {
+        if state.open.len() + state.reserved.len() >= MAX_OPEN_GRANTS {
             return None;
         }
         state.opened += 1;
-        Some(format!("build-{session_id}-{}", state.opened))
+        let row = format!("build-{session_id}-{}", state.opened);
+        state.reserved.insert(row.clone(), session_id);
+        Some(row)
     }
 
-    /// Records a grant that opened, for its deadline and its close.
-    pub(crate) fn opened(&self, withdrawal: WithdrawBoxRequest, deadline: Instant) {
-        self.lock().open.insert(
+    /// Ends the reservation of `row`, whose registration failed.
+    pub(crate) fn unreserve(&self, row: &str) {
+        self.lock().reserved.remove(row);
+    }
+
+    /// Records a grant that opened, for its deadline and its close. Returns
+    /// whether it stands: `false` when its box's table ended while it
+    /// registered, so the caller withdraws it at once.
+    pub(crate) fn opened(&self, withdrawal: WithdrawBoxRequest, deadline: Instant) -> bool {
+        let mut state = self.lock();
+        let Some(session_id) = state.reserved.remove(&withdrawal.name) else {
+            return false;
+        };
+        state.open.insert(
             withdrawal.name.clone(),
             OpenGrant {
+                session_id,
                 deadline,
                 withdrawal,
             },
         );
+        true
     }
 
     /// Ends the grant at the row `grant_row`, handing back its withdrawal. A
@@ -185,6 +241,63 @@ impl BuildGrants {
     pub(crate) fn start_sweep(&self, start: impl FnOnce()) {
         if !self.sweeping.swap(true, Ordering::SeqCst) {
             start();
+        }
+    }
+}
+
+/// Reads the tables persisted at `path`: none when there is no file yet, and
+/// the reason when the file cannot be used.
+fn read_tables_file(
+    path: &std::path::Path,
+) -> Result<BTreeMap<boxes::SessionId, BuildGrantTable>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let file = serde_json_lenient::from_slice::<BuildTablesFile>(&bytes)
+        .map_err(|error| error.to_string())?;
+    if file.version != BUILD_TABLES_FILE_VERSION {
+        return Err(format!(
+            "version {}, this build reads {BUILD_TABLES_FILE_VERSION}",
+            file.version
+        ));
+    }
+    Ok(file.tables)
+}
+
+/// Renames an unusable tables file aside under the `.unusable-<unix seconds>`
+/// suffix an unusable registry file takes, naming `why`, so the first write
+/// does not replace it. Returns whether it was set aside.
+fn set_aside_tables_file(path: &std::path::Path, why: &str) -> bool {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unusable-{stamp}"));
+    let aside = PathBuf::from(aside);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => {
+            tracing::warn!(
+                path = %path.display(),
+                aside = %aside.display(),
+                why,
+                "the persisted build tables are unusable; they are set aside and no table \
+                 reloads, so those boxes' builds follow their own rules"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                why,
+                %error,
+                "the persisted build tables are unusable and could not be set aside; no \
+                 table reloads and none is persisted by this process"
+            );
+            false
         }
     }
 }
@@ -243,33 +356,67 @@ mod tests {
     #[test]
     fn a_grant_ends_at_its_deadline_or_earlier() {
         let grants = BuildGrants::default();
+        let id = boxes::SessionId::mint();
         let now = Instant::now();
         let deadline = grant_deadline(now, false);
         assert_eq!(deadline, now + FETCH_GRANT_DEADLINE);
         assert_eq!(grant_deadline(now, true), now + BUILD_GRANT_DEADLINE);
 
-        grants.opened(withdrawal("build-a-1"), deadline);
+        let first = grants.next_row(id).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&first), deadline));
         assert!(grants.take_expired(now).is_empty());
         let expired = grants.take_expired(deadline);
-        assert_eq!(expired, [withdrawal("build-a-1")]);
+        assert_eq!(expired, [withdrawal(&first)]);
 
-        grants.opened(withdrawal("build-a-2"), deadline);
+        let second = grants.next_row(id).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&second), deadline));
         assert!(grants.take("the-requesters-own-row").is_none());
-        assert_eq!(grants.take("build-a-2"), Some(withdrawal("build-a-2")));
+        assert_eq!(grants.take(&second), Some(withdrawal(&second)));
         assert!(grants.take_expired(deadline).is_empty(), "it already ended");
     }
 
-    /// NET-165: a guest asking in a loop stops at the cap.
+    /// NET-165: a guest asking in a loop stops at the cap, and a row still
+    /// registering counts toward it, so asks that race cannot pass it.
     #[test]
     fn open_grants_stop_at_the_cap() {
         let grants = BuildGrants::default();
         let id = boxes::SessionId::mint();
         let far = Instant::now() + BUILD_GRANT_DEADLINE;
-        for _ in 0..MAX_OPEN_GRANTS {
-            let row = grants.next_row(id).expect("room under the cap");
-            grants.opened(withdrawal(&row), far);
+        let rows: Vec<String> = (0..MAX_OPEN_GRANTS)
+            .map(|_| grants.next_row(id).expect("room under the cap"))
+            .collect();
+        assert!(grants.next_row(id).is_none(), "reservations hold the cap");
+
+        grants.unreserve(&rows[0]);
+        assert!(!grants.opened(withdrawal(&rows[0]), far), "it was released");
+        for row in &rows[1..] {
+            assert!(grants.opened(withdrawal(row), far));
         }
+        let last = grants.next_row(id).expect("the released room");
+        assert!(grants.opened(withdrawal(&last), far));
         assert!(grants.next_row(id).is_none());
+    }
+
+    /// NET-165: a box's table ends with the box, and so does every grant
+    /// open for it, and a grant still registering stands no more. Another
+    /// box's grants stay.
+    #[test]
+    fn a_dropped_table_ends_its_boxs_grants() {
+        let grants = BuildGrants::default();
+        let (id, other) = (boxes::SessionId::mint(), boxes::SessionId::mint());
+        grants.file(id, table("aa", false));
+        let far = Instant::now() + BUILD_GRANT_DEADLINE;
+        let open = grants.next_row(id).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&open), far));
+        let registering = grants.next_row(id).expect("room under the cap");
+        let others = grants.next_row(other).expect("room under the cap");
+        assert!(grants.opened(withdrawal(&others), far));
+
+        assert_eq!(grants.drop_table(id), [withdrawal(&open)]);
+        assert!(grants.lookup(id, "aa").is_none());
+        assert!(!grants.opened(withdrawal(&registering), far));
+        assert!(grants.take(&open).is_none());
+        assert_eq!(grants.take(&others), Some(withdrawal(&others)));
     }
 
     /// NET-165: a box's table survives the VM host daemon.
@@ -287,5 +434,27 @@ mod tests {
                 .lookup(id, "aa")
                 .is_some_and(|grant| grant.internet)
         );
+    }
+
+    /// A tables file that does not parse is set aside, not written over, and
+    /// no table reloads from it.
+    #[test]
+    fn an_unusable_tables_file_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(BUILD_TABLES_FILE);
+        std::fs::write(&path, b"{ not json").unwrap();
+        let id = boxes::SessionId::mint();
+        let grants = BuildGrants::default().persisting_to(path.clone());
+        assert!(grants.lookup(id, "aa").is_none());
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with(&format!("{BUILD_TABLES_FILE}.unusable-")))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+
+        grants.file(id, table("aa", false));
+        let reloaded = BuildGrants::default().persisting_to(path);
+        assert!(reloaded.lookup(id, "aa").is_some());
     }
 }
