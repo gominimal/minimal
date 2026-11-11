@@ -1186,9 +1186,10 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
                         // The box's row is asked back before the attach
                         // (NET-138), and the pair it was registered with is
-                        // read: a Delete at the shell-exit prompt leaves no
-                        // record to read it from after.
-                        let box_addresses = match box_name {
+                        // read, with the box id beside it (#1116): a Delete
+                        // at the shell-exit prompt leaves no record to read
+                        // them from after.
+                        let box_row = match box_name {
                             Some(_) => {
                                 rpc::prepare_attach(&sock, rpc::record_of(p, key.id).await).await
                             }
@@ -1196,8 +1197,8 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         };
                         // A VM host that cannot be reached fails the attach
                         // closed (#1790), with the CLI's message.
-                        let box_addresses = match box_addresses {
-                            Ok(box_addresses) => box_addresses,
+                        let box_row = match box_row {
+                            Ok(box_row) => box_row,
                             Err(error) => {
                                 model.status = Some(format!("error: {error:#}"));
                                 continue;
@@ -1217,13 +1218,8 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         // helper (it carries the lookup timeout the dashboard's
                         // old copy lacked).
                         if let Some(name) = box_name.as_deref() {
-                            crate::release_held_name_after_attach(
-                                &sock,
-                                key.id,
-                                name,
-                                box_addresses,
-                            )
-                            .await;
+                            crate::release_held_name_after_attach(&sock, key.id, name, box_row)
+                                .await;
                         }
                         inbox.push_back(Msg::Tick);
                     }

@@ -1,0 +1,254 @@
+name: stage-release
+
+# One click to stage the next version from the newest release/X.Y.x line. It
+# checks the tip, runs release.yml on the line as a dry run, then runs it for
+# real. A dispatch is the only way in: a release line never builds by itself.
+#
+# release.yml runs by dispatch, not `uses:`. A called workflow would run on
+# this workflow's ref, so it would build main, and the signing runner group
+# admits release.yml only on the branches it lists.
+#
+# See docs/internal/release-pipeline.md.
+on:
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: "Stop after the dry run: stage nothing and use up no version number"
+                type: boolean
+                default: false
+            restage:
+                description: "Replace a staged version that has no smoke record, after a run that failed once it had staged"
+                type: boolean
+                default: false
+
+# One at a time, so two clicks can't race for a version number.
+concurrency:
+    group: stage-release
+    cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+    preflight:
+        # Fails in minutes on what release.yml would only reject late, or on a
+        # number that can't be staged at all. The scripts come from the
+        # dispatch ref and run after the Google Cloud auth, so run only what
+        # main carries; every later job needs this one.
+        if: github.ref == 'refs/heads/main'
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: read
+            checks: read
+            id-token: write
+        outputs:
+            line: ${{ steps.line.outputs.line }}
+            sha: ${{ steps.line.outputs.sha }}
+            version: ${{ steps.version.outputs.version }}
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Pick the newest release line
+              id: line
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  line="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/release/" --paginate --jq '.[].ref' \
+                    | sed 's|^refs/heads/||' | scripts/stage-version.sh --newest-line)"
+                  sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$line" --jq .object.sha)"
+                  echo "newest line: $line at $sha"
+                  {
+                    echo "line=$line"
+                    echo "sha=$sha"
+                  } >> "$GITHUB_OUTPUT"
+            - name: Check out the line
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  ref: ${{ steps.line.outputs.sha }}
+                  path: line
+                  persist-credentials: false
+                  # Full history and tags, for the used versions.
+                  fetch-depth: 0
+                  fetch-tags: true
+            - name: Verify required checks are green on the tip
+              # Same list as release.yml's verify-ci, which only fails the run
+              # after the builds.
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  SHA: ${{ steps.line.outputs.sha }}
+              run: |
+                  set -euo pipefail
+                  required="ci-success ci-linux-native-success ci-linux-kvm-success ci-macos-success ci-shell-installer-success"
+                  runs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs" --paginate \
+                    --jq '.check_runs[] | "\(.name)\t\(.conclusion)"')"
+                  fail=0
+                  for name in $required; do
+                    c="$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1==n {print $2}' | tail -1)"
+                    if [ "$c" != "success" ]; then
+                      echo "::error::required check '$name' is '${c:-missing}' on $SHA (need success)"
+                      fail=1
+                    fi
+                  done
+                  exit "$fail"
+            - name: Authenticate to Google Cloud (read the staged versions)
+              uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+              with:
+                  project_id: "524228262772"
+                  workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Check the tip against the computed version
+              id: version
+              env:
+                  LINE: ${{ steps.line.outputs.line }}
+                  RESTAGE: ${{ inputs.restage }}
+              run: |
+                  set -euo pipefail
+                  version="$(sed -n 's/^package\.version[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' line/Cargo.toml | head -n 1)"
+                  [ -n "$version" ] || { echo "::error::could not read package.version from $LINE"; exit 1; }
+                  row() { sed -n 's|.*/versions/\([^/]*\)/[a-z]*$|\1|p'; }
+                  # Plain assignments, so a failed listing stops the job.
+                  staged="$(gcloud storage ls 'gs://minimal-one/versions/*/components')"
+                  smoked="$(gcloud storage ls 'gs://minimal-one/versions/*/smoked')"
+                  {
+                    git -C line tag -l 'v[0-9]*' | sed 's/^v//'
+                    printf '%s\n' "$staged" | row
+                  } > "$RUNNER_TEMP/used"
+                  printf '%s\n' "$smoked" | row > "$RUNNER_TEMP/smoked"
+                  args=(--check --line "$LINE" --version "$version" --used "$RUNNER_TEMP/used")
+                  [ "$RESTAGE" != "true" ] || args+=(--restage --smoked "$RUNNER_TEMP/smoked")
+                  scripts/stage-version.sh "${args[@]}"
+                  echo "version=$version" >> "$GITHUB_OUTPUT"
+                  echo "Staging \`$version\` from \`$LINE\`" >> "$GITHUB_STEP_SUMMARY"
+
+    check-line:
+        # The line's own next-version.sh, as release.yml's assert-version runs
+        # it. A job of its own, without id-token, so the line's code never runs
+        # where it could get Google Cloud credentials.
+        needs: preflight
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: read
+        steps:
+            - name: Check out the line
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  ref: ${{ needs.preflight.outputs.sha }}
+                  persist-credentials: false
+                  # Full history and tags, for --check.
+                  fetch-depth: 0
+                  fetch-tags: true
+            - name: Check the version against the commits
+              run: scripts/next-version.sh --check
+
+    dry-run:
+        needs: [preflight, check-line]
+        runs-on: ubuntu-latest
+        # Far above a normal run, for a wait on the one signing runner. Hitting
+        # it stops the watching, not release.yml.
+        timeout-minutes: 300
+        permissions:
+            actions: write
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Run release.yml as a dry run
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  LINE: ${{ needs.preflight.outputs.line }}
+                  SHA: ${{ needs.preflight.outputs.sha }}
+              run: scripts/dispatch-release.sh --line "$LINE" --sha "$SHA" --dry-run true
+
+    stage:
+        needs: [preflight, dry-run]
+        if: ${{ !inputs.dry_run }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 300
+        permissions:
+            actions: write
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Stage with release.yml
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  LINE: ${{ needs.preflight.outputs.line }}
+                  SHA: ${{ needs.preflight.outputs.sha }}
+                  RESTAGE: ${{ inputs.restage }}
+              run: scripts/dispatch-release.sh --line "$LINE" --sha "$SHA" --dry-run false --restage "$RESTAGE"
+            - name: Summarize
+              env:
+                  VERSION: ${{ needs.preflight.outputs.version }}
+              run: echo "Staged \`$VERSION\`. Install it with \`install.sh --version $VERSION\`." >> "$GITHUB_STEP_SUMMARY"
+
+    notify:
+        # Tell #releases how the run ended, through gominimal/release-ops. Runs
+        # after every other job, also when one failed. A preflight that failed
+        # before it read the version still reports, with an empty version. A
+        # skipped preflight (dispatched off main) ran nothing to report, and a
+        # dry run is someone watching already.
+        needs: [preflight, check-line, dry-run, stage]
+        if: ${{ always() && !inputs.dry_run && needs.preflight.result != 'skipped' }}
+        # The minimal-backporter key lives in the `release` environment, which
+        # only main and release/* can deploy to.
+        environment: release
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions:
+            contents: read # check out the local release-event action
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Work out the outcome
+              id: result
+              env:
+                  PREFLIGHT: ${{ needs.preflight.result }}
+                  CHECK_LINE: ${{ needs.check-line.result }}
+                  DRY_RUN: ${{ needs.dry-run.result }}
+                  STAGE: ${{ needs.stage.result }}
+              run: |
+                  set -euo pipefail
+                  outcome=success
+                  detail=""
+                  # In run order, so the detail names the job that stopped the
+                  # run; later jobs are only skipped behind it.
+                  for job in "preflight:$PREFLIGHT" "check-line:$CHECK_LINE" "dry-run:$DRY_RUN" "stage:$STAGE"; do
+                    case "${job#*:}" in
+                      failure) outcome=failure; detail="${job%%:*}"; break ;;
+                      cancelled) outcome=cancelled; detail="${job%%:*}"; break ;;
+                    esac
+                  done
+                  {
+                    echo "outcome=$outcome"
+                    echo "detail=$detail"
+                  } >> "$GITHUB_OUTPUT"
+            # Same as promote.yml's report-release: contents:write is what
+            # POST /repos/{owner}/{repo}/dispatches needs, and nothing else.
+            # continue-on-error, so a missing Slack post never turns the run red.
+            - name: Mint release-ops token (minimal-backporter)
+              id: ops-token
+              continue-on-error: true
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              with:
+                  app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: release-ops
+                  permission-contents: write
+            - name: Send the stage event
+              uses: ./.github/actions/release-event
+              with:
+                  token: ${{ steps.ops-token.outputs.token }}
+                  event: stage
+                  outcome: ${{ steps.result.outputs.outcome }}
+                  version: ${{ needs.preflight.outputs.version }}
+                  line: ${{ needs.preflight.outputs.line }}
+                  sha: ${{ needs.preflight.outputs.sha }}
+                  actor: ${{ github.triggering_actor }}
+                  detail: ${{ steps.result.outputs.detail }}

@@ -194,6 +194,12 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
   the developer to allow-list the project in their
   [user policy](./user-policy.md) before they will run — a hook is arbitrary
   code, so the developer must opt in.
+- **`hooks_on_resume`**: Set `hooks_on_resume = true` to run the
+  `on_activate` hooks again each time a stopped or exited session resumes.
+  They run before the `on_attach` hooks of the attach that resumes it. If an
+  `on_activate` hook fails, the session does not resume and stays stopped or
+  exited. The error names the hook's source and its exit status. Without the
+  key, a resume runs only the `on_attach` hooks.
 
 The field shapes and composition semantics (conflicts, policy gating) are the
 same as loadouts; see the [loadout reference](./loadouts.md) for the exact
@@ -216,9 +222,9 @@ disagree about everything else:
 
 Two things narrow the task row. An `echo` task never builds an environment,
 so it never reads — or fails over — an `env_vars` declaration. And
-`min run <task>` from inside a session, along with
-`min session run <session> <task>`, resolves `inherit` against the daemon's
-environment rather than your shell. Both are covered in
+`min run <task>` from inside a session resolves `inherit` against the
+daemon's environment rather than your shell; `min session run` resolves it
+against your shell, as `min task run` does. Both are covered in
 [Tasks](./tasks.md#env_vars).
 
 
@@ -230,6 +236,10 @@ See: [tasks](./tasks.md).
 A task cannot set `interactive = true`. A file with such a task fails to load
 with exit code 3, and the error names the `[sessions.<name>]` entry to
 declare instead. Interactive work belongs in a session.
+
+A task entry takes `hooks_on_resume = true` too, with the same meaning as
+[the `[defaults.session]` key](#session). Only a box with a terminal
+resumes, so the key changes nothing for a task that runs without one.
 
 ### Entry tables {#entries}
 
@@ -253,6 +263,41 @@ An entry writes its settings as flat keys, such as `timeout`, `pty_enabled`,
 `on_oom`, and the `[machine]` table. `packages`, `patches`, `vars`, and
 `lifecycle_hooks` mean the same in an entry as in
 [`[defaults.session]`](#session).
+
+#### `timeout` - How long a box runs {#timeout}
+
+`timeout` sets how long a box can run. Set it in `[defaults.session]`, in
+the legacy `[session]` table, or in a task's `[tasks.<name>]` table:
+
+```toml
+[defaults.session]
+timeout = "8h"
+
+[tasks.lint]
+exec = ["cargo", "clippy"]
+timeout = 90
+```
+
+The value is one of these forms:
+
+- A whole number of seconds, such as `90`.
+- A string of a whole number followed by `s`, `m` or `h`, such as `"30s"`,
+  `"5m"` or `"1h"`.
+
+A timeout of zero, in any unit, means no timeout. Any other value fails the
+load with exit code 3, and the error names the key and the entry.
+
+The clock starts each time the box's first process starts, so a resumed
+box gets its full timeout again. When a session or a task box runs past its
+timeout, every process in the box gets SIGTERM, including processes that
+`min box exec` started. Processes that still run after a grace period of 10
+seconds get SIGKILL. The box then ends as `exited` with the reason
+`timeout`, and keeps its files and its record until you remove it. A box
+that you stop before its timeout ends as `stopped`.
+
+A `min task run` whose task runs past its timeout exits with code 124. It
+prints a line on stderr that says the task ran past its timeout. A task
+that exits with code 124 by itself gets no such line.
 
 
 

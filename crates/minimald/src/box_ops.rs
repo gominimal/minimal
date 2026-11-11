@@ -395,7 +395,8 @@ enum Op {
 /// Where a box's package builds run (NET-155): the box they run for, and
 /// its classifier leaf or its own network. A host-address box placed in a
 /// leaf builds in that leaf. An own-address box has no leaf, and its builds
-/// attach to a network of its own. A box with neither has no per-box egress
+/// attach to a network of its own. A box with no network has a network that
+/// gives its builds none. A box with neither has no per-box egress
 /// enforcement, and its builds run in the daemon's own cgroup.
 #[derive(Debug, Clone)]
 pub(crate) struct BuildPlacement {
@@ -403,7 +404,7 @@ pub(crate) struct BuildPlacement {
     pub box_name: String,
     /// The box's classifier leaf, if its launch placed it in one.
     pub leaf: Option<sandbox::config::ClassifierLeaf>,
-    /// The own-address box's network, which its builds attach to.
+    /// The box's own network, which its builds attach to.
     pub network: Option<op::BuildNetwork>,
 }
 
@@ -495,11 +496,14 @@ impl BuildTap {
 
     /// The error to report for a failed build. A build the box's egress
     /// rules refused names the destination and the box before the build's
-    /// own error. Any other failure is the build's own error, unchanged.
+    /// own error. A build that could not connect to a source names the host
+    /// and the reason. Any other failure is the build's own error, unchanged.
     pub(crate) fn failure(&self, placement: &BuildPlacement, failure: String) -> String {
         match self.refusal(placement, &failure) {
             Some(refusal) => format!("{refusal}\n{failure}"),
-            None => failure,
+            None => {
+                crate::env::unreachable_source(&failure, &placement.box_name).unwrap_or(failure)
+            }
         }
     }
 }

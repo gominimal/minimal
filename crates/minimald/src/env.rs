@@ -532,9 +532,29 @@ impl Env {
                      with no per-box egress enforcement, because the box has none",
                 ),
             }
-            ctx.build_graph(&graph, false, None)
+            // NET-155: a build the box's egress rules refused names the
+            // destination and the box before the build's own error, as the
+            // build side operation's does. The launch knows the box's name.
+            let placement = crate::box_ops::BuildPlacement {
+                box_name: args.name.clone(),
+                leaf: ctx.classifier_leaf().cloned(),
+                network: ctx.box_network().cloned(),
+            };
+            let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
+            // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to
+            // a string in the same poll it appears, so `join!` never holds it.
+            let build = async {
+                match ctx.build_graph(&graph, false, Some(log_tx)).await {
+                    Ok(()) => None,
+                    Err(e) => Some(e.to_string()),
+                }
+            };
+            // The tap names the box for a refused source, and the package
+            // and the host for one it could not connect to
+            // (`BuildTap::failure`); the error is taken as it hands it back.
+            tapped_build(build, log_rx, &placement)
                 .await
-                .map_err(err_to_io)?;
+                .map_err(std::io::Error::other)?;
         }
 
         // Collect the package-derived wiring and merge caller-supplied
@@ -1504,12 +1524,36 @@ struct BoxChannel {
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
-/// The span one helper request is handled in, and the request with its
-/// trace prefix removed.
+/// What a helper request's trace hands a task the request runs (TEL-023,
+/// TEL-045), as [`channel_request_span`] decides it from the request's
+/// prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskTrace {
+    /// The helper opted out (the `otel%off%` prefix): the request's span is
+    /// recorded nowhere, and the task gets `MINIMAL_OTEL=off` and no
+    /// `TRACEPARENT`.
+    OptedOut,
+    /// The `TRACEPARENT` the task may be given: the request span's own
+    /// context, only when the helper sent a context for the span to join and
+    /// the span is recorded ([`crate::exec::box_traceparent`], TEL-024).
+    Parent(Option<String>),
+}
+
+/// The prefix name of a request whose helper opted out of telemetry:
+/// `otel%off%<method>%<data>`. Its one meaningful value is
+/// [`minimald_rpc::trace::OTEL_OFF`]; any other is ignored, as
+/// [`minimald_rpc::trace::opted_out`] ignores it.
+const OTEL_PREFIX: &str = "otel";
+
+/// The span one helper request is handled in, the request with its prefix
+/// removed, and what the request's trace hands a task it runs
+/// ([`TaskTrace`]).
 ///
 /// The helper (`env_min_helper.sh`, `__min_rpc`) sends
-/// `traceparent%<w3c traceparent>%<method>%<data>` when the box has a
-/// `TRACEPARENT` — the exec span's context, handed to the box by
+/// `otel%off%<method>%<data>` when the box has `MINIMAL_OTEL=off` (the
+/// marker [`crate::exec`] hands the box of a request that opted out,
+/// TEL-045), else `traceparent%<w3c traceparent>%<method>%<data>` when the
+/// box has a `TRACEPARENT` — the exec span's context, handed to the box by
 /// [`crate::exec`] — and the bare `<method>%<data>` otherwise. The actor runs
 /// for the env's life under its own `session.env` root, so without this a
 /// request's mailbox messages (`StartMaterialize`, `ExposeDynamic`) and the
@@ -1517,25 +1561,38 @@ struct BoxChannel {
 /// (scenarios 717b and 770). Here the request gets a root of its own that
 /// adopts the forwarded context ([`crate::exec::adopt_trace`] records the
 /// ids and `remember`s them for [`crate::traced::caller_context`]), so the
-/// messages sent while handling it join the exec that ran the helper.
+/// messages sent while handling it join the exec that ran the helper. An
+/// opted-out request's root is made non-recording instead
+/// ([`crate::exec::adopt_opt_out`]): it parents nothing, is exported and
+/// spooled nowhere, and neither is anything under it.
+///
+/// A task gets a `TRACEPARENT` only from a request that carried one: a bare
+/// request (an older helper's, or one from a box handed no `TRACEPARENT`)
+/// mints a root for the daemon's own work, and handing a task that root
+/// would start a trace the caller never asked for.
 ///
 /// `box_id` and `session_id` are the host's own knowledge of who is asking
 /// (the channel was built for that box, by that session): they go on the
 /// span as `box.id` and `session.id`, and nothing the box sends can set
-/// them. The box-supplied part of the line (the traceparent) only parents
-/// the span, and the method is recorded as one of [`CHANNEL_METHODS`] or
-/// `other` ([`channel_method`]), never as the text the box sent.
+/// them. The box-supplied part of the line (the prefix) only parents or
+/// opts out the span, and the method is recorded as one of
+/// [`CHANNEL_METHODS`] or `other` ([`channel_method`]), never as the text
+/// the box sent.
 fn channel_request_span<'a>(
     line: &'a str,
     box_id: &str,
     session_id: Option<boxes::SessionId>,
-) -> (tracing::Span, &'a str) {
-    let (traceparent, request) = match line.split_once('%') {
+) -> (tracing::Span, &'a str, TaskTrace) {
+    let (traceparent, opted_out, request) = match line.split_once('%') {
         Some(("traceparent", rest)) => match rest.split_once('%') {
-            Some((tp, request)) => (Some(tp), request),
-            None => (None, rest),
+            Some((tp, request)) => (Some(tp), false, request),
+            None => (None, false, rest),
         },
-        _ => (None, line),
+        Some((OTEL_PREFIX, rest)) => match rest.split_once('%') {
+            Some((value, request)) => (None, value == minimald_rpc::trace::OTEL_OFF, request),
+            None => (None, false, rest),
+        },
+        _ => (None, false, line),
     };
     let method = channel_method(request);
     let span = tracing::info_span!(
@@ -1544,13 +1601,30 @@ fn channel_request_span<'a>(
         method,
         box.id = box_id,
         session.id = session_id.as_ref().map(tracing::field::display),
+        telemetry = tracing::field::Empty,
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
     );
+    if opted_out {
+        crate::exec::adopt_opt_out(&span);
+        return (span, request, TaskTrace::OptedOut);
+    }
     let client_ctx = traceparent.and_then(minimald_rpc::trace::TraceContext::parse_traceparent);
-    crate::exec::adopt_trace(&span, client_ctx);
-    (span, request)
+    let sent = client_ctx.is_some();
+    let adopted = crate::exec::adopt_trace(&span, client_ctx);
+    let traceparent = task_traceparent(sent, crate::exec::box_traceparent(&adopted));
+    (span, request, TaskTrace::Parent(traceparent))
+}
+
+/// The `TRACEPARENT` the task of a request that did not opt out is given:
+/// the request span's context when that span is recorded (`recorded`), and
+/// only when the helper `sent` a context for the span to join. A bare
+/// request's span is a root the daemon minted for its own work; the box
+/// that sent it was handed no `TRACEPARENT` (TEL-024), or its helper
+/// predates the prefix, and its task gets none either.
+fn task_traceparent(sent: bool, recorded: Option<String>) -> Option<String> {
+    recorded.filter(|_| sent)
 }
 
 /// The methods [`BoxChannel::handle`] dispatches: the only values the
@@ -1604,15 +1678,16 @@ impl BoxChannel {
             mut stream,
         }) = self.rx.recv().await
         {
-            tracing::trace!("session channel handling: {}", loggable_request(&line));
-            let (span, line) = channel_request_span(&line, &self.box_id, self.session_id);
+            let (span, request, trace) = channel_request_span(&line, &self.box_id, self.session_id);
+            // An opted-out request keeps its command line out of the records
+            // (TEL-045), the file log's included.
+            if trace != TaskTrace::OptedOut {
+                tracing::trace!("session channel handling: {}", loggable_request(&line));
+            }
             // Boxed: the handler's future is large (every subcommand's state in
             // one `async fn`) and it is awaited once per request, not per byte.
-            tracing::Instrument::instrument(
-                Box::pin(self.handle_raw(line, raw.as_deref(), &mut stream)),
-                span,
-            )
-            .await;
+            let handled = self.handle_raw(request, raw.as_deref(), trace, &mut stream);
+            tracing::Instrument::instrument(Box::pin(handled), span).await;
             // `stream` is dropped here, closing the connection so the client's
             // `socat` reads EOF and the `min` helper's read loop terminates.
         }
@@ -1621,12 +1696,21 @@ impl BoxChannel {
     /// Dispatches a single valid `method%data` request line.
     #[cfg(test)]
     async fn handle(&mut self, line: &str, stream: &mut UnixStream) {
-        self.handle_raw(line, None, stream).await;
+        self.handle_raw(line, None, TaskTrace::Parent(None), stream)
+            .await;
     }
 
     /// Dispatches a single `method%data` request line. `raw` is the line as
-    /// the box sent it when `line` is its lossy decode.
-    async fn handle_raw(&mut self, line: &str, raw: Option<&[u8]>, stream: &mut UnixStream) {
+    /// the box sent it when `line` is its lossy decode. `trace` is what the
+    /// request's trace hands a task the request runs
+    /// ([`channel_request_span`]).
+    async fn handle_raw(
+        &mut self,
+        line: &str,
+        raw: Option<&[u8]>,
+        trace: TaskTrace,
+        stream: &mut UnixStream,
+    ) {
         let add_dep = match line.split_once('%') {
             Some(("add-transient", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
@@ -1685,7 +1769,7 @@ impl BoxChannel {
                 if let Some(data) = raw.and_then(run_data_bytes) {
                     request.mark_invalid_bytes(data);
                 }
-                self.run_task(stream, request).await;
+                self.run_task(stream, request, trace).await;
                 None
             }
             Some(("build", args)) => {
@@ -1826,6 +1910,7 @@ impl BoxChannel {
             });
         let (build_err, ()) = tokio::join!(build, render);
         if let Some(e) = build_err {
+            let e = unreachable_source(&e, &self.name).unwrap_or(e);
             let _ = writeln!(stream, "error: {e}");
             return;
         }
@@ -1908,10 +1993,9 @@ impl BoxChannel {
     /// leave from (where it stands in one), the host the daemon fetches the
     /// configured remote cache from, and each package in the install's scope
     /// spelled the way `min search` spells it, with its upstream version
-    /// when the graph knows one. It also says whether the install's web
-    /// sources are fetched in the box's classifier leaf (NET-155). Those are
-    /// the box's traffic and are not recorded. A `gs://` source, and a web
-    /// source of a box with no leaf, leave from the daemon and are recorded.
+    /// when the graph knows one. A source a package declares is a package
+    /// build's traffic (NET-155), never the node plane's, so the record
+    /// does not list it.
     fn fetch_record(
         &self,
         graph: &Graph,
@@ -1940,9 +2024,6 @@ impl BoxChannel {
                 &self.ctx.daemon_context().config().remote_cache_url(),
             ),
             objects,
-            // NET-155: the install's web sources are fetched in the box's
-            // leaf when it has one, so they are the box's traffic.
-            sources_placed: self.ctx.classifier_leaf().is_some(),
         }
     }
 
@@ -2126,13 +2207,19 @@ impl BoxChannel {
             let lines = tapped
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(refusal) = patched_build_refusal(
+            let failure = e.to_string();
+            let refusal = patched_build_refusal(
                 build_denies_all(self.classifier_leaf.as_ref(), box_network.as_ref()),
                 pkg_name,
                 &self.name,
-                &e.to_string(),
+                &failure,
                 lines.iter().map(String::as_str),
-            ) {
+            )
+            .or_else(|| {
+                let text = failure.strip_prefix("other: ")?;
+                source_failure(pkg_name, &self.name, text)
+            });
+            if let Some(refusal) = refusal {
                 let _ = writeln!(stream, "error: {refusal}");
             }
             let _ = writeln!(stream, "error: {e}");
@@ -2152,7 +2239,14 @@ impl BoxChannel {
     /// Implements `min task run <task> [args...]`: runs the task and, for a
     /// helper that sends its argv, relays the task's exit code as `exit:<n>`
     /// so the helper exits with it. A task box's entrypoint is that helper.
-    async fn run_task(&mut self, stream: &mut UnixStream, request: TaskRunRequest) {
+    /// `trace` is what the request's trace hands the task
+    /// ([`run_task_trace`]).
+    async fn run_task(
+        &mut self,
+        stream: &mut UnixStream,
+        request: TaskRunRequest,
+        trace: TaskTrace,
+    ) {
         let task_name = request.task.as_str();
         let relays = request.relays_exit();
         // BCLI-010 (T62): a relaying helper prints `err:` lines on stderr,
@@ -2216,6 +2310,7 @@ impl BoxChannel {
             let _ = writeln!(stream, "{}", inherit_refusal(task_name, &name));
             return relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
         }
+        run_task_trace(&mut task.vars, mlog::otel::exporting(), trace, &request.env);
         let start_dir = match start_dir_in_box(
             task.inherit_cwd,
             request.cwd.as_deref(),
@@ -3136,14 +3231,15 @@ impl TaskRunRequest {
 }
 
 /// The data after `run%` in a raw request line, past an optional
-/// `traceparent%<id>%` prefix. `None` when the line is not a `run` request.
+/// `traceparent%<id>%` or `otel%<value>%` prefix ([`channel_request_span`]).
+/// `None` when the line is not a `run` request.
 fn run_data_bytes(raw: &[u8]) -> Option<&[u8]> {
     fn split_pct(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
         let at = bytes.iter().position(|b| *b == b'%')?;
         Some((&bytes[..at], &bytes[at + 1..]))
     }
     let (mut method, mut rest) = split_pct(raw)?;
-    if method == b"traceparent" {
+    if method == b"traceparent" || method == OTEL_PREFIX.as_bytes() {
         (_, rest) = split_pct(rest)?;
         (method, rest) = split_pct(rest)?;
     }
@@ -3195,7 +3291,7 @@ fn unescape_run_item(item: &str) -> String {
 /// `text` with each control character escaped (`\n`, `\r`, `\u{1b}`), for
 /// a name or a path that the channel echoes. A newline in it would start a
 /// protocol line of its own, such as `exit:0`.
-fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.chars().any(char::is_control) {
         return text.into();
     }
@@ -3230,6 +3326,38 @@ fn run_task_vars(
         inherit_from_caller(vars, &request.env, &request.invalid_env)?;
     }
     Ok(())
+}
+
+/// Adds the trace variables to an in-box run's task variables (TEL-023), as
+/// the sandboxed task path adds them (`minimald_rpc::taskenv::with_trace`).
+/// Since T43 a task box's entrypoint is the in-box `min task run`: the
+/// exec's `TRACEPARENT` reaches that helper, and the helper hands it on as
+/// the request's trace prefix, but the task runs in a sandbox of its own
+/// whose variables are the task's alone. Without this the task got no
+/// `TRACEPARENT`, and a `min` it ran started a trace of its own.
+///
+/// `trace` is what the request's trace hands the task
+/// ([`channel_request_span`]): the request span's context, so the task's
+/// work is a child of the span that served it, or the opt-out. A helper
+/// that opted out (`MINIMAL_OTEL=off`, TEL-045) sends the opt-out on the
+/// request itself, so its task gets the marker and no `TRACEPARENT`.
+/// `caller` is the helper's exported environment; its marker opts the task
+/// out too. With `telemetry_on` false nothing but the marker is added, as
+/// [`minimald_rpc::taskenv::trace_env`] decides on the exec path.
+fn run_task_trace(
+    vars: &mut BTreeMap<String, EnvVarValue>,
+    telemetry_on: bool,
+    trace: TaskTrace,
+    caller: &BTreeMap<String, String>,
+) {
+    let (traceparent, opted_out) = match trace {
+        TaskTrace::OptedOut => (None, true),
+        TaskTrace::Parent(traceparent) => (traceparent, minimald_rpc::trace::opted_out(caller)),
+    };
+    let trace = minimald_rpc::taskenv::trace_env(telemetry_on, traceparent, opted_out);
+    for (name, value) in trace {
+        vars.insert(name, EnvVarValue::Value(value));
+    }
 }
 
 /// Gives each `inherit` variable of a task the caller's value. The daemon's
@@ -3411,10 +3539,7 @@ async fn run_invocations_in(
         cmd.stderr(hakoniwa::Stdio::MakePipe);
         let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
             .map_err(|e| Error::Other(anyhow::anyhow!("spawn failed: {e}")))?;
-        let guard = match planned
-            .attach(sandbox::Spawned::from_child(&mut child))
-            .await
-        {
+        let guard = match planned.attach_child(&mut child).await {
             Ok(guard) => guard,
             Err(e) => {
                 let _ = child.kill();
@@ -3443,7 +3568,9 @@ async fn run_invocations_in(
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    guard.teardown().await;
+                    if let Some(guard) = guard {
+                        guard.teardown().await;
+                    }
                     return Err(forwarded_stdin_error(&e));
                 }
             }
@@ -3464,7 +3591,9 @@ async fn run_invocations_in(
         if let Some(Some(forwarded)) = stdin.as_deref() {
             forwarded.task_ended();
         }
-        guard.teardown().await;
+        if let Some(guard) = guard {
+            guard.teardown().await;
+        }
         drop(container);
         let status = status
             .map_err(|e| Error::Other(anyhow::anyhow!("waiting for the task failed: {e}")))?
@@ -3775,6 +3904,43 @@ const WEB_SOURCE_FAILURE: &str = "could not fetch the source ";
 /// followed by the host and the port.
 const WEB_SOURCE_CONNECT_FAILURE: &str = "could not connect to ";
 
+/// The error line for a package build of the box `box_name` that could not
+/// connect to a source, or that needs a network the box does not have
+/// (NET-155), or `None` for any other failure. `failure` is the build's own
+/// error: its package, then the download's text, whose reason the line keeps.
+pub(crate) fn unreachable_source(failure: &str, box_name: &str) -> Option<String> {
+    let (head, rest) = failure.split_once("` failed to build: ")?;
+    let (_, package) = head.rsplit_once('`')?;
+    source_failure(package, box_name, rest.strip_prefix("other: ")?)
+}
+
+/// [`unreachable_source`], for a package already named. `text` is the error
+/// of the build, after its kind. A refusal by the box's rules, or by its
+/// having no network, gives the next step. Any other reason is the
+/// download's own.
+pub(crate) fn source_failure(package: &str, box_name: &str, text: &str) -> Option<String> {
+    if text.lines().next() == Some(op::NEEDS_NETWORK) {
+        return Some(format!(
+            "the build of {package} needs the network, and box {box_name} has none. \
+             To build it, activate a new session with --network host_ip"
+        ));
+    }
+    let connect = text.strip_prefix(WEB_SOURCE_CONNECT_FAILURE)?;
+    let host = connect_host(connect)?;
+    let (_, why) = connect.lines().next()?.split_once(": ")?;
+    let why = match why {
+        common::RULES_REFUSE => egress_rules_refuse(box_name, Some(&host)),
+        common::NO_NETWORK => match egress_remedy(&host) {
+            Some(remedy) => format!("box {box_name} has no network. {remedy}"),
+            None => format!("box {box_name} has no network"),
+        },
+        why => why.to_string(),
+    };
+    Some(format!(
+        "the build of {package} could not reach {host}: {why}"
+    ))
+}
+
 /// The host in the `<host>:<port>: <error>` text that follows
 /// [`WEB_SOURCE_CONNECT_FAILURE`], without the port. `None` when the text
 /// names no host and port.
@@ -3830,14 +3996,45 @@ pub(crate) fn patched_build_refusal<'a>(
 ) -> Option<String> {
     let lines: Vec<&str> = lines.into_iter().collect();
     let destination = refused_destination(lines.iter().copied())?;
-    let host = destination
-        .rsplit_once(':')
-        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        .map_or(destination.as_str(), |(h, _)| h);
-    if !failure.contains(host) {
+    if !failure.contains(destination_host(&destination)) {
         return None;
     }
     egress_refusal(denies_all, package, box_name, lines)
+}
+
+/// A destination [`refused_destination`] read, without its port.
+fn destination_host(destination: &str) -> &str {
+    destination
+        .rsplit_once(':')
+        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .map_or(destination, |(h, _)| h)
+}
+
+/// The next step that lets a box's builds reach `host`, or `None` when `host`
+/// is no name `--allow-dns-hosts` can admit. The step names `--network
+/// own_ip` because a box on the default network refuses that flag at create
+/// (`classifier::unenforceable_rules`). It also names the `minimal.toml` key
+/// that does what the flag does: `min` reads `network.egress` under
+/// `[defaults]` into a new session's rules (NET-060). The file sets no
+/// network mode, so that step still names `--network own_ip`.
+fn egress_remedy(host: &str) -> Option<String> {
+    (boxes::is_valid_dns_host(host) && host.parse::<std::net::Ipv4Addr>().is_err()).then(|| {
+        format!(
+            "To allow it, activate a new session with --network own_ip --allow-dns-hosts {host}. \
+             Or add {host} to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip"
+        )
+    })
+}
+
+/// Why a box's egress rules refused a build, with the next step when `host`
+/// has one.
+fn egress_rules_refuse(box_name: &str, host: Option<&str>) -> String {
+    let refused = format!("the egress rules of box {box_name} do not allow it");
+    match host.and_then(egress_remedy) {
+        Some(remedy) => format!("{refused}. {remedy}"),
+        None => refused,
+    }
 }
 
 /// The error line for a package build that the egress rules of its box
@@ -3855,7 +4052,12 @@ pub(crate) fn egress_refusal<'a>(
     if !denies_all {
         return None;
     }
-    let destination = refused_destination(lines)?;
+    let lines: Vec<&str> = lines.into_iter().collect();
+    let line = lines
+        .into_iter()
+        .rev()
+        .find(|line| refused_destination([*line]).is_some())?;
+    let destination = refused_destination([line])?;
     // Box-zone names are not subject to egress rules, so a failure to
     // resolve or reach one is not a refusal by the box's rules.
     let host = destination
@@ -3867,15 +4069,176 @@ pub(crate) fn egress_refusal<'a>(
     if host == zone_apex || host.ends_with(&format!(".{zone_apex}")) {
         return None;
     }
+    let reason = egress_rules_refuse(box_name, Some(destination_host(&destination)));
     Some(format!(
-        "the build of {package} could not reach {destination}: \
-         the egress rules of box {box_name} do not allow it"
+        "the build of {package} could not reach {destination}: {reason}"
     ))
+}
+
+/// Runs `build`, a box's package builds, while it reads the events they
+/// send on `log_rx`, and returns the error to report when they fail
+/// (NET-155). A build the box's egress rules refused names the destination
+/// and the box before the build's own error. Any other failure is the
+/// build's own error, unchanged. `build` resolves to the build's error, if
+/// any, and drops the events' sender when it ends.
+pub(crate) async fn tapped_build(
+    build: impl std::future::Future<Output = Option<String>>,
+    mut log_rx: futures::channel::mpsc::UnboundedReceiver<orchestrator::BuildEvent>,
+    placement: &crate::box_ops::BuildPlacement,
+) -> Result<(), String> {
+    use futures::StreamExt as _;
+    let tap = async {
+        let mut tap = crate::box_ops::BuildTap::default();
+        while let Some(event) = log_rx.next().await {
+            tap.observe(&event, placement);
+        }
+        tap
+    };
+    let (failure, tap) = tokio::join!(build, tap);
+    match failure {
+        None => Ok(()),
+        Some(failure) => Err(tap.failure(placement, failure)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-155: a build whose source download could not connect reports the
+    /// package, the host and the reason, in the words of the user-facing
+    /// line. Any other failure is left as the build reported it.
+    #[test]
+    fn unreachable_source_names_the_package_and_the_host() {
+        assert_eq!(
+            unreachable_source(
+                "session spawn: `claude-code` failed to build: other: could not connect to \
+                     storage.googleapis.com:443: no answer after 15s",
+                "x"
+            )
+            .as_deref(),
+            Some(
+                "the build of claude-code could not reach storage.googleapis.com: no answer after 15s"
+            )
+        );
+        assert_eq!(
+            unreachable_source(
+                "`zsh` failed to build: other: could not connect to objects.example.net:443: \
+                     Connection refused (os error 111)\nsecond line",
+                "x"
+            )
+            .as_deref(),
+            Some(
+                "the build of zsh could not reach objects.example.net: \
+                     Connection refused (os error 111)"
+            )
+        );
+        assert_eq!(
+            unreachable_source(
+                "`foo` failed to build: other: could not connect to sources.example.com:443: \
+                     the egress rules do not allow this host",
+                "x"
+            )
+            .as_deref(),
+            Some(
+                "the build of foo could not reach sources.example.com: \
+                     the egress rules of box x do not allow it. \
+                     To allow it, activate a new session with \
+                     --network own_ip --allow-dns-hosts sources.example.com. \
+                     Or add sources.example.com to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                     then activate a new session with --network own_ip"
+            )
+        );
+        assert_eq!(
+            unreachable_source(
+                "`foo` failed to build: other: could not connect to sources.example.com:443: \
+                     the box has no network",
+                "x"
+            )
+            .as_deref(),
+            Some(
+                "the build of foo could not reach sources.example.com: \
+                     box x has no network. \
+                     To allow it, activate a new session with \
+                     --network own_ip --allow-dns-hosts sources.example.com. \
+                     Or add sources.example.com to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                     then activate a new session with --network own_ip"
+            )
+        );
+        assert_eq!(
+            unreachable_source(
+                "`foo` failed to build: other: the build needs the network and the box has none",
+                "x"
+            )
+            .as_deref(),
+            Some(
+                "the build of foo needs the network, and box x has none. \
+                     To build it, activate a new session with --network host_ip"
+            )
+        );
+        for other in [
+            "`foo` failed to build: other: hash mismatch",
+            "`foo` failed to build: exit status 1: could not connect to a.example:443: no",
+            "could not connect to a.example:443: no",
+        ] {
+            assert_eq!(unreachable_source(other, "x"), None, "{other}");
+        }
+    }
+
+    /// A refusal gives a next step only where the step would work: a host
+    /// name that a build's own connection or its source fetch named, without
+    /// its port, and not a literal address.
+    #[test]
+    fn a_refusal_gives_a_next_step_only_where_it_works() {
+        let refused = |line: &str| egress_refusal(true, "foo", "x", [line]).unwrap();
+        let with_step = |destination: &str, host: &str| {
+            format!(
+                "the build of foo could not reach {destination}: \
+                 the egress rules of box x do not allow it. \
+                 To allow it, activate a new session with \
+                 --network own_ip --allow-dns-hosts {host}. \
+                 Or add {host} to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                 then activate a new session with --network own_ip"
+            )
+        };
+        let without_step = |destination: &str| {
+            format!(
+                "the build of foo could not reach {destination}: \
+                 the egress rules of box x do not allow it"
+            )
+        };
+        for (line, want) in [
+            (
+                "curl: (6) Could not resolve host: example.com",
+                with_step("example.com", "example.com"),
+            ),
+            (
+                "curl: (7) Failed to connect to example.com port 8080 after 2 ms: refused",
+                with_step("example.com:8080", "example.com"),
+            ),
+            (
+                "Connecting to 93.184.215.14:80... failed: No route to host.",
+                without_step("93.184.215.14:80"),
+            ),
+            (
+                "curl: (7) Failed to connect to [2001:db8::1] port 443 after 2 ms: refused",
+                without_step("[2001:db8::1]:443"),
+            ),
+            (
+                "could not fetch the source https://example.com/a.tar.gz: \
+                 could not connect to example.com:443: refused",
+                with_step("example.com", "example.com"),
+            ),
+            (
+                "could not fetch the source gs://a-bucket/a.tar.gz: \
+                 could not connect to storage.googleapis.com:443: refused",
+                with_step("storage.googleapis.com", "storage.googleapis.com"),
+            ),
+        ] {
+            assert_eq!(refused(line), want, "{line}");
+        }
+    }
+
     /// A helper request arrives as `traceparent%<tp>%<method>%<data>` when
     /// the box has a `TRACEPARENT`, and bare otherwise; the prefix is taken
     /// off before dispatch and the request's span is named for the method.
@@ -3885,16 +4248,16 @@ mod tests {
     fn channel_request_span_strips_the_traceparent_prefix() {
         let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
         let expose = format!("traceparent%{tp}%net-expose%8770");
-        let (_, request) = super::channel_request_span(&expose, "b", None);
+        let (_, request, _) = super::channel_request_span(&expose, "b", None);
         assert_eq!(request, "net-expose%8770");
         let materialize = format!("traceparent%{tp}%materialize%/workbench%--output o o717b");
-        let (_, request) = super::channel_request_span(&materialize, "b", None);
+        let (_, request, _) = super::channel_request_span(&materialize, "b", None);
         assert_eq!(request, "materialize%/workbench%--output o o717b");
-        let (_, request) = super::channel_request_span("net-expose%8770", "b", None);
+        let (_, request, _) = super::channel_request_span("net-expose%8770", "b", None);
         assert_eq!(request, "net-expose%8770");
         // A prefix with no request after it is handed on as-is, to be refused
         // by the dispatcher as unhandled input rather than guessed at.
-        let (_, request) = super::channel_request_span("traceparent%garbage", "b", None);
+        let (_, request, _) = super::channel_request_span("traceparent%garbage", "b", None);
         assert_eq!(request, "garbage");
     }
 
@@ -3912,7 +4275,7 @@ mod tests {
             boxes::SessionId::parse_str("7b3e1f2a-9c4d-4e5f-8a6b-1c2d3e4f5a6b").unwrap();
         let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
         let line = format!("traceparent%{tp}%net-expose%8770");
-        let (span, request) = super::channel_request_span(&line, "leaf-7", Some(session_id));
+        let (span, request, _) = super::channel_request_span(&line, "leaf-7", Some(session_id));
         assert_eq!(request, "net-expose%8770");
         drop(span);
         let served = log.one("session.channel", "method", "net-expose");
@@ -3929,7 +4292,7 @@ mod tests {
         );
 
         // Without a session id the field is simply absent; the box id stays.
-        let (span, _) = super::channel_request_span("net-expose%8770", "solo", None);
+        let (span, _, _) = super::channel_request_span("net-expose%8770", "solo", None);
         drop(span);
         let bare = log.find("session.channel", "box.id", "solo");
         assert_eq!(bare.len(), 1);
@@ -3957,7 +4320,7 @@ mod tests {
             (long.clone(), "other"),
             (format!("traceparent%{tp}%{long}"), "other"),
         ] {
-            let (span, _) = super::channel_request_span(&line, "m", None);
+            let (span, _, _) = super::channel_request_span(&line, "m", None);
             drop(span);
             let served = log.find("session.channel", "box.id", "m");
             let last = served.last().expect("a session.channel span");
@@ -3977,6 +4340,8 @@ mod tests {
     /// that records the line it would send; the span is the one the channel
     /// actor serves that line in. A value that is not the 55-character W3C
     /// form is not forwarded at all, so a `%` in it cannot shift the split.
+    /// A box handed the opt-out (`MINIMAL_OTEL=off`, TEL-045) sends the
+    /// `otel%off%` prefix instead, and never its `TRACEPARENT`.
     #[cfg(unix)]
     #[test]
     fn a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix() {
@@ -4001,7 +4366,7 @@ mod tests {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let send = |traceparent: Option<&str>| -> String {
+        let send_with = |traceparent: Option<&str>, otel: Option<&str>| -> String {
             let mut cmd = std::process::Command::new("bash");
             cmd.arg("-c")
                 .arg(format!(
@@ -4009,9 +4374,13 @@ mod tests {
                     helper.display()
                 ))
                 .env("PATH", &path)
-                .env_remove("TRACEPARENT");
+                .env_remove("TRACEPARENT")
+                .env_remove(minimald_rpc::trace::OTEL_ENV);
             if let Some(tp) = traceparent {
                 cmd.env("TRACEPARENT", tp);
+            }
+            if let Some(otel) = otel {
+                cmd.env(minimald_rpc::trace::OTEL_ENV, otel);
             }
             let out = cmd.output().expect("run bash");
             assert!(out.status.success(), "{out:?}");
@@ -4020,6 +4389,7 @@ mod tests {
                 .trim_end_matches('\n')
                 .to_string()
         };
+        let send = |traceparent: Option<&str>| send_with(traceparent, None);
 
         let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
         let line = send(Some(tp));
@@ -4027,7 +4397,7 @@ mod tests {
 
         let log = crate::test_harness::SpanLog::default();
         let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
-        let (span, request) = super::channel_request_span(&line, "inner", None);
+        let (span, request, _) = super::channel_request_span(&line, "inner", None);
         assert_eq!(request, "net-expose%8770");
         drop(span);
         let served = log.one("session.channel", "box.id", "inner");
@@ -4055,6 +4425,16 @@ mod tests {
             assert_eq!(send(Some(bad)), "net-expose%8770", "{bad:?}");
         }
         assert_eq!(send(None), "net-expose%8770");
+
+        // TEL-045: a box handed the opt-out sends it, and never its
+        // TRACEPARENT; only `off` opts out, as the daemon reads the marker.
+        let off = minimald_rpc::trace::OTEL_OFF;
+        assert_eq!(send_with(Some(tp), Some(off)), "otel%off%net-expose%8770");
+        assert_eq!(send_with(None, Some(off)), "otel%off%net-expose%8770");
+        assert_eq!(
+            send_with(Some(tp), Some("on")),
+            format!("traceparent%{tp}%net-expose%8770")
+        );
     }
 
     /// Every session rootfs carries the per-attach environment hook for every
@@ -5204,6 +5584,182 @@ exit $rc
         assert_eq!(vars.len(), 1);
     }
 
+    /// TEL-023 on a task box (T43): the task an in-box `min task run` runs
+    /// gets the request span's `TRACEPARENT` on opt-in, over whatever the
+    /// task declares, and keeps its other variables. The helper's exported
+    /// `TRACEPARENT` is not what it gets: that names the exec, and the task's
+    /// work is a child of the span that served the request. A helper that
+    /// opted out hands the task the marker and no `TRACEPARENT`; with
+    /// telemetry off, or no recorded span, nothing is added. Scenario 712b.
+    #[test]
+    fn an_in_box_task_run_gives_the_task_the_request_traceparent() {
+        let exec_tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let span_tp = "00-af79b928d8ae574b659f1fbf40208758-1111111111111111-01";
+        let declared = || {
+            BTreeMap::from([
+                ("KEPT".to_string(), EnvVarValue::Value("k".to_string())),
+                (
+                    "TRACEPARENT".to_string(),
+                    EnvVarValue::Value("from-toml".to_string()),
+                ),
+            ])
+        };
+        let on = TaskRunRequest::parse(&format!(
+            "/workbench{RUN_GROUP_SEP}t{RUN_GROUP_SEP}TRACEPARENT={exec_tp}"
+        ));
+
+        let mut vars = declared();
+        let joined = TaskTrace::Parent(Some(span_tp.to_string()));
+        run_task_trace(&mut vars, true, joined.clone(), &on.env);
+        assert_eq!(
+            vars,
+            BTreeMap::from([
+                ("KEPT".to_string(), EnvVarValue::Value("k".to_string())),
+                (
+                    "TRACEPARENT".to_string(),
+                    EnvVarValue::Value(span_tp.to_string()),
+                ),
+            ]),
+            "the task gets the request span's TRACEPARENT and keeps the rest"
+        );
+
+        // Telemetry off, or a request span no export records: nothing added.
+        for (telemetry_on, traceparent) in [(false, Some(span_tp.to_string())), (true, None)] {
+            let mut vars = declared();
+            run_task_trace(
+                &mut vars,
+                telemetry_on,
+                TaskTrace::Parent(traceparent),
+                &on.env,
+            );
+            assert_eq!(vars, declared());
+        }
+
+        // TEL-045: a helper whose exported environment carries the opt-out
+        // marker opts its task out, even with a TRACEPARENT for the request.
+        let off = TaskRunRequest::parse(&format!(
+            "/workbench{RUN_GROUP_SEP}t{RUN_GROUP_SEP}{}={}",
+            minimald_rpc::trace::OTEL_ENV,
+            minimald_rpc::trace::OTEL_OFF,
+        ));
+        let mut vars = BTreeMap::new();
+        run_task_trace(&mut vars, true, joined, &off.env);
+        assert_eq!(
+            vars,
+            BTreeMap::from([(
+                minimald_rpc::trace::OTEL_ENV.to_string(),
+                EnvVarValue::Value(minimald_rpc::trace::OTEL_OFF.to_string()),
+            )])
+        );
+    }
+
+    /// TEL-024 on the in-box path: with no exporter the request span is not
+    /// recorded, so a `run` request yields no `TRACEPARENT` for its task,
+    /// even when the helper sent one.
+    #[test]
+    fn an_unrecorded_request_span_gives_the_task_no_traceparent() {
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = format!("traceparent%{tp}%run%/workbench{RUN_GROUP_SEP}t");
+        let (_, request, trace) = super::channel_request_span(&line, "b", None);
+        assert_eq!(request, format!("run%/workbench{RUN_GROUP_SEP}t"));
+        assert_eq!(trace, TaskTrace::Parent(None));
+    }
+
+    /// TEL-045 on the in-box path: a helper that opted out sends the
+    /// opt-out on the request itself (`otel%off%`). The daemon's span for
+    /// the request is marked `telemetry=opt-out`, parents nothing, and is
+    /// exported nowhere, nor is a span under it; the same request without
+    /// the prefix is exported. The task gets `MINIMAL_OTEL=off` and no
+    /// `TRACEPARENT`, from the request alone: a Line-form request has no
+    /// environment to carry the marker in. Scenario 712e.
+    #[test]
+    fn an_opted_out_helper_request_records_no_span_and_opts_its_task_out() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("t")))
+                .with(log.clone()),
+        );
+        let exported = || -> Vec<String> {
+            exporter
+                .get_finished_spans()
+                .unwrap()
+                .iter()
+                .map(|s| s.name.to_string())
+                .collect()
+        };
+
+        let run = format!("run%/workbench{RUN_GROUP_SEP}t");
+        let line = format!("otel%off%{run}");
+        let (span, request, trace) = super::channel_request_span(&line, "off", None);
+        assert_eq!(request, run);
+        assert_eq!(trace, TaskTrace::OptedOut);
+        span.in_scope(|| drop(tracing::info_span!("under").entered()));
+        drop(span);
+        let served = log.one("session.channel", "box.id", "off");
+        assert_eq!(served.field("telemetry"), Some(crate::exec::OPT_OUT));
+        assert_eq!(served.field("parent_span_id"), None, "{served:?}");
+        assert!(served.field("trace_id").is_some(), "ids for the file log");
+        assert_eq!(exported(), Vec::<String>::new(), "nothing exported");
+
+        let (span, request, trace) = super::channel_request_span(&run, "on", None);
+        assert_eq!(request, run);
+        assert_eq!(trace, TaskTrace::Parent(None));
+        drop(span);
+        assert_eq!(exported(), vec!["session.channel".to_string()]);
+
+        // Only `off` opts out; another value is stripped and ignored.
+        let (_, request, trace) = super::channel_request_span("otel%on%net-expose%8770", "b", None);
+        assert_eq!(request, "net-expose%8770");
+        assert_eq!(trace, TaskTrace::Parent(None));
+
+        let off = BTreeMap::from([(
+            minimald_rpc::trace::OTEL_ENV.to_string(),
+            EnvVarValue::Value(minimald_rpc::trace::OTEL_OFF.to_string()),
+        )]);
+        for telemetry_on in [true, false] {
+            let line_form = TaskRunRequest::parse("t");
+            assert!(line_form.env.is_empty());
+            let mut vars = BTreeMap::new();
+            run_task_trace(&mut vars, telemetry_on, TaskTrace::OptedOut, &line_form.env);
+            assert_eq!(vars, off, "telemetry_on={telemetry_on}");
+        }
+    }
+
+    /// The Line form an older helper sends (`run%<task> <args>`: no prefix,
+    /// no environment) hands its task nothing, as before T43's fix: its
+    /// request span is a root the daemon minted, and a recorded root is no
+    /// trace the caller asked to join. A prefixed request's recorded span
+    /// is handed on; an unrecorded one never is (TEL-024).
+    #[test]
+    fn a_bare_request_hands_its_task_no_traceparent() {
+        let span_tp = "00-af79b928d8ae574b659f1fbf40208758-1111111111111111-01";
+        assert_eq!(task_traceparent(false, Some(span_tp.to_string())), None);
+        assert_eq!(task_traceparent(false, None), None);
+        assert_eq!(task_traceparent(true, None), None);
+        assert_eq!(
+            task_traceparent(true, Some(span_tp.to_string())),
+            Some(span_tp.to_string())
+        );
+
+        let (_, request, trace) = super::channel_request_span("run%lint a b", "old", None);
+        assert_eq!(request, "run%lint a b");
+        assert_eq!(trace, TaskTrace::Parent(None));
+        let line_form = TaskRunRequest::parse("lint a b");
+        assert_eq!(line_form.args, TaskRunArgs::Line("a b".to_string()));
+        let mut vars = BTreeMap::new();
+        run_task_trace(&mut vars, true, trace, &line_form.env);
+        assert_eq!(vars, BTreeMap::new());
+    }
+
     /// BCLI-010 (T62): the request `min task run` sends carries the caller's
     /// args with their spaces, its `$PWD` and its exported variables. The
     /// channel fills the task's `inherit` variables from them and starts an
@@ -5341,6 +5897,12 @@ exit $rc
             BTreeSet::from(["TOKEN".to_string(), "OTHER".to_string()])
         );
         assert_eq!(run_data_bytes(b"search%x\xff"), None);
+        // The opt-out prefix is skipped the same way (TEL-045).
+        assert_eq!(
+            run_data_bytes(b"otel%off%run%/w\x1et\xff"),
+            Some(&b"/w\x1et\xff"[..])
+        );
+        assert_eq!(run_data_bytes(b"otel%off%search%x"), None);
         let mut vars = BTreeMap::from([
             ("TOKEN".to_string(), EnvVarValue::Inherit),
             ("FINE".to_string(), EnvVarValue::Inherit),
@@ -5393,7 +5955,8 @@ exit $rc
             setup_channel_in(crate::box_actor::WeakBoxHandle::dangling(), "web", repo);
         let (mut ours, mut theirs) = UnixStream::pair().unwrap();
         let line = String::from_utf8_lossy(raw).into_owned();
-        chan.handle_raw(&line, Some(raw), &mut ours).await;
+        chan.handle_raw(&line, Some(raw), TaskTrace::Parent(None), &mut ours)
+            .await;
         drop(ours);
         let mut reply = String::new();
         std::io::Read::read_to_string(&mut theirs, &mut reply).unwrap();

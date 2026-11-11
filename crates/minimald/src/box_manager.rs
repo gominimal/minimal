@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, io::ErrorKind::NotFound};
 
 use crate::{
-    box_actor::{BoxActor, BoxActorConfig, BoxHandle},
+    box_actor::{BoxActor, BoxActorConfig, BoxHandle, RestartError},
     box_runtime::HostAttrs,
     store::{BoxRecordHandle, RecordPredicate, Store, StoreHandle},
 };
@@ -108,6 +108,27 @@ pub(crate) static CREATE_CLASSIFIER_TREE_STANDIN: std::sync::Mutex<
     Option<(std::path::PathBuf, String)>,
 > = std::sync::Mutex::new(None);
 
+/// The cgroup a create reads the daemon in, standing in for
+/// `/proc/self/cgroup` in a test that moves the daemon. `None` in every
+/// production path.
+#[cfg(test)]
+pub(crate) static CREATE_OWN_CGROUP_STANDIN: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// The daemon's cgroup as a create reads it (gominimal/inbox#1054): its
+/// own, read live, unless a test stood one in.
+fn create_own_cgroup() -> Option<String> {
+    #[cfg(test)]
+    if let Some(cgroup) = CREATE_OWN_CGROUP_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Some(cgroup);
+    }
+    sandbox::classifier::own_cgroup_path()
+}
+
 /// The tree and mount table a create's re-read answers over: the constant
 /// tree every launch reads and the daemon's own mount table, read live
 /// (`None`), unless a test stood a tree in.
@@ -128,11 +149,18 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
 
 /// The host's classifier fact a create answers over (NET-079). Another
 /// mode's box reads the node fact as it stands. A host-address create reads
-/// it too, unless the stored fact says the probe could not read the table:
-/// that is the one cause a later read can clear without anything on the
-/// host changing (a daemon not yet placed in its leaf at start reads so),
-/// so the create re-reads the host rather than answer from a stale read.
-/// A re-read that does not run keeps the stored fact.
+/// it too, unless the stored fact says the probe could not read the table
+/// or the daemon was not in its leaf: those are the causes a later read can
+/// clear without anything on the host changing (the placement unit places a
+/// daemon whose start outran it), so the create re-reads the host rather
+/// than answer from a stale read.
+/// A re-read that does not run keeps the stored fact. A host-address create
+/// also re-reads when the daemon stands in another cgroup than the one the
+/// fact was read in (gominimal/inbox#1054: `min finalize-install` placed a
+/// running daemon after its start-up reading), so it never answers in the
+/// second before the daemon's own cgroup watch would notice the move; when
+/// that re-read fails, the create goes on to the probe-unreadable retry
+/// below rather than answer the stale fact as re-read.
 // The create lines carry the fact as `host_fact`, never as
 // `host_ip_enforcement`: that field marks the per-launch classifier record,
 // and readers of the log take every line with it as a launch decision.
@@ -140,11 +168,37 @@ async fn create_host_ip_fact(
     network: boxes::NetworkMode,
     session_name: &str,
 ) -> crate::box_runtime::HostIpEnforcementFact {
-    let stored = crate::box_runtime::host_ip_enforcement_fact();
     if !matches!(network, boxes::NetworkMode::HostNet) {
-        return stored;
+        return crate::box_runtime::host_ip_enforcement_fact();
     }
-    if stored.cause != Some(crate::net::classifier::Cause::ProbeUnreadable) {
+    let (root, mountinfo) = create_classifier_tree();
+    if crate::box_runtime::re_read_if_moved(
+        root.clone(),
+        mountinfo.clone(),
+        create_own_cgroup(),
+        "a host-address create",
+    )
+    .await
+    {
+        let fact = crate::box_runtime::host_ip_enforcement_fact();
+        tracing::info!(
+            session_name,
+            reread = true,
+            host_fact = %fact.enforcement.machine_str(),
+            cause = fact.cause.map(crate::net::classifier::Cause::detail),
+            "host-address create re-read the classifier fact because the daemon \
+             moved since the fact was read"
+        );
+        return fact;
+    }
+    let stored = crate::box_runtime::host_ip_enforcement_fact();
+    if !matches!(
+        stored.cause,
+        Some(
+            crate::net::classifier::Cause::ProbeUnreadable
+                | crate::net::classifier::Cause::DaemonNotPlaced
+        )
+    ) {
         tracing::info!(
             session_name,
             reread = false,
@@ -153,7 +207,6 @@ async fn create_host_ip_fact(
         );
         return stored;
     }
-    let (root, mountinfo) = create_classifier_tree();
     match crate::box_runtime::re_read_classifier_fact(
         root,
         mountinfo,
@@ -620,11 +673,9 @@ impl BoxManagerHandle {
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
                 identity: minimald_rpc::BoxIdentity::None,
-                // BOX-149: the daemon does not give an exec an id yet, so
-                // this list is always empty, even when a process runs in
-                // the box. It fills when each exec has an id (BOX-149):
-                // https://github.com/gominimal/minimal/issues/2404 (T30).
-                live_execs: Vec::new(),
+                // BOX-159: each exec running in the box, from the execs this
+                // daemon started under an id (BOX-149).
+                live_execs: crate::exec::live_execs(record.id),
                 disk_bytes,
             }))
         }
@@ -1222,6 +1273,38 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
         .map_err(|e| BoxManagerError::other(format!("could not serialize the box spec: {e}")))
 }
 
+/// The Box Spec sections that a spec can carry and that this daemon does
+/// not enforce (BOX-076): the top-level key, the key inside it when the
+/// section is one key of a table, and the section as the log names it.
+const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
+    ("file_imports", None, "[[file_imports]]"),
+    ("file_exports", None, "[[file_exports]]"),
+    ("github_imports", None, "[[github_imports]]"),
+    ("otel", None, "[otel]"),
+    (
+        "network",
+        Some("vpn_network_names"),
+        "[network] vpn_network_names",
+    ),
+];
+
+/// The sections of `spec` that the daemon carries in the stored spec but
+/// does not enforce, in the order of [`UNENFORCED_SECTIONS`], each once.
+fn unenforced_sections(spec: &serde_json_lenient::Value) -> Vec<&'static str> {
+    let Some(object) = spec.as_object() else {
+        return Vec::new();
+    };
+    UNENFORCED_SECTIONS
+        .iter()
+        .filter(|(key, inner, _)| match (object.get(*key), inner) {
+            (Some(_), None) => true,
+            (Some(value), Some(inner)) => value.get(*inner).is_some(),
+            (None, _) => false,
+        })
+        .map(|(_, _, section)| *section)
+        .collect()
+}
+
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     /// Every retained record, in any state (BOX-158). Read-only against
@@ -1480,6 +1563,33 @@ impl BoxManager {
 
         let running = BTreeMap::new();
         let (sender, receiver) = crate::traced::channel(8);
+        // The manager's root (TEL-030): it serves every request for the
+        // daemon's life, so it never pins whatever span its creator ran in,
+        // and the hand-over and publish-move loops below run under it too,
+        // as its children: they live exactly as long, and a lifetime loop
+        // that is a root of its own reads as a stray trace in the export.
+        // Its ids are noted (`adopt_trace` with no caller), so the work no
+        // request asks for (the boot resume, a hand-over the daemon's own
+        // range walk makes) joins this trace instead of starting one. Made
+        // before the registry below, so a microVM daemon's start walk runs
+        // in it too.
+        //
+        // The root closes when the mainloop ends: the loops end with the
+        // mainloop (`mainloop_done`), not at the runtime's drop, so a root
+        // that never closed (and never exported) cannot hide the boot work
+        // as orphans.
+        let root = tracing::info_span!(
+            parent: None,
+            "sessions.manager",
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+        );
+        let root = crate::traced::detach(root);
+        crate::exec::adopt_trace(&root, None);
+        #[cfg(target_os = "linux")]
+        let lifetime = root.in_scope(crate::traced::caller_context);
+        #[cfg(target_os = "linux")]
+        let mainloop_done = CancellationToken::new();
         // Shared so the host-side proxies can resolve `Host:` headers directly;
         // a clone is held by both the actor (which mutates it) and the handle
         // (which hands it to the proxies via `hostnames()`). Whether the
@@ -1695,8 +1805,11 @@ impl BoxManager {
                 ));
                 // The cell is new and empty here, so the set cannot fail.
                 let _ = range_walk.set(Arc::clone(&walk));
-                crate::traced::spawn(async move {
-                    walk.daemon_start().await;
+                // In the manager's root (above), not in no span at all.
+                root.in_scope(|| {
+                    crate::traced::spawn(async move {
+                        walk.daemon_start().await;
+                    })
                 });
             }
             (hostnames, loopback)
@@ -1705,6 +1818,8 @@ impl BoxManager {
         let handle = BoxManagerHandle {
             sender,
             in_shutdown: in_shutdown.clone(),
+            #[cfg(target_os = "linux")]
+            lifetime,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
             #[cfg(target_os = "linux")]
@@ -1728,15 +1843,34 @@ impl BoxManager {
                 .expect("hostname registry lock poisoned")
                 .notify_hand_overs(sender);
             let manager = weak_self.clone();
-            // Serves hand-overs for the manager's life: a root of its own,
-            // like the manager's mainloop below.
-            crate::traced::spawn_detached(
-                tracing::info_span!(parent: None, "sessions.hand_overs"),
-                async move {
-                    while let Some(hand_over) = hand_overs.recv().await {
-                        let Some(manager) = manager.upgrade() else {
-                            return;
-                        };
+            // Serves hand-overs for the manager's life, under its root. Each
+            // hand-over is handled in a span of its own in the trace of the
+            // work that made it (a destroy, a release, a publish; TEL-022),
+            // or in the manager's when the daemon made it by itself.
+            let done = mainloop_done.clone();
+            let serve = async move {
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        () = done.cancelled() => None,
+                        next = hand_overs.recv() => next,
+                    };
+                    let Some((hand_over, caller)) = next else {
+                        return;
+                    };
+                    let Some(manager) = manager.upgrade() else {
+                        return;
+                    };
+                    let span = tracing::info_span!(
+                        parent: None,
+                        "sessions.hand_over",
+                        port = hand_over.port,
+                        trace_id = tracing::field::Empty,
+                        span_id = tracing::field::Empty,
+                        parent_span_id = tracing::field::Empty,
+                    );
+                    crate::exec::adopt_trace(&span, caller.or(lifetime));
+                    let bind = async {
                         let holder = manager
                             .get_session(BoxKeyPredicate::Id(hand_over.holder))
                             .await;
@@ -1745,9 +1879,13 @@ impl BoxManager {
                                 .bind_handed_port(hand_over.address, hand_over.port)
                                 .await;
                         }
-                    }
-                },
-            );
+                    };
+                    tracing::Instrument::instrument(bind, span).await;
+                }
+            };
+            let lifelong = tracing::info_span!(parent: &root, "sessions.hand_overs");
+            let serve = tracing::Instrument::instrument(serve, lifelong);
+            root.in_scope(|| crate::traced::spawn(serve));
         }
         // #2748: each move of a box's publish is passed to that box's
         // session, which binds its declared ports at the new address and
@@ -1764,22 +1902,44 @@ impl BoxManager {
                 .expect("hostname registry lock poisoned")
                 .notify_publish_moves(sender);
             let manager = weak_self.clone();
-            crate::traced::spawn_detached(
-                tracing::info_span!(parent: None, "sessions.publish_moves"),
-                async move {
-                    while let Some(moved) = moves.recv().await {
-                        let Some(manager) = manager.upgrade() else {
-                            return;
-                        };
+            // Under the manager's root, each move in its sender's trace, as
+            // the hand-overs above.
+            let done = mainloop_done.clone();
+            let serve = async move {
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        () = done.cancelled() => None,
+                        next = moves.recv() => next,
+                    };
+                    let Some((moved, caller)) = next else {
+                        return;
+                    };
+                    let Some(manager) = manager.upgrade() else {
+                        return;
+                    };
+                    let span = tracing::info_span!(
+                        parent: None,
+                        "sessions.publish_move",
+                        trace_id = tracing::field::Empty,
+                        span_id = tracing::field::Empty,
+                        parent_span_id = tracing::field::Empty,
+                    );
+                    crate::exec::adopt_trace(&span, caller.or(lifetime));
+                    let rebind = async {
                         if let Ok(Some(holder)) = manager.running_session(moved.holder).await {
                             let ports = moved.hand_overs.iter().map(|hand_over| hand_over.port);
                             holder
                                 .publish_moved(moved.from, moved.to, ports.collect())
                                 .await;
                         }
-                    }
-                },
-            );
+                    };
+                    tracing::Instrument::instrument(rebind, span).await;
+                }
+            };
+            let lifelong = tracing::info_span!(parent: &root, "sessions.publish_moves");
+            let serve = tracing::Instrument::instrument(serve, lifelong);
+            root.in_scope(|| crate::traced::spawn(serve));
         }
         let mngr = Self {
             in_shutdown,
@@ -1801,13 +1961,18 @@ impl BoxManager {
             deny_all_opt_out,
         };
 
-        // The manager serves every request for the daemon's life: a root of
-        // its own, so it never pins whatever span its creator ran in. Each
-        // message's span names its sender (see `mainloop`).
-        crate::traced::spawn_detached(
-            tracing::info_span!(parent: None, "sessions.manager"),
-            mngr.mainloop(),
-        );
+        // The manager's mainloop runs in its root (see above). Each
+        // message's span names its sender (see `mainloop`). Its end, however
+        // it ends (all senders gone, a panic, the runtime's drop), ends the
+        // loops above, so the root closes with it.
+        #[cfg(target_os = "linux")]
+        let ends_loops = mainloop_done.drop_guard();
+        let serve = async move {
+            #[cfg(target_os = "linux")]
+            let _ends_loops = ends_loops;
+            mngr.mainloop().await;
+        };
+        root.in_scope(|| crate::traced::spawn(serve));
         Ok(handle)
     }
 }
@@ -2737,6 +2902,62 @@ impl BoxManagerHandle {
         Some(answer)
     }
 
+    /// Restarts the box `id` (BOX-176), with the daemon's grace period
+    /// between SIGTERM and SIGKILL when the box runs. Answers whether the
+    /// box was running.
+    ///
+    /// # Errors
+    ///
+    /// [`RestartError::Refused`] when a check refused the restart and left
+    /// the box as it was. [`RestartError::Failed`] with `NotFound` for an id
+    /// no record names, `ConnectionRefused` while the daemon shuts down, or
+    /// the error the start ended on, which leaves the box `stopped`.
+    pub(crate) async fn restart_box(&self, id: SessionId) -> Result<bool, RestartError> {
+        self.restart_box_with_grace(id, crate::box_actor::STOP_GRACE)
+            .await
+    }
+
+    /// [`Self::restart_box`] with the grace period `grace`. The restart
+    /// resolves the box and hands it to the box's actor, which runs the
+    /// checks, the stop and the start in its message loop.
+    pub(crate) async fn restart_box_with_grace(
+        &self,
+        id: SessionId,
+        grace: std::time::Duration,
+    ) -> Result<bool, RestartError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(RestartError::Failed(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            )));
+        }
+        let unknown = || {
+            RestartError::Failed(std::io::Error::new(
+                NotFound,
+                format!(
+                    "{} `{}`",
+                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                    id.as_ref()
+                ),
+            ))
+        };
+        let record = self
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .map_err(RestartError::Failed)?
+            .ok_or_else(unknown)?;
+        // The user the box's processes run as, as a host launched with no
+        // client takes it.
+        let username = record.username.clone().unwrap_or_else(|| "user".into());
+        tracing::info!(session_id = %id, "restart: dispatching to the session");
+        let session = self
+            .get_session(BoxKeyPredicate::Id(id))
+            .await
+            .map_err(RestartError::Failed)?
+            .ok_or_else(unknown)?;
+        session.restart_box(username, grace).await
+    }
+
     /// The state and directories of the box `id` when the box is stopped
     /// or exited, read from the store with no actor started (BOX-017).
     /// Answers `None` for an id no record names, for a box being torn
@@ -3568,6 +3789,9 @@ impl BoxManager {
             name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         config.name = name;
+        // BOX-076: the sections the daemon carries but does not enforce,
+        // read before the spec becomes its stored bytes.
+        let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -3755,12 +3979,25 @@ impl BoxManager {
         if let Some(bytes) = &spec {
             let stored = object.store_spec(bytes).map(|()| object.spec_path());
             match stored {
-                Ok(path) => tracing::info!(
-                    session_id = %session_id,
-                    spec_bytes = bytes.len(),
-                    spec_path = %path.as_str(),
-                    "stored the box spec"
-                ),
+                Ok(path) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        spec_bytes = bytes.len(),
+                        spec_path = %path.as_str(),
+                        "stored the box spec"
+                    );
+                    // BOX-076: one warning for each unenforced section.
+                    // The stored spec keeps the section, and the box is
+                    // created.
+                    for section in &unenforced {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            section = ?section,
+                            "the box spec carries a section this daemon does not \
+                             enforce; the box is created without it"
+                        );
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(
                         session_id = %session_id,

@@ -609,6 +609,43 @@ mod tests {
         assert_eq!(task.state_key.as_deref(), Some("dev"));
     }
 
+    /// The repository's own `minimal.toml` files, which people copy from,
+    /// carry no legacy table, so reading them prints no hint and a release
+    /// past the grace window still reads them. Each one also loads with its
+    /// entry tables read: the session packages and the task state key.
+    #[test]
+    fn repository_minimal_toml_files_carry_no_legacy_table() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        for (path, session_package, state_key) in [
+            (".minimal/minimal.toml", "cargo-nextest", Some("dev")),
+            ("crates/boxes/example_project/minimal.toml", "go", None),
+        ] {
+            let src = std::fs::read_to_string(format!("{root}/{path}"))
+                .unwrap_or_else(|e| panic!("{path} is readable: {e}"));
+            let hints = canonicalize(&mut doc(&src), IN_GRACE).expect("inside grace");
+            assert!(hints.is_empty(), "{path}: {hints:?}");
+            canonicalize(&mut doc(&src), "9.0.0")
+                .unwrap_or_else(|e| panic!("{path} reads past grace: {e}"));
+            let (file, hints) =
+                settled(&src, "9.0.0").unwrap_or_else(|e| panic!("{path} loads past grace: {e}"));
+            assert!(hints.is_empty(), "{path}: {hints:?}");
+            let session = file
+                .session
+                .unwrap_or_else(|| panic!("{path} has a [defaults.session] table"));
+            assert!(
+                session.packages.iter().any(|p| p == session_package),
+                "{path}: {:?}",
+                session.packages
+            );
+            assert_eq!(file.defaults.state_key.as_deref(), state_key, "{path}");
+            assert!(
+                file.defaults.extra.is_empty(),
+                "{path}: {:?}",
+                file.defaults.extra
+            );
+        }
+    }
+
     // BOX-052: a top-level `[params]` reads as `[args]`, with one hint, and
     // a task's own `args` is unchanged.
     #[test]
