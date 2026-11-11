@@ -253,7 +253,8 @@ impl Expansion {
 ///
 /// [`Error::InvalidSpecKey`] for the first key, in key order, that is not
 /// a box setting or has a value of the wrong shape. It names the layer
-/// that set the bad value.
+/// that set the bad value. The same error, before any loadout applies,
+/// when `loadout_mode` is a string other than `sealed` or `open`.
 pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     // The `[upstream]` table is the registry pin, so it sets the one spec
     // key `upstream` and nothing else. An empty table sets nothing.
@@ -271,12 +272,99 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     ordered.push((Origin::of(Layer::Defaults), &layers.defaults));
     ordered.push((Origin::of(Layer::DefaultsType), &layers.defaults_type));
     ordered.push((Origin::of(Layer::Entry), &entry.body));
-    ordered.push((Origin::of(Layer::Loadouts), &layers.loadouts));
+    // BOX-166, BOX-167, BOX-170: the layers up to and including the entry
+    // set `loadout_mode`, and the mode alone decides whether the selected
+    // loadouts apply. A loadout cannot open the gate that admits it.
+    let sealed = toml::Table::new();
+    let loadouts = match loadout_mode(entry, &ordered)? {
+        Some(LoadoutMode::Sealed) => &sealed,
+        Some(LoadoutMode::Open) | None => &layers.loadouts,
+    };
+    ordered.push((Origin::of(Layer::Loadouts), loadouts));
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
     let mut expansion = fold(&ordered);
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
+}
+
+/// Whether an entry takes its selected loadouts: the `loadout_mode` box
+/// setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadoutMode {
+    /// The entry takes no loadout (BOX-166).
+    Sealed,
+    /// The entry takes each selected loadout whole (BOX-167).
+    Open,
+}
+
+impl LoadoutMode {
+    /// The values `loadout_mode` accepts, as the file writes them.
+    pub const ACCEPTED: &'static [&'static str] = &["sealed", "open"];
+
+    /// The mode a file writes as `value`, or `None` for any other value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sealed" => Some(Self::Sealed),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+}
+
+/// The `loadout_mode` that `ordered`, the layers up to and including the
+/// entry, set. It is the flat key or the `[box]` section's key, whichever
+/// a later layer set. `None` when no layer sets it.
+///
+/// A value that is not a string reads as [`LoadoutMode::Sealed`], so no
+/// loadout applies, and [`check_keys`] then refuses its shape.
+///
+/// # Errors
+///
+/// [`Error::InvalidSpecKey`] with [`SpecKeyProblem::UnknownValue`] for a
+/// string other than `sealed` or `open`, naming the layer that set it
+/// (BOX-174).
+fn loadout_mode(
+    entry: &BoxEntry,
+    ordered: &[(Origin, &toml::Table)],
+) -> Result<Option<LoadoutMode>, Error> {
+    let before = fold(ordered);
+    let rank = |key: &str| -> Option<(usize, &Origin)> {
+        let origin = before.report.values.get(key)?.first()?;
+        let at = ordered.iter().position(|(o, _)| o == origin)?;
+        Some((at, origin))
+    };
+    let flat = before
+        .spec
+        .get("loadout_mode")
+        .and_then(|v| Some((v, rank("loadout_mode")?)));
+    let nested = before
+        .spec
+        .get("box")
+        .and_then(toml::Value::as_table)
+        .and_then(|b| b.get("loadout_mode"))
+        .and_then(|v| Some((v, rank("box")?)));
+    let (key, value, origin) = match (flat, nested) {
+        (Some((_, (f, _))), Some((v, (n, o)))) if n > f => ("box.loadout_mode", v, o),
+        (Some((v, (_, o))), _) => ("loadout_mode", v, o),
+        (None, Some((v, (_, o)))) => ("box.loadout_mode", v, o),
+        (None, None) => return Ok(None),
+    };
+    let Some(found) = value.as_str() else {
+        return Ok(Some(LoadoutMode::Sealed));
+    };
+    match LoadoutMode::parse(found) {
+        Some(mode) => Ok(Some(mode)),
+        None => Err(Error::InvalidSpecKey {
+            key: key.to_owned(),
+            layer: layer_words(entry, Some(origin)),
+            problem: SpecKeyProblem::UnknownValue {
+                found: found.to_owned(),
+                accepted: LoadoutMode::ACCEPTED,
+            },
+        }),
+    }
 }
 
 /// The client sections that a project file can carry but never sets. The
@@ -1221,7 +1309,7 @@ mod tests {
                 type_defaults: vec![(
                     "session".to_owned(),
                     table(
-                        "loadout_mode = \"merge\"\nexec_enabled = true\n\
+                        "loadout_mode = \"open\"\nexec_enabled = true\n\
                          restart = \"never\"\ngithub_token_mode = \"none\"\n\
                          nesting = { allowed = true }",
                     ),
@@ -1466,6 +1554,15 @@ mod tests {
     /// against the file's `[box_types]`, then folds the type chain's
     /// defaults and the file's `[defaults]` under the entry.
     fn expand_typed(file: &str, name: &str) -> Result<Result<Expansion, Error>, BoxTypeError> {
+        expand_typed_with(file, name, toml::Table::new())
+    }
+
+    /// [`expand_typed`], with `loadouts` as the selected loadouts' layer.
+    fn expand_typed_with(
+        file: &str,
+        name: &str,
+        loadouts: toml::Table,
+    ) -> Result<Result<Expansion, Error>, BoxTypeError> {
         let doc = table(file);
         let types = BoxTypes::from_file(&doc)?;
         let entries = read_entries(file.as_bytes()).expect("entries read");
@@ -1482,6 +1579,7 @@ mod tests {
             .unwrap_or_default();
         let layers = Layers {
             type_defaults: resolved.defaults,
+            loadouts,
             ..Layers::default()
         }
         .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
@@ -1643,6 +1741,221 @@ mod tests {
             expand_typed(TYPED_FILE, name)
                 .unwrap_or_else(|e| panic!("{name}: {e}"))
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    /// A selected-loadouts layer that sets each part a loadout carries.
+    fn whole_loadout() -> toml::Table {
+        table(
+            "packages = [\"zellij\"]\n\
+             patches = { \"~/.bashrc\" = \"alias l=ls\" }\n\
+             vars = { EDITOR = \"hx\" }\n\
+             vars_lenient = [{ name = \"my.var\", value = \"1\" }]\n\
+             lifecycle_hooks = [{ on = \"start\", run = \"echo hi\" }]\n",
+        )
+    }
+
+    /// The keys of [`whole_loadout`].
+    const LOADOUT_KEYS: [&str; 5] = [
+        "packages",
+        "patches",
+        "vars",
+        "vars_lenient",
+        "lifecycle_hooks",
+    ];
+
+    /// Asserts that `expansion` carries no part of [`whole_loadout`].
+    fn assert_no_loadout(expansion: &Expansion, what: &str) {
+        for key in LOADOUT_KEYS {
+            let from_loadout = match expansion.report.values.get(key) {
+                Some(ValueOrigin::Value(o)) => o.layer == Layer::Loadouts,
+                Some(ValueOrigin::List(items)) => items.iter().any(|o| o.layer == Layer::Loadouts),
+                None => false,
+            };
+            assert!(!from_loadout, "{what}: {key} came from a loadout");
+        }
+        let packages = expansion.spec.get("packages");
+        assert!(
+            packages.is_none_or(|p| !strings(Some(p)).contains(&"zellij")),
+            "{what}: {:?}",
+            expansion.spec.get("packages")
+        );
+    }
+
+    /// Asserts that `expansion` carries every part of [`whole_loadout`].
+    fn assert_whole_loadout(expansion: &Expansion, what: &str) {
+        assert!(
+            strings(expansion.spec.get("packages")).contains(&"zellij"),
+            "{what}: {:?}",
+            expansion.spec.get("packages")
+        );
+        assert_eq!(
+            expansion.spec["vars"]["EDITOR"].as_str(),
+            Some("hx"),
+            "{what}"
+        );
+        for key in LOADOUT_KEYS {
+            assert!(expansion.spec.contains_key(key), "{what}: {key} is missing");
+        }
+    }
+
+    // BOX-166: a sealed entry takes no loadout at the selected-loadouts
+    // layer, whatever that layer carries.
+    #[test]
+    fn sealed_spec_applies_no_loadout() {
+        let file = "[tasks.lint]\n\n[sessions.locked]\nloadout_mode = \"sealed\"\n";
+        for name in ["lint", "locked"] {
+            let e = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect("expands");
+            assert_eq!(e.spec["loadout_mode"].as_str(), Some("sealed"), "{name}");
+            assert_no_loadout(&e, name);
+        }
+    }
+
+    // BOX-167: an open entry takes the selected loadout whole: packages,
+    // config-file patches, vars, vars_lenient and lifecycle hooks.
+    #[test]
+    fn open_spec_applies_whole_loadout() {
+        let file = "[sessions.dev]\n\n[tasks.lint]\nloadout_mode = \"open\"\n";
+        for name in ["dev", "lint"] {
+            let e = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect("expands");
+            assert_eq!(e.spec["loadout_mode"].as_str(), Some("open"), "{name}");
+            assert_whole_loadout(&e, name);
+        }
+    }
+
+    // BOX-170: the gate reads `loadout_mode` from the layers up to and
+    // including the entry, never the type name. A session set to sealed
+    // takes nothing, a type that extends task and sets open takes the
+    // loadout, and each layer before the entry can set the mode.
+    #[test]
+    fn loadout_gate_follows_setting_not_type_name() {
+        let file = r#"
+            [box_types.ci-open]
+            extends = "task"
+            defaults = { loadout_mode = "open" }
+
+            [box_types.dev-sealed]
+            extends = "session"
+            defaults = { loadout_mode = "sealed" }
+
+            [defaults.task]
+            loadout_mode = "open"
+
+            [sessions.locked]
+            loadout_mode = "sealed"
+
+            [sessions.boxed]
+            box = { loadout_mode = "sealed" }
+
+            [boxes.ci]
+            type = "ci-open"
+
+            [boxes.dev]
+            type = "dev-sealed"
+
+            [boxes.reopened]
+            type = "dev-sealed"
+            loadout_mode = "open"
+
+            [tasks.lint]
+        "#;
+        for name in ["locked", "boxed", "dev"] {
+            let e = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect("expands");
+            assert_no_loadout(&e, name);
+        }
+        for name in ["ci", "reopened", "lint"] {
+            let e = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect("expands");
+            assert_whole_loadout(&e, name);
+        }
+
+        // A loadout that sets `loadout_mode` cannot open a sealed entry.
+        let mut opening = whole_loadout();
+        opening.insert("loadout_mode".to_owned(), "open".into());
+        let e = expand_typed_with(file, "locked", opening)
+            .expect("the type resolves")
+            .expect("expands");
+        assert_no_loadout(&e, "locked, with a loadout that sets open");
+
+        // The report carries the mode and the layer that set it.
+        let e = expand_typed_with(file, "dev", toml::Table::new())
+            .expect("the type resolves")
+            .expect("expands");
+        assert_eq!(
+            e.report.values["loadout_mode"],
+            ValueOrigin::Value(Origin::type_defaults("dev-sealed"))
+        );
+    }
+
+    // BOX-174: a `loadout_mode` other than `sealed` or `open` fails the
+    // expansion with exit 3 before any loadout applies. The error names
+    // the key, the value, the layer that set it and the accepted values.
+    #[test]
+    fn unknown_loadout_mode_refused_exit3() {
+        let file = r#"
+            [box_types.ci]
+            extends = "task"
+            defaults = { loadout_mode = "merge" }
+
+            [defaults.session]
+            loadout_mode = "Open"
+
+            [sessions.dev]
+
+            [sessions.mine]
+            loadout_mode = "everything"
+
+            [sessions.boxed]
+            box = { loadout_mode = "merge" }
+
+            [boxes.ci]
+            type = "ci"
+        "#;
+        let cases = [
+            (
+                "dev",
+                "`[defaults.session]` in minimal.toml sets `loadout_mode` to \"Open\". \
+                 `loadout_mode` accepts only `sealed` or `open`. Fix the value.",
+            ),
+            (
+                "mine",
+                "`[sessions.mine]` in minimal.toml sets `loadout_mode` to \"everything\". \
+                 `loadout_mode` accepts only `sealed` or `open`. Fix the value.",
+            ),
+            (
+                "boxed",
+                "`[sessions.boxed]` in minimal.toml sets `box.loadout_mode` to \"merge\". \
+                 `box.loadout_mode` accepts only `sealed` or `open`. Fix the value.",
+            ),
+            (
+                "ci",
+                "the `defaults` table of `[box_types.ci]` sets `loadout_mode` to \"merge\". \
+                 `loadout_mode` accepts only `sealed` or `open`. Fix the value.",
+            ),
+        ];
+        for (name, msg) in cases {
+            let err = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect_err("an unknown mode is refused");
+            assert!(
+                matches!(
+                    &err,
+                    Error::InvalidSpecKey {
+                        problem: SpecKeyProblem::UnknownValue { .. },
+                        ..
+                    }
+                ),
+                "{name}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{name}");
+            assert_eq!(err.to_string(), msg, "{name}");
         }
     }
 }

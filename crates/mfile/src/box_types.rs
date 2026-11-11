@@ -36,6 +36,22 @@ pub fn builtin(name: &str) -> Option<&'static str> {
     BUILTIN_BOX_TYPES.into_iter().find(|b| *b == name)
 }
 
+/// The defaults that the built-in type `root` supplies as the first layer
+/// of a type chain. `session` is `open` to loadouts (BOX-168) and `task`
+/// is `sealed` (BOX-169). The other built-in types supply nothing yet.
+#[must_use]
+pub fn builtin_defaults(root: &str) -> toml::Table {
+    let loadout_mode = match root {
+        "session" => "open",
+        "task" => "sealed",
+        _ => return toml::Table::new(),
+    };
+    toml::Table::from_iter([(
+        "loadout_mode".to_owned(),
+        toml::Value::String(loadout_mode.to_owned()),
+    )])
+}
+
 /// One `[box_types.<name>]` of the project file.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectType {
@@ -55,7 +71,8 @@ pub struct ResolvedType {
     /// The built-in type at the end of the type's `extends` chain.
     pub root: &'static str,
     /// Every type of the chain, the built-in root first and the type last,
-    /// each with its `defaults`. A built-in type sets no defaults here.
+    /// each with its `defaults`. The built-in root's are
+    /// [`builtin_defaults`].
     /// This is the order of [`crate::expand::Layers::type_defaults`].
     pub defaults: Vec<(String, toml::Table)>,
     /// Every type of the chain, the built-in root first and the type last,
@@ -288,7 +305,7 @@ impl BoxTypes {
             chain.push(current);
             current = &project.extends;
         };
-        let mut defaults = vec![(root.to_owned(), toml::Table::new())];
+        let mut defaults = vec![(root.to_owned(), builtin_defaults(root))];
         let mut constraints = vec![(root.to_owned(), toml::Table::new())];
         for t in chain.iter().rev() {
             let project = &self.project[*t];
@@ -401,7 +418,7 @@ mod tests {
         let names: Vec<&str> = r.defaults.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["task", "ci", "ci-rust"]);
         assert_eq!(r.defaults[1].1["timeout"].as_str(), Some("10m"));
-        assert!(r.defaults[0].1.is_empty());
+        assert_eq!(r.defaults[0].1, builtin_defaults("task"));
         let names: Vec<&str> = r.constraints.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["task", "ci", "ci-rust"]);
         assert_eq!(r.constraints[1].1["pty_enabled"].as_bool(), Some(false));
@@ -420,6 +437,38 @@ mod tests {
 
     /// A type graph whose chains all end at a built-in: type `t<i>` extends
     /// either a built-in or a type with a lower index.
+    // BOX-168, BOX-169: the session root supplies `loadout_mode = "open"`
+    // and the task root `loadout_mode = "sealed"`, as the first type
+    // defaults of every chain that ends at them.
+    #[test]
+    fn builtin_roots_default_loadout_mode() {
+        let t = types(
+            r#"
+            [box_types.dev]
+            extends = "session"
+
+            [box_types.ci]
+            extends = "task"
+            "#,
+        )
+        .expect("the types resolve");
+        for (name, root, mode) in [
+            ("session", "session", "open"),
+            ("dev", "session", "open"),
+            ("task", "task", "sealed"),
+            ("ci", "task", "sealed"),
+        ] {
+            let r = t.resolve(name).expect("resolves");
+            let (first, defaults) = &r.defaults[0];
+            assert_eq!(first, root, "{name}");
+            assert_eq!(defaults["loadout_mode"].as_str(), Some(mode), "{name}");
+            assert_eq!(defaults.len(), 1, "{name}");
+        }
+        for other in ["agent", "service", "build", "container-build"] {
+            assert!(builtin_defaults(other).is_empty(), "{other}");
+        }
+    }
+
     fn acyclic_graph() -> impl Strategy<Value = Vec<(usize, Option<usize>)>> {
         prop::collection::vec(
             (0..BUILTIN_BOX_TYPES.len(), any::<prop::sample::Index>()),
