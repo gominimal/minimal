@@ -2933,11 +2933,20 @@ fn log_rootfs_collisions(c: &common::LinkCollisions, layers: &[PathBuf], rootfs:
 /// The layer whose file stands at `rel` in the assembled `rootfs`: the
 /// first of `layers`, in link order, whose own `rel` is the same inode as
 /// the assembled one (the link pass hardlinks, so the winner's file and
-/// the rootfs path are one). `None` when no layer holds that inode, as for
-/// a path the assembly copied across filesystems.
+/// the rootfs path are one). A symlink is made anew in the rootfs, not
+/// linked, so it shares no inode with its layer: its winner is the first
+/// layer whose link points where the placed one does. `None` when no
+/// layer matches, as for a file the assembly copied across filesystems.
 fn collision_winner<'a>(rootfs: &Path, layers: &'a [PathBuf], rel: &Path) -> Option<&'a Path> {
     use std::os::unix::fs::MetadataExt as _;
     let placed = fs::symlink_metadata(rootfs.join(rel)).ok()?;
+    if placed.is_symlink() {
+        let target = fs::read_link(rootfs.join(rel)).ok()?;
+        return layers
+            .iter()
+            .find(|layer| fs::read_link(layer.join(rel)).is_ok_and(|t| t == target))
+            .map(PathBuf::as_path);
+    }
     layers
         .iter()
         .find(|layer| {
@@ -4240,6 +4249,38 @@ mod tests {
         assert_eq!(
             super::collision_winner(&rootfs, &layers, std::path::Path::new("usr/lib/none")),
             None
+        );
+    }
+
+    /// Two layers ship one path as symlinks to different targets. The link
+    /// pass makes the rootfs symlink anew rather than linking it, so no
+    /// layer shares its inode: the winner is the layer whose link points
+    /// where the placed one does, in link order.
+    #[test]
+    fn collision_winner_of_a_symlink_is_the_layer_whose_target_the_rootfs_carries() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let rootfs = tmp.path().join("rootfs");
+        for layer in [&a, &b] {
+            std::fs::create_dir_all(layer.join("usr/bin")).unwrap();
+        }
+        symlink("python3.12", a.join("usr/bin/python3")).unwrap();
+        symlink("python3.13", b.join("usr/bin/python3")).unwrap();
+        let mut counts = common::LinkCollisions::recording();
+        super::hardlink_dir_contents_counted(&a, &rootfs, &mut counts).unwrap();
+        super::hardlink_dir_contents_counted(&b, &rootfs, &mut counts).unwrap();
+        assert_eq!(counts.differ, 1);
+        let d = &counts.differing[0];
+        assert_eq!(d.rel, std::path::Path::new("usr/bin/python3"));
+        assert_eq!(d.loser, b);
+        assert_eq!(d.why, "another target");
+        let layers = [a.clone(), b.clone()];
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, &d.rel),
+            Some(a.as_path()),
+            "the first-linked layer's target is the one the rootfs link carries"
         );
     }
 
