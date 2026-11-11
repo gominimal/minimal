@@ -58,6 +58,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# apparmor_parser lives in /usr/sbin (Debian, Ubuntu), which a user's PATH
+# does not hold: --check runs unprivileged, so look there too.
+PATH="$PATH:/usr/sbin:/sbin"
 command -v apparmor_parser >/dev/null 2>&1 ||
     die "apparmor_parser not found; this host does not have AppArmor (nothing to install)"
 
