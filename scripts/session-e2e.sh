@@ -379,8 +379,9 @@
 #   a_build_box_fetches_its_source
 #                                    NET-155, NET-165: a deny-all box's cold
 #                                    build of a package at the pinned commit
-#                                    fetches its source and succeeds, and the
-#                                    box stays deny-all
+#                                    fetches its source cold and succeeds,
+#                                    and the box stays deny-all; NOT RUN
+#                                    without a switch or, natively, a tap
 #   host_ip_rules_follow_the_running_box
 #                                    NET-085, VM host: root in the VM
 #                                    wearing the node's address and the box
@@ -23215,12 +23216,54 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 }
 
 # NET-155, NET-165: every other proof of a build box stops at a refusal or at a
-# cache hit, so this one forces a cold build. The package comes from the pinned
-# upstream, its source is `gs://`, and the box allows nothing: only the table
-# `min` made at the box's creation can give the fetch its reach.
+# cache hit, so this one forces a cold build and a cold source fetch. The
+# package comes from the pinned upstream, its source is `gs://`, and the box
+# allows nothing: only the table `min` made at the box's creation can give the
+# fetch its reach. The package is `tree`: a plain Makefile with no configure,
+# so its cold build regenerates nothing, and no other proof builds it. On a VM
+# lane the guest daemon's download cache starts empty with the lane's fresh
+# state. On a native lane this proof removes the source from the daemon's
+# download cache first. Either way the proof asks the daemon's log for the
+# grant the fetch opened, so a source that was cached anyway fails the proof.
 proof_a_build_box_fetches_its_source() {
-  local bbf_pkg="jq" bbf_sid="" bbf_out="" bbf_rc="" bbf_policy=""
+  local bbf_pkg="tree" bbf_sid="" bbf_out="" bbf_rc="" bbf_policy="" bbf_native=""
+  local bbf_sha="513a53cbc42ca1f4ea06af2bab1f5283524a3848266b1d162416f8033afc4985"
+  local bbf_grant=""
   echo "::group::a build box fetches its source for a deny-all box (NET-155, NET-165)"
+  # An own-address box needs the switch, as the other own-IP proofs do, and
+  # on a native lane the tap device too.
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    not_run a_build_box_fetches_its_source "no switch staged: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set, and a deny-all box is an own-address box"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
+    bbf_native=1
+    if [ ! -c /dev/net/tun ]; then
+      not_run a_build_box_fetches_its_source "no /dev/net/tun on this host: a native own-address box opens its tap on this host and needs the device"
+      echo "::endgroup::"
+      return 0
+    fi
+    native_switch_daemon
+    # The daemon's download cache, by the source's sha256 (paths::minimal_cache_dir).
+    # shellcheck disable=SC2031
+    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/minimal/downloads/$bbf_sha"
+  fi
+  # The logs that say why a failed build failed: the daemon's, where this
+  # lane can read it, and on a VM lane the guest daemon's console too.
+  bbf_logs() {
+    if [ -n "$bbf_native" ]; then
+      echo "--- the daemon's log, last lines ---"
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+        -exec cat {} + 2>/dev/null | tail -n 40 || true
+    else
+      echo "--- the VM host daemon's build grant lines ---"
+      minvmd_log_lines 'build grant' | tail -n 20 || true
+      echo "--- the guest daemon's console, last lines ---"
+      tail -n 40 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" \
+        2>/dev/null || true
+    fi
+  }
   BBF_SEED_DIR="$(hook_mktemp /tmp/mnlbbf.XXXXXX)"
   hook_seed_preamble > "$BBF_SEED_DIR/minimal.toml"
   mkdir "$BBF_SEED_DIR/.git"
@@ -23228,6 +23271,7 @@ proof_a_build_box_fetches_its_source() {
     --network own_ip --deny-all-egress 2>"$WORK/bbf-activate.err")" || {
     echo "::error::the deny-all box's activate failed"
     cat "$WORK/bbf-activate.err" 2>/dev/null || true
+    switch_spawn_fault "$WORK/bbf-activate.err" || true
     fail
   }
   bbf_sid="$(printf '%s\n' "$bbf_sid" | tail -n1)"
@@ -23237,15 +23281,35 @@ proof_a_build_box_fetches_its_source() {
     2>"$WORK/bbf-build.err")" || {
     echo "::error::the in-box 'min package build --rebuild $bbf_pkg' could not run"
     cat "$WORK/bbf-build.err" 2>/dev/null || true
+    bbf_logs
     fail
   }
   bbf_out="$(printf '%s\n' "$bbf_out" | tr -d '\r')"
-  printf '%s\n' "$bbf_out" | tail -n 20 | sed 's/^/  /'
   bbf_rc="$(printf '%s\n' "$bbf_out" | sed -n 's/^build-exit=//p' | tail -n1)"
   if [ "$bbf_rc" != 0 ]; then
     echo "::error::the cold build of $bbf_pkg failed (exit '$bbf_rc'): the table should give its fetch the source's host"
+    echo "--- the build's output, last lines ---"
+    printf '%s\n' "$bbf_out" | tail -n 60 | sed 's/^/  /'
+    bbf_logs
     fail
   fi
+  printf '%s\n' "$bbf_out" | tail -n 20 | sed 's/^/  /'
+  # The fetch was cold: the build box opened its grant, which a cached source
+  # never asks for.
+  if [ -n "$bbf_native" ]; then
+    bbf_grant="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+      -exec grep -h -- 'opened the network of a build box' {} + 2>/dev/null \
+      | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' | tail -n1)"
+  else
+    bbf_grant="$(minvmd_log_lines 'opened a build grant' \
+      | grep -F -- "\"session\":\"$bbf_sid\"" | tail -n1)"
+  fi
+  if [ -z "$bbf_grant" ]; then
+    echo "::error::the build of $bbf_pkg passed, but no build grant opened for the box: its source was in the daemon's download cache, so the build box fetched nothing"
+    bbf_logs
+    fail
+  fi
+  echo "grant: $bbf_grant"
   bbf_policy="$(mnl session policy "$bbf_sid" 2>&1)"
   if ! grep -qF 'deny-all' <<<"$bbf_policy"; then
     echo "::error::the box's own rules changed: the reach is the build box's, not the box's"
