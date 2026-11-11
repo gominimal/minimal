@@ -815,6 +815,12 @@ pub type BuildGrantTable = std::collections::BTreeMap<String, BuildGrant>;
 
 /// The egress of a build box reaching `hosts`, or the internet (NET-167,
 /// NET-168).
+///
+/// The internet branch, `0.0.0.0/0`, is an interim (design §7.1 and §8): it
+/// lasts until per-package host lists replace it (design §12 item 15), and
+/// then a build that declares `needs` gets its package's listed hosts
+/// instead. The flip is tracked in
+/// [gominimal/arch#158](https://github.com/gominimal/arch/issues/158).
 #[must_use]
 pub fn build_box_egress(
     hosts: &std::collections::BTreeSet<String>,

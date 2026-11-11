@@ -811,7 +811,7 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-168** WHILE a package with a table entry declares `needs.dns` or `needs.internet`, on the package or in its closure, THE SYSTEM SHALL give its build box egress to the internet for its fetch and its build steps.
   tier:     T0
   verify:   cargo nextest run -p op registry_needs_internet_build_box_gets_internet
-  <!-- state-driven; rules 3 and 9 of the ruling: `needs.internet` means only that build steps need the internet, and a `needs` through the build closure still counts until the sequence in gominimal/pkgs#1370 ends. The always-on infrastructure deny set (NET-067) still applies. -->
+  <!-- state-driven; rules 3 and 9 of the ruling: `needs.internet` means only that build steps need the internet, and a `needs` through the build closure still counts until the sequence in gominimal/pkgs#1370 ends. The always-on infrastructure deny set (NET-067) still applies. The open internet is the interim of design §7.1 and §8, not the end state: it lasts until per-package host lists replace it (design §12 item 15), and then the build box gets its package's listed hosts instead. The flip is tracked in [gominimal/arch#158](https://github.com/gominimal/arch/issues/158). -->
 
 - **NET-169** WHEN `minimald` runs a build for a box whose spec hash the box's table does not hold THE SYSTEM SHALL give the build box the egress rules of the requesting box, whatever the package's origin.
   tier:     T0
