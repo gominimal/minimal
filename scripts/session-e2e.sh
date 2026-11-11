@@ -8128,7 +8128,7 @@ echo "::endgroup::"
 #      which stays listed as exited (BOX-038),
 #   3. a re-attach resumes the exited box, and killing the ssh transport
 #      mid-attach (the `min proxy` ProxyCommand,
-#      as a dropped connection) exits 255 and leaves the terminal's termios
+#      as a dropped connection) exits 7 (BCLI-068) and leaves the terminal's termios
 #      (its `stty -g`) exactly as it was before the attach,
 #   4. the session outlives the drop, its shell's `exit` ends the box as
 #      exited, and `min session destroy` then removes it.
@@ -8198,10 +8198,10 @@ echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte p
 # 3. Re-attach, which resumes the exited box, and kill the transport
 # mid-attach.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=255 \
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=7 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-drop.err")" || {
-  echo "::error::the transport-drop attach did not exit 255"
+  echo "::error::the transport-drop attach did not exit 7"
   echo "--- transcript ---"; printf '%s\n' "$relay_out"
   echo "--- stderr ---"; cat "$WORK/relay-drop.err" 2>/dev/null || true
   fail
@@ -8211,7 +8211,7 @@ if [[ "$relay_out" != *OUTER_STTY_UNCHANGED* ]]; then
   echo "--- transcript ---"; printf '%s\n' "$relay_out"
   fail
 fi
-echo "a dropped transport exited 255 and left the terminal's stty -g unchanged"
+echo "a dropped transport exited 7 and left the terminal's stty -g unchanged"
 
 # 4. The session outlived the drop. Its shell's `exit` ends the box, and the
 # destroy removes it.

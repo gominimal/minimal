@@ -28,7 +28,8 @@ local spool:
 
 ```sh
 export MINIMAL_TELEMETRY=1
-min stop   # daemons keep the settings they started with; see below
+min host list          # prints your host names, such as local0
+min host stop local0   # daemons keep the settings they started with; see below
 min ls
 ```
 
@@ -37,7 +38,7 @@ To also send them to a collector, name its OTLP/HTTP endpoint:
 ```sh
 export MINIMAL_TELEMETRY=1
 export MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-min stop
+min host stop local0
 min ls
 ```
 
@@ -46,7 +47,7 @@ min ls
 **Daemons keep the settings they started with.** `minimald` and `minvmd`
 read the telemetry variables once, when they start, from the environment of
 the `min` command that started them. Changing a variable in your shell does
-not change a daemon that is already running. Run `min stop`, and the next
+not change a daemon that is already running. Run `min host stop <host>`, and the next
 `min` command starts the daemon again with your current settings.
 
 ## Pointing at a collector
@@ -180,7 +181,7 @@ level and above, from every part of minimal. That includes command and
 request names, session ids and names, paths (which can include your user
 name), host names, timing, and errors.
 
-- The command line of a session exec goes on its span only after the secret
+- The command line of an exec in a box goes on its span only after the secret
   scrubber that `min bug` also uses runs over it. The scrubber masks
   `Authorization` and `Proxy-Authorization` header values, credentials in
   URLs, and tokens with well-known prefixes (GitHub, `sk-`, Slack, AWS access
@@ -253,8 +254,8 @@ min 0.7.1: the stable channel is now at 0.7.2. How to update: https://docs.minim
 ```
 
 The line goes to stderr only when stderr is a terminal, and it waits for a
-short command whose output leaves it in view, such as `min ls`, `min dirs`,
-`min stop` or `min init`. A command that takes the terminal (bare `min`,
+short command whose output leaves it in view, such as `min ls`, `min dirs`
+or `min init`. A command that takes the terminal (bare `min`,
 `min run`, `min session attach`, `min task`, `min box`, the dashboard) never
 prints it, so if you only use those, the line is not shown. stdout, the exit
 code and the command's timing are never touched: the request is made by a
@@ -326,7 +327,7 @@ At 1.0 the default flips to off.
 | Scope | How |
 |---|---|
 | One command | Unset `MINIMAL_TELEMETRY`, or set `DO_NOT_TRACK` to any non-empty value, or set `OTEL_SDK_DISABLED=true`. |
-| The daemons | Run `min stop` and start the next command from a shell where telemetry is off. A running daemon keeps the setting it started with, and records nothing for a command that runs with telemetry off. |
+| The daemons | Run `min host stop <host>` and start the next command from a shell where telemetry is off. A running daemon keeps the setting it started with, and records nothing for a command that runs with telemetry off. |
 | One signal | `MINIMAL_OTEL_TRACES_EXPORTER=none` or `MINIMAL_OTEL_LOGS_EXPORTER=none`. |
 | The spool only | `MINIMAL_OTEL_SPOOL=0`. |
 | One project | There is no setting in `minimal.toml`. Set the variables in that project's shell environment. The daemons are shared by all your projects, so they follow whichever command started them. |
@@ -414,7 +415,7 @@ given, so it needs the full path. Check that headers your collector needs are in
 `MINIMAL_OTEL_EXPORTER_OTLP_HEADERS` for a `MINIMAL_` endpoint, or in
 `OTEL_EXPORTER_OTLP_HEADERS` for a plain one.
 
-**A change did not take effect.** Run `min stop`: the daemons still have the
+**A change did not take effect.** Run `min host stop <host>`: the daemons still have the
 settings they started with.
 
 ## Privacy
