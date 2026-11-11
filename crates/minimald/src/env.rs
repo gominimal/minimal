@@ -4988,6 +4988,9 @@ exit $rc
             .args(args)
             .current_dir(cwd)
             .env_remove("TRACEPARENT")
+            // The host can carry the telemetry opt-out, and the helper then
+            // prefixes its request with `otel%off%`.
+            .env_remove(minimald_rpc::trace::OTEL_ENV)
             .env("PWD", cwd)
             .envs(envs.iter().copied())
             .env(
@@ -5071,6 +5074,7 @@ exit $rc
             .args(args)
             .current_dir(rootfs)
             .env_remove("TRACEPARENT")
+            .env_remove(minimald_rpc::trace::OTEL_ENV)
             .env("PWD", rootfs)
             .env(
                 "PATH",
