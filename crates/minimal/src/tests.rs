@@ -14688,6 +14688,61 @@ async fn box_exec_show_logs_wait_stop_end_to_end() {
     }
 }
 
+/// BCLI-042: the concept and reference pages name no removed session verb.
+/// Each page names the box verbs and the type nouns in their place.
+#[test]
+fn concept_and_reference_docs_use_no_removed_session_verb() {
+    const PAGES: &[&str] = &[
+        "docs/concepts/loadouts.md",
+        "docs/concepts/sessions.md",
+        "docs/reference/linux-host-setup.md",
+        "docs/reference/loadouts.md",
+        "docs/reference/minimal-dot-toml.md",
+        "docs/reference/sandbox-operations.md",
+        "docs/reference/tasks.md",
+        "docs/reference/telemetry.md",
+        "docs/reference/user-policy.md",
+    ];
+    const REMOVED_SESSION_VERBS: &[&str] = &[
+        "activate", "destroy", "exec", "rename", "policy", "hooks", "run",
+    ];
+    // A spelling matches only as a whole word: `min stop` is removed, and
+    // `min stopwatch` is a different word.
+    fn has_word(line: &str, spelling: &str) -> bool {
+        line.match_indices(spelling).any(|(at, _)| {
+            let next = line[at + spelling.len()..].chars().next();
+            !next.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        })
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut found = Vec::new();
+    for page in PAGES {
+        let text = std::fs::read_to_string(root.join(page))
+            .unwrap_or_else(|e| panic!("{page} must be readable: {e}"));
+        for (n, line) in text.lines().enumerate() {
+            let mut hits: Vec<String> = REMOVED_SESSION_VERBS
+                .iter()
+                .map(|verb| format!("min session {verb}"))
+                .filter(|spelling| has_word(line, spelling))
+                .collect();
+            if has_word(line, "min task run") && line.contains("--path") {
+                hits.push("min task run --path".to_owned());
+            }
+            if has_word(line, "min stop") {
+                hits.push("min stop".to_owned());
+            }
+            for hit in hits {
+                found.push(format!("{page}:{}: `{hit}`: {line}", n + 1));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "removed spellings in the concept and reference docs:\n{}",
+        found.join("\n")
+    );
+}
+
 // T26 (S6): retained boxes managed, end to end. `min box rename` renames a
 // box, and every later command reaches it by the new name. `min box cp`
 // copies a file out of the box after it stops. `min box events` replays the
