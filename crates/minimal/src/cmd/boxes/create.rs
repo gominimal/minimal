@@ -2710,20 +2710,27 @@ pub(crate) fn put_spec(
 /// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
 /// list of the spec on `request` (BCLI-024). A name the list already holds
 /// is not added again. The daemon stores the list with the box's spec, and
-/// does not enforce it (BOX-076). Nothing changes when `names` is empty or
-/// the request carries no spec.
+/// does not enforce it (BOX-076). Nothing changes when `names` is empty.
 ///
 /// # Errors
 ///
-/// Fails when the spec on `request` has a `network` that is not a table,
-/// or a `network.vpn_network_names` that is not a list.
+/// Fails when `names` is not empty and the request carries no spec, so a
+/// name is never dropped without a word. Fails too when the spec on
+/// `request` has a `network` that is not a table, or a
+/// `network.vpn_network_names` that is not a list.
 pub(crate) fn add_vpn_network_names(
     request: &mut minimald_rpc::CreateSessionRequest,
     names: &[String],
 ) -> Result<(), anyhow::Error> {
     use serde_json_lenient::Value;
-    let Some(spec) = request.spec.as_mut().filter(|_| !names.is_empty()) else {
+    if names.is_empty() {
         return Ok(());
+    }
+    let Some(spec) = request.spec.as_mut() else {
+        anyhow::bail!(
+            "Cannot use --vpn-network-names here: this box does not store a `[network]` \
+             section. Run the command again without --vpn-network-names."
+        );
     };
     let network = spec
         .as_object_mut()

@@ -231,7 +231,8 @@ fn task_box_network(
 /// ingress policy, `--credentialed-upstream` declares the lane to the
 /// Box Egress Proxy, and `--quic443` sets the stance on UDP to port 443.
 /// Each flag changes only its own key. `--vpn-network-names` is applied to
-/// the spec, by [`crate::add_vpn_network_names`].
+/// the spec, by [`crate::add_vpn_network_names`], which refuses it when
+/// the box has no spec.
 ///
 /// # Errors
 ///
@@ -1515,12 +1516,14 @@ pub(crate) async fn run_entry(
     // interactive task sends none: the task type denies a terminal.
     if let Some(spec) = &spec {
         crate::put_spec(&mut request, spec)?;
-        crate::add_vpn_network_names(&mut request, &args.other.vpn_network_names)?;
     } else {
         // With no spec to name it, the request carries the entry's name,
         // cleaned as the daemon cleans a spec's entry.
         request.config.name = Some(interactive_task_box_name(&args.entry));
     }
+    // With no spec, a `--vpn-network-names` value has no place to go, so
+    // the helper refuses it rather than drop it.
+    crate::add_vpn_network_names(&mut request, &args.other.vpn_network_names)?;
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
