@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod box_types;
 pub mod duration;
 pub mod entry;
 mod error;
@@ -29,8 +30,7 @@ pub use tasks::{Task, TaskAction};
 
 pub const MFILE_NAME: &str = "minimal.toml";
 
-/// The top-level table that declares the project's Box Types (BOX-059).
-const BOX_TYPES_TABLE: &str = "box_types";
+use box_types::BOX_TYPES_TABLE;
 
 /// Overrides how many seconds an edit of `minimal.toml` waits for another
 /// command's lock before it fails.
