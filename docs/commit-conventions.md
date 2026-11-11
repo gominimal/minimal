@@ -72,6 +72,8 @@ feat(boxes): T102 — Add CWD-relative path types
 
 Commits on the branch still follow the lower-case rule above. Only a PR title may keep the capitals of the task-key form.
 
+A title has no length limit, so a subject on `main` may run past commitlint's 100 characters; nothing that reads subjects depends on it. The check warns, without failing, when a title is over 92 characters, which leaves room for the ` (#1234)` that GitHub appends.
+
 ## Examples
 
 ```
