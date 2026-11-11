@@ -1027,8 +1027,20 @@ proxy_port_from_ls() {
         PROXY_PORT="$(mnl ls --json 2>/dev/null \
           | jq -r 'first(.. | objects | select(has("hostname_proxy_port")) | .hostname_proxy_port | numbers)' 2>/dev/null || true)"
         case "$PROXY_PORT" in *[!0-9]*|"") PROXY_PORT="" ;; esac
-        [ -n "$PROXY_PORT" ] || PROXY_PORT="$(printf '%s\n' "$PROXY_LS_OUT" | grep -F -- 'HOSTNAME PROXY' \
-          | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
+        # The text fallback takes the row's port only when the row names one:
+        # a row naming several (a VM host's served ports) is read through
+        # jq alone, since the first listed is not the one a box dials, and a
+        # lane without jq fails here rather than probe a port no box dials.
+        if [ -z "$PROXY_PORT" ]; then
+          local row_ports
+          row_ports="$(printf '%s\n' "$PROXY_LS_OUT" | grep -F -- 'HOSTNAME PROXY' \
+            | grep -oE '127\.0\.0\.1:[0-9]+' | cut -d: -f2 | sort -u || true)"
+          case "$(printf '%s\n' "$row_ports" | grep -c .)" in
+            1) PROXY_PORT="$row_ports" ;;
+            0) ;;
+            *) echo "hostname proxy: the row names several ports ($(printf '%s' "$row_ports" | tr '\n' ' ')) and jq is not available to read the reported one; not guessing" ;;
+          esac
+        fi
         ;;
     esac
     [ -n "$PROXY_PORT" ] && break
