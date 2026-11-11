@@ -3173,14 +3173,39 @@ fn box_listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>>
         .collect())
 }
 
-/// The listening ports of `entry`'s network namespace whose socket `entry`'s
-/// own process holds a descriptor for: the rows of its `tcp` and `tcp6`
-/// tables ([`listen_port`]) matched by socket inode against the
-/// `socket:[<inode>]` links under its `fd` directory. A missing `tcp6`
-/// table reads as no v6 listeners, as in [`listening_ports_in`].
-#[cfg(test)]
-fn listening_ports_held_by(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
-    let held: HashSet<u64> = std::fs::read_dir(entry.join("fd"))?
+/// The listening sockets of the network namespace whose `net/tcp` and
+/// `net/tcp6` tables sit under `dir` (a `/proc` root, or one `/proc/<pid>`
+/// entry): every row a forward dialing `lease` can deliver to
+/// ([`listen_port`]), keyed by the socket's inode, the table's tenth column.
+/// A missing `tcp6` table reads as no v6 listeners, as in
+/// [`listening_ports_in`].
+fn listening_inodes(dir: &Path, lease: Ipv4Addr) -> io::Result<HashMap<u64, u16>> {
+    let mut by_inode = HashMap::new();
+    for (table, v6) in [("net/tcp", false), ("net/tcp6", true)] {
+        let text = match std::fs::read_to_string(dir.join(table)) {
+            Ok(text) => text,
+            Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for line in text.lines().skip(1) {
+            let inode = line
+                .split_whitespace()
+                .nth(9)
+                .and_then(|word| word.parse().ok());
+            if let (Some(port), Some(inode)) = (listen_port(line, v6, lease), inode) {
+                by_inode.insert(inode, port);
+            }
+        }
+    }
+    Ok(by_inode)
+}
+
+/// The socket inodes a process holds a descriptor for: the `socket:[<inode>]`
+/// links under its `fd` directory. Fails only when the directory itself
+/// cannot be read; a link that cannot be read, or is not a socket, is passed
+/// over.
+fn socket_inodes(fd_dir: &Path) -> io::Result<Vec<u64>> {
+    Ok(std::fs::read_dir(fd_dir)?
         .flatten()
         .filter_map(|fd| std::fs::read_link(fd.path()).ok())
         .filter_map(|target| {
@@ -3191,27 +3216,20 @@ fn listening_ports_held_by(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<
                 .parse()
                 .ok()
         })
-        .collect();
-    let mut ports = HashSet::new();
-    for (table, v6) in [("net/tcp", false), ("net/tcp6", true)] {
-        let text = match std::fs::read_to_string(entry.join(table)) {
-            Ok(text) => text,
-            Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for line in text.lines().skip(1) {
-            let inode = line
-                .split_whitespace()
-                .nth(9)
-                .and_then(|word| word.parse::<u64>().ok());
-            if let (Some(port), Some(inode)) = (listen_port(line, v6, lease), inode)
-                && held.contains(&inode)
-            {
-                ports.insert(port);
-            }
-        }
-    }
-    Ok(ports)
+        .collect())
+}
+
+/// The listening ports of `entry`'s network namespace whose socket `entry`'s
+/// own process holds a descriptor for: its [`listening_inodes`] matched
+/// against its [`socket_inodes`].
+#[cfg(test)]
+fn listening_ports_held_by(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
+    let held = socket_inodes(&entry.join("fd"))?;
+    let listening = listening_inodes(entry, lease)?;
+    Ok(held
+        .iter()
+        .filter_map(|inode| listening.get(inode).copied())
+        .collect())
 }
 
 /// [`listening_ports`] for one `/proc` entry.
@@ -3337,23 +3355,7 @@ pub(crate) fn host_address_listening_ports(
     own_pid: u32,
     lease: Ipv4Addr,
 ) -> io::Result<BTreeSet<u16>> {
-    let mut by_inode: HashMap<u64, u16> = HashMap::new();
-    for (table, v6) in [("net/tcp", false), ("net/tcp6", true)] {
-        let text = match std::fs::read_to_string(proc_root.join(table)) {
-            Ok(text) => text,
-            Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for line in text.lines().skip(1) {
-            let inode = line
-                .split_whitespace()
-                .nth(9)
-                .and_then(|word| word.parse().ok());
-            if let (Some(port), Some(inode)) = (listen_port(line, v6, lease), inode) {
-                by_inode.insert(inode, port);
-            }
-        }
-    }
+    let by_inode = listening_inodes(proc_root, lease)?;
     // Per listening socket: whether a box process holds it, and whether
     // anything that is not a box process holds it too.
     let mut held: HashMap<u64, (bool, bool)> = HashMap::new();
@@ -3365,20 +3367,11 @@ pub(crate) fn host_address_listening_ports(
         else {
             continue;
         };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+        let Ok(inodes) = socket_inodes(&entry.path().join("fd")) else {
             continue;
         };
-        let inodes: Vec<u64> = fds
-            .flatten()
-            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
-            .filter_map(|target| {
-                target
-                    .to_str()?
-                    .strip_prefix("socket:[")?
-                    .strip_suffix(']')?
-                    .parse()
-                    .ok()
-            })
+        let inodes: Vec<u64> = inodes
+            .into_iter()
             .filter(|inode| by_inode.contains_key(inode))
             .collect();
         if inodes.is_empty() {
