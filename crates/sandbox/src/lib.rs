@@ -113,6 +113,11 @@ impl FirstStdin {
     pub fn new(hook: impl FnOnce(fs::File) -> std::io::Result<()> + Send + 'static) -> Self {
         Self(Box::new(hook))
     }
+
+    /// Hands `pipe` to the hook.
+    pub fn call(self, pipe: fs::File) -> std::io::Result<()> {
+        (self.0)(pipe)
+    }
 }
 
 impl std::fmt::Debug for FirstStdin {
@@ -2618,7 +2623,7 @@ impl<C: Channel> Sandbox<C> {
 
             if let Some(hook) = stdin_hook {
                 let passed = match child.stdin.take() {
-                    Some(pipe) => (hook.0)(fs::File::from(std::os::fd::OwnedFd::from(pipe))),
+                    Some(pipe) => hook.call(fs::File::from(std::os::fd::OwnedFd::from(pipe))),
                     None => Err(std::io::Error::other("the invocation has no stdin pipe")),
                 };
                 if let Err(e) = passed {
@@ -2627,7 +2632,11 @@ impl<C: Channel> Sandbox<C> {
                     if let Some(net_guard) = net_guard {
                         net_guard.teardown().await;
                     }
-                    return Err(Error::IO("passing stdin to the task", Default::default(), e));
+                    return Err(Error::IO(
+                        "passing stdin to the task",
+                        Default::default(),
+                        e,
+                    ));
                 }
             }
 
@@ -8089,7 +8098,10 @@ int main(int argc, char **argv) {
             .arg(&src)
             .status()
             .expect("spawning gcc to compile the cwd probe");
-        assert!(status.success(), "gcc failed to compile the cwd probe: {status:?}");
+        assert!(
+            status.success(),
+            "gcc failed to compile the cwd probe: {status:?}"
+        );
         let source = build.path().join("rootfs-src");
         probe_rootfs(&source, &bin);
         let sandbox_home = tempfile::tempdir_in(&base_dir)
