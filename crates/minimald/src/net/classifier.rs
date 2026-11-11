@@ -771,8 +771,16 @@ pub(crate) async fn run_nft_script(nft: &Path, script: &str) -> std::io::Result<
                 format!("cannot run {}: {error}", nft.display()),
             )
         })?;
+    // nft may exit before it has read the whole script (a refusal on its first lines): the write then
+    // ends in EPIPE, and what nft said is in its stderr below, which is the error to report. Only an nft
+    // that exits 0 without reading its whole script is an error of its own.
+    let mut unread = false;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(script.as_bytes()).await?;
+        match stdin.write_all(script.as_bytes()).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => unread = true,
+            Err(error) => return Err(error),
+        }
     }
     let ran = tokio::time::timeout(TABLE_LIST_DEADLINE, child.wait_with_output())
         .await
@@ -783,6 +791,12 @@ pub(crate) async fn run_nft_script(nft: &Path, script: &str) -> std::io::Result<
             )
         })??;
     if ran.status.success() {
+        if unread {
+            return Err(std::io::Error::other(format!(
+                "{} exited 0 before reading its whole script",
+                nft.display()
+            )));
+        }
         return Ok(());
     }
     Err(std::io::Error::other(format!(
@@ -10135,6 +10149,28 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(error.to_string().contains("no such table"), "{error}");
+
+        // An nft that refuses before reading its whole script (the write ends in EPIPE, which won the
+        // race over its stderr once in 213 lab runs and once on a Lima host) still reports what it said.
+        // A script past the pipe's buffer makes the early exit certain.
+        let big = "# padding\n".repeat(20_000);
+        let error = run_nft_script(&refusing, &big)
+            .await
+            .expect_err("refused before reading");
+        assert!(error.to_string().contains("no such table"), "{error}");
+        // and one that exits 0 without reading it is its own error, not a success
+        let silent = dir.path().join("silent");
+        std::fs::write(&silent, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = run_nft_script(&silent, &big)
+            .await
+            .expect_err("exit 0 without reading the script");
+        assert!(
+            error
+                .to_string()
+                .contains("before reading its whole script"),
+            "{error}"
+        );
     }
 
     /// gominimal/minimal#3067: a native daemon outside its leaf places no
