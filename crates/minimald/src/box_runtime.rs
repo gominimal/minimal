@@ -676,7 +676,7 @@ pub(crate) fn launch_span(
         entrypoint = entrypoint.log_name(),
         args = entrypoint.arg_count(),
         otel.status_code = tracing::field::Empty,
-        otel.status_message = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
     );
     tracing::info!(
         parent: &span,
@@ -1306,7 +1306,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // (gominimal/minimal#3223), before the error goes up.
         if let Err(e) = &launched {
             launch_span.record("otel.status_code", "ERROR");
-            launch_span.record("otel.status_message", format!("{e:#}").as_str());
+            launch_span.record("otel.status_description", format!("{e:#}").as_str());
         }
         let Launched {
             master,

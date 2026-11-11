@@ -67,7 +67,7 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
-        otel.status_message = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -333,7 +333,7 @@ where
         && outcome == "error"
     {
         span.record("otel.status_code", "ERROR");
-        span.record("otel.status_message", format!("{e:#}").as_str());
+        span.record("otel.status_description", format!("{e:#}").as_str());
     }
     // Release every handle on the span, so it closes here.
     drop(slot);
@@ -1981,7 +1981,7 @@ mod handoff_tests {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
             // The code and the message land on one span in that order; the
             // log keeps the last, which is the message when there is one.
-            if field.name() == "otel.status_code" || field.name() == "otel.status_message" {
+            if field.name() == "otel.status_code" || field.name() == "otel.status_description" {
                 self.0 = Some(value.to_owned());
             }
         }
@@ -2140,7 +2140,7 @@ mod handoff_tests {
             tracing::info_span!(
                 "cmd",
                 otel.status_code = tracing::field::Empty,
-                otel.status_message = tracing::field::Empty
+                otel.status_description = tracing::field::Empty
             )
         };
         let ok = run_in_root(cmd(), async { Ok(()) }).await;

@@ -273,6 +273,10 @@ pub struct GcsUrl {
 impl FetchUrl for GcsUrl {
     type JoinError = ();
 
+    fn origin(&self) -> String {
+        format!("gs://{}", self.bucket)
+    }
+
     fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
         let mut out = self.clone();
         if out.object.is_empty() {
@@ -413,6 +417,13 @@ impl FetchUrl for AnyUrl {
         match self {
             AnyUrl::Https(u) => u.filename(),
             AnyUrl::Gcs(u) => u.filename(),
+        }
+    }
+
+    fn origin(&self) -> String {
+        match self {
+            AnyUrl::Https(u) => u.origin(),
+            AnyUrl::Gcs(u) => u.origin(),
         }
     }
 }

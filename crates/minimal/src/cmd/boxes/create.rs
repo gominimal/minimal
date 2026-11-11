@@ -2431,7 +2431,7 @@ impl ActivationStep {
             "activation_step",
             step = self.name(),
             otel.status_code = tracing::field::Empty,
-            otel.status_message = tracing::field::Empty
+            otel.status_description = tracing::field::Empty
         );
         let result = work.instrument(span.clone()).await;
         if let Err(error) = &result {
@@ -2440,7 +2440,7 @@ impl ActivationStep {
             // (gominimal/minimal#3223); the event stays at INFO, since a
             // failed step is often expected.
             span.record("otel.status_code", "ERROR");
-            span.record("otel.status_message", format!("{error:#}").as_str());
+            span.record("otel.status_description", format!("{error:#}").as_str());
             span.in_scope(|| {
                 tracing::info!(
                     step = self.name(),

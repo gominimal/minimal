@@ -520,7 +520,7 @@ impl Client {
         self.oneshot_rpc_within::<R>(request, deadline).await
     }
 
-    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty, otel.status_message = tracing::field::Empty))]
+    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty, otel.status_description = tracing::field::Empty))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -583,7 +583,7 @@ impl Client {
             if daemon_refused(&resp_buf) {
                 let span = tracing::Span::current();
                 span.record("otel.status_code", "ERROR");
-                span.record("otel.status_message", "the daemon refused the request");
+                span.record("otel.status_description", "the daemon refused the request");
             }
             Ok(response)
         };
@@ -598,7 +598,7 @@ impl Client {
             // status says what failed (gominimal/minimal#3223).
             let span = tracing::Span::current();
             span.record("otel.status_code", "ERROR");
-            span.record("otel.status_message", format!("{e:#}").as_str());
+            span.record("otel.status_description", format!("{e:#}").as_str());
         }
         result
     }
