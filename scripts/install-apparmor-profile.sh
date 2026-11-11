@@ -72,7 +72,12 @@ command -v apparmor_parser >/dev/null 2>&1 ||
 # --uninstall path still runs, for a file an earlier run left.
 if [ "$mode" != uninstall ] && [ ! -e "$APPARMOR_D/abi/4.0" ]; then
     note "this host's AppArmor has no abi/4.0 (parser: $(apparmor_parser --version 2>/dev/null | head -1)):"
-    note "it does not mediate user namespaces, so minimald needs no profile here; nothing installed"
+    if [ "$mode" = check ]; then
+        # a lane that depends on the parse reads this line, not a silent 0
+        note "check skipped: the profile declares abi/4.0, which this parser cannot read; it was not parsed here"
+    else
+        note "it does not mediate user namespaces, so minimald needs no profile here; nothing installed"
+    fi
     exit 0
 fi
 
