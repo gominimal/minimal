@@ -1436,6 +1436,15 @@ mod tests {
                 minimal::BoxAttachRefusal::NotResumable {
                     address: "web".to_owned(),
                     state: "running".to_owned(),
+                    pty_enabled: true,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NotResumable {
+                    address: "web".to_owned(),
+                    state: "running".to_owned(),
+                    pty_enabled: false,
                 },
                 2,
             ),

@@ -13202,6 +13202,17 @@ async fn attach_and_resume_verbs_resume_stopped_pty_box() {
         assert_eq!(target.box_id, live, "{verb:?}");
     }
     assert_eq!(address_state(&alpha.host, "live").await, "running");
+
+    // Arch C1: `min box resume` of a running box with no terminal exits 2
+    // and names `min box logs`, since `min box attach` refuses that box.
+    alpha.create("quiet", Some(false)).await;
+    let (message, code) = refused_by(AttachVerb::BoxResume, &hosts, Some("quiet"), None).await;
+    assert_eq!(code, 2, "{message}");
+    assert_eq!(
+        message,
+        "Cannot resume quiet: the box is running.\nRun min box logs quiet to see its output."
+    );
+    assert_eq!(address_state(&alpha.host, "quiet").await, "running");
 }
 
 /// NET-058: a named attach finds a box that only another VM knows, with

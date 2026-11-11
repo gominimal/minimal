@@ -576,6 +576,9 @@ pub enum BoxAttachRefusal {
         address: String,
         /// The box's state.
         state: String,
+        /// Whether the box has a terminal, so `min box attach` can attach
+        /// a running box. Else `min box logs` shows its output.
+        pty_enabled: bool,
     },
     /// A running box on the same host holds the name of the stopped or
     /// exited box to resume. Exit 2.
@@ -720,10 +723,18 @@ impl std::fmt::Display for BoxAttachRefusal {
                     write!(f, "Run it again with min box run <entry>.")
                 }
             }
-            Self::NotResumable { address, state } => {
+            Self::NotResumable {
+                address,
+                state,
+                pty_enabled,
+            } => {
                 writeln!(f, "Cannot resume {address}: the box is {state}.")?;
-                if state == "running" {
+                if state == "running" && *pty_enabled {
                     write!(f, "Attach to it with min box attach {address}.")
+                } else if state == "running" {
+                    // The same next step as `NoTerminalInBox`: an attach
+                    // to a running box with no terminal is refused.
+                    write!(f, "Run min box logs {address} to see its output.")
                 } else {
                     write!(f, "Only a stopped or exited box can resume.")
                 }
@@ -1569,6 +1580,7 @@ pub(crate) async fn attach_target(
         let refusal = BoxAttachRefusal::NotResumable {
             address: address.to_owned(),
             state: record.state.clone(),
+            pty_enabled: record.pty_enabled,
         };
         return Err(refuse(refusal, Some(box_id)));
     }
