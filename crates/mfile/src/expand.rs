@@ -298,6 +298,9 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
 ///
 /// The check reads the expansion and never changes it (BOX-062).
 ///
+/// No product path calls this function yet. gominimal/minimal#3295 adds
+/// the call after each `expand` in `crates/minimal/src/cmd/boxes/create.rs`.
+///
 /// # Errors
 ///
 /// [`BoxTypeError::ConstraintBroken`] for the first value that a
