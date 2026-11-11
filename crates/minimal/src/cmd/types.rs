@@ -15,13 +15,13 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use mfile::box_types::{BUILTIN_BOX_TYPES, BoxTypes, ResolvedType, builtin};
+use mfile::box_types::{BUILTIN_BOX_TYPES, BoxTypeError, BoxTypes, ResolvedType, builtin};
 use serde::Serialize;
 
-use crate::{GlobalArgs, TypeShowArgs};
+use crate::{GlobalArgs, TypeListArgs, TypeOutputFormat, TypeShowArgs};
 
 use super::box_audit::printable;
-use super::output::{ObjectType, OutputMode, Rendered, write_object};
+use super::output::{ObjectType, OutputMode, Rendered, write_object, write_objects};
 
 /// Where a type comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -135,6 +135,14 @@ pub fn write_type_list(out: &mut dyn Write, rows: &[TypeRow]) -> std::io::Result
     Ok(())
 }
 
+impl Rendered for TypeRow {
+    const TYPE: ObjectType = ObjectType::Type;
+
+    fn text(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        write_type_list(out, std::slice::from_ref(self))
+    }
+}
+
 /// One value of a type's defaults or constraints, with the type that sets
 /// it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -160,6 +168,9 @@ pub struct TypeDetail {
     pub extends: Option<String>,
     /// The built-in type at the end of the type's `extends` chain.
     pub root: String,
+    /// Every type of the `extends` chain, the built-in type first and this
+    /// type last. A type that sets no value is in it too.
+    pub chain: Vec<String>,
     /// The defaults of every type of the chain, the built-in type first and
     /// this type last.
     pub defaults: Vec<TypeValue>,
@@ -209,6 +220,11 @@ pub fn type_detail(types: &BoxTypes, resolved: &ResolvedType) -> TypeDetail {
             .get(&resolved.name)
             .map(|p| p.extends.clone()),
         root: resolved.root.to_owned(),
+        chain: resolved
+            .defaults
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect(),
         defaults: chain_values(&resolved.defaults),
         constraints: chain_values(&resolved.constraints),
     }
@@ -245,12 +261,335 @@ impl Rendered for TypeDetail {
             writeln!(out, "Extends:        {}", printable(extends))?;
         }
         writeln!(out, "Built-in type:  {}", self.root)?;
+        let chain: Vec<String> = self
+            .chain
+            .iter()
+            .map(|n| printable(n).into_owned())
+            .collect();
+        writeln!(out, "Type chain:     {}", chain.join(" -> "))?;
         writeln!(out)?;
         writeln!(out, "Defaults, in the order they apply:")?;
         write_values(out, &self.defaults)?;
         writeln!(out)?;
         writeln!(out, "Constraints:")?;
         write_values(out, &self.constraints)
+    }
+}
+
+/// Why the project's box types do not load.
+#[derive(Debug)]
+pub enum BoxTypesCause {
+    /// The `minimal.toml` does not load.
+    Load(mfile::Error),
+    /// The `minimal.toml` at `path` is not valid TOML.
+    Parse {
+        /// The file.
+        path: PathBuf,
+        /// The parser's error.
+        error: toml::de::Error,
+    },
+    /// A type of `[box_types]` does not resolve.
+    Resolve(BoxTypeError),
+}
+
+/// `min type list` or `min type show` cannot read the project's box types.
+/// The command exits 3, the exit code of an invalid project file.
+#[derive(Debug)]
+pub struct BoxTypesInvalid {
+    /// What the command was doing, as the message says it.
+    pub doing: &'static str,
+    /// Why the types do not load.
+    pub cause: BoxTypesCause,
+}
+
+impl BoxTypesInvalid {
+    /// The exit code of the refusal.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for BoxTypesInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cause is in this text and `source()` returns none, so the
+        // printer's `{:#}` shows it once.
+        let doing = self.doing;
+        match &self.cause {
+            BoxTypesCause::Load(error) => write!(
+                f,
+                "Cannot {doing}: the project's {} does not load: {error}",
+                mfile::MFILE_NAME
+            ),
+            BoxTypesCause::Parse { path, error } => write!(
+                f,
+                "Cannot {doing}: {} is not valid TOML: {error}",
+                path.display()
+            ),
+            BoxTypesCause::Resolve(error) => write!(f, "Cannot {doing}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for BoxTypesInvalid {}
+
+/// `min type show <name>` of a name that is no box type. The command exits
+/// 4, the exit code of a thing that is not found.
+#[derive(Debug)]
+pub struct BoxTypeNotFound {
+    /// The name the user gave.
+    pub name: String,
+}
+
+impl BoxTypeNotFound {
+    /// The exit code of the refusal.
+    pub const EXIT_CODE: u8 = 4;
+    /// The next step, for the `hint` of the machine-mode error object.
+    pub const HINT: &'static str = "run `min type list` to see the box types";
+}
+
+impl std::fmt::Display for BoxTypeNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No box type is named `{}`. Run `min type list` to see the box types.",
+            printable(&self.name)
+        )
+    }
+}
+
+impl std::error::Error for BoxTypeNotFound {}
+
+/// An object with its `min/v1/type` stamp first, for the TOML and YAML
+/// forms. The JSON form takes its stamp from [`write_object`].
+#[derive(Serialize)]
+struct Stamped<'a, T: Serialize> {
+    schema: &'static str,
+    #[serde(flatten)]
+    body: &'a T,
+}
+
+fn stamped<T: Rendered>(body: &T) -> Stamped<'_, T> {
+    Stamped {
+        schema: T::TYPE.schema(),
+        body,
+    }
+}
+
+/// The TOML form of `min type list`: one `[[types]]` table for each type,
+/// because a TOML document cannot be an array.
+#[derive(Serialize)]
+struct TypeListDoc<'a> {
+    types: Vec<Stamped<'a, TypeRow>>,
+}
+
+/// A string as a YAML double-quoted scalar. Every control character is
+/// escaped, so the text cannot carry a terminal control sequence.
+fn yaml_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}') => {
+                quoted.push_str(&format!("\\u{:04x}", u32::from(c)));
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// A mapping key, plain where YAML reads it as the same string, and
+/// quoted otherwise.
+fn yaml_key(key: &str) -> String {
+    let plain = key
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && !matches!(
+            key.to_ascii_lowercase().as_str(),
+            "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "y" | "n"
+        );
+    if plain {
+        key.to_owned()
+    } else {
+        yaml_quote(key)
+    }
+}
+
+/// A YAML node, built from an ordered TOML document so the keys keep the
+/// order of the object's fields.
+enum YamlNode {
+    /// A value on one line, already written as YAML.
+    Scalar(String),
+    Map(Vec<(String, YamlNode)>),
+    Seq(Vec<YamlNode>),
+}
+
+fn yaml_from_value(value: &toml_edit::Value) -> YamlNode {
+    use toml_edit::Value;
+    match value {
+        Value::String(s) => YamlNode::Scalar(yaml_quote(s.value())),
+        Value::Integer(i) => YamlNode::Scalar(i.value().to_string()),
+        Value::Float(f) => {
+            let f = *f.value();
+            YamlNode::Scalar(if f.is_nan() {
+                ".nan".to_owned()
+            } else if f.is_infinite() {
+                if f > 0.0 { ".inf" } else { "-.inf" }.to_owned()
+            } else {
+                format!("{f:?}")
+            })
+        }
+        Value::Boolean(b) => YamlNode::Scalar(b.value().to_string()),
+        Value::Datetime(d) => YamlNode::Scalar(yaml_quote(&d.value().to_string())),
+        Value::Array(items) => YamlNode::Seq(items.iter().map(yaml_from_value).collect()),
+        Value::InlineTable(table) => YamlNode::Map(
+            table
+                .iter()
+                .map(|(k, v)| (k.to_owned(), yaml_from_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn yaml_from_table(table: &toml_edit::Table) -> YamlNode {
+    YamlNode::Map(
+        table
+            .iter()
+            .map(|(k, item)| (k.to_owned(), yaml_from_item(item)))
+            .collect(),
+    )
+}
+
+fn yaml_from_item(item: &toml_edit::Item) -> YamlNode {
+    match item {
+        toml_edit::Item::None => YamlNode::Scalar("null".to_owned()),
+        toml_edit::Item::Value(value) => yaml_from_value(value),
+        toml_edit::Item::Table(table) => yaml_from_table(table),
+        toml_edit::Item::ArrayOfTables(tables) => {
+            YamlNode::Seq(tables.iter().map(yaml_from_table).collect())
+        }
+    }
+}
+
+impl YamlNode {
+    /// The node on one line: a scalar, or an empty map or sequence.
+    fn inline(&self) -> Option<String> {
+        match self {
+            Self::Scalar(s) => Some(s.clone()),
+            Self::Map(entries) if entries.is_empty() => Some("{}".to_owned()),
+            Self::Seq(items) if items.is_empty() => Some("[]".to_owned()),
+            Self::Map(_) | Self::Seq(_) => None,
+        }
+    }
+
+    /// Write the node as a block, each line at `indent`.
+    fn block(&self, out: &mut String, indent: usize) {
+        if let Some(inline) = self.inline() {
+            out.push_str(&" ".repeat(indent));
+            out.push_str(&inline);
+            out.push('\n');
+            return;
+        }
+        match self {
+            Self::Map(entries) => {
+                for (key, value) in entries {
+                    out.push_str(&" ".repeat(indent));
+                    out.push_str(&yaml_key(key));
+                    out.push(':');
+                    if let Some(inline) = value.inline() {
+                        out.push(' ');
+                        out.push_str(&inline);
+                        out.push('\n');
+                    } else {
+                        out.push('\n');
+                        value.block(out, indent + 2);
+                    }
+                }
+            }
+            Self::Seq(items) => {
+                for item in items {
+                    out.push_str(&" ".repeat(indent));
+                    out.push_str("- ");
+                    // The item's first line goes on the line of its dash.
+                    let mut nested = String::new();
+                    item.block(&mut nested, indent + 2);
+                    out.push_str(nested.get(indent + 2..).unwrap_or_default());
+                }
+            }
+            Self::Scalar(_) => {}
+        }
+    }
+}
+
+/// `value` as a YAML document, its keys in the order of its fields. With
+/// `key`, the document is the value under that key.
+fn yaml_document<T: Serialize>(value: &T, key: Option<&str>) -> std::io::Result<String> {
+    let text = toml::to_string(value).map_err(std::io::Error::other)?;
+    let doc: toml_edit::DocumentMut = text.parse().map_err(std::io::Error::other)?;
+    let node = match key {
+        Some(key) => doc
+            .get(key)
+            .map_or(YamlNode::Seq(Vec::new()), yaml_from_item),
+        None => yaml_from_table(doc.as_table()),
+    };
+    let mut out = String::new();
+    node.block(&mut out, 0);
+    Ok(out)
+}
+
+/// Write the rows of `min type list` in `format`: a JSON array, a YAML
+/// sequence, or a TOML `[[types]]` table for each row. Each row is a
+/// `min/v1/type` object.
+///
+/// # Errors
+/// The writer's error, or a row that does not encode.
+pub fn write_type_rows_as(
+    out: &mut dyn Write,
+    format: TypeOutputFormat,
+    rows: &[TypeRow],
+) -> std::io::Result<()> {
+    match format {
+        TypeOutputFormat::Json => write_objects(out, OutputMode::Json, rows),
+        TypeOutputFormat::Yaml => {
+            let doc = TypeListDoc {
+                types: rows.iter().map(stamped).collect(),
+            };
+            out.write_all(yaml_document(&doc, Some("types"))?.as_bytes())
+        }
+        TypeOutputFormat::Toml => {
+            let doc = TypeListDoc {
+                types: rows.iter().map(stamped).collect(),
+            };
+            let text = toml::to_string(&doc).map_err(std::io::Error::other)?;
+            out.write_all(text.as_bytes())
+        }
+    }
+}
+
+/// Write the detail of `min type show` in `format`, as one `min/v1/type`
+/// object.
+///
+/// # Errors
+/// The writer's error, or a detail that does not encode.
+pub fn write_type_detail_as(
+    out: &mut dyn Write,
+    format: TypeOutputFormat,
+    detail: &TypeDetail,
+) -> std::io::Result<()> {
+    match format {
+        TypeOutputFormat::Json => write_object(out, OutputMode::Json, detail),
+        TypeOutputFormat::Yaml => out.write_all(yaml_document(&stamped(detail), None)?.as_bytes()),
+        TypeOutputFormat::Toml => {
+            let text = toml::to_string(&stamped(detail)).map_err(std::io::Error::other)?;
+            out.write_all(text.as_bytes())
+        }
     }
 }
 
@@ -269,12 +608,13 @@ fn project_dir(global: &GlobalArgs) -> (PathBuf, bool) {
 /// no `minimal.toml` is found there, or above it when `search_ancestors`.
 ///
 /// # Errors
-/// A `minimal.toml` that does not load, or whose `[box_types]` does not
-/// resolve. `doing` names the command in the message.
+/// [`BoxTypesInvalid`] for a `minimal.toml` that does not load, is not
+/// valid TOML, or whose `[box_types]` does not resolve. `doing` names the
+/// command in the message.
 pub fn load_types(
     dir: &std::path::Path,
     search_ancestors: bool,
-    doing: &str,
+    doing: &'static str,
 ) -> anyhow::Result<BoxTypes> {
     let loaded = if search_ancestors {
         mfile::File::from_dir_recursive(dir)
@@ -287,24 +627,30 @@ pub fn load_types(
             tracing::debug!(dir = %dir.display(), "no project file: built-in types only");
             return Ok(BoxTypes::default());
         }
-        Err(error) => anyhow::bail!(
-            "Cannot {doing}: the project's {} does not load: {error}",
-            mfile::MFILE_NAME
-        ),
+        Err(error) => {
+            return Err(BoxTypesInvalid {
+                doing,
+                cause: BoxTypesCause::Load(error),
+            }
+            .into());
+        }
     };
     let Some(path) = file.file_path() else {
         return Ok(BoxTypes::default());
     };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Cannot {doing}: cannot read {}", path.display()))?;
-    let doc: toml::Table = toml::from_str(&text).map_err(|error| {
-        anyhow::anyhow!(
-            "Cannot {doing}: {} is not valid TOML: {error}",
-            path.display()
-        )
+    let doc: toml::Table = toml::from_str(&text).map_err(|error| BoxTypesInvalid {
+        doing,
+        cause: BoxTypesCause::Parse {
+            path: path.to_path_buf(),
+            error,
+        },
     })?;
-    let types =
-        BoxTypes::from_file(&doc).map_err(|error| anyhow::anyhow!("Cannot {doing}: {error}"))?;
+    let types = BoxTypes::from_file(&doc).map_err(|error| BoxTypesInvalid {
+        doing,
+        cause: BoxTypesCause::Resolve(error),
+    })?;
     tracing::debug!(
         path = %path.display(),
         project_types = types.project().len(),
@@ -317,17 +663,27 @@ pub fn load_types(
 ///
 /// # Errors
 /// As [`load_types`], or the writer's error.
-pub fn cmd_type_list(global: &GlobalArgs, out: &mut dyn Write) -> anyhow::Result<()> {
+pub fn cmd_type_list(
+    global: &GlobalArgs,
+    args: &TypeListArgs,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
     let (dir, search_ancestors) = project_dir(global);
     let types = load_types(&dir, search_ancestors, "list the box types")?;
-    write_type_list(out, &type_rows(&types)).context("failed to write to stdout")?;
+    let rows = type_rows(&types);
+    match args.output {
+        None => write_type_list(out, &rows),
+        Some(format) => write_type_rows_as(out, format, &rows),
+    }
+    .context("failed to write to stdout")?;
     out.flush().context("failed to write to stdout")
 }
 
 /// `min type show <name>`.
 ///
 /// # Errors
-/// As [`load_types`], a name that is no type, or the writer's error.
+/// As [`load_types`], [`BoxTypeNotFound`] for a name that is no type, or
+/// the writer's error.
 pub fn cmd_type_show(
     global: &GlobalArgs,
     args: &TypeShowArgs,
@@ -336,15 +692,20 @@ pub fn cmd_type_show(
     let (dir, search_ancestors) = project_dir(global);
     let types = load_types(&dir, search_ancestors, "show the box type")?;
     if !types.contains(&args.name) {
-        anyhow::bail!(
-            "No box type is named `{}`. Run `min type list` to see the box types.",
-            printable(&args.name)
-        );
+        return Err(BoxTypeNotFound {
+            name: args.name.clone(),
+        }
+        .into());
     }
-    let resolved = types
-        .resolve(&args.name)
-        .map_err(|error| anyhow::anyhow!("Cannot show the box type: {error}"))?;
-    write_object(out, OutputMode::Text, &type_detail(&types, &resolved))
-        .context("failed to write to stdout")?;
+    let resolved = types.resolve(&args.name).map_err(|error| BoxTypesInvalid {
+        doing: "show the box type",
+        cause: BoxTypesCause::Resolve(error),
+    })?;
+    let detail = type_detail(&types, &resolved);
+    match args.output {
+        None => write_object(out, OutputMode::Text, &detail),
+        Some(format) => write_type_detail_as(out, format, &detail),
+    }
+    .context("failed to write to stdout")?;
     out.flush().context("failed to write to stdout")
 }

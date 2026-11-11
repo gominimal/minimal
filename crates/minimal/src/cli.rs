@@ -665,18 +665,40 @@ pub enum TypeCommand {
     /// List the box types: the built-in types and the types this
     /// project's minimal.toml defines, each with where it comes from
     #[command(visible_alias = "ls")]
-    List,
+    List(TypeListArgs),
     /// Show one box type: the type it extends, and its defaults and
     /// constraints, each with the type that sets it
     Show(TypeShowArgs),
 }
 
-// BCLI-020: `min type show <name>`.
+// BCLI-019: `min type list [-o json|yaml|toml]`.
+#[derive(Debug, Default, Args)]
+pub struct TypeListArgs {
+    /// Write the types in this format instead of a table
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<TypeOutputFormat>,
+}
+
+// BCLI-020: `min type show <name> [-o json|yaml|toml]`.
 #[derive(Debug, Args)]
 pub struct TypeShowArgs {
     /// The type, as `min type list` prints it (`session`, `task`, or a
     /// type of this project)
     pub name: String,
+    /// Write the type in this format instead of text
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<TypeOutputFormat>,
+}
+
+/// The formats `min type list` and `min type show` write, beside text.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum TypeOutputFormat {
+    /// JSON: one object for each type
+    Json,
+    /// YAML: one mapping for each type
+    Yaml,
+    /// TOML: one table for each type
+    Toml,
 }
 
 // BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.

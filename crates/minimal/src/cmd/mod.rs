@@ -50,6 +50,7 @@ pub use net::*;
 pub use project::*;
 pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
+pub use types::{BoxTypeNotFound, BoxTypesCause, BoxTypesInvalid};
 
 pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
     // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
@@ -168,7 +169,7 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             ProviderCommand::List(_) => "provider list",
         },
         Some(Command::Type(TypeArgs { command })) => match command {
-            TypeCommand::List => "type list",
+            TypeCommand::List(_) => "type list",
             TypeCommand::Show(_) => "type show",
         },
         Some(Command::Net(_)) => "net forward",
@@ -455,7 +456,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             }
         },
         Some(Command::Type(TypeArgs { command })) => match command {
-            TypeCommand::List => types::cmd_type_list(&cli.global_args, &mut std::io::stdout()),
+            TypeCommand::List(args) => {
+                types::cmd_type_list(&cli.global_args, &args, &mut std::io::stdout())
+            }
             TypeCommand::Show(args) => {
                 types::cmd_type_show(&cli.global_args, &args, &mut std::io::stdout())
             }
