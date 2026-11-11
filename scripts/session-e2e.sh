@@ -24131,7 +24131,7 @@ proof_min_internal_names_through_proxy() {
   # The request origin: a host-address box (the default network), sharing
   # its host's loopback — which is how it reaches the proxy at all, on every
   # lane (natively the host's loopback; on a VM lane the guest's, where the
-  # in-guest daemon serves :7654).
+  # in-guest daemon serves the port proxy_port_from_ls reads from it).
   PROXY_SEED_DIR="$(hook_mktemp /tmp/mnlpr.XXXXXX)"
   hook_seed_preamble > "$PROXY_SEED_DIR/minimal.toml"
   mkdir "$PROXY_SEED_DIR/.git"
@@ -29015,7 +29015,8 @@ proof_proxy_refuses_like_direct() {
   PAR_OWN_MARKER="PAR_OWN_ROUTED_OK"
 
   # The request origin: a host-address box, sharing its host's loopback —
-  # which is how it reaches the proxy at 127.0.0.1:7654, on every lane.
+  # which is how it reaches the proxy on every lane, at the port
+  # proxy_port_from_ls reads from this run's daemon.
   PAR_SEED_DIR="$(hook_mktemp /tmp/mnlpd.XXXXXX)"
   hook_seed_preamble > "$PAR_SEED_DIR/minimal.toml"
   mkdir "$PAR_SEED_DIR/.git"
