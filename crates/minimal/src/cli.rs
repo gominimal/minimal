@@ -229,7 +229,9 @@ pub enum SessionCommand {
     /// Create a box from a session entry of the project and attach this
     /// terminal to it. `--detach` creates the box, prints its id and returns
     Start(SessionStartArgs),
-    /// Attach to an existing session
+    /// Attach this terminal to a session box's terminal. With no box named,
+    /// attach to this project's running session box that has a terminal,
+    /// else to its only stopped or exited one, which starts again
     Attach(AttachArgs),
     /// Execute a command in an existing session
     Exec(ExecArgs),
@@ -479,6 +481,11 @@ pub enum BoxCommand {
     /// to this project's running box that has a terminal, else to its only
     /// stopped or exited one, which starts again
     Attach(BoxAttachArgs),
+    /// Start a stopped or exited box that has a terminal again, from the
+    /// spec it was created with, and attach this terminal to it. A box that
+    /// is not stopped or exited is refused. Attach to a running box with
+    /// `min box attach`
+    Resume(BoxResumeArgs),
     /// Create a box from an entry of the project. A box with a terminal
     /// attaches this terminal to it, unless `--detach` is given. Any other
     /// box starts with no input, and the command prints its id and returns
@@ -719,6 +726,14 @@ pub struct BoxAttachArgs {
     /// exec id it printed. Needs a box
     #[arg(long = "exec", value_name = "EXEC_ID", requires = "target")]
     pub exec: Option<String>,
+}
+
+// BCLI-007, BCLI-009: `min box resume <box>`.
+#[derive(Debug, Args)]
+pub struct BoxResumeArgs {
+    /// The box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min box list` prints them
+    pub target: String,
 }
 
 // BOX-019 (BCLI-060, BCLI-004): `min box rm <box> [--force]`.
@@ -1946,10 +1961,9 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID, unique id prefix, or session name). When
-    /// omitted, `min session attach` resolves a session from the current
-    /// working directory (or the only existing session), and opens an interactive picker if the choice is
-    /// ambiguous. See `--no-input` to skip the picker in scripts.
+    /// The session box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min session list` prints them. Omit it to
+    /// attach to this project's session box
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
 }
