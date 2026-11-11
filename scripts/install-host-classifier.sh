@@ -1806,7 +1806,7 @@ done
 parent=$(dirname "$tree_root")
 if grep -qw memory "$parent/cgroup.subtree_control" 2>/dev/null; then
     if err=$(printf '+memory\n' 2>&1 >"$tree_root/cgroup.subtree_control"); then
-        note "enabled the memory controller on the slice ($tree_root/cgroup.subtree_control): a box reads its own memory.max under its cgroup2 cover once minimald enables it on the cohort below"
+        note "enabled the memory controller on the slice, $tree_root. Boxes can read their own memory.max."
     else
         # the one cause this step can prove is a process standing in the slice itself (cgroup v2 refuses
         # a controller for the children of a cgroup that holds a process); any other failure is named as

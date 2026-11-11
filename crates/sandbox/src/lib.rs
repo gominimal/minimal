@@ -1100,14 +1100,15 @@ pub mod classifier {
     /// error to report but the common case to build on. Every other errno is
     /// the caller's, unchanged: a `NotFound` is a parent this entry could not
     /// make, a `PermissionDenied` a tree this account has no privilege over.
-    fn make_cgroup(dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir(dir).or_else(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })
+    ///
+    /// Says whether this call made the level: `true` for a cgroup that was
+    /// not there, `false` for one found made.
+    fn make_cgroup(dir: &Path) -> std::io::Result<bool> {
+        match std::fs::create_dir(dir) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Moves this process into `root`'s [`DAEMON_LEAF`], as the daemon does at
@@ -1133,7 +1134,13 @@ pub mod classifier {
     /// internal-process rule. A leaf without it carries no `memory.max` at
     /// all, so no reader — a diagnostics bundle on the host side, or the box
     /// itself under the design's own cover — can name the limit a box's
-    /// verdict is decided on.
+    /// verdict is decided on. The controller reaches the cohort only from
+    /// the tree root, and the tree root only from the cgroup above it: a root
+    /// this entry made (the guest's) gets both, since nothing stands in a
+    /// cgroup it just made and the cgroup2 mount root above it, which holds
+    /// this process, is the one cgroup exempt from the internal-process rule.
+    /// A root that was already there is the installer's to enable, as root,
+    /// before anything is placed in it.
     pub fn enter_daemon_leaf(root: &Path) -> std::io::Result<()> {
         // The layout, top down: the tree root, the cohort, both of its
         // subtrees, then this daemon's own leaf. `create_dir` makes no
@@ -1145,7 +1152,7 @@ pub mod classifier {
         // that is not there is the guest's to build and a native host's to
         // be left outside. Already-there is the common case everywhere else
         // (the installer made the root, a previous daemon made the rest).
-        make_cgroup(root)?;
+        let made_root = make_cgroup(root)?;
         let mut tree = vec![root.join(BOXES_DIR)];
         for dir in &tree {
             make_cgroup(dir)?;
@@ -1160,15 +1167,26 @@ pub mod classifier {
         // Over a stand-in tree (a test's) this writes a plain file; over a
         // real tree the kernel takes `+memory` as a subtree_control command
         // and may refuse it — a host without the memory controller, or one
-        // that has it threaded off, still gets its boxes placed. The cohort
-        // comes first and the subtrees after it: over a real tree a
-        // controller reaches a cgroup only once the cgroup above it has
-        // enabled it, so the cascade order is the only one that works. The
-        // tree root is not in the cascade and must not be: this process is
-        // still a member of it until the `place_pid` below moves it out, and
-        // a controller enabled on a cgroup that holds a process makes its
-        // children `domain invalid` — the daemon's own leaf among them, the
-        // very cgroup this entry exists to take.
+        // that has it threaded off, still gets its boxes placed. Top down:
+        // over a real tree a controller reaches a cgroup only once the cgroup
+        // above it has enabled it, so the cascade order is the only one that
+        // works. A tree root that was already there is not in the cascade
+        // and must not be: this process is still a member of it until the
+        // `place_pid` below moves it out, and a controller enabled on a
+        // cgroup that holds a process makes its children `domain invalid` —
+        // the daemon's own leaf among them, the very cgroup this entry exists
+        // to take. A root this entry made holds nothing, so it joins the
+        // cascade, and so does the cgroup above it: the guest's pid 1 made
+        // the root under the cgroup2 mount root it boots in, whose children
+        // get a controller only once it is enabled there, and the mount root
+        // is the one cgroup the internal-process rule exempts.
+        if made_root {
+            let mut above: Vec<PathBuf> =
+                root.parent().map(Path::to_path_buf).into_iter().collect();
+            above.push(root.to_path_buf());
+            above.append(&mut tree);
+            tree = above;
+        }
         for dir in &tree {
             if let Err(e) = std::fs::write(dir.join("cgroup.subtree_control"), "+memory\n")
                 && e.kind() != std::io::ErrorKind::NotFound
