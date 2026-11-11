@@ -15155,37 +15155,74 @@ type TableCells = Vec<(&'static str, &'static str)>;
 /// with the value as TOML writes it inline. A `(constrains)` cell is a
 /// constraint, and every other cell a default. The `—` cells and the
 /// proposed `on_oom` row are left out.
-///
-/// The architecture document is not in this repository. These are the
-/// cells that the BOX spec quotes from that table: `lifetime` (its
-/// "Completion follows `lifetime`" note) and `loadout_mode` (BOX-168,
-/// BOX-169, and its "A project layer can open a sealed type" note). Copy
-/// the other cells of the table rows into this fixture before the test
-/// runs.
 fn architecture_builtin_table() -> Vec<(&'static str, TableCells, TableCells)> {
     let until_complete = ("lifetime", "\"until_complete\"");
+    let no_timeout = ("timeout", "\"0\"");
+    let sealed = ("loadout_mode", "\"sealed\"");
     vec![
         (
             "session",
-            vec![until_complete, ("loadout_mode", "\"open\"")],
-            vec![],
+            vec![
+                until_complete,
+                ("loadout_mode", "\"open\""),
+                ("exec_enabled", "true"),
+                ("nesting.allowed", "true"),
+                no_timeout,
+            ],
+            vec![("pty_enabled", "true")],
         ),
         (
             "task",
-            vec![until_complete, ("loadout_mode", "\"sealed\"")],
+            vec![
+                until_complete,
+                sealed,
+                ("exec_enabled", "true"),
+                ("nesting.allowed", "false"),
+                no_timeout,
+            ],
+            vec![("pty_enabled", "false")],
+        ),
+        (
+            "agent",
+            vec![
+                until_complete,
+                sealed,
+                ("pty_enabled", "false"),
+                ("exec_enabled", "true"),
+                ("nesting.allowed", "true"),
+                no_timeout,
+            ],
             vec![],
         ),
-        ("agent", vec![until_complete], vec![]),
-        ("service", vec![], vec![]),
+        (
+            "service",
+            vec![
+                ("lifetime", "\"until_stopped\""),
+                sealed,
+                ("exec_enabled", "true"),
+                ("nesting.allowed", "false"),
+            ],
+            vec![("pty_enabled", "false")],
+        ),
         (
             "build",
-            vec![until_complete],
-            vec![("loadout_mode", "\"sealed\"")],
+            vec![until_complete, no_timeout],
+            vec![
+                sealed,
+                ("pty_enabled", "false"),
+                ("exec_enabled", "false"),
+                ("nesting.allowed", "false"),
+            ],
         ),
         (
             "container-build",
-            vec![until_complete],
-            vec![("loadout_mode", "\"sealed\"")],
+            vec![until_complete, no_timeout],
+            vec![
+                sealed,
+                ("pty_enabled", "false"),
+                ("exec_enabled", "false"),
+                ("nesting.allowed", "false"),
+            ],
         ),
     ]
 }
