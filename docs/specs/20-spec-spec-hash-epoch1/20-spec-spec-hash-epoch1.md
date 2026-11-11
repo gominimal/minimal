@@ -231,20 +231,22 @@ build-infra operator. Release manager.
 - **EPOCH-004** THE SYSTEM SHALL refute every class of the epoch-0 defect
   catalog: the witness pair of each distinct-spec class (1 to 6 and 9)
   encodes to distinct outputs, and the witness of each one-spec class
-  encodes to one output, the same at both index widths (7) and the same
-  for negative zero and zero (8, by EPOCH-006).
+  encodes to one output: for negative zero and zero (8, by EPOCH-006), and
+  for class 7 by construction, since the epoch-1 encoding has no index or
+  reference field at all (an edge enters as its 32-byte key, every length
+  and count prefix is a `u32`), so no field of it has a platform width.
   tier:     T2
   verify:   cargo nextest run -p graph epoch1_witness_refutations
   property: for all distinct-spec witness pairs (a, b): encode(a) !=
-    encode(b); for class 7's witness g: encode_u32(g) == encode_u64(g); for
-    class 8's witness pair (z, -z): encode(z) == encode(-z)
+    encode(b); for class 8's witness pair (z, -z): encode(z) == encode(-z);
+    for class 7, the layout's field list holds no index and no reference
+    (read from the layout, not run)
   harness:  kani_epoch1_witness_refutations, one harness per witness class
-    of the epoch-0 defect catalog (nine), each over its concrete witness,
-    unwind 9 for classes 1 to 8 (their witnesses' strings are at most 8
-    bytes) and unwind 33 for class 9 (its witness pair carries a 32-byte
-    parent key, the same loop EPOCH-001 bounds); class 7's
-    harness encodes under both index widths in one run, since one platform
-    cannot witness the other
+    with a witness to run (eight: 1 to 6, 8 and 9), each over its concrete
+    witness, unwind 9 for classes 1 to 6 and 8 (their witnesses' strings
+    are at most 8 bytes) and unwind 33 for class 9 (its witness pair
+    carries a 32-byte parent key, the same loop EPOCH-001 bounds); class 7
+    has no harness, since there is no width to vary
 
 - **EPOCH-005** THE SYSTEM SHALL derive an epoch-1 spec key under the
   epoch-1 context, 32 bytes wide.
@@ -493,9 +495,9 @@ build-infra operator. Release manager.
 
 The codec is a fixed-width, byte-tagged TLV and does not use varints. With
 TLV, injectivity is structural. Every payload has a length prefix and every
-list has a count prefix. A key is 32 bytes and a reference inside an
-encoding is a `u32`. So a 32-bit client encodes the same bytes as a 64-bit
-one. The codec also stays in the provers' comfort zone. It is pure, with no
+list has a count prefix. A key is 32 bytes, every prefix is a `u32`, and
+nothing in an encoding is an index into anything. So a 32-bit client encodes
+the same bytes as a 64-bit one. The codec also stays in the provers' comfort zone. It is pure, with no
 unsafe code, no trait objects and no unbounded recursion, because the spec
 walk stays outside it.
 
