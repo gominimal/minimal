@@ -277,8 +277,8 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     // loadouts apply. A loadout cannot open the gate that admits it.
     let sealed = toml::Table::new();
     let loadouts = match loadout_mode(entry, &ordered)? {
-        Some(LoadoutMode::Sealed) => &sealed,
-        Some(LoadoutMode::Open) | None => &layers.loadouts,
+        Some(LoadoutMode::Open) => &layers.loadouts,
+        Some(LoadoutMode::Sealed) | None => &sealed,
     };
     ordered.push((Origin::of(Layer::Loadouts), loadouts));
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
@@ -315,7 +315,8 @@ impl LoadoutMode {
 
 /// The `loadout_mode` that `ordered`, the layers up to and including the
 /// entry, set. It is the flat key or the `[box]` section's key, whichever
-/// a later layer set. `None` when no layer sets it.
+/// a later layer set. `None` when no layer sets it, and the gate treats
+/// `None` as sealed, so the entry takes no loadout.
 ///
 /// A value that is not a string reads as [`LoadoutMode::Sealed`], so no
 /// loadout applies, and [`check_keys`] then refuses its shape.
@@ -960,6 +961,10 @@ mod tests {
             type_defaults: vec![
                 (
                     "session".to_owned(),
+                    crate::box_types::builtin_defaults("session"),
+                ),
+                (
+                    "session".to_owned(),
                     table("packages = [\"u\"]\ntimeout = \"4s\"\npty_enabled = false"),
                 ),
                 (
@@ -1080,6 +1085,10 @@ mod tests {
 
     fn example_layers() -> Layers {
         Layers {
+            type_defaults: vec![(
+                "session".to_owned(),
+                crate::box_types::builtin_defaults("session"),
+            )],
             loadouts: table("packages = [\"zellij\"]"),
             overrides: table("timeout = \"30m\""),
             ..Layers::default()
@@ -1097,6 +1106,7 @@ mod tests {
         assert_eq!(
             bytes,
             indoc::indoc! {r#"
+                loadout_mode = "open"
                 packages = ["git", "ripgrep", "helix", "fish", "zellij"]
                 pty_enabled = true
                 timeout = "30m"
@@ -1347,6 +1357,10 @@ mod tests {
         let layers = Layers {
             upstream: table("commit = \"abc123\""),
             type_defaults: vec![
+                (
+                    "session".to_owned(),
+                    crate::box_types::builtin_defaults("session"),
+                ),
                 ("session".to_owned(), table("lifetime = \"until_complete\"")),
                 (
                     "rust-dev".to_owned(),
@@ -1862,6 +1876,8 @@ mod tests {
             loadout_mode = "open"
 
             [tasks.lint]
+
+            [agents.helper]
         "#;
         for name in ["locked", "boxed", "dev"] {
             let e = expand_typed_with(file, name, whole_loadout())
@@ -1869,6 +1885,20 @@ mod tests {
                 .expect("expands");
             assert_no_loadout(&e, name);
         }
+        // The agent root supplies no `loadout_mode`, and the gate seals an
+        // entry whose layers set none. This release refuses `[agents.*]`
+        // before expansion, so expand the entry past that check.
+        let helper = Layers {
+            type_defaults: vec![(
+                "agent".to_owned(),
+                crate::box_types::builtin_defaults("agent"),
+            )],
+            loadouts: whole_loadout(),
+            ..Layers::default()
+        };
+        let e = expand_in(file, "helper", helper).expect("expands");
+        assert_eq!(e.spec.get("loadout_mode"), None);
+        assert_no_loadout(&e, "helper");
         for name in ["ci", "reopened", "lint"] {
             let e = expand_typed_with(file, name, whole_loadout())
                 .expect("the type resolves")

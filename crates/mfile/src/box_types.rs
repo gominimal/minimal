@@ -38,7 +38,9 @@ pub fn builtin(name: &str) -> Option<&'static str> {
 
 /// The defaults that the built-in type `root` supplies as the first layer
 /// of a type chain. `session` is `open` to loadouts (BOX-168) and `task`
-/// is `sealed` (BOX-169). The other built-in types supply nothing yet.
+/// is `sealed` (BOX-169). gominimal/inbox#678 owns the defaults of the
+/// `agent`, `service`, `build` and `container-build` types. Until then
+/// they supply nothing, and the expansion gate seals those roots.
 #[must_use]
 pub fn builtin_defaults(root: &str) -> toml::Table {
     let loadout_mode = match root {
@@ -435,8 +437,6 @@ mod tests {
         assert!(types("").expect("resolves").project().is_empty());
     }
 
-    /// A type graph whose chains all end at a built-in: type `t<i>` extends
-    /// either a built-in or a type with a lower index.
     // BOX-168, BOX-169: the session root supplies `loadout_mode = "open"`
     // and the task root `loadout_mode = "sealed"`, as the first type
     // defaults of every chain that ends at them.
@@ -469,6 +469,8 @@ mod tests {
         }
     }
 
+    /// A type graph whose chains all end at a built-in: type `t<i>` extends
+    /// either a built-in or a type with a lower index.
     fn acyclic_graph() -> impl Strategy<Value = Vec<(usize, Option<usize>)>> {
         prop::collection::vec(
             (0..BUILTIN_BOX_TYPES.len(), any::<prop::sample::Index>()),
