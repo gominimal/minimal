@@ -24,19 +24,50 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Error;
-use crate::entry::BoxEntry;
+use crate::box_types::{BoxTypeError, BoxTypes, ResolvedType};
+use crate::entry::{BoxEntry, EntryTable};
 use crate::error::{EntryHeader, SpecKeyProblem};
 
 /// The built-in Box Types. A `[defaults.<name>]` table for one of these,
 /// or for a project type, is that type's defaults, not a `[defaults]` key.
-pub const BUILTIN_BOX_TYPES: [&str; 6] = [
-    "session",
-    "task",
-    "agent",
-    "service",
-    "build",
-    "container-build",
-];
+pub use crate::box_types::BUILTIN_BOX_TYPES;
+
+/// The built-in roots whose entries this release expands (BOX-063).
+pub const EXPANDABLE_ROOTS: [&str; 2] = ["session", "task"];
+
+/// Resolves the type of `entry` and checks that this release expands it:
+/// its type, or its type's built-in root, is `session` or `task`, and it
+/// does not come from `[agents.*]` or `[services.*]` (BOX-063).
+///
+/// The check is per entry, so a refused entry leaves the file's other
+/// entries usable. The resolved type's
+/// [`defaults`](crate::box_types::ResolvedType::defaults) are the entry's
+/// [`Layers::type_defaults`].
+///
+/// # Errors
+///
+/// [`BoxTypeError::Unsupported`] for an entry of another root, and the
+/// errors of [`BoxTypes::resolve_entry`] for an entry whose type does not
+/// resolve. Each exits 3.
+pub fn expandable_type(entry: &BoxEntry, types: &BoxTypes) -> Result<ResolvedType, BoxTypeError> {
+    let refuse = |box_type: &str, root: &'static str| BoxTypeError::Unsupported {
+        table: entry.table.key(),
+        entry: entry.name.clone(),
+        box_type: box_type.to_owned(),
+        root,
+    };
+    // A sugar table for a refused type is refused whatever its `type`.
+    match entry.table {
+        EntryTable::Agents => return Err(refuse("agent", "agent")),
+        EntryTable::Services => return Err(refuse("service", "service")),
+        EntryTable::Boxes | EntryTable::Sessions | EntryTable::Tasks => {}
+    }
+    let resolved = types.resolve_entry(entry)?;
+    if !EXPANDABLE_ROOTS.contains(&resolved.root) {
+        return Err(refuse(&resolved.name, resolved.root));
+    }
+    Ok(resolved)
+}
 
 /// One layer of an entry's expansion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1429,5 +1460,189 @@ mod tests {
         )
         .expect("expands");
         assert!(!declared.report.implicit);
+    }
+
+    /// Expands entry `name` of `file` as a client does: resolves its type
+    /// against the file's `[box_types]`, then folds the type chain's
+    /// defaults and the file's `[defaults]` under the entry.
+    fn expand_typed(file: &str, name: &str) -> Result<Result<Expansion, Error>, BoxTypeError> {
+        let doc = table(file);
+        let types = BoxTypes::from_file(&doc)?;
+        let entries = read_entries(file.as_bytes()).expect("entries read");
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let resolved = expandable_type(entry, &types)?;
+        let project_types = types.project().keys().cloned().collect();
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let layers = Layers {
+            type_defaults: resolved.defaults,
+            ..Layers::default()
+        }
+        .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+        Ok(expand(entry, &layers))
+    }
+
+    const TYPED_FILE: &str = r#"
+        [defaults]
+        packages = ["git"]
+
+        [box_types.ci]
+        extends = "task"
+        defaults = { timeout = "10m", packages = ["make"] }
+
+        [box_types.ci-rust]
+        extends = "ci"
+        defaults = { packages = ["rust"] }
+
+        [box_types.helper]
+        extends = "agent"
+
+        [box_types.web]
+        extends = "service"
+
+        [defaults.ci-rust]
+        pty_enabled = false
+
+        [sessions.dev]
+        pty_enabled = true
+
+        [tasks.lint]
+        timeout = "1m"
+
+        [boxes.check]
+        type = "ci-rust"
+
+        [boxes.bad]
+        type = "ci"
+        not_a_setting = 1
+
+        [agents.bot]
+
+        [services.api]
+
+        [boxes.builder]
+        type = "build"
+
+        [boxes.image]
+        type = "container-build"
+
+        [boxes.assistant]
+        type = "helper"
+
+        [boxes.frontend]
+        type = "web"
+
+        [boxes.plain-agent]
+        type = "agent"
+    "#;
+
+    // BOX-063: entries whose type, or whose type's built-in root, is
+    // `session` or `task` expand, and their keys are validated.
+    #[test]
+    fn session_and_task_entries_expand_and_validate() {
+        let dev = expand_typed(TYPED_FILE, "dev")
+            .expect("resolves")
+            .expect("expands");
+        assert_eq!(dev.spec["type"].as_str(), Some("session"));
+        assert_eq!(dev.spec["pty_enabled"].as_bool(), Some(true));
+        assert_eq!(strings(dev.spec.get("packages")), ["git"]);
+
+        let lint = expand_typed(TYPED_FILE, "lint")
+            .expect("resolves")
+            .expect("expands");
+        assert_eq!(lint.spec["timeout"].as_str(), Some("1m"));
+
+        // A type that extends `task` through `ci`: the chain's defaults,
+        // root first, then `[defaults]`, `[defaults.ci-rust]` and the entry.
+        let check = expand_typed(TYPED_FILE, "check")
+            .expect("resolves")
+            .expect("expands");
+        assert_eq!(check.spec["type"].as_str(), Some("ci-rust"));
+        assert_eq!(check.spec["timeout"].as_str(), Some("10m"));
+        assert_eq!(check.spec["pty_enabled"].as_bool(), Some(false));
+        assert_eq!(strings(check.spec.get("packages")), ["make", "rust", "git"]);
+        assert_eq!(
+            check.report.values["timeout"],
+            ValueOrigin::Value(Origin::type_defaults("ci"))
+        );
+
+        // Validation still runs on an entry of a type rooted at `task`.
+        let err = expand_typed(TYPED_FILE, "bad")
+            .expect("resolves")
+            .expect_err("an unknown key fails");
+        assert_eq!(err.exit_code(), Some(3), "{err}");
+        assert!(err.to_string().contains("not_a_setting"), "{err}");
+
+        // An entry type that no table defines fails with exit 3.
+        let err = expand_typed("[boxes.x]\ntype = \"nope\"\n", "x").expect_err("fails");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "`[boxes.x]` has the type `nope`, which is not a built-in type and not in `[box_types]`."
+        );
+        let err = expand_typed("[boxes.x]\n", "x").expect_err("fails");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "`[boxes.x]` sets no `type`. Set `type` to `session`, `task` or a type in `[box_types]`."
+        );
+    }
+
+    // BOX-063: an entry of `agent`, `service`, `build` or `container-build`,
+    // directly or as the built-in root of its type, or from `[agents.*]` or
+    // `[services.*]`, is refused with exit 3 naming the type and the epic.
+    // The file's other entries stay usable.
+    #[test]
+    fn other_builtin_type_entry_refused_exit3_other_entries_usable() {
+        for (name, header, box_type, root) in [
+            ("bot", "[agents.bot]", "agent", "agent"),
+            ("api", "[services.api]", "service", "service"),
+            ("builder", "[boxes.builder]", "build", "build"),
+            (
+                "image",
+                "[boxes.image]",
+                "container-build",
+                "container-build",
+            ),
+            ("assistant", "[boxes.assistant]", "helper", "agent"),
+            ("frontend", "[boxes.frontend]", "web", "service"),
+            ("plain-agent", "[boxes.plain-agent]", "agent", "agent"),
+        ] {
+            let err = expand_typed(TYPED_FILE, name).expect_err(name);
+            assert_eq!(err.exit_code(), 3, "{name}");
+            assert!(
+                matches!(&err, BoxTypeError::Unsupported { root: r, .. } if *r == root),
+                "{name}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with(&format!("`{header}` has the type `{box_type}`")),
+                "{msg}"
+            );
+            assert!(msg.contains("gominimal/inbox#678"), "{msg}");
+            assert!(msg.contains(&format!("a box of type `{root}`")), "{msg}");
+        }
+        assert_eq!(
+            expand_typed(TYPED_FILE, "assistant")
+                .expect_err("refused")
+                .to_string(),
+            "`[boxes.assistant]` has the type `helper`, which extends `agent`. \
+             This release cannot create a box of type `agent`. \
+             gominimal/inbox#678 tracks it. \
+             The other entries of minimal.toml are not affected."
+        );
+
+        // The refused entries leave the session and task entries usable.
+        for name in ["dev", "lint", "check"] {
+            expand_typed(TYPED_FILE, name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 }
