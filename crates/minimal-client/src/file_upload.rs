@@ -44,12 +44,15 @@ pub fn is_vcs_root(dir: &Path) -> bool {
     VCS_MARKERS.iter().any(|marker| dir.join(marker).exists())
 }
 
-/// The repository path a linked git worktree's `.git` *file* points at
-/// (`gitdir: <path>`), or `None` when `dir` has no such file: a plain
-/// checkout keeps a `.git` directory, and a directory with no `.git` is not
-/// a worktree. That path is the host's, which no box can reach, so the
-/// upload leaves the file out ([`stream_tar_zstd`]) and the caller says so
-/// (gominimal/inbox#854).
+/// The repository path a `.git` *file* at the root of `dir` points at
+/// (`gitdir: <path>`: a linked worktree's, absolute, or a submodule checked
+/// out on its own, relative and above the root), or `None` when `dir` has
+/// no such file or the file holds no pointer: a plain checkout keeps a
+/// `.git` directory, and a directory with no `.git` is not a worktree.
+/// That path is outside what the box receives, so the upload leaves the
+/// file out ([`stream_tar_zstd`]) and the caller says so, by this one
+/// test, so the two never disagree (gominimal/inbox#854). The pointer is
+/// returned as the file holds it: a caller that prints it escapes it.
 pub fn linked_worktree_gitdir(dir: &Path) -> Option<String> {
     let marker = dir.join(".git");
     if !marker.is_file() {
@@ -651,12 +654,19 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
             // box cannot reach; uploaded, it makes every git command in the
             // box fail, `git config --global` included, since git resolves
             // the repository first. Left out, the box holds the files and no
-            // repository, which git says plainly (gominimal/inbox#854). A
-            // `.git` directory, and a `.git` file below the root (a
-            // submodule's), are uploaded as they are.
-            if prefix.is_empty() && name_str == ".git" && file_type.is_file() {
+            // repository, which git says plainly (gominimal/inbox#854). The
+            // test is [`linked_worktree_gitdir`]'s, the one the caller's
+            // notice reads, so a file is left out exactly when the person is
+            // told; a root `.git` file with no `gitdir:` pointer travels as
+            // it is, and so do a `.git` directory and a `.git` file below the
+            // root (a submodule's).
+            if prefix.is_empty()
+                && name_str == ".git"
+                && file_type.is_file()
+                && linked_worktree_gitdir(root).is_some()
+            {
                 tracing::info!(
-                    "leaving out {}: a linked worktree's .git file names a host path",
+                    "leaving out {}: its gitdir pointer names a path outside the project",
                     entry_path.display()
                 );
                 continue;
@@ -1515,6 +1525,20 @@ mod tests {
             "the worktree's .git file travelled: {paths:?}"
         );
         assert!(paths.iter().any(|p| p == "vendored/.git"), "{paths:?}");
+    }
+
+    /// The upload and the notice share one test: a root `.git` file that
+    /// holds no `gitdir:` pointer is not a worktree's, so it travels as it
+    /// is, where the person would be told nothing.
+    #[tokio::test]
+    async fn a_root_git_file_without_a_pointer_travels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".git"), "not a pointer\n").unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        assert_eq!(linked_worktree_gitdir(dir.path()), None);
+        let paths = stream_and_list(dir.path()).await;
+        assert!(paths.iter().any(|p| p == ".git"), "{paths:?}");
+        assert!(paths.iter().any(|p| p == "hello.txt"), "{paths:?}");
     }
 
     /// A writer that accepts a small amount of data then parks forever,

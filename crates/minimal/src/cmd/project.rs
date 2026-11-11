@@ -296,11 +296,29 @@ async fn upload_workspace(
 /// plain checkout or a directory with no `.git`.
 pub(crate) fn linked_worktree_notice(root: &camino::Utf8Path) -> Option<String> {
     let gitdir = file_upload::linked_worktree_gitdir(root.as_std_path())?;
+    // the pointer is a cloned repository's text: a control byte in it (an
+    // escape sequence) would reach the terminal as it is
+    let gitdir = printable(&gitdir);
     Some(format!(
-        "{root} is a linked git worktree: its .git file points at {gitdir}, which the box \
-         cannot reach, so the upload leaves it out; the files are in /workbench, and git \
-         there sees no repository"
+        "{root}'s .git file points at {gitdir}, outside the project (a linked git worktree, \
+         or a submodule checked out on its own), which the box cannot reach, so the upload \
+         leaves it out; the files are in /workbench, and git there sees no repository"
     ))
+}
+
+/// `s` with every control character shown as its escape (`\u{1b}`, `\n`),
+/// so text read from a repository prints as text and never as a terminal
+/// command.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The notice that the upload root resolved above the invocation directory —
@@ -1258,6 +1276,52 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    /// A `.git` pointer is a cloned repository's text: an escape sequence in
+    /// it is printed as its escape, and a plain path as it is. The notice
+    /// says the same for a worktree's absolute pointer and a submodule's
+    /// relative one, since the upload leaves both out by the one test.
+    #[test]
+    fn the_notice_prints_a_pointer_as_text_and_names_the_file_for_both_shapes() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf-8");
+        assert_eq!(
+            linked_worktree_notice(root),
+            None,
+            "no .git file, no notice"
+        );
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /home/me/repo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        let n = linked_worktree_notice(root).expect("a worktree's pointer");
+        assert!(
+            n.contains("points at /home/me/repo/.git/worktrees/x, outside the project"),
+            "{n}"
+        );
+        std::fs::write(dir.path().join(".git"), "gitdir: ../.git/modules/x\n").unwrap();
+        let n = linked_worktree_notice(root).expect("a submodule's pointer");
+        assert!(
+            n.contains("points at ../.git/modules/x, outside the project"),
+            "{n}"
+        );
+        std::fs::write(dir.path().join(".git"), "gitdir: /x\u{1b}]0;owned\u{7}\n").unwrap();
+        let n = linked_worktree_notice(root).expect("a pointer with an escape in it");
+        assert!(n.contains("/x\\u{1b}]0;owned\\u{7},"), "{n}");
+        assert!(!n.contains('\u{1b}'), "{n}");
+        std::fs::write(dir.path().join(".git"), "not a pointer\n").unwrap();
+        assert_eq!(
+            linked_worktree_notice(root),
+            None,
+            "no pointer, nothing left out, no notice"
+        );
+    }
 }
 
 #[cfg(test)]
