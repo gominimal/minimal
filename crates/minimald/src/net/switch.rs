@@ -1728,6 +1728,9 @@ pub struct BoxGate {
     /// against it, so the name rule reads the name the target holds and
     /// not the source's lookups. `None` for a gate built with no name.
     zone_name: Option<String>,
+    /// The box's name as it was given, for the lines that name the box
+    /// (gominimal/inbox#1228). `None` for a gate built with no name.
+    name: Option<String>,
 }
 
 /// What the gate holds for one flow to a host exposure.
@@ -2122,6 +2125,7 @@ impl BoxGate {
             host_flows: Mutex::new(HashMap::new()),
             box_names: named_boxes(policy),
             zone_name: box_name.map(box_zone_name),
+            name: box_name.map(str::to_owned),
         }
     }
 
@@ -2145,21 +2149,11 @@ impl BoxGate {
         self.names_box(&target)
     }
 
-    /// The name rule's verdict on `target` for a box that names boxes:
-    /// `Some(Ok(()))` when [`Self::box_names`] lists the zone name the
-    /// target holds, `Some(Err(name))` otherwise, and `None` for a box that
-    /// names no box. A target gate built with no name is named by its
-    /// label, the name its own log lines carry.
-    /// The box's own name for a log line: its zone name without the zone's
-    /// suffix, so a reader sees what `min box list` shows. `None` for a gate
-    /// built with no name.
+    /// The box's own name for a log line, as the box was named, so a reader
+    /// sees what `min box list` shows (the zone name folds its case).
+    /// `None` for a gate built with no name.
     fn box_name(&self) -> Option<&str> {
-        let zone = self.zone_name.as_deref()?;
-        Some(
-            zone.strip_suffix(super::dns::HOSTNAME_SUFFIX)
-                .and_then(|name| name.strip_suffix('.'))
-                .unwrap_or(zone),
-        )
+        self.name.as_deref()
     }
 
     /// The box as a violation line names it ([`super::policy::Offender`]):
@@ -2171,6 +2165,11 @@ impl BoxGate {
         }
     }
 
+    /// The name rule's verdict on `target` for a box that names boxes:
+    /// `Some(Ok(()))` when [`Self::box_names`] lists the zone name the
+    /// target holds, `Some(Err(name))` otherwise, and `None` for a box that
+    /// names no box. A target gate built with no name is named by its
+    /// label, the name its own log lines carry.
     fn names_box(&self, target: &BoxGate) -> Option<Result<(), String>> {
         if self.box_names.is_empty() {
             return None;

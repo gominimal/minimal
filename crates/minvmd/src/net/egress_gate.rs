@@ -5009,12 +5009,7 @@ async fn relay_switch_frames_to_guest(
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
                 let addr = l4.as_ref().map(|pkt| pkt.dst.ip().octets());
-                let record = addr.and_then(|addr| table.by_source(addr));
-                limiter.warn_backpressure(
-                    QueueDirection::TowardGuest,
-                    addr,
-                    Who(record.as_deref()),
-                );
+                limiter.warn_backpressure(QueueDirection::TowardGuest, addr, Who::of(&table, addr));
                 continue;
             }
             Err(mpsc::error::TrySendError::Closed(())) => {
@@ -5202,20 +5197,18 @@ async fn relay_frames_to_switch(
             // Every line below names the box the frame's source resolves to
             // (its row as it is now, a rename moves it), beside the address
             // the line already carried: the address alone means nothing once
-            // the box is gone (gominimal/inbox#1228).
+            // the box is gone (gominimal/inbox#1228). The row is read only
+            // for a line the limiter lets through.
             Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
-                let record = table.by_source(src);
-                limiter.warn_switch_surface(src, Who(record.as_deref()), dst_port);
+                limiter.warn_switch_surface(src, Who::of(table, Some(src)), dst_port);
                 continue;
             }
             Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
-                let record = table.by_source(src);
-                limiter.warn_infrastructure(src, Who(record.as_deref()), dst, dst_port);
+                limiter.warn_infrastructure(src, Who::of(table, Some(src)), dst, dst_port);
                 continue;
             }
             Err(GateDrop::HostAlias { src, dst_port, row }) => {
-                let record = table.by_source(src);
-                limiter.warn_host_alias(src, Who(record.as_deref()), dst_port, row);
+                limiter.warn_host_alias(src, Who::of(table, Some(src)), dst_port, row);
                 continue;
             }
             Err(GateDrop::BoxName { src, dst, dst_port }) => {
@@ -5274,10 +5267,9 @@ async fn relay_frames_to_switch(
                 // address and the port the frame gave it, read off the frame
                 // the reason's own shape refuses — so a bundle's reader learns
                 // which reach was refused without cross-reading the rows.
-                let record = summary.source().and_then(|src| table.by_source(src));
                 limiter.warn_undeclared_subnet(
                     summary.source(),
-                    Who(record.as_deref()),
+                    Who::of(table, summary.source()),
                     dst,
                     summary.destination_port(),
                     reason.rule(),
@@ -5285,8 +5277,11 @@ async fn relay_frames_to_switch(
                 continue;
             }
             Err(dropped) => {
-                let record = summary.source().and_then(|src| table.by_source(src));
-                limiter.emit(summary.source(), Who(record.as_deref()), dropped.rule());
+                limiter.emit(
+                    summary.source(),
+                    Who::of(table, summary.source()),
+                    dropped.rule(),
+                );
                 continue;
             }
         };
@@ -5361,11 +5356,10 @@ async fn relay_frames_to_switch(
         match switch.try_send(framed) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                let record = summary.source().and_then(|src| table.by_source(src));
                 limiter.warn_backpressure(
                     QueueDirection::TowardSwitch,
                     summary.source(),
-                    Who(record.as_deref()),
+                    Who::of(table, summary.source()),
                 );
                 continue;
             }
@@ -6943,20 +6937,48 @@ fn family_drop(family: FrameFamily) -> DropReason {
     }
 }
 
-/// The box a dropped frame's address resolved to, for the line that names
-/// the drop: its name and id as the row holds them now, or nothing for an
-/// address no row holds (gominimal/inbox#1228: the address alone means
-/// nothing once the box is gone).
+/// The box a dropped frame's address may resolve to, for the line that
+/// names the drop (gominimal/inbox#1228: the address alone means nothing
+/// once the box is gone). The row is looked up only once the limiter has
+/// said to write a line, so a flood of silenced drops takes no row lock.
 #[derive(Clone, Copy)]
-struct Who<'a>(Option<&'a crate::box_registry::BoxRecord>);
+struct Who<'a> {
+    table: &'a BoxTable,
+    addr: Option<[u8; 4]>,
+}
 
-impl Who<'_> {
-    fn name(self) -> Option<std::sync::Arc<str>> {
-        self.0.map(crate::box_registry::BoxRecord::name)
+impl<'a> Who<'a> {
+    fn of(table: &'a BoxTable, addr: Option<[u8; 4]>) -> Self {
+        Self { table, addr }
     }
 
-    fn id(self) -> Option<tracing::field::DisplayValue<uuid::Uuid>> {
+    /// The row `addr` holds now, or none: for a frame with no address, for
+    /// an address no row holds, and for the node address, which the
+    /// `host_ip` cohort shares with the VM's own namespace, so no one box
+    /// is the frame's and the node row's name would be the wrong one.
+    fn resolve(self) -> Named {
+        let Some(addr) = self.addr else {
+            return Named(None);
+        };
+        if addr == self.table.subnet().daemon_ip().octets() {
+            return Named(None);
+        }
+        Named(self.table.by_source(addr))
+    }
+}
+
+/// What a drop line names: the box's name and id as its row holds them now,
+/// or nothing.
+struct Named(Option<std::sync::Arc<crate::box_registry::BoxRecord>>);
+
+impl Named {
+    fn name(&self) -> Option<std::sync::Arc<str>> {
+        self.0.as_deref().map(crate::box_registry::BoxRecord::name)
+    }
+
+    fn id(&self) -> Option<tracing::field::DisplayValue<uuid::Uuid>> {
         self.0
+            .as_deref()
             .map(|record| tracing::field::display(uuid::Uuid::from_bytes(record.box_id())))
     }
 }
@@ -6973,6 +6995,7 @@ impl DropLimiter {
         match self.should_warn_at(src, rule, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
+                let who = who.resolve();
                 let source =
                     src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
                 tracing::warn!(
@@ -7004,6 +7027,7 @@ impl DropLimiter {
         match self.should_warn_at(Some(src), SWITCH_CONTROL_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
+                let who = who.resolve();
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     box = who.name().as_deref(),
@@ -7047,6 +7071,7 @@ impl DropLimiter {
         match self.should_warn_at(addr, rule, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
+                let who = who.resolve();
                 let addr = addr.map_or_else(
                     || "none".to_string(),
                     |addr| Ipv4Addr::from(addr).to_string(),
@@ -7100,6 +7125,7 @@ impl DropLimiter {
         match self.should_warn_at(Some(src), INFRASTRUCTURE_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
+                let who = who.resolve();
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     box = who.name().as_deref(),
@@ -7132,6 +7158,7 @@ impl DropLimiter {
         match self.should_warn_at(Some(src), HOST_ALIAS_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
+                let who = who.resolve();
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     box = who.name().as_deref(),
@@ -7410,6 +7437,7 @@ impl DropLimiter {
         match self.should_warn_at(src, rule, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
+                let who = who.resolve();
                 let source =
                     src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
                 tracing::warn!(
@@ -8303,7 +8331,7 @@ mod tests {
         PublishedForwards, Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE,
         UNDECLARED_RETRACT_RULE, UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE,
         UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE,
-        UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins, gate_verdict, max_frame,
+        UnregisteredSourcePhase, WarnDecision, Who, accept_loop, dns_pins, gate_verdict, max_frame,
         render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
@@ -8329,6 +8357,36 @@ mod tests {
                     allow_dns_hosts: None,
                     deny_subnets: None,
                 }),
+        );
+    }
+
+    /// gominimal/inbox#1228: a drop line names the box its address resolves
+    /// to, and names none for the node address, which every `host_ip` box
+    /// shares with the VM's own namespace, so the node row's name there
+    /// would be the wrong box's.
+    #[test]
+    fn a_drop_line_names_the_rows_box_and_never_the_node_row() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        tcp_lan_box(&registry, LEASE);
+        let table = registry.table();
+
+        let named = Who::of(&table, Some(LEASE)).resolve();
+        assert_eq!(named.name().as_deref(), Some("web"));
+        assert!(named.id().is_some(), "the row's box has an id");
+
+        let node = Who::of(&table, Some(SUBNET.daemon_ip().octets())).resolve();
+        assert!(
+            node.name().is_none() && node.id().is_none(),
+            "the node address names no box: {:?}",
+            node.name()
+        );
+        assert!(Who::of(&table, None).resolve().name().is_none());
+        assert!(
+            Who::of(&table, Some([100, 64, 0, 250]))
+                .resolve()
+                .name()
+                .is_none()
         );
     }
 
