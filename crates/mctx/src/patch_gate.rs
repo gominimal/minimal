@@ -25,8 +25,10 @@
 //!   deny on its target or onto a target no rule allows.
 //! - For a directory, a probe of what it holds: a `deny` that matches a
 //!   contained path denies the entry, since the mount would expose it. The
-//!   probe runs only when some `deny` pattern can reach inside the directory,
-//!   and it is bounded: a tree it cannot read whole is refused, not mounted.
+//!   probe runs only when some `deny` pattern can reach inside the directory
+//!   and the entry would otherwise be mounted (an ignored entry exposes
+//!   nothing, so it is not probed), and it is bounded: a tree it cannot read
+//!   whole is refused, not mounted.
 //!
 //! A denied entry refuses the run (`policy denied ...`). An ignored entry is
 //! dropped from the sandbox, and the caller says so. An entry no rule decides
@@ -263,10 +265,19 @@ fn judge_task_patches(
                 .map_err(|e| anyhow!("task `{task_name}`: {e}"))?;
             let at = Utf8PathBuf::from(at);
             let decided = decide_entry(&expanded, &source, &at, is_file).map_err(|e| {
+                // The policy file is named only where a rule in it is one of
+                // the things the person can change: a probe the `deny`
+                // pattern reaching inside the directory set off. A path that
+                // cannot be judged (a `..` segment, a dangling link, an
+                // unreadable ancestor) is the entry's own.
+                let rules = if e.downcast_ref::<ProbeRefusal>().is_some() {
+                    format!(" The `[patches]` rules are in {}.", policy_path.display())
+                } else {
+                    String::new()
+                };
                 anyhow!(
-                    "task `{task_name}`: {kind}.\"{declared}\" was not mounted. {e} The \
-                     `[patches]` rules are in {}.",
-                    policy_path.display()
+                    "task `{task_name}`: the run was refused because of \
+                     {kind}.\"{declared}\". {e}{rules}"
                 )
             })?;
             match decided.verdict {
@@ -356,7 +367,13 @@ fn decide_entry(
         (Some(r), Some(Verdict::Denied)) if own != Verdict::Denied => Some(r.to_string()),
         _ => None,
     };
-    if verdict != Verdict::Denied && !is_file && !expanded.deny().is_empty() {
+    // Only an entry that would be mounted is probed: an ignored one is
+    // dropped from the sandbox and exposes nothing, so a `deny` hit inside
+    // it, or a part of it that cannot be read, refuses nothing.
+    if matches!(verdict, Verdict::Allowed | Verdict::NeedsApproval)
+        && !is_file
+        && !expanded.deny().is_empty()
+    {
         let probe_root = resolved.as_deref().unwrap_or(at);
         if let Some(hit) = probe_dir_for_deny(expanded, source, at, probe_root)? {
             verdict = Verdict::Denied;
@@ -426,8 +443,7 @@ fn resolve(path: &Utf8Path) -> anyhow::Result<Option<Utf8PathBuf>> {
             }
             Err(e) => {
                 return Err(anyhow!(
-                    "`{cur}` cannot be resolved: {e}. Point the entry at a path the daemon \
-                     can read."
+                    "`{cur}` cannot be resolved: {e}. Point the entry at a path you can read."
                 ));
             }
         }
@@ -438,6 +454,21 @@ fn resolve(path: &Utf8Path) -> anyhow::Result<Option<Utf8PathBuf>> {
         cur = parent;
     }
 }
+
+/// A directory entry the deny probe could not check whole. It is the one
+/// refusal a `[patches]` rule sets off (the `deny` pattern that reaches
+/// inside the directory is one of the two things the person can narrow),
+/// so the refusal that reaches the person names the policy file for it.
+#[derive(Debug)]
+struct ProbeRefusal(String);
+
+impl std::fmt::Display for ProbeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProbeRefusal {}
 
 /// Look inside the directory entry for a path a `deny` rule matches. The
 /// directory is walked at `on_disk` (its resolved form) and every path in it
@@ -464,7 +495,7 @@ fn probe_dir_for_deny(
     source: &Source,
     declared: &Utf8Path,
     on_disk: &Utf8Path,
-) -> anyhow::Result<Option<String>> {
+) -> Result<Option<String>, ProbeRefusal> {
     let reaches = expanded.deny().iter().any(|fs| {
         deny_reaches_inside(fs, declared.as_str()) || deny_reaches_inside(fs, on_disk.as_str())
     });
@@ -480,20 +511,19 @@ fn probe_dir_for_deny(
         let item = match item {
             Ok(item) => item,
             Err(e) => {
-                return Err(anyhow!(
+                return Err(ProbeRefusal(format!(
                     "A part of it cannot be read to check it against `[patches] deny`: {e}. \
-                     Narrow the entry in the project's minimal.toml to the part the daemon \
-                     can read."
-                ));
+                     Narrow the entry in the project's minimal.toml to the part you can read."
+                )));
             }
         };
         seen += 1;
         if seen > DIR_PROBE_LIMIT {
-            return Err(anyhow!(
+            return Err(ProbeRefusal(format!(
                 "It holds more than {DIR_PROBE_LIMIT} entries, too many to check against \
                  `[patches] deny`. Narrow the entry in the project's minimal.toml, or narrow \
                  the `deny` pattern so it does not reach inside this directory."
-            ));
+            )));
         }
         let real = Utf8PathBuf::from(item.path().to_string_lossy().into_owned());
         if denied(real.as_path()) {
@@ -688,6 +718,56 @@ mod tests {
         };
         let notice = gated.ignored_notice("peek").unwrap();
         assert!(notice.contains(drop.as_str()), "{notice}");
+    }
+
+    /// An ignored entry is dropped from the sandbox and exposes nothing, so
+    /// what it holds is not probed: a `deny` that refuses the same directory
+    /// as an allowed entry refuses nothing here, and the run goes on without
+    /// the entry.
+    #[test]
+    fn an_ignored_directory_is_not_probed() {
+        let t = Tree::new();
+        let keep = t.dir("keep");
+        let drop = t.dir("drop");
+        t.file("drop/nested/id.pem");
+        let mut patches = dir_patch(&keep);
+        patches.dir.insert(drop.to_string(), PatchSetting::ReadOnly);
+        let rules = format!(
+            "[patches]\nallow = [\"{keep}\"]\nignore = [\"{drop}\"]\ndeny = [\"**/*.pem\"]\n"
+        );
+        let (kept, ignored) = judge(&t, &patches, &policy(&rules)).unwrap();
+        assert_eq!(kept, dir_patch(&keep));
+        assert_eq!(ignored, vec![drop.to_string()]);
+        // The same directory as an allowed entry is probed, and refused.
+        let allowed =
+            format!("[patches]\nallow = [\"{keep}\", \"{drop}\"]\ndeny = [\"**/*.pem\"]\n");
+        let err = judge(&t, &patches, &policy(&allowed))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("policy denied"), "{err}");
+    }
+
+    /// What the person at `mip run` reads when an entry cannot be judged:
+    /// that the run was refused because of the entry, then why. The policy
+    /// file is named only for a probe a `deny` pattern set off; a path that
+    /// cannot be resolved names no rule, since none caused it.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_names_the_entry_and_the_policy_file_only_for_a_probe() {
+        let t = Tree::new();
+        let d = t.dir("cfg");
+        let dangling = t.root.join("cfg/gone");
+        std::os::unix::fs::symlink("/nowhere/at/all", &dangling).unwrap();
+        let pol = policy(&format!("[patches]\nallow = [\"{d}\"]\n"));
+        let err = gate(&t, &dir_patch(&dangling), &pol)
+            .unwrap_err()
+            .to_string();
+        let head =
+            format!("task `peek`: the run was refused because of patch.dir.\"{dangling}\". ");
+        assert!(err.starts_with(&head), "{err}");
+        assert!(err.contains("does not resolve"), "{err}");
+        assert!(!err.contains("rules are in"), "{err}");
+        assert!(!err.contains("not mounted"), "{err}");
     }
 
     /// A symlink inside an allowed directory is judged as the link: the mount
