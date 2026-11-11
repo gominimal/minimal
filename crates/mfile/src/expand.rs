@@ -32,7 +32,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Error;
-use crate::box_types::{BoxTypeError, BoxTypes, ResolvedType, allowed_words, excluded, inline};
+use crate::box_types::{
+    BoxTypeError, BoxTypes, ResolvedType, allowed_words, canonical_constraints, excluded, inline,
+};
 use crate::entry::{BoxEntry, EntryTable};
 use crate::error::{EntryHeader, SpecKeyProblem};
 
@@ -308,27 +310,40 @@ pub fn check_constraints(
     box_type: &ResolvedType,
 ) -> Result<(), BoxTypeError> {
     for (type_name, constraints) in box_type.constraints.iter().rev() {
-        for (key, constraint) in constraints {
-            let Some(value) = expansion.spec.get(key) else {
-                continue;
-            };
-            let Some(bad) = excluded(key, constraint, value) else {
-                continue;
-            };
-            let origin = expansion.report.values.get(key);
-            let origin = match (origin, bad.item) {
-                // Only a top-level list has an origin for each item.
-                (Some(ValueOrigin::List(origins)), Some(i)) if bad.key == *key => origins.get(i),
-                (origin, _) => origin.and_then(ValueOrigin::first),
-            };
-            return Err(BoxTypeError::ConstraintBroken {
-                box_type: type_name.clone(),
-                key: bad.key,
-                value: inline(&bad.value),
-                allowed: allowed_words(&bad.constraint),
-                layer: layer_words(entry, origin),
-                item: bad.item.is_some(),
-            });
+        for (key, constraint) in canonical_constraints(constraints) {
+            // A flat setting is checked where the spec carries it: at its
+            // flat key and at the same key under its section.
+            let mut places = vec![(key.clone(), key.clone(), expansion.spec.get(&key))];
+            if let Some(section) = crate::spec::flat_key_section(&key) {
+                let nested = expansion
+                    .spec
+                    .get(section)
+                    .and_then(toml::Value::as_table)
+                    .and_then(|t| t.get(&key));
+                places.push((format!("{section}.{key}"), section.to_owned(), nested));
+            }
+            for (path, top, value) in places {
+                let Some(value) = value else {
+                    continue;
+                };
+                let Some(bad) = excluded(&path, &constraint, value) else {
+                    continue;
+                };
+                let origin = expansion.report.values.get(&top);
+                let origin = match (origin, bad.item) {
+                    // Only a top-level list has an origin for each item.
+                    (Some(ValueOrigin::List(origins)), Some(i)) if bad.key == top => origins.get(i),
+                    (origin, _) => origin.and_then(ValueOrigin::first),
+                };
+                return Err(BoxTypeError::ConstraintBroken {
+                    box_type: type_name.clone(),
+                    key: bad.key,
+                    value: inline(&bad.value),
+                    allowed: allowed_words(&bad.constraint),
+                    layer: layer_words(entry, origin),
+                    item: bad.item.is_some(),
+                });
+            }
         }
     }
     Ok(())
@@ -1850,6 +1865,72 @@ mod tests {
         assert!(
             msg.starts_with("a selected loadout adds `\"jq\"` to `packages`"),
             "{msg}"
+        );
+
+        // A setting under its section is checked as the flat key is.
+        for (setting, key, value, allowed) in [
+            (
+                "execution = { restart = \"always\" }",
+                "execution.restart",
+                "\"always\"",
+                "`[box_types.ci-small]` allows only `\"never\"`",
+            ),
+            (
+                "io = { pty_enabled = true }",
+                "io.pty_enabled",
+                "true",
+                "`[box_types.ci]` allows only `false`",
+            ),
+        ] {
+            let file = format!("{CONSTRAINED_FILE}\n[boxes.x]\ntype = \"ci-small\"\n{setting}\n");
+            let (_, checked) = expand_checked(&file, "x", "", "");
+            let err = checked.expect_err(setting);
+            assert!(
+                matches!(err, BoxTypeError::ConstraintBroken { .. }),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`[boxes.x]` in minimal.toml sets `{key}` to `{value}`. \
+                     {allowed} for `{key}`. Change the value."
+                )
+            );
+        }
+
+        // A constraint written under its section checks the flat key too.
+        let file = r#"
+            [box_types.ci-io]
+            extends = "task"
+            constraints = { io = { pty_enabled = false }, install = { packages = ["git"] } }
+
+            [boxes.x]
+            type = "ci-io"
+            pty_enabled = true
+        "#;
+        let (_, checked) = expand_checked(file, "x", "", "");
+        assert_eq!(
+            checked.expect_err("flat pty_enabled").to_string(),
+            "`[boxes.x]` in minimal.toml sets `pty_enabled` to `true`. \
+             `[box_types.ci-io]` allows only `false` for `pty_enabled`. Change the value."
+        );
+        let (_, checked) =
+            expand_checked(file, "x", "", "pty_enabled = false\npackages = [\"jq\"]");
+        assert_eq!(
+            checked.expect_err("flat packages").to_string(),
+            "a command-line flag adds `\"jq\"` to `packages`. \
+             `[box_types.ci-io]` allows only `\"git\"` in `packages`. Change the value."
+        );
+
+        // A built-in type ships its own constraints: a task has no PTY.
+        let file = "[tasks.x]\npty_enabled = true\n";
+        let (_, checked) = expand_checked(file, "x", "", "");
+        let err = checked.expect_err("a task with a PTY");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "`[tasks.x]` in minimal.toml sets `pty_enabled` to `true`. \
+             The built-in type `task` allows only `false` for `pty_enabled`. Change the value."
         );
     }
 

@@ -257,18 +257,21 @@ impl fmt::Display for BoxTypeError {
                 parent,
                 value,
             } => {
+                let parent = if builtin(parent).is_some() {
+                    format!("`{parent}`")
+                } else {
+                    TypeWords(parent).to_string()
+                };
                 match value {
                     Some(value) => write!(
                         f,
                         "`[{BOX_TYPES_TABLE}.{name}]` allows `{value}` for `{key}` \
-                         in `constraints`, but its parent type {} does not.",
-                        TypeWords(parent)
+                         in `constraints`, but its parent type {parent} does not."
                     )?,
                     None => write!(
                         f,
                         "`[{BOX_TYPES_TABLE}.{name}]` allows values for `{key}` \
-                         in `constraints` that its parent type {} does not allow.",
-                        TypeWords(parent)
+                         in `constraints` that its parent type {parent} does not allow."
                     )?,
                 }
                 write!(
@@ -382,7 +385,7 @@ impl BoxTypes {
             current = &project.extends;
         };
         let mut defaults = vec![(root.to_owned(), toml::Table::new())];
-        let mut constraints = vec![(root.to_owned(), toml::Table::new())];
+        let mut constraints = vec![(root.to_owned(), builtin_constraints(root))];
         for t in chain.iter().rev() {
             let project = &self.project[*t];
             defaults.push(((*t).to_owned(), project.defaults.clone()));
@@ -429,6 +432,10 @@ fn check_narrowing(chain: &[(String, toml::Table)]) -> Result<(), BoxTypeError> 
     // The resolved constraint of each key: the last one the chain set. Each
     // one is checked to admit no more than the one before it, so the last
     // one admits no more than any of them.
+    let chain: Vec<(&str, Vec<(String, toml::Value)>)> = chain
+        .iter()
+        .map(|(name, table)| (name.as_str(), canonical_constraints(table)))
+        .collect();
     let mut resolved: BTreeMap<&str, &toml::Value> = BTreeMap::new();
     for (i, (name, table)) in chain.iter().enumerate() {
         for (key, derived) in table {
@@ -436,9 +443,9 @@ fn check_narrowing(chain: &[(String, toml::Table)]) -> Result<(), BoxTypeError> 
                 && let Some((key, value)) = loosening(key, derived, parent)
             {
                 return Err(BoxTypeError::Loosening {
-                    name: name.clone(),
+                    name: (*name).to_owned(),
                     key,
-                    parent: chain[i.saturating_sub(1)].0.clone(),
+                    parent: chain[i.saturating_sub(1)].0.to_owned(),
                     value: value.map(|v| inline(&v)),
                 });
             }
@@ -446,6 +453,60 @@ fn check_narrowing(chain: &[(String, toml::Table)]) -> Result<(), BoxTypeError> 
         }
     }
     Ok(())
+}
+
+/// The constraints each built-in type ships with, from the shipped-types
+/// table of the architecture. A project type that extends a built-in can
+/// only narrow these (BOX-156), and an entry of the type is checked
+/// against them (BOX-061).
+#[must_use]
+pub fn builtin_constraints(root: &str) -> toml::Table {
+    let mut table = toml::Table::new();
+    match root {
+        "session" => {
+            table.insert("pty_enabled".into(), true.into());
+        }
+        "task" | "service" => {
+            table.insert("pty_enabled".into(), false.into());
+        }
+        "build" | "container-build" => {
+            table.insert("pty_enabled".into(), false.into());
+            table.insert("exec_enabled".into(), false.into());
+            table.insert("loadout_mode".into(), "sealed".into());
+            let mut nesting = toml::Table::new();
+            nesting.insert("allowed".into(), false.into());
+            table.insert("nesting".into(), nesting.into());
+        }
+        _ => {}
+    }
+    table
+}
+
+/// A `constraints` table with each flat setting at its flat key. A
+/// setting written under its section, such as `io = { pty_enabled =
+/// false }`, moves to its flat key, `pty_enabled`. The keys a section
+/// holds that are not flat settings stay under the section. A key the
+/// table sets in both forms appears twice, and each one constrains.
+pub(crate) fn canonical_constraints(table: &toml::Table) -> Vec<(String, toml::Value)> {
+    let mut out = Vec::new();
+    for (key, value) in table {
+        let toml::Value::Table(inner) = value else {
+            out.push((key.clone(), value.clone()));
+            continue;
+        };
+        let mut rest = toml::Table::new();
+        for (sub, sub_value) in inner {
+            if crate::spec::flat_key_section(sub) == Some(key.as_str()) {
+                out.push((sub.clone(), sub_value.clone()));
+            } else {
+                rest.insert(sub.clone(), sub_value.clone());
+            }
+        }
+        if !rest.is_empty() || inner.is_empty() {
+            out.push((key.clone(), rest.into()));
+        }
+    }
+    out
 }
 
 /// The values a constraint that is not a table admits: a list's items, or
@@ -869,6 +930,44 @@ mod tests {
                 )
             );
         }
+
+        // A built-in parent ships its own constraints: a task has no PTY,
+        // in either form of the key.
+        for constraints in ["pty_enabled = true", "io = { pty_enabled = [true, false] }"] {
+            let err = types(&format!(
+                "[box_types.ci-pty]\nextends = \"task\"\nconstraints = {{ {constraints} }}\n"
+            ))
+            .expect_err(constraints);
+            assert_eq!(err.exit_code(), 3);
+            assert_eq!(
+                err,
+                BoxTypeError::Loosening {
+                    name: "ci-pty".into(),
+                    key: "pty_enabled".into(),
+                    parent: "task".into(),
+                    value: Some("true".into()),
+                }
+            );
+            assert_eq!(
+                err.to_string(),
+                "`[box_types.ci-pty]` allows `true` for `pty_enabled` in `constraints`, \
+                 but its parent type `task` does not. \
+                 A type can only narrow the constraints of the type it extends. \
+                 Change `pty_enabled` in the `constraints` of `[box_types.ci-pty]`."
+            );
+        }
+        // A session keeps its PTY, and a build stays sealed.
+        types("[box_types.dev]\nextends = \"session\"\nconstraints = { pty_enabled = true }\n")
+            .expect("repeats the session constraint");
+        let err = types(
+            "[box_types.img]\nextends = \"build\"\nconstraints = { box = { loadout_mode = \"open\" } }\n",
+        )
+        .expect_err("a build is sealed");
+        assert!(
+            matches!(&err, BoxTypeError::Loosening { key, parent, .. }
+                if key == "loadout_mode" && parent == "build"),
+            "{err:?}"
+        );
 
         // The parent's resolved constraint holds through a type that does
         // not repeat it: the parent named is the type extended.
