@@ -1800,16 +1800,26 @@ done
 # the root's own cgroup.subtree_control; a root that offers no memory
 # controller is a note, not a failure: boxes still get their leaves and
 # their verdicts, and read no memory.max. (A rehearsal's stand-in root has
-# that file only if the rehearsal wrote it.)
-mount_root=$(dirname "$tree_root")
-if grep -qw memory "$mount_root/cgroup.subtree_control" 2>/dev/null; then
-    if printf '+memory\n' >"$tree_root/cgroup.subtree_control" 2>/dev/null; then
+# that file only if the rehearsal wrote it.) What offers it is the slice's
+# parent cgroup, whatever depth the tree root sits at: a nested --tree-root
+# reads its parent's cgroup.subtree_control, not the mount root's.
+parent=$(dirname "$tree_root")
+if grep -qw memory "$parent/cgroup.subtree_control" 2>/dev/null; then
+    if err=$(printf '+memory\n' 2>&1 >"$tree_root/cgroup.subtree_control"); then
         note "enabled the memory controller on the slice ($tree_root/cgroup.subtree_control): a box reads its own memory.max under its cgroup2 cover once minimald enables it on the cohort below"
     else
-        note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control): a process standing in the slice itself rather than in a leaf refuses it; boxes read no memory.max until a re-install with the slice's processes in their leaves"
+        # the one cause this step can prove is a process standing in the slice itself (cgroup v2 refuses
+        # a controller for the children of a cgroup that holds a process); any other failure is named as
+        # the write's own error
+        standing=$(tr '\n' ' ' <"$tree_root/cgroup.procs" 2>/dev/null)
+        if [ -n "${standing// /}" ]; then
+            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control): a process stands in the slice itself rather than in a leaf (pid ${standing% }); boxes read no memory.max until a re-install with the slice's processes in their leaves"
+        else
+            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control): the write failed (${err:-no error text}); boxes read no memory.max until a re-install over a slice that takes it"
+        fi
     fi
 else
-    note "the mount root offers the slice no memory controller ($mount_root/cgroup.subtree_control): boxes get their leaves and verdicts, and read no memory.max"
+    note "the slice's parent offers it no memory controller ($parent/cgroup.subtree_control): boxes get their leaves and verdicts, and read no memory.max"
 fi
 
 # The cgroups' paths the ruleset is keyed on, as the covering mount spells

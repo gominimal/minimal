@@ -2808,10 +2808,10 @@ STUB
 
     run_hc unenrolled "$root/mi-on" --user "$me"
     check 0 "$rc" "install exits 0 with neither identity"
-    want_ok "a mount root with no memory controller is noted, and the install goes on" \
-        grep -q "offers the slice no memory controller" "$OUT"
-    want_err "no controller is enabled on the slice over such a root" \
-        grep -q "+memory" "$tree/cgroup.subtree_control"
+    want_ok "a parent with no memory controller is noted, and the install goes on" \
+        grep -q "parent offers it no memory controller" "$OUT"
+    want_ok "no controller is enabled on the slice over such a parent (no file, or no +memory in it)" \
+        sh -c '[ ! -e "$1" ] || ! grep -q "+memory" "$1"' _ "$tree/cgroup.subtree_control"
     want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
     want_ok "the un-enrolled install lays out the QUIC block leaf" \
         test -d "$tree/boxes/quic443-blocked"
@@ -3015,6 +3015,26 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     # --- --print-ruleset prints the same transaction the install loaded:
     # the daemon's own ruleset tests read this mode, so the two spellings
     # cannot drift.
+
+    # The write to the slice's cgroup.subtree_control can fail. The one cause the step proves is a process
+    # standing in the slice itself (cgroup.procs non-empty); any other failure is named as the write's error.
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    chmod 0444 "$tree/cgroup.subtree_control"
+    printf '4242\n' >"$tree/cgroup.procs"
+    run_hc install-standing "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "install exits 0 when the slice refuses the memory controller"
+    want_ok "a process standing in the slice is named as the cause, with its pid" \
+        grep -q "a process stands in the slice itself rather than in a leaf (pid 4242)" "$OUT"
+    : >"$tree/cgroup.procs"
+    run_hc install-unwritable "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "install exits 0 when the write fails for another reason"
+    want_ok "an unexplained failure is named as the write's own error, not as a standing process" \
+        sh -c 'grep -q "the write failed (" "$1" && ! grep -q "a process stands in the slice" "$1"' _ "$OUT"
+    chmod 0644 "$tree/cgroup.subtree_control"
+    unset HC_HELPER HC_SUDOERS
     run_hc print_ruleset "$root/mi-on" --print-ruleset \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 0 "$rc" "--print-ruleset exits 0"
