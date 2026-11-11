@@ -4,9 +4,9 @@ title: "spec-hash epoch 1: an injective, machine-checked BuildSpec encoding"
 status: draft
 owner: bryan-minimal
 epic: gominimal/inbox#583
-arch: https://github.com/gominimal/arch/blob/d77725b6dcca73918efb66f0e15e97120db62a0e/architecture.md#d31--the-build-spec-hash-keyspace-contract-and-epochs
-arch_sha: "d77725b6dcca73918efb66f0e15e97120db62a0e"
-updated: 2026-11-05
+arch: https://github.com/gominimal/arch/blob/15b603e6afb8dd2ebf6fc15f2ec1cac1fb57a0ec/architecture.md#d31--the-build-spec-hash-keyspace-contract-and-epochs
+arch_sha: "15b603e6afb8dd2ebf6fc15f2ec1cac1fb57a0ec"
+updated: 2026-11-11
 ---
 
 # EPOCH — spec-hash epoch 1: an injective, machine-checked BuildSpec encoding
