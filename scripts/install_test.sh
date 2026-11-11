@@ -3035,18 +3035,21 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     # the slice (that cause the step proves from cgroup.procs and names with the pid; a pid planted there would
     # also change what the install lays out, so the rehearsal leaves it alone): an unwritable file. The note then
     # names the write's own error and no standing process. After the section's own checks, so the tree the
-    # print-ruleset and --check runs read is the first install's.
-    HC_HELPER="$root/hclib/quic443-leaf"
-    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
-    chmod 0444 "$tree/cgroup.subtree_control"
-    run_hc install-unwritable "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    chmod 0644 "$tree/cgroup.subtree_control"
-    unset HC_HELPER HC_SUDOERS
-    check 0 "$rc" "install exits 0 when the slice's write fails"
-    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
-    want_ok "an unexplained failure is named as the write's own error, not as a standing process" \
-        sh -c 'grep -q "the write failed (" "$1" && ! grep -q "a process stands in the slice" "$1"' _ "$OUT"
+    # print-ruleset and --check runs read is the first install's. (Root ignores file modes, so the case
+    # cannot be staged there.)
+    if [ "$(id -u)" -ne 0 ]; then
+        HC_HELPER="$root/hclib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        chmod 0444 "$tree/cgroup.subtree_control"
+        run_hc install-unwritable "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        chmod 0644 "$tree/cgroup.subtree_control"
+        unset HC_HELPER HC_SUDOERS
+        check 0 "$rc" "install exits 0 when the slice's write fails"
+        # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+        want_ok "an unexplained failure is named as the write's own error, not as a standing process" \
+            sh -c 'grep -q "the write failed (" "$1" && ! grep -q "a process stands in the slice" "$1"' _ "$OUT"
+    fi
 
     # --user takes an account name too, resolved to the same uid and group;
     # only when the caller's uid has a passwd entry to name it by (a cross
