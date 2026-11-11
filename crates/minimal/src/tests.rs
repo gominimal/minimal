@@ -470,6 +470,10 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::planned_session_request = asserts nothing",
             // A unit test's request, never sent: it checks the fresh instance.
             "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
+            // A test's request, sent only to the in-process test daemon,
+            // which is this build: it starts the box the end-to-end test
+            // attaches to and resumes.
+            "tests.rs::start_attach_resume_end_to_end = asserts nothing",
         ]
     );
 }
@@ -15713,7 +15717,6 @@ async fn start_attach_resume_end_to_end() {
             panic!("the start failed: {error}\n{ran}");
         }
         ran.push(&argv.join(" "), format!("{web}\n").as_bytes(), b"", 0);
-        tracing::info!(verb = "session start", box_id = %web, outcome = "created");
         let record = shown_record(&alpha.host, web).await;
         assert_eq!(record.name.as_deref(), Some("web"), "{ran}");
         assert_eq!(record.state, "running", "{ran}");
@@ -15839,10 +15842,12 @@ async fn start_attach_resume_end_to_end() {
         }
     }
 
-    // The span covers the start, the detach, the stop and the resume.
+    // The span covers the start, the detach, the stop and the resume. The
+    // start leg calls the test daemon directly, and the CLI logs its verb
+    // only as the root span's field, so no start event is asserted here.
+    // The attach and the resume events come from the CLI code itself.
     let log = log.contents();
     for (verb, outcome) in [
-        ("session start", "created"),
         ("box attach", "ended"),
         ("box resume", "attaching"),
     ] {
