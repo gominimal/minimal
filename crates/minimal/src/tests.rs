@@ -470,6 +470,9 @@ fn every_create_session_asserts_the_daemon_build() {
             // A unit test's request, never sent: it checks the run path's
             // `--quic443` and `--vpn-network-names` on the spec.
             "tests.rs::start_and_run_take_every_network_key_flag = asserts nothing",
+            // A unit test's request, never sent: it checks that
+            // `--vpn-network-names` is refused when the request has no spec.
+            "tests.rs::vpn_network_names_without_a_spec_is_refused = asserts nothing",
         ]
     );
 }
