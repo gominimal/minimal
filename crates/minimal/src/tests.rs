@@ -14744,7 +14744,7 @@ async fn box_spec_renders_formats_secrets_as_refs() {
     let (_project, global) = spec_project(
         "[defaults]\npackages = [\"curl\"]\n\n\
          [sessions.default]\npackages = [\"git\"]\n\n\
-         [sessions.default.secrets.API_KEY]\nsource = \"client_env\"\nvalue = \"hunter2\"\n",
+         [sessions.default.secrets.API_KEY]\nsource = \"client_env\"\n",
     );
 
     let toml = box_spec_text(&global, &["min", "box", "spec", "default"])
@@ -14777,6 +14777,7 @@ async fn box_spec_renders_formats_secrets_as_refs() {
         .await
         .expect("the entry renders");
     let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["schema"], crate::output::ObjectType::Spec.schema());
     assert_eq!(doc["entry"], "default");
     assert_eq!(doc["type"], "session");
     assert_eq!(
@@ -14799,7 +14800,7 @@ async fn box_spec_renders_formats_secrets_as_refs() {
     .await
     .expect("the entry renders");
     assert!(
-        yaml.starts_with("entry: default\nloadouts:\n  - default\nsources:\n"),
+        yaml.starts_with("entry: default\nloadouts:\n  - default\nschema: min/v1/spec\nsources:\n"),
         "{yaml}"
     );
     assert!(
@@ -14820,12 +14821,19 @@ async fn box_spec_renders_formats_secrets_as_refs() {
         "{yaml}"
     );
 
-    for text in [&toml, &json, &yaml] {
-        assert!(
-            !text.contains("hunter2"),
-            "a secret's value never renders\n{text}"
-        );
-    }
+    // A grant with a key that `min box start` refuses is refused here
+    // too, with the exit of an invalid minimal.toml.
+    let (_project, bad) = spec_project(
+        "[sessions.default.secrets.API_KEY]\nsource = \"client_env\"\nvalue = \"hunter2\"\n",
+    );
+    let error = box_spec_text(&bad, &["min", "box", "spec", "default"])
+        .await
+        .expect_err("a grant with a value key is refused");
+    assert!(
+        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("hunter2"), "{error:#}");
 
     // A broker grant is a credentialed upstream: the proxy rows follow.
     let (_project, global) = spec_project(
@@ -15104,12 +15112,20 @@ async fn create_specced_box(
         request.config.name = Some(name.to_owned());
         request.fresh_instance = false;
     }
+    let id = create_box_from(server, &request).await;
+    (request, id)
+}
+
+/// Creates the box `request` describes on `server`, and returns its id.
+async fn create_box_from(
+    server: &minimald::test_harness::TestServer,
+    request: &minimald_rpc::CreateSessionRequest,
+) -> boxes::SessionId {
     let mut daemon = server.connect().await;
-    let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+    match daemon.call::<minimald_rpc::CreateSession>(request).await {
         minimald_rpc::Errorable::Ok(created) => created.id,
         minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
-    };
-    (request, id)
+    }
 }
 
 // BCLI-022: `min box spec <box>` renders the spec stored with the box's
@@ -15133,6 +15149,7 @@ async fn box_spec_box_renders_stored_copy() {
         .await
         .expect("the stored spec renders");
     let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["schema"], crate::output::ObjectType::Spec.schema());
     assert_eq!(doc["box"], serde_json_lenient::json!(id_text));
     assert_eq!(Some(doc["spec"].clone()), request.spec);
 
@@ -15153,8 +15170,32 @@ async fn box_spec_box_renders_stored_copy() {
     let yaml = box_spec_text(&global, &["min", "box", "spec", &id_text, "-o", "yaml"])
         .await
         .expect("the stored spec renders");
-    assert!(yaml.starts_with(&format!("box: {id}\nspec:\n")), "{yaml}");
+    assert!(
+        yaml.starts_with(&format!("box: \"{id}\"\nschema: min/v1/spec\nspec:\n")),
+        "{yaml}"
+    );
     assert!(yaml.contains("    mode: own_ip\n"), "{yaml}");
+
+    // A stored grant shows its reference only, whatever else it holds.
+    let mut secret_request = request.clone();
+    secret_request.config.name = Some("with-secret".to_owned());
+    if let Some(serde_json_lenient::Value::Object(spec)) = secret_request.spec.as_mut() {
+        spec.insert(
+            "secrets".to_owned(),
+            serde_json_lenient::json!({"API_KEY": {"source": "client_env", "value": "hunter2"}}),
+        );
+    }
+    let secret_id = create_box_from(&server, &secret_request).await.to_string();
+    for format in ["toml", "json", "yaml"] {
+        let text = box_spec_text(&global, &["min", "box", "spec", &secret_id, "-o", format])
+            .await
+            .expect("the stored spec renders");
+        assert!(text.contains("client_env"), "{text}");
+        assert!(
+            !text.contains("hunter2"),
+            "a secret's value never renders\n{text}"
+        );
+    }
 
     // The box form takes no override flag.
     let error = box_spec_text(
@@ -15215,6 +15256,24 @@ async fn box_spec_argument_directory_then_entry_then_box() {
         .await
         .expect_err("a directory is not a project argument");
     assert_eq!(spec_refusal_code(&error), 4, "{error:#}");
+
+    // A minimal.toml that does not load names no entry. The argument is a
+    // box address, and with no such box the project file error stands.
+    std::fs::write(elsewhere.path().join(mfile::MFILE_NAME), "[tasks.build\n").unwrap();
+    let text = box_spec_text(&other, &["min", "box", "spec", "build"])
+        .await
+        .expect("the box renders past an invalid minimal.toml");
+    assert!(
+        text.starts_with(&format!("# The spec box {id} was created with.\n")),
+        "{text}"
+    );
+    let error = box_spec_text(&other, &["min", "box", "spec", "nothing-here"])
+        .await
+        .expect_err("no entry and no box");
+    assert!(
+        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        "{error:#}"
+    );
 }
 
 // BCLI-023: every section of the spec renders, whether or not this host

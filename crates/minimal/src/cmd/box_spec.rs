@@ -21,6 +21,7 @@ use boxes::core::bep::{
     SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals, store_references,
 };
 
+use crate::output::ObjectType;
 use crate::{BoxSpecArgs, BoxSpecOutputFormat, GlobalArgs};
 
 /// What [`render`] reads.
@@ -245,10 +246,40 @@ pub(crate) async fn box_spec_to(
         .repo_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    let entries = match project_file_bytes(&project)? {
+    let entries = project_file_bytes(&project).and_then(|bytes| match bytes {
         Some((_, bytes)) => mfile::entry::read_entries(&bytes)
-            .map_err(|error| crate::ProjectFileInvalid { error })?,
-        None => Vec::new(),
+            .map_err(|error| crate::ProjectFileInvalid { error }.into()),
+        None => Ok(Vec::new()),
+    });
+    let entries = match entries {
+        Ok(entries) => entries,
+        // A project file that does not load names no entry, so the
+        // argument can only be a box address. When no box answers to it,
+        // the project file error is the useful one.
+        Err(project_error) => {
+            if !given_override_flags(&args, true).is_empty() {
+                return Err(project_error);
+            }
+            let format = args.output.unwrap_or_default();
+            if spawn && crate::cmd::ensure_daemon(global).is_err() {
+                return Err(project_error);
+            }
+            return match box_spec(global, &target, format, out).await {
+                Err(error)
+                    if !matches!(
+                        error.downcast_ref::<super::box_verbs::BoxAddressRefusal>(),
+                        Some(
+                            super::box_verbs::BoxAddressRefusal::Ambiguous { .. }
+                                | super::box_verbs::BoxAddressRefusal::AmbiguousIdStart { .. }
+                        )
+                    ) =>
+                {
+                    tracing::info!(verb = "box spec", target = %target, outcome = "project file invalid");
+                    Err(project_error)
+                }
+                result => result,
+            };
+        }
     };
     // BCLI-022: an entry of the project first, else a box address.
     let is_entry = entries.iter().any(|entry| entry.name == target)
@@ -524,6 +555,7 @@ fn entry_spec(
         }
         format => {
             let mut doc = serde_json_lenient::Map::new();
+            doc.insert("schema".to_owned(), ObjectType::Spec.schema().into());
             doc.insert("entry".to_owned(), rendered.entry.clone().into());
             doc.insert("type".to_owned(), rendered.box_type.clone().into());
             if let Some(loadouts) = &rendered.loadouts {
@@ -729,16 +761,18 @@ fn expand_entry(
     }
 
     // A secret shows as its reference only, never a value.
+    // The grants parse first, so a grant that `min box start` refuses is
+    // refused here too.
     let mut grants = SecretGrants::new();
     if let Some(toml::Value::Table(secrets)) = spec.get_mut("secrets") {
+        grants = toml::Value::Table(secrets.clone())
+            .try_into()
+            .map_err(|e| invalid(mfile::Error::Format(e)))?;
         for (_, grant) in secrets.iter_mut() {
             if let toml::Value::Table(fields) = grant {
                 fields.retain(|key, _| SECRET_REFERENCE_KEYS.contains(&key));
             }
         }
-        grants = toml::Value::Table(secrets.clone())
-            .try_into()
-            .map_err(|e| invalid(mfile::Error::Format(e)))?;
     }
     let mut rows_text = Vec::new();
     if grants.values().any(SecretGrant::is_credentialed) {
@@ -803,13 +837,21 @@ async fn box_spec(
             anyhow::bail!("{error}")
         }
     };
-    let Some(stored) = stored else {
+    let Some(mut stored) = stored else {
         tracing::info!(verb = "box spec", box_id = %id, outcome = "no stored spec");
         anyhow::bail!(
             "Box {id} has no stored spec. Its host stores none for a box created \
              before boxes stored their spec."
         );
     };
+    // A secret shows as its reference only, whatever the stored copy holds.
+    if let Some(serde_json_lenient::Value::Object(secrets)) = stored.get_mut("secrets") {
+        for grant in secrets.values_mut() {
+            if let serde_json_lenient::Value::Object(fields) = grant {
+                fields.retain(|key, _| SECRET_REFERENCE_KEYS.contains(&key.as_str()));
+            }
+        }
+    }
     let mut text = Vec::new();
     match format {
         BoxSpecOutputFormat::Toml => {
@@ -822,6 +864,7 @@ async fn box_spec(
         }
         format => {
             let mut doc = serde_json_lenient::Map::new();
+            doc.insert("schema".to_owned(), ObjectType::Spec.schema().into());
             doc.insert("box".to_owned(), id.to_string().into());
             doc.insert("spec".to_owned(), stored);
             write_document(&serde_json_lenient::Value::Object(doc), format, &mut text)?;
@@ -912,15 +955,22 @@ fn write_document(
 
 /// A YAML scalar or key for `text`: plain when it is safe, else quoted.
 fn yaml_string(text: &str) -> String {
-    let plain = !text.is_empty()
+    // Plain only in a narrow safe set: a letter, `_` or `/` first, so no
+    // number, date, `-` or `.inf` reads as another type, and no word that
+    // YAML 1.1 or 1.2 reads as a bool or null in any case.
+    const TYPED_WORDS: [&str; 12] = [
+        "true", "false", "null", "yes", "no", "on", "off", "y", "n", "nan", "inf", "infinity",
+    ];
+    let plain = text
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '/'))
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
-        && !matches!(
-            text,
-            "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "~"
-        )
-        && text.parse::<f64>().is_err();
+        && !TYPED_WORDS
+            .iter()
+            .any(|word| text.eq_ignore_ascii_case(word));
     if plain {
         text.to_owned()
     } else {
@@ -985,6 +1035,28 @@ mod tests {
         "uploads.github.com",
         "codeload.github.com",
     ];
+
+    #[test]
+    fn yaml_string_quotes_text_that_reads_as_another_type() {
+        for text in [
+            "True",
+            "NO",
+            "Yes",
+            "Null",
+            "y",
+            "-",
+            "0x1F",
+            "1_000",
+            ".inf",
+            "2026-11-11",
+            "",
+        ] {
+            assert!(yaml_string(text).starts_with('"'), "{text}");
+        }
+        for text in ["client_env", "min/v1/spec", "own_ip", "api.github.com"] {
+            assert_eq!(yaml_string(text), text);
+        }
+    }
 
     fn grant(scopes: &[&str]) -> SecretGrant {
         SecretGrant {
