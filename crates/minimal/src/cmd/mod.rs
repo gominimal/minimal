@@ -132,12 +132,16 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             SessionCommand::SetupZed(_) => "session setup-zed",
             SessionCommand::Hooks(_) => "session hooks",
             SessionCommand::Logs(_) => "session logs",
+            SessionCommand::Stop(_) => "session stop",
+            SessionCommand::Rm(_) => "session rm",
         },
         Some(Command::Loadout(_)) => "loadout list",
         Some(Command::Task(TaskArgs { command })) => match command {
             TaskCommand::Run(_) => "task run",
             TaskCommand::List(_) => "task list",
             TaskCommand::Logs(_) => "task logs",
+            TaskCommand::Stop(_) => "task stop",
+            TaskCommand::Rm(_) => "task rm",
         },
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(_) => "box spec",
@@ -382,7 +386,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
         Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
         Some(Command::Session(SessionArgs { command })) => match command {
-            SessionCommand::List(args) => cmd_ls(&cli.global_args, args).await,
+            SessionCommand::List(args) => {
+                let session = boxes::SESSION_BOX_TYPE;
+                cmd_typed_box_list(&cli.global_args, args, session, "session list").await
+            }
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Start(args) => cmd_session_start(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
@@ -397,6 +404,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
                 let session = Some(boxes::SESSION_BOX_TYPE);
                 cmd_box_logs(&cli.global_args, args, session, "session logs").await
             }
+            SessionCommand::Stop(args) => {
+                let session = boxes::SESSION_BOX_TYPE;
+                cmd_typed_box_stop(&cli.global_args, args, session, "session stop").await
+            }
+            SessionCommand::Rm(args) => {
+                let session = boxes::SESSION_BOX_TYPE;
+                cmd_typed_box_rm(&cli.global_args, args, session, "session rm").await
+            }
         },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
@@ -408,6 +423,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
                 let task = Some(boxes::TASK_BOX_TYPE);
                 cmd_box_logs(&cli.global_args, args, task, "task logs").await
             }
+            TaskCommand::Stop(args) => task::cmd_task_stop(&cli.global_args, args).await,
+            TaskCommand::Rm(args) => task::cmd_task_rm(&cli.global_args, args).await,
         },
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),

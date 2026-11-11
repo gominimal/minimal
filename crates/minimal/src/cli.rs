@@ -87,6 +87,7 @@ pub enum Command {
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
     /// Box subcommands: show what a box will get
+    #[command(visible_alias = "boxes")]
     Box(BoxArgs),
     /// Host subcommands: the daemons on this machine that run boxes
     #[command(visible_alias = "hosts")]
@@ -129,6 +130,7 @@ pub enum Command {
     /// Sign in to GitHub, and show the sign-in that boxes use
     Auth(AuthArgs),
     /// Store, list and remove the secrets that boxes reference by name
+    #[command(visible_alias = "secrets")]
     Secret(SecretArgs),
     // NET-109: `min login` is the alias for `min auth login`, so it takes
     // the same arguments and runs the same sign-in.
@@ -221,9 +223,12 @@ pub struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
-    /// List sessions
+    // BCLI-030: `min box list`, filtered to session boxes.
+    /// List the session boxes of the current project, in any state, as
+    /// `min box list` lists boxes. `--all` lists the session boxes of every
+    /// project
     #[command(visible_alias = "ls")]
-    List(LsArgs),
+    List(BoxListArgs),
     /// Activate (create) a new session
     Activate(ActivateArgs),
     /// Create a box from a session entry of the project and attach this
@@ -276,6 +281,15 @@ pub enum SessionCommand {
     /// showing new output until the session is removed or the command is
     /// interrupted
     Logs(BoxLogsArgs),
+    // BCLI-030: `min box stop`, filtered to session boxes.
+    /// Stop a running session box and keep it, as `min box stop` does.
+    /// `--force` kills every process in the box at once, with no grace
+    /// period
+    Stop(BoxStopArgs),
+    // BCLI-030: `min box rm`, filtered to session boxes.
+    /// Remove a stopped or exited session box, as `min box rm` does. A
+    /// running box is refused unless `--force` is given
+    Rm(BoxRmArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1164,22 +1178,24 @@ pub enum TaskCommand {
     /// or egress flag after a task argument is refused. A task argument
     /// that shares a flag's name goes after `--`.
     Run(TaskRunArgs),
-    /// List the task boxes of the current project, in any state. A task
-    /// that ended shows its exit code, as `exited (exit 3)`, until
-    /// `min box prune` removes it. `--all` lists the tasks of every project
-    List(TaskListArgs),
+    // BCLI-015, BCLI-030: `min box list`, filtered to task boxes.
+    /// List the task boxes of the current project, in any state, as
+    /// `min box list` lists boxes. A task that ended shows its exit code,
+    /// as `exited (exit 3)`, until `min box prune` removes it. `--all`
+    /// lists the tasks of every project
+    List(BoxListArgs),
     /// Show what a task printed, from its start. `-f` keeps showing new
     /// output until the task's box is removed or the command is interrupted
     Logs(BoxLogsArgs),
-}
-
-// BCLI-015: `min task list [--all]`.
-#[derive(Debug, Args)]
-pub struct TaskListArgs {
-    /// List the tasks of every project, not only the tasks of the current
-    /// project
-    #[arg(long)]
-    pub all: bool,
+    // BCLI-030: `min box stop`, filtered to task boxes.
+    /// Stop a running task box and keep it, as `min box stop` does.
+    /// `--force` kills every process in the box at once, with no grace
+    /// period
+    Stop(BoxStopArgs),
+    // BCLI-030: `min box rm`, filtered to task boxes.
+    /// Remove a stopped or exited task box, as `min box rm` does. A running
+    /// box is refused unless `--force` is given
+    Rm(BoxRmArgs),
 }
 
 // BCLI-069 gives `--name` to `min task run` too. It is not here yet: the
