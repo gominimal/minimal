@@ -1504,8 +1504,17 @@ pub(crate) async fn run_entry(
     let compose_options = inputs.compose_options;
     let hook_scripts = inputs.hook_scripts;
     let finalize_hook_budget = inputs.hook_budget;
-    let contribution = inputs.contribution;
+    let mut contribution = inputs.contribution;
     let user_policy = inputs.user_policy;
+    // BOX-068: the task's expanded entry rides on the contribution, and the
+    // daemon composes the project's part of the box from it. One span
+    // covers the expansion and the compose call that sends it.
+    let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
+    contribution.entry = entry_span
+        .in_scope(|| {
+            crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
+        })?
+        .map(Box::new);
     // Sent only for a task that declares `inherit_cwd`; any other task
     // starts at the root of the uploaded tree.
     let task_cwd = if declared.inherit_cwd {
@@ -1607,6 +1616,7 @@ pub(crate) async fn run_entry(
             session_id: id,
             contribution,
         })
+        .instrument(entry_span)
         .await
         .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error))?;
     let configured = match configured {

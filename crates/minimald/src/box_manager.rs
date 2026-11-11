@@ -616,7 +616,9 @@ impl BoxManagerHandle {
                 .filter(|(record, _)| {
                     project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
                 })
-                .map(|(record, pty)| box_listing_entry(record, *pty))
+                .map(|(record, traits)| {
+                    box_listing_entry(record, traits.pty, traits.lifetime.clone())
+                })
                 .collect();
             boxes.sort_by_key(|entry| entry.box_id);
             tracing::Span::current().record("count", boxes.len());
@@ -658,7 +660,7 @@ impl BoxManagerHandle {
                 .or_else(|| records.iter().find(|(record, _)| record.id == id));
             tracing::Span::current().record("found", record.is_some());
             tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
-            let Some((record, pty)) = record else {
+            let Some((record, traits)) = record else {
                 return Ok(None);
             };
             // BOX-159: the disk a reap frees, for a box a reap can take.
@@ -669,7 +671,7 @@ impl BoxManagerHandle {
             };
             tracing::Span::current().record("disk", disk_bytes.is_some());
             Ok(Some(minimald_rpc::ShowBoxResponse {
-                record: box_listing_entry(record, *pty),
+                record: box_listing_entry(record, traits.pty, traits.lifetime.clone()),
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
                 identity: minimald_rpc::BoxIdentity::None,
@@ -865,7 +867,7 @@ impl BoxManagerHandle {
                     .ok_or_else(|| unknown_box(key))?;
             }
             // The reaped box has no terminal left to attach to.
-            let reaped = box_listing_entry(&record, false);
+            let reaped = box_listing_entry(&record, false, None);
             let (send, recv) = Responder::channel();
             // A send error means the manager is gone: the recv fails as well.
             let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
@@ -1123,7 +1125,7 @@ impl BoxManagerHandle {
                 let disk_bytes = self.box_disk_bytes(&record).await;
                 reply.matched.push(minimald_rpc::PrunePreviewEntry {
                     // As a prune reports a reaped box: no terminal is left.
-                    record: box_listing_entry(&record, false),
+                    record: box_listing_entry(&record, false, None),
                     disk_bytes,
                 });
             }
@@ -1196,7 +1198,11 @@ fn unknown_box(id: SessionId) -> BoxManagerError {
 /// ending is not a row of the BOX-011 table reports its status with the
 /// stored `reason`, `exit_code` and `signal` as they are.
 /// `pty_enabled` is whether the box has a terminal ([`record_has_pty`]).
-fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc::BoxListingEntry {
+fn box_listing_entry(
+    record: &boxes::Record,
+    pty_enabled: bool,
+    lifetime: Option<String>,
+) -> minimald_rpc::BoxListingEntry {
     let (state, reason, exit_code, signal) = match record.state() {
         Ok(state) => (
             state.name(),
@@ -1231,6 +1237,7 @@ fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc:
         exit_code,
         signal,
         pty_enabled,
+        lifetime,
     }
 }
 
@@ -1246,6 +1253,26 @@ pub(crate) fn record_has_pty(record: &boxes::Record, stored_spec: Option<&[u8]>)
             .as_deref()
             .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
     }
+}
+
+/// What a listing reads from a box's stored spec beside its record.
+#[derive(Debug, Clone)]
+pub(crate) struct ListedTraits {
+    /// Whether the box has a terminal ([`record_has_pty`]).
+    pub pty: bool,
+    /// The `box.lifetime` its stored spec sets ([`stored_spec_lifetime`]).
+    pub lifetime: Option<String>,
+}
+
+/// The `box.lifetime` a box's stored spec sets, such as `until_stopped`
+/// (BCLI-009). `None` for a box filed with no spec, a spec that sets none,
+/// and bytes that are not a JSON object.
+pub(crate) fn stored_spec_lifetime(stored_spec: Option<&[u8]>) -> Option<String> {
+    let spec = serde_json_lenient::from_slice::<serde_json_lenient::Value>(stored_spec?).ok()?;
+    spec.get("box")?
+        .get("lifetime")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// The bytes the daemon stores for a box's spec (BOX-068): the spec the
@@ -1305,6 +1332,119 @@ fn unenforced_sections(spec: &serde_json_lenient::Value) -> Vec<&'static str> {
         .collect()
 }
 
+/// The identity every box on this daemon runs under, as the create span
+/// records it (BOX-140). No host this daemon runs on has an identity
+/// plane, so the mode is always `none`.
+pub(crate) const IDENTITY_MODE_NONE: &str = "none";
+
+/// The names of the `[secrets]` entries of `spec` that set
+/// `source = "broker"`, in name order.
+fn brokered_secrets(spec: &serde_json_lenient::Value) -> Vec<String> {
+    let Some(secrets) = spec.get("secrets").and_then(|s| s.as_object()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = secrets
+        .iter()
+        .filter(|(_, entry)| entry.get("source").and_then(|s| s.as_str()) == Some("broker"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether the `[secrets]` entry `entry` asks for a `github:` scope, the
+/// same test as [`boxes::core::bep::SecretGrant::is_github`].
+fn is_github_grant(entry: &serde_json_lenient::Value) -> bool {
+    entry
+        .get("scopes")
+        .and_then(|s| s.as_array())
+        .is_some_and(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|scope| scope.as_str())
+                .any(|scope| scope.starts_with("github:"))
+        })
+}
+
+/// The names of the brokered secrets of `spec` that a create refuses
+/// while no identity plane is configured (BOX-081), in name order. With no
+/// node-local proxy, every brokered secret is refused. A node-local proxy
+/// serves only a GitHub grant, so with a proxy the brokered secrets with
+/// no `github:` scope are refused. A `source = "store"` secret is never
+/// refused here (BOX-141).
+fn refused_broker_grants(spec: &serde_json_lenient::Value, proxy_serves: bool) -> Vec<String> {
+    let mut names = brokered_secrets(spec);
+    if proxy_serves {
+        let secrets = spec.get("secrets").and_then(|s| s.as_object());
+        names.retain(|name| {
+            !secrets
+                .and_then(|secrets| secrets.get(name))
+                .is_some_and(is_github_grant)
+        });
+    }
+    names
+}
+
+/// The refusal of a create whose spec carries a brokered secret that
+/// nothing on this host can serve (BOX-081), with the names of the refused
+/// secrets. `proxy_serves` says whether the request carries one
+/// well-formed root certificate ([`proxy_root_certificate`]). A client sets
+/// it only from an identity that a node-local proxy published.
+fn unenrolled_broker_refusal(
+    spec: &serde_json_lenient::Value,
+    proxy_serves: bool,
+) -> Option<(boxes::core::bep::ActivationRefused, Vec<String>)> {
+    let grants = refused_broker_grants(spec, proxy_serves);
+    if grants.is_empty() {
+        return None;
+    }
+    // The refusal text calls a grant a "GitHub grant" unless this flag is
+    // set, and then it says "secret". A grant with no `github:` scope is
+    // not a GitHub grant, so the text must say "secret" for it.
+    let secrets = spec.get("secrets").and_then(|s| s.as_object());
+    let not_github = grants.iter().any(|name| {
+        !secrets
+            .and_then(|secrets| secrets.get(name))
+            .is_some_and(is_github_grant)
+    });
+    Some((
+        boxes::core::bep::unenrolled_node(
+            grants.clone(),
+            not_github,
+            // When `proxy_serves` is true, this cause's text is wrong: a
+            // proxy is present and serves only GitHub grants. The cause
+            // for that case lives in `crates/boxes` (#3277).
+            boxes::core::bep::ProxyAbsence::NotServed,
+        ),
+        grants,
+    ))
+}
+
+/// Whether `certificate` counts as the node-local proxy's root
+/// certificate for the BOX-081 gate. This daemon has no fact of its own
+/// about the proxy: on a microVM host the proxy runs beside the host
+/// daemon, outside this guest. So the gate takes the certificate the
+/// caller read from the proxy's published identity, and it accepts only
+/// one well-formed certificate block. An empty or malformed value counts
+/// as no certificate, and the brokered secret is refused.
+///
+/// The daemon cannot compare the value with a proxy root it knows, so the
+/// check is advisory: it trusts the caller. A caller that sends a made-up
+/// certificate passes it. Even then, only a GitHub grant passes, because
+/// a node-local proxy serves no other brokered secret.
+fn proxy_root_certificate(certificate: Option<&str>) -> bool {
+    certificate.is_some_and(crate::env::is_one_certificate)
+}
+
+/// The un-enrolled refusal an error from a create carries, if any.
+pub(crate) fn unenrolled_refusal(
+    error: &std::io::Error,
+) -> Option<&boxes::core::bep::ActivationRefused> {
+    error
+        .get_ref()?
+        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+}
+
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     /// Every retained record, in any state (BOX-158). Read-only against
@@ -1312,7 +1452,7 @@ enum ManagerMessage {
     Records(Responder<Vec<boxes::Record>>),
     /// [`Self::Records`], each record with whether its box has a terminal
     /// ([`record_has_pty`]), for the listing and the read (BCLI-068).
-    Listing(Responder<Vec<(boxes::Record, bool)>>),
+    Listing(Responder<Vec<(boxes::Record, ListedTraits)>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
@@ -3688,6 +3828,8 @@ impl BoxManager {
             spec_bytes = tracing::field::Empty,
             name_given = tracing::field::Empty,
             name = tracing::field::Empty,
+            // BOX-140: the identity the box runs under.
+            identity = IDENTITY_MODE_NONE,
             fresh,
         )
     )]
@@ -3792,6 +3934,41 @@ impl BoxManager {
         // BOX-076: the sections the daemon carries but does not enforce,
         // read before the spec becomes its stored bytes.
         let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
+        // BOX-081: no identity plane is configured on this host, so a
+        // brokered secret is refused unless a node-local proxy serves the
+        // box and the secret is a GitHub grant. The refusal comes before the record exists, so it leaves no
+        // record, id or name behind. A certificate that is not one
+        // well-formed block does not count as the proxy's.
+        let proxy_serves = proxy_root_certificate(config.root_certificate.as_deref());
+        if config.root_certificate.is_some() && !proxy_serves {
+            tracing::info!(
+                session_name = config
+                    .name
+                    .as_deref()
+                    .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                "the create carries a root certificate that is not one well-formed \
+                 certificate block, so no node-local proxy counts as serving the box"
+            );
+        }
+        if let Some((refusal, grants)) = spec
+            .as_ref()
+            .and_then(|spec| unenrolled_broker_refusal(spec, proxy_serves))
+        {
+            tracing::info!(
+                session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                identity = IDENTITY_MODE_NONE,
+                secrets = ?grants,
+                code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                exit_code = refusal.exit_code(),
+                proxy_serves,
+                "refused a create: the spec carries a brokered secret that nothing on this \
+                 host serves, and no identity plane is configured"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                refusal,
+            ));
+        }
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -4214,8 +4391,11 @@ impl BoxManager {
                                 None
                             }
                         };
-                        let pty = record_has_pty(&record, stored.as_deref());
-                        records.push((record, pty));
+                        let traits = ListedTraits {
+                            pty: record_has_pty(&record, stored.as_deref()),
+                            lifetime: stored_spec_lifetime(stored.as_deref()),
+                        };
+                        records.push((record, traits));
                     }
                     Ok::<_, BoxManagerError>(records)
                 })

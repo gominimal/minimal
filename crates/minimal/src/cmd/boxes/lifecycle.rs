@@ -1045,6 +1045,123 @@ pub(crate) async fn rename_listed_box(
     }
 }
 
+/// `min box restart <box>`: stops a box whose spec sets
+/// `lifetime = "until_stopped"`, if it runs, and starts it again from its
+/// stored spec under the same id and name (BCLI-074, BOX-176). A refusal
+/// returns as a [`minimald_rpc::RestartRefusal`], and the process exits
+/// with the code it carries.
+pub async fn cmd_box_restart(
+    global: &GlobalArgs,
+    args: BoxRestartArgs,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    restart_box_on_hosts(hosts, &mut out, &args.target).await?;
+    Ok(())
+}
+
+/// Resolves the address `target` over `hosts` and restarts that box on
+/// the host that keeps it, as BOX-176 defines. Returns the box
+/// and its host.
+pub(crate) async fn restart_box_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    out: &mut impl std::io::Write,
+    target: &str,
+) -> Result<ResolvedBox, anyhow::Error> {
+    restart_box_on_hosts_with(hosts, out, target, async |client, request| {
+        client
+            .oneshot_rpc::<minimald_rpc::RestartBox>(request)
+            .await
+    })
+    .await
+}
+
+/// [`restart_box_on_hosts`], with `send` to put the `RestartBox` request
+/// to the host that keeps the box.
+pub(crate) async fn restart_box_on_hosts_with(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    out: &mut impl std::io::Write,
+    target: &str,
+    send: impl AsyncFnOnce(
+        &mut client::Client,
+        minimald_rpc::RestartBoxRequest,
+    ) -> Result<RestartBoxAnswer, anyhow::Error>,
+) -> Result<ResolvedBox, anyhow::Error> {
+    let resolved = resolve_box_on_hosts(hosts, target, "box restart").await?;
+    let mut client = gated_box_host_client(&resolved.host).await?;
+    crate::output::record_box_id(&resolved.box_id.to_string());
+    let request = minimald_rpc::RestartBoxRequest {
+        id: resolved.box_id,
+    };
+    let answer = send(&mut client, request)
+        .await
+        .context("RestartBox RPC failed")?;
+    finish_restart(out, resolved.box_id, target, answer)?;
+    Ok(resolved)
+}
+
+/// The daemon's answer to a `RestartBox` request.
+pub(crate) type RestartBoxAnswer = minimald_rpc::Errorable<minimald_rpc::RestartBoxResponse>;
+
+/// The refusal `min box restart` prints when the daemon answers
+/// `Lifetime` (BCLI-074): the box's stored spec does not set
+/// `lifetime = "until_stopped"`. That includes a box with no stored spec,
+/// so the text claims no more than that. It names `min box run`, the hint
+/// BCLI-009 chooses by `lifetime`.
+pub(crate) fn restart_lifetime_refusal(target: &str) -> minimald_rpc::RestartRefusal {
+    minimald_rpc::RestartRefusal {
+        kind: minimald_rpc::RestartRefusalKind::Lifetime,
+        exit_code: 2,
+        message: format!(
+            "The spec of {target} does not set lifetime = \"until_stopped\", \
+             so min box restart cannot restart it. \
+             Run it again with min box run <entry>."
+        ),
+    }
+}
+
+/// Ends a restart of the box `id`, which the address `target` resolved
+/// to, on the daemon's `answer` (BOX-176). Writes one line to `out` when
+/// the box runs again. A refusal returns as a
+/// [`minimald_rpc::RestartRefusal`]: the lifetime refusal with the
+/// client's hint, any other refusal as the daemon wrote it.
+fn finish_restart(
+    out: &mut impl std::io::Write,
+    id: boxes::SessionId,
+    target: &str,
+    answer: RestartBoxAnswer,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::{Errorable, RestartBoxResponse};
+
+    match answer {
+        Errorable::Ok(RestartBoxResponse::Restarted { was_running }) => {
+            tracing::info!(verb = "box restart", box_id = %id, was_running, outcome = "restarted");
+            writeln!(out, "Restarted {target}.")?;
+            Ok(())
+        }
+        Errorable::Ok(RestartBoxResponse::Refused(refusal)) => {
+            tracing::info!(
+                verb = "box restart",
+                box_id = %id,
+                outcome = "refused",
+                refusal = refusal.kind.name(),
+                "{refusal}"
+            );
+            match refusal.kind {
+                minimald_rpc::RestartRefusalKind::Lifetime => {
+                    Err(restart_lifetime_refusal(target).into())
+                }
+                _ => Err(refusal.into()),
+            }
+        }
+        Errorable::Err { error } => {
+            tracing::info!(verb = "box restart", box_id = %id, outcome = "failed", "{error}");
+            Err(box_rpc_error(target, error))
+        }
+    }
+}
+
 /// The refusal of `min box prune` off a terminal without `--yes`
 /// (BCLI-005). It ends the command with exit 2.
 #[derive(Debug, Clone, PartialEq, Eq)]

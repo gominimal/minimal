@@ -294,6 +294,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
         return minimal::BoxRenameRefusal::EXIT_CODE;
     }
+    // BCLI-074: `min box restart` refused, such as for a box that runs to
+    // completion (exit 2). The refusal carries its own code, never 0.
+    if let Some(refusal) = e.downcast_ref::<minimald_rpc::RestartRefusal>() {
+        return refusal.exit_code.max(1);
+    }
     // BCLI-005: `min box prune` off a terminal without `--yes`.
     if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
         return minimal::PruneNeedsYes::EXIT_CODE;
@@ -341,7 +346,8 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
     }
-    // BCLI-068: `min box attach` refused, or its connection failed.
+    // BCLI-068, BCLI-007, BCLI-009, BCLI-032: `min box attach`, `min box
+    // resume` or `min session attach` refused, or its connection failed.
     if let Some(refused) = e.downcast_ref::<minimal::BoxAttachRefusal>() {
         return refused.exit_code();
     }
@@ -1414,6 +1420,57 @@ mod tests {
             ),
         ] {
             let err = anyhow::Error::new(refusal).context("copying the file");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    /// BCLI-007, BCLI-009, BCLI-032: the refusals of `min box resume` and
+    /// `min session attach` end the run with their exit codes.
+    #[test]
+    fn resume_and_session_attach_refusals_map_to_exit_codes() {
+        let id = boxes::SessionId::parse_str("0199f000-0000-7000-8000-000000000001").unwrap();
+        for (refusal, code) in [
+            (
+                minimal::BoxAttachRefusal::NoTerminalToResume {
+                    address: "web".to_owned(),
+                    until_stopped: true,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NotResumable {
+                    address: "web".to_owned(),
+                    state: "running".to_owned(),
+                    pty_enabled: true,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NotResumable {
+                    address: "web".to_owned(),
+                    state: "running".to_owned(),
+                    pty_enabled: false,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NameHeld {
+                    address: "web".to_owned(),
+                    name: "web".to_owned(),
+                    holder: id,
+                    box_id: id,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::AmbiguousSessions {
+                    candidates: Vec::new(),
+                },
+                2,
+            ),
+            (minimal::BoxAttachRefusal::NoSessionCandidate, 4),
+        ] {
+            let err = anyhow::Error::new(refusal);
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
         }
     }

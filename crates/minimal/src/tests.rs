@@ -270,6 +270,10 @@ fn every_daemon_connection_is_classified() {
             // why the host ended it. The attach itself went through the
             // address resolution above, and the read builds nothing.
             "cmd/boxes/attach.rs::box_after_attach = ungated",
+            // A by-name attach asks the selected host for the name before it
+            // looks at other VMs. That lookup goes through
+            // `resolve_session_version_gated`, so a skewed host is refused.
+            "cmd/boxes/attach.rs::named_attach_hosts = gated",
             // Test-only: the BEP-032 store mint test registers a box with a
             // proxy control socket it serves itself, so no daemon is involved.
             "cmd/boxes/create.rs::box_creation_seals_a_store_member_per_accepted_rule = ungated",
@@ -333,7 +337,6 @@ fn every_daemon_connection_is_classified() {
             // the rule is already saved before the ask, so a skew can
             // half-build nothing here, the same as the mint path's sites.
             "cmd/secret.rs::recertify = ungated",
-            "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
@@ -390,6 +393,9 @@ fn every_daemon_connection_is_classified() {
             // Not a product path: the end-to-end test's own connection to
             // the harness daemon, to read the version it expects.
             "tests.rs::hosts_and_providers_end_to_end = ungated",
+            // Not a product path: the restart test's own connection to the
+            // harness daemon, to list the ids and names it expects kept.
+            "tests.rs::listed_ids_and_names = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
@@ -5176,7 +5182,7 @@ async fn attach_fall_through_hands_off_the_owning_vm() {
     // A name only alpha knows: the selected VM's daemon has just said so, so
     // the target is alpha's record over alpha's socket.
     let (record, handed_off) =
-        cmd::resolve_attach_target_version_gated(&global, &mut client, selected.clone(), "web")
+        resolve_attach_target_version_gated(&global, &mut client, selected.clone(), "web")
             .await
             .expect("a name alpha owns resolves through the selected VM's miss");
     assert_eq!(
@@ -5192,7 +5198,7 @@ async fn attach_fall_through_hands_off_the_owning_vm() {
 
     // A name the selected VM itself knows never leaves it.
     let (on_selected, its_sock) =
-        cmd::resolve_attach_target_version_gated(&global, &mut client, selected.clone(), "api")
+        resolve_attach_target_version_gated(&global, &mut client, selected.clone(), "api")
             .await
             .expect("a name the selected VM owns resolves on the selected VM");
     assert_eq!(on_selected.id, api);
@@ -5200,10 +5206,9 @@ async fn attach_fall_through_hands_off_the_owning_vm() {
 
     // A name nothing owns reports the selected VM's own miss: it is the
     // more useful of the two answers.
-    let err =
-        cmd::resolve_attach_target_version_gated(&global, &mut client, selected, "no-such-box")
-            .await
-            .expect_err("an unowned name is the selected VM's error");
+    let err = resolve_attach_target_version_gated(&global, &mut client, selected, "no-such-box")
+        .await
+        .expect_err("an unowned name is the selected VM's error");
     assert!(
         err.to_string().contains("no-such-box"),
         "the miss names what was asked for: {err}"
@@ -5366,11 +5371,10 @@ async fn attach_refuses_a_box_name_two_vms_know() {
     let mut client = client::Client::connect(&selected_sock)
         .await
         .expect("connect to the selected VM's daemon");
-    let err =
-        cmd::resolve_attach_target_version_gated(&global, &mut client, selected_sock, "shared")
-            .await
-            .expect_err("a name two VMs own must be refused, not guessed")
-            .to_string();
+    let err = resolve_attach_target_version_gated(&global, &mut client, selected_sock, "shared")
+        .await
+        .expect_err("a name two VMs own must be refused, not guessed")
+        .to_string();
     assert!(
         err.contains("alpha") && err.contains("beta"),
         "the refusal must name every VM that knows the name: {err}"
@@ -7443,7 +7447,7 @@ async fn box_on_stopped_vm_names_start_command() {
     // The attach path itself: the selected VM's miss falls through to the
     // stopped VM's records.
     let (mut client, sock) = selected_client(state.path()).await;
-    let err = cmd::resolve_attach_target_version_gated(&global, &mut client, sock, "beta")
+    let err = resolve_attach_target_version_gated(&global, &mut client, sock, "beta")
         .await
         .expect_err("attach refuses a box on a stopped VM");
     assert_eq!(err.to_string(), expected);
@@ -7580,7 +7584,7 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
     assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
     let (mut client, sock) = selected_client(state.path()).await;
-    let err = cmd::resolve_attach_target_version_gated(&global, &mut client, sock, "shared")
+    let err = resolve_attach_target_version_gated(&global, &mut client, sock, "shared")
         .await
         .expect_err("attach refuses a name two VMs hold");
     assert_eq!(err.to_string(), expected);
@@ -8703,6 +8707,7 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         exit_code: None,
         signal: None,
         pty_enabled: true,
+        lifetime: None,
     }
 }
 
@@ -9507,6 +9512,44 @@ async fn create_attach_box(
     project: &std::path::Path,
     pty: Option<bool>,
 ) -> boxes::SessionId {
+    let spec = pty.map(|pty| serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": pty}}));
+    create_spec_box(
+        daemon,
+        name,
+        project,
+        spec,
+        minimald_rpc::CreatingVerb::Session,
+    )
+    .await
+}
+
+/// Creates a running box named `name` from `project` on the harness
+/// daemon, through the whole create flow, with `spec` as its stored spec.
+async fn create_box_with_spec(
+    daemon: &mut minimald::test_harness::TestClient,
+    name: &str,
+    project: &std::path::Path,
+    spec: Option<serde_json_lenient::Value>,
+) -> boxes::SessionId {
+    create_spec_box(
+        daemon,
+        name,
+        project,
+        spec,
+        minimald_rpc::CreatingVerb::Session,
+    )
+    .await
+}
+
+/// [`create_attach_box`] with the whole stored `spec`, and `verb` as the
+/// creating verb, which sets the box's type.
+async fn create_spec_box(
+    daemon: &mut minimald::test_harness::TestClient,
+    name: &str,
+    project: &std::path::Path,
+    spec: Option<serde_json_lenient::Value>,
+    verb: minimald_rpc::CreatingVerb,
+) -> boxes::SessionId {
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
         FinalizeSessionRequest,
@@ -9515,7 +9558,8 @@ async fn create_attach_box(
         name,
         project.to_str().expect("a UTF-8 project path"),
     );
-    request.spec = pty.map(|pty| serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": pty}}));
+    request.spec = spec;
+    request.config.creating_verb = verb;
     let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
     minimald::test_harness::unwrap_ready(
         daemon
@@ -9566,6 +9610,18 @@ impl AttachHost {
         create_attach_box(&mut daemon, name, self.project.path(), pty).await
     }
 
+    /// Creates a running box from this host's project, with the whole
+    /// stored `spec`, of the type `verb` sets.
+    async fn create_with(
+        &self,
+        name: &str,
+        spec: serde_json_lenient::Value,
+        verb: minimald_rpc::CreatingVerb,
+    ) -> boxes::SessionId {
+        let mut daemon = self.server.connect().await;
+        create_spec_box(&mut daemon, name, self.project.path(), Some(spec), verb).await
+    }
+
     /// The project root the bare form reads for this host's project.
     fn scope(&self) -> paths::HostAbsPath {
         paths::HostAbsPath::try_new(self.project.path().to_str().expect("a UTF-8 path"))
@@ -9577,6 +9633,135 @@ impl AttachHost {
         cmd::stop_box_on_hosts(vec![self.host.clone()], &mut Vec::new(), name, false)
             .await
             .expect("the stop succeeds");
+    }
+}
+
+/// A box spec with a terminal whose `lifetime` is `lifetime`, as a project
+/// entry stores it at creation.
+fn restart_spec(lifetime: mfile::spec::Lifetime) -> serde_json_lenient::Value {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = lifetime;
+    spec.pty_enabled = true;
+    serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// The id and the name of every box the host `host` lists.
+async fn listed_ids_and_names(host: &LocalHost) -> Vec<(boxes::SessionId, Option<String>)> {
+    let mut client = client::Client::connect(&host.sock).await.unwrap();
+    list_box_records(&mut client, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.box_id, entry.name))
+        .collect()
+}
+
+/// BCLI-074: `min box restart <box>` resolves the until_stopped box by any
+/// address and asks the host that keeps it to restart that box, by its id.
+/// The box keeps its id and name, and the command prints one line, whether
+/// the box ran or was stopped. This crate's harness daemon has no package
+/// store, so it cannot start a box: the daemon's answer here is scripted.
+/// minimald's own tests start the box again from its stored spec (BOX-176).
+#[tokio::test]
+async fn box_restart_until_stopped_restarts_same_id_and_name() {
+    use minimald_rpc::{Errorable, RestartBoxResponse};
+
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let mut daemon = alpha.server.connect().await;
+    let id = create_box_with_spec(
+        &mut daemon,
+        "api",
+        alpha.project.path(),
+        Some(restart_spec(mfile::spec::Lifetime::UntilStopped)),
+    )
+    .await;
+    let other = create_box_with_spec(
+        &mut daemon,
+        "db",
+        alpha.project.path(),
+        Some(restart_spec(mfile::spec::Lifetime::UntilStopped)),
+    )
+    .await;
+    let before = listed_ids_and_names(&alpha.host).await;
+    assert!(before.contains(&(id, Some("api".to_owned()))), "{before:?}");
+
+    // A running box by its name and by its id, then the stopped box.
+    let short = id.to_string()[..13].to_owned();
+    for (address, was_running) in [
+        ("api".to_owned(), true),
+        (id.to_string(), true),
+        (short, true),
+        ("api".to_owned(), false),
+    ] {
+        if !was_running {
+            alpha.stop("api").await;
+        }
+        let mut asked = Vec::new();
+        let mut out = Vec::new();
+        let resolved = cmd::restart_box_on_hosts_with(
+            vec![alpha.host.clone()],
+            &mut out,
+            &address,
+            async |_client, request| {
+                asked.push(request.id);
+                Ok(Errorable::Ok(RestartBoxResponse::Restarted { was_running }))
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{address}: {err:#}"));
+        assert_eq!(resolved.box_id, id, "{address}");
+        assert_eq!(resolved.host.sock, alpha.host.sock, "{address}");
+        assert_eq!(asked, vec![id], "{address}: one restart, of this box");
+        assert_ne!(asked, vec![other], "{address}");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Restarted {address}.\n")
+        );
+        assert_eq!(
+            listed_ids_and_names(&alpha.host).await,
+            before,
+            "{address}: the boxes keep their ids and names"
+        );
+    }
+}
+
+/// BCLI-074: `min box restart` of a box that runs to completion fails with
+/// exit 2 and names `min box run <entry>`, the hint BCLI-009 chooses by
+/// `lifetime`. The box is left as it was, running or stopped.
+#[tokio::test]
+async fn box_restart_not_until_stopped_exit2_hint_by_lifetime() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let mut daemon = alpha.server.connect().await;
+    create_box_with_spec(
+        &mut daemon,
+        "job",
+        alpha.project.path(),
+        Some(restart_spec(mfile::spec::Lifetime::UntilComplete)),
+    )
+    .await;
+
+    for state in ["running", "stopped"] {
+        if state == "stopped" {
+            alpha.stop("job").await;
+        }
+        let mut out = Vec::new();
+        let err = cmd::restart_box_on_hosts(vec![alpha.host.clone()], &mut out, "job")
+            .await
+            .expect_err("a box that runs to completion does not restart");
+        let refusal = err
+            .downcast_ref::<minimald_rpc::RestartRefusal>()
+            .unwrap_or_else(|| panic!("a restart refusal: {err:#}"));
+        assert_eq!(refusal.exit_code, 2, "{state}");
+        assert_eq!(
+            refusal.to_string(),
+            "The spec of job does not set lifetime = \"until_stopped\", \
+             so min box restart cannot restart it. \
+             Run it again with min box run <entry>.",
+            "{state}"
+        );
+        assert_eq!(refusal.kind, minimald_rpc::RestartRefusalKind::Lifetime);
+        assert!(out.is_empty(), "{state}: nothing on stdout");
+        assert_eq!(address_state(&alpha.host, "job").await, state);
     }
 }
 
@@ -9680,6 +9865,20 @@ async fn box_attach_without_tty_exit2() {
         );
     }
     assert_eq!(address_state(&alpha.host, "web").await, "stopped");
+
+    // No host knows the box, or there is no host: the refusal is still the
+    // no-terminal one, because the check comes before any lookup.
+    for hosts in [vec![alpha.host.clone()], Vec::new()] {
+        let err = box_attach_on_hosts(hosts, Some("no-such-box"), None, false, no_attach)
+            .await
+            .expect_err("no terminal, no attach");
+        let (message, code) = attach_refusal(&err);
+        assert_eq!(code, 2, "{message}");
+        assert_eq!(
+            message,
+            "Cannot attach: stdin is not a terminal. Run `min box attach` from a terminal."
+        );
+    }
     // The check needs no host at all.
     assert!(ensure_box_attach_tty(true).is_ok());
 }
@@ -13023,6 +13222,657 @@ async fn task_list_shows_exited_until_pruned() {
     );
 }
 
+/// The cross-VM name resolution the tests above drive, with the example
+/// and the announcement an attach to `name` gives.
+async fn resolve_attach_target_version_gated(
+    global: &GlobalArgs,
+    client: &mut client::Client,
+    sock: std::path::PathBuf,
+    name: &str,
+) -> Result<(boxes::Record, std::path::PathBuf), anyhow::Error> {
+    let example = format!("session attach {name}");
+    cmd::resolve_named_box_version_gated(global, client, sock, name, "Attaching to", &example).await
+}
+
+/// `min box attach` over the local `hosts`, as [`attach_on_hosts`] runs it.
+async fn box_attach_on_hosts<A>(
+    hosts: Vec<LocalHost>,
+    address: Option<&str>,
+    scope: Option<&paths::HostAbsPath>,
+    stdin_is_tty: bool,
+    attach: A,
+) -> Result<AttachEnding, anyhow::Error>
+where
+    A: AsyncFnOnce(&BoxAttachTarget) -> Result<i32, anyhow::Error>,
+{
+    attach_on_hosts(
+        AttachVerb::BoxAttach,
+        hosts,
+        address,
+        scope,
+        stdin_is_tty,
+        attach,
+    )
+    .await
+}
+
+/// A stored spec with a terminal set to `pty`, and `lifetime` when given.
+fn resume_spec(pty: bool, lifetime: Option<&str>) -> serde_json_lenient::Value {
+    match lifetime {
+        Some(lifetime) => serde_json_lenient::json!({
+            "v": 1,
+            "io": {"pty_enabled": pty},
+            "box": {"lifetime": lifetime},
+        }),
+        None => serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": pty}}),
+    }
+}
+
+/// The box `verb` attaches to on `hosts`, with the attach that records it
+/// in place of the ssh hand-off. The hand-off is where the host resumes a
+/// stopped or exited box.
+async fn attached_by(
+    verb: AttachVerb,
+    hosts: &[LocalHost],
+    address: Option<&str>,
+    scope: Option<&paths::HostAbsPath>,
+) -> Result<BoxAttachTarget, anyhow::Error> {
+    let mut attached = None;
+    attach_on_hosts(
+        verb,
+        hosts.to_vec(),
+        address,
+        scope,
+        true,
+        async |target: &BoxAttachTarget| {
+            attached = Some(target.clone());
+            Ok(0)
+        },
+    )
+    .await?;
+    Ok(attached.expect("the attach ran"))
+}
+
+/// The refusal `verb` gives on `hosts`, with the attach that must not run.
+async fn refused_by(
+    verb: AttachVerb,
+    hosts: &[LocalHost],
+    address: Option<&str>,
+    scope: Option<&paths::HostAbsPath>,
+) -> (String, u8) {
+    let err = attach_on_hosts(verb, hosts.to_vec(), address, scope, true, no_attach)
+        .await
+        .expect_err("the attach is refused");
+    attach_refusal(&err)
+}
+
+/// BCLI-007: `min box attach`, `min session attach` and `min box resume`
+/// each take a stopped box with a terminal to the attach, which resumes it
+/// on its host. The bare forms take it too, as the project's only one.
+#[tokio::test]
+async fn attach_and_resume_verbs_resume_stopped_pty_box() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    alpha.stop("web").await;
+    let hosts = [alpha.host.clone()];
+    let scope = alpha.scope();
+
+    for (verb, address) in [
+        (AttachVerb::BoxAttach, Some("web")),
+        (AttachVerb::BoxResume, Some("web")),
+        (AttachVerb::SessionAttach, Some("web")),
+        (AttachVerb::BoxResume, Some(&*web.to_string())),
+        (AttachVerb::BoxAttach, None),
+        (AttachVerb::SessionAttach, None),
+    ] {
+        let target = attached_by(verb, &hosts, address, Some(&scope))
+            .await
+            .unwrap_or_else(|err| panic!("{verb:?} {address:?}: {err:#}"));
+        assert_eq!(target.box_id, web, "{verb:?} {address:?}");
+        assert_eq!(target.host.sock, alpha.host.sock, "{verb:?} {address:?}");
+        assert_eq!(target.name.as_deref(), Some("web"));
+        assert_eq!(target.label, address.unwrap_or("web"));
+    }
+    // The attach here only records its target, so the box is not resumed.
+    assert_eq!(address_state(&alpha.host, "web").await, "stopped");
+
+    // Arch C1: `min box resume` of a running box exits 2 and makes no
+    // attach call. `min box attach` and `min session attach` attach it.
+    let live = alpha.create("live", Some(true)).await;
+    let (message, code) = refused_by(AttachVerb::BoxResume, &hosts, Some("live"), None).await;
+    assert_eq!(code, 2, "{message}");
+    assert_eq!(
+        message,
+        "Cannot resume live: the box is running.\nAttach to it with min box attach live."
+    );
+    for verb in [AttachVerb::BoxAttach, AttachVerb::SessionAttach] {
+        let target = attached_by(verb, &hosts, Some("live"), None)
+            .await
+            .unwrap_or_else(|err| panic!("{verb:?}: {err:#}"));
+        assert_eq!(target.box_id, live, "{verb:?}");
+    }
+    assert_eq!(address_state(&alpha.host, "live").await, "running");
+
+    // Arch C1: `min box resume` of a running box with no terminal exits 2
+    // and names `min box logs`, since `min box attach` refuses that box.
+    alpha.create("quiet", Some(false)).await;
+    let (message, code) = refused_by(AttachVerb::BoxResume, &hosts, Some("quiet"), None).await;
+    assert_eq!(code, 2, "{message}");
+    assert_eq!(
+        message,
+        "Cannot resume quiet: the box is running.\nRun min box logs quiet to see its output."
+    );
+    assert_eq!(address_state(&alpha.host, "quiet").await, "running");
+}
+
+/// NET-058: a named attach finds a box that only another VM knows, with
+/// no `--vm`. The attach looks only on the VM that holds the box, and it
+/// runs there.
+#[tokio::test]
+async fn named_attach_finds_box_only_another_vm_knows() {
+    let (state, default_vm, alpha) = two_vms().await;
+    create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+    let global = vm_globals(state.path(), None);
+    let alpha_sock = state.path().join("providers/local-minvmd0/alpha/ssh.sock");
+    let hosts = local_hosts(&global).expect("the local hosts");
+    assert_eq!(hosts.len(), 2, "{hosts:?}");
+
+    for verb in [AttachVerb::SessionAttach, AttachVerb::BoxAttach] {
+        let on = named_attach_hosts(&global, hosts.clone(), verb, "web")
+            .await
+            .unwrap_or_else(|err| panic!("{verb:?}: {err:#}"));
+        assert_eq!(
+            on.iter().map(|h| h.sock.clone()).collect::<Vec<_>>(),
+            vec![alpha_sock.clone()],
+            "{verb:?}: only the VM that holds the box"
+        );
+        let target = attached_by(verb, &on, Some("web"), None)
+            .await
+            .unwrap_or_else(|err| panic!("{verb:?}: {err:#}"));
+        assert_eq!(target.box_id, web, "{verb:?}");
+        assert_eq!(target.host.sock, alpha_sock, "{verb:?}");
+    }
+
+    // A name no VM knows keeps every host, so the attach refuses the
+    // address.
+    let on = named_attach_hosts(&global, hosts.clone(), AttachVerb::BoxAttach, "nope")
+        .await
+        .expect("a name no VM knows is not an error here");
+    assert_eq!(on, hosts);
+}
+
+/// BCLI-007: a resume of a box with a terminal whose name a running box on
+/// its host holds fails with exit 2. The refusal names the running box and
+/// the renames that free the name, and notes the volume refusal.
+#[tokio::test]
+async fn resume_name_conflict_exit2_names_holder() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    alpha.stop("web").await;
+    // A running box with no terminal takes the name. It is no candidate of
+    // the bare form, so the bare form still finds the stopped box.
+    let holder = alpha.create("web", Some(false)).await;
+    let hosts = [alpha.host.clone()];
+    let scope = alpha.scope();
+    let id = web.to_string();
+
+    for (verb, address) in [
+        (AttachVerb::BoxAttach, Some(&*id)),
+        (AttachVerb::BoxResume, Some(&*id)),
+        (AttachVerb::SessionAttach, Some(&*id)),
+        (AttachVerb::BoxAttach, None),
+        (AttachVerb::SessionAttach, None),
+    ] {
+        let (message, code) = refused_by(verb, &hosts, address, Some(&scope)).await;
+        assert_eq!(code, 2, "{verb:?} {address:?}: {message}");
+        let label = address.unwrap_or("web");
+        assert_eq!(
+            message,
+            format!(
+                "Cannot resume {label}: the running box {holder} has the name web.\n\
+                 Rename the running box with min box rename {holder} <new-name>, \
+                 or rename this box with min box rename {web} <new-name>.\n\
+                 Then resume this box with min box resume {web}.\n\
+                 A resume is also refused when another box holds a volume that this box declares."
+            ),
+            "{verb:?} {address:?}"
+        );
+    }
+    let stopped = shown_record(&alpha.host, web).await;
+    assert_eq!(stopped.state, "stopped", "the refused box stays stopped");
+}
+
+/// BCLI-009: a stopped box with no terminal is refused with exit 2, and
+/// the hint follows the spec's lifetime: `min box restart <box>` for a box
+/// that runs until stopped, `min box run <entry>` for one that runs to
+/// completion. The terminal check comes before the name check.
+#[tokio::test]
+async fn resume_non_pty_box_exit2_hint_by_lifetime() {
+    use minimald_rpc::CreatingVerb;
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha
+        .create_with(
+            "agent",
+            resume_spec(false, Some("until_stopped")),
+            CreatingVerb::Session,
+        )
+        .await;
+    let job = alpha
+        .create_with("job", resume_spec(false, None), CreatingVerb::Task)
+        .await;
+    alpha.stop("agent").await;
+    alpha.stop("job").await;
+    let hosts = [alpha.host.clone()];
+
+    for verb in [AttachVerb::BoxAttach, AttachVerb::BoxResume] {
+        let (message, code) = refused_by(verb, &hosts, Some("agent"), None).await;
+        assert_eq!(code, 2, "{verb:?}: {message}");
+        assert_eq!(
+            message,
+            "agent has no terminal to resume.\nRestart it with min box restart agent."
+        );
+        let (message, code) = refused_by(verb, &hosts, Some("job"), None).await;
+        assert_eq!(code, 2, "{verb:?}: {message}");
+        assert_eq!(
+            message,
+            "job has no terminal to resume.\nRun it again with min box run <entry>."
+        );
+    }
+
+    // A running box that holds the name does not change the refusal.
+    alpha.create("job", Some(true)).await;
+    let id = job.to_string();
+    let (message, code) = refused_by(AttachVerb::BoxResume, &hosts, Some(&id), None).await;
+    assert_eq!(code, 2, "{message}");
+    assert_eq!(
+        message,
+        format!("{id} has no terminal to resume.\nRun it again with min box run <entry>.")
+    );
+    assert_eq!(address_state(&alpha.host, "agent").await, "stopped");
+    assert_eq!(shown_record(&alpha.host, job).await.state, "stopped");
+}
+
+/// BCLI-032: `min session attach <box>` resolves the box as `min box
+/// attach` does, among the boxes of type session only.
+#[tokio::test]
+async fn session_attach_is_box_attach_filtered_to_sessions() {
+    use minimald_rpc::CreatingVerb;
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let dev = alpha.create("dev", None).await;
+    let build = alpha
+        .create_with("build", resume_spec(true, None), CreatingVerb::Task)
+        .await;
+    let hosts = [alpha.host.clone()];
+
+    for address in [
+        "dev",
+        "local-minvmd/alpha.local-minvmd0/dev",
+        &*dev.to_string(),
+    ] {
+        let session = attached_by(AttachVerb::SessionAttach, &hosts, Some(address), None)
+            .await
+            .unwrap_or_else(|err| panic!("{address}: {err:#}"));
+        let boxed = attached_by(AttachVerb::BoxAttach, &hosts, Some(address), None)
+            .await
+            .unwrap_or_else(|err| panic!("{address}: {err:#}"));
+        assert_eq!(session, boxed, "{address}: the same box, by the same rules");
+        assert_eq!(session.box_id, dev);
+    }
+
+    // A box of another type is not found by the session verb.
+    let boxed = attached_by(AttachVerb::BoxAttach, &hosts, Some("build"), None)
+        .await
+        .expect("min box attach sees every type");
+    assert_eq!(boxed.box_id, build);
+    let err = attach_on_hosts(
+        AttachVerb::SessionAttach,
+        hosts.to_vec(),
+        Some("build"),
+        None,
+        true,
+        no_attach,
+    )
+    .await
+    .expect_err("a task box is no session");
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .unwrap_or_else(|| panic!("an address refusal: {err:#}"));
+    assert_eq!(refusal.exit_code(), 4, "{refusal}");
+}
+
+/// BCLI-032: `min session attach` of a session with no terminal gives the
+/// refusal `min box attach` gives: the logs hint while it runs, and the
+/// hint by lifetime once it stopped.
+#[tokio::test]
+async fn session_attach_non_pty_reports_box_attach_refusal() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("worker", Some(false)).await;
+    let hosts = [alpha.host.clone()];
+
+    let running = refused_by(AttachVerb::BoxAttach, &hosts, Some("worker"), None).await;
+    assert_eq!(
+        refused_by(AttachVerb::SessionAttach, &hosts, Some("worker"), None).await,
+        running
+    );
+    assert_eq!(
+        running,
+        (
+            "Box worker has no terminal to attach to. \
+             Run `min box logs worker` to see its output."
+                .to_owned(),
+            2
+        )
+    );
+
+    alpha.stop("worker").await;
+    let stopped = refused_by(AttachVerb::BoxAttach, &hosts, Some("worker"), None).await;
+    assert_eq!(
+        refused_by(AttachVerb::SessionAttach, &hosts, Some("worker"), None).await,
+        stopped
+    );
+    assert_eq!(
+        stopped,
+        (
+            "worker has no terminal to resume.\nRun it again with min box run <entry>.".to_owned(),
+            2
+        )
+    );
+}
+
+/// BCLI-032: with no box named, `min session attach` takes the project's
+/// running session box with a terminal, else its only retained one. A box
+/// of another type is never a candidate.
+#[tokio::test]
+async fn session_attach_without_address_picks_project_else_sole() {
+    use minimald_rpc::CreatingVerb;
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let build = alpha
+        .create_with("build", resume_spec(true, None), CreatingVerb::Task)
+        .await;
+    let dev = alpha.create("dev", Some(true)).await;
+    let hosts = [alpha.host.clone()];
+    let scope = alpha.scope();
+
+    let session = || attached_by(AttachVerb::SessionAttach, &hosts, None, Some(&scope));
+    assert_eq!(session().await.unwrap().box_id, dev);
+
+    // Stopped, the session is still the only one, though a running task
+    // box with a terminal is what `min box attach` takes.
+    alpha.stop("dev").await;
+    assert_eq!(session().await.unwrap().box_id, dev);
+    let boxed = attached_by(AttachVerb::BoxAttach, &hosts, None, Some(&scope))
+        .await
+        .unwrap();
+    assert_eq!(boxed.box_id, build);
+
+    // A running session wins over the retained one.
+    let api = alpha.create("api", Some(true)).await;
+    assert_eq!(session().await.unwrap().box_id, api);
+}
+
+/// BCLI-032: with no box named, two session candidates fail with exit 2
+/// and the refusal lists them. A task box is not listed.
+#[tokio::test]
+async fn session_attach_without_address_ambiguous_exit2_lists() {
+    use minimald_rpc::CreatingVerb;
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let api = alpha.create("api", None).await;
+    alpha
+        .create_with("build", resume_spec(true, None), CreatingVerb::Task)
+        .await;
+    let hosts = [alpha.host.clone()];
+
+    let (message, code) = refused_by(
+        AttachVerb::SessionAttach,
+        &hosts,
+        None,
+        Some(&alpha.scope()),
+    )
+    .await;
+    assert_eq!(code, 2, "{message}");
+    let mut lines = [
+        format!("  local-minvmd/alpha.local-minvmd0/web  running  {web}"),
+        format!("  local-minvmd/alpha.local-minvmd0/api  running  {api}"),
+    ];
+    lines.sort_by_key(|line| message.find(line.as_str()));
+    assert_eq!(
+        message,
+        format!(
+            "More than one session box in this project has a terminal:\n{}\n{}\n\
+             Name one with `min session attach <box>`.",
+            lines[0], lines[1]
+        )
+    );
+}
+
+/// Starts a box named `name` from `project` on the harness daemon with
+/// `entry` on its contribution, through create, compose, verdict and
+/// finalize. Returns the vars, as `NAME=value`, and the hooks the daemon
+/// composed from the entry and sent back for the gate. The vars are
+/// approved. The hooks are ignored, so the start runs none of them.
+async fn start_from_entry(
+    daemon: &mut minimald::test_harness::TestClient,
+    name: &str,
+    project: &std::path::Path,
+    entry: boxes::wire::request::WireBoxEntry,
+) -> (Vec<String>, Vec<String>) {
+    use boxes::wire::policy::{WireHookVerdict, WireVarVerdict};
+    use boxes::wire::primitives::{WireResolvedVar, WireVarSpec};
+    use boxes::wire::request::{BoxStep, ContributionVerdict, WireContribution};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSession,
+        Errorable, SubmitVerdict,
+    };
+    let request = minimald::test_harness::create_session_req(
+        name,
+        project.to_str().expect("a UTF-8 project path"),
+    );
+    let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
+    let configured = daemon
+        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+            session_id: id,
+            contribution: WireContribution {
+                entry: Some(Box::new(entry)),
+                ..WireContribution::default()
+            },
+        })
+        .await;
+    let response = match configured {
+        Errorable::Ok(ConfigureLoadoutResponse::Pending { response }) => response,
+        // Nothing to gate: the box composed with no vars and no hooks.
+        Errorable::Ok(ConfigureLoadoutResponse::Materialized) => {
+            finalize_from_entry(daemon, id).await;
+            return (Vec::new(), Vec::new());
+        }
+        Errorable::Err { error } => panic!("ConfigureLoadout failed: {error}"),
+    };
+    let mut vars = Vec::new();
+    let mut var_verdicts = Vec::new();
+    for var in &response.vars {
+        let WireVarSpec::Specified { value } = &var.spec else {
+            panic!("the entry's vars are literal: {var:?}");
+        };
+        vars.push(format!("{}={value}", var.name));
+        var_verdicts.push(WireVarVerdict::Approved {
+            id: var.id,
+            value: WireResolvedVar {
+                name: var.name.clone(),
+                value: value.clone(),
+                carries_user_data: false,
+            },
+        });
+    }
+    let hooks = response
+        .lifecycle_hooks
+        .iter()
+        .map(|hook| format!("{:?}", hook.hook))
+        .collect();
+    let hook_verdicts = response
+        .lifecycle_hooks
+        .iter()
+        .map(|hook| WireHookVerdict::Ignored { id: hook.id })
+        .collect();
+    match daemon
+        .call::<SubmitVerdict>(&ContributionVerdict {
+            session_id: id,
+            vars: var_verdicts,
+            patches: Vec::new(),
+            lifecycle_hooks: hook_verdicts,
+        })
+        .await
+    {
+        Errorable::Ok(BoxStep::Materialized { .. }) => {}
+        other => panic!("SubmitVerdict did not compose the box: {other:?}"),
+    }
+    finalize_from_entry(daemon, id).await;
+    (vars, hooks)
+}
+
+/// Finalizes box `id`, which [`start_from_entry`] composed.
+async fn finalize_from_entry(
+    daemon: &mut minimald::test_harness::TestClient,
+    id: boxes::SessionId,
+) {
+    use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
+    match daemon
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+}
+
+/// BOX-068 with BOX-048 and BOX-050: one `minimal.toml` declares a session
+/// and a task entry that share `[defaults]`. The client expands each entry
+/// and sends it, and the daemon composes and starts each box from its own
+/// expanded entry. A project with only a legacy `[session]` table still
+/// expands, as `[defaults.session]` of the implicit `default` entry.
+#[tokio::test]
+async fn expanded_session_and_task_entries_start_both_boxes() {
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        r#"
+[defaults]
+lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo shared" } }]
+
+[defaults.session]
+vars = { EDITOR = "hx" }
+
+[sessions.default]
+lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo session" } }]
+
+[tasks.check]
+echo = "ok"
+"#,
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+
+    let session = crate::session_box_entry(root, None, true)
+        .expect("the session entry expands")
+        .expect("the project declares a session entry");
+    assert_eq!(
+        (session.name.as_str(), session.box_type.as_str()),
+        ("default", "session")
+    );
+    let task = crate::task_box_entry(root, "check", true)
+        .expect("the task entry expands")
+        .expect("the project declares the task");
+    assert_eq!(
+        (task.name.as_str(), task.box_type.as_str()),
+        ("check", "task")
+    );
+    // A task's own vars have the task shape, so a task entry sends none.
+    assert_eq!(task.vars, None);
+    // `--no-hooks` sends no hook list, so the daemon's own stays cleared.
+    let no_hooks = crate::session_box_entry(root, None, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(no_hooks.lifecycle_hooks, None);
+
+    let server = minimald::test_harness::TestServer::new().await;
+    let mut daemon = server.connect().await;
+    let (session_vars, session_hooks) =
+        start_from_entry(&mut daemon, "dev", project.path(), session).await;
+    assert_eq!(
+        session_vars,
+        ["EDITOR=hx"],
+        "[defaults.session] reaches the session"
+    );
+    assert_eq!(session_hooks.len(), 2, "{session_hooks:?}");
+    assert!(
+        session_hooks[0].contains("echo shared"),
+        "{session_hooks:?}"
+    );
+    assert!(
+        session_hooks[1].contains("echo session"),
+        "{session_hooks:?}"
+    );
+
+    let (task_vars, task_hooks) =
+        start_from_entry(&mut daemon, "check-1", project.path(), task).await;
+    assert_eq!(
+        task_vars,
+        Vec::<String>::new(),
+        "[defaults.session] stays off the task"
+    );
+    assert_eq!(task_hooks.len(), 1, "{task_hooks:?}");
+    assert!(task_hooks[0].contains("echo shared"), "{task_hooks:?}");
+
+    // An old `[session]` table expands as `[defaults.session]` of the
+    // implicit `default` entry. A task entry in the same project gets
+    // none of it: the daemon reads no `[session]` table when it gets an
+    // entry.
+    let legacy = tempfile::tempdir().expect("a legacy project dir");
+    std::fs::write(
+        legacy.path().join(mfile::MFILE_NAME),
+        "[session]\nvars = { EDITOR = \"vi\" }\n\n[tasks.check]\necho = \"ok\"\n",
+    )
+    .unwrap();
+    let legacy_root = camino::Utf8Path::from_path(legacy.path()).expect("a UTF-8 path");
+    let entry = crate::session_box_entry(legacy_root, None, true)
+        .expect("the legacy table expands")
+        .expect("the implicit default entry");
+    assert_eq!(entry.name, "default");
+    let (legacy_vars, _) = start_from_entry(&mut daemon, "legacy", legacy.path(), entry).await;
+    assert_eq!(legacy_vars, ["EDITOR=vi"]);
+    let legacy_task = crate::task_box_entry(legacy_root, "check", true)
+        .expect("the legacy project's task entry expands")
+        .expect("the legacy project declares the task");
+    let (legacy_task_vars, _) =
+        start_from_entry(&mut daemon, "legacy-check", legacy.path(), legacy_task).await;
+    assert_eq!(
+        legacy_task_vars,
+        Vec::<String>::new(),
+        "a legacy [session] table stays off the task"
+    );
+
+    // A project with two session entries and no `default` cannot pick one.
+    // The start fails with the refusal, and sends no entry.
+    let undecided = tempfile::tempdir().expect("an undecided project dir");
+    std::fs::write(
+        undecided.path().join(mfile::MFILE_NAME),
+        "[sessions.a]\n\n[sessions.b]\n",
+    )
+    .unwrap();
+    let undecided_root = camino::Utf8Path::from_path(undecided.path()).expect("a UTF-8 path");
+    let error = crate::session_box_entry(undecided_root, None, true)
+        .expect_err("an undecided pick refuses the start");
+    assert_eq!(
+        error.downcast_ref::<crate::SessionEntryUndecided>(),
+        Some(&crate::SessionEntryUndecided::NoDefault {
+            candidates: vec!["a".into(), "b".into()],
+        }),
+    );
+}
+
 /// The start `argv` types, as `min box start` or `min session start`.
 fn parsed_start(argv: &[&str]) -> StartEntry {
     match Cli::try_parse_from(argv).expect("the start parses").command {
@@ -13827,6 +14677,57 @@ async fn box_wait_exec_returns_exec_code() {
     );
 }
 
+/// BCLI-032: with no box named and no session candidate, `min session
+/// attach` fails with exit 4 and a hint that names `min session start`.
+#[tokio::test]
+async fn session_attach_without_address_none_exit4_hints_start() {
+    use minimald_rpc::CreatingVerb;
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    // A task box with a terminal, and a session with none.
+    alpha
+        .create_with("build", resume_spec(true, None), CreatingVerb::Task)
+        .await;
+    alpha.create("worker", Some(false)).await;
+    let hosts = [alpha.host.clone()];
+
+    let (message, code) = refused_by(
+        AttachVerb::SessionAttach,
+        &hosts,
+        None,
+        Some(&alpha.scope()),
+    )
+    .await;
+    assert_eq!(code, 4, "{message}");
+    assert_eq!(
+        message,
+        "No session box with a terminal in this project. Start one with min session start."
+    );
+}
+
+/// BCLI-032: with no box named, a host that does not answer fails `min
+/// session attach` with exit 7, names the host, and attaches to nothing.
+#[tokio::test]
+async fn session_attach_without_address_unreachable_host_exit7() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("dev", Some(true)).await;
+    let down = address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", true);
+
+    let (message, code) = refused_by(
+        AttachVerb::SessionAttach,
+        &[alpha.host.clone(), down],
+        None,
+        Some(&alpha.scope()),
+    )
+    .await;
+    assert_eq!(code, 7, "{message}");
+    assert_eq!(
+        message,
+        "Could not reach host beta.local-minvmd0, so no box was chosen. \
+         Run the command again when the host answers, \
+         or name the box as provider/host/name."
+    );
+}
+
 /// One command the end-to-end test ran, with what it wrote and how it
 /// ended, for the failure message.
 struct Ran {
@@ -14115,4 +15016,565 @@ async fn task_run_logs_wait_list_end_to_end() {
     }
     .instrument(span)
     .await;
+}
+
+// T17 (S4; BCLI-053, BCLI-055, BCLI-056, BCLI-057, BCLI-067): commands run
+// inside a box, end to end. `min box exec` starts a command with a terminal
+// and one detached, and prints each exec id where the CLI prints it. The
+// harness daemon starts no process, so the two starts go over scripted
+// channels, and the daemon then lists the two execs by those ids. `min box
+// show` lists both live execs. `min box logs --exec` reads the detached
+// exec's output. `min box stop --exec` stops the terminal exec alone, and
+// the box and the other exec run on. `min box wait --exec` returns the
+// detached exec's code when it ends. One span covers the exec, the show,
+// the wait and the stop. A failure prints each command run so far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_exec_show_logs_wait_stop_end_to_end() {
+    use minimald_rpc::exec::{ExecId, ExecMode, ExecRequest};
+    use tracing::Instrument as _;
+
+    const TERMINAL_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f5c01";
+    const DETACHED_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f5c02";
+    let shell = ["sh", "-i"];
+    let job = ["sh", "-c", "echo building; sleep 600"];
+
+    let log = minimald::test_harness::captured_log();
+    let mut ran = Transcript::default();
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    let hosts = || vec![alpha.host.clone()];
+
+    let span = tracing::info_span!("box_exec_end_to_end", box_id = %web);
+    let ran = &mut ran;
+    async {
+        // `min box exec -t`: the exec id on stderr, then the exec's output
+        // alone on stdout, and the exec's code.
+        let (run, opened) = run_scripted_exec(
+            &box_exec_request("web", &["-t"], &shell),
+            vec![
+                answer(format!("{TERMINAL_EXEC_ID}\n").as_bytes(), b"", 0),
+                answer(b"$ ", b"", 0),
+            ],
+        )
+        .await;
+        ran.push(
+            "min box exec web -t -- sh -i",
+            run.stdout.as_bytes(),
+            run.stderr.as_bytes(),
+            run.exit,
+        );
+        assert_eq!(run.exit, 0, "{ran}");
+        assert!(run.error.is_none(), "{ran}");
+        assert_eq!(run.stderr, format!("{TERMINAL_EXEC_ID}\n"), "{ran}");
+        assert_eq!(run.stdout, "$ ", "{ran}");
+        assert_eq!(
+            opened,
+            [
+                exec_form(&shell, ExecMode::Tty, None),
+                ExecRequest::ExecAttach(ExecId::parse(TERMINAL_EXEC_ID).unwrap()),
+            ],
+            "{ran}"
+        );
+
+        // `min box exec --detach`: only the exec id on stdout, no wait.
+        let (run, opened) = run_scripted_exec(
+            &box_exec_request("web", &["--detach"], &job),
+            vec![answer(format!("{DETACHED_EXEC_ID}\n").as_bytes(), b"", 0)],
+        )
+        .await;
+        ran.push(
+            "min box exec web --detach -- sh -c 'echo building; sleep 600'",
+            run.stdout.as_bytes(),
+            run.stderr.as_bytes(),
+            run.exit,
+        );
+        assert_eq!(run.exit, 0, "{ran}");
+        assert_eq!(run.stdout, format!("{DETACHED_EXEC_ID}\n"), "{ran}");
+        assert_eq!(run.stderr, "", "{ran}");
+        assert_eq!(opened, [exec_form(&job, ExecMode::Detached, None)], "{ran}");
+
+        // The daemon now runs the two execs by the ids it gave.
+        let terminal = alpha
+            .server
+            .list_running_exec(web, TERMINAL_EXEC_ID, &shell, true);
+        let detached = alpha
+            .server
+            .list_running_exec(web, DETACHED_EXEC_ID, &job, false);
+        let box_dir =
+            camino::Utf8PathBuf::from_path_buf(exec_box_dir(&state, web)).expect("a UTF-8 path");
+        let transcript = boxes::store::exec_transcript_path(&box_dir, DETACHED_EXEC_ID);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"building\n").unwrap();
+
+        // `min box show` lists both live execs.
+        let text = box_show_text(&alpha.host, "web").await;
+        ran.push("min box show web", text.as_bytes(), b"", 0);
+        assert_eq!(
+            live_exec_rows(&text),
+            [
+                "Live execs:".to_owned(),
+                format!("  {TERMINAL_EXEC_ID}  terminal  sh -i"),
+                format!("  {DETACHED_EXEC_ID}  detached  sh -c 'echo building; sleep 600'"),
+            ],
+            "{ran}"
+        );
+
+        // `min box logs --exec` reads the detached exec's output.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let logs =
+            box_logs_exec_on_hosts(hosts(), "web", DETACHED_EXEC_ID, &mut out, &mut err).await;
+        ran.push(
+            &format!("min box logs web --exec {DETACHED_EXEC_ID}"),
+            &out,
+            &err,
+            format!("{:?}", logs.as_ref().map_err(|e| format!("{e:#}"))),
+        );
+        assert_eq!(
+            logs.unwrap_or_else(|e| panic!("the logs: {e:#}\n{ran}")),
+            0,
+            "{ran}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out), "building\n", "{ran}");
+        assert_eq!(String::from_utf8_lossy(&err), "", "{ran}");
+
+        // `min box stop --exec` stops the terminal exec alone. The harness
+        // exec has no process, so the test ends it while the stop waits.
+        let mut out = Vec::new();
+        let stop = box_stop_exec_on_hosts(hosts(), &mut out, "web", TERMINAL_EXEC_ID);
+        let end = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            terminal.end();
+        };
+        let (stopped, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(stop, end)
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the stop returns when the exec ends\n{ran}"));
+        ran.push(
+            &format!("min box stop web --exec {TERMINAL_EXEC_ID}"),
+            &out,
+            b"",
+            format!("{:?}", stopped.as_ref().map_err(|e| format!("{e:#}"))),
+        );
+        stopped.unwrap_or_else(|e| panic!("the exec stop: {e:#}\n{ran}"));
+        let text = box_show_text(&alpha.host, "web").await;
+        ran.push("min box show web", text.as_bytes(), b"", 0);
+        assert!(
+            text.lines().any(|line| line == "State:      running"),
+            "the box runs on\n{ran}"
+        );
+        assert_eq!(
+            live_exec_rows(&text),
+            [
+                "Live execs:".to_owned(),
+                format!("  {DETACHED_EXEC_ID}  detached  sh -c 'echo building; sleep 600'"),
+            ],
+            "the other exec runs on\n{ran}"
+        );
+
+        // `min box wait --exec` returns the detached exec's code when it ends.
+        let mut err = Vec::new();
+        let wait = box_wait_exec_on_hosts(hosts(), "web", DETACHED_EXEC_ID, None, &mut err);
+        let end = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            detached.end();
+        };
+        let (waited, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(wait, end)
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the wait returns when the exec ends\n{ran}"));
+        ran.push(
+            &format!("min box wait web --exec {DETACHED_EXEC_ID}"),
+            b"",
+            &err,
+            format!("{:?}", waited.as_ref().map_err(|e| format!("{e:#}"))),
+        );
+        assert_eq!(
+            waited.unwrap_or_else(|e| panic!("the wait: {e:#}\n{ran}")),
+            0,
+            "{ran}"
+        );
+        assert_eq!(String::from_utf8_lossy(&err), "", "{ran}");
+        let text = box_show_text(&alpha.host, "web").await;
+        ran.push("min box show web", text.as_bytes(), b"", 0);
+        assert_eq!(
+            live_exec_rows(&text),
+            Vec::<String>::new(),
+            "no live exec\n{ran}"
+        );
+    }
+    .instrument(span)
+    .await;
+
+    // The span covers the logs, the stop and the wait of the execs.
+    let log = log.contents();
+    for verb in ["box logs", "box stop", "box wait"] {
+        assert!(
+            log.lines().any(|line| line.contains("box_exec_end_to_end{")
+                && line.contains(&format!("verb=\"{verb}\""))
+                && line.contains(&format!("box_id={web}"))),
+            "a `{verb}` event in the span\n{log}\n{ran}"
+        );
+    }
+}
+
+/// BCLI-042: the concept and reference pages name no removed session verb.
+/// Each page names the box verbs and the type nouns in their place.
+#[test]
+fn concept_and_reference_docs_use_no_removed_session_verb() {
+    const PAGES: &[&str] = &[
+        "docs/concepts/loadouts.md",
+        "docs/concepts/sessions.md",
+        "docs/reference/linux-host-setup.md",
+        "docs/reference/loadouts.md",
+        "docs/reference/minimal-dot-toml.md",
+        "docs/reference/sandbox-operations.md",
+        "docs/reference/tasks.md",
+        "docs/reference/telemetry.md",
+        "docs/reference/user-policy.md",
+    ];
+    const REMOVED_SESSION_VERBS: &[&str] = &[
+        "activate", "destroy", "exec", "rename", "policy", "hooks", "run",
+    ];
+    // A spelling matches only as a whole word: `min stop` is removed, and
+    // `min stopwatch` is a different word.
+    fn has_word(line: &str, spelling: &str) -> bool {
+        line.match_indices(spelling).any(|(at, _)| {
+            let next = line[at + spelling.len()..].chars().next();
+            !next.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        })
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut found = Vec::new();
+    for page in PAGES {
+        let text = std::fs::read_to_string(root.join(page))
+            .unwrap_or_else(|e| panic!("{page} must be readable: {e}"));
+        for (n, line) in text.lines().enumerate() {
+            let mut hits: Vec<String> = REMOVED_SESSION_VERBS
+                .iter()
+                .map(|verb| format!("min session {verb}"))
+                .filter(|spelling| has_word(line, spelling))
+                .collect();
+            if has_word(line, "min task run") && line.contains("--path") {
+                hits.push("min task run --path".to_owned());
+            }
+            if has_word(line, "min stop") {
+                hits.push("min stop".to_owned());
+            }
+            for hit in hits {
+                found.push(format!("{page}:{}: `{hit}`: {line}", n + 1));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "removed spellings in the concept and reference docs:\n{}",
+        found.join("\n")
+    );
+}
+
+// T26 (S6): retained boxes managed, end to end. `min box rename` renames a
+// box, and every later command reaches it by the new name. `min box cp`
+// copies a file out of the box after it stops. `min box events` replays the
+// box's events, and a follow tails them until the prune removes the box.
+// `min box prune --dry-run` lists the stopped box with the disk it holds and
+// removes nothing, and `min box prune` then removes it. `min box restart`
+// restarts a long-running box under the same id and name. The harness
+// daemon cannot start a box, so its restart answer is scripted. One span
+// covers the rename, the copy, the events read and the prune of the box. A
+// failure prints each command run so far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_box_management_end_to_end() {
+    use minimald_rpc::{Errorable, RestartBoxResponse, ShowBox, ShowBoxRequest};
+    use tracing::Instrument as _;
+
+    let log = minimald::test_harness::captured_log();
+    let mut ran = Transcript::default();
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let web = minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await;
+    let api = create_box_with_spec(
+        &mut daemon,
+        "api",
+        project.path(),
+        Some(restart_spec(mfile::spec::Lifetime::UntilStopped)),
+    )
+    .await;
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let sftp = daemon.open_sftp(web).await;
+        let mut file = sftp.create("notes.txt").await.unwrap();
+        file.write_all(b"kept after the stop").await.unwrap();
+        file.shutdown().await.unwrap();
+    }
+    let hosts = || local_hosts(&global).unwrap();
+    let host = hosts()
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the native host is selected");
+
+    let span = tracing::info_span!("retained_box_end_to_end", box_id = %web);
+    let ran = &mut ran;
+    async {
+        // `min box rename web front`.
+        let mut client = box_host_client(&host).await.unwrap();
+        let mut out = Vec::new();
+        let renamed = rename_listed_box(&mut client, &mut out, web, "web", "front").await;
+        ran.push(
+            "min box rename web front",
+            &out,
+            b"",
+            format!("{:?}", renamed.as_ref().map_err(|e| format!("{e:#}"))),
+        );
+        renamed.unwrap_or_else(|e| panic!("the rename: {e:#}\n{ran}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "Renamed web to front.\n",
+            "{ran}"
+        );
+        let names = listed_ids_and_names(&host).await;
+        assert!(
+            names.contains(&(web, Some("front".to_owned()))),
+            "the box keeps its id under the new name: {names:?}\n{ran}"
+        );
+
+        // `min box stop front`.
+        let mut out = Vec::new();
+        let stopped = stop_box_on_hosts(hosts(), &mut out, "front", false).await;
+        ran.push(
+            "min box stop front",
+            &out,
+            b"",
+            format!(
+                "{:?}",
+                stopped.as_ref().map(|_| 0).map_err(|e| format!("{e:#}"))
+            ),
+        );
+        stopped.unwrap_or_else(|e| panic!("the stop: {e:#}\n{ran}"));
+        assert_eq!(address_state(&host, "front").await, "stopped", "{ran}");
+
+        // `min box cp front:notes.txt <dir>` copies out of the stopped box.
+        let local = tempfile::tempdir().expect("a local dir");
+        let copied = box_cp_on_hosts(hosts(), "front:notes.txt", local.path()).await;
+        ran.push(
+            &format!("min box cp front:notes.txt {}", local.path().display()),
+            b"",
+            b"",
+            format!("{:?}", copied.as_ref().map_err(|e| format!("{e:#}"))),
+        );
+        let written = copied.unwrap_or_else(|e| panic!("the copy: {e:#}\n{ran}"));
+        assert_eq!(written, local.path().join("notes.txt"), "{ran}");
+        assert_eq!(
+            std::fs::read(&written).unwrap(),
+            b"kept after the stop",
+            "{ran}"
+        );
+
+        // `min box events front -o jsonl` replays the kept events.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let replay = box_events_on_hosts(
+            hosts(),
+            &events_args(Some("front"), None, false),
+            &mut out,
+            &mut err,
+        )
+        .await;
+        ran.push(
+            "min box events front -o jsonl",
+            &out,
+            &err,
+            format!(
+                "{:?}",
+                replay.as_ref().map(|_| 0).map_err(|e| format!("{e:#}"))
+            ),
+        );
+        replay.unwrap_or_else(|e| panic!("the events replay: {e:#}\n{ran}"));
+        assert_eq!(String::from_utf8_lossy(&err), "", "{ran}");
+        let replayed = event_lines(&out);
+        assert_eq!(
+            replayed.first().map(|line| line["type"].clone()),
+            Some("created".into()),
+            "{ran}"
+        );
+        assert!(
+            replayed.len() > 1,
+            "the stop adds to the created event\n{ran}"
+        );
+        assert!(
+            replayed.iter().all(|line| line["box"] == web.to_string()),
+            "{ran}"
+        );
+
+        // `min box prune --dry-run` lists the stopped box with its disk.
+        let bytes = {
+            let mut client = box_host_client(&host).await.unwrap();
+            match client
+                .oneshot_rpc::<ShowBox>(ShowBoxRequest { id: web })
+                .await
+                .unwrap()
+            {
+                Errorable::Ok(shown) => shown.disk_bytes,
+                Errorable::Err { error } => panic!("ShowBox failed: {error}\n{ran}"),
+            }
+        }
+        .unwrap_or_else(|| panic!("the daemon measures a stopped box\n{ran}"));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let dry = match prune_hosts(
+            hosts(),
+            false,
+            box_prune_request(None, None),
+            PruneMode::DryRun,
+            &mut out,
+        )
+        .await
+        {
+            Ok(tally) => finish_prune_dry_run(&tally, &mut out, &mut err),
+            Err(e) => Err(e),
+        };
+        ran.push(
+            "min box prune --dry-run",
+            &out,
+            &err,
+            format!(
+                "{:?}",
+                dry.as_ref().map(|_| 0).map_err(|e| format!("{e:#}"))
+            ),
+        );
+        dry.unwrap_or_else(|e| panic!("the dry run: {e:#}\n{ran}"));
+        let size = format_disk(bytes);
+        assert_eq!(
+            String::from_utf8_lossy(&out).lines().collect::<Vec<_>>(),
+            [
+                format!("Would remove front ({web}): {size}"),
+                format!("Total: {size}"),
+                "Nothing was removed.".to_owned(),
+            ],
+            "the running box `api` is left out\n{ran}"
+        );
+        assert_eq!(address_state(&host, "front").await, "stopped", "{ran}");
+
+        // `min box events front --follow` tails until `min box prune`
+        // removes the box.
+        let followed = SharedOut::default();
+        let follow_args = events_args(Some("front"), None, true);
+        let follow = {
+            let mut out = followed.clone();
+            let args = &follow_args;
+            async move { box_events_on_hosts(hosts(), args, &mut out, &mut Vec::new()).await }
+                .in_current_span()
+        };
+        let drive = async {
+            let first = followed.more_than(replayed.len() - 1).await;
+            assert_eq!(first, replayed, "the follow replays the kept events\n{ran}");
+            let mut out = Vec::new();
+            let pruned = prune_hosts(
+                hosts(),
+                false,
+                box_prune_request(None, None),
+                PruneMode::Remove,
+                &mut out,
+            )
+            .await;
+            (out, pruned)
+        };
+        let (follow_result, (out, pruned)) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                tokio::join!(follow, drive)
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the follow ends when the prune removes the box\n{ran}"));
+        ran.push(
+            "min box prune --yes",
+            &out,
+            b"",
+            format!(
+                "{:?}",
+                pruned
+                    .as_ref()
+                    .map(|t| t.reaped)
+                    .map_err(|e| format!("{e:#}"))
+            ),
+        );
+        ran.push(
+            "min box events front --follow -o jsonl",
+            followed.0.lock().unwrap().as_slice(),
+            b"",
+            format!(
+                "{:?}",
+                follow_result
+                    .as_ref()
+                    .map(|_| 0)
+                    .map_err(|e| format!("{e:#}"))
+            ),
+        );
+        let tally = pruned.unwrap_or_else(|e| panic!("the prune: {e:#}\n{ran}"));
+        assert_eq!(tally.reaped, 1, "only the stopped box\n{ran}");
+        follow_result.unwrap_or_else(|e| panic!("the follow ends cleanly: {e:#}\n{ran}"));
+        let names = listed_ids_and_names(&host).await;
+        assert!(
+            !names.iter().any(|(id, _)| *id == web),
+            "the prune removes the box: {names:?}\n{ran}"
+        );
+        assert!(
+            names.contains(&(api, Some("api".to_owned()))),
+            "the running box stays: {names:?}\n{ran}"
+        );
+    }
+    .instrument(span)
+    .await;
+
+    // `min box restart api`: the long-running box restarts by its id, and
+    // keeps its id and name.
+    let before = listed_ids_and_names(&host).await;
+    let mut asked = Vec::new();
+    let mut out = Vec::new();
+    let restarted =
+        cmd::restart_box_on_hosts_with(hosts(), &mut out, "api", async |_client, request| {
+            asked.push(request.id);
+            Ok(Errorable::Ok(RestartBoxResponse::Restarted {
+                was_running: true,
+            }))
+        })
+        .await;
+    ran.push(
+        "min box restart api",
+        &out,
+        b"",
+        format!(
+            "{:?}",
+            restarted.as_ref().map(|_| 0).map_err(|e| format!("{e:#}"))
+        ),
+    );
+    let resolved = restarted.unwrap_or_else(|e| panic!("the restart: {e:#}\n{ran}"));
+    assert_eq!(resolved.box_id, api, "{ran}");
+    assert_eq!(asked, vec![api], "one restart, of this box\n{ran}");
+    assert_eq!(String::from_utf8_lossy(&out), "Restarted api.\n", "{ran}");
+    assert_eq!(
+        listed_ids_and_names(&host).await,
+        before,
+        "the box keeps its id and name\n{ran}"
+    );
+
+    // The span covers the rename, the copy and the events read of the box.
+    // The prune runs in the span too, but `prune_hosts` logs no event of
+    // its own on success: `cmd_box_prune` logs the verb after it returns.
+    let log = log.contents();
+    for verb in ["box rename", "box cp", "box events"] {
+        assert!(
+            log.lines()
+                .any(|line| line.contains("retained_box_end_to_end{")
+                    && line.contains(&format!("verb=\"{verb}\""))
+                    && line.contains(&format!("box_id={web}"))),
+            "a `{verb}` event in the span\n{log}\n{ran}"
+        );
+    }
 }
