@@ -14798,7 +14798,10 @@ async fn box_spec_renders_formats_secrets_as_refs() {
     )
     .await
     .expect("the entry renders");
-    assert!(yaml.starts_with("entry: default\nsources:\n"), "{yaml}");
+    assert!(
+        yaml.starts_with("entry: default\nloadouts:\n  - default\nsources:\n"),
+        "{yaml}"
+    );
     assert!(
         yaml.contains("\nspec:\n  network:\n    mode: host_ip\n"),
         "{yaml}"
@@ -14972,6 +14975,114 @@ async fn box_spec_entry_network_flags_match_start() {
         doc["sources"]["network.egress"],
         serde_json_lenient::json!(["[sessions.default]"])
     );
+
+    // A task entry takes neither --ingress nor --loadout. The spec refuses
+    // each flag with exit 2, as `min box start` refuses it, and renders
+    // nothing.
+    let file = "[tasks.build]\necho = 'x'\n";
+    let (_project, global) = spec_project(file);
+    for (flag, value) in [("--ingress", "8080:80"), ("--loadout", "dev")] {
+        let start = parsed_start(&["min", "box", "start", "build", flag, value]);
+        let error = plan_start(&start, &start_entries(file), true).expect_err("start refuses");
+        assert_eq!(
+            error.downcast_ref::<StartEntryRefusal>(),
+            Some(&StartEntryRefusal::FlagUnsupported {
+                entry: "build".to_owned(),
+                flag,
+            })
+        );
+        let error = box_spec_text(&global, &["min", "box", "spec", "build", flag, value])
+            .await
+            .expect_err("the spec refuses");
+        assert_eq!(spec_refusal_code(&error), 2);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "min box spec does not take {flag} for build. A box from a task entry \
+                 does not take {flag}. Run min box spec build without {flag}."
+            )
+        );
+    }
+}
+
+// BCLI-021: `min box spec <entry>` selects the loadouts `min box start`
+// selects, from the same client config, and names them: a `loadouts` field
+// in JSON and YAML, and a comment line in the TOML header. A loadout that
+// is not on disk fails the spec with the error the start gives, and
+// nothing renders.
+#[tokio::test]
+async fn box_spec_entry_loadouts_resolve_as_start() {
+    let (_project, global) = spec_project("[sessions.default]\npackages = [\"git\"]\n");
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(loadouts.join("dev.toml"), "packages = [\"helix\"]\n").unwrap();
+
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["loadouts"], serde_json_lenient::json!(["dev"]));
+    let yaml = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--loadout",
+            "dev",
+            "-o",
+            "yaml",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    assert!(yaml.contains("\nloadouts:\n  - dev\n"), "{yaml}");
+    let toml = box_spec_text(
+        &global,
+        &["min", "box", "spec", "default", "--loadout", "dev"],
+    )
+    .await
+    .expect("the entry renders");
+    assert!(
+        toml.lines().nth(1) == Some("# Loadouts: dev."),
+        "the header names the loadout\n{toml}"
+    );
+
+    // With no flag, the default selection of the client config applies,
+    // as it does for `min box start`.
+    let toml = box_spec_text(&global, &["min", "box", "spec", "default"])
+        .await
+        .expect("the entry renders");
+    assert!(toml.contains("\n# Loadouts: default.\n"), "{toml}");
+
+    // A missing loadout fails as the start fails, and nothing renders.
+    let cfg = crate::config::read_client_config(&global).unwrap();
+    let expected = crate::loadouts::resolve_active_loadouts(
+        crate::loadouts::LoadoutSelection::from_flags(&["missing".to_owned()], false),
+        &cfg,
+        &global,
+    )
+    .expect_err("start fails on a missing loadout");
+    let error = box_spec_text(
+        &global,
+        &["min", "box", "spec", "default", "--loadout", "missing"],
+    )
+    .await
+    .expect_err("the spec fails");
+    assert_eq!(format!("{error:#}"), format!("{expected:#}"));
 }
 
 /// Creates a session box on the in-process daemon `server` from the

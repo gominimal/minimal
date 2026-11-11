@@ -482,6 +482,10 @@ struct EntrySpec {
     spec: toml::Table,
     sources: std::collections::BTreeMap<String, Vec<String>>,
     proxy_rows: Vec<String>,
+    /// The names of the loadouts `min box start` selects for the entry, in
+    /// the order it applies them. `None` for a task entry, which takes no
+    /// loadout.
+    loadouts: Option<Vec<String>>,
 }
 
 /// `min box spec <entry>` (BCLI-021): the entry's expanded spec in the
@@ -503,6 +507,13 @@ fn entry_spec(
                  value names the layer that set it.",
                 rendered.entry, rendered.box_type
             )?;
+            if let Some(loadouts) = &rendered.loadouts {
+                if loadouts.is_empty() {
+                    writeln!(text, "# Loadouts: none.")?;
+                } else {
+                    writeln!(text, "# Loadouts: {}.", loadouts.join(", "))?;
+                }
+            }
             write_toml(&rendered.spec, &rendered.sources, &mut text)?;
             if !rendered.proxy_rows.is_empty() {
                 writeln!(text, "\n# Box Egress Proxy:")?;
@@ -515,6 +526,12 @@ fn entry_spec(
             let mut doc = serde_json_lenient::Map::new();
             doc.insert("entry".to_owned(), rendered.entry.clone().into());
             doc.insert("type".to_owned(), rendered.box_type.clone().into());
+            if let Some(loadouts) = &rendered.loadouts {
+                doc.insert(
+                    "loadouts".to_owned(),
+                    serde_json_lenient::to_value(loadouts).context("Cannot encode the loadouts")?,
+                );
+            }
             doc.insert(
                 "spec".to_owned(),
                 serde_json_lenient::to_value(&rendered.spec).context("Cannot encode the spec")?,
@@ -590,13 +607,21 @@ fn expand_entry(
     // flags, from the functions it calls.
     let overrides = &args.overrides;
     let network_label = sources.get("network").cloned();
+    let mut loadouts = None;
     let (mode, mode_source, egress, ingress) = if box_type == boxes::TASK_BOX_TYPE {
-        if !overrides.ingress.is_empty() {
+        // `min box start` refuses these two flags for a task entry, so the
+        // spec refuses them the same way (`StartEntryRefusal::FlagUnsupported`).
+        let unsupported = [
+            (!overrides.ingress.is_empty(), "--ingress"),
+            (!overrides.loadout.is_empty(), "--loadout"),
+        ];
+        if let Some((_, flag)) = unsupported.into_iter().find(|(given, _)| *given) {
+            tracing::info!(verb = "box spec", entry = %entry.name, outcome = "refused", flag = %flag);
             return Err(crate::InitRefusal {
                 code: 2,
                 message: format!(
-                    "min box spec does not take --ingress for {name}. A box from a task \
-                     entry does not take --ingress. Run min box spec {name} without --ingress.",
+                    "min box spec does not take {flag} for {name}. A box from a task \
+                     entry does not take {flag}. Run min box spec {name} without {flag}.",
                     name = entry.name
                 ),
             }
@@ -619,6 +644,22 @@ fn expand_entry(
         };
         (mode, source, egress.policy, None)
     } else {
+        // The loadouts `min box start` selects, read from the same client
+        // config. A missing or malformed loadout fails here as it fails
+        // the start. Folding their values into the spec is #3236.
+        let cfg = crate::config::read_client_config(global)?;
+        let active = crate::loadouts::resolve_active_loadouts(
+            crate::loadouts::LoadoutSelection::from_flags(&overrides.loadout, false),
+            &cfg,
+            global,
+        )?;
+        loadouts = Some(
+            active
+                .loadouts
+                .iter()
+                .map(|loadout| loadout.name().as_ref().to_owned())
+                .collect(),
+        );
         let mut activate = crate::ActivateArgs::unflagged();
         if let Some(network) = overrides.network {
             activate.network = network;
@@ -727,6 +768,7 @@ fn expand_entry(
         spec,
         sources,
         proxy_rows: rows_text,
+        loadouts,
     })
 }
 
