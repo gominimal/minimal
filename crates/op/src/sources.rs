@@ -390,6 +390,67 @@ mod tests {
         assert_eq!(record.files[0].text.as_deref(), Some("upstream notice"));
     }
 
+    /// An extracted source keeps each file's modification time from the
+    /// tarball, so a build's tools see the age order upstream shipped: an
+    /// autotools `configure` stays newer than its `configure.ac` and is not
+    /// regenerated.
+    #[tokio::test]
+    async fn an_extracted_source_keeps_the_tarballs_modification_times() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("cache")).unwrap();
+        let cache = Cache::at_dir(tmp.path().join("cache")).unwrap();
+        let path = tmp.path().join("pkg-1.0.tar.gz");
+        let enc = GzEncoder::new(std::fs::File::create(&path).unwrap(), Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        for (name, mtime) in [
+            ("pkg-1.0/configure.ac", 1_000),
+            ("pkg-1.0/configure", 2_000),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_mtime(mtime);
+            header.set_cksum();
+            tar.append(&header, std::io::empty()).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        let fetcher = FixtureFetcher::new(path);
+        let graph = Graph::new();
+        let opts = Options {
+            cache,
+            graph: &graph,
+            exec_base: tmp.path().to_path_buf(),
+            ot: None,
+            daemon_id: None,
+        };
+        let source = web_source();
+        let materialized = SourceLoad {
+            source: &source,
+            remote_fetcher: &fetcher,
+            into: None,
+            build_box: None,
+            package: "pkg",
+        }
+        .run(&opts)
+        .await
+        .unwrap();
+        let Materialized::TempDir(root) = materialized else {
+            panic!("an extracted source materializes into a temp dir");
+        };
+        let mtime = |name: &str| {
+            std::fs::metadata(root.path().join(name))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(mtime("configure.ac"), 1_000);
+        assert_eq!(mtime("configure"), 2_000);
+    }
+
     fn web_source() -> SourceInput {
         SourceInput {
             from: SourceFetch::Web {
