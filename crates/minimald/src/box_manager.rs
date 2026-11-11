@@ -1384,6 +1384,9 @@ fn unenrolled_broker_refusal(
         boxes::core::bep::unenrolled_node(
             grants.clone(),
             not_github,
+            // When `proxy_serves` is true, this cause's text is wrong: a
+            // proxy is present and serves only GitHub grants. The cause
+            // for that case lives in `crates/boxes` (#3277).
             boxes::core::bep::ProxyAbsence::NotServed,
         ),
         grants,
