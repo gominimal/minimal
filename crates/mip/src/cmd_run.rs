@@ -187,7 +187,9 @@ fn gate_task_patches(
 ) -> Result<mfile::Task, Error> {
     let gated = mctx::gate_task_patches(ctx, task_name, task)?;
     if let Some(notice) = gated.ignored_notice(task_name) {
-        warn!("{notice}");
+        // on stderr, not a log record: a `RUST_LOG=error` filter would hide the one line that says the
+        // task runs without a mount it asked for; the nested run sends the same notice as a `msg:` line
+        eprintln!("{notice}");
     }
     Ok(gated.task)
 }
