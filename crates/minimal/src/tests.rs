@@ -15847,10 +15847,7 @@ async fn start_attach_resume_end_to_end() {
     // only as the root span's field, so no start event is asserted here.
     // The attach and the resume events come from the CLI code itself.
     let log = log.contents();
-    for (verb, outcome) in [
-        ("box attach", "ended"),
-        ("box resume", "attaching"),
-    ] {
+    for (verb, outcome) in [("box attach", "ended"), ("box resume", "attaching")] {
         assert!(
             log.lines()
                 .any(|line| line.contains("start_attach_resume_end_to_end{")
