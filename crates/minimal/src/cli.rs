@@ -94,6 +94,9 @@ pub enum Command {
     /// Provider subcommands: the kinds of local host this machine runs
     #[command(visible_alias = "providers")]
     Provider(ProviderArgs),
+    /// Type subcommands: the box types this project can use
+    #[command(visible_alias = "types")]
+    Type(TypeArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Print important directories and file paths for debugging
@@ -649,6 +652,31 @@ pub struct ProviderListArgs {
     /// command selects
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TypeArgs {
+    #[command(subcommand)]
+    pub command: TypeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TypeCommand {
+    /// List the box types: the built-in types and the types this
+    /// project's minimal.toml defines, each with where it comes from
+    #[command(visible_alias = "ls")]
+    List,
+    /// Show one box type: the type it extends, and its defaults and
+    /// constraints, each with the type that sets it
+    Show(TypeShowArgs),
+}
+
+// BCLI-020: `min type show <name>`.
+#[derive(Debug, Args)]
+pub struct TypeShowArgs {
+    /// The type, as `min type list` prints it (`session`, `task`, or a
+    /// type of this project)
+    pub name: String,
 }
 
 // BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.

@@ -14992,3 +14992,202 @@ async fn retained_box_management_end_to_end() {
         );
     }
 }
+
+/// A project whose `minimal.toml` declares two box types: `base` extends
+/// `session`, and `rust-dev` extends `base`.
+fn project_with_box_types() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(mfile::MFILE_NAME),
+        "\
+[box_types.base]
+extends = \"session\"
+
+[box_types.base.defaults]
+timeout = \"30m\"
+
+[box_types.rust-dev]
+extends = \"base\"
+
+[box_types.rust-dev.defaults]
+pty_enabled = true
+
+[box_types.rust-dev.defaults.io]
+exec_enabled = false
+
+[box_types.rust-dev.constraints]
+loadout_mode = \"sealed\"
+",
+    )
+    .unwrap();
+    dir
+}
+
+fn type_globals(project: &std::path::Path) -> GlobalArgs {
+    GlobalArgs {
+        repo_dir: Some(project.to_path_buf()),
+        ..GlobalArgs::default()
+    }
+}
+
+/// BCLI-019: `min type list` prints the six built-in types and each type
+/// the project defines, each row with its source.
+#[test]
+fn type_list_shows_builtin_and_project_types_with_source() {
+    use clap::Parser as _;
+    let parsed = Cli::try_parse_from(["min", "type", "list"]).expect("`min type list` parses");
+    assert!(matches!(
+        parsed.command,
+        Some(Command::Type(TypeArgs {
+            command: TypeCommand::List
+        }))
+    ));
+    assert!(Cli::try_parse_from(["min", "types", "ls"]).is_ok());
+
+    let project = project_with_box_types();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(&type_globals(project.path()), &mut out).expect("the list renders");
+    let text = String::from_utf8(out).unwrap();
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        rows[0],
+        ["NAME", "SOURCE", "EXTENDS", "BUILT-IN", "TYPE"],
+        "{text}"
+    );
+    let mut expected: Vec<Vec<&str>> = mfile::box_types::BUILTIN_BOX_TYPES
+        .iter()
+        .map(|t| vec![*t, "builtin", "-", *t])
+        .collect();
+    expected.push(vec!["base", "project", "session", "session"]);
+    expected.push(vec!["rust-dev", "project", "base", "session"]);
+    assert_eq!(rows[1..], expected[..], "{text}");
+
+    // Outside a project, the list holds the built-in types only.
+    let empty = tempfile::tempdir().unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(&type_globals(empty.path()), &mut out).expect("the list renders");
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text.lines().count(),
+        1 + mfile::box_types::BUILTIN_BOX_TYPES.len(),
+        "{text}"
+    );
+    assert!(!text.contains("project"), "{text}");
+
+    // The source enum reserves `org` for organization types.
+    assert_eq!(cmd::types::TypeSource::Org.to_string(), "org");
+    assert_eq!(
+        serde_json_lenient::to_string(&cmd::types::TypeSource::Builtin).unwrap(),
+        "\"builtin\""
+    );
+}
+
+/// BCLI-020: `min type show <name>` renders a type's defaults and
+/// constraints as the shipped type data states them, and names the type
+/// and the source that set each value.
+#[test]
+fn type_show_matches_shipped_table_with_sources() {
+    let project = project_with_box_types();
+    let globals = type_globals(project.path());
+    let show = |name: &str| -> anyhow::Result<String> {
+        let mut out = Vec::new();
+        let args = TypeShowArgs {
+            name: name.to_owned(),
+        };
+        cmd::types::cmd_type_show(&globals, &args, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    };
+
+    // Each built-in type renders the defaults and constraints that the
+    // shipped type data gives it, every one from that type, as builtin.
+    let types = mfile::box_types::BoxTypes::default();
+    for name in mfile::box_types::BUILTIN_BOX_TYPES {
+        let resolved = types.resolve(name).unwrap();
+        let detail = cmd::types::type_detail(&types, &resolved);
+        assert_eq!(detail.source, cmd::types::TypeSource::Builtin);
+        assert_eq!(detail.extends, None);
+        assert_eq!(detail.root, name);
+        let shipped = |chain: &[(String, toml::Table)]| -> Vec<(String, String)> {
+            chain
+                .iter()
+                .flat_map(|(_, t)| t.iter().map(|(k, v)| (k.clone(), v.to_string())))
+                .collect()
+        };
+        let shown = |values: &[cmd::types::TypeValue]| -> Vec<(String, String)> {
+            values
+                .iter()
+                .map(|v| (v.key.clone(), v.value.clone()))
+                .collect()
+        };
+        assert_eq!(
+            shown(&detail.defaults),
+            shipped(&resolved.defaults),
+            "{name}"
+        );
+        assert_eq!(
+            shown(&detail.constraints),
+            shipped(&resolved.constraints),
+            "{name}"
+        );
+        for v in detail.defaults.iter().chain(&detail.constraints) {
+            assert_eq!(
+                (v.set_by.as_str(), v.source),
+                (name, cmd::types::TypeSource::Builtin)
+            );
+        }
+        let text = show(name).expect("a built-in type shows");
+        assert!(
+            text.contains(&format!("Name:           {name}\n")),
+            "{text}"
+        );
+        assert!(text.contains("Source:         builtin\n"), "{text}");
+        assert!(!text.contains("Extends:"), "{text}");
+    }
+
+    // A project type names the type and the source of every value, from the
+    // built-in type to itself.
+    let text = show("rust-dev").expect("a project type shows");
+    for line in [
+        "Name:           rust-dev",
+        "Source:         project",
+        "Extends:        base",
+        "Built-in type:  session",
+    ] {
+        assert!(text.contains(line), "missing {line:?}\n{text}");
+    }
+    let (defaults, constraints) = text
+        .split_once("Constraints:")
+        .expect("a constraints section");
+    let value = |section: &str, setting: &str| -> String {
+        section
+            .lines()
+            .find(|l| l.trim_start().starts_with(setting))
+            .unwrap_or_else(|| panic!("no {setting:?} in\n{text}"))
+            .split_once("  from ")
+            .unwrap()
+            .1
+            .to_owned()
+    };
+    assert_eq!(value(defaults, "timeout = \"30m\""), "base (project)");
+    assert_eq!(value(defaults, "pty_enabled = true"), "rust-dev (project)");
+    assert_eq!(
+        value(defaults, "io.exec_enabled = false"),
+        "rust-dev (project)"
+    );
+    assert_eq!(
+        value(constraints, "loadout_mode = \"sealed\""),
+        "rust-dev (project)"
+    );
+    // The chain applies from the built-in type to the type itself.
+    assert!(defaults.find("timeout").unwrap() < defaults.find("pty_enabled").unwrap());
+
+    // A name that is no type is refused with the next step.
+    let err = show("nope").unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "No box type is named `nope`. Run `min type list` to see the box types."
+    );
+}
