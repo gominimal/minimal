@@ -15110,6 +15110,7 @@ fn a_box_context_keys_task_state_on_the_records_project() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let config = mctx::ConfigBuilder::new()
         .with_state_dir(state.path().to_path_buf())
+        .with_cache_dir(state.path().join("cache"))
         .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
         .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
         .with_no_fetch(true)
