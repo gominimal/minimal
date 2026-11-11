@@ -224,7 +224,12 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box is `host_ip` |
 | `--ingress <EXT:INT[/PROTO]>` | Override of the entry's `network.ingress`: each use adds one port mapping, `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Requires `--network own_ip` |
 | `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | Overrides of the entry's `network.egress` keys, as on [`session activate`](#session-activate): a list flag adds to the entry's list, `--allow-protocols` replaces it, and `--deny-all-egress` empties the allow lists |
+| `--dynamic-ingress <allow\|ask\|deny>` | Override of the entry's `network.dynamic_ingress`: the stance that decides the box's own requests to publish a port, as on [`session activate`](#session-activate). Requires `--network own_ip` |
+| `--dynamic-range <LO-HI>` | Override of the port range in the entry's `network.ingress` inside which `--dynamic-ingress allow` publishes, as on [`session activate`](#session-activate). Requires `--dynamic-ingress` |
+| `--credentialed-upstream` | Override of the entry's `network.credentialed_upstream`: the box can reach the Box Egress Proxy, as on [`session activate`](#session-activate) |
 | `--loadout <NAME>` | Apply the named loadout. Repeatable. With any `--loadout`, the config file's `default_loadouts` are not applied |
+| `--no-loadouts` | Apply no loadouts, and not the config file's `default_loadouts` either. Cannot be combined with `--loadout` |
+| `--no-hooks` | Run none of the box's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from the loadouts or from `minimal.toml`. The box keeps hooks off, so the choice also holds when the box is attached or detached, and when it ends |
 
 Each override flag changes only the key it names. The other
 `network.egress` keys of the entry stay as the entry declares them. A session
@@ -234,9 +239,14 @@ result: `min box show <box> --network` prints the `[network]` section that
 the box was created with.
 
 `min box start [ENTRY]` takes the same flags. For a task entry, it takes
-`--network` and the egress flags, and with no `--network` the box takes the
-entry's `network.mode`. A task entry refuses `--ingress` and `--loadout` with
-exit code 2.
+every flag in the table except `--ingress` and `--loadout`, and with no
+`--network` the box takes the entry's `network.mode`. A task entry refuses
+`--ingress` and `--loadout` with exit code 2.
+
+`min task run <task>` and `min box run <entry>` take the same flags as a
+task entry's start: `--network`, the egress flags, `--dynamic-ingress`,
+`--dynamic-range`, `--credentialed-upstream`, `--no-loadouts` and
+`--no-hooks`. Put them before the task's first argument.
 
 Without `ENTRY`, the command starts the session entry named `default`. When
 no session entry has that name, it starts the project's only session entry. A
@@ -255,6 +265,7 @@ The command refuses these starts before it creates a box:
 | Without `ENTRY`: no session entry, and an entry of another type is named `default` | 2 |
 | An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |
 | No terminal, and no `--detach` | 2 |
+| `--no-loadouts` and `--loadout` together | 2 |
 | A running box holds the box's name. Pass `--new` or `--name` to create the box | 2 |
 
 An invalid `minimal.toml` ends the command with exit code 3.
