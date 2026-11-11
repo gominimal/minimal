@@ -322,10 +322,11 @@ impl BuildBox {
             .await;
         if let Err(e) = ran {
             let said = String::from_utf8_lossy(&stderr);
-            let failure = fetch_failure(said.lines().last().unwrap_or_default());
+            let error = format!("{e:#}");
+            let failure = fetch_failure(said.lines().last().unwrap_or_default(), &error);
             tracing::info!(
                 package,
-                error = %crate::specs::strip_urls(&format!("{e:#}")),
+                error = %crate::specs::strip_urls(&error),
                 "{failure}",
             );
             return Err(Error::Other(anyhow::anyhow!(failure)));
@@ -353,10 +354,17 @@ impl BuildBox {
 
 /// What a failed source fetch says: the fetch process's own last line, as
 /// the download wrote it. A download that could not connect names the host
-/// and the port there. Any URL it quotes loses its credentials and its query.
+/// and the port there. A process that wrote nothing, because it died before
+/// it could, says the sandbox's `error` instead. Any URL either quotes loses
+/// its credentials and its query.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn fetch_failure(said: &str) -> String {
-    crate::specs::strip_urls(said)
+fn fetch_failure(said: &str, error: &str) -> String {
+    let said = crate::specs::strip_urls(said.trim());
+    if said.is_empty() {
+        crate::specs::strip_urls(error)
+    } else {
+        said
+    }
 }
 
 /// Whether the spec's build steps need the network: its own `needs.dns` and
@@ -771,9 +779,26 @@ mod tests {
     #[test]
     fn source_fetch_failure_strips_url_credentials() {
         assert_eq!(
-            fetch_failure("error sending request for url (https://user:secret@host/x?sig=abc)"),
+            fetch_failure(
+                "error sending request for url (https://user:secret@host/x?sig=abc)",
+                "the sandbox's own error"
+            ),
             "error sending request for url (https://host/x)"
         );
+    }
+
+    /// NET-155: a fetch process that wrote nothing fails with the sandbox's
+    /// error, its URLs stripped too, never with an empty message.
+    #[test]
+    fn source_fetch_failure_with_no_output_keeps_the_sandbox_error() {
+        assert_eq!(
+            fetch_failure(
+                "",
+                "exec /fetcher failed for https://user:secret@host/x?sig=abc"
+            ),
+            "exec /fetcher failed for https://host/x"
+        );
+        assert_eq!(fetch_failure("  \n", "killed"), "killed");
     }
 
     /// NET-155: a build's own `needs` decide its network, and a `needs` in
