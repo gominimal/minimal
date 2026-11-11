@@ -1325,24 +1325,68 @@ fn brokered_secrets(spec: &serde_json_lenient::Value) -> Vec<String> {
     names
 }
 
-/// The refusal of a create whose spec carries a brokered secret while no
-/// identity plane is configured and no node-local proxy serves the box
-/// (BOX-081). `proxy_serves` says whether the request carries one
+/// Whether the `[secrets]` entry `entry` asks for a `github:` scope, the
+/// same test as [`boxes::core::bep::SecretGrant::is_github`].
+fn is_github_grant(entry: &serde_json_lenient::Value) -> bool {
+    entry
+        .get("scopes")
+        .and_then(|s| s.as_array())
+        .is_some_and(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|scope| scope.as_str())
+                .any(|scope| scope.starts_with("github:"))
+        })
+}
+
+/// The names of the brokered secrets of `spec` that a create refuses
+/// while no identity plane is configured (BOX-081), in name order. With no
+/// node-local proxy, every brokered secret is refused. A node-local proxy
+/// serves only a GitHub grant, so with a proxy the brokered secrets with
+/// no `github:` scope are refused. A `source = "store"` secret is never
+/// refused here (BOX-141).
+fn refused_broker_grants(spec: &serde_json_lenient::Value, proxy_serves: bool) -> Vec<String> {
+    let mut names = brokered_secrets(spec);
+    if proxy_serves {
+        let secrets = spec.get("secrets").and_then(|s| s.as_object());
+        names.retain(|name| {
+            !secrets
+                .and_then(|secrets| secrets.get(name))
+                .is_some_and(is_github_grant)
+        });
+    }
+    names
+}
+
+/// The refusal of a create whose spec carries a brokered secret that
+/// nothing on this host can serve (BOX-081), with the names of the refused
+/// secrets. `proxy_serves` says whether the request carries one
 /// well-formed root certificate ([`proxy_root_certificate`]). A client sets
-/// it only from an identity that a node-local proxy published. A
-/// `source = "store"` secret is never refused here (BOX-141).
+/// it only from an identity that a node-local proxy published.
 fn unenrolled_broker_refusal(
     spec: &serde_json_lenient::Value,
     proxy_serves: bool,
-) -> Option<boxes::core::bep::ActivationRefused> {
-    let grants = brokered_secrets(spec);
-    if grants.is_empty() || proxy_serves {
+) -> Option<(boxes::core::bep::ActivationRefused, Vec<String>)> {
+    let grants = refused_broker_grants(spec, proxy_serves);
+    if grants.is_empty() {
         return None;
     }
-    Some(boxes::core::bep::unenrolled_node(
+    // The refusal text calls a grant a "GitHub grant" unless this flag is
+    // set, and then it says "secret". A grant with no `github:` scope is
+    // not a GitHub grant, so the text must say "secret" for it.
+    let secrets = spec.get("secrets").and_then(|s| s.as_object());
+    let not_github = grants.iter().any(|name| {
+        !secrets
+            .and_then(|secrets| secrets.get(name))
+            .is_some_and(is_github_grant)
+    });
+    Some((
+        boxes::core::bep::unenrolled_node(
+            grants.clone(),
+            not_github,
+            boxes::core::bep::ProxyAbsence::NotServed,
+        ),
         grants,
-        false,
-        boxes::core::bep::ProxyAbsence::NotServed,
     ))
 }
 
@@ -1353,6 +1397,11 @@ fn unenrolled_broker_refusal(
 /// caller read from the proxy's published identity, and it accepts only
 /// one well-formed certificate block. An empty or malformed value counts
 /// as no certificate, and the brokered secret is refused.
+///
+/// The daemon cannot compare the value with a proxy root it knows, so the
+/// check is advisory: it trusts the caller. A caller that sends a made-up
+/// certificate passes it. Even then, only a GitHub grant passes, because
+/// a node-local proxy serves no other brokered secret.
 fn proxy_root_certificate(certificate: Option<&str>) -> bool {
     certificate.is_some_and(crate::env::is_one_certificate)
 }
@@ -3857,7 +3906,7 @@ impl BoxManager {
         let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
         // BOX-081: no identity plane is configured on this host, so a
         // brokered secret is refused unless a node-local proxy serves the
-        // box. The refusal comes before the record exists, so it leaves no
+        // box and the secret is a GitHub grant. The refusal comes before the record exists, so it leaves no
         // record, id or name behind. A certificate that is not one
         // well-formed block does not count as the proxy's.
         let proxy_serves = proxy_root_certificate(config.root_certificate.as_deref());
@@ -3871,18 +3920,19 @@ impl BoxManager {
                  certificate block, so no node-local proxy counts as serving the box"
             );
         }
-        if let Some((refusal, grants)) = spec.as_ref().and_then(|spec| {
-            unenrolled_broker_refusal(spec, proxy_serves)
-                .map(|refusal| (refusal, brokered_secrets(spec)))
-        }) {
+        if let Some((refusal, grants)) = spec
+            .as_ref()
+            .and_then(|spec| unenrolled_broker_refusal(spec, proxy_serves))
+        {
             tracing::info!(
                 session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 identity = IDENTITY_MODE_NONE,
                 secrets = ?grants,
                 code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
                 exit_code = refusal.exit_code(),
-                "refused a create: the spec carries a brokered secret, no identity plane \
-                 is configured, and no node-local proxy serves the box"
+                proxy_serves,
+                "refused a create: the spec carries a brokered secret that nothing on this \
+                 host serves, and no identity plane is configured"
             );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,

@@ -6369,48 +6369,53 @@ async fn broker_secret_unenrolled_exit5() {
     let (_state, _cache, mngr) = manager().await;
 
     const ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n";
+    // The secret names are unique to this test, so the log lines it counts
+    // are its own when tests share one subscriber (libtest).
+    let gh = || serde_json_lenient::json!({ "x5-gh": broker_secret() });
     let cases = [
-        // (secrets, the create's root certificate, refused)
+        // (secrets, the create's root certificate, the refused secrets)
+        (gh(), None, vec!["x5-gh"]),
         (
-            serde_json_lenient::json!({ "gh": broker_secret() }),
+            serde_json_lenient::json!({ "x5-gh": broker_secret(), "npm": store_secret() }),
             None,
-            true,
+            vec!["x5-gh"],
         ),
-        (
-            serde_json_lenient::json!({ "gh": broker_secret(), "npm": store_secret() }),
-            None,
-            true,
-        ),
-        (
-            serde_json_lenient::json!({ "gh": broker_secret() }),
-            Some(ROOT_PEM),
-            false,
-        ),
+        (gh(), Some(ROOT_PEM), vec![]),
         (
             serde_json_lenient::json!({ "npm": store_secret() }),
             None,
-            false,
+            vec![],
         ),
         (
             serde_json_lenient::json!({ "npm": store_secret() }),
             Some(ROOT_PEM),
-            false,
+            vec![],
         ),
-        (serde_json_lenient::json!({}), None, false),
-        (serde_json_lenient::json!({}), Some(ROOT_PEM), false),
+        (serde_json_lenient::json!({}), None, vec![]),
+        (serde_json_lenient::json!({}), Some(ROOT_PEM), vec![]),
         // A certificate that is not one well-formed block does not count
         // as the proxy's, so the brokered secret is still refused.
+        (gh(), Some(""), vec!["x5-gh"]),
+        (gh(), Some("not a certificate"), vec!["x5-gh"]),
+        // A node-local proxy serves only a GitHub grant, so a brokered
+        // secret with no `github:` scope is refused beside it.
         (
-            serde_json_lenient::json!({ "gh": broker_secret() }),
-            Some(""),
-            true,
+            serde_json_lenient::json!({ "x5-aws": broker_secret_aws() }),
+            Some(ROOT_PEM),
+            vec!["x5-aws"],
         ),
         (
-            serde_json_lenient::json!({ "gh": broker_secret() }),
-            Some("not a certificate"),
-            true,
+            serde_json_lenient::json!({ "x5-gh": broker_secret(), "x5-aws": broker_secret_aws() }),
+            Some(ROOT_PEM),
+            vec!["x5-aws"],
+        ),
+        (
+            serde_json_lenient::json!({ "x5-aws": broker_secret_aws() }),
+            None,
+            vec!["x5-aws"],
         ),
     ];
+    let expected_lines = cases.iter().filter(|(_, _, r)| !r.is_empty()).count();
     for (n, (secrets, certificate, refused)) in cases.into_iter().enumerate() {
         let entry = format!("case-{n}");
         let mut config = unnamed_config();
@@ -6419,13 +6424,13 @@ async fn broker_secret_unenrolled_exit5() {
         let created = mngr
             .create_box_with_spec(config, Some(spec_with_secrets(&entry, secrets)), None, None)
             .await;
-        if !refused {
+        if refused.is_empty() {
             let id = created.unwrap_or_else(|e| panic!("{entry} is created: {e}"));
             let filed = mngr.get_record(BoxKeyPredicate::Id(id)).await.unwrap();
             assert!(filed.is_some(), "{entry} files its record");
             continue;
         }
-        let err = created.expect_err("a brokered secret with no proxy is refused");
+        let err = created.expect_err("a brokered secret nothing serves is refused");
         let refusal = unenrolled_refusal(&err).expect("the error is the un-enrolled refusal");
         assert_eq!(refusal.exit_code(), 5, "{entry}");
         assert_eq!(
@@ -6437,13 +6442,17 @@ async fn broker_secret_unenrolled_exit5() {
             vec![Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)],
             "{entry}"
         );
+        let text = err.to_string();
+        for name in ["x5-gh", "x5-aws"] {
+            assert_eq!(
+                text.contains(name),
+                refused.contains(&name),
+                "{entry}: the refusal names only the refused secrets: {text}"
+            );
+        }
         assert!(
-            err.to_string().contains("gh"),
-            "the refusal names the brokered secret: {err}"
-        );
-        assert!(
-            !err.to_string().contains("npm"),
-            "the refusal does not name a store reference: {err}"
+            !text.contains("npm"),
+            "the refusal does not name a store reference: {text}"
         );
         assert_eq!(
             mngr.list_boxes(None).await.unwrap().len(),
@@ -6456,10 +6465,18 @@ async fn broker_secret_unenrolled_exit5() {
     let refusals: Vec<&str> = logged
         .lines()
         .filter(|line| line.contains("the spec carries a brokered secret"))
+        .filter(|line| line.contains("x5-"))
         .collect();
-    assert_eq!(refusals.len(), 4, "one log line per refusal:\n{logged}");
+    assert_eq!(
+        refusals.len(),
+        expected_lines,
+        "one log line per refusal:\n{logged}"
+    );
     for line in refusals {
-        assert!(line.contains("\"gh\""), "the log names the secret: {line}");
+        assert!(
+            line.contains("\"x5-gh\"") || line.contains("\"x5-aws\""),
+            "the log names the secret: {line}"
+        );
         assert!(
             line.contains("gatehouse_unenrolled_node"),
             "the log names the code: {line}"
@@ -6467,6 +6484,11 @@ async fn broker_secret_unenrolled_exit5() {
         assert!(line.contains("exit_code=5"), "{line}");
         assert!(line.contains("identity=\"none\""), "{line}");
     }
+}
+
+/// A brokered secret with no `github:` scope.
+fn broker_secret_aws() -> serde_json_lenient::Value {
+    serde_json_lenient::json!({ "source": "broker", "scopes": ["aws:s3"] })
 }
 
 /// BOX-081 over the socket: the create reply carries the refusal's text,
