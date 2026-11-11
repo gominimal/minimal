@@ -274,6 +274,9 @@ async fn upload_workspace(
     root: &camino::Utf8Path,
     progress: UploadProgress,
 ) -> Result<WorkspaceUpload, anyhow::Error> {
+    if let (UploadProgress::Bar, Some(notice)) = (progress, linked_worktree_notice(root)) {
+        eprintln!("{notice}");
+    }
     let result = match progress {
         UploadProgress::Bar => client.upload_workspace_files(id, root.as_std_path()).await,
         UploadProgress::Quiet => {
@@ -285,6 +288,19 @@ async fn upload_workspace(
     result
         .map(|()| WorkspaceUpload::Uploaded)
         .context("Failed to upload project files")
+}
+
+/// The notice that the project is a linked git worktree, whose `.git` file
+/// names a host path the box cannot reach: the upload leaves it out, so the
+/// box holds the files and no repository (gominimal/inbox#854). `None` for a
+/// plain checkout or a directory with no `.git`.
+pub(crate) fn linked_worktree_notice(root: &camino::Utf8Path) -> Option<String> {
+    let gitdir = file_upload::linked_worktree_gitdir(root.as_std_path())?;
+    Some(format!(
+        "{root} is a linked git worktree: its .git file points at {gitdir}, which the box \
+         cannot reach, so the upload leaves it out; the files are in /workbench, and git \
+         there sees no repository"
+    ))
 }
 
 /// The notice that the upload root resolved above the invocation directory —

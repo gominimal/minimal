@@ -44,6 +44,25 @@ pub fn is_vcs_root(dir: &Path) -> bool {
     VCS_MARKERS.iter().any(|marker| dir.join(marker).exists())
 }
 
+/// The repository path a linked git worktree's `.git` *file* points at
+/// (`gitdir: <path>`), or `None` when `dir` has no such file: a plain
+/// checkout keeps a `.git` directory, and a directory with no `.git` is not
+/// a worktree. That path is the host's, which no box can reach, so the
+/// upload leaves the file out ([`stream_tar_zstd`]) and the caller says so
+/// (gominimal/inbox#854).
+pub fn linked_worktree_gitdir(dir: &Path) -> Option<String> {
+    let marker = dir.join(".git");
+    if !marker.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&marker).ok()?;
+    let pointer = text.lines().next()?.trim();
+    pointer
+        .strip_prefix("gitdir:")
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+}
+
 /// Returns `true` when activating from `dir` should skip the workspace
 /// upload without prompting: either `dir` is empty (nothing to sync) or
 /// it is the user's home directory (`home`). An empty box has nothing
@@ -627,6 +646,21 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                         .context(format!("getting file type for {}", entry_path.display())));
                 }
             };
+
+            // A linked worktree's `.git` is a file holding a host path the
+            // box cannot reach; uploaded, it makes every git command in the
+            // box fail, `git config --global` included, since git resolves
+            // the repository first. Left out, the box holds the files and no
+            // repository, which git says plainly (gominimal/inbox#854). A
+            // `.git` directory, and a `.git` file below the root (a
+            // submodule's), are uploaded as they are.
+            if prefix.is_empty() && name_str == ".git" && file_type.is_file() {
+                tracing::info!(
+                    "leaving out {}: a linked worktree's .git file names a host path",
+                    entry_path.display()
+                );
+                continue;
+            }
 
             if file_type.is_dir() {
                 let mut header = async_tar::Header::new_gnu();
@@ -1433,6 +1467,54 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(".git"), "gitdir: /some/elsewhere\n").unwrap();
         assert!(is_vcs_root(dir.path()));
+    }
+
+    /// gominimal/inbox#854: the pointer a linked worktree's `.git` file
+    /// holds is read; a `.git` directory and no `.git` at all read as none.
+    #[test]
+    fn linked_worktree_gitdir_reads_the_pointer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(linked_worktree_gitdir(dir.path()), None);
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /home/me/repo/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        assert_eq!(
+            linked_worktree_gitdir(dir.path()).as_deref(),
+            Some("/home/me/repo/.git/worktrees/feature")
+        );
+        std::fs::remove_file(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(linked_worktree_gitdir(dir.path()), None);
+    }
+
+    /// gominimal/inbox#854: a linked worktree's `.git` file is left out of
+    /// the upload, the files beside it are not, and a `.git` file below the
+    /// root (a submodule's) still travels.
+    #[tokio::test]
+    async fn a_linked_worktrees_git_file_is_left_out() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /home/me/repo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        std::fs::create_dir(dir.path().join("vendored")).unwrap();
+        std::fs::write(
+            dir.path().join("vendored/.git"),
+            "gitdir: ../.git/modules/vendored\n",
+        )
+        .unwrap();
+
+        let paths = stream_and_list(dir.path()).await;
+        assert!(paths.iter().any(|p| p == "hello.txt"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p == ".git"),
+            "the worktree's .git file travelled: {paths:?}"
+        );
+        assert!(paths.iter().any(|p| p == "vendored/.git"), "{paths:?}");
     }
 
     /// A writer that accepts a small amount of data then parks forever,
