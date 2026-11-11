@@ -15810,6 +15810,8 @@ fn architecture_builtin_table() -> Vec<(&'static str, TableCells, TableCells)> {
     let until_complete = ("lifetime", "\"until_complete\"");
     let no_timeout = ("timeout", "\"0\"");
     let sealed = ("loadout_mode", "\"sealed\"");
+    let user_token = ("github_token_mode", "\"user\"");
+    let installation_token = ("github_token_mode", "\"installation\"");
     vec![
         (
             "session",
@@ -15819,6 +15821,7 @@ fn architecture_builtin_table() -> Vec<(&'static str, TableCells, TableCells)> {
                 ("exec_enabled", "true"),
                 ("nesting.allowed", "true"),
                 no_timeout,
+                user_token,
             ],
             vec![("pty_enabled", "true")],
         ),
@@ -15830,6 +15833,7 @@ fn architecture_builtin_table() -> Vec<(&'static str, TableCells, TableCells)> {
                 ("exec_enabled", "true"),
                 ("nesting.allowed", "false"),
                 no_timeout,
+                user_token,
             ],
             vec![("pty_enabled", "false")],
         ),
@@ -15842,6 +15846,7 @@ fn architecture_builtin_table() -> Vec<(&'static str, TableCells, TableCells)> {
                 ("exec_enabled", "true"),
                 ("nesting.allowed", "true"),
                 no_timeout,
+                user_token,
             ],
             vec![],
         ),
@@ -15852,12 +15857,14 @@ fn architecture_builtin_table() -> Vec<(&'static str, TableCells, TableCells)> {
                 sealed,
                 ("exec_enabled", "true"),
                 ("nesting.allowed", "false"),
+                ("restart", "\"never\""),
+                installation_token,
             ],
             vec![("pty_enabled", "false")],
         ),
         (
             "build",
-            vec![until_complete, no_timeout],
+            vec![until_complete, no_timeout, installation_token],
             vec![
                 sealed,
                 ("pty_enabled", "false"),
@@ -15867,7 +15874,7 @@ fn architecture_builtin_table() -> Vec<(&'static str, TableCells, TableCells)> {
         ),
         (
             "container-build",
-            vec![until_complete, no_timeout],
+            vec![until_complete, no_timeout, installation_token],
             vec![
                 sealed,
                 ("pty_enabled", "false"),
