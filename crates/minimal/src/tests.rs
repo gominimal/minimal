@@ -14687,3 +14687,461 @@ async fn box_exec_show_logs_wait_stop_end_to_end() {
         );
     }
 }
+
+/// The `min box spec` arguments of `argv`, from the real clap parse.
+fn parsed_box_spec(argv: &[&str]) -> BoxSpecArgs {
+    match Cli::try_parse_from(argv).expect("the spec parses").command {
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Spec(args),
+        })) => args,
+        _ => panic!("not a box spec: {argv:?}"),
+    }
+}
+
+/// What `min box spec` writes for `argv` under `global`. It starts no
+/// daemon.
+async fn box_spec_text(global: &GlobalArgs, argv: &[&str]) -> anyhow::Result<String> {
+    let mut out = Vec::new();
+    box_spec_to(global, parsed_box_spec(argv), false, &mut out).await?;
+    Ok(String::from_utf8(out).expect("utf-8"))
+}
+
+/// A project whose `minimal.toml` is `toml`, and the global arguments of a
+/// command run with `--repo-dir` at it and a config directory of its own.
+fn spec_project(toml: &str) -> (tempfile::TempDir, GlobalArgs) {
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).expect("write minimal.toml");
+    let config = project.path().join("config");
+    std::fs::create_dir_all(&config).expect("a config dir");
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        config_dir: Some(config),
+        ..Default::default()
+    };
+    (project, global)
+}
+
+/// The exit code of a refusal that `min box spec` ends with.
+fn spec_refusal_code(error: &anyhow::Error) -> u8 {
+    if let Some(refusal) = error.downcast_ref::<InitRefusal>() {
+        return refusal.code;
+    }
+    if let Some(refusal) = error.downcast_ref::<BoxAddressRefusal>() {
+        return refusal.exit_code();
+    }
+    if let Some(refusal) = error.downcast_ref::<boxes::core::bep::ActivationRefused>() {
+        return refusal.exit_code();
+    }
+    panic!("not a refusal with an exit code: {error:#}")
+}
+
+// BCLI-021: `min box spec <entry>` renders the entry's expanded spec in
+// the `-o` format, names the layer of each value, and shows a secret as
+// its reference only. An entry with a credentialed upstream adds the Box
+// Egress Proxy rows.
+#[tokio::test]
+async fn box_spec_renders_formats_secrets_as_refs() {
+    let (_project, global) = spec_project(
+        "[defaults]\npackages = [\"curl\"]\n\n\
+         [sessions.default]\npackages = [\"git\"]\n\n\
+         [sessions.default.secrets.API_KEY]\nsource = \"client_env\"\nvalue = \"hunter2\"\n",
+    );
+
+    let toml = box_spec_text(&global, &["min", "box", "spec", "default"])
+        .await
+        .expect("the entry renders");
+    assert!(
+        toml.starts_with("# The spec of entry default (type session)."),
+        "{toml}"
+    );
+    assert!(
+        toml.contains(
+            "# packages: from [defaults], [sessions.default]\npackages = [\"curl\", \"git\"]\n"
+        ),
+        "{toml}"
+    );
+    assert!(
+        toml.contains(
+            "# secrets: from [sessions.default]\n[secrets.API_KEY]\nsource = \"client_env\"\n"
+        ),
+        "{toml}"
+    );
+    assert!(
+        toml.contains("# network.mode: from the default\n"),
+        "{toml}"
+    );
+    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
+    assert_eq!(parsed["network"]["mode"].as_str(), Some("host_ip"));
+
+    let json = box_spec_text(&global, &["min", "box", "spec", "default", "-o", "json"])
+        .await
+        .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["entry"], "default");
+    assert_eq!(doc["type"], "session");
+    assert_eq!(
+        doc["spec"]["packages"],
+        serde_json_lenient::json!(["curl", "git"])
+    );
+    assert_eq!(
+        doc["sources"]["packages"],
+        serde_json_lenient::json!(["[defaults]", "[sessions.default]"])
+    );
+    assert_eq!(
+        doc["spec"]["secrets"]["API_KEY"],
+        serde_json_lenient::json!({"source": "client_env"})
+    );
+
+    let yaml = box_spec_text(
+        &global,
+        &["min", "box", "spec", "default", "--output", "yaml"],
+    )
+    .await
+    .expect("the entry renders");
+    assert!(yaml.starts_with("entry: default\nsources:\n"), "{yaml}");
+    assert!(
+        yaml.contains("\nspec:\n  network:\n    mode: host_ip\n"),
+        "{yaml}"
+    );
+    assert!(yaml.ends_with("\ntype: session\n"), "{yaml}");
+    assert!(
+        yaml.contains("  packages:\n    - curl\n    - git\n"),
+        "{yaml}"
+    );
+    assert!(
+        yaml.contains("    API_KEY:\n      source: client_env\n"),
+        "{yaml}"
+    );
+    assert!(
+        yaml.contains("  packages:\n    - \"[defaults]\"\n    - \"[sessions.default]\"\n"),
+        "{yaml}"
+    );
+
+    for text in [&toml, &json, &yaml] {
+        assert!(
+            !text.contains("hunter2"),
+            "a secret's value never renders\n{text}"
+        );
+    }
+
+    // A broker grant is a credentialed upstream: the proxy rows follow.
+    let (_project, global) = spec_project(
+        "[sessions.default.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [sessions.default.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n",
+    );
+    let json = box_spec_text(
+        &global,
+        &[
+            "min",
+            "box",
+            "spec",
+            "default",
+            "--network",
+            "own_ip",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    let rows: Vec<String> =
+        serde_json_lenient::from_value(doc["egress_proxy"].clone()).expect("the proxy rows");
+    assert!(
+        rows.iter().any(|row| row.starts_with("root CA ")),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.contains("GH_TOKEN")), "{rows:?}");
+    assert!(rows.contains(&"steering  proxy_env".to_owned()), "{rows:?}");
+    let toml = box_spec_text(
+        &global,
+        &["min", "box", "spec", "default", "--network", "own_ip"],
+    )
+    .await
+    .expect("the entry renders");
+    assert!(toml.contains("\n# Box Egress Proxy:\n"), "{toml}");
+    assert!(toml.contains("# steering  proxy_env\n"), "{toml}");
+}
+
+// BCLI-021: with no argument, `min box spec` renders the proxy rows of the
+// project that `--repo-dir` names. That form takes `--network` and refuses
+// every other override flag with exit 2, rendering nothing.
+#[tokio::test]
+async fn box_spec_path_form_renders_bep_rows() {
+    let (_project, global) = spec_project("[sessions.default]\npackages = [\"git\"]\n");
+    let text = box_spec_text(&global, &["min", "box", "spec"])
+        .await
+        .expect("the rows render");
+    assert_eq!(
+        text,
+        "This project declares no broker secret, so its box does not use the proxy.\n"
+    );
+
+    let (_project, global) = spec_project(
+        "[session.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n",
+    );
+    let text = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+        .await
+        .expect("the rows render");
+    assert!(text.contains("\nsteering  proxy_env\n"), "{text}");
+    assert!(text.contains("GH_TOKEN"), "{text}");
+
+    let error = box_spec_text(&global, &["min", "box", "spec", "--ingress", "8080:80"])
+        .await
+        .expect_err("--ingress is refused");
+    assert_eq!(spec_refusal_code(&error), 2);
+    assert_eq!(
+        error.to_string(),
+        "min box spec does not take --ingress when it shows the project's proxy rows. \
+         Run min box spec without --ingress."
+    );
+}
+
+// BCLI-021: `min box spec <entry>` with the `[network]` override flags
+// renders the network that `min box start` sends with the same flags:
+// the mode, the egress and the ingress, each flag marked as the source.
+#[tokio::test]
+async fn box_spec_entry_network_flags_match_start() {
+    let file = "[sessions.default.network.egress]\n\
+                allow_dns_hosts = [\"a.example\"]\n\
+                allow_protocols = [\"tcp\"]\n";
+    let (project, global) = spec_project(file);
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let flags = [
+        "--network",
+        "own_ip",
+        "--ingress",
+        "8080:80",
+        "--allow-dns-hosts",
+        "b.example",
+        "--deny-subnets",
+        "10.9.0.0/16",
+    ];
+
+    let mut start = vec!["min", "box", "start"];
+    start.extend(flags);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&parsed_start(&start), &start_entries(file), true).expect("the start plans")
+    else {
+        panic!("the default entry is a session");
+    };
+    let request = planned_session_request(&args, &options, root);
+    let sent: mfile::spec::BoxSpec =
+        serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+
+    let mut spec = vec!["min", "box", "spec", "default", "-o", "json"];
+    spec.extend(flags);
+    let json = box_spec_text(&global, &spec)
+        .await
+        .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    let network = &doc["spec"]["network"];
+    assert_eq!(network["mode"], sent.network.mode.word());
+    let egress: boxes::EgressPolicy =
+        serde_json_lenient::from_value(network["egress"].clone()).expect("the egress");
+    assert_eq!(Some(egress), sent.network.policy.egress);
+    let ingress: boxes::IngressPolicy =
+        serde_json_lenient::from_value(network["ingress"].clone()).expect("the ingress");
+    assert_eq!(Some(ingress), sent.network.policy.ingress);
+    assert_eq!(
+        doc["sources"]["network.mode"],
+        serde_json_lenient::json!(["the command line"])
+    );
+    assert_eq!(
+        doc["sources"]["network.egress"],
+        serde_json_lenient::json!(["[sessions.default]", "the command line"])
+    );
+    assert_eq!(
+        doc["sources"]["network.ingress"],
+        serde_json_lenient::json!(["the command line"])
+    );
+
+    // With no flag, the entry's egress stays and the mode is the default
+    // that a start with no flag gives.
+    let json = box_spec_text(&global, &["min", "box", "spec", "default", "-o", "json"])
+        .await
+        .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["spec"]["network"]["mode"], "host_ip");
+    assert_eq!(
+        doc["spec"]["network"]["egress"]["allow_dns_hosts"],
+        serde_json_lenient::json!(["a.example"])
+    );
+    assert_eq!(
+        doc["sources"]["network.egress"],
+        serde_json_lenient::json!(["[sessions.default]"])
+    );
+}
+
+/// Creates a session box on the in-process daemon `server` from the
+/// project in `root`, named `name` when it is given, with its spec stamped
+/// on the request as a start stamps it. Gives the request and the box id.
+async fn create_specced_box(
+    server: &minimald::test_harness::TestServer,
+    root: &camino::Utf8Path,
+    name: Option<&str>,
+) -> (minimald_rpc::CreateSessionRequest, boxes::SessionId) {
+    let start = parsed_start(&["min", "box", "start", "--network", "own_ip"]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &[], true).expect("the start plans")
+    else {
+        panic!("the implicit default entry is a session");
+    };
+    let mut request = planned_session_request(&args, &options, root);
+    if let Some(name) = name {
+        request.config.name = Some(name.to_owned());
+        request.fresh_instance = false;
+    }
+    let mut daemon = server.connect().await;
+    let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+        minimald_rpc::Errorable::Ok(created) => created.id,
+        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+    };
+    (request, id)
+}
+
+// BCLI-022: `min box spec <box>` renders the spec stored with the box's
+// record, as its creating command sent it.
+#[tokio::test]
+async fn box_spec_box_renders_stored_copy() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        "[session]\npackages = [\"git\"]\n",
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, mut global, server) = show_network_daemon().await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    global.repo_dir = Some(elsewhere.path().to_path_buf());
+    let (request, id) = create_specced_box(&server, root, None).await;
+    let id_text = id.to_string();
+
+    let json = box_spec_text(&global, &["min", "box", "spec", &id_text, "-o", "json"])
+        .await
+        .expect("the stored spec renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(doc["box"], serde_json_lenient::json!(id_text));
+    assert_eq!(Some(doc["spec"].clone()), request.spec);
+
+    let toml = box_spec_text(&global, &["min", "box", "spec", &id_text])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        toml.starts_with(&format!("# The spec box {id} was created with.\n")),
+        "{toml}"
+    );
+    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
+    assert_eq!(parsed["network"]["mode"].as_str(), Some("own_ip"));
+    assert_eq!(
+        parsed["install"]["packages"],
+        toml::Value::Array(vec!["git".into()])
+    );
+
+    let yaml = box_spec_text(&global, &["min", "box", "spec", &id_text, "-o", "yaml"])
+        .await
+        .expect("the stored spec renders");
+    assert!(yaml.starts_with(&format!("box: {id}\nspec:\n")), "{yaml}");
+    assert!(yaml.contains("    mode: own_ip\n"), "{yaml}");
+
+    // The box form takes no override flag.
+    let error = box_spec_text(
+        &global,
+        &["min", "box", "spec", &id_text, "--network", "none"],
+    )
+    .await
+    .expect_err("--network is refused for a box");
+    assert_eq!(spec_refusal_code(&error), 2);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "min box spec does not take --network when it shows a box's stored spec. \
+             Run min box spec {id_text} without --network."
+        )
+    );
+}
+
+// BCLI-022: an argument is an entry of the project that `--repo-dir`
+// names first, and a box address second. It is never a directory.
+#[tokio::test]
+async fn box_spec_argument_directory_then_entry_then_box() {
+    let (project, mut global) = spec_project("[tasks.build]\necho = \"x\"\n");
+    let root = camino::Utf8Path::from_path(project.path())
+        .unwrap()
+        .to_owned();
+    let (_state, daemon_global, server) = show_network_daemon().await;
+    global.minimal_dir = daemon_global.minimal_dir.clone();
+    global.provider = daemon_global.provider;
+    global.no_input = true;
+    let (_request, id) = create_specced_box(&server, &root, Some("build")).await;
+
+    // The project declares `build`, so the entry wins over the box.
+    let text = box_spec_text(&global, &["min", "box", "spec", "build"])
+        .await
+        .expect("the entry renders");
+    assert!(
+        text.starts_with("# The spec of entry build (type task)."),
+        "{text}"
+    );
+
+    // In a project with no such entry, the same word is the box.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut other = global.clone();
+    other.repo_dir = Some(elsewhere.path().to_path_buf());
+    let text = box_spec_text(&other, &["min", "box", "spec", "build"])
+        .await
+        .expect("the box renders");
+    assert!(
+        text.starts_with(&format!("# The spec box {id} was created with.\n")),
+        "{text}"
+    );
+
+    // A directory with a minimal.toml is not read as a project: it is a
+    // box address, and no box has that name.
+    let dir = project.path().to_string_lossy().into_owned();
+    let error = box_spec_text(&global, &["min", "box", "spec", &dir])
+        .await
+        .expect_err("a directory is not a project argument");
+    assert_eq!(spec_refusal_code(&error), 4, "{error:#}");
+}
+
+// BCLI-023: every section of the spec renders, whether or not this host
+// enforces it.
+#[tokio::test]
+async fn box_spec_renders_unenforced_sections() {
+    let (_project, global) = spec_project(
+        "[sessions.default]\ntimeout = \"2h\"\nlifetime = \"until_stopped\"\n\
+         on_oom = \"restart\"\nvolumes = [\"data\"]\n\n\
+         [sessions.default.machine]\ncpus = 2\n\n\
+         [sessions.default.otel]\nenabled = true\n",
+    );
+    let toml = box_spec_text(&global, &["min", "box", "spec", "default"])
+        .await
+        .expect("the entry renders");
+    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
+    assert_eq!(parsed["timeout"].as_str(), Some("2h"));
+    assert_eq!(parsed["lifetime"].as_str(), Some("until_stopped"));
+    assert_eq!(parsed["on_oom"].as_str(), Some("restart"));
+    assert_eq!(parsed["volumes"], toml::Value::Array(vec!["data".into()]));
+    assert_eq!(parsed["machine"]["cpus"].as_integer(), Some(2));
+    assert_eq!(parsed["otel"]["enabled"].as_bool(), Some(true));
+    for key in [
+        "timeout", "lifetime", "on_oom", "volumes", "machine", "otel",
+    ] {
+        assert!(
+            toml.contains(&format!("# {key}: from [sessions.default]\n")),
+            "{key}\n{toml}"
+        );
+    }
+
+    let json = box_spec_text(&global, &["min", "box", "spec", "default", "-o", "json"])
+        .await
+        .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    for key in [
+        "timeout", "lifetime", "on_oom", "volumes", "machine", "otel",
+    ] {
+        assert!(!doc["spec"][key].is_null(), "{key}\n{json}");
+    }
+}

@@ -445,8 +445,11 @@ pub struct BoxArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum BoxCommand {
-    /// Show how a project's box reaches GitHub through the local proxy:
-    /// the proxy's root certificate fingerprint, each secret with its hosts,
+    /// Show the spec of an entry of the project before a start, or the
+    /// spec a box was created with. An entry's spec names the minimal.toml
+    /// table or flag that set each value. With no entry or box named, show
+    /// how the project's box reaches GitHub through the local proxy: the
+    /// proxy's root certificate fingerprint, each secret with its hosts,
     /// the steering mode and the UDP 443 stance
     Spec(BoxSpecArgs),
     /// Show what the local proxy recorded for one box: each request it
@@ -1066,22 +1069,33 @@ pub enum BoxAuditOutputFormat {
     Jsonl,
 }
 
+// BCLI-021, BCLI-022, BCLI-023 and BEP-038:
+// `min box spec [<entry>|<box>] [-o toml|json|yaml]`, with the override
+// flags of `min box start`. The project form keeps only `--network`.
 #[derive(Debug, Args)]
 pub struct BoxSpecArgs {
-    /// The project directory whose minimal.toml declares the box
-    /// (default: --repo-dir, or the current directory)
-    pub path: Option<PathBuf>,
-    // The same flag as `min session activate --network`, from the same
-    // definition, so the preview is of the box that activation creates.
-    #[arg(
-        long,
-        value_name = NETWORK_VALUE_NAME,
-        value_parser = parse_network_mode,
-        default_value = NETWORK_DEFAULT,
-        help = NETWORK_HELP,
-        long_help = NETWORK_LONG_HELP
-    )]
-    pub network: CliNetworkMode,
+    /// An entry of the project's minimal.toml, else a box: its id, the
+    /// start of its id, or its name, as `min box list` prints them. With
+    /// none, show the project's proxy rows. Use --repo-dir to name another
+    /// project
+    pub target: Option<String>,
+    /// The format of an entry's or a box's spec (default: toml)
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxSpecOutputFormat>,
+    #[command(flatten)]
+    pub overrides: StartOverrideArgs,
+}
+
+/// The format `min box spec` writes an entry's or a box's spec in.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+pub enum BoxSpecOutputFormat {
+    /// TOML, with a comment that names the source of each value
+    #[default]
+    Toml,
+    /// One JSON object
+    Json,
+    /// One YAML document
+    Yaml,
 }
 
 #[derive(Debug, Args)]
