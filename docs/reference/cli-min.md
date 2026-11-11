@@ -227,6 +227,8 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | `--dynamic-ingress <allow\|ask\|deny>` | Override of the entry's `network.dynamic_ingress`: the stance that decides the box's own requests to publish a port, as on [`session activate`](#session-activate). Requires `--network own_ip` |
 | `--dynamic-range <LO-HI>` | Override of the port range in the entry's `network.ingress` inside which `--dynamic-ingress allow` publishes, as on [`session activate`](#session-activate). Requires `--dynamic-ingress` |
 | `--credentialed-upstream` | Declare a credentialed upstream for the box, so the box can reach the Box Egress Proxy, as on [`session activate`](#session-activate). Without the flag, the box has one only when `minimal.toml` grants it a secret through the proxy |
+| `--quic443 <auto\|block\|allow>` | Override of the entry's `network.quic443`: whether the box can send UDP to port 443, the traffic of HTTP/3. `block` always blocks it, `allow` always allows it, and `auto` blocks it only when the box has a credentialed upstream. `min session activate` does not take this flag |
+| `--vpn-network-names <NAME>` | Adds a name to the box's `network.vpn_network_names`. Repeatable. The box keeps the names, but `minimald` does not connect the box to a VPN yet. `min session activate` does not take this flag |
 | `--loadout <NAME>` | Apply the named loadout. Repeatable. With any `--loadout`, the config file's `default_loadouts` are not applied |
 | `--no-loadouts` | Apply no loadouts, and not the config file's `default_loadouts` either. Cannot be combined with `--loadout` |
 | `--no-hooks` | Run none of the box's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from the loadouts or from `minimal.toml`. The box keeps hooks off, so the choice also holds when the box is attached or detached, and when it ends |
@@ -245,8 +247,8 @@ every flag in the table except `--ingress` and `--loadout`, and with no
 
 `min task run <task>` and `min box run <entry>` take the same flags as a
 task entry's start: `--network`, the egress flags, `--dynamic-ingress`,
-`--dynamic-range`, `--credentialed-upstream`, `--no-loadouts` and
-`--no-hooks`. Put them before the task's first argument.
+`--dynamic-range`, `--credentialed-upstream`, `--quic443`,
+`--vpn-network-names`, `--no-loadouts` and `--no-hooks`. Put them before the task's first argument.
 
 Without `ENTRY`, the command starts the session entry named `default`. When
 no session entry has that name, it starts the project's only session entry. A

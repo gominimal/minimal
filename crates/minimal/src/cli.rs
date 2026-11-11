@@ -1327,11 +1327,6 @@ pub struct StartOverrideArgs {
 // are the rest of activate's `[network]` flags, `--no-loadouts` and
 // `--no-hooks`.
 //
-// Not yet every `[network]` key has its flag here. BCLI-024's rule also
-// gives `--quic443` and `--vpn-network-names`, and neither verb takes them
-// yet. `min session activate` does not take them either. They need a
-// follow-up issue of their own.
-//
 // Deliberately NOT a doc comment: clap propagates a flattened struct's doc
 // comment into the parent command's long_about.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
@@ -1366,6 +1361,22 @@ pub struct BoxOverrideArgs {
     /// boxes in a VM.
     #[arg(long)]
     pub credentialed_upstream: bool,
+    /// Whether the box can send UDP to port 443, the traffic of HTTP/3.
+    /// `block` always blocks it, and `allow` always allows it. `auto`, the
+    /// same as leaving the flag unset, blocks it only when the box has a
+    /// credentialed upstream. Sets the box's `network.quic443`, in place of
+    /// the value in minimal.toml.
+    #[arg(
+        long = "quic443",
+        value_name = "auto|block|allow",
+        value_parser = parse_quic443
+    )]
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// Add this VPN network name to the box's `network.vpn_network_names`.
+    /// Repeatable. The box keeps the names, but this version of minimald
+    /// does not connect the box to a VPN.
+    #[arg(long = "vpn-network-names", value_name = "NAME")]
+    pub vpn_network_names: Vec<String>,
     /// Apply no loadouts, and not the client config's
     /// `[loadouts].default_loadouts` either
     #[arg(long)]
@@ -1936,6 +1947,20 @@ pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<boxes::DynamicIngr
         "ask" => Ok(boxes::DynamicIngress::Ask),
         other => Err(format!(
             "dynamic ingress: unknown mode '{other}' (expected allow, ask, or deny)"
+        )),
+    }
+}
+
+/// Parse a `--quic443` value into the box's stance on UDP to port 443
+/// (BCLI-024, BEP-018).
+pub(crate) fn parse_quic443(raw: &str) -> Result<boxes::core::bep::Quic443, String> {
+    use boxes::core::bep::Quic443;
+    match raw {
+        "auto" => Ok(Quic443::Auto),
+        "block" => Ok(Quic443::Block),
+        "allow" => Ok(Quic443::Allow),
+        other => Err(format!(
+            "unknown value '{other}'. Use auto, block or allow."
         )),
     }
 }

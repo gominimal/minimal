@@ -13456,6 +13456,7 @@ fn planned_session_request(
         credentialed_upstream: args
             .credentialed_upstream
             .then(boxes::CredentialedUpstream::default),
+        quic443: options.quic443,
         ..network_override_policy(args, port_mappings, egress.policy)
     };
     let mut request = minimald_rpc::CreateSessionRequest::new(
@@ -13467,6 +13468,7 @@ fn planned_session_request(
     request.config.name = minimal_client::box_name::request_name(None);
     request.config.hooks_enabled = !args.no_hooks;
     stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    add_vpn_network_names(&mut request, &options.vpn_network_names).unwrap();
     // Each create in a test is a fresh instance, so no name is held.
     request_fresh_instance(&mut request);
     request
@@ -13727,6 +13729,15 @@ async fn start_and_run_take_every_network_key_flag() {
                 verb[1]
             );
         }
+        // Two `[network]` keys have a flag that activate does not take.
+        for flag in ["--quic443", "--vpn-network-names"] {
+            assert!(
+                flags.contains(flag),
+                "min {} {} takes {flag}",
+                verb[0],
+                verb[1]
+            );
+        }
     }
 
     let toml = "[sessions.default.network.egress]\n\
@@ -13750,6 +13761,12 @@ async fn start_and_run_take_every_network_key_flag() {
             "--dynamic-range",
             "8000-8443",
             "--credentialed-upstream",
+            "--quic443",
+            "block",
+            "--vpn-network-names",
+            "corp",
+            "--vpn-network-names",
+            "lab",
         ]);
         let StartPlan::Session { args, options, .. } =
             plan_start(&start, &start_entries(toml), true).expect("the start is planned")
@@ -13759,6 +13776,8 @@ async fn start_and_run_take_every_network_key_flag() {
         assert_eq!(args.dynamic_ingress, Some(boxes::DynamicIngress::Allow));
         assert_eq!(args.dynamic_range, Some((8000, 8443)));
         assert!(args.credentialed_upstream, "{verb}");
+        assert_eq!(options.quic443, Some(boxes::core::bep::Quic443::Block));
+        assert_eq!(options.vpn_network_names, ["corp", "lab"], "{verb}");
 
         let request = planned_session_request(&args, &options, root);
         let spec: mfile::spec::BoxSpec =
@@ -13769,6 +13788,17 @@ async fn start_and_run_take_every_network_key_flag() {
         assert!(ingress.port_mappings.is_empty(), "{verb}");
         assert!(
             spec.network.policy.credentialed_upstream.is_some(),
+            "{verb}"
+        );
+        assert_eq!(
+            spec.network.policy.quic443,
+            Some(boxes::core::bep::Quic443::Block),
+            "{verb}"
+        );
+        // A list flag adds one name for each use.
+        assert_eq!(
+            request.spec.as_ref().unwrap()["network"]["vpn_network_names"],
+            serde_json_lenient::json!(["corp", "lab"]),
             "{verb}"
         );
         // A key no flag names keeps the entry's value.
@@ -13790,6 +13820,57 @@ async fn start_and_run_take_every_network_key_flag() {
         assert_eq!(record.policy, spec.network.policy, "{verb}");
     }
 
+    // The run path applies `--quic443` and `--vpn-network-names` too.
+    for verb in ["task", "box"] {
+        let run = parsed_run(&[
+            "min",
+            verb,
+            "run",
+            "--quic443",
+            "allow",
+            "--vpn-network-names",
+            "corp",
+            "--vpn-network-names",
+            "lab",
+            "build",
+        ]);
+        let mut network = task::TaskBoxNetwork {
+            mode: boxes::NetworkMode::HostNet,
+            policy: boxes::BoxPolicy {
+                quic443: Some(boxes::core::bep::Quic443::Block),
+                ..boxes::BoxPolicy::default()
+            },
+            hints: Vec::new(),
+            mode_layer: None,
+        };
+        task::apply_run_overrides(&mut network, &run.other).expect("the flags are taken");
+        // A scalar flag replaces the declared value.
+        assert_eq!(
+            network.policy.quic443,
+            Some(boxes::core::bep::Quic443::Allow),
+            "{verb}"
+        );
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+            network.mode,
+            network.policy,
+        );
+        let spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
+        put_spec(&mut request, &spec).unwrap();
+        add_vpn_network_names(&mut request, &run.other.vpn_network_names).unwrap();
+        let sent = request.spec.as_ref().unwrap();
+        assert_eq!(sent["network"]["quic443"], "allow", "{verb}");
+        assert_eq!(
+            sent["network"]["vpn_network_names"],
+            serde_json_lenient::json!(["corp", "lab"]),
+            "{verb}"
+        );
+        // The spec with the names still reads as a box spec.
+        serde_json_lenient::from_value::<mfile::spec::BoxSpec>(sent.clone())
+            .expect("the spec reads");
+    }
+
     // A task entry's start passes the flags to the run path.
     let tasks = start_entries("[tasks.build]\necho = 'x'\n");
     let start = parsed_start(&[
@@ -13802,12 +13883,18 @@ async fn start_and_run_take_every_network_key_flag() {
         "--dynamic-ingress",
         "ask",
         "--credentialed-upstream",
+        "--quic443",
+        "block",
+        "--vpn-network-names",
+        "corp",
     ]);
     let StartPlan::Detached { run, .. } = plan_start(&start, &tasks, true).unwrap() else {
         panic!("a task box starts detached");
     };
     assert_eq!(run.other.dynamic_ingress, Some(boxes::DynamicIngress::Ask));
     assert!(run.other.credentialed_upstream);
+    assert_eq!(run.other.quic443, Some(boxes::core::bep::Quic443::Block));
+    assert_eq!(run.other.vpn_network_names, ["corp"]);
 }
 
 // BCLI-076: `--no-hooks` on a start empties the composed lifecycle-hook

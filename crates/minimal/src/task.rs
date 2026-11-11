@@ -228,8 +228,10 @@ fn task_box_network(
 
 /// Applies the run's other `[network]` override flags to the box's
 /// network (BCLI-024): `--dynamic-ingress` and `--dynamic-range` set the
-/// ingress policy, and `--credentialed-upstream` declares the lane to the
-/// Box Egress Proxy. Each flag changes only its own key.
+/// ingress policy, `--credentialed-upstream` declares the lane to the
+/// Box Egress Proxy, and `--quic443` sets the stance on UDP to port 443.
+/// Each flag changes only its own key. `--vpn-network-names` is applied to
+/// the spec, by [`crate::add_vpn_network_names`].
 ///
 /// # Errors
 ///
@@ -256,6 +258,10 @@ pub(crate) fn apply_run_overrides(
     // the only source of the declaration, with the default proxy settings.
     if other.credentialed_upstream && network.policy.credentialed_upstream.is_none() {
         network.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+    }
+    // `--quic443` replaces the stance, and no flag keeps the declared one.
+    if other.quic443.is_some() {
+        network.policy.quic443 = other.quic443;
     }
     Ok(())
 }
@@ -1509,6 +1515,7 @@ pub(crate) async fn run_entry(
     // interactive task sends none: the task type denies a terminal.
     if let Some(spec) = &spec {
         crate::put_spec(&mut request, spec)?;
+        crate::add_vpn_network_names(&mut request, &args.other.vpn_network_names)?;
     } else {
         // With no spec to name it, the request carries the entry's name,
         // cleaned as the daemon cleans a spec's entry.

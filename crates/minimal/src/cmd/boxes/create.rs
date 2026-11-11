@@ -818,6 +818,8 @@ pub(crate) fn plan_start(
                     entry: Some(entry.name.clone()),
                     box_name: start.name.clone(),
                     fresh_instance: start.new,
+                    quic443: other.quic443,
+                    vpn_network_names: other.vpn_network_names.clone(),
                 },
                 entry: entry.name,
                 args,
@@ -1008,6 +1010,12 @@ pub struct ActivationOptions {
     pub box_name: Option<String>,
     /// Ask for a fresh instance, `<name>-<n>` (BCLI-070).
     pub fresh_instance: bool,
+    /// The `--quic443` of a start (BCLI-024). `min session activate` does
+    /// not take the flag.
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// The `--vpn-network-names` of a start (BCLI-024). `min session
+    /// activate` does not take the flag.
+    pub vpn_network_names: Vec<String>,
 }
 
 impl From<bool> for ActivationOptions {
@@ -2699,6 +2707,45 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
+/// list of the spec on `request` (BCLI-024). A name the list already holds
+/// is not added again. The daemon stores the list with the box's spec, and
+/// does not enforce it (BOX-076). Nothing changes when `names` is empty or
+/// the request carries no spec.
+///
+/// # Errors
+///
+/// Fails when the spec on `request` has a `network` that is not a table,
+/// or a `network.vpn_network_names` that is not a list.
+pub(crate) fn add_vpn_network_names(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    names: &[String],
+) -> Result<(), anyhow::Error> {
+    use serde_json_lenient::Value;
+    let Some(spec) = request.spec.as_mut().filter(|_| !names.is_empty()) else {
+        return Ok(());
+    };
+    let network = spec
+        .as_object_mut()
+        .context("The box spec is not a table")?
+        .entry("network")
+        .or_insert_with(|| Value::Object(serde_json_lenient::Map::new()))
+        .as_object_mut()
+        .context("The box spec's network is not a table")?;
+    let list = network
+        .entry("vpn_network_names")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("The box spec's network.vpn_network_names is not a list")?;
+    for name in names {
+        let value = Value::String(name.clone());
+        if !list.contains(&value) {
+            list.push(value);
+        }
+    }
+    Ok(())
+}
+
 /// Marks `request` as a fresh instance (BCLI-070, BOX-163). The daemon
 /// names the box `<name>-<n>`, with the smallest `n` no retained box uses,
 /// and never refuses it for a held name. The client invents no name, so the
@@ -3146,7 +3193,8 @@ pub(crate) async fn activate_box(
                 // BEP-018: the declared stance is a setting of every box, lane
                 // or not, so a declared `block` reaches the gate of a box with
                 // no credentialed upstream.
-                quic443: project_quic443,
+                // BCLI-024: `--quic443` replaces the declared stance.
+                quic443: options.quic443.or(project_quic443),
                 ..network_override_policy(&args, port_mappings, egress.policy)
             };
 
@@ -3345,6 +3393,7 @@ pub(crate) async fn activate_box(
                 options.entry.as_deref(),
                 options.box_name.as_deref(),
             )?;
+            add_vpn_network_names(&mut request, &options.vpn_network_names)?;
 
             let Some(root) = upload_root else {
                 return Ok::<_, anyhow::Error>(UploadPlan::Skip);
