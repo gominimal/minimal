@@ -14371,7 +14371,7 @@ proof_bep_first_slice_end_to_end() {
   mkdir "$GRANT_SEED_DIR/.git"
 
   # 1. `min box spec` (BEP-038).
-  if ! fs_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
+  if ! fs_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
     echo "::error::'min box spec' of the demo project failed"
     cat "$WORK/$fs_case.spec.err" 2>/dev/null || true
     fs_fail
@@ -14648,7 +14648,7 @@ proof_bep_store_reference_end_to_end() {
     printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
-  if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+  if ! sr_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
     echo "::error::'min box spec' of the store-reference project failed"
     cat "$WORK/$sr_case.spec.err" 2>/dev/null || true
     sr_fail
@@ -15230,7 +15230,7 @@ proof_bep_signing_rotation_keeps_running_box_working() {
   # The root CA fingerprint from `min box spec` of the project ($1 = the
   # round, for the error).
   sr_root_fingerprint() {
-    if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+    if ! sr_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
       echo "::error::'min box spec' of the grant project failed $1 the rotation" >&2
       cat "$WORK/$sr_case.spec.err" >&2 2>/dev/null || true
       return 1
