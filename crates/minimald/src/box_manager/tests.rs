@@ -6368,44 +6368,53 @@ async fn broker_secret_unenrolled_exit5() {
     let log = crate::test_harness::captured_log();
     let (_state, _cache, mngr) = manager().await;
 
+    const ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n";
     let cases = [
-        // (secrets, proxy serves the box, refused)
+        // (secrets, the create's root certificate, refused)
         (
             serde_json_lenient::json!({ "gh": broker_secret() }),
-            false,
+            None,
             true,
         ),
         (
             serde_json_lenient::json!({ "gh": broker_secret(), "npm": store_secret() }),
-            false,
+            None,
             true,
         ),
         (
             serde_json_lenient::json!({ "gh": broker_secret() }),
-            true,
+            Some(ROOT_PEM),
             false,
         ),
         (
             serde_json_lenient::json!({ "npm": store_secret() }),
-            false,
+            None,
             false,
         ),
         (
             serde_json_lenient::json!({ "npm": store_secret() }),
-            true,
+            Some(ROOT_PEM),
             false,
         ),
-        (serde_json_lenient::json!({}), false, false),
-        (serde_json_lenient::json!({}), true, false),
+        (serde_json_lenient::json!({}), None, false),
+        (serde_json_lenient::json!({}), Some(ROOT_PEM), false),
+        // A certificate that is not one well-formed block does not count
+        // as the proxy's, so the brokered secret is still refused.
+        (
+            serde_json_lenient::json!({ "gh": broker_secret() }),
+            Some(""),
+            true,
+        ),
+        (
+            serde_json_lenient::json!({ "gh": broker_secret() }),
+            Some("not a certificate"),
+            true,
+        ),
     ];
-    for (n, (secrets, proxy_serves, refused)) in cases.into_iter().enumerate() {
+    for (n, (secrets, certificate, refused)) in cases.into_iter().enumerate() {
         let entry = format!("case-{n}");
         let mut config = unnamed_config();
-        if proxy_serves {
-            config.root_certificate = Some(
-                "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n".to_string(),
-            );
-        }
+        config.root_certificate = certificate.map(str::to_string);
         let before = mngr.list_boxes(None).await.unwrap().len();
         let created = mngr
             .create_box_with_spec(config, Some(spec_with_secrets(&entry, secrets)), None, None)
@@ -6448,7 +6457,7 @@ async fn broker_secret_unenrolled_exit5() {
         .lines()
         .filter(|line| line.contains("the spec carries a brokered secret"))
         .collect();
-    assert_eq!(refusals.len(), 2, "one log line per refusal:\n{logged}");
+    assert_eq!(refusals.len(), 4, "one log line per refusal:\n{logged}");
     for line in refusals {
         assert!(line.contains("\"gh\""), "the log names the secret: {line}");
         assert!(

@@ -1327,10 +1327,10 @@ fn brokered_secrets(spec: &serde_json_lenient::Value) -> Vec<String> {
 
 /// The refusal of a create whose spec carries a brokered secret while no
 /// identity plane is configured and no node-local proxy serves the box
-/// (BOX-081). `proxy_serves` says whether the request carries the proxy's
-/// root certificate, which a client sets only from an identity that a
-/// node-local proxy published. A `source = "store"` secret is never
-/// refused here (BOX-141).
+/// (BOX-081). `proxy_serves` says whether the request carries one
+/// well-formed root certificate ([`proxy_root_certificate`]). A client sets
+/// it only from an identity that a node-local proxy published. A
+/// `source = "store"` secret is never refused here (BOX-141).
 fn unenrolled_broker_refusal(
     spec: &serde_json_lenient::Value,
     proxy_serves: bool,
@@ -1344,6 +1344,17 @@ fn unenrolled_broker_refusal(
         false,
         boxes::core::bep::ProxyAbsence::NotServed,
     ))
+}
+
+/// Whether `certificate` counts as the node-local proxy's root
+/// certificate for the BOX-081 gate. This daemon has no fact of its own
+/// about the proxy: on a microVM host the proxy runs beside the host
+/// daemon, outside this guest. So the gate takes the certificate the
+/// caller read from the proxy's published identity, and it accepts only
+/// one well-formed certificate block. An empty or malformed value counts
+/// as no certificate, and the brokered secret is refused.
+fn proxy_root_certificate(certificate: Option<&str>) -> bool {
+    certificate.is_some_and(crate::env::is_one_certificate)
 }
 
 /// The un-enrolled refusal an error from a create carries, if any.
@@ -3847,9 +3858,21 @@ impl BoxManager {
         // BOX-081: no identity plane is configured on this host, so a
         // brokered secret is refused unless a node-local proxy serves the
         // box. The refusal comes before the record exists, so it leaves no
-        // record, id or name behind.
+        // record, id or name behind. A certificate that is not one
+        // well-formed block does not count as the proxy's.
+        let proxy_serves = proxy_root_certificate(config.root_certificate.as_deref());
+        if config.root_certificate.is_some() && !proxy_serves {
+            tracing::info!(
+                session_name = config
+                    .name
+                    .as_deref()
+                    .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                "the create carries a root certificate that is not one well-formed \
+                 certificate block, so no node-local proxy counts as serving the box"
+            );
+        }
         if let Some((refusal, grants)) = spec.as_ref().and_then(|spec| {
-            unenrolled_broker_refusal(spec, config.root_certificate.is_some())
+            unenrolled_broker_refusal(spec, proxy_serves)
                 .map(|refusal| (refusal, brokered_secrets(spec)))
         }) {
             tracing::info!(

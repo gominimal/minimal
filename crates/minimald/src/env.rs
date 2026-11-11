@@ -1167,6 +1167,16 @@ fn certificate_block(pem: &str) -> Option<&str> {
     Some(&pem[start..end])
 }
 
+/// Whether `pem` holds exactly one certificate block with a base64 body
+/// that is not empty. The create gate of a brokered secret reads this
+/// (BOX-081), so an empty or malformed value does not count as the
+/// proxy's root certificate.
+pub(crate) fn is_one_certificate(pem: &str) -> bool {
+    certificate_block(pem)
+        .and_then(certificate_der)
+        .is_some_and(|der| !der.is_empty())
+}
+
 /// The DER bytes of the first certificate in `pem`, or `None` when `pem`
 /// holds no certificate block or its body is not base64.
 fn certificate_der(pem: &str) -> Option<Vec<u8>> {
