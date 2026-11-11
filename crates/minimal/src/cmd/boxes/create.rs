@@ -2913,12 +2913,25 @@ pub(crate) async fn hold_requester_build_row(
         host_ip: false,
         stays_detached: true,
     };
-    match minimal_client::box_registration::register_box_with_vm_host(sock, request).await {
-        Ok(registered) => registered.task_addresses,
-        Err(error) => {
+    let registration = tokio::time::timeout(
+        minimal_client::box_registration::BOX_CONTROL_TIMEOUT,
+        minimal_client::box_registration::register_box_with_vm_host(sock, request),
+    )
+    .await;
+    match registration {
+        Ok(Ok(registered)) => registered.task_addresses,
+        Ok(Err(error)) => {
             tracing::warn!(
                 error = %format!("{error:#}"),
                 "could not register the row of the box's builds"
+            );
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout = ?minimal_client::box_registration::BOX_CONTROL_TIMEOUT,
+                "the VM host daemon did not answer the registration of the row of the box's \
+                 builds in time"
             );
             Vec::new()
         }
