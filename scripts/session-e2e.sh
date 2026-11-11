@@ -7989,19 +7989,14 @@ relay_sid="$(printf '%s\n' "$relay_sid" | tail -n1 | tr -d '\r')"
 
 # 1. Resize, then the detach chord. The typed line echoes as
 # `RELAY_SIZE[%s]`; only the shell's output carries the size itself. The
-# resize travels client -> ssh -> daemon -> the session's pty, and the helper
-# types the next line half a second after it; on a loaded host that relay
-# can take longer, so the session's shell waits (up to 10 s) for `stty size`
-# to show the new size before it prints. Each poll prints a dot: the helper
-# sends the detach chord once the pty has been quiet for two seconds, so a
-# silent wait would be cut short at about two seconds and the line would
-# never print. The helper also waits for the shell's RELAY_READY before it
-# counts the stream as quiet: under load the sandbox can take longer than
-# two seconds to mint, and the chord then left before a line ran. What is
-# asserted is unchanged: the size the session reports is the resized one.
-# The typed line builds the marker with printf, as the helper's own default
-# stream does, so the pty's echo of the typed text never contains it: only the
-# shell's output does, once it has run the command.
+# resize travels client -> ssh -> daemon -> the session's pty, so the
+# session's shell polls `stty size` (up to 10 s) for the new size before it
+# prints, and each poll prints a dot: the dots keep the pty busy, so the
+# helper's quiet-stream detach does not fire while the shell waits. The
+# ready marker is built with printf, so the pty's echo of the typed text
+# never contains it; the E2E_PTY_READY docstring in e2e-attach-pty.py has
+# the rest. What is asserted: the size the session reports is the resized
+# one.
 # shellcheck disable=SC2016 # `$(stty size)` must run in the SESSION's shell.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
 relay_out="$(E2E_PTY_COMMANDS='printf "RELAY_%s\n" READY' E2E_PTY_READY='RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
