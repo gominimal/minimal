@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod resolver;
 pub mod task;
 pub mod theme;
+pub mod update_check;
 pub mod zed;
 
 mod cli;

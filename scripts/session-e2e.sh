@@ -95,7 +95,13 @@
 #                                    TCP 53 is dropped (NET-141)
 #   task_run                         `min task run` / `min session run` loop
 #   task_network_inherits_session    a task's network mode follows its session
-#                                    (own_ip egress + loopback isolation, none)
+#                                    (own_ip egress + loopback isolation, none);
+#                                    native: `min task run --network own_ip`
+#                                    cannot reach a host loopback listener
+#                                    no [host-exposures] entry opens; an
+#                                    own_ip task run gets the deny-all
+#                                    default, and one whose entry allows a
+#                                    name reaches it and not another
 #   hooks                            lifecycle hooks, loadouts, patches, shells
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
 #   sandbox                          interactive attach: in-sandbox `min add`
@@ -6749,6 +6755,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[stack]\nuse = "shell"\n'
     printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
     printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
+    # shellcheck disable=SC2016 # $l is the task's, expanded in the box
+    printf '\n[tasks.e2e-stdin]\nbash = "read -r l; echo STDIN_GOT:$l"\n'
     printf '\n[tasks.e2e-sleep]\nbash = "sleep 300"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
     # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
@@ -6835,6 +6843,25 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   task_kept_check e2e-fail "$WORK/task-fail.err"
   echo "task run exit-code relay: 7 → 7 OK"
+
+  # A piped stdin reaches the task through the in-box `min task run`
+  # (T123), and stdout is the task's alone: `cat q.sql | min task run
+  # query > out.csv`.
+  task_out="$(cd "$TASK_SEED_DIR" && printf 'piped-line\n' | mnl task run e2e-stdin 2>"$WORK/task-stdin.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-stdin' with a piped stdin exited $rc (expected 0)"
+    echo "--- task stderr ---"; cat "$WORK/task-stdin.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$task_out" != "STDIN_GOT:piped-line" ]; then
+    echo "::error::'min task run e2e-stdin' did not give the task its piped stdin, or stdout is not the task's alone"
+    echo "--- task stdout ---"; printf '%s\n' "$task_out"
+    echo "--- task stderr ---"; cat "$WORK/task-stdin.err" 2>/dev/null || true
+    fail
+  fi
+  task_kept_check e2e-stdin "$WORK/task-stdin.err"
+  echo "task run stdin: piped input reached the task OK"
 
   # Ctrl-C on a running task stops its box (BOX-013) and keeps its record
   # (BOX-038): the run exits 130, the box lists as stopped, and
@@ -6946,14 +6973,14 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   grep -q 'e2e-echo' "$WORK/task-unknown.err" \
     || { echo "::error::unknown-task error does not list the declared tasks"; cat "$WORK/task-unknown.err" 2>/dev/null || true; fail; }
 
-  # Muscle-memory catch: the hidden bare `min run <task>` errors naming the
-  # canonical spelling.
+  # The hidden bare `min run <task>` is gone (BCLI-011): `run` is no longer
+  # a subcommand, so clap refuses it as unrecognized.
   if mnl run e2e-echo >/dev/null 2>"$WORK/task-alias.err"; then
-    echo "::error::hidden 'min run' unexpectedly succeeded"
+    echo "::error::removed 'min run' unexpectedly succeeded"
     fail
   fi
-  grep -q 'min task run' "$WORK/task-alias.err" \
-    || { echo "::error::hidden 'min run' error does not name 'min task run'"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
+  grep -q "unrecognized subcommand 'run'" "$WORK/task-alias.err" \
+    || { echo "::error::removed 'min run' error does not say 'run' is not a subcommand"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
 
   # env_vars inherit crosses the VM boundary: the client reads the value out
   # of the invoking shell and the task's `printenv` sees it inside the
@@ -7039,11 +7066,18 @@ fi
 # exit code, so a task that fails for another reason (curl missing, the task
 # never starting) cannot pass for a refused connection. A host_ip control
 # task reaches the same host listener, so the own-IP refusal is shown to
-# depend on the mode. The own-IP and host_ip legs are native-only: on a VM
-# lane a task self-allocates a switch address the host-side table holds no
-# row for, so the egress gate drops its traffic (NET-085, until NET-138
-# registers every box), and the listener is on the CI host while every task
-# runs in the guest. The none leg runs on every lane. Own seeded project (the
+# depend on the mode. The same loopback task then runs with no session, as
+# `min task run --network own_ip` and `--network host_ip` (NET-060): the
+# own-IP box cannot reach the host listener, whose port no [host-exposures]
+# entry opens, and the host_ip box can. Then the task box's egress rules:
+# with no rules an own-IP task run reaches no external name (NET-074), and
+# a task whose entry declares `mode = "own_ip"` and one allowed name
+# reaches that name and not another. The own-IP and host_ip legs (the
+# task-run ones too: `min task run` refuses own_ip on a VM host) are
+# native-only: on a VM lane a task self-allocates a switch address the
+# host-side table holds no row for, so the egress gate drops its traffic
+# (NET-085, until NET-138 registers every box), and the listener is on the
+# CI host while every task runs in the guest. The none leg runs on every lane. Own seeded project (the
 # shared seed declares no tasks), switch-gated like the own-IP proofs above
 # (a task in an own-IP session needs the tap the switch carries):
 # MINVMD_GVPROXY_BIN on a VM lane, E2E_NATIVE_SWITCH on the native one.
@@ -7076,6 +7110,10 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[tasks.e2e-tn-egress-com]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.com"\n'
     printf '\n[tasks.e2e-tn-egress-org]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.org"\n'
     printf '\n[tasks.e2e-tn-loopback]\nbash = "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:%s/"\n' "$TN_LB_PORT"
+    # Own-IP tasks whose entry declares the mode and one allowed name: the
+    # `min task run` egress leg runs them with no flag.
+    printf '\n[tasks.e2e-tn-dns-com]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.com"\nnetwork = { mode = "own_ip", egress = { allow_dns_hosts = ["example.com"] } }\n'
+    printf '\n[tasks.e2e-tn-dns-org]\nbash = "curl -fsS --max-time 10 -o /dev/null https://example.org"\nnetwork = { mode = "own_ip", egress = { allow_dns_hosts = ["example.com"] } }\n'
   } > "$TN_SEED_DIR/minimal.toml"
   mkdir "$TN_SEED_DIR/.git"
 
@@ -7128,6 +7166,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # answering passes (a host that fails all three is a warning, not a fail —
   # the other host proves the box's egress).
   tn_egress_ok=0
+  tn_com_reached=""
   for tn_h in com org; do
     tn_status=1
     for tn_t in 1 2 3; do
@@ -7142,6 +7181,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     done
     if [ "$tn_status" -eq 0 ]; then
       tn_egress_ok=$((tn_egress_ok + 1))
+      [ "$tn_h" = com ] && tn_com_reached=1
     else
       echo "::warning::outbound from the own-IP session's task to example.$tn_h failed all 3 attempts; not fatal while the other host still proves egress"
       cat "$WORK/tn-egress.err" 2>/dev/null || true
@@ -7204,6 +7244,141 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   echo "host_ip session task: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
   mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
+
+  # -- `min task run --network own_ip`: a fresh task box, no session --------
+  # The same loopback task, run as its own box (NET-060). This lane writes no
+  # [host-exposures] table, so no entry opens the listener's port. The box
+  # declares reach to every address, so the only thing between it and the
+  # listener is that its 127.0.0.1 is its own: curl must exit 7. A host_ip
+  # task run reaches the same listener and exits 0, so the refusal is shown
+  # to follow the flag. Every task run keeps its box; each is removed here.
+  # $1: the run's stderr; $2: the task, e2e-tn-loopback by default.
+  tn_rm_kept() {
+    local tn_kept
+    # The run names the box, or gives its id when it cannot read the name.
+    tn_kept="$(grep -Eo "Kept box (${2:-e2e-tn-loopback}-[0-9]+|[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})" "$1" | head -n1)"
+    tn_kept="${tn_kept#Kept box }"
+    if [ -z "$tn_kept" ]; then
+      echo "::warning::no 'Kept box' line in $1; the task-run box, if any, stays until teardown"
+      return 0
+    fi
+    for _ in $(seq 1 20); do
+      mnl box rm "$tn_kept" >/dev/null 2>&1 && return 0
+      sleep 0.5
+    done
+    echo "::warning::'min box rm $tn_kept' failed after the task-run leg"
+  }
+  (cd "$TN_SEED_DIR" && mnl task run --network own_ip --allow-subnets 0.0.0.0/0 \
+    e2e-tn-loopback >/dev/null 2>"$WORK/tn-taskrun-ownip.err")
+  rc=$?
+  tn_rm_kept "$WORK/tn-taskrun-ownip.err"
+  if [ "$rc" -ne 7 ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::'min task run --network own_ip' reached the host's listener at 127.0.0.1:$TN_LB_PORT, which no [host-exposures] entry opens — the task box's loopback is not its own"
+    else
+      echo "::error::'min task run --network own_ip' of the loopback task exited $rc, want 7 (curl: could not connect) — it failed for a reason other than an empty loopback"
+      echo "--- task stderr ---"; cat "$WORK/tn-taskrun-ownip.err" 2>/dev/null || true
+    fi
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "own-IP task run: 127.0.0.1:$TN_LB_PORT unreachable (exit $rc: $(grep -m1 'curl:' "$WORK/tn-taskrun-ownip.err" 2>/dev/null || true))"
+  (cd "$TN_SEED_DIR" && mnl task run --network host_ip \
+    e2e-tn-loopback >/dev/null 2>"$WORK/tn-taskrun-hostip.err")
+  rc=$?
+  tn_rm_kept "$WORK/tn-taskrun-hostip.err"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run --network host_ip' could not reach the host's listener at 127.0.0.1:$TN_LB_PORT (exit $rc) — the own-IP task run's refusal above is not shown to follow the flag"
+    echo "--- task stderr ---"; cat "$WORK/tn-taskrun-hostip.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "host_ip task run: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
+
+  # -- `min task run` egress: the task box's rules are enforced -----------
+  # NET-074, NET-060: an own-IP task box with no egress rules gets the
+  # deny-all default, so example.com fails at resolution (curl exit 6) and
+  # the run prints the deny-all note. A task whose entry declares
+  # `mode = "own_ip"` and `allow_dns_hosts = ["example.com"]`, run with no
+  # flag, reaches example.com and not example.org, whose name its relay
+  # refuses (exit 6). The allowed run goes first, with the outbound proofs'
+  # three attempts, and only once it completes do the refusals prove the
+  # rules rather than a dead network. Its own control is the own-IP session
+  # leg above: when that reached example.com, an allowed run that never does
+  # is the rules' fault, not the weather's.
+  tn_dns_ok=""
+  tn_egress_proven=""
+  for tn_t in 1 2 3; do
+    (cd "$TN_SEED_DIR" && mnl task run e2e-tn-dns-com >/dev/null 2>"$WORK/tn-taskrun-dns-com.err")
+    rc=$?
+    tn_rm_kept "$WORK/tn-taskrun-dns-com.err" e2e-tn-dns-com
+    echo "exec: min task run e2e-tn-dns-com (allow_dns_hosts example.com, attempt $tn_t) → exit $rc"
+    if [ "$rc" -eq 0 ]; then
+      tn_dns_ok=1
+      break
+    fi
+    [ "$tn_t" -lt 3 ] && sleep "$((tn_t * 3))"
+  done
+  if [ -z "$tn_dns_ok" ] && [ -n "$tn_com_reached" ]; then
+    echo "::error::'min task run e2e-tn-dns-com' could not reach https://example.com, which its allow_dns_hosts names, while the own-IP session above reached it on this run — the task's declared egress is not applied"
+    echo "--- task stderr ---"; cat "$WORK/tn-taskrun-dns-com.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  elif [ -z "$tn_dns_ok" ]; then
+    echo "::warning::'min task run e2e-tn-dns-com' could not reach https://example.com in 3 attempts, and neither did the own-IP session above; the task-run egress refusals are skipped as a weather warning"
+    cat "$WORK/tn-taskrun-dns-com.err" 2>/dev/null || true
+  else
+    echo "own-IP task run from the entry's network table: https://example.com reachable (exit 0)"
+    if grep -qF "This box can reach no external address" "$WORK/tn-taskrun-dns-com.err"; then
+      echo "::error::'min task run e2e-tn-dns-com' printed the deny-all note for a box that declares egress"
+      cat "$WORK/tn-taskrun-dns-com.err"
+      kill "$TN_LISTENER_PID" 2>/dev/null || true
+      TN_LISTENER_PID=""
+      fail
+    fi
+    (cd "$TN_SEED_DIR" && mnl task run e2e-tn-dns-org >/dev/null 2>"$WORK/tn-taskrun-dns-org.err")
+    rc=$?
+    tn_rm_kept "$WORK/tn-taskrun-dns-org.err" e2e-tn-dns-org
+    if [ "$rc" -ne 6 ]; then
+      if [ "$rc" -eq 0 ]; then
+        echo "::error::'min task run e2e-tn-dns-org' reached https://example.org, which its allow_dns_hosts does not name — the task box's egress rules are not enforced"
+      else
+        echo "::error::'min task run e2e-tn-dns-org' exited $rc, want 6 (curl: could not resolve) — it failed for a reason other than its relay refusing the name"
+      fi
+      echo "--- task stderr ---"; cat "$WORK/tn-taskrun-dns-org.err" 2>/dev/null || true
+      kill "$TN_LISTENER_PID" 2>/dev/null || true
+      TN_LISTENER_PID=""
+      fail
+    fi
+    echo "own-IP task run from the entry's network table: https://example.org refused at resolution (exit 6)"
+    (cd "$TN_SEED_DIR" && mnl task run --network own_ip e2e-tn-egress-com \
+      >/dev/null 2>"$WORK/tn-taskrun-denyall.err")
+    rc=$?
+    tn_rm_kept "$WORK/tn-taskrun-denyall.err" e2e-tn-egress-com
+    if [ "$rc" -ne 6 ]; then
+      if [ "$rc" -eq 0 ]; then
+        echo "::error::'min task run --network own_ip e2e-tn-egress-com' reached https://example.com with no egress rules — the deny-all default (NET-074) is not in force for a task box"
+      else
+        echo "::error::'min task run --network own_ip e2e-tn-egress-com' exited $rc, want 6 (curl: could not resolve) — it failed for a reason other than the deny-all default"
+      fi
+      echo "--- task stderr ---"; cat "$WORK/tn-taskrun-denyall.err" 2>/dev/null || true
+      kill "$TN_LISTENER_PID" 2>/dev/null || true
+      TN_LISTENER_PID=""
+      fail
+    fi
+    if ! grep -qF "This box can reach no external address" "$WORK/tn-taskrun-denyall.err"; then
+      echo "::error::'min task run --network own_ip' with no egress rules did not print the deny-all note"
+      cat "$WORK/tn-taskrun-denyall.err" 2>/dev/null || true
+      kill "$TN_LISTENER_PID" 2>/dev/null || true
+      TN_LISTENER_PID=""
+      fail
+    fi
+    echo "own-IP task run with no egress rules: https://example.com refused at resolution (exit 6), with the deny-all note"
+    tn_egress_proven=1
+  fi
   tn_own_proven=1
   else
     known_gap task_network_inherits_session "own-IP/host_ip task legs on a VM lane: a task self-allocates a switch address the host-side table holds no row for, so the egress gate drops its traffic (NET-085, closed by NET-138); the host listener is also unreachable from the guest"
@@ -7243,7 +7418,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   TN_LISTENER_PID=""
   rm -rf "$TN_SEED_DIR"; TN_SEED_DIR=""
   if [ -n "$tn_own_proven" ]; then
-    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable; host_ip: host loopback reachable; none: no network)"
+    tn_taskrun_egress="task-run egress skipped as weather"
+    [ -n "$tn_egress_proven" ] && tn_taskrun_egress="a task run takes its entry's own_ip mode and allow_dns_hosts, and an own_ip task run with no rules gets the deny-all default"
+    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable, in a session and from 'min task run --network own_ip'; $tn_taskrun_egress; host_ip: host loopback reachable; none: no network)"
   else
     echo "task network proof OK (none: no network; own-IP and host_ip legs known_gap on this VM lane)"
   fi
@@ -23047,17 +23224,12 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 #     host-side boot log. The attempt never reads the server's SSH banner
 #     either way.
 #
-#   * the build leg (NET-155 under NET-130): `min add --session` of a
-#     project-local package whose one web source is a literal address in
-#     TEST-NET-2. An own-address box has no classifier leaf, so the daemon
-#     fetches the source from its own namespace with the node's address,
-#     and the host-side gate decides it by the node-plane baseline set: the
-#     address is no registry or cache pin, so the gate drops it and writes
-#     its `egress-node-plane-unpinned` line naming the destination. The
-#     build fails and the package is not installed. This is the interim
-#     that the NET-155 scope note names, and issue #2802 owns it. When #2802
-#     gives an own-address box its own leaf, change this leg to expect the
-#     box's own drop in place of the node's.
+#   * the build leg (NET-155): `min add --session` of a project-local
+#     package whose one web source is a literal address in TEST-NET-2. The
+#     box's rules admit no destination, so the fetch opens no connection.
+#     The build fails, its error names the destination and the box's rules,
+#     the package is not installed, and no frame reaches the host-side gate,
+#     so the gate writes no line for the destination.
 #
 #   * the escape leg (NET-085): a root escapee wearing the node's own
 #     address speaks the shuttle protocol at the gate's landing edge (the
@@ -23072,10 +23244,8 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 #     no infrastructure destination and no pin. The gate drops it under
 #     `egress-node-plane-unpinned`, which proves the pin itself.
 #
-# The build leg runs before the escape leg on purpose: the gate writes one
-# line per source per rule per 60 s, and both legs' lines are the node
-# address's under the same rule, so each escape probe waits out the window
-# that the line before it opened. Every leg's failure prints the record it expected
+# The gate writes one line per source per rule per 60 s, so each leg waits out
+# the window that the line before it opened. Every leg's failure prints the record it expected
 # and the host log lines it searched.
 proof_escapes_and_builds_stay_inside_box_rules() {
   local ebr_sid="" ebr_rec="" ebr_ip="" ebr_node="" ebr_host="" ebr_out=""
@@ -23410,11 +23580,11 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
   # ---- the build leg: a deny-all box's package build (NET-155) -------------
   # The gate writes one line per source address per rule in a 60 s window,
   # whatever the destination. An earlier drop from the node's address (the
-  # activate, or an earlier case) can hold that window open and silence this
-  # leg's line. Wait it out, as the escape leg does.
+  # activate, or an earlier case) can hold that window open, and then a line
+  # this leg must not see could not appear. Wait it out, as the escape leg does.
   echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
   sleep 61
-  EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, and the gate writes an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_build_dst"
+  EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, its error names $ebr_build_dst and the egress rules of box e2e-ebr, and the gate writes no line for $ebr_build_dst"
   ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)"
   # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
   ebr_out="$(mnl session exec "$ebr_sid" \
@@ -23429,7 +23599,7 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
   printf '%s\n' "$ebr_out" | tail -n 20 | sed 's/^/  /'
   ebr_rc="$(printf '%s\n' "$ebr_out" | sed -n 's/^min-add-exit=//p' | tail -n1)"
   if [ -z "$ebr_rc" ] || [ "$ebr_rc" = 0 ]; then
-    echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules and the baseline set"
+    echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules"
     ebr_fail
   fi
   if [ "$ebr_rc" = 124 ]; then
@@ -23441,17 +23611,22 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
     echo "::error::the build never started: the box did not resolve the project's own package $ebr_pkg"
     ebr_fail
   fi
-  ebr_line="$(ebr_wait_new_gate_line "$ebr_node" egress-node-plane-unpinned \
-    "$ebr_build_dst" "$ebr_prior")" || {
-    echo "::error::the build failed, but the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_build_dst ($ebr_prior such line(s) before the leg)"
+  if ! grep -q "could not reach $ebr_build_dst: the egress rules of box e2e-ebr do not allow it" <<<"$ebr_out"; then
+    echo "::error::the build failed, but its error does not name $ebr_build_dst and the box's rules"
     ebr_fail
-  }
+  fi
+  # A line takes a moment to reach the log, so look only after that moment.
+  sleep 5
+  if [ "$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)" -gt "$ebr_prior" ]; then
+    echo "::error::the gate wrote a line for $ebr_node toward $ebr_build_dst: the fetch of a box whose rules admit nothing must send nothing"
+    ebr_fail
+  fi
   ebr_rows="$ebr_rows
-attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build failed (exit $ebr_rc) record=gate: $ebr_line"
-  echo "build leg OK: the deny-all box's build reached nothing outside its rules and the baseline set"
+attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build failed (exit $ebr_rc) record=the build's error, and no gate line"
+  echo "build leg OK: the deny-all box's fetch sent nothing, and its build named the rules"
 
   # ---- the escape leg: root in the VM wearing the node's address (NET-085) --
-  # Two probes, each after a 61 s wait: the build leg's line, and the first
+  # Two probes, each after a 61 s wait: an earlier drop, and the first
   # probe's line, each open the gate's 60 s window for this source and rule.
   #
   # Probe 1 aims at the runner's own address, where the host listener sits.

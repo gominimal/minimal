@@ -12,8 +12,7 @@
 # (and, cross-arch, impossible) build. The pinned commit is authoritative.
 #
 # Linux-only: package materialization runs the build pipeline natively on Linux.
-# On macOS the CLI runs inside a VM and only the project dir syncs to the host;
-# use the local dev flow in crates/minvmd/README.md instead.
+# On macOS, use `just artifacts` (see crates/minvmd/README.md).
 #
 # Set MIP to a prebuilt mip binary to run it directly and skip the compile — e.g.
 # the release pipeline reuses the static mip it already built rather than

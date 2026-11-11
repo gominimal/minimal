@@ -11,10 +11,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod duration;
 pub mod entry;
 mod error;
 pub use error::{EntryNameRule, Error, SpecKeyProblem};
 pub mod expand;
+pub mod legacy;
+pub mod network;
 mod package_composable;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
@@ -25,6 +28,9 @@ use serde::{Deserializer, Serializer};
 pub use tasks::{Task, TaskAction};
 
 pub const MFILE_NAME: &str = "minimal.toml";
+
+/// The top-level table that declares the project's Box Types (BOX-059).
+const BOX_TYPES_TABLE: &str = "box_types";
 
 /// Overrides how many seconds an edit of `minimal.toml` waits for another
 /// command's lock before it fails.
@@ -976,6 +982,41 @@ pub struct File {
     layout: Option<Layout>,
 }
 
+/// The entry keys that `[session]` and a task keep among their unknown
+/// fields but that a box spec reads (BOX-049), so they are not reported
+/// as unknown.
+const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout"];
+
+/// An entry's unknown fields, in key order, less the ones a box spec reads.
+fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
+    let mut keys: Vec<&str> = extra
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !SPEC_READ_ENTRY_KEYS.contains(key))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Refuses an entry's `timeout` that is not a duration, naming the key and
+/// the entry's table as `layer`.
+fn check_entry_timeout(layer: &str, extra: &HashMap<String, toml::Value>) -> Result<(), Error> {
+    let Some(value) = extra.get("timeout") else {
+        return Ok(());
+    };
+    match duration::spec_timeout(value) {
+        Ok(_) => Ok(()),
+        Err(found) => Err(Error::InvalidSpecKey {
+            key: "timeout".to_owned(),
+            layer: layer.to_owned(),
+            problem: SpecKeyProblem::WrongShape {
+                expected: duration::TIMEOUT_TAKES,
+                found,
+            },
+        }),
+    }
+}
+
 /// Maps a key that is unknown at the top level of an mfile to the nesting
 /// path where it is actually valid, when there is one. `lifecycle_hooks` is
 /// top-level in a loadout but nests under `[session]` in a project mfile, so a
@@ -997,6 +1038,35 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Whether to print the legacy-table hints for this read of a file.
+///
+/// One command parses the same file many times, so without this a single
+/// `min session activate` prints each hint once per parse. A file's hints
+/// print the first time this process reads a given (path, content). The
+/// key holds the content as well as the path, as in
+/// [`File::warn_unknown_fields`], so the long-lived `minimald` prints them
+/// again after the file is edited. A read with no path always prints.
+fn legacy_hints_due(path: Option<&Path>, bytes: &[u8]) -> bool {
+    static HINTED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let Some(path) = path else {
+        return true;
+    };
+    HINTED_FILES
+        .lock()
+        .unwrap()
+        .insert((path.to_path_buf(), hash_bytes(bytes)))
+}
+
+/// Whether a load refuses a task that sets `interactive = true` (BOX-054).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskCheck {
+    /// Refuse it: the file is the project's own.
+    Refuse,
+    /// Read it: the package graph reads the file as a layer.
+    Skip,
+}
+
 impl File {
     /// Parses a `minimal.toml` from raw bytes — the pure, filesystem-free core
     /// of [`File::from_dir`], exposed for fuzzing (crates/mfile/fuzz) and tests.
@@ -1008,7 +1078,34 @@ impl File {
     /// `LinkConfig` failure to [`Error::LinkConfig`], which names the keys a
     /// link table must set and where the bad table is, instead of quoting
     /// serde's internal enum name.
+    ///
+    /// It then reads the legacy tables (BOX-050, BOX-051, BOX-052) and
+    /// prints one hint on stderr for each, the first time this process reads
+    /// the file (see [`legacy_hints_due`]).
     fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
+        Self::parse_to(bytes, path, &mut std::io::stderr())
+    }
+
+    /// [`File::parse`], writing the legacy hints to `hints_out` rather than
+    /// stderr, so a test can read what a parse prints.
+    fn parse_to(
+        bytes: &[u8],
+        path: Option<&Path>,
+        hints_out: &mut dyn std::io::Write,
+    ) -> Result<Self, Error> {
+        let mut file = Self::deserialize_bytes(bytes, path)?;
+        let hints = legacy::settle(&mut file, legacy::this_release(), path)?;
+        if !hints.is_empty() && legacy_hints_due(path, bytes) {
+            for legacy in hints {
+                // A hint that cannot be written (a closed stderr) is not a
+                // reason to fail the read.
+                let _ = writeln!(hints_out, "{legacy}");
+            }
+        }
+        Ok(file)
+    }
+
+    fn deserialize_bytes(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
         toml::from_slice(bytes).map_err(|e| {
             if !e.message().contains("untagged enum LinkConfig") {
                 return Error::Format(e);
@@ -1066,6 +1163,7 @@ impl File {
         path: &PathBuf,
         layout: Layout,
         content_hash: u64,
+        tasks: TaskCheck,
     ) -> Result<Self, Error> {
         self.mfile_path = Some(path.to_path_buf());
         self.layout = Some(layout);
@@ -1076,7 +1174,7 @@ impl File {
                 sideload.link.fixup_relative(path);
             }
         }
-        self.validate()?;
+        self.check(tasks)?;
         Ok(self)
     }
 
@@ -1093,9 +1191,17 @@ impl File {
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
     /// no `default` field, [`Error::HarnessTable`] if the file names the
-    /// pre-v0.5.0 `harness` key, or [`Error::MultipleTaskActions`] if a task
-    /// sets more than one action key.
+    /// pre-v0.5.0 `harness` key, [`Error::MultipleTaskActions`] if a task
+    /// sets more than one action key, [`Error::InteractiveTask`] if a
+    /// task sets `interactive = true`, or [`Error::InvalidSpecKey`] if
+    /// `[session]` or a task sets a `timeout` that is not a duration.
     pub fn validate(&self) -> Result<(), Error> {
+        self.check(TaskCheck::Refuse)
+    }
+
+    /// [`Self::validate`], with the interactive-task refusal as `tasks`
+    /// says.
+    fn check(&self, tasks: TaskCheck) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
                 if s.default.is_none() {
@@ -1126,6 +1232,21 @@ impl File {
             if keys.len() > 1 {
                 return Err(Error::MultipleTaskActions(task_name.clone(), keys));
             }
+            if tasks == TaskCheck::Refuse {
+                task.refuse_interactive(task_name)?;
+            }
+        }
+        // BOX-049: an entry's `timeout` takes the duration grammar. A bad
+        // value is refused here, before a spec is built from the entry.
+        if let Some(session) = &self.session {
+            check_entry_timeout("`[defaults.session]` in minimal.toml", &session.extra)?;
+        }
+        for (task_name, task) in &self.tasks {
+            let layer = format!(
+                "`{}` in minimal.toml",
+                error::EntryHeader("tasks", task_name)
+            );
+            check_entry_timeout(&layer, &task.extra)?;
         }
         self.warn_unknown_fields();
         Ok(())
@@ -1134,11 +1255,26 @@ impl File {
     /// Loads the minimal file from the given directory path. The given
     /// directory must be a repository / minimalfile root.
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        Self::load_dir(dir.as_ref(), TaskCheck::Refuse)
+    }
+
+    /// Loads the minimal file from `dir` as the package graph reads a
+    /// layer: [`Self::from_dir`] without the interactive-task refusal
+    /// (BOX-054). The graph reads only a layer's `[upstream]`, `[params]`
+    /// and `[stdlib]`, and never runs its tasks. An upstream package
+    /// repository can still declare `interactive = true` tasks, and the
+    /// user cannot fix that file. The project's own file gets the refusal
+    /// when it loads through [`Self::from_dir`].
+    pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        Self::load_dir(dir.as_ref(), TaskCheck::Skip)
+    }
+
+    fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Error> {
         // Check for the minimal file at the directory root.
-        let path = dir.as_ref().join(MFILE_NAME);
+        let path = dir.join(MFILE_NAME);
         match std::fs::read(&path) {
             Ok(file_data) => {
-                let conflicting_path = dir.as_ref().join(".minimal").join(MFILE_NAME);
+                let conflicting_path = dir.join(".minimal").join(MFILE_NAME);
                 if std::fs::exists(&conflicting_path)
                     .map_err(|e| Error::IO("stat", conflicting_path.clone(), e))?
                 {
@@ -1150,6 +1286,7 @@ impl File {
                     &path,
                     Layout::Root,
                     hash_bytes(&file_data),
+                    tasks,
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1157,13 +1294,14 @@ impl File {
         };
 
         // Check for the minimal file at `./.minimal`.
-        let path = dir.as_ref().join(".minimal").join(MFILE_NAME);
+        let path = dir.join(".minimal").join(MFILE_NAME);
         match std::fs::read(&path) {
             Ok(file_data) => Self::init_toml(
                 Self::parse(&file_data, Some(&path))?,
                 &path,
                 Layout::DotMinimal,
                 hash_bytes(&file_data),
+                tasks,
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
@@ -1496,6 +1634,10 @@ impl File {
     }
 
     fn warn_unknown_fields(&self) {
+        // BOX-028: an entry's `hooks_on_resume` stays in its `extra`, where
+        // the spec reads it, and is not an unknown key.
+        const HOOKS_ON_RESUME_KEY: &str = "hooks_on_resume";
+
         // One command decodes the same file several times; without this a
         // single load prints each warning once per decode. Surface them only
         // the first time a given path is validated in this process.
@@ -1524,6 +1666,14 @@ impl File {
             }
         }
 
+        // A warning names the file it is about. A command can load a file
+        // the user did not write (`min init` reads a fetched checkout), so a
+        // bare `minimal.toml` would point at the wrong file.
+        let shown = self
+            .mfile_path
+            .as_ref()
+            .map_or_else(|| MFILE_NAME.to_owned(), |p| p.display().to_string());
+
         let mut was_unknown_fields = false;
         if !self.extra.is_empty() {
             // A key that is valid at another nesting level is not really
@@ -1539,29 +1689,50 @@ impl File {
             for key in self.extra.keys().filter(|key| {
                 *key != boxes::core::bep::STORE_RULES_TABLE
                     && *key != boxes::core::egress::HOST_EXPOSURES_TABLE
+                    // The entry tables and the project's Box Types are read
+                    // by `entry` and `expand`, not by this struct.
+                    && !entry::EntryTable::ALL.iter().any(|t| t.key() == key.as_str())
+                    && *key != BOX_TYPES_TABLE
             }) {
                 match misplaced_top_level_key(key) {
                     Some(correct) => tracing::warn!(
-                        "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
+                        "{key} is unknown at the top level of {shown}; did you mean {correct}?"
                     ),
                     None => unknown.push(key.clone()),
                 }
             }
             if !unknown.is_empty() {
-                tracing::warn!("unknown fields in {}: {}", MFILE_NAME, unknown.join(","));
+                tracing::warn!("unknown fields in {}: {}", shown, unknown.join(","));
                 was_unknown_fields = true;
             }
         }
-        if !self.defaults.extra.is_empty() {
+        // BOX-048: `[defaults]` also holds box settings for every entry, and
+        // a `[defaults.<type>]` table for a built-in or project Box Type.
+        // Expansion reads both and refuses a bad one (BOX-066).
+        let project_types: HashSet<&str> = self
+            .extra
+            .get(BOX_TYPES_TABLE)
+            .and_then(toml::Value::as_table)
+            .map(|t| t.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut unknown_defaults: Vec<&str> = self
+            .defaults
+            .extra
+            .iter()
+            .filter(|(key, value)| {
+                let type_defaults = value.is_table()
+                    && (expand::BUILTIN_BOX_TYPES.contains(&key.as_str())
+                        || project_types.contains(key.as_str()));
+                !type_defaults && !expand::is_spec_key(key)
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        unknown_defaults.sort_unstable();
+        if !unknown_defaults.is_empty() {
             tracing::warn!(
                 "unknown fields in [defaults] section of {}: {}",
-                MFILE_NAME,
-                self.defaults
-                    .extra
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",")
+                shown,
+                unknown_defaults.join(",")
             );
             was_unknown_fields = true;
         }
@@ -1575,7 +1746,7 @@ impl File {
         {
             tracing::warn!(
                 "unknown fields in [stack] section of {}: {}",
-                MFILE_NAME,
+                shown,
                 stack.extra.keys().cloned().collect::<Vec<_>>().join(",")
             );
             was_unknown_fields = true;
@@ -1584,16 +1755,15 @@ impl File {
             && !session.extra.is_empty()
         {
             boxes::core::bep::warn_project_store_rules(session.extra.keys().map(String::as_str));
-            let unknown: Vec<&str> = session
-                .extra
-                .keys()
-                .map(String::as_str)
+            let unknown: Vec<&str> = unknown_entry_keys(&session.extra)
+                .into_iter()
                 .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
+                .filter(|key| *key != HOOKS_ON_RESUME_KEY)
                 .collect();
             if !unknown.is_empty() {
                 tracing::warn!(
                     "unknown fields in [session] section of {}: {}",
-                    MFILE_NAME,
+                    shown,
                     unknown.join(",")
                 );
                 was_unknown_fields = true;
@@ -1601,11 +1771,15 @@ impl File {
         }
 
         for (task_name, task) in &self.tasks {
-            if !task.extra.is_empty() {
+            let unknown: Vec<&str> = unknown_entry_keys(&task.extra)
+                .into_iter()
+                .filter(|key| *key != HOOKS_ON_RESUME_KEY)
+                .collect();
+            if !unknown.is_empty() {
                 tracing::warn!(
                     "unknown fields in task {}: {}",
                     task_name,
-                    task.extra.keys().cloned().collect::<Vec<_>>().join(",")
+                    unknown.join(",")
                 );
                 was_unknown_fields = true;
             }
@@ -2987,11 +3161,12 @@ mod tests {
             "/../boxes/example_project/minimal.toml"
         );
         let src = std::fs::read_to_string(path).expect("example project is readable");
-        let file: File = toml::from_str(&src).expect("example project must parse as an mfile");
+        let file =
+            File::from_toml_bytes(src.as_bytes()).expect("example project must parse as an mfile");
 
         let session = file
             .session
-            .expect("the example declares a [session] block");
+            .expect("the example declares a [defaults.session] block");
         assert_eq!(session.lifecycle_hooks.len(), 1);
         let hook = &session.lifecycle_hooks[0];
         // All four transitions, so each can be exercised from the demo.
@@ -3124,6 +3299,81 @@ mod tests {
         assert!(!out.contains("update to a newer version"), "{out}");
     }
 
+    /// BOX-049: a `timeout` that is not a duration, in `[session]` or a
+    /// task, refuses the load with exit 3, naming the key and the entry.
+    #[test]
+    fn invalid_timeout_exit3_names_key_and_entry() {
+        let takes = "but `timeout` takes a whole number of seconds, or a string of a \
+                     whole number followed by s, m or h, such as \"30s\", \"5m\" or \"1h\". \
+                     Fix the value.";
+        let cases = [
+            (
+                "[defaults.session]\ntimeout = \"2 days\"\n",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a string that is not a duration",
+            ),
+            (
+                "[session]\ntimeout = \"2 days\"\n",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a string that is not a duration",
+            ),
+            (
+                "[tasks.lint]\nexec = [\"true\"]\ntimeout = -5\n",
+                "`[tasks.lint]` in minimal.toml sets `timeout` to a negative number",
+            ),
+            (
+                "[tasks.lint]\nexec = [\"true\"]\ntimeout = 1.5\n",
+                "`[tasks.lint]` in minimal.toml sets `timeout` to a decimal number",
+            ),
+            (
+                "[session]\ntimeout = \"9223372036854775808\"\n",
+                "`[defaults.session]` in minimal.toml sets `timeout` to a duration that is too long",
+            ),
+        ];
+        for (file, start) in cases {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(MFILE_NAME), file).unwrap();
+            let err = File::from_dir(dir.path()).expect_err("a bad timeout is refused");
+            assert!(matches!(&err, Error::InvalidSpecKey { .. }), "{err:?}");
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            assert_eq!(err.to_string(), format!("{start}, {takes}"));
+        }
+
+        // Every value in the grammar loads, zero included.
+        for timeout in ["\"30s\"", "\"5m\"", "\"1h\"", "45", "0", "\"0s\""] {
+            let file = format!("[session]\ntimeout = {timeout}\n");
+            let parsed: File = toml::from_str(&file).unwrap();
+            parsed.validate().expect(&file);
+        }
+    }
+
+    /// BOX-049: `timeout` in `[session]` or a task is a box setting, so the
+    /// load does not report it as an unknown field.
+    #[test]
+    fn timeout_entry_key_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[session]\ntimeout = \"8h\"\n\n[tasks.lint]\nexec = [\"true\"]\ntimeout = 90\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("a timeout in the grammar loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+
+        // Another unknown key in the same entry is still reported, alone.
+        let task: Task = toml::from_str("exec = [\"true\"]\ntimeout = 90\ncolour = 1\n").unwrap();
+        assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
+    }
+
     #[test]
     fn task_with_one_action_passes_validate() {
         for action in [
@@ -3192,6 +3442,174 @@ mod tests {
             "{out}"
         );
         assert_eq!(count_unknown_warnings(&capture), 0, "{out}");
+    }
+
+    /// BOX-028: `hooks_on_resume` under `[session]` or a `[tasks.*]` entry
+    /// is read into the spec, and no unknown-field warning names it.
+    #[test]
+    fn hooks_on_resume_entry_key_is_not_reported_unknown() {
+        for body in [
+            "[session]\nhooks_on_resume = true\n",
+            "[tasks.lint]\nbash = \"true\"\nhooks_on_resume = true\n",
+        ] {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
+            let capture = CaptureWriter::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            File::from_dir(dir.path()).expect("the file reads");
+            drop(guard);
+            let out = capture.contents();
+            assert_eq!(count_unknown_warnings(&capture), 0, "{body}: {out}");
+        }
+        // A key that is not known still warns beside it.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[session]\nhooks_on_resume = true\nbogus = 1\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("the file reads");
+        drop(guard);
+        let out = capture.contents();
+        assert!(out.contains("unknown fields in [session] section"), "{out}");
+        assert!(out.contains("bogus"), "{out}");
+        assert!(!out.contains("hooks_on_resume"), "{out}");
+    }
+
+    /// #3190: a file's legacy-table hints print on the first read of a
+    /// given (path, content) in this process, not on every read. An edit
+    /// prints them again, and a read with no path always prints.
+    #[test]
+    fn legacy_hints_print_once_per_path_and_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        let old = b"[session]\npackages = [\"git\"]\n";
+        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
+        assert!(legacy_hints_due(Some(&path), old), "first read prints");
+        assert!(
+            !legacy_hints_due(Some(&path), old),
+            "second read of the same file is quiet"
+        );
+        assert!(legacy_hints_due(Some(&path), new), "an edit prints again");
+        assert!(!legacy_hints_due(Some(&path), new), "and only once");
+        assert!(legacy_hints_due(None, old), "a read with no path prints");
+        assert!(legacy_hints_due(None, old), "every time");
+    }
+
+    /// #3190, end to end through the parse: reading the same legacy file
+    /// twice prints its hint once, an edit prints it again, and a read with
+    /// no path prints it on every read.
+    #[test]
+    fn parse_prints_a_files_legacy_hint_once_until_it_changes() {
+        // A `[session]` table is the one legacy table here, so a read that
+        // prints prints exactly one `hint:` line.
+        let printed = |bytes: &[u8], path: Option<&Path>| {
+            let mut out = Vec::new();
+            File::parse_to(bytes, path, &mut out).expect("the file parses");
+            let out = String::from_utf8(out).unwrap();
+            out.lines().filter(|l| l.starts_with("hint: ")).count()
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        let old = b"[session]\npackages = [\"git\"]\n";
+        let new = b"[session]\npackages = [\"git\", \"jq\"]\n";
+
+        assert_eq!(
+            printed(old, Some(&path)),
+            1,
+            "the first read prints the hint"
+        );
+        assert_eq!(
+            printed(old, Some(&path)),
+            0,
+            "a second read of the same file is quiet"
+        );
+        assert_eq!(printed(new, Some(&path)), 1, "an edit prints it again");
+        assert_eq!(printed(new, Some(&path)), 0, "and only once");
+        assert_eq!(printed(old, None), 1, "a read with no path prints");
+        assert_eq!(printed(old, None), 1, "on every read");
+    }
+
+    /// Reads `body` as a project's `minimal.toml` and returns the warnings
+    /// it prints and the file's path.
+    fn load_warnings(body: &str) -> (String, PathBuf, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, body).unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("the file reads");
+        drop(guard);
+        (capture.contents(), path, dir)
+    }
+
+    /// #3188: the entry tables, `[box_types]`, the box settings in
+    /// `[defaults]` and a `[defaults.<type>]` table are read by `entry` and
+    /// `expand`, so no unknown-field warning names them.
+    #[test]
+    fn entry_shape_tables_are_not_reported_unknown() {
+        let body = "\
+[defaults]
+timeout = \"30s\"
+
+[defaults.session]
+packages = [\"git\"]
+
+[defaults.devbox]
+pty_enabled = true
+
+[box_types.devbox]
+extends = \"session\"
+
+[sessions.shell]
+
+[boxes.dev]
+type = \"devbox\"
+
+[tasks.lint]
+bash = \"true\"
+";
+        let (out, _path, _dir) = load_warnings(body);
+        assert!(!out.contains("unknown fields in"), "{out}");
+        assert!(!out.contains("newer version of minimal"), "{out}");
+    }
+
+    /// #3188: a key nothing reads still warns, and the warning names the
+    /// file's path rather than a bare `minimal.toml`.
+    #[test]
+    fn unknown_keys_still_warn_and_name_the_files_path() {
+        let (out, path, _dir) = load_warnings(
+            "bogus = 1\n\n[defaults]\nnot_a_setting = 1\n\n[defaults.nosuchtype]\nx = 1\n",
+        );
+        let shown = path.display();
+        assert!(
+            out.contains(&format!("unknown fields in {shown}: bogus")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "unknown fields in [defaults] section of {shown}: nosuchtype,not_a_setting"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("help: do you need to update to a newer version of minimal?"),
+            "{out}"
+        );
     }
 
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {

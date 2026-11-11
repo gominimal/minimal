@@ -345,9 +345,21 @@ pub(crate) fn build_composables(
     // below — once folded into `top_level_names` for the closure
     // walk, once moved into the effective Session block so those
     // packages actually land in the sandbox.
+    //
+    // When the client sent the box's expanded entry (BOX-068), the entry
+    // is the only source of the project's `[session]` items. The client
+    // already expanded a legacy `[session]` table into a session entry,
+    // and a task entry must not inherit it. So `[session]` is not read
+    // here, and the entry's own packages join the closure walk below.
+    let entry = contribution.entry.as_deref();
+    let session_table = if entry.is_some() {
+        None
+    } else {
+        mfile.session.as_ref()
+    };
     let project_declared_packages: std::collections::BTreeSet<String> = {
         let mut all = std::collections::BTreeSet::<String>::new();
-        if let Some(s) = mfile.session.as_ref() {
+        if let Some(s) = session_table {
             all.extend(s.packages.iter().cloned());
         }
         if let Some(stack) = mfile.stack.as_ref() {
@@ -372,6 +384,12 @@ pub(crate) fn build_composables(
                 .iter()
                 .map(|p| p.name.clone()),
         );
+        // An entry package gets its `env_state_wiring` and fs mappings,
+        // the same as a `[session]` package. The composer adds the
+        // package itself to the box when it reads the entry.
+        if let Some(packages) = entry.and_then(|e| e.packages.as_ref()) {
+            set.extend(packages.iter().cloned());
+        }
         set.into_iter().collect()
     };
 
@@ -381,16 +399,16 @@ pub(crate) fn build_composables(
     // graph-Stack `build_env_vars`. Skips the `mfile.session.clone()`
     // allocation on the common bare-mfile path.
     let has_material = !project_declared_packages.is_empty()
-        || mfile.session.as_ref().is_some_and(|s| !s.is_empty())
+        || session_table.is_some_and(|s| !s.is_empty())
         || graph_stack.is_some_and(|g| !g.build_env_vars.is_empty());
     let project_composable = if !has_material {
         None
     } else {
         // Starts from the on-disk `[session]` block (or an empty
-        // default), then folds in the union package list and any
+        // default, always when the client sent an entry), then folds in the union package list and any
         // graph-Stack `build_env_vars`. Session-declared vars win
         // over stack-inherited ones for the same name.
-        let mut effective = mfile.session.clone().unwrap_or_default();
+        let mut effective = session_table.cloned().unwrap_or_default();
         effective.packages = project_declared_packages.into_iter().collect();
         if let Some(gstack) = graph_stack {
             fold_stack_vars_into_session(&mut effective, &gstack.name, &gstack.build_env_vars);
@@ -421,6 +439,8 @@ pub(crate) fn build_composables(
     tracing::info!(
         project_path = %project_path,
         top_level_names = ?top_level_names,
+        entry = ?entry.map(|e| e.name.as_str()),
+        reads_session_table = session_table.is_some(),
         "compose: walking top-level packages for env_state_wiring + \
          env_dir/file_mappings",
     );
@@ -864,5 +884,91 @@ mod tests {
             msg.contains("cache/artifacts"),
             "error should name the offending prefix: {msg}"
         );
+    }
+
+    /// BOX-068: when the client sends an expanded entry, the daemon
+    /// reads no `[session]` table, and each entry package joins the
+    /// closure walk. An entry-only package with `env_state_wiring` then
+    /// contributes its var, as a `[session]` package does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entry_only_package_contributes_its_state_wiring() {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"cargo\"]\n",
+        )
+        .unwrap();
+        let pkg_dir = project.path().join("packages").join("wired");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("build.ncl"),
+            indoc! {"
+                let {build, ..} = import \"minimal.ncl\" in
+                build {
+                    name = \"wired\",
+                    build_deps = [],
+                    cmd = \"\",
+                    attrs.env_state_wiring = [
+                      { env_var = \"WIRED_CACHE\", prefix = \"wired\" },
+                    ],
+                }
+            "},
+        )
+        .unwrap();
+
+        let cache = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+        let declared = paths::HostAbsPath::try_new("/home/dev/myproject").unwrap();
+        let resolution = resolve_project_ctx_and_graph(&daemon, &path)
+            .expect("a project with one local package resolves offline");
+
+        let mut entry =
+            boxes::wire::request::WireBoxEntry::new("check", "task", declared.clone().into());
+        entry.packages = Some(vec!["wired".into()]);
+        let contribution = WireContribution {
+            entry: Some(Box::new(entry)),
+            ..WireContribution::default()
+        };
+        let (project_composable, packages) =
+            build_composables(&path, &declared, &resolution, &contribution, true).unwrap();
+
+        assert!(
+            project_composable.is_none(),
+            "with an entry, the `[session]` table contributes nothing",
+        );
+        let names: Vec<&str> = packages.iter().map(|p| p.package_name()).collect();
+        assert_eq!(names, ["wired"], "the entry package is walked");
+        let env = |_: &str| Err(std::env::VarError::NotPresent);
+        let wired = packages
+            .into_iter()
+            .next()
+            .unwrap()
+            .contribute(&env)
+            .unwrap();
+        let vars: Vec<(&str, &str)> = wired
+            .vars()
+            .iter()
+            .map(|pv| (pv.var().name(), pv.var().value()))
+            .collect();
+        assert_eq!(vars, [("WIRED_CACHE", "/state/wired")]);
+
+        // With no entry, the same project still reads `[session]`.
+        let (project_composable, _) = build_composables(
+            &path,
+            &declared,
+            &resolution,
+            &WireContribution::default(),
+            true,
+        )
+        .unwrap();
+        assert!(project_composable.is_some());
     }
 }

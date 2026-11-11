@@ -13,8 +13,11 @@ pub enum Error {
     IO(&'static str, PathBuf, #[source] std::io::Error),
     #[error("invalid TOML: {0}")]
     Format(#[source] toml::de::Error),
+    // Every mfile error's Display already prints its cause: the TOML parse
+    // error, or the io error. So the variant returns no `source()`, and a
+    // chain printer such as `{:#}` shows each cause once.
     #[error("{prefix}: {0}", prefix = mfile::MFILE_NAME)]
-    MFile(#[from] mfile::Error),
+    MFile(mfile::Error),
     #[error("{}", GraphDisplay(.0))]
     Graph(Box<graph::Error>),
 
@@ -352,6 +355,12 @@ pub fn remote_cache_setup_error(
     }
 }
 
+impl From<mfile::Error> for Error {
+    fn from(e: mfile::Error) -> Self {
+        Error::MFile(e)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +375,45 @@ mod tests {
             Error::MFile(mfile::Error::NotFound).to_string(),
             "minimal.toml: not found",
         );
+    }
+
+    /// A minimal file that does not parse prints `invalid TOML` and the TOML
+    /// parse error once each under `{:#}`, with the snippet.
+    #[test]
+    fn mfile_format_error_prints_toml_error_once() {
+        let error = mfile::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("the file does not parse");
+        assert!(matches!(error, mfile::Error::Format(_)), "{error:?}");
+        // `Error` is not `Send`, so anyhow cannot hold it. Walk the chain the
+        // way anyhow's `{:#}` does.
+        let error = Error::MFile(error);
+        let mut printed = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(e) = cause {
+            printed.push_str(&format!(": {e}"));
+            cause = e.source();
+        }
+        assert!(
+            printed.starts_with("minimal.toml: invalid TOML: TOML parse error"),
+            "{printed}"
+        );
+        assert_eq!(printed.matches("invalid TOML").count(), 1, "{printed}");
+        assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
+        assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
+    }
+
+    /// An unreadable minimal file prints its io error once under `{:#}`.
+    #[test]
+    fn mfile_io_error_prints_io_error_once() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let error = Error::MFile(mfile::Error::IO("minimal file", "p".into(), io));
+        let mut printed = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(e) = cause {
+            printed.push_str(&format!(": {e}"));
+            cause = e.source();
+        }
+        assert_eq!(printed.matches("denied").count(), 1, "{printed}");
     }
 
     /// A remote cache setup failure keeps its cause under `{:#}`, rendered

@@ -140,7 +140,9 @@ impl Layer {
 
     /// Loads all objects in the given directory following the standard directory layout.
     pub fn new<P: AsRef<Path>>(layer_dir: P, opts: &LoadOptions) -> Result<Self, Error> {
-        let (upstream, params, config_dir) = match mfile::File::from_dir(layer_dir.as_ref()) {
+        // As the graph reads a layer: its tasks never run here.
+        let loaded = mfile::File::from_dir_for_graph(layer_dir.as_ref());
+        let (upstream, params, config_dir) = match loaded {
             Ok(mfile) => {
                 if let Some(min_vers) = &mfile.stdlib.minimum_version
                     && stdlib::outdated(min_vers)
