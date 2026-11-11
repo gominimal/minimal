@@ -15578,3 +15578,281 @@ async fn retained_box_management_end_to_end() {
         );
     }
 }
+
+// T14 (S3): boxes started, attached and resumed, end to end. `min session
+// start default --name web --network own_ip --loadout rust` creates the box
+// of the session entry `default` under the name `web`, with the network mode and
+// the loadouts the flags give. `min box start build` plans the task entry's
+// box as a detached run. `min box attach web` and the bare `min box attach`
+// reach the box later, and the caller detaches. `min box stop web` stops
+// it, and `min box resume web` takes the stopped box to the attach. A
+// stopped box with no terminal is refused, and the refusal names the next
+// command. The harness attach records its target in place of the ssh
+// hand-off, so the host does not resume the box here: minimald's tests
+// prove that half. One span covers the start, the detach, the stop and the
+// resume of the box. A failure prints each command run so far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_attach_resume_end_to_end() {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreatingVerb, Errorable,
+        FinalizeSession, FinalizeSessionRequest,
+    };
+    use tracing::Instrument as _;
+
+    let toml = "[sessions.default.network.egress]\n\
+                allow_dns_hosts = [\"a.example\"]\n\n\
+                [tasks.build]\n\
+                echo = 'x'\n";
+    let log = minimald::test_harness::captured_log();
+    let mut ran = Transcript::default();
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    std::fs::write(alpha.project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(alpha.project.path()).expect("a UTF-8 path");
+    let hosts = || vec![alpha.host.clone()];
+    let scope = alpha.scope();
+    let entries = start_entries(toml);
+
+    // `min box start build` plans the task entry's box as a detached run.
+    let argv = ["min", "box", "start", "build", "--network", "none"];
+    let plan = plan_start(&parsed_start(&argv), &entries, true);
+    ran.push(
+        &argv.join(" "),
+        b"",
+        b"",
+        format!(
+            "{:?}",
+            plan.as_ref()
+                .map(|p| p.entry().to_owned())
+                .map_err(|e| format!("{e:#}"))
+        ),
+    );
+    let Ok(StartPlan::Detached { entry, run }) = plan else {
+        panic!("a task box starts detached\n{ran}");
+    };
+    assert_eq!(entry, "build", "{ran}");
+    assert_eq!(run.entry, "build", "{ran}");
+    assert_eq!(run.network, Some(CliNetworkMode::NoNet), "{ran}");
+
+    let span = tracing::info_span!("start_attach_resume_end_to_end", entry = "default");
+    let ran = &mut ran;
+    let web = async {
+        // `min session start default --name web --network own_ip --loadout rust`.
+        let argv = [
+            "min",
+            "session",
+            "start",
+            "default",
+            "--name",
+            "web",
+            "--network",
+            "own_ip",
+            "--loadout",
+            "rust",
+        ];
+        let plan = plan_start(&parsed_start(&argv), &entries, true);
+        let Ok(StartPlan::Session {
+            entry,
+            args,
+            options,
+        }) = plan
+        else {
+            panic!("the entry default is a session: {plan:?}\n{ran}");
+        };
+        assert_eq!(entry, "default", "{ran}");
+        assert!(args.attach, "a session box attaches this terminal\n{ran}");
+        assert_eq!(
+            start_loadout_selection(&args),
+            loadouts::LoadoutSelection::Cli(vec!["rust".to_owned()]),
+            "{ran}"
+        );
+        let (port_mappings, flags) = flag_network_overrides(&args).expect("the flags parse");
+        let project = project_egress(root, options.entry.as_deref()).expect("the project loads");
+        let egress = effective_egress(project.policy, flags, args.egress.deny_all_egress);
+        let policy = network_override_policy(&args, port_mappings, egress.policy);
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+            args.network.into(),
+            policy,
+        );
+        request.config.name = minimal_client::box_name::request_name(args.name.as_deref());
+        request.config.creating_verb = CreatingVerb::Session;
+        stamp_session_spec_as(
+            &mut request,
+            root,
+            options.entry.as_deref(),
+            options.box_name.as_deref(),
+        )
+        .expect("the spec is stamped");
+        let mut daemon = alpha.server.connect().await;
+        let created = daemon.call::<CreateSession>(&request).await;
+        let web = match created {
+            Errorable::Ok(created) => created.id,
+            Errorable::Err { error } => {
+                ran.push(&argv.join(" "), b"", error.as_bytes(), 1);
+                panic!("the create failed: {error}\n{ran}")
+            }
+        };
+        minimald::test_harness::unwrap_ready(
+            daemon
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: web,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        if let Errorable::Err { error } = daemon
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: web,
+                report_shared_port_collisions: false,
+            })
+            .await
+        {
+            ran.push(&argv.join(" "), b"", error.as_bytes(), 1);
+            panic!("the start failed: {error}\n{ran}");
+        }
+        ran.push(&argv.join(" "), format!("{web}\n").as_bytes(), b"", 0);
+        tracing::info!(verb = "session start", box_id = %web, outcome = "created");
+        let record = shown_record(&alpha.host, web).await;
+        assert_eq!(record.name.as_deref(), Some("web"), "{ran}");
+        assert_eq!(record.state, "running", "{ran}");
+        let mut client = box_host_client(&alpha.host).await.unwrap();
+        let stored = stored_box_record(&mut client, web)
+            .await
+            .expect("the record is read")
+            .expect("the box has a record");
+        assert_eq!(stored.network, boxes::NetworkMode::OwnIp, "{ran}");
+        assert_eq!(
+            stored
+                .policy
+                .egress
+                .as_ref()
+                .and_then(|egress| egress.allow_dns_hosts.clone()),
+            Some(vec!["a.example".to_owned()]),
+            "the entry's egress stays\n{ran}"
+        );
+
+        // `min box attach web`, then the bare `min box attach`, each reach
+        // the box, and the caller detaches.
+        for address in [Some("web"), Some(&*web.to_string()), None] {
+            let mut attached = None;
+            let ended = box_attach_on_hosts(
+                hosts(),
+                address,
+                Some(&scope),
+                true,
+                async |target: &BoxAttachTarget| {
+                    attached = Some(target.clone());
+                    Ok(0)
+                },
+            )
+            .await;
+            let command = format!("min box attach {}", address.unwrap_or_default());
+            let notice = ended
+                .as_ref()
+                .ok()
+                .and_then(|ending| ending.notice.clone())
+                .unwrap_or_default();
+            ran.push(
+                command.trim_end(),
+                b"",
+                notice.as_bytes(),
+                format!(
+                    "{:?}",
+                    ended.as_ref().map(|e| e.code).map_err(|e| format!("{e:#}"))
+                ),
+            );
+            let ended = ended.unwrap_or_else(|e| panic!("the attach: {e:#}\n{ran}"));
+            assert_eq!(ended.code, 0, "the caller detached\n{ran}");
+            let target = attached.expect("the attach ran");
+            assert_eq!(target.box_id, web, "{ran}");
+            assert_eq!(target.host.sock, alpha.host.sock, "{ran}");
+            assert_eq!(address_state(&alpha.host, "web").await, "running", "{ran}");
+        }
+
+        // `min box stop web`.
+        let mut out = Vec::new();
+        let stopped = cmd::stop_box_on_hosts(hosts(), &mut out, "web", false).await;
+        ran.push(
+            "min box stop web",
+            &out,
+            b"",
+            format!(
+                "{:?}",
+                stopped.as_ref().map(|_| 0).map_err(|e| format!("{e:#}"))
+            ),
+        );
+        stopped.unwrap_or_else(|e| panic!("the stop: {e:#}\n{ran}"));
+        assert_eq!(address_state(&alpha.host, "web").await, "stopped", "{ran}");
+
+        // `min box resume web` takes the stopped box to the attach.
+        let resumed = attached_by(AttachVerb::BoxResume, &hosts(), Some("web"), None).await;
+        ran.push(
+            "min box resume web",
+            b"",
+            b"",
+            format!(
+                "{:?}",
+                resumed.as_ref().map(|_| 0).map_err(|e| format!("{e:#}"))
+            ),
+        );
+        let target = resumed.unwrap_or_else(|e| panic!("the resume: {e:#}\n{ran}"));
+        assert_eq!(target.box_id, web, "{ran}");
+        assert_eq!(target.name.as_deref(), Some("web"), "{ran}");
+        web
+    }
+    .instrument(span)
+    .await;
+
+    // A stopped box with no terminal: the refusal names the next command.
+    alpha
+        .create_with(
+            "agent",
+            resume_spec(false, Some("until_stopped")),
+            CreatingVerb::Session,
+        )
+        .await;
+    alpha
+        .create_with("job", resume_spec(false, None), CreatingVerb::Task)
+        .await;
+    alpha.stop("agent").await;
+    alpha.stop("job").await;
+    for (address, next) in [
+        ("agent", "Restart it with min box restart agent."),
+        ("job", "Run it again with min box run <entry>."),
+    ] {
+        for verb in [AttachVerb::BoxAttach, AttachVerb::BoxResume] {
+            let (message, code) = refused_by(verb, &hosts(), Some(address), None).await;
+            ran.push(
+                &format!("min {} {address}", verb.name()),
+                b"",
+                message.as_bytes(),
+                code,
+            );
+            assert_eq!(code, 2, "{ran}");
+            assert_eq!(
+                message,
+                format!("{address} has no terminal to resume.\n{next}"),
+                "{ran}"
+            );
+        }
+    }
+
+    // The span covers the start, the detach, the stop and the resume.
+    let log = log.contents();
+    for (verb, outcome) in [
+        ("session start", "created"),
+        ("box attach", "ended"),
+        ("box resume", "attaching"),
+    ] {
+        assert!(
+            log.lines()
+                .any(|line| line.contains("start_attach_resume_end_to_end{")
+                    && line.contains(&format!("verb=\"{verb}\""))
+                    && line.contains(&format!("box_id={web}"))
+                    && line.contains(&format!("outcome=\"{outcome}\""))),
+            "a `{verb}` {outcome} event in the span\n{log}\n{ran}"
+        );
+    }
+}
