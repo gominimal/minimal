@@ -51,12 +51,12 @@ pub fn box_registered_start_line(
 /// apply to, so a stance or range on a `host_ip` or `none` box would be a
 /// declaration `min session policy` shows and nothing ever honours. The
 /// CLI reference documents the flags as requiring `--network own_ip`.
-pub(super) fn refuse_dynamic_ingress_off_own_ip(
-    network: crate::cli::CliNetworkMode,
+pub(crate) fn refuse_dynamic_ingress_off_own_ip(
+    network: impl Into<boxes::NetworkMode>,
     mode: Option<boxes::DynamicIngress>,
     range: Option<(u16, u16)>,
 ) -> Result<(), anyhow::Error> {
-    if network != crate::cli::CliNetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
+    if network.into() != boxes::NetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
         anyhow::bail!(
             "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with \
              its own IP address can publish ports"
@@ -805,6 +805,13 @@ pub(crate) fn plan_start(
             args.ingress.clone_from(&overrides.ingress);
             args.egress.clone_from(&overrides.egress);
             args.loadout.clone_from(&overrides.loadout);
+            // BCLI-075, BCLI-076: the rest of activate's override flags.
+            let other = &overrides.other;
+            args.dynamic_ingress = other.dynamic_ingress;
+            args.dynamic_range = other.dynamic_range;
+            args.credentialed_upstream = other.credentialed_upstream;
+            args.no_loadouts = other.no_loadouts;
+            args.no_hooks = other.no_hooks;
             Ok(StartPlan::Session {
                 options: ActivationOptions {
                     offer_scaffold: false,
@@ -861,6 +868,7 @@ pub(crate) fn plan_start(
                 args: Vec::new(),
                 network: start.overrides.network,
                 egress: start.overrides.egress.clone(),
+                other: start.overrides.other.clone(),
             },
             entry: entry.name,
         }),
@@ -952,6 +960,7 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
         ingress = ?start.overrides.ingress,
         egress = ?start.overrides.egress,
         loadouts = ?start.overrides.loadout,
+        other_overrides = ?start.overrides.other,
         "starting a box from the entry"
     );
     match plan {

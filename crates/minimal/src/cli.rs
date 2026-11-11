@@ -1194,6 +1194,8 @@ pub struct TaskRunArgs {
     pub network: Option<CliNetworkMode>,
     #[command(flatten)]
     pub egress: EgressArgs,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
     /// Start the box, print its id and return. The task gets no input.
     #[arg(long)]
     pub detach: bool,
@@ -1227,6 +1229,8 @@ pub struct BoxRunArgs {
     pub network: Option<CliNetworkMode>,
     #[command(flatten)]
     pub egress: EgressArgs,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
     /// Arguments to the entry, passed through to its declared `args`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
@@ -1308,8 +1312,64 @@ pub struct StartOverrideArgs {
     /// Repeatable. With any `--loadout`, the client config's
     /// `[loadouts].default_loadouts` are not applied. A task entry does not
     /// take it
-    #[arg(long = "loadout", value_name = "NAME")]
+    // BCLI-075: `--no-loadouts` with `--loadout` is a usage error, exit 2.
+    // The conflict is declared here because the run verbs take
+    // `--no-loadouts` and no `--loadout`.
+    #[arg(long = "loadout", value_name = "NAME", conflicts_with = "no_loadouts")]
     pub loadout: Vec<String>,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
+}
+
+// The override flags that `min box start`, `min session start`, `min task
+// run` and `min box run` take beside `--network` and the egress flags, as
+// `min session activate` takes them (BCLI-024, BCLI-075, BCLI-076). They
+// are the rest of activate's `[network]` flags, `--no-loadouts` and
+// `--no-hooks`.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct BoxOverrideArgs {
+    /// How the box's requests to publish a port while it runs are decided:
+    /// `allow` publishes a port the box asks for with `min net expose` or
+    /// listens on inside `--dynamic-range`, `ask` puts each request to the
+    /// person attached to the box, and `deny`, the same as leaving the flag
+    /// unset, refuses every request. Sets the box's
+    /// `network.dynamic_ingress`. Requires `--network own_ip`.
+    #[arg(
+        long = "dynamic-ingress",
+        value_name = "allow|ask|deny",
+        value_parser = parse_dynamic_ingress_mode
+    )]
+    pub dynamic_ingress: Option<boxes::DynamicIngress>,
+    /// Port range `LO-HI`, both ends included, in which
+    /// `--dynamic-ingress allow` accepts requests, e.g. `8000-8443`. A
+    /// request outside it is refused. Requires `--dynamic-ingress`.
+    #[arg(
+        long = "dynamic-range",
+        value_name = "LO-HI",
+        value_parser = parse_dynamic_range,
+        requires = "dynamic_ingress"
+    )]
+    pub dynamic_range: Option<(u16, u16)>,
+    /// Let the box reach the Box Egress Proxy, whatever its
+    /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
+    /// box sends to the proxy's address is dropped, unless minimal.toml
+    /// grants the box a secret through the proxy. Takes effect with
+    /// `--network own_ip`, and with `--network host_ip` on a host that runs
+    /// boxes in a VM.
+    #[arg(long)]
+    pub credentialed_upstream: bool,
+    /// Apply no loadouts, and not the client config's
+    /// `[loadouts].default_loadouts` either
+    #[arg(long)]
+    pub no_loadouts: bool,
+    /// Run none of the box's lifecycle hooks, from the loadouts or from
+    /// minimal.toml. The choice is kept with the box, so it also holds
+    /// when the box is attached or detached, and when it ends
+    #[arg(long)]
+    pub no_hooks: bool,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
