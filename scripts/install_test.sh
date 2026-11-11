@@ -2810,6 +2810,7 @@ STUB
     check 0 "$rc" "install exits 0 with neither identity"
     want_ok "a parent with no memory controller is noted, and the install goes on" \
         grep -q "parent offers it no memory controller" "$OUT"
+    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
     want_ok "no controller is enabled on the slice over such a parent (no file, or no +memory in it)" \
         sh -c '[ ! -e "$1" ] || ! grep -q "+memory" "$1"' _ "$tree/cgroup.subtree_control"
     want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
@@ -3016,25 +3017,6 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     # the daemon's own ruleset tests read this mode, so the two spellings
     # cannot drift.
 
-    # The write to the slice's cgroup.subtree_control can fail. The one cause the step proves is a process
-    # standing in the slice itself (cgroup.procs non-empty); any other failure is named as the write's error.
-    HC_HELPER="$root/hclib/quic443-leaf"
-    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
-    chmod 0444 "$tree/cgroup.subtree_control"
-    printf '4242\n' >"$tree/cgroup.procs"
-    run_hc install-standing "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 0 "$rc" "install exits 0 when the slice refuses the memory controller"
-    want_ok "a process standing in the slice is named as the cause, with its pid" \
-        grep -q "a process stands in the slice itself rather than in a leaf (pid 4242)" "$OUT"
-    : >"$tree/cgroup.procs"
-    run_hc install-unwritable "$root/mi-on" --user "$me" \
-        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 0 "$rc" "install exits 0 when the write fails for another reason"
-    want_ok "an unexplained failure is named as the write's own error, not as a standing process" \
-        sh -c 'grep -q "the write failed (" "$1" && ! grep -q "a process stands in the slice" "$1"' _ "$OUT"
-    chmod 0644 "$tree/cgroup.subtree_control"
-    unset HC_HELPER HC_SUDOERS
     run_hc print_ruleset "$root/mi-on" --print-ruleset \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 0 "$rc" "--print-ruleset exits 0"
@@ -3048,6 +3030,23 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
     want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
     want_ok "check reports the recorded ct-mark mask" grep -q "ct-mark:  0x30000000" "$OUT"
+
+    # The write to the slice's cgroup.subtree_control can fail for a reason other than a process standing in
+    # the slice (that cause the step proves from cgroup.procs and names with the pid; a pid planted there would
+    # also change what the install lays out, so the rehearsal leaves it alone): an unwritable file. The note then
+    # names the write's own error and no standing process. After the section's own checks, so the tree the
+    # print-ruleset and --check runs read is the first install's.
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    chmod 0444 "$tree/cgroup.subtree_control"
+    run_hc install-unwritable "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    chmod 0644 "$tree/cgroup.subtree_control"
+    unset HC_HELPER HC_SUDOERS
+    check 0 "$rc" "install exits 0 when the slice's write fails"
+    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+    want_ok "an unexplained failure is named as the write's own error, not as a standing process" \
+        sh -c 'grep -q "the write failed (" "$1" && ! grep -q "a process stands in the slice" "$1"' _ "$OUT"
 
     # --user takes an account name too, resolved to the same uid and group;
     # only when the caller's uid has a passwd entry to name it by (a cross
