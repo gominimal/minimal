@@ -282,6 +282,20 @@ pub fn link_collision(src: &Path, dst: &Path) -> LinkCollision {
 }
 
 /// Creates a hardlink farm in dst representing files in src, recursively.
+/// The cross-device stand-in for a hard link: copy `src` (whose metadata is `meta`) to `dst` and give the
+/// copy the source's modification time. `fs::copy` keeps the permission bits only and stamps the copy
+/// with now, so a source tree copied that way carries its files' order of copying as their age, and an
+/// autotools build then regenerates `configure` (`make` sees it older than `configure.ac`) and dies in
+/// `missing autoconf`.
+fn copy_keeping_mtime(src: &Path, meta: &std::fs::Metadata, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst)?;
+    let mtime = meta.modified()?;
+    std::fs::File::options()
+        .write(true)
+        .open(dst)?
+        .set_times(std::fs::FileTimes::new().set_modified(mtime))
+}
+
 pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError> {
     hardlink_dir_contents_counted(src, dst, &mut LinkCollisions::default())
 }
@@ -362,7 +376,12 @@ pub fn hardlink_dir_contents_counted(
                             dst_path.display()
                         );
                     }
-                    fs::copy(&path, &dst_path).map(|_| ())
+                    // A hard link shares the source's inode, times included; `fs::copy` keeps the
+                    // permission bits only and stamps the copy with now. A source tree copied this
+                    // way comes out with its files' order of copying as their age, so make's regen
+                    // rules fire (`configure` older than `configure.ac`) and an autotools build
+                    // dies in `missing autoconf`. Keep the source's modification time.
+                    copy_keeping_mtime(&path, &metadata, &dst_path)
                 }
                 Err(e) => Err(e),
             }
@@ -850,6 +869,28 @@ pub fn default_parallelism() -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// The cross-device copy keeps the source's modification time, as the hard link it stands in for
+    /// does: the age of a copied `configure` is the tarball's, not the copy's.
+    #[test]
+    fn a_cross_device_copy_keeps_the_sources_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("configure");
+        let dst = dir.path().join("copy").join("configure");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&src, "#!/bin/sh\n").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let meta = std::fs::metadata(&src).unwrap();
+        super::copy_keeping_mtime(&src, &meta, &dst).unwrap();
+        assert_eq!(std::fs::metadata(&dst).unwrap().modified().unwrap(), old);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"#!/bin/sh\n");
+    }
+
     use super::*;
 
     /// A symlink loop in a tree sends the following walk down `a/a/a/...` until
