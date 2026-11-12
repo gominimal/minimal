@@ -765,18 +765,26 @@ impl AddressBook {
             node: node.to_string(),
             name: name.to_string(),
         };
-        let own = self
+        // The box's own address, back from its quarantine: the one address
+        // that is not fresh.
+        let came_back = self
             .released
             .iter()
             .find(|(_, (was, _))| *was == holder)
-            .map(|(address, _)| *address)
-            .or_else(|| {
-                keep.filter(|address| {
-                    in_box_range(*address)
-                        && !self.held.contains_key(address)
-                        && !self.released.contains_key(address)
-                })
-            });
+            .map(|(address, _)| *address);
+        let own = came_back.or_else(|| {
+            keep.filter(|address| {
+                in_box_range(*address)
+                    && !self.held.contains_key(address)
+                    && !self.released.contains_key(address)
+            })
+        });
+        // An address the caller asks to keep is theirs to name, but it is a
+        // fresh one all the same and counts against their user's share: it
+        // once did not, and one member could name the whole range.
+        if came_back.is_none() && own.is_some() {
+            self.within_user_cap(node)?;
+        }
         let (first, last) = switch::box_loopback_interior();
         let free = own.or_else(|| {
             (u32::from(first)..=u32::from(last))
@@ -880,7 +888,16 @@ impl AddressBook {
             node: node.to_string(),
             name: name.to_string(),
         };
-        if !self.held.values().any(|held| *held == holder) {
+        // Fresh unless this holder has this very address already, held or
+        // in its quarantine. Holding some other address under the same name
+        // is no exemption: it once was, and one name (or the one name every
+        // node address is kept by) could claim the whole range.
+        let already_theirs = self.held.get(&address) == Some(&holder)
+            || self
+                .released
+                .get(&address)
+                .is_some_and(|(was, _)| *was == holder);
+        if !already_theirs {
             self.within_user_cap(node)?;
         }
         if let Some((was, at)) = self.released.get(&address)
@@ -5248,6 +5265,82 @@ mod tests {
             single
                 .allocate(&alice, &format!("box{i}"))
                 .unwrap_or_else(|e| panic!("one operator is not capped: {e}"));
+        }
+    }
+
+    /// The share holds whichever way an address is asked for: an `allocate`
+    /// that names an address to keep, a second address under a name already
+    /// held, and a host-address box's node address each count, where each
+    /// once took the whole range for one user (differential review, B-2).
+    #[test]
+    fn the_share_holds_for_kept_repeated_and_node_addresses() {
+        let alice = qualified_node("vm-a", 501);
+        let bob = qualified_node("vm-b", 502);
+        let at = |tail: usize| Ipv4Addr::new(127, 0, 64, u8::try_from(tail + 2).expect("in range"));
+        let past_the_share = |granted: usize| {
+            assert!(
+                granted <= PER_USER_ADDRESSES,
+                "{granted} addresses for one user, past the share of {PER_USER_ADDRESSES}"
+            );
+        };
+
+        // `keep`: a free address the caller names is a fresh one.
+        {
+            let tables = RegisteredTables::shared();
+            let mut book = tables.book();
+            book.range_probe = range_present;
+            let kept = (0..PER_USER_ADDRESSES * 2)
+                .filter(|i| {
+                    book.allocate_keeping(&alice, &format!("box{i}"), Some(at(*i)))
+                        .is_ok()
+                })
+                .count();
+            past_the_share(kept);
+            book.allocate(&bob, "theirs")
+                .expect("another user still gets one");
+        }
+
+        // One name, many addresses.
+        {
+            let tables = RegisteredTables::shared();
+            let mut book = tables.book();
+            book.range_probe = range_present;
+            let repeated = (0..PER_USER_ADDRESSES * 2)
+                .filter(|i| book.claim(&alice, "same", at(*i)).is_ok())
+                .count();
+            past_the_share(repeated);
+            book.allocate(&bob, "theirs")
+                .expect("another user still gets one");
+        }
+
+        // Node addresses, all under the one name the book keeps them by.
+        {
+            let tables = RegisteredTables::shared();
+            let mut book = tables.book();
+            book.range_probe = range_present;
+            let node = (0..PER_USER_ADDRESSES * 2)
+                .filter(|i| book.claim_node_address(&alice, at(*i)).is_ok())
+                .count();
+            past_the_share(node);
+            book.allocate(&bob, "theirs")
+                .expect("another user still gets one");
+        }
+
+        // What is not fresh still costs nothing: the same claim again, and
+        // a box's own address coming back from its quarantine.
+        {
+            let tables = RegisteredTables::shared();
+            let mut book = tables.book();
+            book.range_probe = range_present;
+            for i in 0..PER_USER_ADDRESSES {
+                book.claim(&alice, &format!("box{i}"), at(i))
+                    .expect("within the share");
+            }
+            book.claim(&alice, "box0", at(0))
+                .expect("the same claim again");
+            assert_eq!(book.release(&alice, "box1"), Some(at(1)));
+            book.claim(&alice, "box1", at(1))
+                .expect("its own address comes back");
         }
     }
 
