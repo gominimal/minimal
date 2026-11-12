@@ -750,25 +750,33 @@ pub(crate) mod linux {
     /// placed, but one started by an earlier release does not. No single quote:
     /// the block echoes it in one.
     pub(crate) const DAEMON_RUNNING_NOTE: &str = "note: a Minimal daemon is running. If a box \
-         you start next still says this machine cannot enforce it yet, restart the daemon. Run \
+         you start next still says this machine cannot enforce its egress yet, restart the daemon. Run \
          min host stop local0, which stops each running box and then the daemon. Then run min ls, \
          which starts the daemon again.";
 
     /// [`DAEMON_RUNNING_NOTE`] for the daemon of `minimal_dir`, the
     /// `--minimal-dir` this run was given: both commands carry the flag, so
     /// they stop and start the daemon the step placed, not the default one.
-    /// No quoting is needed: the socket path is the directory joined with
-    /// more names, and the block refuses a socket path outside
+    /// The directory prints absolute, as the daemon resolves it
+    /// (`std::path::absolute`): a relative one would name another directory
+    /// when the person runs the commands from another working directory.
+    /// No quoting is needed: the socket path is the absolute directory joined
+    /// with more names, and the block refuses a socket path outside
     /// `[A-Za-z0-9._/-]` before it renders this note.
     pub(crate) fn daemon_running_note(minimal_dir: Option<&str>) -> String {
         match minimal_dir {
             None => DAEMON_RUNNING_NOTE.to_string(),
-            Some(dir) => DAEMON_RUNNING_NOTE
-                .replace(
-                    "min host stop local0,",
-                    &format!("min host stop local0 --minimal-dir {dir},"),
-                )
-                .replace("min ls,", &format!("min ls --minimal-dir {dir},")),
+            Some(dir) => {
+                let dir = std::path::absolute(dir)
+                    .map(|abs| abs.display().to_string())
+                    .unwrap_or_else(|_| dir.to_string());
+                DAEMON_RUNNING_NOTE
+                    .replace(
+                        "min host stop local0,",
+                        &format!("min host stop local0 --minimal-dir {dir},"),
+                    )
+                    .replace("min ls,", &format!("min ls --minimal-dir {dir},"))
+            }
         }
     }
 
@@ -3855,6 +3863,18 @@ mod tests {
         assert!(note.contains("Run min host stop local0 --minimal-dir /home/alice/m, which"));
         assert!(note.contains("Then run min ls --minimal-dir /home/alice/m, which starts"));
         assert!(!note.contains('\''));
+        // A relative directory prints absolute, as the daemon resolves it.
+        let cwd = std::env::current_dir().expect("a working directory");
+        let abs = cwd.join("m").display().to_string();
+        let relative = daemon_running_note(Some("m"));
+        assert!(
+            relative.contains(&format!("min host stop local0 --minimal-dir {abs},")),
+            "{relative}"
+        );
+        assert!(
+            relative.contains(&format!("min ls --minimal-dir {abs},")),
+            "{relative}"
+        );
         let facts = ClassifierFacts {
             table_present: false,
             recorded_mask: None,
