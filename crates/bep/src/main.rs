@@ -1349,12 +1349,13 @@ fn refuse_unreadable(restored: &revoke::Restored, dir: &Path) -> Result<(), Stri
         "those segments"
     };
     Err(format!(
-        "bep did not start. The audit log has {lines} that bep cannot read, in:\n{}\n\
+        "{}\nThe audit log has {lines} that bep cannot read, in:\n{}\n\
          A line that bep cannot read can record a destroyed box. \
          Without it, bep cannot keep refusing that box.\n\
          To move {these} into {} and start, run `bep serve` again with `--quarantine-unreadable`.\n\
          bep then records again the revocations it can read there. \
          A destroyed box that only an unreadable line records is no longer refused.",
+        bep::UNREADABLE_AUDIT_LOG_REFUSAL,
         segments.join("\n"),
         dir.join(audit::QUARANTINE_DIR).display()
     ))
@@ -1992,7 +1993,8 @@ mod tests {
         let err = refuse_unreadable(&restored, dir).unwrap_err();
         assert_eq!(
             err,
-            "bep did not start. The audit log has 2 lines that bep cannot read, in:\n  \
+            "bep did not start, because its audit log has lines that it cannot read.\n\
+             The audit log has 2 lines that bep cannot read, in:\n  \
              /audit/audit-0.jsonl\n\
              A line that bep cannot read can record a destroyed box. \
              Without it, bep cannot keep refusing that box.\n\

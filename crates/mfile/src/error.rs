@@ -89,6 +89,21 @@ pub enum Error {
     /// The entry's Box Type does not resolve, or the entry cannot use it.
     /// Exits 3.
     BoxType(crate::box_types::BoxTypeError),
+    /// A selected loadout sets a variable to a resolved value other than
+    /// the one the layers up to and including the entry, or another
+    /// selected loadout, give it (BOX-183). Carries the variable and the
+    /// two sources, as the message names them. Exits 3.
+    LoadoutVarConflict {
+        name: String,
+        first: String,
+        second: String,
+    },
+    /// One layer sets a variable twice, to different values (BOX-184).
+    /// Carries the variable and the layer, as the message names it. Exits 3.
+    DuplicateVar {
+        name: String,
+        layer: String,
+    },
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -174,7 +189,9 @@ impl Error {
             | Error::LoadoutSetsLoadoutMode { .. }
             | Error::NamedLoadoutOnSealedBox { .. }
             | Error::ConstraintViolated { .. }
-            | Error::BoxType(_) => Some(3),
+            | Error::BoxType(_)
+            | Error::LoadoutVarConflict { .. }
+            | Error::DuplicateVar { .. } => Some(3),
             _ => None,
         }
     }
@@ -393,6 +410,23 @@ impl fmt::Display for Error {
                     admitted.join(" or ")
                 )
             }
+            Error::LoadoutVarConflict {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "The variable `{name}` has two different values. {first} sets one \
+                 value, and {second} sets the other. A loadout cannot change a \
+                 variable that is already set. Remove `{name}` from one of them, \
+                 or add `{name}` to the `ignore` list under `[vars]` in \
+                 user_policy.toml to drop every value of `{name}`."
+            ),
+            Error::DuplicateVar { name, layer } => write!(
+                f,
+                "{layer} sets the variable `{name}` twice, to different values. \
+                 Remove one of the two settings."
+            ),
         }
     }
 }
@@ -422,6 +456,8 @@ impl std::error::Error for Error {
             // `Display` prints the type error, so a chain printer prints it
             // once.
             Error::BoxType(_) => None,
+            Error::LoadoutVarConflict { .. } => None,
+            Error::DuplicateVar { .. } => None,
         }
     }
 }
