@@ -54,6 +54,9 @@ pub enum Error {
     /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
     /// the task name. Exits 3.
     InteractiveTask(String),
+    /// A Box Type error that expansion reports, such as an expanded spec
+    /// that breaks a constraint of its type (BOX-061). Exits 3.
+    BoxType(Box<crate::box_types::BoxTypeError>),
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -126,7 +129,8 @@ impl Error {
             Error::InvalidEntryName { .. }
             | Error::InvalidSpecKey { .. }
             | Error::LegacyTable { .. }
-            | Error::InteractiveTask(_) => Some(3),
+            | Error::InteractiveTask(_)
+            | Error::BoxType(_) => Some(3),
             _ => None,
         }
     }
@@ -278,6 +282,7 @@ impl fmt::Display for Error {
                 EntryHeader("tasks", name),
                 EntryHeader("sessions", name)
             ),
+            Error::BoxType(e) => write!(f, "{e}"),
         }
     }
 }
@@ -301,6 +306,7 @@ impl std::error::Error for Error {
             Error::InvalidSpecKey { .. } => None,
             Error::LegacyTable { .. } => None,
             Error::InteractiveTask(_) => None,
+            Error::BoxType(_) => None,
         }
     }
 }

@@ -20,11 +20,19 @@
 //! settings and the shape each one takes. A bad key fails with
 //! [`Error::InvalidSpecKey`], which exits 3 and names the key and the
 //! layer that set it (BOX-066).
+//!
+//! The last step of expansion, after the command-line override layer,
+//! checks the spec against the constraints of the entry's type chain
+//! ([`Layers::constraints`]). A value that a constraint excludes fails
+//! with [`BoxTypeError::ConstraintViolation`], which exits 3 and names the
+//! type, the key and the layer that set the value (BOX-061). The check
+//! never changes the spec, so a constraint never adds a package, a port
+//! or an egress entry (BOX-062).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Error;
-use crate::box_types::{BoxTypeError, BoxTypes, ResolvedType};
+use crate::box_types::{BoxTypeError, BoxTypes, ResolvedType, resolve_constraints};
 use crate::entry::{BoxEntry, EntryTable};
 use crate::error::{EntryHeader, SpecKeyProblem};
 
@@ -184,6 +192,10 @@ pub struct Layers {
     pub loadouts: toml::Table,
     /// The command-line overrides.
     pub overrides: toml::Table,
+    /// The `constraints` of each type in the entry's type chain, the
+    /// built-in root first and the entry's own type last, each with its
+    /// type name: [`ResolvedType::constraints`]. Empty checks nothing.
+    pub constraints: Vec<(String, toml::Table)>,
 }
 
 impl Layers {
@@ -285,7 +297,70 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     let mut expansion = fold(&ordered);
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
+    // BOX-061: the constraints are the final step, after every layer.
+    check_constraints(entry, &layers.constraints, &expansion)
+        .map_err(|e| Error::BoxType(Box::new(e)))?;
     Ok(expansion)
+}
+
+/// Checks the expanded spec against the resolved constraints of the
+/// entry's type chain, in key order. A key the spec does not carry passes:
+/// a constraint never adds a value (BOX-062).
+///
+/// # Errors
+///
+/// [`BoxTypeError::ConstraintViolation`] for the first key whose value, or
+/// one of whose list items, the constraint excludes. It names the type
+/// that declares the constraint and the layer that set the value.
+fn check_constraints(
+    entry: &BoxEntry,
+    chain: &[(String, toml::Table)],
+    expansion: &Expansion,
+) -> Result<(), BoxTypeError> {
+    for constraint in resolve_constraints(chain) {
+        let Some((top, rest)) = constraint.path.split_first() else {
+            continue;
+        };
+        let Some(mut value) = expansion.spec.get(top) else {
+            continue;
+        };
+        let mut found = true;
+        for key in rest {
+            match value.as_table().and_then(|t| t.get(key)) {
+                Some(v) => value = v,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if !found {
+            continue;
+        }
+        let Some(bad) = constraint.excluded(value).first().copied() else {
+            continue;
+        };
+        let origin = expansion.report.values.get(top.as_str());
+        // A top-level list knows the layer of each item.
+        let origin = match (origin, value) {
+            (Some(ValueOrigin::List(origins)), toml::Value::Array(items)) if rest.is_empty() => {
+                items
+                    .iter()
+                    .position(|i| i == bad)
+                    .and_then(|i| origins.get(i))
+            }
+            (origin, _) => origin.and_then(ValueOrigin::first),
+        };
+        return Err(BoxTypeError::ConstraintViolation {
+            box_type: constraint.box_type.clone(),
+            key: constraint.key(),
+            found: bad.to_string(),
+            in_list: value.is_array(),
+            admitted: constraint.admits.iter().map(ToString::to_string).collect(),
+            layer: layer_words(entry, origin),
+        });
+    }
+    Ok(())
 }
 
 /// Whether an entry takes its selected loadouts: the `loadout_mode` box
@@ -1594,6 +1669,7 @@ mod tests {
         let layers = Layers {
             type_defaults: resolved.defaults,
             loadouts,
+            constraints: resolved.constraints,
             ..Layers::default()
         }
         .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
@@ -1987,5 +2063,271 @@ mod tests {
             assert_eq!(err.exit_code(), Some(3), "{name}");
             assert_eq!(err.to_string(), msg, "{name}");
         }
+    }
+
+    /// [`expand_typed_with`], with `overrides` as the command-line layer.
+    fn expand_constrained(
+        file: &str,
+        name: &str,
+        loadouts: toml::Table,
+        overrides: toml::Table,
+    ) -> Result<Expansion, Error> {
+        let doc = table(file);
+        let types = BoxTypes::from_file(&doc).expect("the types resolve");
+        let entries = read_entries(file.as_bytes()).expect("entries read");
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let resolved = expandable_type(entry, &types).expect("expandable");
+        let project_types = types.project().keys().cloned().collect();
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let layers = Layers {
+            type_defaults: resolved.defaults,
+            loadouts,
+            overrides,
+            constraints: resolved.constraints,
+            ..Layers::default()
+        }
+        .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+        expand(entry, &layers)
+    }
+
+    const CONSTRAINED_FILE: &str = r#"
+        [box_types.ci]
+        extends = "task"
+        constraints = { pty_enabled = false, packages = ["git", "make", "rust"] }
+
+        [box_types.ci-locked]
+        extends = "ci"
+        constraints = { network = { mode = "none" }, packages = ["git", "make"] }
+
+        [boxes.build]
+        type = "ci-locked"
+        packages = ["git"]
+
+        [boxes.tty]
+        type = "ci-locked"
+        pty_enabled = true
+
+        [boxes.extra]
+        type = "ci-locked"
+        packages = ["git", "rust"]
+
+        [boxes.netless]
+        type = "ci"
+        network = { mode = "host" }
+    "#;
+
+    // BOX-061: the expanded spec, checked after every layer including the
+    // command-line overrides, fails with exit 3 when it carries a value its
+    // type's constraint excludes, naming the type, the key and the layer.
+    #[test]
+    fn expanded_spec_violating_constraint_exit3_names_type_and_layer() {
+        let none = toml::Table::new;
+        let err = |name: &str, loadouts: toml::Table, overrides: toml::Table| {
+            let err = expand_constrained(CONSTRAINED_FILE, name, loadouts, overrides)
+                .expect_err("breaks a constraint");
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            assert!(matches!(&err, Error::BoxType(_)), "{err:?}");
+            err.to_string()
+        };
+
+        // The entry's own table sets the value.
+        assert_eq!(
+            err("tty", none(), none()),
+            "`[boxes.tty]` in minimal.toml sets `pty_enabled` to true, \
+             but the box type `ci` allows only false for `pty_enabled`. Fix the value."
+        );
+        // A list item names the layer that added it.
+        assert_eq!(
+            err("extra", none(), none()),
+            "`[boxes.extra]` in minimal.toml adds \"rust\" to `packages`, \
+             but the box type `ci-locked` allows only \"git\" or \"make\" for `packages`. \
+             Fix the value."
+        );
+        // A key inside a section, set by `[defaults.<type>]`.
+        let host =
+            format!("{CONSTRAINED_FILE}\n[defaults.ci-locked]\nnetwork = {{ mode = \"host\" }}\n");
+        let msg =
+            expand_constrained(&host, "build", none(), none()).expect_err("breaks a constraint");
+        assert_eq!(msg.exit_code(), Some(3));
+        assert_eq!(
+            msg.to_string(),
+            "`[defaults.ci-locked]` in minimal.toml sets `network.mode` to \"host\", \
+             but the box type `ci-locked` allows only \"none\" for `network.mode`. \
+             Fix the value."
+        );
+
+        // A file that sets `network.mode = "none"` passes, until a
+        // command-line flag sets it back: the check comes after overrides.
+        let file = host.replace("mode = \"host\"", "mode = \"none\"");
+        let ok =
+            expand_constrained(&file, "build", none(), none()).expect("inside every constraint");
+        assert_eq!(ok.spec["network"]["mode"].as_str(), Some("none"));
+        let overrides = table("network = { mode = \"host\" }");
+        let msg = expand_constrained(&file, "build", none(), overrides)
+            .expect_err("the override breaks it")
+            .to_string();
+        assert!(
+            msg.starts_with("a command-line flag sets `network.mode`"),
+            "{msg}"
+        );
+        assert!(msg.contains("box type `ci-locked`"), "{msg}");
+
+        // A selected loadout is a layer too, when the entry takes it.
+        let file = format!("{file}\n[boxes.open]\ntype = \"ci-locked\"\nloadout_mode = \"open\"\n");
+        let msg = expand_constrained(&file, "open", table("packages = [\"curl\"]"), none())
+            .expect_err("the loadout breaks it")
+            .to_string();
+        assert!(
+            msg.starts_with("a selected loadout adds \"curl\" to `packages`"),
+            "{msg}"
+        );
+
+        // A type's own defaults are a layer too.
+        let file = r#"
+            [box_types.ci]
+            extends = "task"
+            defaults = { pty_enabled = true }
+            constraints = { pty_enabled = false }
+
+            [boxes.t]
+            type = "ci"
+        "#;
+        let msg = expand_constrained(file, "t", none(), none())
+            .expect_err("the type's defaults break it")
+            .to_string();
+        assert!(
+            msg.starts_with("the `defaults` table of `[box_types.ci]` sets `pty_enabled`"),
+            "{msg}"
+        );
+
+        // The parent's constraint holds for a derived type's entry.
+        let msg = expand_constrained(CONSTRAINED_FILE, "netless", none(), none());
+        assert!(msg.is_ok(), "`ci` does not constrain `network`: {msg:?}");
+    }
+
+    /// A constraint table over `packages`, `network.ingress` and
+    /// `network.egress.allow_dns_hosts`, each of which a strategy may leave out.
+    fn constraint_strategy() -> impl Strategy<Value = toml::Table> {
+        let names = || prop::collection::vec(prop::sample::select(vec!["a", "b", "c", "d"]), 0..4);
+        let ports = || prop::collection::vec(prop::sample::select(vec![80i64, 443, 8080]), 0..3);
+        (
+            prop::option::of(names()),
+            prop::option::of(ports()),
+            prop::option::of(names()),
+        )
+            .prop_map(|(packages, ingress, hosts)| {
+                let mut t = toml::Table::new();
+                let list = |items: Vec<toml::Value>| toml::Value::Array(items);
+                if let Some(p) = packages {
+                    t.insert(
+                        "packages".into(),
+                        list(p.into_iter().map(toml::Value::from).collect()),
+                    );
+                }
+                let mut network = toml::Table::new();
+                if let Some(i) = ingress {
+                    network.insert(
+                        "ingress".into(),
+                        list(i.into_iter().map(toml::Value::from).collect()),
+                    );
+                }
+                if let Some(h) = hosts {
+                    let egress = toml::Table::from_iter([(
+                        "allow_dns_hosts".to_owned(),
+                        list(h.into_iter().map(toml::Value::from).collect()),
+                    )]);
+                    network.insert("egress".into(), toml::Value::Table(egress));
+                }
+                if !network.is_empty() {
+                    t.insert("network".into(), toml::Value::Table(network));
+                }
+                t
+            })
+    }
+
+    /// An entry layer over the same keys as [`constraint_strategy`].
+    fn constrained_entry_strategy() -> impl Strategy<Value = toml::Table> {
+        constraint_strategy()
+    }
+
+    fn list_at<'a>(spec: &'a toml::Table, path: &[&str]) -> Vec<&'a toml::Value> {
+        let mut value = spec.get(path[0]);
+        for key in &path[1..] {
+            value = value.and_then(|v| v.as_table()).and_then(|t| t.get(*key));
+        }
+        value
+            .and_then(toml::Value::as_array)
+            .map(|items| items.iter().collect())
+            .unwrap_or_default()
+    }
+
+    // BOX-062: a constraint never adds a package, a port or an egress
+    // entry. A spec that passes is the unconstrained spec, and a spec that
+    // carries none of those keys stays without them.
+    #[test]
+    fn constraint_never_adds_package_port_or_egress() {
+        let entry = &read_entries(b"[tasks.t]\ntimeout = \"1m\"\n").expect("entries read")[0];
+        let constraints = table(
+            r#"
+            packages = ["git"]
+            network = { ingress = [8080], egress = { allow_dns_hosts = ["example.com"] } }
+            "#,
+        );
+        let layers = Layers {
+            constraints: vec![("ci".to_owned(), constraints)],
+            ..Layers::default()
+        };
+        let constrained = expand(entry, &layers).expect("no key to break");
+        assert_eq!(
+            constrained.spec,
+            expand(entry, &Layers::default()).expect("expands").spec
+        );
+        assert!(!constrained.spec.contains_key("packages"));
+        assert!(!constrained.spec.contains_key("network"));
+
+        let paths: [&[&str]; 3] = [
+            &["packages"],
+            &["network", "ingress"],
+            &["network", "egress", "allow_dns_hosts"],
+        ];
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner
+            .run(
+                &(constraint_strategy(), constrained_entry_strategy()),
+                |(constraints, body)| {
+                    let entry = BoxEntry {
+                        body,
+                        ..entry.clone()
+                    };
+                    let free = expand(&entry, &Layers::default()).expect("expands");
+                    let layers = Layers {
+                        constraints: vec![("ci".to_owned(), constraints)],
+                        ..Layers::default()
+                    };
+                    if let Ok(constrained) = expand(&entry, &layers) {
+                        prop_assert_eq!(&constrained.spec, &free.spec);
+                        for path in paths {
+                            let have = list_at(&free.spec, path);
+                            for item in list_at(&constrained.spec, path) {
+                                prop_assert!(
+                                    have.contains(&item),
+                                    "{:?} added to {:?}",
+                                    item,
+                                    path
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .expect("BOX-062 property");
     }
 }
