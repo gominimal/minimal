@@ -283,7 +283,7 @@ Steering and the interception CA
 - **BEP-060** THE SYSTEM SHALL replace the sealing key or the root CA only on an explicit operator command, and never on restart.
   tier:     T0
   verify:   cargo nextest run -p bep keys_never_regenerated_on_restart
-  <!-- Gatehouse §6.10 un-enrolled lifecycle: replacement is never a silent overlap failure -->
+  <!-- Gatehouse §6.10 un-enrolled lifecycle: replacement is never a silent overlap failure; the published identity (BEP-072) is the record of which roles the proxy made, so a start refuses a role the identity names and the store lost; a host that lost every key and its identity file holds no record that it ever had keys, so its next start is a first start; that fails closed: a box created before then holds values sealed to the old key and a trust store with the old root, which the proxy refuses and does not present, and the box is re-created, as after a replacement -->
   - WHEN the sealing key or the root CA is replaced THE SYSTEM SHALL refuse every member sealed to the previous key and report that running boxes holding one are re-created to re-mint.
     tier:   T0
     verify: cargo nextest run -p bep key_replacement_kills_outstanding_members
@@ -326,14 +326,18 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p bep an_unreachable_tpm_refuses_start_and_keeps_the_key
     <!-- unwanted; a TPM that is disabled in firmware, not yet ready, or whose device the proxy's user cannot open, and a TPM that answers a load with a response the TCG library defines as temporary, such as `TPM_RC_OBJECT_MEMORY` or `TPM_RC_RETRY`, can load the key later, so replacing it would throw away a key that still works; the proxy never generates the key again by itself and never falls back to Secret Service -->
-  - IF a proxy key is in a TPM and its key file or its authorization file is missing or unreadable, or the TPM refuses the key file as not its own, THEN THE SYSTEM SHALL refuse to start, report which of the three it is for that role, and name `bep --replace-key <role>` with that role.
+  - IF a proxy key is in a TPM and its key file or its authorization file exists and the proxy's user cannot read it THEN THE SYSTEM SHALL refuse to start, report which file the proxy's user cannot read for that role, and not name `bep --replace-key`.
+    tier:   T0
+    verify: cargo nextest run -p bep an_unreadable_tpm_key_file_refuses_start_and_keeps_the_key
+    <!-- unwanted; a file the proxy cannot read because of its mode or owner is intact, and restoring access recovers the key, so replacing it would discard a key that still works -->
+  - IF a proxy key is in a TPM and its key file or its authorization file is missing, or the TPM refuses the key file as not its own, THEN THE SYSTEM SHALL refuse to start, report which of the three it is for that role, and name `bep --replace-key <role>` with that role.
     tier:   T0
     verify: cargo nextest run -p bep a_tpm_key_the_tpm_cannot_load_refuses_start
-    <!-- unwanted; each is a lost key: a key file that the TPM refuses as not its own (an integrity or hierarchy error) belongs to a cleared TPM or another one, and without its file or its authorization value no TPM can use the key; replacement is the remedy, as BEP-060's refusal names it; a `noDA` key is not refused by dictionary-attack lockout, so lockout is not this case -->
-  - IF the proxy holds a key for one role and its store holds no key for another role THEN THE SYSTEM SHALL refuse to start, report that the store no longer holds the key of that role, and name `bep --replace-key <role>` with that role.
+    <!-- unwanted; each is a lost key: a key file that the TPM refuses as not its own (an integrity or hierarchy error) belongs to a cleared TPM or another one, and without its key file or its authorization value no TPM can use the key; replacement is the remedy, as BEP-060's refusal names it; a `noDA` key is not refused by dictionary-attack lockout, so lockout is not this case -->
+  - IF the proxy holds a key for one role and none of the host's key stores holds a key for another role THEN THE SYSTEM SHALL refuse to start, report that no key store holds the key of that role, and name `bep --replace-key <role>` with that role.
     tier:   T0
     verify: cargo nextest run -p bep a_missing_role_key_refuses_start_and_names_replacement
-    <!-- unwanted; an unlocked, reachable keyring with no entry for a role, or a TPM key directory with no file for it, while another role's key is held, is a lost key and never a first start, so the proxy never generates it at start (BEP-060); only a host that holds no key for any role is a first start; a first start stopped between two generations leaves this state too, and its way forward is the named command: `bep --replace-key <role>` generates the missing role's key alone and keeps the key already made, and no box holds a value sealed to either, because the proxy publishes its identity (BEP-072) only after every key exists -->
+    <!-- unwanted; an unlocked, reachable keyring with no entry for a role, or a TPM key directory with no file for it, while another role's key is held, is a lost key and never a first start, so the proxy never generates it at start (BEP-060); each role is looked up in every store, because BEP-088 can put the roles in different stores; only a host whose stores hold no key for any role, and whose published identity (BEP-072) names no role, is a first start; a host that lost every key and its identity file is indistinguishable from a new host and starts as one, which BEP-060 records; a first start stopped between two generations leaves this state too, and its way forward is the named command: `bep --replace-key <role>` generates the missing role's key alone and keeps the key already made, and no box holds a value sealed to either, because the proxy publishes its identity (BEP-072) only after every key exists -->
 
 - **BEP-090** WHILE the proxy holds a key in Secret Service THE SYSTEM SHALL report on `min auth status` that key's role and that it is a software key, which a program running as the operator's user can copy.
   tier:     T0
