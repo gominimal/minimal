@@ -564,9 +564,10 @@ pub struct BoxLogsArgs {
     /// writes it, until the box is removed or the command is interrupted
     #[arg(short = 'f', long)]
     pub follow: bool,
-    /// Show the output of a box with a terminal byte for byte, with its
-    /// terminal control codes. Without `--raw`, they are removed when the
-    /// output does not go to a terminal. `--exec` does not take `--raw`
+    /// Write the box's own output byte for byte, with its terminal control
+    /// codes. Without `--raw`, the codes are removed from the output of a
+    /// box with a terminal when stdout is not a terminal. `--exec` output is
+    /// always written unchanged, so `--exec` does not take `--raw`
     #[arg(long)]
     pub raw: bool,
 }
