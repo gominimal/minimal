@@ -448,28 +448,32 @@ impl BoxTypes {
 /// Checks that each type of a chain, root first, only narrows the
 /// constraints of the type before it (BOX-156).
 fn check_narrowing(chain: &[(String, toml::Table)]) -> Result<(), BoxTypeError> {
-    // The resolved constraint of each key: the last one the chain set. Each
-    // one is checked to admit no more than the one before it, so the last
-    // one admits no more than any of them.
+    // The resolved constraints of each key: every form that the last type
+    // to set the key wrote, flat or under its section. A type is checked
+    // only against the types before it, and each of its forms must admit
+    // no more than each resolved form. So the last forms admit no more
+    // than any form before them.
     let chain: Vec<(&str, Vec<(String, toml::Value)>)> = chain
         .iter()
         .map(|(name, table)| (name.as_str(), canonical_constraints(table)))
         .collect();
-    let mut resolved: BTreeMap<&str, &toml::Value> = BTreeMap::new();
+    let mut resolved: BTreeMap<&str, Vec<&toml::Value>> = BTreeMap::new();
     for (i, (name, table)) in chain.iter().enumerate() {
+        let mut own: BTreeMap<&str, Vec<&toml::Value>> = BTreeMap::new();
         for (key, derived) in table {
-            if let Some(parent) = resolved.get(key.as_str())
-                && let Some((key, value)) = loosening(key, derived, parent)
-            {
-                return Err(BoxTypeError::Loosening {
-                    name: (*name).to_owned(),
-                    key,
-                    parent: chain[i.saturating_sub(1)].0.to_owned(),
-                    value: value.map(|v| inline(&v)),
-                });
+            for parent in resolved.get(key.as_str()).into_iter().flatten() {
+                if let Some((key, value)) = loosening(key, derived, parent) {
+                    return Err(BoxTypeError::Loosening {
+                        name: (*name).to_owned(),
+                        key,
+                        parent: chain[i.saturating_sub(1)].0.to_owned(),
+                        value: value.map(|v| inline(&v)),
+                    });
+                }
             }
-            resolved.insert(key, derived);
+            own.entry(key.as_str()).or_default().push(derived);
         }
+        resolved.extend(own);
     }
     Ok(())
 }
@@ -1018,6 +1022,25 @@ mod tests {
             matches!(&err, BoxTypeError::Loosening { key, parent, .. }
                 if key == "loadout_mode" && parent == "build"),
             "{err:?}"
+        );
+
+        // A type that sets a key in both forms is not checked against
+        // itself, and each form constrains the type that extends it.
+        let both = "[box_types.dev]\nextends = \"session\"\n\
+                    constraints = { restart = [\"never\", \"always\"], execution = { restart = \"never\" } }\n";
+        types(both).expect("one type's two forms are not checked against each other");
+        let err = types(&format!(
+            "{both}[box_types.leaf]\nextends = \"dev\"\nconstraints = {{ restart = \"always\" }}\n"
+        ))
+        .expect_err("the section form of dev excludes always");
+        assert_eq!(
+            err,
+            BoxTypeError::Loosening {
+                name: "leaf".into(),
+                key: "restart".into(),
+                parent: "dev".into(),
+                value: Some("\"always\"".into()),
+            }
         );
 
         // The parent's resolved constraint holds through a type that does
