@@ -23228,7 +23228,7 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 proof_a_build_box_fetches_its_source() {
   local bbf_pkg="tree" bbf_sid="" bbf_out="" bbf_rc="" bbf_policy="" bbf_native=""
   local bbf_sha="513a53cbc42ca1f4ea06af2bab1f5283524a3848266b1d162416f8033afc4985"
-  local bbf_grant=""
+  local bbf_grant="" bbf_log_mark=0
   echo "::group::a build box fetches its source for a deny-all box (NET-155, NET-165)"
   # An own-address box needs the switch, as the other own-IP proofs do, and
   # on a native lane the tap device too.
@@ -23244,11 +23244,29 @@ proof_a_build_box_fetches_its_source() {
       echo "::endgroup::"
       return 0
     fi
-    native_switch_daemon
     # The daemon's download cache, by the source's sha256 (paths::minimal_cache_dir).
     # shellcheck disable=SC2031
     rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/minimal/downloads/$bbf_sha"
   fi
+  # Stop whatever daemon is up, so the activation below autospawns a fresh
+  # one under this proof's record filter. The grant lines it reads are INFO,
+  # which the lane's default filter drops (the daemon inherits RUST_LOG at
+  # autospawn; see the header). On a native lane the fresh daemon also
+  # carries the staged switch (native_switch_daemon).
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  local bbf_filter="warn,minimald::exec=info,minimald::build_boxes=info,minvmd=info"
+  # The daemon log this proof reads its grant from: the native daemon's own,
+  # or on a VM lane the VM host daemon's. Each day's file in date order, so a
+  # line count taken before the build marks where the build's lines begin.
+  bbf_grant_log() {
+    local daemon=minvmd
+    [ -z "$bbf_native" ] || daemon=minimald
+    find "$XDG_STATE_HOME/minimal/logs" -name "$daemon.log.*" -type f 2>/dev/null \
+      | sort | while IFS= read -r day; do cat "$day"; done
+  }
   # The logs that say why a failed build failed: the daemon's, where this
   # lane can read it, and on a VM lane the guest daemon's console too.
   bbf_logs() {
@@ -23267,7 +23285,7 @@ proof_a_build_box_fetches_its_source() {
   BBF_SEED_DIR="$(hook_mktemp /tmp/mnlbbf.XXXXXX)"
   hook_seed_preamble > "$BBF_SEED_DIR/minimal.toml"
   mkdir "$BBF_SEED_DIR/.git"
-  bbf_sid="$(cd "$BBF_SEED_DIR" && mnl session activate . --name e2e-bbf \
+  bbf_sid="$(cd "$BBF_SEED_DIR" && RUST_LOG="$bbf_filter" mnl session activate . --name e2e-bbf \
     --network own_ip --deny-all-egress 2>"$WORK/bbf-activate.err")" || {
     echo "::error::the deny-all box's activate failed"
     cat "$WORK/bbf-activate.err" 2>/dev/null || true
@@ -23275,6 +23293,9 @@ proof_a_build_box_fetches_its_source() {
     fail
   }
   bbf_sid="$(printf '%s\n' "$bbf_sid" | tail -n1)"
+  # Where this build's log lines begin: a grant the activation or an earlier
+  # build opened is before it, and does not count.
+  bbf_log_mark="$(bbf_grant_log | wc -l | tr -d ' ')"
   # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
   bbf_out="$(mnl session exec "$bbf_sid" \
     "timeout 600 min package build --rebuild $bbf_pkg 2>&1; echo build-exit=\$?" \
@@ -23295,17 +23316,22 @@ proof_a_build_box_fetches_its_source() {
   fi
   printf '%s\n' "$bbf_out" | tail -n 20 | sed 's/^/  /'
   # The fetch was cold: the build box opened its grant, which a cached source
-  # never asks for.
+  # never asks for. Only a line written after the build began counts. On a
+  # VM lane the line names the box's session, not the package: it names the
+  # spec hash, which the box computes from the resolved graph, and nothing
+  # this script runs prints that hash.
   if [ -n "$bbf_native" ]; then
-    bbf_grant="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
-      -exec grep -h -- 'opened the network of a build box' {} + 2>/dev/null \
-      | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' | tail -n1)"
+    bbf_grant="$(bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+      | grep -F -- 'opened the network of a build box' \
+      | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' \
+      | grep -F -- "package: \\\"$bbf_pkg\\\"" | tail -n1)"
   else
-    bbf_grant="$(minvmd_log_lines 'opened a build grant' \
+    bbf_grant="$(bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+      | grep -F -- 'opened a build grant' \
       | grep -F -- "\"session\":\"$bbf_sid\"" | tail -n1)"
   fi
   if [ -z "$bbf_grant" ]; then
-    echo "::error::the build of $bbf_pkg passed, but no build grant opened for the box: its source was in the daemon's download cache, so the build box fetched nothing"
+    echo "::error::the build of $bbf_pkg passed, but no build grant line for box e2e-bbf appeared in the daemon's log after the build began"
     bbf_logs
     fail
   fi
