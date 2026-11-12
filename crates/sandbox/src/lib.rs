@@ -2907,12 +2907,15 @@ fn log_rootfs_collisions(c: &common::LinkCollisions, layers: &[PathBuf], rootfs:
         );
     }
     if c.differ > 0 {
+        // the record holds the first `DIFFERING_KEPT` differing paths; past
+        // that a path is counted, and `unnamed` says how many got no line
         let kept = c.differing.len();
         tracing::info!(
             same = c.same,
             unchecked = c.unchecked,
             differ = c.differ,
             named = kept,
+            unnamed = c.differ.saturating_sub(kept as u64),
             layers = %layers
                 .iter()
                 .map(|l| l.file_name().map_or_else(|| l.display().to_string(), |n| n.to_string_lossy().into_owned()))

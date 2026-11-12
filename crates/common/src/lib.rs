@@ -457,21 +457,29 @@ fn hardlink_layer_contents(
                                     dst_path.display()
                                 );
                             }
-                            _ if counts.recording => {
-                                counts.add(LinkCollision::Differs("another target"), rel, layer);
-                                tracing::debug!(
-                                    "Not symlinking {} => {}, already exists (another target or not a symlink; the first stays)",
-                                    path.display(),
-                                    dst_path.display()
-                                );
-                            }
-                            _ => {
-                                counts.add(LinkCollision::Differs("another target"), rel, layer);
-                                warn!(
-                                    "Not symlinking {} => {}, already exists (another target or not a symlink; the first stays)",
-                                    path.display(),
-                                    dst_path.display()
-                                );
+                            existing => {
+                                // what stands there: a symlink elsewhere, or
+                                // a file or directory an earlier layer put
+                                // at the path, which has no target to name
+                                let why = if existing.is_ok() {
+                                    "another target"
+                                } else {
+                                    "not a symlink"
+                                };
+                                counts.add(LinkCollision::Differs(why), rel, layer);
+                                if counts.recording {
+                                    tracing::debug!(
+                                        "Not symlinking {} => {}, already exists ({why}; the first stays)",
+                                        path.display(),
+                                        dst_path.display()
+                                    );
+                                } else {
+                                    warn!(
+                                        "Not symlinking {} => {}, already exists ({why}; the first stays)",
+                                        path.display(),
+                                        dst_path.display()
+                                    );
+                                }
                             }
                         }
                         Ok(())
