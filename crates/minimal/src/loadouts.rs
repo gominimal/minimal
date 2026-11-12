@@ -45,8 +45,8 @@ impl LoadoutSelection {
 /// loadouts a `--loadout` flag names, and never a loadout file. So a
 /// sealed box reads no default loadout (BOX-175).
 ///
-/// An entry whose type does not resolve takes the defaults of its type
-/// name when that name is built in.
+/// An entry whose type does not resolve takes the defaults and the
+/// constraints of its type name when that name is built in.
 ///
 /// # Errors
 ///
@@ -82,13 +82,14 @@ pub(crate) fn entry_loadout_gate(
     };
     let (type_defaults, type_constraints) = match resolved {
         Ok(resolved) => (resolved.defaults, resolved.constraints),
-        // A built-in type name keeps its built-in defaults. Any other name
-        // has constraints the gate cannot read, so the gate refuses the
-        // entry rather than decide the mode without them.
+        // A built-in type name keeps its built-in defaults and its built-in
+        // constraints, so a `build` entry that sets `open` is refused. Any
+        // other name has constraints the gate cannot read, so the gate
+        // refuses the entry rather than decide the mode without them.
         Err(error) => match builtin_type_layer(entry) {
             Some(layer) => {
                 tracing::debug!(%error, "the loadout gate reads the entry with its built-in type");
-                (layer, Vec::new())
+                layer
             }
             None => return Err(mfile::Error::BoxType(Box::new(error))),
         },
@@ -105,14 +106,23 @@ pub(crate) fn entry_loadout_gate(
     Ok(mode)
 }
 
+/// A type chain's layers: its defaults and its constraints, each by type.
+type TypeLayer = (Vec<(String, toml::Table)>, Vec<(String, toml::Table)>);
+
 /// The type layer of an entry whose type does not resolve: the built-in
-/// defaults of its type name, when the name is built in.
-fn builtin_type_layer(entry: &mfile::entry::BoxEntry) -> Option<Vec<(String, toml::Table)>> {
+/// defaults and the built-in constraints of its type name, when the name
+/// is built in.
+fn builtin_type_layer(entry: &mfile::entry::BoxEntry) -> Option<TypeLayer> {
     entry
         .box_type
         .as_deref()
         .and_then(mfile::box_types::builtin)
-        .map(|root| vec![(root.to_owned(), mfile::box_types::builtin_defaults(root))])
+        .map(|root| {
+            (
+                vec![(root.to_owned(), mfile::box_types::builtin_defaults(root))],
+                vec![(root.to_owned(), mfile::box_types::builtin_constraints(root))],
+            )
+        })
 }
 
 /// `selection` under the box's loadout `mode`. A sealed box selects no

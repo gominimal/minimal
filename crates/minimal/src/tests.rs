@@ -17345,6 +17345,31 @@ fn sealed_box_ignores_broken_default_loadout() {
     }
 }
 
+// BOX-181: an entry of the built-in `build` type does not resolve as a
+// start, so the gate reads the built-in constraints of `build`. They hold
+// `loadout_mode` at `sealed`, so an entry that sets `open` fails with
+// exit 3 before any loadout is read: the broken default does not fail it.
+#[test]
+fn builtin_build_entry_setting_open_refused_exit3() {
+    let (project, _config, _global) = loadout_project(
+        "[boxes.b]\ntype = 'build'\nloadout_mode = 'open'\n",
+        "",
+        &[("default.toml", "= not = toml =")],
+    );
+    let error = session_loadout_mode(&utf8(&project), Some("b"), &[])
+        .expect_err("a build entry that sets open refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::ConstraintViolated { key, box_type, .. }
+                if key == "loadout_mode" && box_type.contains("`build`")
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+}
+
 // BOX-175: a start whose session entry the pick cannot decide refuses with
 // exit 2 when it reads the loadout mode, before any loadout is read. It does
 // not fall back to the bare session entry, which is open.
