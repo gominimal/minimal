@@ -6815,7 +6815,9 @@ async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
             spec["io"]["pty_enabled"] = serde_json_lenient::json!(on);
         }
     };
-    let cases: Vec<(serde_json_lenient::Value, Option<(&str, &str, &str, &str)>)> = vec![
+    // The refused type, root, key and value.
+    type Refused = Option<(&'static str, &'static str, &'static str, &'static str)>;
+    let cases: Vec<(serde_json_lenient::Value, Refused)> = vec![
         // (spec, the refused type, root, key and value)
         (
             spec_of("rc-task-pty", "task", &pty(true)),
