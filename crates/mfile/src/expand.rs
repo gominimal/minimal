@@ -571,7 +571,7 @@ fn merge_vars(
     let mut merged: Vec<(String, MergedVar)> = Vec::new();
     // `vars_lenient` items with no name. The merge has no name to key
     // them by, so the spec keeps each one, and the client refuses it.
-    let mut nameless: Vec<toml::Value> = Vec::new();
+    let mut nameless: Vec<(toml::Value, Origin)> = Vec::new();
     // The layer that last set each key, and a key whose value has the
     // wrong shape, which the spec then carries whole.
     let mut key_origin: BTreeMap<&str, Origin> = BTreeMap::new();
@@ -593,7 +593,7 @@ fn merge_vars(
             }
             key_origin.insert(key, origin.clone());
         }
-        nameless.extend(nameless_lenient(layer).cloned());
+        nameless.extend(nameless_lenient(layer).map(|item| (item.clone(), origin.clone())));
         // BOX-184: one layer has no later layer to settle a name it sets
         // twice, so two different values for it are refused.
         let mut this_layer: BTreeMap<&str, Option<String>> = BTreeMap::new();
@@ -661,30 +661,57 @@ fn merge_vars(
     }
     let mut vars = toml::Table::new();
     let mut lenient = Vec::new();
+    let mut lenient_origins = Vec::new();
     let report = &mut expansion.report;
     for (name, var) in merged {
         match var.table {
             VarTable::Vars => {
                 vars.insert(name.clone(), var.item);
             }
-            VarTable::Lenient => lenient.push(var.item),
+            VarTable::Lenient => {
+                lenient.push(var.item);
+                lenient_origins.push(var.origin.clone());
+            }
         }
         report.vars.insert(name, var.origin);
     }
-    lenient.extend(nameless);
+    for (item, origin) in nameless {
+        lenient.push(item);
+        lenient_origins.push(origin);
+    }
+    // The names of one key come from several layers, so the key's origin
+    // is the layer of each name: in key order for `vars`, and in item
+    // order for `vars_lenient`.
+    let vars_origins: Vec<Origin> = vars
+        .keys()
+        .filter_map(|name| report.vars.get(name).cloned())
+        .collect();
     for key in VAR_KEYS {
         let Some(origin) = key_origin.remove(key) else {
             continue;
         };
-        let (value, origin) = match bad_shape.remove(key) {
-            Some(bad) => bad,
-            None if key == "vars" => (toml::Value::Table(std::mem::take(&mut vars)), origin),
-            None => (toml::Value::Array(std::mem::take(&mut lenient)), origin),
+        let (value, origin, origins) = match bad_shape.remove(key) {
+            Some((bad, origin)) => (bad, origin, Vec::new()),
+            None if key == "vars" => (
+                toml::Value::Table(std::mem::take(&mut vars)),
+                origin,
+                vars_origins.clone(),
+            ),
+            None => (
+                toml::Value::Array(std::mem::take(&mut lenient)),
+                origin,
+                std::mem::take(&mut lenient_origins),
+            ),
         };
         expansion.spec.insert(key.to_owned(), value);
-        report
-            .values
-            .insert(key.to_owned(), ValueOrigin::Value(origin));
+        // A value of the wrong shape, or an empty one, has no names to
+        // give a layer, so it keeps the layer that set the key.
+        let value_origin = if origins.is_empty() {
+            ValueOrigin::Value(origin)
+        } else {
+            ValueOrigin::List(origins)
+        };
+        report.values.insert(key.to_owned(), value_origin);
     }
     Ok(())
 }
@@ -2355,6 +2382,26 @@ mod tests {
         assert_eq!(at("my.var"), Layer::DefaultsType);
         assert_eq!(at("C"), Layer::Loadouts);
         assert_eq!(at("H"), Layer::Loadouts);
+        // The key's origin names the layer of each name, so a render can
+        // label every layer that the names came from.
+        let layers_of = |key: &str| match &e.report.values[key] {
+            ValueOrigin::List(origins) => origins.iter().map(|o| o.layer).collect::<Vec<_>>(),
+            other => panic!("{key}: {other:?}"),
+        };
+        assert_eq!(
+            layers_of("vars"),
+            [
+                Layer::Entry,
+                Layer::Loadouts,
+                Layer::Loadouts,
+                Layer::Loadouts,
+                Layer::Defaults
+            ]
+        );
+        assert_eq!(
+            layers_of("vars_lenient"),
+            [Layer::Entry, Layer::DefaultsType]
+        );
         // The merge is the same on every run.
         let again = expand_in(file, "dev", vars_layers(loadouts, &[("H", "host")])).unwrap();
         assert_eq!(e.spec_bytes().unwrap(), again.spec_bytes().unwrap());
@@ -2392,6 +2439,10 @@ mod tests {
         let items = e.spec["vars_lenient"].as_array().unwrap();
         assert_eq!(items.len(), 3, "{items:?}");
         assert!(items.iter().any(|item| item.get("name").is_none()));
+        match &e.report.values["vars_lenient"] {
+            ValueOrigin::List(origins) => assert_eq!(origins.len(), items.len()),
+            other => panic!("{other:?}"),
+        }
     }
 
     // BOX-183: a loadout that gives a set name another resolved value fails
