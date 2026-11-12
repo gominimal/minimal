@@ -3311,8 +3311,16 @@ impl PlannedLaunch {
             .await
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    async fn attach_unless_ended(
+    /// [`attach_child`](Self::attach_child) for a caller that holds its
+    /// process behind its own type, as minimald's task path does: `ended`
+    /// says whether the process has exited, and is asked only when the
+    /// attach fails. `None` stands for a process that ended first, and the
+    /// plan's release has run when it returns.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's attach failure while the process still runs.
+    pub async fn attach_unless_ended(
         mut self,
         spawned: network::Spawned,
         ended: impl FnOnce() -> bool,
@@ -4561,6 +4569,23 @@ mod tests {
             })
             .await;
         assert!(matches!(attached, Ok(Some(_))));
+    }
+
+    /// A caller outside this crate reaches the ended-aware attach through
+    /// the public `attach_unless_ended`, and a refused attach of an ended
+    /// process gives no error and no guard.
+    #[tokio::test]
+    async fn attach_unless_ended_is_no_failure_for_an_ended_process() {
+        let rec = std::sync::Arc::new(Recorder {
+            events: std::sync::Mutex::new(Vec::new()),
+            attach_fails: true,
+        });
+        let planned = PlannedLaunch::begin(rec.clone()).await.expect("planning");
+        let attached = planned
+            .attach_unless_ended(network::Spawned::new(1), || true)
+            .await;
+        assert!(matches!(attached, Ok(None)), "the process ended first");
+        assert_eq!(rec.events(), vec!["plan", "attach", "abandon"]);
     }
 
     /// 017-002 sub-requirement: the launch future going away is the one exit a
