@@ -152,9 +152,12 @@ the task it runs, reading the same file (it has no `--config-dir` flag, so the
 default location). The same check applies to a task a `mip run` sandbox runs
 in turn with the in-sandbox `min run <task>` helper. The sandbox mounts each
 entry whole, so an entry is decided as one path: the declared path with `~/`
-expanded, and the path it resolves to through a symlink, must both pass. A
-directory is also checked for contained paths that a `deny` rule names, and
-refused if it holds one, or if it holds more than 10,000 entries to check.
+expanded, and the path it resolves to through a symlink, must both pass. When
+a `deny` pattern can match inside a directory (`**/*.pem` can match in any
+directory; `~/.ssh/**` only under `~/.ssh`), the part of the directory it can
+reach is also checked for a path the rule names, and the entry is refused if
+one is found, or if that part holds more than 10,000 entries to check. A
+directory no `deny` pattern can reach inside is mounted without the check.
 `$NAME` references expand against the environment `mip` runs in. `mip` does
 not prompt: an entry that no rule allows refuses the run, with the
 `[patches] allow` snippet that would approve it. An entry an `ignore` rule matches is

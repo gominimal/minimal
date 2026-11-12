@@ -203,16 +203,17 @@ impl VarLookup for ProcessEnv {
 /// When there is no config directory to name: `XDG_CONFIG_HOME` is not an
 /// absolute path and there is no home directory.
 fn user_policy_path() -> anyhow::Result<PathBuf> {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .is_some_and(|p| p.is_absolute());
-    if !xdg && std::env::home_dir().is_none() {
-        return Err(anyhow!(
-            "cannot find user_policy.toml to check this task's patches against: \
-             XDG_CONFIG_HOME is not set to an absolute path and there is no home directory"
-        ));
-    }
-    Ok(paths::minimal_config_dir_with_override(None).join("user_policy.toml"))
+    // the one resolution `paths` makes, without its panics: `None` when no
+    // config directory can be named at all
+    paths::try_minimal_config_dir_with_override(None)
+        .map(|dir| dir.join("user_policy.toml"))
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot find user_policy.toml to check this task's patches against: \
+                 XDG_CONFIG_HOME is not set to an absolute path and there is no home directory \
+                 whose path is valid UTF-8"
+            )
+        })
 }
 
 /// Judge `patches`, the entries task `task_name` declares, against `policy`
@@ -297,7 +298,8 @@ fn judge_task_patches(
                     };
                     return Err(anyhow!(
                         "task `{task_name}` declares {kind}.\"{declared}\": {denied}. \
-                         The rule is in `[patches]` of {}.",
+                         The rule is in `[patches]` of {}. Remove the entry from the task in \
+                         the project's minimal.toml, or remove the rule that denies it.",
                         policy_path.display()
                     ));
                 }
@@ -496,47 +498,99 @@ fn probe_dir_for_deny(
     declared: &Utf8Path,
     on_disk: &Utf8Path,
 ) -> Result<Option<String>, ProbeRefusal> {
-    let reaches = expanded.deny().iter().any(|fs| {
-        deny_reaches_inside(fs, declared.as_str()) || deny_reaches_inside(fs, on_disk.as_str())
-    });
-    if !reaches || !on_disk.as_std_path().is_dir() {
+    let Some(starts) = probe_starts(expanded, declared, on_disk) else {
+        return Ok(None);
+    };
+    if !on_disk.as_std_path().is_dir() {
         return Ok(None);
     }
     let denied = |p: &Utf8Path| decide(expanded, source, p) == Verdict::Denied;
     let mut seen = 0usize;
-    for item in walkdir::WalkDir::new(on_disk.as_std_path())
-        .follow_links(false)
-        .min_depth(1)
-    {
-        let item = match item {
-            Ok(item) => item,
-            Err(e) => {
+    for start in starts {
+        // a root under the directory that holds nothing has nothing to match
+        if std::fs::symlink_metadata(start.as_std_path()).is_err() {
+            continue;
+        }
+        // the directory itself was decided already; a deny's own root is a path to judge
+        let min_depth = usize::from(start == on_disk);
+        for item in walkdir::WalkDir::new(start.as_std_path())
+            .follow_links(false)
+            .min_depth(min_depth)
+        {
+            let item = match item {
+                Ok(item) => item,
+                Err(e) => {
+                    return Err(ProbeRefusal(format!(
+                        "A part of it cannot be read to check it against `[patches] deny`: {e}. \
+                         Narrow the entry in the project's minimal.toml to the part you can read."
+                    )));
+                }
+            };
+            seen += 1;
+            if seen > DIR_PROBE_LIMIT {
                 return Err(ProbeRefusal(format!(
-                    "A part of it cannot be read to check it against `[patches] deny`: {e}. \
-                     Narrow the entry in the project's minimal.toml to the part you can read."
+                    "It holds more than {DIR_PROBE_LIMIT} entries, too many to check against \
+                     `[patches] deny`. Narrow the entry in the project's minimal.toml, or narrow \
+                     the `deny` pattern so it does not reach inside this directory."
                 )));
             }
-        };
-        seen += 1;
-        if seen > DIR_PROBE_LIMIT {
-            return Err(ProbeRefusal(format!(
-                "It holds more than {DIR_PROBE_LIMIT} entries, too many to check against \
-                 `[patches] deny`. Narrow the entry in the project's minimal.toml, or narrow \
-                 the `deny` pattern so it does not reach inside this directory."
-            )));
-        }
-        let real = Utf8PathBuf::from(item.path().to_string_lossy().into_owned());
-        if denied(real.as_path()) {
-            return Ok(Some(real.to_string()));
-        }
-        if let Ok(rel) = real.strip_prefix(on_disk) {
-            let exposed = declared.join(rel);
-            if exposed != real && denied(exposed.as_path()) {
-                return Ok(Some(exposed.to_string()));
+            let real = Utf8PathBuf::from(item.path().to_string_lossy().into_owned());
+            if denied(real.as_path()) {
+                return Ok(Some(real.to_string()));
+            }
+            if let Ok(rel) = real.strip_prefix(on_disk) {
+                let exposed = declared.join(rel);
+                if exposed != real && denied(exposed.as_path()) {
+                    return Ok(Some(exposed.to_string()));
+                }
             }
         }
     }
     Ok(None)
+}
+
+/// Where the probe of a directory walks: `None` when no `deny` can reach
+/// inside it, else the roots to walk, each mapped into `on_disk`. A deny
+/// whose literal prefix lies under the directory can match only under that
+/// prefix, so only that part is walked: `~/.ssh/**` against `patch.dir."~"`
+/// counts the entries of `~/.ssh`, not of the home. A deny with no prefix,
+/// or one whose prefix is the directory or above it, walks the directory
+/// whole, and one such deny makes the whole walk the only one.
+fn probe_starts(
+    expanded: &ExpandedPatchesPolicy,
+    declared: &Utf8Path,
+    on_disk: &Utf8Path,
+) -> Option<Vec<Utf8PathBuf>> {
+    let mut starts: Vec<Utf8PathBuf> = Vec::new();
+    let mut whole = false;
+    let mut any = false;
+    for fs in expanded.deny() {
+        for base in [declared, on_disk] {
+            if !deny_reaches_inside(fs, base.as_str()) {
+                continue;
+            }
+            any = true;
+            let inside = format!("{}/", base.as_str().trim_end_matches('/'));
+            match fs.walk_root() {
+                Some(root) if root.as_str().starts_with(&inside) => {
+                    let rel = root.as_str()[inside.len()..].trim_end_matches('/');
+                    let start = on_disk.join(rel);
+                    if !starts.contains(&start) {
+                        starts.push(start);
+                    }
+                }
+                _ => whole = true,
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(if whole {
+        vec![on_disk.to_path_buf()]
+    } else {
+        starts
+    })
 }
 
 /// Whether the expanded `deny` pattern can match a path strictly inside the
@@ -768,6 +822,36 @@ mod tests {
         assert!(err.contains("does not resolve"), "{err}");
         assert!(!err.contains("rules are in"), "{err}");
         assert!(!err.contains("not mounted"), "{err}");
+    }
+
+    /// A `deny` with a fixed root inside the directory is probed under that
+    /// root alone: a home past the probe limit with `deny = ["<home>/.ssh/**"]`
+    /// is not walked whole, so it is not refused for its size, and a key under
+    /// `.ssh` is still found; a `deny` with no fixed root walks it whole.
+    #[test]
+    fn the_probe_walks_from_each_denys_root_not_the_whole_directory() {
+        let t = Tree::new();
+        let home = t.dir("home");
+        let bulk = t.dir("home/bulk");
+        for i in 0..=DIR_PROBE_LIMIT {
+            std::fs::write(bulk.join(format!("f{i}")), "").unwrap();
+        }
+        let rules = format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{home}/.ssh/**\"]\n");
+        assert_eq!(
+            gate(&t, &dir_patch(&home), &policy(&rules)).unwrap(),
+            dir_patch(&home)
+        );
+        t.file("home/.ssh/id_ed25519");
+        let err = gate(&t, &dir_patch(&home), &policy(&rules))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("policy denied"), "{err}");
+        assert!(err.contains("id_ed25519"), "{err}");
+        let whole = format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"**/*.pem\"]\n");
+        let err = gate(&t, &dir_patch(&home), &policy(&whole))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too many to check"), "{err}");
     }
 
     /// A symlink inside an allowed directory is judged as the link: the mount
