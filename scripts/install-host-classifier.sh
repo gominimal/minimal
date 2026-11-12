@@ -1799,7 +1799,7 @@ done
 # and before anything is placed. What the mount root offers the slice is
 # the root's own cgroup.subtree_control; a root that offers no memory
 # controller is a note, not a failure: boxes still get their leaves and
-# their verdicts, and read no memory.max. (A rehearsal's stand-in root has
+# their rules, and read no memory.max. (A rehearsal's stand-in root has
 # that file only if the rehearsal wrote it.) What offers it is the slice's
 # parent cgroup, whatever depth the tree root sits at: a nested --tree-root
 # reads its parent's cgroup.subtree_control, not the mount root's.
@@ -1813,13 +1813,13 @@ if grep -qw memory "$parent/cgroup.subtree_control" 2>/dev/null; then
         # the write's own error
         standing=$(tr '\n' ' ' <"$tree_root/cgroup.procs" 2>/dev/null)
         if [ -n "${standing// /}" ]; then
-            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control): a process stands in the slice itself rather than in a leaf (pid ${standing% }); boxes read no memory.max until a re-install with the slice's processes in their leaves"
+            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control). A process stands in the slice itself rather than in a leaf (pid ${standing% }). Boxes read no memory.max. Stop that daemon (min host stop local0), so that its next start places it in a leaf, then run min finalize-install again."
         else
-            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control): the write failed (${err:-no error text}); boxes read no memory.max until a re-install over a slice that takes it"
+            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control). The write failed (${err:-no error text}). Boxes read no memory.max. Run min finalize-install again once the slice takes the controller."
         fi
     fi
 else
-    note "the slice's parent offers it no memory controller ($parent/cgroup.subtree_control): boxes get their leaves and verdicts, and read no memory.max"
+    note "the slice's parent offers it no memory controller ($parent/cgroup.subtree_control). Boxes get their leaves and their rules, and read no memory.max."
 fi
 
 # The cgroups' paths the ruleset is keyed on, as the covering mount spells

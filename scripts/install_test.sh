@@ -3016,7 +3016,6 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     # --- --print-ruleset prints the same transaction the install loaded:
     # the daemon's own ruleset tests read this mode, so the two spellings
     # cannot drift.
-
     run_hc print_ruleset "$root/mi-on" --print-ruleset \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 0 "$rc" "--print-ruleset exits 0"
@@ -3048,7 +3047,7 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
         check 0 "$rc" "install exits 0 when the slice's write fails"
         # shellcheck disable=SC2016 # the positional reaches sh unexpanded
         want_ok "an unexplained failure is named as the write's own error, not as a standing process" \
-            sh -c 'grep -q "the write failed (" "$1" && ! grep -q "a process stands in the slice" "$1"' _ "$OUT"
+            sh -c 'grep -q "The write failed (" "$1" && ! grep -q "A process stands in the slice" "$1"' _ "$OUT"
     fi
 
     # --user takes an account name too, resolved to the same uid and group;
