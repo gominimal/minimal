@@ -33,6 +33,7 @@ pub mod output;
 mod project;
 mod secret;
 mod session;
+pub mod types;
 
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
@@ -52,6 +53,7 @@ pub use net::*;
 pub use project::*;
 pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
+pub use types::{BoxTypeNotFound, BoxTypesCause, BoxTypesInvalid};
 
 pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
     // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
@@ -173,6 +175,10 @@ fn command_verb(command: Option<&Command>) -> &'static str {
         },
         Some(Command::Provider(ProviderArgs { command })) => match command {
             ProviderCommand::List(_) => "provider list",
+        },
+        Some(Command::Type(TypeArgs { command })) => match command {
+            TypeCommand::List(_) => "type list",
+            TypeCommand::Show(_) => "type show",
         },
         Some(Command::Net(_)) => "net forward",
         Some(Command::FinalizeInstall(_)) => "finalize-install",
@@ -469,6 +475,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Provider(ProviderArgs { command })) => match command {
             ProviderCommand::List(args) => {
                 hosts::cmd_provider_list(&cli.global_args, &args, &mut std::io::stdout())
+            }
+        },
+        Some(Command::Type(TypeArgs { command })) => match command {
+            TypeCommand::List(args) => {
+                types::cmd_type_list(&cli.global_args, &args, &mut std::io::stdout())
+            }
+            TypeCommand::Show(args) => {
+                types::cmd_type_show(&cli.global_args, &args, &mut std::io::stdout())
             }
         },
         Some(Command::Net(NetArgs {

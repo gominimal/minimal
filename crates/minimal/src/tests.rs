@@ -13608,6 +13608,7 @@ fn plural_nouns_accepted() {
         ("host", "hosts"),
         ("provider", "providers"),
         ("secret", "secrets"),
+        ("type", "types"),
     ];
     // Nouns that do not count: a network, a sign-in, diagnostics, the mesh
     // and the completions (already plural).
@@ -17120,6 +17121,645 @@ async fn retained_box_management_end_to_end() {
             "a `{verb}` event in the span\n{log}\n{ran}"
         );
     }
+}
+
+/// A project whose `minimal.toml` declares two box types: `base` extends
+/// `session`, and `rust-dev` extends `base`.
+fn project_with_box_types() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(mfile::MFILE_NAME),
+        "\
+[box_types.base]
+extends = \"session\"
+
+[box_types.base.defaults]
+timeout = \"30m\"
+
+[box_types.rust-dev]
+extends = \"base\"
+
+[box_types.rust-dev.defaults]
+pty_enabled = true
+
+[box_types.rust-dev.defaults.io]
+exec_enabled = false
+
+[box_types.rust-dev.constraints]
+loadout_mode = \"sealed\"
+",
+    )
+    .unwrap();
+    dir
+}
+
+fn type_globals(project: &std::path::Path) -> GlobalArgs {
+    GlobalArgs {
+        repo_dir: Some(project.to_path_buf()),
+        ..GlobalArgs::default()
+    }
+}
+
+/// BCLI-019: `min type list` prints the six built-in types and each type
+/// the project defines, each row with its source.
+#[test]
+fn type_list_shows_builtin_and_project_types_with_source() {
+    use clap::Parser as _;
+    let parsed = Cli::try_parse_from(["min", "type", "list"]).expect("`min type list` parses");
+    assert!(matches!(
+        parsed.command,
+        Some(Command::Type(TypeArgs {
+            command: TypeCommand::List(TypeListArgs { output: None })
+        }))
+    ));
+    assert!(Cli::try_parse_from(["min", "types", "ls"]).is_ok());
+
+    let project = project_with_box_types();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(
+        &type_globals(project.path()),
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect("the list renders");
+    let text = String::from_utf8(out).unwrap();
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        rows[0],
+        ["NAME", "SOURCE", "EXTENDS", "BUILT-IN", "TYPE"],
+        "{text}"
+    );
+    let mut expected: Vec<Vec<&str>> = mfile::box_types::BUILTIN_BOX_TYPES
+        .iter()
+        .map(|t| vec![*t, "builtin", "-", *t])
+        .collect();
+    expected.push(vec!["base", "project", "session", "session"]);
+    expected.push(vec!["rust-dev", "project", "base", "session"]);
+    assert_eq!(rows[1..], expected[..], "{text}");
+
+    // Outside a project, the list holds the built-in types only.
+    let empty = tempfile::tempdir().unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(
+        &type_globals(empty.path()),
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect("the list renders");
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text.lines().count(),
+        1 + mfile::box_types::BUILTIN_BOX_TYPES.len(),
+        "{text}"
+    );
+    assert!(!text.contains("project"), "{text}");
+
+    // `--repo-dir` names the project root: a directory under a project, with
+    // no `minimal.toml` of its own, does not read the parent's types.
+    let nested = project.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(&type_globals(&nested), &TypeListArgs::default(), &mut out)
+        .expect("the list renders");
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("project"), "{text}");
+
+    // Without `--repo-dir`, the search walks up from the current directory:
+    // run in a subdirectory of the project, both verbs find its types.
+    let deep = nested.join("a").join("b");
+    std::fs::create_dir_all(&deep).unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list_in(
+        &GlobalArgs::default(),
+        &deep,
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect("the list renders from a subdirectory");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.lines().any(|l| l.starts_with("rust-dev ")), "{text}");
+    assert!(text.lines().any(|l| l.starts_with("base ")), "{text}");
+    let mut out = Vec::new();
+    cmd::types::cmd_type_show_in(
+        &GlobalArgs::default(),
+        &deep,
+        &TypeShowArgs {
+            name: "rust-dev".to_owned(),
+            output: None,
+        },
+        &mut out,
+    )
+    .expect("`min type show rust-dev` finds the project type from a subdirectory");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("rust-dev"), "{text}");
+    assert!(text.contains("project"), "{text}");
+
+    // A type name with a control character prints escaped, so a cloned
+    // `minimal.toml` cannot send terminal control sequences.
+    let hostile = tempfile::tempdir().unwrap();
+    std::fs::write(
+        hostile.path().join(mfile::MFILE_NAME),
+        "[box_types.\"evil\\u001b[2J\"]\nextends = \"session\"\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(
+        &type_globals(hostile.path()),
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect("the list renders");
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(text.contains("evil\\u{1b}[2J"), "{text}");
+
+    // The source enum reserves `org` for organization types.
+    assert_eq!(cmd::types::TypeSource::Org.to_string(), "org");
+    assert_eq!(
+        serde_json_lenient::to_string(&cmd::types::TypeSource::Builtin).unwrap(),
+        "\"builtin\""
+    );
+}
+
+/// `min type show <name>` of `globals`'s project, in text or in `output`.
+fn type_show(
+    globals: &GlobalArgs,
+    name: &str,
+    output: Option<TypeOutputFormat>,
+) -> anyhow::Result<String> {
+    let mut out = Vec::new();
+    let args = TypeShowArgs {
+        name: name.to_owned(),
+        output,
+    };
+    cmd::types::cmd_type_show(globals, &args, &mut out)?;
+    Ok(String::from_utf8(out).unwrap())
+}
+
+/// `min type list` of `globals`'s project, in `output`.
+fn type_list(globals: &GlobalArgs, output: Option<TypeOutputFormat>) -> String {
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(globals, &TypeListArgs { output }, &mut out)
+        .expect("the list renders");
+    String::from_utf8(out).unwrap()
+}
+
+/// The cells of one built-in type's defaults or constraints.
+type TableCells = Vec<(&'static str, &'static str)>;
+
+/// The built-in types as the architecture's table of built-in types states
+/// them: for each type, its defaults and its constraints, as `(key, value)`
+/// with the value as TOML writes it inline. A `(constrains)` cell is a
+/// constraint, and every other cell a default. The `—` cells and the
+/// proposed `on_oom` row are left out.
+fn architecture_builtin_table() -> Vec<(&'static str, TableCells, TableCells)> {
+    let until_complete = ("lifetime", "\"until_complete\"");
+    let no_timeout = ("timeout", "\"0\"");
+    let sealed = ("loadout_mode", "\"sealed\"");
+    let user_token = ("github_token_mode", "\"user\"");
+    let installation_token = ("github_token_mode", "\"installation\"");
+    vec![
+        (
+            "session",
+            vec![
+                until_complete,
+                ("loadout_mode", "\"open\""),
+                ("exec_enabled", "true"),
+                ("nesting.allowed", "true"),
+                no_timeout,
+                user_token,
+            ],
+            vec![("pty_enabled", "true")],
+        ),
+        (
+            "task",
+            vec![
+                until_complete,
+                sealed,
+                ("exec_enabled", "true"),
+                ("nesting.allowed", "false"),
+                no_timeout,
+                user_token,
+            ],
+            vec![("pty_enabled", "false")],
+        ),
+        (
+            "agent",
+            vec![
+                until_complete,
+                sealed,
+                ("pty_enabled", "false"),
+                ("exec_enabled", "true"),
+                ("nesting.allowed", "true"),
+                no_timeout,
+                user_token,
+            ],
+            vec![],
+        ),
+        (
+            "service",
+            vec![
+                ("lifetime", "\"until_stopped\""),
+                sealed,
+                ("exec_enabled", "true"),
+                ("nesting.allowed", "false"),
+                ("restart", "\"never\""),
+                installation_token,
+            ],
+            vec![("pty_enabled", "false")],
+        ),
+        (
+            "build",
+            vec![until_complete, no_timeout, installation_token],
+            vec![
+                sealed,
+                ("pty_enabled", "false"),
+                ("exec_enabled", "false"),
+                ("nesting.allowed", "false"),
+            ],
+        ),
+        (
+            "container-build",
+            vec![until_complete, no_timeout, installation_token],
+            vec![
+                sealed,
+                ("pty_enabled", "false"),
+                ("exec_enabled", "false"),
+                ("nesting.allowed", "false"),
+            ],
+        ),
+    ]
+}
+
+/// BCLI-020: `min type show <name>` renders each built-in type's defaults
+/// and constraints exactly as the architecture's table of built-in types
+/// states them, each value set by that type, as builtin.
+#[test]
+#[ignore = "https://github.com/gominimal/minimal/issues/3294"]
+fn type_show_matches_shipped_table_with_sources() {
+    let types = mfile::box_types::BoxTypes::default();
+    let table = architecture_builtin_table();
+    assert_eq!(
+        table.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
+        mfile::box_types::BUILTIN_BOX_TYPES,
+    );
+    for (name, defaults, constraints) in table {
+        let resolved = types.resolve(name).unwrap();
+        let detail = cmd::types::type_detail(&types, &resolved);
+        let shown = |values: &[cmd::types::TypeValue]| -> Vec<(String, String)> {
+            let mut shown: Vec<_> = values
+                .iter()
+                .map(|v| (v.key.clone(), v.value.clone()))
+                .collect();
+            shown.sort();
+            shown
+        };
+        let fixture = |cells: &[(&str, &str)]| -> Vec<(String, String)> {
+            let mut cells: Vec<_> = cells
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            cells.sort();
+            cells
+        };
+        assert_eq!(shown(&detail.defaults), fixture(&defaults), "{name}");
+        assert_eq!(shown(&detail.constraints), fixture(&constraints), "{name}");
+        for v in detail.defaults.iter().chain(&detail.constraints) {
+            assert_eq!(
+                (v.set_by.as_str(), v.source),
+                (name, cmd::types::TypeSource::Builtin),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// BCLI-020: `min type show <name>` names the type and the source of every
+/// value, and the chain of types from the built-in type to the type.
+#[test]
+fn type_show_names_the_type_and_source_of_each_value() {
+    let project = project_with_box_types();
+    let globals = type_globals(project.path());
+
+    for name in mfile::box_types::BUILTIN_BOX_TYPES {
+        let text = type_show(&globals, name, None).expect("a built-in type shows");
+        for line in [
+            format!("Name:           {name}\n"),
+            "Source:         builtin\n".to_owned(),
+            format!("Built-in type:  {name}\n"),
+            format!("Type chain:     {name}\n"),
+        ] {
+            assert!(text.contains(&line), "missing {line:?}\n{text}");
+        }
+        assert!(!text.contains("Extends:"), "{text}");
+    }
+
+    // A project type names the type and the source of every value, from the
+    // built-in type to itself.
+    let text = type_show(&globals, "rust-dev", None).expect("a project type shows");
+    for line in [
+        "Name:           rust-dev\n",
+        "Source:         project\n",
+        "Extends:        base\n",
+        "Built-in type:  session\n",
+        // `session` sets `loadout_mode` and is the first type of the chain.
+        "Type chain:     session -> base -> rust-dev\n",
+    ] {
+        assert!(text.contains(line), "missing {line:?}\n{text}");
+    }
+    let resolved = mfile::box_types::BoxTypes::from_file(
+        &toml::from_str(&std::fs::read_to_string(project.path().join(mfile::MFILE_NAME)).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let detail = cmd::types::type_detail(&resolved, &resolved.resolve("rust-dev").unwrap());
+    assert_eq!(detail.chain, ["session", "base", "rust-dev"]);
+
+    let (defaults, constraints) = text
+        .split_once("Constraints:")
+        .expect("a constraints section");
+    let value = |section: &str, setting: &str| -> String {
+        section
+            .lines()
+            .find(|l| l.trim_start().starts_with(setting))
+            .unwrap_or_else(|| panic!("no {setting:?} in\n{text}"))
+            .split_once("  from ")
+            .unwrap()
+            .1
+            .to_owned()
+    };
+    assert_eq!(value(defaults, "timeout = \"30m\""), "base (project)");
+    assert_eq!(value(defaults, "pty_enabled = true"), "rust-dev (project)");
+    assert_eq!(
+        value(defaults, "io.exec_enabled = false"),
+        "rust-dev (project)"
+    );
+    assert_eq!(
+        value(constraints, "loadout_mode = \"sealed\""),
+        "rust-dev (project)"
+    );
+    // The chain applies from the built-in type to the type itself.
+    assert!(defaults.find("timeout").unwrap() < defaults.find("pty_enabled").unwrap());
+
+    let text = type_show(&globals, "base", None).expect("a project type shows");
+    assert!(text.contains("Type chain:     session -> base\n"), "{text}");
+
+    // A name that is no type is refused with the next step, and exits 4.
+    let err = type_show(&globals, "nope", None).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "No box type is named `nope`. Run `min type list` to see the box types."
+    );
+    let not_found = err
+        .downcast_ref::<cmd::types::BoxTypeNotFound>()
+        .expect("a typed not-found refusal");
+    assert_eq!(not_found.name, "nope");
+    assert_eq!(cmd::types::BoxTypeNotFound::EXIT_CODE, 4);
+}
+
+/// BCLI-019, BCLI-020: a `minimal.toml` that is not valid TOML, or whose
+/// `[box_types]` does not resolve, fails `min type list` and `min type
+/// show` with the typed refusal that exits 3.
+#[test]
+fn type_commands_refuse_invalid_project_types_with_exit_3() {
+    for (file, kind) in [
+        ("[box_types.x\n", "parse"),
+        ("[box_types.orphan]\n", "resolve"),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(mfile::MFILE_NAME), file).unwrap();
+        let globals = type_globals(project.path());
+        let mut out = Vec::new();
+        let list = cmd::types::cmd_type_list(&globals, &TypeListArgs::default(), &mut out)
+            .expect_err("the list refuses");
+        let show = type_show(&globals, "session", None).expect_err("the show refuses");
+        for (err, doing) in [(list, "list the box types"), (show, "show the box type")] {
+            let invalid = err
+                .downcast_ref::<cmd::types::BoxTypesInvalid>()
+                .unwrap_or_else(|| panic!("{kind}: not a typed refusal: {err:#}"));
+            assert_eq!(invalid.doing, doing, "{kind}");
+            if kind == "resolve" {
+                assert!(
+                    matches!(invalid.cause, cmd::types::BoxTypesCause::Resolve(_)),
+                    "{kind}: {invalid:?}"
+                );
+            }
+            assert!(
+                err.to_string().starts_with(&format!("Cannot {doing}: ")),
+                "{err}"
+            );
+        }
+        assert!(out.is_empty(), "{kind}: a refusal writes nothing to stdout");
+    }
+    assert_eq!(cmd::types::BoxTypesInvalid::EXIT_CODE, 3);
+}
+
+/// What `min type show <name>` resolves in `project`: the same load and
+/// resolution the command runs, so the `-o` tests follow the built-in
+/// defaults that ship, not a literal list.
+fn resolved_type_detail(project: &std::path::Path, name: &str) -> cmd::types::TypeDetail {
+    let types = cmd::types::load_types(project, false, "show the box type").unwrap();
+    cmd::types::type_detail(&types, &types.resolve(name).unwrap())
+}
+
+/// `values` as `min type show -o yaml` writes them under `field`.
+fn yaml_type_values(field: &str, values: &[cmd::types::TypeValue]) -> String {
+    let quote = |text: &str| serde_json_lenient::to_string(text).unwrap();
+    let mut block = format!("{field}:\n");
+    for value in values {
+        block.push_str(&format!(
+            "  - key: {}\n    value: {}\n    set_by: {}\n    source: {}\n",
+            quote(&value.key),
+            quote(&value.value),
+            quote(&value.set_by),
+            quote(value.source.as_str()),
+        ));
+    }
+    block
+}
+
+/// `min type list -o json` and `min type show -o json` write `min/v1/type`
+/// objects: an array of rows, and one detail.
+#[test]
+fn type_output_json_writes_type_objects() {
+    use clap::Parser as _;
+    let parsed = Cli::try_parse_from(["min", "type", "show", "base", "-o", "json"]).unwrap();
+    assert!(matches!(
+        parsed.command,
+        Some(Command::Type(TypeArgs {
+            command: TypeCommand::Show(TypeShowArgs {
+                output: Some(TypeOutputFormat::Json),
+                ..
+            })
+        }))
+    ));
+    let project = project_with_box_types();
+    let globals = type_globals(project.path());
+
+    let list: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&type_list(&globals, Some(TypeOutputFormat::Json))).unwrap();
+    let rows = list.as_array().expect("an array");
+    assert_eq!(rows.len(), mfile::box_types::BUILTIN_BOX_TYPES.len() + 2);
+    for row in rows {
+        assert_eq!(row["schema"], "min/v1/type", "{row}");
+    }
+    assert_eq!(rows[0]["name"], "session");
+    assert_eq!(rows[0]["source"], "builtin");
+    let last = &rows[rows.len() - 1];
+    assert_eq!(last["name"], "rust-dev");
+    assert_eq!(last["source"], "project");
+    assert_eq!(last["extends"], "base");
+    assert_eq!(last["root"], "session");
+
+    let show = type_show(&globals, "rust-dev", Some(TypeOutputFormat::Json)).unwrap();
+    let detail: serde_json_lenient::Value = serde_json_lenient::from_str(&show).unwrap();
+    assert_eq!(detail["schema"], "min/v1/type");
+    assert_eq!(detail["name"], "rust-dev");
+    assert_eq!(
+        detail["chain"],
+        serde_json_lenient::json!(["session", "base", "rust-dev"])
+    );
+    let expected = resolved_type_detail(project.path(), "rust-dev");
+    assert_eq!(
+        detail["defaults"],
+        serde_json_lenient::to_value(&expected.defaults).unwrap()
+    );
+    assert_eq!(
+        detail["constraints"],
+        serde_json_lenient::to_value(&expected.constraints).unwrap()
+    );
+    // The project's own value is among them, with the type that sets it.
+    assert!(
+        detail["defaults"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json_lenient::json!({
+                "key": "timeout",
+                "value": "\"30m\"",
+                "set_by": "base",
+                "source": "project",
+            })),
+        "{detail}"
+    );
+}
+
+/// `min type list -o yaml` and `min type show -o yaml` write `min/v1/type`
+/// mappings: a sequence of rows, and one detail.
+#[test]
+fn type_output_yaml_writes_type_mappings() {
+    let project = project_with_box_types();
+    let globals = type_globals(project.path());
+
+    let list = type_list(&globals, Some(TypeOutputFormat::Yaml));
+    assert!(
+        list.starts_with(
+            "- schema: \"min/v1/type\"\n  name: \"session\"\n  source: \"builtin\"\n  root: \"session\"\n"
+        ),
+        "{list}"
+    );
+    assert!(
+        list.ends_with(
+            "- schema: \"min/v1/type\"\n  name: \"rust-dev\"\n  source: \"project\"\n  extends: \"base\"\n  root: \"session\"\n"
+        ),
+        "{list}"
+    );
+
+    let show = type_show(&globals, "rust-dev", Some(TypeOutputFormat::Yaml)).unwrap();
+    for block in [
+        "schema: \"min/v1/type\"\nname: \"rust-dev\"\nsource: \"project\"\nextends: \"base\"\nroot: \"session\"\n",
+        "chain:\n  - \"session\"\n  - \"base\"\n  - \"rust-dev\"\n",
+    ] {
+        assert!(show.contains(block), "missing {block:?}\n{show}");
+    }
+    let expected = resolved_type_detail(project.path(), "rust-dev");
+    for block in [
+        yaml_type_values("defaults", &expected.defaults),
+        yaml_type_values("constraints", &expected.constraints),
+    ] {
+        assert!(show.contains(&block), "missing {block:?}\n{show}");
+    }
+    assert!(
+        show.contains("  - key: \"timeout\"\n    value: \"\\\"30m\\\"\"\n    set_by: \"base\"\n    source: \"project\"\n"),
+        "{show}"
+    );
+
+    // A built-in type shows the values its own table sets, and no `extends`.
+    let show = type_show(&globals, "session", Some(TypeOutputFormat::Yaml)).unwrap();
+    assert!(show.contains("chain:\n  - \"session\"\n"), "{show}");
+    assert!(!show.contains("extends"), "{show}");
+    let expected = resolved_type_detail(project.path(), "session");
+    for (field, values) in [
+        ("defaults", &expected.defaults),
+        ("constraints", &expected.constraints),
+    ] {
+        if !values.is_empty() {
+            let block = yaml_type_values(field, values);
+            assert!(show.contains(&block), "missing {block:?}\n{show}");
+        }
+    }
+
+    // A type name with a control character is escaped in the YAML too.
+    let hostile = tempfile::tempdir().unwrap();
+    std::fs::write(
+        hostile.path().join(mfile::MFILE_NAME),
+        "[box_types.\"evil\\u001b[2J\"]\nextends = \"session\"\n",
+    )
+    .unwrap();
+    let list = type_list(&type_globals(hostile.path()), Some(TypeOutputFormat::Yaml));
+    assert!(!list.contains('\u{1b}'), "{list:?}");
+    assert!(list.contains("name: \"evil\\u001b[2J\""), "{list}");
+}
+
+/// `min type list -o toml` and `min type show -o toml` write `min/v1/type`
+/// tables: a `[[types]]` table for each row, and one detail.
+#[test]
+fn type_output_toml_writes_type_tables() {
+    let project = project_with_box_types();
+    let globals = type_globals(project.path());
+
+    let list: toml::Table = toml::from_str(&type_list(&globals, Some(TypeOutputFormat::Toml)))
+        .expect("the list is TOML");
+    let rows = list["types"].as_array().expect("a [[types]] array");
+    assert_eq!(rows.len(), mfile::box_types::BUILTIN_BOX_TYPES.len() + 2);
+    for row in rows {
+        assert_eq!(row["schema"].as_str(), Some("min/v1/type"), "{row}");
+    }
+    let last = rows[rows.len() - 1].as_table().unwrap();
+    assert_eq!(last["name"].as_str(), Some("rust-dev"));
+    assert_eq!(last["extends"].as_str(), Some("base"));
+    assert!(!rows[0].as_table().unwrap().contains_key("extends"));
+
+    let show = type_show(&globals, "rust-dev", Some(TypeOutputFormat::Toml)).unwrap();
+    let detail: toml::Table = toml::from_str(&show).expect("the detail is TOML");
+    assert_eq!(detail["schema"].as_str(), Some("min/v1/type"));
+    assert_eq!(detail["source"].as_str(), Some("project"));
+    let chain: Vec<&str> = detail["chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect();
+    assert_eq!(chain, ["session", "base", "rust-dev"]);
+    let expected = resolved_type_detail(project.path(), "rust-dev");
+    assert_eq!(
+        detail["defaults"],
+        toml::Value::try_from(&expected.defaults).unwrap()
+    );
+    assert_eq!(
+        detail["constraints"],
+        toml::Value::try_from(&expected.constraints).unwrap()
+    );
+    let timeout = detail["defaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["key"].as_str() == Some("timeout"))
+        .expect("the project's timeout");
+    assert_eq!(timeout["value"].as_str(), Some("\"30m\""));
+    assert_eq!(timeout["set_by"].as_str(), Some("base"));
 }
 
 // T14 (S3): boxes started, attached and resumed, end to end. `min session
