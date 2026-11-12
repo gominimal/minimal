@@ -17079,7 +17079,7 @@ fn type_show_names_the_type_and_source_of_each_value() {
         "Source:         project\n",
         "Extends:        base\n",
         "Built-in type:  session\n",
-        // `session` sets no value and is in the chain all the same.
+        // `session` sets `loadout_mode` and is the first type of the chain.
         "Type chain:     session -> base -> rust-dev\n",
     ] {
         assert!(text.contains(line), "missing {line:?}\n{text}");
