@@ -235,12 +235,19 @@ pub(crate) async fn release_held_box_name(
 /// box under that name takes a fresh id (BEP-082). The VM host daemon
 /// serves that withdraw by name alone: it retires and revokes nothing.
 /// Then the old name's hold is released. Best-effort, as the hold is.
+///
+/// With no control socket (a native host) no VM host daemon holds a row or
+/// a name for the box, so the move asks for nothing and logs nothing
+/// (BCLI-058).
 pub(crate) async fn move_held_box_name(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
     old_name: Option<&str>,
     new_name: &str,
 ) {
+    if control_sock.is_none() {
+        return;
+    }
     if let Some(old_name) = old_name {
         withdraw_box_row(
             control_sock.clone(),
