@@ -2006,10 +2006,9 @@ impl File {
     /// For a daemon that reads every box's project from a tree laid out
     /// afresh each session, native or VM, whose path changes every time, so
     /// the caller supplies the stable host path. The `~` prefix is never
-    /// used: the host's home
-    /// is not this machine's. Components are encoded with
-    /// [`Self::encode_component_escaped`], so two project paths never share a
-    /// directory.
+    /// used: the host's home is not this machine's. Components are encoded
+    /// with [`Self::encode_component_escaped`], so two project paths never
+    /// share a directory.
     pub fn state_dir_under<P: AsRef<Path>>(
         &self,
         state_key: &str,

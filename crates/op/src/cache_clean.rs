@@ -180,7 +180,9 @@ impl CleanCache {
             // otherwise go, and stops at the first recent entry.
             let path = entry.path();
             let last_touched = || match kind {
-                StaleKind::Sandbox => newest_modified(&path, now.checked_sub(FOREIGN_OWNER_IDLE)?),
+                StaleKind::Sandbox => {
+                    newest_modified(&path, now, now.checked_sub(FOREIGN_OWNER_IDLE)?)
+                }
                 StaleKind::Task | StaleKind::TempDir => None,
             };
             if !owner_is_gone(name, self.daemon_id.as_deref(), last_touched, now) {
@@ -218,12 +220,16 @@ const FOREIGN_OWNER_IDLE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// may not list is skipped, its own time still counted. The walk stops at the
 /// first time at or after `stop_at` and returns it; it never follows a
 /// symlink or crosses onto another filesystem.
-fn newest_modified(root: &Path, stop_at: SystemTime) -> Option<SystemTime> {
+fn newest_modified(root: &Path, now: SystemTime, stop_at: SystemTime) -> Option<SystemTime> {
     use std::os::unix::fs::MetadataExt as _;
 
+    // A time past `now` is no evidence of life: a tarball keeps upstream
+    // dates, some of them in the future, and a clock stepped back leaves the
+    // same. Counting one would keep a dead daemon's sandbox for good.
+    let seen = |t: SystemTime| if t > now { SystemTime::UNIX_EPOCH } else { t };
     let meta = std::fs::symlink_metadata(root).ok()?;
     let dev = meta.dev();
-    let mut newest = meta.modified().ok()?;
+    let mut newest = seen(meta.modified().ok()?);
     let mut dirs = if meta.is_dir() {
         vec![root.to_path_buf()]
     } else {
@@ -242,7 +248,7 @@ fn newest_modified(root: &Path, stop_at: SystemTime) -> Option<SystemTime> {
             let entry = entry.ok()?;
             // `DirEntry::metadata` does not follow a symlink.
             let meta = entry.metadata().ok()?;
-            newest = newest.max(meta.modified().ok()?);
+            newest = newest.max(seen(meta.modified().ok()?));
             if meta.is_dir() && meta.dev() == dev {
                 dirs.push(entry.path());
             }
@@ -614,12 +620,28 @@ mod tests {
             .set_modified(newer)
             .unwrap();
 
-        let far_future = SystemTime::now() + Duration::from_secs(3600);
-        assert_eq!(newest_modified(&root, far_future), Some(newer));
+        let now = SystemTime::now();
+        let far_future = now + Duration::from_secs(3600);
+        assert_eq!(newest_modified(&root, now, far_future), Some(newer));
         assert_eq!(
-            newest_modified(&tmp.path().join("missing"), far_future),
+            newest_modified(&tmp.path().join("missing"), now, far_future),
             None
         );
+
+        // A file dated past `now` (a tarball's upstream date, or a clock that
+        // stepped back) counts for nothing: the sandbox is as old as its
+        // newest real time, so a dead daemon's sandbox with one such file
+        // still goes.
+        std::fs::write(deep.join("future"), b"y").unwrap();
+        std::fs::File::open(deep.join("future"))
+            .unwrap()
+            .set_modified(now + Duration::from_secs(30 * 24 * 60 * 60))
+            .unwrap();
+        std::fs::File::open(&deep)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(newest_modified(&root, now, far_future), Some(newer));
     }
 
     /// A daemon never sweeps its own work, even though `sandbox` stamps its
