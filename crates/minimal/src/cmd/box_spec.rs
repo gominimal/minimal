@@ -524,8 +524,8 @@ struct EntrySpec {
     sources: std::collections::BTreeMap<String, Vec<String>>,
     proxy_rows: Vec<String>,
     /// The names of the loadouts `min box start` selects for the entry, in
-    /// the order it applies them. `None` for a task entry, which takes no
-    /// loadout.
+    /// the order it applies them, for a task entry too. Empty for a sealed
+    /// box, which selects no loadout.
     loadouts: Option<Vec<String>>,
 }
 
