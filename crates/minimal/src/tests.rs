@@ -18104,3 +18104,66 @@ async fn start_attach_resume_end_to_end() {
         );
     }
 }
+
+// T42 (BCLI-058): `min box rename` on a native host renames the box and
+// prints no warning about the VM host daemon. A native host has no VM host
+// daemon, so there is no host row to withdraw and no name hold to move.
+// The VM host half, where the rename still withdraws the old row, is
+// `a_rename_retires_nothing_and_a_stop_retires_as_stopped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_rename_native_host_prints_no_vm_host_warning() {
+    let log = minimald::test_harness::captured_log();
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let web = minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await;
+    let host = local_hosts(&global)
+        .unwrap()
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the native host is selected");
+    let control_sock = cmd::box_host_control_sock(&host);
+    assert_eq!(control_sock, None, "a native host has no VM host daemon");
+
+    // `min box rename web front`, as `cmd_box_rename` runs it.
+    let mut client = box_host_client(&host).await.unwrap();
+    let record = cmd::get_session_record(&mut client, &web.to_string())
+        .await
+        .expect("the box's record")
+        .record
+        .expect("the record is there");
+    assert!(
+        crate::holds_name(&record),
+        "the harness box takes the held-name path: {:?}",
+        record.network
+    );
+    let mut out = Vec::new();
+    cmd::rename_listed_box(&mut client, &mut out, web, "web", "front")
+        .await
+        .unwrap_or_else(|e| panic!("the rename: {e:#}"));
+    cmd::rename_box_with_vm_host(control_sock, &record, "front").await;
+
+    assert_eq!(String::from_utf8_lossy(&out), "Renamed web to front.\n");
+    let names = listed_ids_and_names(&host).await;
+    assert!(
+        names.contains(&(web, Some("front".to_owned()))),
+        "the box keeps its id under the new name: {names:?}"
+    );
+    let log = log.contents();
+    let warnings: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains("VM host daemon"))
+        .collect();
+    assert!(
+        warnings.is_empty(),
+        "a native rename warns about no VM host daemon:\n{}",
+        warnings.join("\n")
+    );
+}
