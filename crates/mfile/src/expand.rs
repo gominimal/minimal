@@ -8,6 +8,14 @@
 //! list before it in layer order, each value once, and any other value
 //! (a scalar or a table) replaces the earlier one wholesale.
 //!
+//! `vars` and `vars_lenient` are the exception (BOX-180). They merge by
+//! variable name, keyed across both tables: a name keeps the value, and
+//! the table, of the most specific layer that sets it. A selected loadout
+//! only adds names. A loadout that gives a set name another resolved value
+//! fails the expansion (BOX-183), and so does one layer that sets a name
+//! twice to different values (BOX-184). An `inherit` value resolves
+//! against [`Layers::host_vars`].
+//!
 //! The fold is a pure function. Its spec is a `toml::Table`, and
 //! [`Expansion::spec_bytes`] writes it with every table in key order, so
 //! one set of layers gives the same bytes on every run (BOX-065).
@@ -158,6 +166,9 @@ impl ValueOrigin {
 pub struct ExpansionReport {
     /// The origin of each top-level key's value, by key.
     pub values: BTreeMap<String, ValueOrigin>,
+    /// The layer that set each variable of `vars` and `vars_lenient`, by
+    /// variable name (BOX-180).
+    pub vars: BTreeMap<String, Origin>,
     /// Whether the expanded entry is the implicit default session entry,
     /// which the file does not declare (BOX-165).
     pub implicit: bool,
@@ -184,6 +195,12 @@ pub struct Layers {
     pub loadouts: toml::Table,
     /// The command-line overrides.
     pub overrides: toml::Table,
+    /// The host's value for each variable that a layer sets to
+    /// `{ inherit = true }`, by name. A name the host does not set is not
+    /// here. The merge of `vars` compares resolved values (BOX-183,
+    /// BOX-184), so the client fills this from its environment, for the
+    /// names [`inherited_var_names`] gives.
+    pub host_vars: BTreeMap<String, String>,
 }
 
 impl Layers {
@@ -283,6 +300,7 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     ordered.push((Origin::of(Layer::Loadouts), loadouts));
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
     let mut expansion = fold(&ordered);
+    merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
@@ -384,6 +402,9 @@ fn fold(ordered: &[(Origin, &toml::Table)]) -> Expansion {
     let mut ignored_sections = Vec::new();
     for (origin, layer) in ordered {
         for (key, value) in layer.iter() {
+            if VAR_KEYS.contains(&key.as_str()) {
+                continue;
+            }
             if IGNORED_SECTIONS.contains(&key.as_str()) {
                 ignored_sections.push((key.clone(), origin.clone()));
                 continue;
@@ -396,6 +417,257 @@ fn fold(ordered: &[(Origin, &toml::Table)]) -> Expansion {
         report,
         ignored_sections,
     }
+}
+
+/// The keys that hold variables. [`fold`] leaves them out, and
+/// [`merge_vars`] merges them by variable name (BOX-180).
+const VAR_KEYS: [&str; 2] = ["vars", "vars_lenient"];
+
+/// Which table of the spec holds a variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarTable {
+    /// `vars`, a table of name to value.
+    Vars,
+    /// `vars_lenient`, a list of `{ name, value }` tables.
+    Lenient,
+}
+
+/// One variable as the merge holds it.
+#[derive(Debug, Clone)]
+struct MergedVar {
+    table: VarTable,
+    /// For [`VarTable::Vars`], the value. For [`VarTable::Lenient`], the
+    /// whole list item.
+    item: toml::Value,
+    /// The value, resolved against the host. `None` for an `inherit` that
+    /// the host does not set.
+    resolved: Option<String>,
+    origin: Origin,
+}
+
+/// The names that some layer sets to `{ inherit = true }`, in `vars` or
+/// `vars_lenient`. The client looks each one up in its environment and
+/// puts the values it finds in [`Layers::host_vars`].
+#[must_use]
+pub fn inherited_var_names(entry: &BoxEntry, layers: &Layers) -> BTreeSet<String> {
+    let tables = layers.type_defaults.iter().map(|(_, t)| t).chain([
+        &layers.defaults,
+        &layers.defaults_type,
+        &entry.body,
+        &layers.loadouts,
+        &layers.overrides,
+    ]);
+    let mut names = BTreeSet::new();
+    for table in tables {
+        for (name, kind, item) in layer_vars(table) {
+            if var_value(kind, item)
+                .and_then(|v| v.get("inherit"))
+                .and_then(toml::Value::as_bool)
+                == Some(true)
+            {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// The variables one layer sets, in the order the layer writes them:
+/// `vars` first, then `vars_lenient`. Each is the name, the table and, for
+/// `vars`, the value, for `vars_lenient` the whole list item. A part of
+/// the wrong shape is not here: [`merge_vars`] keeps it whole, so
+/// [`check_keys`] refuses it.
+fn layer_vars(layer: &toml::Table) -> Vec<(&str, VarTable, &toml::Value)> {
+    let mut out = Vec::new();
+    if let Some(toml::Value::Table(vars)) = layer.get("vars") {
+        for (name, value) in vars {
+            out.push((name.as_str(), VarTable::Vars, value));
+        }
+    }
+    if let Some(toml::Value::Array(items)) = layer.get("vars_lenient") {
+        for item in items {
+            if let Some(name) = item.get("name").and_then(toml::Value::as_str) {
+                out.push((name, VarTable::Lenient, item));
+            }
+        }
+    }
+    out
+}
+
+/// The value part of a variable: the value itself for `vars`, and the
+/// `value` key of a `vars_lenient` item.
+fn var_value(table: VarTable, item: &toml::Value) -> Option<&toml::Value> {
+    match table {
+        VarTable::Vars => Some(item),
+        VarTable::Lenient => item.get("value"),
+    }
+}
+
+/// The value of a variable after the host resolves it: a string as it is,
+/// an `inherit` as the host's value or else its `default`. `None` for an
+/// `inherit` with no host value and no default. Any other shape resolves
+/// to its TOML text, so two such values compare as they are written.
+fn resolve_var(
+    name: &str,
+    table: VarTable,
+    item: &toml::Value,
+    host: &BTreeMap<String, String>,
+) -> Option<String> {
+    match var_value(table, item) {
+        Some(toml::Value::String(s)) => Some(s.clone()),
+        Some(toml::Value::Table(t))
+            if t.get("inherit").and_then(toml::Value::as_bool) == Some(true) =>
+        {
+            host.get(name).cloned().or_else(|| {
+                t.get("default")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+            })
+        }
+        Some(other) => Some(other.to_string()),
+        None => None,
+    }
+}
+
+/// Merges `vars` and `vars_lenient` of `ordered` by variable name, into
+/// `expansion` (BOX-180).
+///
+/// A name keeps the value and the table of the latest layer that sets it.
+/// The selected loadouts' layer is the exception: it only adds names. A
+/// loadout value that resolves to the value already set adds nothing, and
+/// a loadout `inherit` that the host does not set is not compared.
+///
+/// A layer's `vars` that is not a table, or `vars_lenient` that is not a
+/// list, replaces the spec's value whole, so [`check_keys`] refuses it and
+/// names the layer.
+///
+/// # Errors
+///
+/// [`Error::LoadoutVarConflict`] when a loadout gives a set name another
+/// resolved value (BOX-183). [`Error::DuplicateVar`] when one layer, other
+/// than the loadouts, sets a name twice to different resolved values
+/// (BOX-184). In the loadouts' layer, that is two loadouts that disagree,
+/// so it is [`Error::LoadoutVarConflict`].
+fn merge_vars(
+    entry: &BoxEntry,
+    ordered: &[(Origin, &toml::Table)],
+    host: &BTreeMap<String, String>,
+    expansion: &mut Expansion,
+) -> Result<(), Error> {
+    let mut merged: Vec<(String, MergedVar)> = Vec::new();
+    // The layer that last set each key, and a key whose value has the
+    // wrong shape, which the spec then carries whole.
+    let mut key_origin: BTreeMap<&str, Origin> = BTreeMap::new();
+    let mut bad_shape: BTreeMap<&str, (toml::Value, Origin)> = BTreeMap::new();
+    for (origin, layer) in ordered {
+        let loadouts = origin.layer == Layer::Loadouts;
+        for key in VAR_KEYS {
+            let Some(value) = layer.get(key) else {
+                continue;
+            };
+            let shaped = match key {
+                "vars" => value.is_table(),
+                _ => value.is_array(),
+            };
+            if shaped {
+                bad_shape.remove(key);
+            } else {
+                bad_shape.insert(key, (value.clone(), origin.clone()));
+            }
+            key_origin.insert(key, origin.clone());
+        }
+        // BOX-184: one layer has no later layer to settle a name it sets
+        // twice, so two different values for it are refused.
+        let mut this_layer: BTreeMap<&str, Option<String>> = BTreeMap::new();
+        for (name, table, item) in layer_vars(layer) {
+            let resolved = resolve_var(name, table, item, host);
+            if let Some(seen) = this_layer.get(name) {
+                if *seen == resolved {
+                    continue;
+                }
+                let words = layer_words(entry, Some(origin));
+                tracing::debug!(
+                    rule = "BOX-184",
+                    variable = name,
+                    layer = %words,
+                    "one layer sets a variable twice to different values"
+                );
+                return Err(if loadouts {
+                    Error::LoadoutVarConflict {
+                        name: name.to_owned(),
+                        first: words,
+                        second: "another selected loadout".to_owned(),
+                    }
+                } else {
+                    Error::DuplicateVar {
+                        name: name.to_owned(),
+                        layer: words,
+                    }
+                });
+            }
+            this_layer.insert(name, resolved.clone());
+            let new = MergedVar {
+                table,
+                item: item.clone(),
+                resolved,
+                origin: origin.clone(),
+            };
+            let Some(at) = merged.iter().position(|(n, _)| n == name) else {
+                merged.push((name.to_owned(), new));
+                continue;
+            };
+            if !loadouts {
+                merged[at].1 = new;
+                continue;
+            }
+            // BOX-183: a loadout adds names, and never changes one.
+            let have = &merged[at].1;
+            match (&have.resolved, &new.resolved) {
+                (Some(a), Some(b)) if a != b => {
+                    let first = layer_words(entry, Some(&have.origin));
+                    tracing::debug!(
+                        rule = "BOX-183",
+                        variable = name,
+                        set_by = %first,
+                        "a selected loadout sets a variable to another value"
+                    );
+                    return Err(Error::LoadoutVarConflict {
+                        name: name.to_owned(),
+                        first,
+                        second: layer_words(entry, Some(origin)),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut vars = toml::Table::new();
+    let mut lenient = Vec::new();
+    let report = &mut expansion.report;
+    for (name, var) in merged {
+        match var.table {
+            VarTable::Vars => {
+                vars.insert(name.clone(), var.item);
+            }
+            VarTable::Lenient => lenient.push(var.item),
+        }
+        report.vars.insert(name, var.origin);
+    }
+    for key in VAR_KEYS {
+        let Some(origin) = key_origin.remove(key) else {
+            continue;
+        };
+        let (value, origin) = match bad_shape.remove(key) {
+            Some(bad) => bad,
+            None if key == "vars" => (toml::Value::Table(std::mem::take(&mut vars)), origin),
+            None => (toml::Value::Array(std::mem::take(&mut lenient)), origin),
+        };
+        expansion.spec.insert(key.to_owned(), value);
+        report
+            .values
+            .insert(key.to_owned(), ValueOrigin::Value(origin));
+    }
+    Ok(())
 }
 
 /// The keys whose list is an argument vector. Order and repeats are part of
@@ -1987,5 +2259,245 @@ mod tests {
             assert_eq!(err.exit_code(), Some(3), "{name}");
             assert_eq!(err.to_string(), msg, "{name}");
         }
+    }
+
+    /// Layers whose selected loadouts' layer is `loadouts` and whose host
+    /// sets `host`.
+    fn vars_layers(loadouts: &str, host: &[(&str, &str)]) -> Layers {
+        Layers {
+            loadouts: table(loadouts),
+            host_vars: host
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..Layers::default()
+        }
+    }
+
+    /// The `vars_lenient` items of `spec`, as `(name, value)` pairs.
+    fn lenient(spec: &toml::Table) -> Vec<(String, toml::Value)> {
+        spec["vars_lenient"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|item| {
+                (
+                    item["name"].as_str().unwrap().to_owned(),
+                    item["value"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    // BOX-180: `vars` and `vars_lenient` merge by name across both tables.
+    // A name keeps the value, and the table, of the most specific layer up
+    // to the entry, and a loadout adds the names it sets.
+    #[test]
+    fn vars_merge_by_name_across_layers() {
+        let file = r#"
+            [defaults]
+            vars = { A = "defaults", B = "defaults", KEEP = "defaults" }
+            [defaults.session]
+            vars_lenient = [{ name = "my.var", value = "1" }]
+            [sessions.dev]
+            loadout_mode = "open"
+            vars = { A = "entry" }
+            vars_lenient = [{ name = "B", value = "entry" }]
+        "#;
+        let loadouts = r#"
+            vars = { A = "entry", C = "loadout", H = { inherit = true }, GONE = { inherit = true } }
+            vars_lenient = [{ name = "KEEP", value = "defaults" }]
+        "#;
+        let e = expand_in(file, "dev", vars_layers(loadouts, &[("H", "host")]))
+            .expect("the entry expands");
+        let vars = e.spec["vars"].as_table().expect("a table");
+        let names: Vec<&str> = vars.keys().map(String::as_str).collect();
+        assert_eq!(names, ["A", "C", "GONE", "H", "KEEP"]);
+        assert_eq!(vars["A"].as_str(), Some("entry"), "the entry wins");
+        assert_eq!(vars["KEEP"].as_str(), Some("defaults"), "defaults kept");
+        assert_eq!(vars["C"].as_str(), Some("loadout"), "a loadout adds");
+        assert_eq!(
+            lenient(&e.spec),
+            [
+                ("B".to_owned(), toml::Value::from("entry")),
+                ("my.var".to_owned(), toml::Value::from("1")),
+            ],
+            "B moves to the entry's table, and keeps its first place"
+        );
+        // The report keeps the layer of each name.
+        let at = |name: &str| e.report.vars[name].layer;
+        assert_eq!(
+            at("A"),
+            Layer::Entry,
+            "a loadout's equal value adds nothing"
+        );
+        assert_eq!(at("B"), Layer::Entry);
+        assert_eq!(at("KEEP"), Layer::Defaults);
+        assert_eq!(at("my.var"), Layer::DefaultsType);
+        assert_eq!(at("C"), Layer::Loadouts);
+        assert_eq!(at("H"), Layer::Loadouts);
+        // The merge is the same on every run.
+        let again = expand_in(file, "dev", vars_layers(loadouts, &[("H", "host")])).unwrap();
+        assert_eq!(e.spec_bytes().unwrap(), again.spec_bytes().unwrap());
+        // A sealed entry takes no loadout name.
+        let sealed = file.replace("\"open\"", "\"sealed\"");
+        let e = expand_in(&sealed, "dev", vars_layers(loadouts, &[])).unwrap();
+        let names: Vec<&String> = e.spec["vars"].as_table().unwrap().keys().collect();
+        assert_eq!(names, ["A", "KEEP"]);
+        // A loadout's `inherit` that matches the set value, or that the host
+        // does not set, is not a conflict.
+        let loadouts = "vars = { A = { inherit = true }, KEEP = { inherit = true } }";
+        let e = expand_in(file, "dev", vars_layers(loadouts, &[("A", "entry")])).unwrap();
+        assert_eq!(e.spec["vars"]["A"].as_str(), Some("entry"));
+        assert_eq!(e.spec["vars"]["KEEP"].as_str(), Some("defaults"));
+        // A name that the entry has only from a type's defaults: the entry
+        // still wins over the built-in layer.
+        let layers = Layers {
+            type_defaults: vec![(
+                "session".to_owned(),
+                table("vars = { T = \"type\", A = \"type\" }"),
+            )],
+            ..Layers::default()
+        };
+        let e = expand_in(file, "dev", layers).unwrap();
+        assert_eq!(e.spec["vars"]["T"].as_str(), Some("type"));
+        assert_eq!(e.spec["vars"]["A"].as_str(), Some("entry"));
+        assert_eq!(e.report.vars["T"], Origin::type_defaults("session"));
+    }
+
+    // BOX-183: a loadout that gives a set name another resolved value fails
+    // the expansion with exit 3, naming the variable, both sources and the
+    // policy remedy.
+    #[test]
+    fn conflicting_loadout_var_refused_exit3() {
+        let file = r#"
+            [defaults]
+            vars = { D = "defaults" }
+            [sessions.dev]
+            loadout_mode = "open"
+            vars = { A = "entry", I = { inherit = true } }
+        "#;
+        let conflict = |name: &str, first: &str, second: &str| {
+            format!(
+                "The variable `{name}` has two different values. {first} sets one \
+                 value, and {second} sets the other. A loadout cannot change a \
+                 variable that is already set. Remove `{name}` from one of them, \
+                 or add `{name}` to the `ignore` list under `[vars]` in \
+                 user_policy.toml to drop every value of `{name}`."
+            )
+        };
+        let cases = [
+            (
+                "a literal against the entry",
+                "vars = { A = \"loadout\" }",
+                vec![],
+                conflict(
+                    "A",
+                    "`[sessions.dev]` in minimal.toml",
+                    "a selected loadout",
+                ),
+            ),
+            (
+                "a lenient item against [defaults]",
+                "vars_lenient = [{ name = \"D\", value = \"loadout\" }]",
+                vec![],
+                conflict("D", "`[defaults]` in minimal.toml", "a selected loadout"),
+            ),
+            (
+                "a literal against the entry's resolved inherit",
+                "vars = { I = \"loadout\" }",
+                vec![("I", "host")],
+                conflict(
+                    "I",
+                    "`[sessions.dev]` in minimal.toml",
+                    "a selected loadout",
+                ),
+            ),
+            (
+                "an inherit that resolves to another value",
+                "vars = { A = { inherit = true } }",
+                vec![("A", "host")],
+                conflict(
+                    "A",
+                    "`[sessions.dev]` in minimal.toml",
+                    "a selected loadout",
+                ),
+            ),
+            (
+                "two loadouts",
+                "vars = { N = \"one\" }\nvars_lenient = [{ name = \"N\", value = \"two\" }]",
+                vec![],
+                conflict("N", "a selected loadout", "another selected loadout"),
+            ),
+        ];
+        for (what, loadouts, host, msg) in cases {
+            let err = expand_in(file, "dev", vars_layers(loadouts, &host)).expect_err(what);
+            assert!(
+                matches!(err, Error::LoadoutVarConflict { .. }),
+                "{what}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{what}");
+            assert_eq!(err.to_string(), msg, "{what}");
+        }
+        // The same values pass, and a sealed entry checks nothing.
+        expand_in(
+            file,
+            "dev",
+            vars_layers("vars = { I = \"host\" }", &[("I", "host")]),
+        )
+        .expect("the same resolved value is one variable");
+        let sealed = file.replace("\"open\"", "\"sealed\"");
+        expand_in(
+            &sealed,
+            "dev",
+            vars_layers("vars = { A = \"loadout\" }", &[]),
+        )
+        .expect("a sealed entry takes no loadout");
+    }
+
+    // BOX-184: one layer that sets a name twice, in `vars_lenient` or in
+    // both tables, to different values fails with exit 3, naming the
+    // variable and the layer. The same value twice is one variable.
+    #[test]
+    fn duplicate_var_in_one_layer_refused_exit3() {
+        let cases = [
+            (
+                "both tables of the entry",
+                "[sessions.dev]\nvars = { A = \"1\" }\nvars_lenient = [{ name = \"A\", value = \"2\" }]\n",
+                "A",
+                "`[sessions.dev]` in minimal.toml",
+            ),
+            (
+                "vars_lenient of [defaults]",
+                "[defaults]\nvars_lenient = [{ name = \"my.var\", value = \"1\" }, { name = \"my.var\", value = \"2\" }]\n[sessions.dev]\n",
+                "my.var",
+                "`[defaults]` in minimal.toml",
+            ),
+            (
+                "an inherit and a literal in [defaults.session]",
+                "[defaults.session]\nvars = { H = { inherit = true } }\nvars_lenient = [{ name = \"H\", value = \"literal\" }]\n[sessions.dev]\n",
+                "H",
+                "`[defaults.session]` in minimal.toml",
+            ),
+        ];
+        for (what, file, name, layer) in cases {
+            let err = expand_in(file, "dev", vars_layers("", &[("H", "host")])).expect_err(what);
+            assert!(matches!(err, Error::DuplicateVar { .. }), "{what}: {err:?}");
+            assert_eq!(err.exit_code(), Some(3), "{what}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "{layer} sets the variable `{name}` twice, to different values. \
+                     Remove one of the two settings."
+                ),
+                "{what}"
+            );
+        }
+        // The same resolved value twice is one variable, kept once.
+        let file = "[sessions.dev]\nvars = { A = \"1\", H = { inherit = true } }\n\
+                    vars_lenient = [{ name = \"A\", value = \"1\" }, { name = \"H\", value = \"host\" }]\n";
+        let e = expand_in(file, "dev", vars_layers("", &[("H", "host")])).expect("one variable");
+        assert_eq!(e.spec["vars"]["A"].as_str(), Some("1"));
+        assert!(lenient(&e.spec).is_empty(), "{:?}", e.spec);
     }
 }
