@@ -671,7 +671,7 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Events(args),
         })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
-        // BCLI-033: a `min box show -o json|yaml|toml` failure is one
+        // BCLI-033: a `min box show -o json|yaml` failure is one
         // `min/v1/error` object.
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Show(args),
@@ -1238,7 +1238,6 @@ mod tests {
         for (output, machine) in [
             (Some(minimal::BoxShowOutputFormat::Json), true),
             (Some(minimal::BoxShowOutputFormat::Yaml), true),
-            (Some(minimal::BoxShowOutputFormat::Toml), true),
             (None, false),
         ] {
             let cli = minimal::Cli {
