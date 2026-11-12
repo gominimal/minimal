@@ -476,7 +476,8 @@ pub fn inherited_var_names(entry: &BoxEntry, layers: &Layers) -> BTreeSet<String
 /// `vars` first, then `vars_lenient`. Each is the name, the table and, for
 /// `vars`, the value, for `vars_lenient` the whole list item. A part of
 /// the wrong shape is not here: [`merge_vars`] keeps it whole, so
-/// [`check_keys`] refuses it.
+/// [`check_keys`] refuses it. A `vars_lenient` item with no string `name`
+/// is not here either: [`nameless_lenient`] gives those to [`merge_vars`].
 fn layer_vars(layer: &toml::Table) -> Vec<(&str, VarTable, &toml::Value)> {
     let mut out = Vec::new();
     if let Some(toml::Value::Table(vars)) = layer.get("vars") {
@@ -492,6 +493,19 @@ fn layer_vars(layer: &toml::Table) -> Vec<(&str, VarTable, &toml::Value)> {
         }
     }
     out
+}
+
+/// The `vars_lenient` items of one layer that have no string `name`.
+/// [`merge_vars`] keeps each one in the spec's list, so the client's
+/// reading of the list refuses it, as it did before the merge by name.
+fn nameless_lenient(layer: &toml::Table) -> impl Iterator<Item = &toml::Value> {
+    let items = match layer.get("vars_lenient") {
+        Some(toml::Value::Array(items)) => items.as_slice(),
+        _ => &[],
+    };
+    items
+        .iter()
+        .filter(|item| item.get("name").and_then(toml::Value::as_str).is_none())
 }
 
 /// The value part of a variable: the value itself for `vars`, and the
@@ -555,6 +569,9 @@ fn merge_vars(
     expansion: &mut Expansion,
 ) -> Result<(), Error> {
     let mut merged: Vec<(String, MergedVar)> = Vec::new();
+    // `vars_lenient` items with no name. The merge has no name to key
+    // them by, so the spec keeps each one, and the client refuses it.
+    let mut nameless: Vec<toml::Value> = Vec::new();
     // The layer that last set each key, and a key whose value has the
     // wrong shape, which the spec then carries whole.
     let mut key_origin: BTreeMap<&str, Origin> = BTreeMap::new();
@@ -576,6 +593,7 @@ fn merge_vars(
             }
             key_origin.insert(key, origin.clone());
         }
+        nameless.extend(nameless_lenient(layer).cloned());
         // BOX-184: one layer has no later layer to settle a name it sets
         // twice, so two different values for it are refused.
         let mut this_layer: BTreeMap<&str, Option<String>> = BTreeMap::new();
@@ -653,6 +671,7 @@ fn merge_vars(
         }
         report.vars.insert(name, var.origin);
     }
+    lenient.extend(nameless);
     for key in VAR_KEYS {
         let Some(origin) = key_origin.remove(key) else {
             continue;
@@ -2363,6 +2382,16 @@ mod tests {
         assert_eq!(e.spec["vars"]["T"].as_str(), Some("type"));
         assert_eq!(e.spec["vars"]["A"].as_str(), Some("entry"));
         assert_eq!(e.report.vars["T"], Origin::type_defaults("session"));
+        // A `vars_lenient` item with no name stays in the list, so the
+        // client refuses it, and the merge does not drop it silently.
+        let nameless = file.replace(
+            "[{ name = \"B\", value = \"entry\" }]",
+            "[{ name = \"B\", value = \"entry\" }, { value = \"x\" }]",
+        );
+        let e = expand_in(&nameless, "dev", Layers::default()).unwrap();
+        let items = e.spec["vars_lenient"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(items.iter().any(|item| item.get("name").is_none()));
     }
 
     // BOX-183: a loadout that gives a set name another resolved value fails
