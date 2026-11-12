@@ -642,6 +642,19 @@ const SECTIONS: &[SectionKey] = &[
     ("network", KeyShape::Keys(NETWORK_KEYS)),
 ];
 
+/// The section that also carries the flat top-level setting `key`, such
+/// as `io` for `pty_enabled` or `install` for `packages`. `None` when
+/// `key` is not a flat setting of the spec, or no section carries it.
+pub(crate) fn flat_key_section(key: &str) -> Option<&'static str> {
+    if !crate::expand::is_spec_key(key) {
+        return None;
+    }
+    SECTIONS.iter().find_map(|(section, shape)| match shape {
+        KeyShape::Keys(keys) if keys.iter().any(|(k, _)| *k == key) => Some(*section),
+        _ => None,
+    })
+}
+
 /// A key inside a Box Spec section that the spec cannot carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SectionProblem {

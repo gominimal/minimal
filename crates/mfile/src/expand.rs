@@ -28,11 +28,21 @@
 //! settings and the shape each one takes. A bad key fails with
 //! [`Error::InvalidSpecKey`], which exits 3 and names the key and the
 //! layer that set it (BOX-066).
+//!
+//! The type's constraints come last. [`check_constraints`] reads the
+//! finished expansion, after the command-line override layer, and fails
+//! with [`BoxTypeError::ConstraintBroken`] when a value of the spec is one
+//! the type's constraints exclude (BOX-061). It names the type, the key
+//! and the layer that set the value. It reads the spec and never changes
+//! it, so a constraint never adds a package, a port or an egress entry
+//! (BOX-062).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Error;
-use crate::box_types::{BoxTypeError, BoxTypes, ResolvedType};
+use crate::box_types::{
+    BoxTypeError, BoxTypes, ResolvedType, allowed_words, canonical_constraints, excluded, inline,
+};
 use crate::entry::{BoxEntry, EntryTable};
 use crate::error::{EntryHeader, SpecKeyProblem};
 
@@ -304,6 +314,69 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
+}
+
+/// Checks a finished expansion of `entry` against the constraints of its
+/// type, `box_type`: the final step of expansion, after the command-line
+/// override layer (BOX-061). Every type of the chain is checked, the
+/// entry's own type first, each key in key order. A type only narrows the
+/// type it extends (BOX-156), so the first failing constraint is the
+/// tightest one that holds the key.
+///
+/// The check reads the expansion and never changes it (BOX-062).
+///
+/// No product path calls this function yet. gominimal/minimal#3295 adds
+/// the call after each `expand` in `crates/minimal/src/cmd/boxes/create.rs`.
+///
+/// # Errors
+///
+/// [`BoxTypeError::ConstraintBroken`] for the first value that a
+/// constraint excludes. It names the type of the chain whose
+/// `constraints` table holds that constraint, the key and the layer that
+/// set the value, and exits 3.
+pub fn check_constraints(
+    entry: &BoxEntry,
+    expansion: &Expansion,
+    box_type: &ResolvedType,
+) -> Result<(), BoxTypeError> {
+    for (type_name, constraints) in box_type.constraints.iter().rev() {
+        for (key, constraint) in canonical_constraints(constraints) {
+            // A flat setting is checked where the spec carries it: at its
+            // flat key and at the same key under its section.
+            let mut places = vec![(key.clone(), key.clone(), expansion.spec.get(&key))];
+            if let Some(section) = crate::spec::flat_key_section(&key) {
+                let nested = expansion
+                    .spec
+                    .get(section)
+                    .and_then(toml::Value::as_table)
+                    .and_then(|t| t.get(&key));
+                places.push((format!("{section}.{key}"), section.to_owned(), nested));
+            }
+            for (path, top, value) in places {
+                let Some(value) = value else {
+                    continue;
+                };
+                let Some(bad) = excluded(&path, &constraint, value) else {
+                    continue;
+                };
+                let origin = expansion.report.values.get(&top);
+                let origin = match (origin, bad.item) {
+                    // Only a top-level list has an origin for each item.
+                    (Some(ValueOrigin::List(origins)), Some(i)) if bad.key == top => origins.get(i),
+                    (origin, _) => origin.and_then(ValueOrigin::first),
+                };
+                return Err(BoxTypeError::ConstraintBroken {
+                    box_type: type_name.clone(),
+                    key: bad.key,
+                    value: inline(&bad.value),
+                    allowed: allowed_words(&bad.constraint),
+                    layer: layer_words(entry, origin),
+                    item: bad.item.is_some(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether an entry takes its selected loadouts: the `loadout_mode` box
@@ -2073,6 +2146,357 @@ mod tests {
             expand_typed(TYPED_FILE, name)
                 .unwrap_or_else(|e| panic!("{name}: {e}"))
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    /// Expands entry `name` of `file` as a client does, with `overrides` and
+    /// `loadouts` as the last two layers, then checks the type's
+    /// constraints last (BOX-061). Returns the expansion with and without
+    /// the check.
+    fn expand_checked(
+        file: &str,
+        name: &str,
+        loadouts: &str,
+        overrides: &str,
+    ) -> (Expansion, Result<(), BoxTypeError>) {
+        let doc = table(file);
+        let types = BoxTypes::from_file(&doc).expect("the types resolve");
+        let entries = read_entries(file.as_bytes()).expect("entries read");
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let resolved = expandable_type(entry, &types).expect("expandable");
+        let project_types = types.project().keys().cloned().collect();
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let layers = Layers {
+            type_defaults: resolved.defaults.clone(),
+            loadouts: table(loadouts),
+            overrides: table(overrides),
+            ..Layers::default()
+        }
+        .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+        let expansion = expand(entry, &layers).expect("expands");
+        let checked = check_constraints(entry, &expansion, &resolved);
+        (expansion, checked)
+    }
+
+    const CONSTRAINED_FILE: &str = r#"
+        [box_types.ci]
+        extends = "task"
+        defaults = { packages = ["git"] }
+        constraints = { pty_enabled = false, restart = ["never", "on-failure"], network = { mode = "none" } }
+
+        [box_types.ci-small]
+        extends = "ci"
+        constraints = { packages = ["git", "make"], restart = "never" }
+
+        [defaults.ci]
+        restart = "always"
+
+        [boxes.ok]
+        type = "ci-small"
+        packages = ["make"]
+        restart = "never"
+        network = { mode = "none" }
+
+        [boxes.pty]
+        type = "ci"
+        pty_enabled = true
+
+        [boxes.from-defaults]
+        type = "ci"
+
+        [boxes.extra]
+        type = "ci-small"
+        restart = "never"
+        packages = ["curl"]
+
+        [boxes.small-always]
+        type = "ci-small"
+        restart = "always"
+    "#;
+
+    // BOX-061: the expanded spec is checked against the type's constraints
+    // after the override layer. A value outside them fails with exit 3
+    // naming the type, the key and the layer that set it.
+    #[test]
+    fn expanded_spec_violating_constraint_exit3_names_type_and_layer() {
+        let (_, checked) = expand_checked(CONSTRAINED_FILE, "ok", "", "");
+        checked.expect("a spec inside every constraint is accepted");
+
+        // The entry's own table.
+        let (_, checked) = expand_checked(CONSTRAINED_FILE, "pty", "", "");
+        let err = checked.expect_err("pty_enabled = true is outside the type");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "`[boxes.pty]` in minimal.toml sets `pty_enabled` to `true`. \
+             `[box_types.ci]` allows only `false` for `pty_enabled`. Change the value."
+        );
+
+        // `[defaults.<type>]`.
+        let (_, checked) = expand_checked(CONSTRAINED_FILE, "from-defaults", "", "");
+        assert_eq!(
+            checked.expect_err("restart = always").to_string(),
+            "`[defaults.ci]` in minimal.toml sets `restart` to `\"always\"`. \
+             `[box_types.ci]` allows only `\"never\"` or `\"on-failure\"` for `restart`. \
+             Change the value."
+        );
+
+        // A list item: the layer that added it, here the entry.
+        let (_, checked) = expand_checked(CONSTRAINED_FILE, "extra", "", "");
+        assert_eq!(
+            checked.expect_err("curl is outside the list").to_string(),
+            "`[boxes.extra]` in minimal.toml adds `\"curl\"` to `packages`. \
+             `[box_types.ci-small]` allows only `\"git\"` or `\"make\"` in `packages`. \
+             Change the value."
+        );
+
+        // The error names the type whose table holds the failing
+        // constraint. A derived type narrows its parent, so its own
+        // constraint is checked first.
+        let (_, checked) = expand_checked(CONSTRAINED_FILE, "small-always", "", "");
+        assert_eq!(
+            checked.expect_err("restart = always").to_string(),
+            "`[boxes.small-always]` in minimal.toml sets `restart` to `\"always\"`. \
+             `[box_types.ci-small]` allows only `\"never\"` for `restart`. \
+             Change the value."
+        );
+
+        // A nested key names its path, and the parent type that constrains it.
+        let (_, checked) =
+            expand_checked(CONSTRAINED_FILE, "ok", "", "network = { mode = \"open\" }");
+        let err = checked.expect_err("network.mode = open");
+        assert_eq!(
+            err.to_string(),
+            "a command-line flag sets `network.mode` to `\"open\"`. \
+             `[box_types.ci]` allows only `\"none\"` for `network.mode`. \
+             Change the value."
+        );
+
+        // The check runs after the override layer: an override can break a
+        // constraint, and an override can repair a value an earlier layer
+        // set.
+        let (_, checked) = expand_checked(CONSTRAINED_FILE, "ok", "", "pty_enabled = true");
+        let msg = checked.expect_err("override breaks").to_string();
+        assert!(
+            msg.starts_with("a command-line flag sets `pty_enabled`"),
+            "{msg}"
+        );
+        let (_, checked) =
+            expand_checked(CONSTRAINED_FILE, "from-defaults", "", "restart = \"never\"");
+        checked.expect("the override sets an allowed value last");
+
+        // A selected loadout is named as its layer. A `task`-rooted entry
+        // is sealed, so this one opens itself to its loadouts.
+        let open = format!(
+            "{CONSTRAINED_FILE}\n[boxes.ok-open]\ntype = \"ci-small\"\nloadout_mode = \"open\"\n"
+        );
+        let (_, checked) = expand_checked(&open, "ok-open", "packages = [\"jq\"]", "");
+        let msg = checked.expect_err("loadout adds jq").to_string();
+        assert!(
+            msg.starts_with("a selected loadout adds `\"jq\"` to `packages`"),
+            "{msg}"
+        );
+
+        // A setting under its section is checked as the flat key is.
+        for (setting, key, value, allowed) in [
+            (
+                "execution = { restart = \"always\" }",
+                "execution.restart",
+                "\"always\"",
+                "`[box_types.ci-small]` allows only `\"never\"`",
+            ),
+            (
+                "io = { pty_enabled = true }",
+                "io.pty_enabled",
+                "true",
+                "`[box_types.ci]` allows only `false`",
+            ),
+        ] {
+            let file = format!("{CONSTRAINED_FILE}\n[boxes.x]\ntype = \"ci-small\"\n{setting}\n");
+            let (_, checked) = expand_checked(&file, "x", "", "");
+            let err = checked.expect_err(setting);
+            assert!(
+                matches!(err, BoxTypeError::ConstraintBroken { .. }),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`[boxes.x]` in minimal.toml sets `{key}` to `{value}`. \
+                     {allowed} for `{key}`. Change the value."
+                )
+            );
+        }
+
+        // A constraint written under its section checks the flat key too.
+        let file = r#"
+            [box_types.ci-io]
+            extends = "task"
+            constraints = { io = { pty_enabled = false }, install = { packages = ["git"] } }
+
+            [boxes.x]
+            type = "ci-io"
+            pty_enabled = true
+        "#;
+        let (_, checked) = expand_checked(file, "x", "", "");
+        assert_eq!(
+            checked.expect_err("flat pty_enabled").to_string(),
+            "`[boxes.x]` in minimal.toml sets `pty_enabled` to `true`. \
+             `[box_types.ci-io]` allows only `false` for `pty_enabled`. Change the value."
+        );
+        let (_, checked) =
+            expand_checked(file, "x", "", "pty_enabled = false\npackages = [\"jq\"]");
+        assert_eq!(
+            checked.expect_err("flat packages").to_string(),
+            "a command-line flag adds `\"jq\"` to `packages`. \
+             `[box_types.ci-io]` allows only `\"git\"` in `packages`. Change the value."
+        );
+
+        // A built-in type ships its own constraints: a task has no PTY.
+        let file = "[tasks.x]\npty_enabled = true\n";
+        let (_, checked) = expand_checked(file, "x", "", "");
+        let err = checked.expect_err("a task with a PTY");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "`[tasks.x]` in minimal.toml sets `pty_enabled` to `true`. \
+             The built-in type `task` allows only `false` for `pty_enabled`. Change the value."
+        );
+    }
+
+    /// A value for one constrained key, from a small domain.
+    fn small_value() -> impl Strategy<Value = toml::Value> {
+        prop::sample::select(vec!["a", "b", "c"]).prop_map(|s| toml::Value::String(s.to_owned()))
+    }
+
+    /// A constraint: one value, or a list of values.
+    fn small_constraint() -> impl Strategy<Value = toml::Value> {
+        prop_oneof![
+            small_value(),
+            prop::collection::vec(small_value(), 0..3).prop_map(toml::Value::Array),
+        ]
+    }
+
+    proptest! {
+        // BOX-061 property: whichever layer sets the value, an expanded
+        // spec outside the type's constraint is rejected, and one inside
+        // every constraint is accepted.
+        #[test]
+        fn expanded_spec_violating_constraint_exit3_names_type_and_layer_property(
+            constraint in small_constraint(),
+            outer in small_constraint(),
+            layer_values in prop::collection::vec(prop::option::of(small_value()), 4),
+        ) {
+            let mut file = format!(
+                "[box_types.outer]\nextends = \"session\"\nconstraints = {{ restart = {outer} }}\n\
+                 [box_types.inner]\nextends = \"outer\"\nconstraints = {{ restart = {constraint} }}\n"
+            );
+            let set = |v: &Option<toml::Value>| {
+                v.as_ref().map(|v| format!("restart = {v}\n")).unwrap_or_default()
+            };
+            file.push_str(&format!("[defaults.inner]\n{}", set(&layer_values[0])));
+            file.push_str(&format!("[boxes.dev]\ntype = \"inner\"\n{}", set(&layer_values[1])));
+            // A derived type that loosens fails to resolve; that is BOX-156.
+            let doc = table(&file);
+            prop_assume!(BoxTypes::from_file(&doc).is_ok());
+            let (expansion, checked) =
+                expand_checked(&file, "dev", &set(&layer_values[2]), &set(&layer_values[3]));
+            let inside = expansion.spec.get("restart").is_none_or(|v| {
+                crate::box_types::admitted(&constraint).contains(v)
+                    && crate::box_types::admitted(&outer).contains(v)
+            });
+            prop_assert_eq!(checked.is_ok(), inside);
+            if let Err(err) = checked {
+                prop_assert_eq!(err.exit_code(), 3);
+                let msg = err.to_string();
+                let layer = layer_values.iter().rposition(Option::is_some).expect("set");
+                let words = [
+                    "`[defaults.inner]` in minimal.toml",
+                    "`[boxes.dev]` in minimal.toml",
+                    "a selected loadout",
+                    "a command-line flag",
+                ][layer];
+                prop_assert!(msg.starts_with(&format!("{words} sets `restart`")), "{}", msg);
+                prop_assert!(msg.contains("`[box_types.inner]`"), "{}", msg);
+            }
+        }
+    }
+
+    // BOX-062: a type constraint never adds a package, a port or an egress
+    // entry. The check reads the spec and leaves it as the layers set it.
+    #[test]
+    fn constraint_never_adds_package_port_or_egress() {
+        let file = r#"
+            [box_types.ci]
+            extends = "task"
+            constraints = { packages = ["git", "make", "rust"], network = { ingress = [{ proto = "tcp", port = 8080 }, { proto = "tcp", port = 9090 }], egress = { allow_dns_hosts = ["example.com", "example.org"] } } }
+
+            [boxes.dev]
+            type = "ci"
+            packages = ["git"]
+            network = { ingress = [{ proto = "tcp", port = 8080 }], egress = { allow_dns_hosts = ["example.com"] } }
+
+            [boxes.bare]
+            type = "ci"
+        "#;
+        let unconstrained = file.replace("constraints = ", "#");
+        for name in ["dev", "bare"] {
+            let (constrained, checked) = expand_checked(file, name, "", "");
+            checked.expect("the spec is inside the constraint");
+            let (plain, checked) = expand_checked(&unconstrained, name, "", "");
+            checked.expect("no constraint");
+            assert_eq!(constrained.spec, plain.spec, "{name}");
+            assert_eq!(constrained.report, plain.report, "{name}");
+        }
+        let (bare, _) = expand_checked(file, "bare", "", "");
+        assert!(bare.spec.get("packages").is_none());
+        assert!(bare.spec.get("network").is_none());
+        let (dev, _) = expand_checked(file, "dev", "", "");
+        assert_eq!(strings(dev.spec.get("packages")), ["git"]);
+        let network = dev.spec["network"].as_table().expect("network");
+        assert_eq!(network["ingress"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            strings(network["egress"].get("allow_dns_hosts")),
+            ["example.com"]
+        );
+    }
+
+    proptest! {
+        // BOX-062 property: for every constraint and spec, the constrained
+        // spec's package, port and egress lists are subsets of the
+        // unconstrained spec's.
+        #[test]
+        fn constraint_never_adds_package_port_or_egress_property(
+            allowed in prop::collection::vec(small_value(), 0..4),
+            set in prop::collection::vec(small_value(), 0..3),
+        ) {
+            let list = |v: &[toml::Value]| toml::Value::Array(v.to_vec()).to_string();
+            let entry = format!(
+                "[boxes.dev]\ntype = \"ci\"\npackages = {}\n\
+                 network = {{ egress = {{ allow_dns_hosts = {} }} }}\n",
+                list(&set),
+                list(&set)
+            );
+            let file = format!(
+                "[box_types.ci]\nextends = \"task\"\n\
+                 constraints = {{ packages = {a}, network = {{ ingress = {a}, egress = {{ allow_dns_hosts = {a} }} }} }}\n{entry}",
+                a = list(&allowed)
+            );
+            let plain = format!("[box_types.ci]\nextends = \"task\"\n{entry}");
+            let (constrained, checked) = expand_checked(&file, "dev", "", "");
+            let (unconstrained, _) = expand_checked(&plain, "dev", "", "");
+            prop_assert_eq!(&constrained.spec, &unconstrained.spec);
+            prop_assert_eq!(
+                checked.is_ok(),
+                set.iter().all(|v| allowed.contains(v))
+            );
         }
     }
 
