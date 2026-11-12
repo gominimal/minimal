@@ -18314,8 +18314,13 @@ async fn spec_type_init_end_to_end() {
         ..daemon_global.clone()
     };
     std::fs::create_dir_all(project.path().join("config")).unwrap();
-    // The type's own defaults (`timeout` here) are not asserted: the CLI
-    // expansion does not apply the type-defaults layer yet.
+    // Interim, with no tracking issue yet: architecture.md puts the Box Type
+    // defaults layer in every expansion, but `expand_entry` in
+    // cmd/box_spec.rs and the start path build `Layers::default()` with no
+    // `type_defaults`. So `[box_types.rust-dev.defaults] timeout = "30m"`
+    // does not reach the render, and this test does not assert it.
+    // When that layer lands, add to the `web` needles the line
+    // "# timeout: from type rust-dev defaults\ntimeout = \"30m\"\n".
     for (entry, needles) in [
         (
             "dev",
