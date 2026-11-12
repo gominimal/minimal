@@ -895,6 +895,7 @@ pub(crate) struct AttachEnding {
 
 /// What the box's host said of the box once the attach ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(clippy::large_enum_variant, reason = "one value per attach, read once as it ends")]
 pub(crate) enum BoxAfterAttach {
     /// The host keeps the box, in this state.
     Listed(minimald_rpc::BoxListingEntry),
