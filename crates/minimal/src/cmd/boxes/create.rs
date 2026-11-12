@@ -1220,38 +1220,39 @@ pub(crate) struct ProjectEgress {
 
 /// The loadout mode of the session box a start creates, from the project
 /// at `project`: the entry the start names, else the entry
-/// [`pick_session_entry`] picks. With no project file, or no session entry
-/// the pick decides, the bare session entry applies. `named` is the
-/// start's `--loadout` list.
+/// [`pick_session_entry`] picks, as [`session_box_entry`] picks it. With
+/// no project file, the bare session entry applies. `named` is the start's
+/// `--loadout` list.
 ///
 /// # Errors
 ///
-/// Exit 3 ([`ProjectFileInvalid`]) for the refusals of
-/// [`loadouts::entry_loadout_gate`], before any loadout file is read.
+/// Exit 2 ([`SessionEntryUndecided`]) when the pick is undecided, and exit
+/// 3 ([`ProjectFileInvalid`]) for the refusals of
+/// [`loadouts::entry_loadout_gate`], each before any loadout file is read.
 pub(crate) fn session_loadout_mode(
     project: &camino::Utf8Path,
     entry: Option<&str>,
     named: &[String],
 ) -> anyhow::Result<mfile::expand::LoadoutMode> {
     let bytes = project_file_bytes(project)?;
-    let entries = match &bytes {
+    let entry = match &bytes {
         Some(bytes) => {
-            mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?
+            let entries =
+                mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?;
+            let typed = entry.and_then(|name| entries.iter().find(|e| e.name == name));
+            match typed {
+                Some(entry) => entry.clone(),
+                // An undecided pick refuses the start here, as
+                // `session_box_entry` does, before any loadout is read.
+                None => pick_session_entry(&entries)?,
+            }
         }
-        None => Vec::new(),
-    };
-    let typed = entry.and_then(|name| entries.iter().find(|e| e.name == name));
-    let picked = match typed {
-        Some(entry) => Some(entry.clone()),
-        None => pick_session_entry(&entries).ok(),
-    };
-    let entry = picked.unwrap_or_else(|| {
-        bare_entry(
+        None => bare_entry(
             entry.unwrap_or(mfile::entry::DEFAULT_ENTRY_NAME),
             mfile::entry::EntryTable::Sessions,
             boxes::SESSION_BOX_TYPE,
-        )
-    });
+        ),
+    };
     loadouts::entry_loadout_gate(bytes.as_deref(), &entry, named)
         .map_err(|error| ProjectFileInvalid { error }.into())
 }

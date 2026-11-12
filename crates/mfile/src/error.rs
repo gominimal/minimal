@@ -74,6 +74,11 @@ pub enum Error {
     /// layers set (BOX-061, BOX-181). Carries the key, the layer that set
     /// the value, the value, the type as the message names it, and the
     /// values the constraint admits. Exits 3.
+    ///
+    /// This check duplicates `check_constraints` and
+    /// `BoxTypeError::ConstraintBroken`. When #3292 merges, the two become
+    /// one check and this variant goes:
+    /// <https://github.com/gominimal/minimal/issues/3304>.
     ConstraintViolated {
         key: String,
         layer: String,
@@ -81,6 +86,9 @@ pub enum Error {
         box_type: String,
         admitted: Vec<String>,
     },
+    /// The entry's Box Type does not resolve, or the entry cannot use it.
+    /// Exits 3.
+    BoxType(crate::box_types::BoxTypeError),
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -165,7 +173,8 @@ impl Error {
             | Error::InteractiveTask(_)
             | Error::LoadoutSetsLoadoutMode { .. }
             | Error::NamedLoadoutOnSealedBox { .. }
-            | Error::ConstraintViolated { .. } => Some(3),
+            | Error::ConstraintViolated { .. }
+            | Error::BoxType(_) => Some(3),
             _ => None,
         }
     }
@@ -367,6 +376,8 @@ impl fmt::Display for Error {
                     ),
                 }
             }
+            // The type error's own message is the whole message.
+            Error::BoxType(error) => write!(f, "{error}"),
             Error::ConstraintViolated {
                 key,
                 layer,
@@ -408,6 +419,9 @@ impl std::error::Error for Error {
             Error::LoadoutSetsLoadoutMode { .. } => None,
             Error::NamedLoadoutOnSealedBox { .. } => None,
             Error::ConstraintViolated { .. } => None,
+            // `Display` prints the type error, so a chain printer prints it
+            // once.
+            Error::BoxType(_) => None,
         }
     }
 }

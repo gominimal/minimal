@@ -46,13 +46,14 @@ impl LoadoutSelection {
 /// sealed box reads no default loadout (BOX-175).
 ///
 /// An entry whose type does not resolve takes the defaults of its type
-/// name when that name is built in, and no type layer otherwise. The start
-/// refuses such an entry elsewhere, so the gate does not refuse it first.
+/// name when that name is built in.
 ///
 /// # Errors
 ///
 /// The refusals of [`mfile::expand::loadout_gate`], each with exit 3, and
-/// a legacy table this release no longer reads.
+/// a legacy table this release no longer reads. An entry whose type name
+/// is not built in and does not resolve fails with
+/// [`mfile::Error::BoxType`], exit 3.
 pub(crate) fn entry_loadout_gate(
     bytes: Option<&[u8]>,
     entry: &mfile::entry::BoxEntry,
@@ -70,27 +71,25 @@ pub(crate) fn entry_loadout_gate(
         .and_then(toml::Value::as_table)
         .cloned()
         .unwrap_or_default();
-    let (type_defaults, type_constraints, project_types) =
-        match mfile::box_types::BoxTypes::from_file(&doc) {
-            Ok(types) => {
-                let project_types = types.project().keys().cloned().collect();
-                match mfile::expand::expandable_type(entry, &types) {
-                    Ok(resolved) => (resolved.defaults, resolved.constraints, project_types),
-                    Err(error) => {
-                        tracing::debug!(%error, "the loadout gate reads the entry without its type");
-                        (builtin_type_layer(entry), Vec::new(), project_types)
-                    }
-                }
+    let types = mfile::box_types::BoxTypes::from_file(&doc);
+    let project_types = types
+        .as_ref()
+        .map(|types| types.project().keys().cloned().collect())
+        .unwrap_or_default();
+    let resolved = types.and_then(|types| mfile::expand::expandable_type(entry, &types));
+    let (type_defaults, type_constraints) = match resolved {
+        Ok(resolved) => (resolved.defaults, resolved.constraints),
+        // A built-in type name keeps its built-in defaults. Any other name
+        // has constraints the gate cannot read, so the gate refuses the
+        // entry rather than decide the mode without them.
+        Err(error) => match builtin_type_layer(entry) {
+            Some(layer) => {
+                tracing::debug!(%error, "the loadout gate reads the entry with its built-in type");
+                (layer, Vec::new())
             }
-            Err(error) => {
-                tracing::debug!(%error, "the loadout gate reads the entry without its type");
-                (
-                    builtin_type_layer(entry),
-                    Vec::new(),
-                    std::collections::BTreeSet::new(),
-                )
-            }
-        };
+            None => return Err(mfile::Error::BoxType(error)),
+        },
+    };
     let layers = mfile::expand::Layers {
         type_defaults,
         type_constraints,
@@ -105,13 +104,12 @@ pub(crate) fn entry_loadout_gate(
 
 /// The type layer of an entry whose type does not resolve: the built-in
 /// defaults of its type name, when the name is built in.
-fn builtin_type_layer(entry: &mfile::entry::BoxEntry) -> Vec<(String, toml::Table)> {
+fn builtin_type_layer(entry: &mfile::entry::BoxEntry) -> Option<Vec<(String, toml::Table)>> {
     entry
         .box_type
         .as_deref()
         .and_then(mfile::box_types::builtin)
         .map(|root| vec![(root.to_owned(), mfile::box_types::builtin_defaults(root))])
-        .unwrap_or_default()
 }
 
 /// `selection` under the box's loadout `mode`. A sealed box selects no

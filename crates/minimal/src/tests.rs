@@ -16891,3 +16891,43 @@ fn sealed_box_ignores_broken_default_loadout() {
         );
     }
 }
+
+// BOX-175: a start whose session entry the pick cannot decide refuses with
+// exit 2 when it reads the loadout mode, before any loadout is read. It does
+// not fall back to the bare session entry, which is open.
+#[test]
+fn undecided_session_pick_refuses_before_loadouts() {
+    let (project, _config, _global) = loadout_project(
+        "[sessions.one]\n\n[sessions.two]\n",
+        "",
+        &[("default.toml", "= not = toml =")],
+    );
+    let error = session_loadout_mode(&utf8(&project), None, &[])
+        .expect_err("an undecided pick refuses the start");
+    assert!(
+        error
+            .downcast_ref::<crate::SessionEntryUndecided>()
+            .is_some(),
+        "{error:#}"
+    );
+}
+
+// BOX-181: an entry whose type name is not built in and does not resolve
+// refuses with exit 3. The gate does not decide the mode without the type
+// chain's constraints.
+#[test]
+fn unresolved_project_type_refuses_loadout_gate_exit3() {
+    let (project, _config, _global) =
+        loadout_project("[boxes.odd]\ntype = 'nosuchtype'\n", "", &[]);
+    let error = session_loadout_mode(&utf8(&project), Some("odd"), &[])
+        .expect_err("an unresolved type refuses the gate");
+    let invalid = error
+        .downcast_ref::<crate::ProjectFileInvalid>()
+        .unwrap_or_else(|| panic!("not a project file error: {error:#}"));
+    assert!(
+        matches!(invalid.error, mfile::Error::BoxType(_)),
+        "{:?}",
+        invalid.error
+    );
+    assert_eq!(invalid.error.exit_code(), Some(3));
+}
