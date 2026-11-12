@@ -236,7 +236,8 @@ jobs:
     # A userspace swtpm stands in for the host's TPM 2.0, reached over its TCP
     # TCTI, so the job needs no /dev/tpmrm0, no kernel module and no root
     # beyond the apt install. The proofs are #[ignore] and gated on
-    # BEP_TPM_TCTI, so they run only here and against a local VM's TPM.
+    # BEP_TPM_TCTI, so they run only here and against a local VM's TPM. The
+    # logic lives in scripts/bep-tpm-integration.sh; this job schedules it.
     # libtss2-dev carries every TCTI library, for tpm2-tools and for a
     # tss-esapi build alike: the plan's experiment picks between them.
     needs: [changes]
@@ -258,30 +259,11 @@ jobs:
         run: |
           sudo sh -c 'apt-get update && apt-get install -y --no-install-recommends \
             swtpm swtpm-tools tpm2-tools libtss2-dev'
-      - name: Start swtpm
-        # not-need-init,startup-clear: the TPM starts up itself, so a test sees
-        # a TPM in the state a booted host's is in.
-        run: |
-          mkdir -p "$RUNNER_TEMP/swtpm"
-          swtpm socket --tpm2 --tpmstate dir="$RUNNER_TEMP/swtpm" \
-            --server type=tcp,port=2321 --ctrl type=tcp,port=2322 \
-            --flags not-need-init,startup-clear --daemon
-          TPM2TOOLS_TCTI=swtpm:host=localhost,port=2321 tpm2_getcap properties-fixed | head -n 4
-      - name: Run bep TPM proofs (auto-discovered)
-        env:
-          BEP_TPM_TCTI: swtpm:host=localhost,port=2321
-        # nextest refuses a binary() filter that names no binary, so the step
-        # runs only once a *_tpm_integration file exists; from then on
-        # `--no-tests=fail` reds the job if the convention matches nothing.
-        run: |
-          shopt -s nullglob
-          proofs=(crates/bep/tests/*_tpm_integration.rs)
-          if (( ${#proofs[@]} == 0 )); then
-            echo "No crates/bep/tests/*_tpm_integration.rs yet: nothing to run."
-            exit 0
-          fi
-          cargo nextest run -p bep --profile ci \
-            --run-ignored all --no-tests=fail -E 'binary(/_tpm_integration$/)'
+      - name: Run bep TPM proofs against swtpm (auto-discovered)
+        # The script starts swtpm, points the proofs at it and runs every
+        # crates/bep/tests/*_tpm_integration.rs; `just test-tpm` is its
+        # local twin.
+        run: ./scripts/bep-tpm-integration.sh
 
   # Single required status check for this lane (branch-protection context:
   # ci-linux-native-success). Green when every gating job succeeded OR was
