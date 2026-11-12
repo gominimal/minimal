@@ -657,6 +657,36 @@ VM-backed host, `min box spec --network own_ip` accepts `steering = "both"`.
 With no `--network` flag, it refuses that spec because a `host_ip` box has no
 box DNS resolver, and `min session activate` with no flag refuses it too.
 
+### `type list` (alias: `ls`) and `type show`
+
+```
+min type list [-o json|yaml|toml]
+min type show <NAME> [-o json|yaml|toml]
+```
+
+`min type list` lists the box types that the project can use. These are the
+built-in types and each type of the project's `[box_types]` in
+`minimal.toml`. Each row shows the type's source, `builtin` or `project`, the
+type it extends, and the built-in type at the end of its chain.
+
+`min type show <NAME>` shows one type. It shows the type that it extends,
+and the chain of types from the built-in type to this type. It lists each
+default and each constraint with the type that sets it and the source of
+that type.
+
+The commands read the `minimal.toml` in `--repo-dir`. Without `--repo-dir`,
+they read the first one in the current directory or a parent directory.
+Outside a project, they show the built-in types only.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--output <json\|yaml\|toml>` | `-o` | Write `min/v1/type` objects in this format, in place of text. `min type list` writes a JSON array, a YAML sequence, or a TOML `[[types]]` table for each type |
+
+| Exit code | Meaning |
+|---|---|
+| 3 | The project's `minimal.toml` does not load, is not valid TOML, or has a type in `[box_types]` that does not resolve |
+| 4 | `min type show` names a type that does not exist |
+
 ### `net forward`
 
 ```

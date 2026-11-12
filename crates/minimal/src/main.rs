@@ -328,6 +328,14 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
         return 3;
     }
+    // BCLI-019, BCLI-020: `min type` of a project whose box types do not
+    // load exits 3, and `min type show` of a name that is no type exits 4.
+    if e.downcast_ref::<minimal::BoxTypesInvalid>().is_some() {
+        return minimal::BoxTypesInvalid::EXIT_CODE;
+    }
+    if e.downcast_ref::<minimal::BoxTypeNotFound>().is_some() {
+        return minimal::BoxTypeNotFound::EXIT_CODE;
+    }
     // BEP-007: a GitHub grant the box cannot receive in its environment.
     if e.downcast_ref::<minimal::GrantNotDelivered>().is_some() {
         return 3;
@@ -465,6 +473,14 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             code,
             format!("{e:#}"),
             hint,
+        ));
+    }
+    // BCLI-020: `min type show` of a name that is no type is `not_found`.
+    if e.downcast_ref::<minimal::BoxTypeNotFound>().is_some() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            "not_found",
+            format!("{e:#}"),
+            minimal::BoxTypeNotFound::HINT.to_string(),
         ));
     }
     // BCLI-053: an exec that its own timeout ended is `timeout`.
@@ -645,6 +661,13 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Events(args),
         })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
+        // BCLI-019, BCLI-020: `min type list|show -o json|yaml|toml`.
+        Some(minimal::Command::Type(minimal::TypeArgs {
+            command: minimal::TypeCommand::List(minimal::TypeListArgs { output }),
+        })) => output.is_some(),
+        Some(minimal::Command::Type(minimal::TypeArgs {
+            command: minimal::TypeCommand::Show(args),
+        })) => args.output.is_some(),
         _ => false,
     }
 }
@@ -678,6 +701,50 @@ fn emit_machine_mode_error(stderr: &mut dyn std::io::Write, failure: &minimal::M
 mod tests {
     use super::*;
     use minimal::Command;
+
+    /// BCLI-019, BCLI-020: `min type` exits 3 when the project's box types
+    /// do not load, and 4 for a name that is no type. Its `-o` forms are a
+    /// machine mode, and the unknown name is `not_found` there.
+    #[test]
+    fn type_refusals_exit_3_and_4() {
+        let parse = toml::from_str::<toml::Table>("[").unwrap_err();
+        let invalid = anyhow::Error::new(minimal::BoxTypesInvalid {
+            doing: "list the box types",
+            cause: minimal::BoxTypesCause::Parse {
+                path: "minimal.toml".into(),
+                error: parse,
+            },
+        });
+        assert_eq!(failure_exit_code(&invalid), 3);
+        let not_found = anyhow::Error::new(minimal::BoxTypeNotFound {
+            name: "nope".to_owned(),
+        });
+        assert_eq!(failure_exit_code(&not_found), 4);
+        let MachineModeAnswer::Object(failure) = machine_mode_answer(&not_found) else {
+            panic!("a not-found refusal is an error object");
+        };
+        assert_eq!(failure.code(), "not_found");
+
+        for (output, machine) in [(Some(minimal::TypeOutputFormat::Yaml), true), (None, false)] {
+            let list = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Type(minimal::TypeArgs {
+                    command: minimal::TypeCommand::List(minimal::TypeListArgs { output }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&list), machine);
+            let show = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Type(minimal::TypeArgs {
+                    command: minimal::TypeCommand::Show(minimal::TypeShowArgs {
+                        name: "session".to_owned(),
+                        output,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&show), machine);
+        }
+    }
 
     /// A bare `min` (no subcommand) keeps stdout clean: the non-TTY twin
     /// promises pipelines an empty stdout, so its tracing must go to stderr.

@@ -98,6 +98,9 @@ pub enum Command {
     /// Provider subcommands: the kinds of local host this machine runs
     #[command(visible_alias = "providers")]
     Provider(ProviderArgs),
+    /// Type subcommands: the box types this project can use
+    #[command(visible_alias = "types")]
+    Type(TypeArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Print important directories and file paths for debugging
@@ -676,6 +679,53 @@ pub struct ProviderListArgs {
     /// command selects
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TypeArgs {
+    #[command(subcommand)]
+    pub command: TypeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TypeCommand {
+    /// List the box types: the built-in types and the types this
+    /// project's minimal.toml defines, each with where it comes from
+    #[command(visible_alias = "ls")]
+    List(TypeListArgs),
+    /// Show one box type: the type it extends, and its defaults and
+    /// constraints, each with the type that sets it
+    Show(TypeShowArgs),
+}
+
+// BCLI-019: `min type list [-o json|yaml|toml]`.
+#[derive(Debug, Default, Args)]
+pub struct TypeListArgs {
+    /// Write the types in this format instead of a table
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<TypeOutputFormat>,
+}
+
+// BCLI-020: `min type show <name> [-o json|yaml|toml]`.
+#[derive(Debug, Args)]
+pub struct TypeShowArgs {
+    /// The type, as `min type list` prints it (`session`, `task`, or a
+    /// type of this project)
+    pub name: String,
+    /// Write the type in this format instead of text
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<TypeOutputFormat>,
+}
+
+/// The formats `min type list` and `min type show` write, beside text.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum TypeOutputFormat {
+    /// JSON: one object for each type
+    Json,
+    /// YAML: one mapping for each type
+    Yaml,
+    /// TOML: one table for each type
+    Toml,
 }
 
 // BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
