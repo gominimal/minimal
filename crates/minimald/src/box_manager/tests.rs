@@ -6792,3 +6792,119 @@ async fn unenrolled_operations_over_file_mode_trust() {
     }
     assert!(mngr.list_boxes(None).await.unwrap().is_empty());
 }
+
+/// BOX-160: the daemon re-checks a create's spec against the constraints
+/// of its type's built-in root at admission, whatever the client checked.
+/// A spec that breaks one is refused with exit 3 naming the type, its root
+/// and the key, files no record, and the daemon log names the refusal. A
+/// spec inside its root's constraints is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    // A spec of `box_type` whose entry is `entry`, edited by `edit`.
+    let spec_of = |entry: &str, box_type: &str, edit: &dyn Fn(&mut serde_json_lenient::Value)| {
+        let mut spec = task_spec(entry, None);
+        spec["box"]["type"] = serde_json_lenient::json!(box_type);
+        edit(&mut spec);
+        spec
+    };
+    let pty = |on: bool| {
+        move |spec: &mut serde_json_lenient::Value| {
+            spec["io"]["pty_enabled"] = serde_json_lenient::json!(on);
+        }
+    };
+    let cases: Vec<(serde_json_lenient::Value, Option<(&str, &str, &str, &str)>)> = vec![
+        // (spec, the refused type, root, key and value)
+        (
+            spec_of("rc-task-pty", "task", &pty(true)),
+            Some(("task", "task", "io.pty_enabled", "true")),
+        ),
+        (
+            spec_of("rc-task-flat", "task", &|spec| {
+                spec["pty_enabled"] = serde_json_lenient::json!(true);
+            }),
+            Some(("task", "task", "pty_enabled", "true")),
+        ),
+        (
+            spec_of("rc-session-nopty", "session", &pty(false)),
+            Some(("session", "session", "io.pty_enabled", "false")),
+        ),
+        // A project type is checked against its built-in root.
+        (
+            spec_of("rc-derived", "ci", &|spec| {
+                pty(true)(spec);
+                spec["type"] = serde_json_lenient::json!({ "root": "task" });
+            }),
+            Some(("ci", "task", "io.pty_enabled", "true")),
+        ),
+        (
+            spec_of("rc-build-nesting", "build", &|spec| {
+                spec["nesting"] = serde_json_lenient::json!({ "allowed": true });
+            }),
+            Some(("build", "build", "nesting.allowed", "true")),
+        ),
+        // Inside the root's constraints: created.
+        (spec_of("rc-task-ok", "task", &pty(false)), None),
+        (spec_of("rc-session-ok", "session", &pty(true)), None),
+    ];
+    for (spec, refused) in cases {
+        let entry = spec["entry"].as_str().unwrap_or_default().to_owned();
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let created = mngr
+            .create_box_with_spec(unnamed_config(), Some(spec), None, None)
+            .await;
+        let Some((box_type, root, key, value)) = refused else {
+            created.unwrap_or_else(|e| panic!("{entry} is created: {e}"));
+            continue;
+        };
+        let err = created.expect_err("a spec its root excludes is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{entry}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<RootConstraintRefusal>())
+            .unwrap_or_else(|| panic!("{entry}: the error is the root refusal: {err}"));
+        assert_eq!(refusal.exit_code(), 3, "{entry}");
+        assert_eq!(
+            (
+                refusal.box_type.as_str(),
+                refusal.root.as_str(),
+                refusal.key.as_str(),
+                refusal.value.as_str()
+            ),
+            (box_type, root, key, value),
+            "{entry}"
+        );
+        let text = err.to_string();
+        for word in [
+            format!("`{box_type}`"),
+            format!("`{root}`"),
+            format!("`{key}`"),
+        ] {
+            assert!(
+                text.contains(&word),
+                "{entry}: the refusal names {word}: {text}"
+            );
+        }
+        assert!(!text.contains("BOX-"), "{entry}: {text}");
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{entry}: a refused create files no record"
+        );
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("its type's built-in root excludes")
+                    && line.contains(&format!("box_type={box_type} root={root} key={key} "))
+            })
+            .unwrap_or_else(|| panic!("{entry}: the daemon log names the refusal:\n{logged}"));
+        assert!(line.contains("exit_code=3"), "{line}");
+        assert!(
+            line.contains("refusal="),
+            "the create span records it: {line}"
+        );
+    }
+}
