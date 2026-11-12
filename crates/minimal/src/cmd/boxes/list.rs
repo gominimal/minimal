@@ -227,9 +227,13 @@ pub(crate) fn render_box_list(
     ];
     let rows: Vec<[String; 8]> = boxes
         .iter()
-        .map(|listed| {
+        .flat_map(|listed| {
             let entry = &listed.record;
-            [
+            let project = entry
+                .project_root
+                .as_ref()
+                .map_or_else(|| NO_VALUE.to_string(), |root| root.to_string());
+            let own = [
                 entry.box_id.to_string(),
                 entry.name.clone().unwrap_or_else(|| NO_VALUE.to_string()),
                 entry
@@ -239,14 +243,26 @@ pub(crate) fn render_box_list(
                 entry
                     .parent
                     .map_or_else(|| NO_VALUE.to_string(), |parent| parent.to_string()),
-                entry
-                    .project_root
-                    .as_ref()
-                    .map_or_else(|| NO_VALUE.to_string(), |root| root.to_string()),
+                project.clone(),
                 box_state_label(entry),
                 listed.provider.clone(),
                 listed.host.clone(),
-            ]
+            ];
+            // NET-171: a build box has no record, so its row names its
+            // package and its requesting box.
+            let builds = entry.build_boxes.iter().map(move |build| {
+                [
+                    NO_VALUE.to_string(),
+                    build.package.clone(),
+                    boxes::BUILD_BOX_TYPE.to_string(),
+                    entry.box_id.to_string(),
+                    project.clone(),
+                    "running".to_string(),
+                    listed.provider.clone(),
+                    listed.host.clone(),
+                ]
+            });
+            std::iter::once(own).chain(builds)
         })
         .collect();
     let mut widths = header.map(str::len);
@@ -299,7 +315,27 @@ pub(crate) fn render_box_list_json(
     out: &mut impl std::io::Write,
     boxes: &[ListedBox],
 ) -> std::io::Result<()> {
-    let objects: Vec<serde_json_lenient::Value> = boxes.iter().map(box_json).collect();
+    let objects: Vec<serde_json_lenient::Value> = boxes
+        .iter()
+        .flat_map(|listed| {
+            std::iter::once(box_json(listed)).chain(listed.record.build_boxes.iter().map(|build| {
+                serde_json_lenient::json!({
+                    "schema": BOX_SCHEMA,
+                    "id": null,
+                    "name": build.package,
+                    "type": boxes::BUILD_BOX_TYPE,
+                    "state": "running",
+                    "provider": listed.provider,
+                    "host": listed.host,
+                    "parent": listed.record.box_id.to_string(),
+                    "project": listed.record.project_root.as_ref().map(|r| r.to_string()),
+                    "reason": null,
+                    "exit_code": null,
+                    "signal": null,
+                })
+            }))
+        })
+        .collect();
     serde_json_lenient::to_writer_pretty(&mut *out, &objects)?;
     writeln!(out)
 }
@@ -331,7 +367,69 @@ mod tests {
             signal: None,
             pty_enabled: true,
             lifetime: None,
+            build_boxes: Vec::new(),
         }
+    }
+
+    /// NET-171, BOX-186: a running build box lists under its requesting box
+    /// with its type, its parent and its package, as a row and as JSON.
+    #[test]
+    fn build_box_listed_while_it_runs() {
+        let mut parent = entry(
+            "0199e0a0-0000-7000-8000-000000000001",
+            Some("sealed"),
+            "session",
+            "materializing",
+        );
+        parent.build_boxes = vec![minimald_rpc::RunningBuildBox {
+            package: "claude-code".to_string(),
+            egress: None,
+            granted: true,
+            no_network: false,
+        }];
+        let listed = [local(parent)];
+        let mut table = Vec::new();
+        render_box_list(&mut table, &listed, false).unwrap();
+        let table = String::from_utf8(table).unwrap();
+        let row = table
+            .lines()
+            .find(|line| line.contains("claude-code"))
+            .expect("the build box has a row");
+        assert!(row.starts_with("- "), "a build box has no id: {row}");
+        assert!(row.contains(" build "), "{row}");
+        assert!(
+            row.contains("0199e0a0-0000-7000-8000-000000000001"),
+            "{row}"
+        );
+
+        let mut json = Vec::new();
+        render_box_list_json(&mut json, &listed).unwrap();
+        let json: serde_json_lenient::Value = serde_json_lenient::from_slice(&json).unwrap();
+        assert_eq!(json[1]["type"], "build");
+        assert_eq!(json[1]["name"], "claude-code");
+        assert_eq!(json[1]["parent"], "0199e0a0-0000-7000-8000-000000000001");
+    }
+
+    /// BOX-185: a build box has no record, so no box verb can name it, by its
+    /// package or otherwise.
+    #[test]
+    fn build_box_is_no_target_of_a_box_verb() {
+        let mut parent = entry(
+            "0199e0a0-0000-7000-8000-000000000001",
+            Some("sealed"),
+            "session",
+            "materializing",
+        );
+        parent.build_boxes = vec![minimald_rpc::RunningBuildBox {
+            package: "claude-code".to_string(),
+            egress: None,
+            granted: true,
+            no_network: false,
+        }];
+        assert!(
+            find_listed_box(&[parent], "claude-code", "local0", "").is_err(),
+            "only a record resolves"
+        );
     }
 
     /// BOX-158, BOX-159 (BCLI-001, BCLI-003): the listing renders every

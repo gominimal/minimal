@@ -1,48 +1,24 @@
 use crate::{Error, Materialized, Options, Runnable};
-use common::Placement;
 use graph::SourceInput;
 use lcache::PendingDir;
 
 use anyhow::{Context, Result, anyhow};
 use ot::OpTracker;
-use sandbox::config::ClassifierLeaf;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::debug;
 use url::Url;
 
-/// Where a source fetch for a box opens its connections (NET-155), so the
-/// box's egress rules decide them.
-#[derive(Debug, Clone, Copy)]
-pub enum SourcePlace<'a> {
-    /// In the box's classifier leaf.
-    Leaf(&'a ClassifierLeaf),
-    /// On the box's own network. `exec_base` holds the sandbox that keeps
-    /// that network up for the fetch.
-    Network {
-        network: &'a crate::BuildNetwork,
-        exec_base: &'a Path,
-    },
-}
-
 pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
-    /// Returns a path to the specified URL, after sha256 verification, and
-    /// whether the fetch opened a connection at `place`.
+    /// Returns a path to the specified URL, after sha256 verification.
     ///
     /// The returned path may be cached - there's no expectation a fresh fetch is performed.
-    ///
-    /// `place` is where the box the build runs for opens the fetch's
-    /// connections, if the build runs for a box (NET-155). `None` keeps the
-    /// fetch as the caller's own traffic. The `bool` is `true` only when the
-    /// fetch had a place and opened a connection there. It is `false` when
-    /// the download cache served the source, or when the fetch had no place.
     fn download_web(
         &self,
         url: &str,
         sha256: &str,
-        place: Option<SourcePlace<'_>>,
         op: &OpTracker,
-    ) -> impl Future<Output = Result<(PathBuf, bool), anyhow::Error>> + Send;
+    ) -> impl Future<Output = Result<PathBuf, anyhow::Error>> + Send;
 
     /// Returns a path to the specified bucket + file, after sha256 verification.
     ///
@@ -54,6 +30,18 @@ pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
         sha256: &str,
         op: &OpTracker,
     ) -> impl Future<Output = Result<PathBuf, anyhow::Error>> + Send;
+
+    /// The cached file of this name and hash, if there is one. A build box
+    /// asks before it opens any network (NET-155).
+    fn cached(&self, _filename: &str, _sha256: &str) -> Result<Option<PathBuf>, anyhow::Error> {
+        Ok(None)
+    }
+
+    /// Takes the file a build box fetched into the cache, after the sha256
+    /// check, and returns its path.
+    fn adopt(&self, filename: &str, _sha256: &str, _from: &Path) -> Result<PathBuf, anyhow::Error> {
+        Err(anyhow!("this fetcher takes no file for {filename}"))
+    }
 }
 
 impl SourceFetcher for common::RemoteStorage {
@@ -61,38 +49,10 @@ impl SourceFetcher for common::RemoteStorage {
         &self,
         url: &str,
         sha256: &str,
-        place: Option<SourcePlace<'_>>,
         op: &OpTracker,
-    ) -> Result<(PathBuf, bool), anyhow::Error> {
-        let Some(place) = place else {
-            let path = self
-                .download_web_with_verification_and_caching(url, sha256, None, op)
-                .await?;
-            return Ok((path, false));
-        };
-        // Kept up until the download ends.
-        let _held;
-        let placement = match place {
-            // A leaf in the deny subtree admits no destination, so the
-            // download resolves no name for it.
-            SourcePlace::Leaf(leaf) if leaf.is_deny() => Placement::Refused(common::RULES_REFUSE),
-            SourcePlace::Leaf(leaf) => Placement::Cgroup(leaf.procs()),
-            SourcePlace::Network { network, exec_base } => {
-                if let Some(why) = network.refusal() {
-                    return self
-                        .download_web_placed(url, sha256, &Placement::Refused(why), op)
-                        .await;
-                }
-                // A source the download cache holds needs no network.
-                if let Some(path) = self.cached_web(url, sha256)? {
-                    return Ok((path, false));
-                }
-                let (namespace, held) = network.hold(exec_base).await?;
-                _held = held;
-                Placement::Namespace(namespace)
-            }
-        };
-        self.download_web_placed(url, sha256, &placement, op).await
+    ) -> Result<PathBuf, anyhow::Error> {
+        self.download_web_with_verification_and_caching(url, sha256, op)
+            .await
     }
 
     async fn download_gcs(
@@ -105,6 +65,14 @@ impl SourceFetcher for common::RemoteStorage {
         self.download_with_verification_and_caching(bucket_id, file, sha256, op)
             .await
     }
+
+    fn cached(&self, filename: &str, sha256: &str) -> Result<Option<PathBuf>, anyhow::Error> {
+        common::RemoteStorage::cached(self, filename, sha256)
+    }
+
+    fn adopt(&self, filename: &str, sha256: &str, from: &Path) -> Result<PathBuf, anyhow::Error> {
+        common::RemoteStorage::adopt(self, filename, sha256, from)
+    }
 }
 
 /// Loads a source.
@@ -112,67 +80,12 @@ pub struct SourceLoad<'a, SF: SourceFetcher> {
     pub source: &'a SourceInput,
     pub remote_fetcher: &'a SF,
     pub into: Option<PendingDir>,
-    /// Where the box the build runs for fetches its sources, if it runs for
-    /// a box (NET-155). A source is fetched there, so the box's egress
-    /// verdict decides the fetch. `None` fetches it as the caller's own
-    /// traffic.
-    pub place: Option<SourcePlace<'a>>,
-}
-
-/// Fetches `url` at `place` and logs where it came from, for a box's build
-/// (NET-155). The log names the URL's host and never quotes the URL.
-async fn fetch_placed<SF: SourceFetcher>(
-    fetcher: &SF,
-    url: &Url,
-    sha256: &str,
-    place: Option<SourcePlace<'_>>,
-    op: &OpTracker,
-) -> Result<PathBuf, anyhow::Error> {
-    let fetched = fetcher.download_web(url.as_str(), sha256, place, op).await;
-    let host = url.host_str().unwrap_or_default();
-    let leaf = match place {
-        Some(SourcePlace::Leaf(leaf)) => Some(leaf),
-        _ => None,
-    };
-    if let Some(leaf) = leaf {
-        // The leaf's own name is the box's id in the tree.
-        let box_id = leaf
-            .dir()
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let leaf = leaf.dir().display();
-        match &fetched {
-            Ok((_, true)) => info!(
-                %box_id, host, %leaf,
-                "fetched a web source for a box in the box's classifier leaf",
-            ),
-            Ok((_, false)) => info!(
-                %box_id, host, %leaf,
-                "the download cache served a web source for a box, and no connection opened",
-            ),
-            // The error can quote the request URL, with its credentials and
-            // its signed query.
-            Err(e) => info!(
-                %box_id, host, %leaf,
-                error = %crate::specs::strip_urls(&format!("{e:#}")),
-                "a web source for a box could not be fetched in the box's classifier leaf",
-            ),
-        }
-    } else if place.is_some() {
-        match &fetched {
-            Ok((_, connected)) => info!(
-                host,
-                connected, "fetched a web source for a box on the box's own network",
-            ),
-            Err(e) => info!(
-                host,
-                error = %crate::specs::strip_urls(&format!("{e:#}")),
-                "a web source for a box could not be fetched on the box's own network",
-            ),
-        }
-    }
-    fetched.map(|(path, _)| path)
+    /// The build box the build runs in, if it runs for a box (NET-155). A
+    /// source is fetched inside it, so its egress decides the fetch. `None`
+    /// fetches the source as the caller's own traffic: `mip`'s.
+    pub build_box: Option<&'a crate::BuildBox>,
+    /// The package the source belongs to.
+    pub package: &'a str,
 }
 
 impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
@@ -217,9 +130,26 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
 
                 match url.scheme() {
                     "https" | "http" => {
-                        let cached_path =
-                            fetch_placed(self.remote_fetcher, &url, sha256, self.place, &op)
-                                .await?;
+                        let cached_path = match self.build_box {
+                            Some(build_box) => {
+                                build_box
+                                    .fetch(
+                                        self.package,
+                                        self.remote_fetcher,
+                                        url.as_str(),
+                                        &filename,
+                                        sha256,
+                                        opts,
+                                        &op,
+                                    )
+                                    .await?
+                            }
+                            None => {
+                                self.remote_fetcher
+                                    .download_web(url.as_str(), sha256, &op)
+                                    .await?
+                            }
+                        };
 
                         debug!(
                             "  Downloaded and verified source from {}",
@@ -238,18 +168,28 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
 
                         let file_name = url.path().trim_start_matches('/');
 
-                        // The Cloud Storage client opens its connections
-                        // where it runs. A box's fetch must open them at its
-                        // place, so it reads the object over `https` there.
-                        let cached_path = if self.place.is_some() {
-                            let object = Url::parse(&common::gcs_object_url(bucket_id, file_name)?)
-                                .context("Failed to name a gs:// object as a URL")?;
-                            fetch_placed(self.remote_fetcher, &object, sha256, self.place, &op)
-                                .await?
-                        } else {
-                            self.remote_fetcher
-                                .download_gcs(bucket_id.to_string(), file_name, sha256, &op)
-                                .await?
+                        let cached_path = match self.build_box {
+                            // The public object, over `https`, from inside
+                            // the build box (NET-155). The cache key is the
+                            // object's last path segment either way.
+                            Some(build_box) => {
+                                build_box
+                                    .fetch(
+                                        self.package,
+                                        self.remote_fetcher,
+                                        &common::gcs_object_url(bucket_id, file_name)?,
+                                        &filename,
+                                        sha256,
+                                        opts,
+                                        &op,
+                                    )
+                                    .await?
+                            }
+                            None => {
+                                self.remote_fetcher
+                                    .download_gcs(bucket_id.to_string(), file_name, sha256, &op)
+                                    .await?
+                            }
                         };
 
                         debug!(
@@ -330,50 +270,49 @@ mod tests {
     const SHA: &str = "4474de87e084953eefc1120cf905a79f72bbbf85091e30cf37c9214eafcaa9c9";
 
     /// Serves one local archive for any URL, standing in for a verified fetch.
-    /// It records the classifier leaf each fetch was asked to run in, and
-    /// each URL it was asked for.
+    /// It counts the fetches that reached it, and `cached` serves it from the
+    /// cache.
     #[derive(Debug)]
-    struct FixtureFetcher(
-        PathBuf,
-        std::sync::Mutex<Vec<Option<ClassifierLeaf>>>,
-        std::sync::Mutex<Vec<String>>,
-    );
+    struct FixtureFetcher {
+        archive: PathBuf,
+        cached: bool,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
 
     impl FixtureFetcher {
         fn new(archive: PathBuf) -> Self {
-            Self(archive, Default::default(), Default::default())
+            Self {
+                archive,
+                cached: false,
+                fetches: Default::default(),
+            }
         }
     }
 
     impl SourceFetcher for FixtureFetcher {
         async fn download_web(
             &self,
-            url: &str,
+            _url: &str,
             _sha256: &str,
-            place: Option<SourcePlace<'_>>,
             _op: &OpTracker,
-        ) -> anyhow::Result<(PathBuf, bool)> {
-            let leaf = match place {
-                Some(SourcePlace::Leaf(leaf)) => Some(leaf.clone()),
-                _ => None,
-            };
-            self.1.lock().unwrap().push(leaf);
-            self.2.lock().unwrap().push(url.to_string());
-            Ok((self.0.clone(), place.is_some()))
+        ) -> anyhow::Result<PathBuf> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.archive.clone())
+        }
+
+        fn cached(&self, _filename: &str, _sha256: &str) -> anyhow::Result<Option<PathBuf>> {
+            Ok(self.cached.then(|| self.archive.clone()))
         }
 
         async fn download_gcs(
             &self,
-            bucket_id: String,
-            file: &str,
+            _bucket_id: String,
+            _file: &str,
             _sha256: &str,
             _op: &OpTracker,
         ) -> anyhow::Result<PathBuf> {
-            self.2
-                .lock()
-                .unwrap()
-                .push(format!("client:{bucket_id}/{file}"));
-            Ok(self.0.clone())
+            anyhow::bail!("only web sources are fetched here")
         }
     }
 
@@ -430,7 +369,8 @@ mod tests {
             source: &source,
             remote_fetcher: &fetcher,
             into: None,
-            place: None,
+            build_box: None,
+            package: "pkg",
         }
         .run(&opts)
         .await
@@ -450,12 +390,136 @@ mod tests {
         assert_eq!(record.files[0].text.as_deref(), Some("upstream notice"));
     }
 
-    /// NET-155: a web source loaded for a build placed in a box's classifier
-    /// leaf is fetched in that leaf, so the box's egress verdict decides the
-    /// fetch. A load with no leaf fetches as the caller's own traffic. The
-    /// fetched archive is extracted the same way in both cases.
+    /// An extracted source keeps each file's modification time from the
+    /// tarball, so a build's tools see the age order upstream shipped: an
+    /// autotools `configure` stays newer than its `configure.ac` and is not
+    /// regenerated.
     #[tokio::test]
-    async fn web_source_fetch_runs_in_the_given_classifier_leaf() {
+    async fn an_extracted_source_keeps_the_tarballs_modification_times() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("cache")).unwrap();
+        let cache = Cache::at_dir(tmp.path().join("cache")).unwrap();
+        let path = tmp.path().join("pkg-1.0.tar.gz");
+        let enc = GzEncoder::new(std::fs::File::create(&path).unwrap(), Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        for (name, mtime) in [
+            ("pkg-1.0/configure.ac", 1_000),
+            ("pkg-1.0/configure", 2_000),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_mtime(mtime);
+            header.set_cksum();
+            tar.append(&header, std::io::empty()).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        let fetcher = FixtureFetcher::new(path);
+        let graph = Graph::new();
+        let opts = Options {
+            cache,
+            graph: &graph,
+            exec_base: tmp.path().to_path_buf(),
+            ot: None,
+            daemon_id: None,
+        };
+        let source = web_source();
+        let materialized = SourceLoad {
+            source: &source,
+            remote_fetcher: &fetcher,
+            into: None,
+            build_box: None,
+            package: "pkg",
+        }
+        .run(&opts)
+        .await
+        .unwrap();
+        let Materialized::TempDir(root) = materialized else {
+            panic!("an extracted source materializes into a temp dir");
+        };
+        let mtime = |name: &str| {
+            std::fs::metadata(root.path().join(name))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(mtime("configure.ac"), 1_000);
+        assert_eq!(mtime("configure"), 2_000);
+    }
+
+    fn web_source() -> SourceInput {
+        SourceInput {
+            from: SourceFetch::Web {
+                url: "https://downloads.example.org/pkg-1.0.tar.gz".into(),
+                sha256: SHA.into(),
+                url_pos: None,
+                sha256_pos: None,
+            },
+            extract: true,
+            strip_prefix: Some("pkg-1.0".into()),
+        }
+    }
+
+    fn closed_build_box() -> crate::BuildBox {
+        crate::BuildBox::on_network("/nonexistent".into(), None)
+    }
+
+    /// What a source refused at `host_port` says: what a download that could
+    /// not connect says, with the rules as the reason, so the daemon names
+    /// the host and the next step.
+    fn refused_at(host_port: &str) -> String {
+        format!(
+            "other: could not connect to {host_port}: {}",
+            common::RULES_REFUSE
+        )
+    }
+
+    /// NET-155: a source already in the download cache needs no network, so
+    /// a build box with none still has it, and nothing is fetched.
+    #[tokio::test]
+    async fn a_cached_source_opens_no_network() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("cache")).unwrap();
+        let cache = Cache::at_dir(tmp.path().join("cache")).unwrap();
+        let archive = tarball(tmp.path(), &[("pkg-1.0/README", b"readme")]);
+        let mut fetcher = FixtureFetcher::new(archive);
+        fetcher.cached = true;
+        let graph = Graph::new();
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &graph,
+            exec_base: tmp.path().to_path_buf(),
+            ot: None,
+            daemon_id: None,
+        };
+        let source = web_source();
+        let build_box = closed_build_box();
+        let materialized = SourceLoad {
+            source: &source,
+            remote_fetcher: &fetcher,
+            into: None,
+            build_box: Some(&build_box),
+            package: "pkg",
+        }
+        .run(&opts)
+        .await
+        .unwrap();
+        let Materialized::TempDir(root) = materialized else {
+            panic!("an extracted source materializes into a temp dir");
+        };
+        assert!(root.path().join("README").exists());
+        assert_eq!(fetcher.fetches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// NET-155: in a build box a `gs://` source goes over `https` from inside
+    /// the box, not through the daemon's bucket client, so a box with no
+    /// network refuses it and the bucket client is never asked.
+    #[tokio::test]
+    async fn gs_source_fetches_over_https_in_the_build_box() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join("cache")).unwrap();
         let cache = Cache::at_dir(tmp.path().join("cache")).unwrap();
@@ -471,7 +535,7 @@ mod tests {
         };
         let source = SourceInput {
             from: SourceFetch::Web {
-                url: "https://downloads.example.org/pkg-1.0.tar.gz".into(),
+                url: "gs://minimal-staging-archives/pkg-1.0.tar.gz".into(),
                 sha256: SHA.into(),
                 url_pos: None,
                 sha256_pos: None,
@@ -479,45 +543,29 @@ mod tests {
             extract: true,
             strip_prefix: Some("pkg-1.0".into()),
         };
-        let leaf = ClassifierLeaf::under(
-            Path::new("/sys/fs/cgroup/minimald.slice"),
-            "sealed",
-            sandbox::config::Verdict::Deny,
-        );
-
-        for given in [Some(&leaf), None] {
-            let materialized = SourceLoad {
-                source: &source,
-                remote_fetcher: &fetcher,
-                into: None,
-                place: given.map(SourcePlace::Leaf),
-            }
-            .run(&opts)
-            .await
-            .unwrap();
-            let Materialized::TempDir(root) = materialized else {
-                panic!("an extracted source materializes into a temp dir");
-            };
-            assert!(root.path().join("README").exists());
+        let build_box = closed_build_box();
+        let refused = SourceLoad {
+            source: &source,
+            remote_fetcher: &fetcher,
+            into: None,
+            build_box: Some(&build_box),
+            package: "pkg",
         }
+        .run(&opts)
+        .await
+        .expect_err("a build box with no network fetches nothing");
         assert_eq!(
-            *fetcher.1.lock().unwrap(),
-            vec![Some(leaf.clone()), None],
-            "each fetch runs in the leaf its load was given"
-        );
-        assert_eq!(
-            leaf.procs(),
-            Path::new("/sys/fs/cgroup/minimald.slice/boxes/deny/sealed/cgroup.procs"),
-            "the download joins the leaf through its cgroup.procs"
+            refused.to_string(),
+            refused_at("storage.googleapis.com:443"),
+            "the refusal names the host the box would fetch from"
         );
     }
 
-    /// NET-155: a `gs://` source loaded for a box is read over `https` at
-    /// the box's place, on the box's own network or in its leaf, so the
-    /// box's rules decide it. A load for no box stays on the Cloud Storage
-    /// client, as its caller's own traffic.
+    /// NET-155, NET-171: a source outside the cache, for a build box with no
+    /// network, stops the build with the refusal. It reaches no fetcher, so
+    /// the daemon does not fetch it either.
     #[tokio::test]
-    async fn a_gs_source_for_a_box_is_fetched_at_the_boxs_place() {
+    async fn source_fetch_runs_in_the_build_box() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join("cache")).unwrap();
         let cache = Cache::at_dir(tmp.path().join("cache")).unwrap();
@@ -525,204 +573,39 @@ mod tests {
         let fetcher = FixtureFetcher::new(archive);
         let graph = Graph::new();
         let opts = Options {
-            cache,
+            cache: cache.clone(),
             graph: &graph,
             exec_base: tmp.path().to_path_buf(),
             ot: None,
             daemon_id: None,
         };
-        let source = SourceInput {
-            from: SourceFetch::Web {
-                url: "gs://sources-bucket/dir/pkg-1.0.tar.gz".into(),
-                sha256: SHA.into(),
-                url_pos: None,
-                sha256_pos: None,
-            },
-            extract: true,
-            strip_prefix: Some("pkg-1.0".into()),
-        };
-        let leaf = ClassifierLeaf::under(
-            Path::new("/sys/fs/cgroup/minimald.slice"),
-            "box-1",
-            sandbox::config::Verdict::Allow,
-        );
-        let network = crate::BuildNetwork::none();
-
-        for place in [
-            Some(SourcePlace::Leaf(&leaf)),
-            Some(SourcePlace::Network {
-                network: &network,
-                exec_base: tmp.path(),
-            }),
-            None,
-        ] {
-            SourceLoad {
-                source: &source,
-                remote_fetcher: &fetcher,
-                into: None,
-                place,
-            }
-            .run(&opts)
-            .await
-            .unwrap();
-        }
-        let web = "https://storage.googleapis.com/sources-bucket/dir/pkg-1.0.tar.gz";
-        assert_eq!(
-            *fetcher.2.lock().unwrap(),
-            vec![web, web, "client:sources-bucket/dir/pkg-1.0.tar.gz"]
-        );
-    }
-
-    /// NET-155: a box with no network has nowhere to open a connection. A
-    /// source the download cache lacks fails before it leaves, and the error
-    /// names the host and the reason. Rules that admit nothing fail the same
-    /// way, with their own reason. Neither case looks for a network.
-    #[tokio::test]
-    async fn a_fetch_on_a_closed_network_sends_nothing() {
-        let tmp = TempDir::new().unwrap();
-        let storage = common::RemoteStorage::new(tmp.path().join("downloads"), false)
-            .await
-            .unwrap();
-        let op = OpTracker::new_root();
-        let denied =
-            crate::BuildNetwork::new(|| panic!("no network is made")).with_denies_all(true);
-        for (network, why) in [
-            (crate::BuildNetwork::none(), common::NO_NETWORK),
-            (denied, common::RULES_REFUSE),
-        ] {
-            let place = SourcePlace::Network {
-                network: &network,
-                exec_base: tmp.path(),
-            };
-            let refused = storage
-                .download_web(
-                    "https://sources.example.invalid/a.tar.gz",
-                    SHA,
-                    Some(place),
-                    &op,
-                )
-                .await
-                .expect_err("nothing leaves");
-            assert_eq!(
-                refused.to_string(),
-                format!("could not connect to sources.example.invalid:443: {why}"),
-                "{refused:#}"
-            );
-        }
-    }
-
-    /// Fails every web fetch with an error that quotes a URL with
-    /// credentials and a signed query, as a reqwest error does.
-    #[derive(Debug)]
-    struct LeakyFailFetcher;
-
-    impl SourceFetcher for LeakyFailFetcher {
-        async fn download_web(
-            &self,
-            _url: &str,
-            _sha256: &str,
-            _place: Option<SourcePlace<'_>>,
-            _op: &OpTracker,
-        ) -> anyhow::Result<(PathBuf, bool)> {
-            Err(anyhow!(
-                "error sending request for url (https://user:secret@host/x?sig=abc)"
-            ))
-        }
-
-        async fn download_gcs(
-            &self,
-            _bucket_id: String,
-            _file: &str,
-            _sha256: &str,
-            _op: &OpTracker,
-        ) -> anyhow::Result<PathBuf> {
-            unreachable!("only web sources are fetched here")
-        }
-    }
-
-    /// Writes every event's fields into one shared string.
-    #[derive(Clone, Default)]
-    struct CaptureEvents(std::sync::Arc<std::sync::Mutex<String>>);
-
-    impl tracing::field::Visit for CaptureEvents {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write;
-            let _ = writeln!(self.0.lock().unwrap(), "{}={value:?}", field.name());
-        }
-    }
-
-    impl tracing::Subscriber for CaptureEvents {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            event.record(&mut self.clone());
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    /// NET-155: the daemon log line for a box's failed web-source fetch
-    /// keeps the error, but strips the credentials and the query from any
-    /// URL the error quotes.
-    #[tokio::test]
-    async fn web_source_fetch_failure_log_strips_url_credentials() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir(tmp.path().join("cache")).unwrap();
-        let cache = Cache::at_dir(tmp.path().join("cache")).unwrap();
-        let graph = Graph::new();
-        let opts = Options {
-            cache,
-            graph: &graph,
-            exec_base: tmp.path().to_path_buf(),
-            ot: None,
-            daemon_id: None,
-        };
-        let source = SourceInput {
-            from: SourceFetch::Web {
-                url: "https://host/x.tar.gz".into(),
-                sha256: SHA.into(),
-                url_pos: None,
-                sha256_pos: None,
-            },
-            extract: true,
-            strip_prefix: None,
-        };
-        let leaf = ClassifierLeaf::under(
-            Path::new("/sys/fs/cgroup/minimald.slice"),
-            "sealed",
-            sandbox::config::Verdict::Deny,
-        );
-        let capture = CaptureEvents::default();
-        let _guard = tracing::subscriber::set_default(capture.clone());
-
-        let result = SourceLoad {
+        let source = web_source();
+        let build_box = closed_build_box();
+        let refused = SourceLoad {
             source: &source,
-            remote_fetcher: &LeakyFailFetcher,
+            remote_fetcher: &fetcher,
             into: None,
-            place: Some(SourcePlace::Leaf(&leaf)),
+            build_box: Some(&build_box),
+            package: "pkg",
         }
         .run(&opts)
-        .await;
+        .await
+        .expect_err("a build box with no network fetches nothing");
+        assert_eq!(refused.to_string(), refused_at("downloads.example.org:443"));
+        assert_eq!(fetcher.fetches.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        assert!(result.is_err(), "the failed fetch fails the load");
-        let logged = capture.0.lock().unwrap().clone();
-        assert!(
-            logged.contains("could not be fetched") && logged.contains("https://host/x"),
-            "the failure is logged with the stripped URL: {logged}"
-        );
-        assert!(
-            !logged.contains("secret"),
-            "no password in the log: {logged}"
-        );
-        assert!(
-            !logged.contains("sig=abc"),
-            "no signed query in the log: {logged}"
-        );
+        // Outside any box, the caller fetches as its own traffic.
+        let materialized = SourceLoad {
+            source: &source,
+            remote_fetcher: &fetcher,
+            into: None,
+            build_box: None,
+            package: "pkg",
+        }
+        .run(&opts)
+        .await
+        .unwrap();
+        assert!(matches!(materialized, Materialized::TempDir(_)));
+        assert_eq!(fetcher.fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -11,6 +11,8 @@ use super::*;
 mod address;
 #[path = "boxes/attach.rs"]
 mod attach;
+#[path = "boxes/build_boxes.rs"]
+mod build_boxes;
 #[path = "boxes/create.rs"]
 mod create;
 #[path = "boxes/events.rs"]
@@ -36,6 +38,7 @@ pub(crate) use address::*;
 pub use address::{AddressCandidate, BoxAddressRefusal};
 pub use attach::BoxAttachRefusal;
 pub(crate) use attach::*;
+pub(crate) use build_boxes::{BuildBoxActivation, prepare_build_boxes};
 pub use create::*;
 pub use events::BoxFileRefusal;
 pub(crate) use events::*;

@@ -107,7 +107,7 @@ use minimald_rpc::{
     RenameBoxRequest, WithdrawBoxRequest, WithdrawPortRequest,
 };
 
-use crate::box_registry::{AllocationError, BoxRegistry, ClientBoxSpec};
+use crate::box_registry::{AllocationError, BoxRegistry, BuildRow, ClientBoxSpec};
 use crate::net::answerer::AnswererStatus;
 
 /// The control socket's file name inside the host dir, beside
@@ -684,6 +684,8 @@ pub fn spawn_guest_reports_door_with_proxy(
     let reconcile = spawn_host_ip_reconcile(
         boxes.clone(),
         control_sock_path.with_file_name(paths::SSH_SOCK_FILE),
+        answerer.clone(),
+        audit_path.clone(),
     )?;
     tracing::info!(
         sock = %sock_path.display(),
@@ -1062,26 +1064,43 @@ impl HostIpReconcileNudge {
 /// `guest_rpc_sock` and hands it to
 /// [`BoxRegistry::reconcile_host_ip_boxes`]. A read that fails changes
 /// nothing: a failed read is no evidence that a box ended.
+///
+/// The same list ends the requester build row of a box it no longer
+/// names (NET-169, [`BoxRegistry::requester_rows_without_a_box`]): the
+/// box's retirement normally withdraws it, and its creator may never send
+/// one. Each withdrawal takes its turn in an order of the thread's own,
+/// as each door's do.
 fn spawn_host_ip_reconcile(
     boxes: BoxRegistry,
     guest_rpc_sock: PathBuf,
+    answerer: AnswererStatus,
+    audit_path: PathBuf,
 ) -> std::io::Result<HostIpReconcileNudge> {
-    spawn_host_ip_reconcile_with(boxes, HOST_IP_RECONCILE_INTERVAL, move || {
-        read_guest_box_states(&guest_rpc_sock)
-    })
+    let order = Arc::new(ApplyOrder::default());
+    let rows = boxes.clone();
+    spawn_host_ip_reconcile_with(
+        boxes,
+        HOST_IP_RECONCILE_INTERVAL,
+        move || read_guest_box_states(&guest_rpc_sock),
+        move |name| {
+            order.apply(|| withdraw_requester_row(&rows, &answerer, &audit_path, name));
+        },
+    )
 }
 
 /// [`spawn_host_ip_reconcile`] with its timer and its session-list read
 /// given, so a test can drive the thread without an in-VM daemon.
-fn spawn_host_ip_reconcile_with<R>(
+fn spawn_host_ip_reconcile_with<R, W>(
     boxes: BoxRegistry,
     interval: Duration,
     mut read_guest: R,
+    mut withdraw_row: W,
 ) -> std::io::Result<HostIpReconcileNudge>
 where
     R: FnMut() -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>>
         + Send
         + 'static,
+    W: FnMut(&str) + Send + 'static,
 {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -1133,6 +1152,14 @@ where
                             && since.is_none_or(|since| {
                                 boxes.host_ip_admitted_after(&outcome.dropped, since)
                             });
+                        for row in boxes.requester_rows_without_a_box(&guest, mark) {
+                            tracing::info!(
+                                row = %row,
+                                trigger = %trigger,
+                                "withdrawing the build row of a box the VM no longer lists"
+                            );
+                            withdraw_row(&row);
+                        }
                     }
                     Err(error) if !failing => {
                         failing = true;
@@ -1258,7 +1285,8 @@ fn serve_request(
     // ended. The read-only verbs and the answerer handover take no ticket.
     match (request, door) {
         (BoxControlRequest::Register(request), ControlDoor::Host) => {
-            let reply = registration_reply(boxes, answerer, order, request);
+            let build_row = request.stays_detached.then_some(BuildRow::Requester);
+            let reply = registration_reply(boxes, answerer, order, request, build_row);
             write_reply(stream, &reply)
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host)
@@ -1291,6 +1319,54 @@ fn serve_request(
         (BoxControlRequest::RenameBox(request), ControlDoor::Host) => {
             let reply = order.apply(|| rename_box(boxes, &request));
             write_reply(stream, &reply)
+        }
+        // NET-165: `min` files a box's table with the host-side creator.
+        (BoxControlRequest::FileBuildTable(request), ControlDoor::Host) => {
+            boxes.build_grants().file(request.session_id, request.table);
+            write_reply(stream, &BoxControlReply::BuildTable { build_table: true })
+        }
+        // NET-165: the guest names a spec hash, and the table decides. The
+        // sources' redirects are read before the ticket, so no turn waits
+        // on a remote host.
+        // A grant whose reply cannot be delivered ends at once: its asker
+        // could never close it.
+        (BoxControlRequest::OpenBuildGrant(request), ControlDoor::GuestReports) => {
+            let reply = open_build_grant(
+                boxes,
+                answerer,
+                order,
+                audit_path,
+                &request,
+                std::time::Instant::now(),
+            );
+            let written = write_reply(stream, &reply);
+            if written.is_err()
+                && let BoxControlReply::BuildGrantOpened(opened) = &reply
+                && let Some(withdrawal) = boxes.build_grants().take(&opened.grant_row)
+            {
+                tracing::info!(
+                    row = %opened.grant_row,
+                    "a build grant's reply could not be delivered; the grant ends now"
+                );
+                order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+            }
+            written
+        }
+        // A guest signal ends a grant early. Only a row a grant opened ends
+        // here: no other row can be named.
+        (BoxControlRequest::CloseBuildGrant(request), ControlDoor::GuestReports) => {
+            if let Some(withdrawal) = boxes.build_grants().take(&request.grant_row) {
+                order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+            }
+            write_reply(stream, &BoxControlReply::BuildTable { build_table: true })
+        }
+        // The box is gone: its table ends, and so does every grant still
+        // open for it.
+        (BoxControlRequest::DropBuildTable(request), ControlDoor::GuestReports) => {
+            for withdrawal in boxes.build_grants().drop_table(request.session_id) {
+                order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+            }
+            write_reply(stream, &BoxControlReply::BuildTable { build_table: true })
         }
         // A read of the host's own table, like the row read: no ticket.
         // The table is this supervisor's, and a supervisor runs one VM and
@@ -1379,6 +1455,22 @@ fn serve_request(
             let box_name = no_switch_box_name(boxes, request.session_id)
                 .unwrap_or_else(|| request.session_id.to_string());
             boxes.retire_host_ip_box(request.session_id, request.end);
+            // The row its builds attach under goes with it (NET-169), in its
+            // turn as any withdrawal, and its published address returns to
+            // the range unless a live row or a registration owns it.
+            order.apply(|| {
+                let name = minimald_rpc::requester_build_row_name(request.session_id);
+                withdraw_requester_row(boxes, answerer, audit_path, &name);
+            });
+            // A destroyed box's table ends with it, and so does every grant
+            // still open for it, as the guest's own drop ends them: that
+            // drop may never have arrived. A stopped box keeps its table,
+            // for its builds when it starts again.
+            if request.end == minimald_rpc::HostIpBoxEnd::Destroyed {
+                for withdrawal in boxes.build_grants().drop_table(request.session_id) {
+                    order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+                }
+            }
             // A host-address box has no switch: its audit window, filed by
             // its box id, ends with it (NET-046).
             flush_guest_audit(
@@ -1702,12 +1794,14 @@ fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Opt
 }
 
 /// Register a box in its door's apply order and build the reply: the one
-/// registration path the one-shot and the held verb share.
+/// registration path the one-shot and the held verb share. `build_row`
+/// names the kind of build row the registration is, when it is one.
 fn registration_reply(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     order: &Arc<ApplyOrder>,
     request: RegisterBoxRequest,
+    build_row: Option<BuildRow>,
 ) -> BoxControlReply {
     // A `host_ip` box leaves the VM from the node's own address (BEP-082):
     // it gets a box id and no address, so the answerer is not asked.
@@ -1723,10 +1817,196 @@ fn registration_reply(
     // registration in its turn. The claim ends with the turn.
     let claim = boxes.begin_registration(&request.name);
     match allocate_box_address(answerer, &request.name) {
-        Ok(loopback_addr) => {
-            order.apply(move || register_box(boxes, answerer, request, loopback_addr, claim))
-        }
+        Ok(loopback_addr) => order
+            .apply(move || register_box(boxes, answerer, request, loopback_addr, claim, build_row)),
         Err(reply) => reply,
+    }
+}
+
+/// The part of the asker's deadline a grant must open within, so its reply
+/// still arrives in time.
+const BUILD_GRANT_OPEN_WITHIN: std::time::Duration =
+    minimald_rpc::BUILD_GRANT_ASK_DEADLINE.saturating_sub(std::time::Duration::from_secs(10));
+
+/// Opens the grant `request`, read at `asked_at`, asks for (NET-165): the
+/// table decides, and the build box gets a row of its own. A hash the table
+/// does not hold, or a grant past the cap, opens nothing, and the build
+/// follows the box's own rules. A grant that opens too late for its asker to
+/// still be waiting ends at once and opens nothing either.
+fn open_build_grant(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    audit_path: &Path,
+    request: &minimald_rpc::OpenBuildGrantRequest,
+    asked_at: std::time::Instant,
+) -> BoxControlReply {
+    let no_grant = BoxControlReply::NoBuildGrant {
+        no_build_grant: true,
+    };
+    let grants = boxes.build_grants();
+    let Some(grant) = grants.lookup(request.session_id, &request.spec_hash) else {
+        return no_grant;
+    };
+    let Some(row) = grants.next_row(request.session_id) else {
+        tracing::warn!(
+            session = %request.session_id,
+            "the most grants are open; this build follows the box's own rules"
+        );
+        return no_grant;
+    };
+    let hosts = if grant.internet {
+        std::collections::BTreeSet::new()
+    } else {
+        grant_hosts(&grant.sources)
+    };
+    let egress = minimald_rpc::build_box_egress(&hosts, grant.internet);
+    let registered = registration_reply(
+        boxes,
+        answerer,
+        order,
+        RegisterBoxRequest {
+            name: row.clone(),
+            ingress_ports: Vec::new(),
+            egress: Some(egress.clone()),
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+            hold: false,
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            host_ip: false,
+            stays_detached: true,
+        },
+        Some(BuildRow::Grant),
+    );
+    let BoxControlReply::Registered(registered) = registered else {
+        grants.unreserve(&row);
+        tracing::warn!(session = %request.session_id, reply = ?registered, "no grant opened");
+        return no_grant;
+    };
+    let withdrawal = WithdrawBoxRequest {
+        name: row.clone(),
+        switch_address: registered.switch_address,
+        loopback_address: registered.loopback_address,
+        box_id: Some(registered.box_id),
+    };
+    let deadline = crate::build_grants::grant_deadline(std::time::Instant::now(), grant.internet);
+    if !grants.opened(withdrawal.clone(), deadline) {
+        tracing::info!(
+            session = %request.session_id,
+            row = %row,
+            "the box's table ended while its grant opened; the grant ends now"
+        );
+        order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+        return no_grant;
+    }
+    if asked_at.elapsed() >= BUILD_GRANT_OPEN_WITHIN {
+        tracing::warn!(
+            session = %request.session_id,
+            row = %row,
+            "a build grant opened after its asker stopped waiting; the grant ends now"
+        );
+        if let Some(withdrawal) = grants.take(&row) {
+            order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+        }
+        return no_grant;
+    }
+    let (sweep_boxes, sweep_answerer, sweep_order, sweep_audit) = (
+        boxes.clone(),
+        answerer.clone(),
+        Arc::clone(order),
+        audit_path.to_path_buf(),
+    );
+    grants.start_sweep(move || {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(crate::build_grants::GRANT_SWEEP_INTERVAL);
+                sweep_grant_deadlines(
+                    &sweep_boxes,
+                    &sweep_answerer,
+                    &sweep_order,
+                    &sweep_audit,
+                    std::time::Instant::now(),
+                );
+            }
+        });
+    });
+    tracing::info!(
+        session = %request.session_id,
+        spec_hash = %request.spec_hash,
+        row = %row,
+        internet = grant.internet,
+        hosts = ?hosts,
+        "opened a build grant"
+    );
+    BoxControlReply::BuildGrantOpened(Box::new(minimald_rpc::OpenedBuildGrant {
+        grant_row: row,
+        task_addresses: registered.task_addresses,
+        egress,
+        internet: grant.internet,
+    }))
+}
+
+/// Ends every grant past its deadline at `now`, each in its turn.
+fn sweep_grant_deadlines(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    audit_path: &Path,
+    now: std::time::Instant,
+) {
+    for withdrawal in boxes.build_grants().take_expired(now) {
+        tracing::info!(row = %withdrawal.name, "a build grant reached its deadline");
+        order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+    }
+}
+
+/// Withdraws the requester build row `name` (NET-169), in the caller's
+/// turn: its published address returns to the range unless a live row or a
+/// registration owns it, and its audit window ends, as any box's
+/// withdrawal ends one.
+fn withdraw_requester_row(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    audit_path: &Path,
+    name: &str,
+) {
+    if let Some((held, switch_address)) = boxes.withdraw_build_row(name) {
+        boxes.release_withdrawn_unless_owned(&held, || {
+            answerer.release_address(&held);
+        });
+        flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
+    }
+}
+
+/// Withdraws a grant's row, in the caller's turn, and ends its audit window
+/// as any box's withdrawal does, so the count of the records it suppressed
+/// lands now and a later row at its address starts a window of its own.
+fn withdraw_grant_row(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    audit_path: &Path,
+    withdrawal: WithdrawBoxRequest,
+) -> BoxControlReply {
+    let switch_address = withdrawal.switch_address;
+    let (reply, held) = withdraw_box(boxes, answerer, withdrawal);
+    if let Some(held) = held {
+        flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
+    }
+    reply
+}
+
+/// The hosts a grant's fetch reaches, read from this host (NET-167).
+fn grant_hosts(sources: &[String]) -> std::collections::BTreeSet<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
+    match runtime {
+        Ok(runtime) => runtime.block_on(common::source_hosts(sources)),
+        Err(error) => {
+            tracing::warn!(%error, "could not read a source's redirects");
+            std::collections::BTreeSet::new()
+        }
     }
 }
 
@@ -1839,7 +2119,8 @@ fn serve_held_registration(
     slot: crate::box_registry::GaugeGuard,
 ) -> std::io::Result<()> {
     let name = request.name.clone();
-    let reply = registration_reply(boxes, answerer, order, request);
+    let build_row = request.stays_detached.then_some(BuildRow::Requester);
+    let reply = registration_reply(boxes, answerer, order, request, build_row);
     let BoxControlReply::Registered(registered) = &reply else {
         return write_reply(&mut stream, &reply);
     };
@@ -1996,6 +2277,10 @@ fn refused_wrong_door(
 fn request_verb(request: &BoxControlRequest) -> &'static str {
     match request {
         BoxControlRequest::Register(_) => "register",
+        BoxControlRequest::FileBuildTable(_) => "file_build_table",
+        BoxControlRequest::OpenBuildGrant(_) => "open_build_grant",
+        BoxControlRequest::CloseBuildGrant(_) => "close_build_grant",
+        BoxControlRequest::DropBuildTable(_) => "drop_build_table",
         BoxControlRequest::Withdraw(_) => "withdraw",
         BoxControlRequest::RenameBox(_) => "rename_box",
         BoxControlRequest::HoldBoxName(_) => "hold_box_name",
@@ -2283,6 +2568,7 @@ fn register_box(
     request: RegisterBoxRequest,
     loopback_addr: std::net::Ipv4Addr,
     claim: crate::box_registry::RegistrationClaim,
+    build_row: Option<BuildRow>,
 ) -> BoxControlReply {
     // The declaration as the row received it; `null` for a box with no
     // egress section. A plain struct of strings serialises infallibly.
@@ -2308,6 +2594,7 @@ fn register_box(
         loopback_addr,
         request.task_slots,
         claim.generation(),
+        build_row,
     ) {
         Ok(record) => {
             tracing::info!(
@@ -4588,7 +4875,11 @@ mod tests {
                      reply for {port}/{proto:?}"
                 )
             }
-            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
+            other @ (BoxControlReply::BuildGrantOpened(_)
+            | BoxControlReply::NoBuildGrant { .. }
+            | BoxControlReply::BuildTable { .. }
+            | BoxControlReply::RowStanding { .. }
+            | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
@@ -4973,6 +5264,7 @@ mod tests {
                     hold: false,
                     task_slots: u8::MAX,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5049,6 +5341,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("first registration is answered"),
@@ -5121,6 +5414,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("second registration is answered"),
@@ -5167,6 +5461,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -5284,6 +5579,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5361,6 +5657,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5417,7 +5714,11 @@ mod tests {
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a withdrawal echoes the pair it went by, never a port report")
             }
-            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
+            other @ (BoxControlReply::BuildGrantOpened(_)
+            | BoxControlReply::NoBuildGrant { .. }
+            | BoxControlReply::BuildTable { .. }
+            | BoxControlReply::RowStanding { .. }
+            | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
@@ -5490,6 +5791,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the marker box is registered"),
@@ -5541,7 +5843,10 @@ mod tests {
                 BoxControlReply::PortRecorded { .. } => {
                     panic!("a foreign pair's withdrawal must be refused, got a port report")
                 }
-                other @ (BoxControlReply::RowStanding { .. }
+                other @ (BoxControlReply::BuildGrantOpened(_)
+                | BoxControlReply::NoBuildGrant { .. }
+                | BoxControlReply::BuildTable { .. }
+                | BoxControlReply::RowStanding { .. }
                 | BoxControlReply::HostIpBox { .. }) => {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
@@ -5618,7 +5923,11 @@ mod tests {
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a repeat withdrawal echoes the pair, never a port report")
             }
-            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
+            other @ (BoxControlReply::BuildGrantOpened(_)
+            | BoxControlReply::NoBuildGrant { .. }
+            | BoxControlReply::BuildTable { .. }
+            | BoxControlReply::RowStanding { .. }
+            | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
@@ -5758,6 +6067,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -6348,6 +6658,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6552,6 +6863,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6622,6 +6934,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6739,6 +7052,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6811,6 +7125,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6911,6 +7226,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -7034,6 +7350,7 @@ mod tests {
             hold: false,
             task_slots: 0,
             host_ip: false,
+            stays_detached: false,
         };
         let web = handed(register(&sock_path, &request("web")).expect("registered"));
         assert_eq!(
@@ -7109,6 +7426,7 @@ mod tests {
             hold: false,
             task_slots: 0,
             host_ip: false,
+            stays_detached: false,
         };
         let web = handed(register(&sock_path, &request("web")).expect("registered"));
         assert!(
@@ -7194,6 +7512,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -7286,6 +7605,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -7410,6 +7730,7 @@ mod tests {
                         hold: false,
                         task_slots: 0,
                         host_ip: false,
+                        stays_detached: false,
                     },
                 )
                 .expect("the registration is answered"),
@@ -8204,6 +8525,7 @@ mod tests {
                 hold: false,
                 task_slots: 0,
                 host_ip: false,
+                stays_detached: false,
             },
         )
         .expect("the second connection is served");
@@ -8329,6 +8651,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -8629,6 +8952,7 @@ mod tests {
             hold: false,
             task_slots: 0,
             host_ip: false,
+            stays_detached: false,
         }
     }
 
@@ -8921,6 +9245,281 @@ mod tests {
         );
     }
 
+    /// NET-165: `min` files the table on the host's door, and the guest
+    /// cannot. The guest names a spec hash and gets a row of the build box's
+    /// own, with what the table says and nothing it sent. A hash the table
+    /// does not hold opens nothing. A close ends the grant, and a close of a
+    /// row no grant opened ends nothing.
+    #[test]
+    fn a_grant_opens_from_the_table_on_a_hash_alone() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let session_id = boxes::SessionId::mint();
+        let file = BoxControlRequest::FileBuildTable(minimald_rpc::FileBuildTableRequest {
+            session_id,
+            table: std::collections::BTreeMap::from([(
+                "aa".to_string(),
+                minimald_rpc::BuildGrant {
+                    sources: Vec::new(),
+                    internet: true,
+                },
+            )]),
+        });
+        let refused = control(&guest, &file).expect("the guest door answers");
+        assert!(
+            matches!(refused, BoxControlReply::Error { .. }),
+            "{refused:?}"
+        );
+        let open = |spec_hash: &str| {
+            control(
+                &guest,
+                &BoxControlRequest::OpenBuildGrant(minimald_rpc::OpenBuildGrantRequest {
+                    session_id,
+                    spec_hash: spec_hash.to_string(),
+                }),
+            )
+            .expect("the guest door answers")
+        };
+        assert!(
+            matches!(open("aa"), BoxControlReply::NoBuildGrant { .. }),
+            "no table is filed yet"
+        );
+
+        let filed = control(&sock_path, &file).expect("the host door answers");
+        assert!(matches!(filed, BoxControlReply::BuildTable { .. }));
+        assert!(matches!(open("bb"), BoxControlReply::NoBuildGrant { .. }));
+        let BoxControlReply::BuildGrantOpened(opened) = open("aa") else {
+            panic!("the table holds the hash");
+        };
+        assert_eq!(
+            opened.egress,
+            minimald_rpc::build_box_egress(&std::collections::BTreeSet::new(), true)
+        );
+        assert!(!opened.task_addresses.is_empty(), "an address of its own");
+        assert!(registry.row_by_name(&opened.grant_row).is_some());
+
+        let close = |grant_row: &str| {
+            control(
+                &guest,
+                &BoxControlRequest::CloseBuildGrant(minimald_rpc::CloseBuildGrantRequest {
+                    grant_row: grant_row.to_string(),
+                }),
+            )
+            .expect("the guest door answers")
+        };
+        close("another-box");
+        assert!(registry.row_by_name(&opened.grant_row).is_some());
+        close(&opened.grant_row);
+        assert!(registry.row_by_name(&opened.grant_row).is_none());
+    }
+
+    /// A filed table and an open grant on it, through the server at
+    /// `sock_path`: the grant the guest opened.
+    fn open_a_grant(
+        sock_path: &std::path::Path,
+        session_id: boxes::SessionId,
+    ) -> minimald_rpc::OpenedBuildGrant {
+        let filed = control(
+            sock_path,
+            &BoxControlRequest::FileBuildTable(minimald_rpc::FileBuildTableRequest {
+                session_id,
+                table: std::collections::BTreeMap::from([(
+                    "aa".to_string(),
+                    minimald_rpc::BuildGrant {
+                        sources: Vec::new(),
+                        internet: true,
+                    },
+                )]),
+            }),
+        )
+        .expect("the host door answers");
+        assert!(matches!(filed, BoxControlReply::BuildTable { .. }));
+        let opened = control(
+            &sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE),
+            &BoxControlRequest::OpenBuildGrant(minimald_rpc::OpenBuildGrantRequest {
+                session_id,
+                spec_hash: "aa".to_string(),
+            }),
+        )
+        .expect("the guest door answers");
+        let BoxControlReply::BuildGrantOpened(opened) = opened else {
+            panic!("the table holds the hash: {opened:?}");
+        };
+        *opened
+    }
+
+    /// NET-165: a box's table ends with the box, and so does every grant
+    /// open for it: its row goes, and its hash opens nothing more.
+    #[test]
+    fn a_dropped_table_ends_its_grants() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let session_id = boxes::SessionId::mint();
+        let opened = open_a_grant(&sock_path, session_id);
+        assert!(registry.row_by_name(&opened.grant_row).is_some());
+
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let dropped = control(
+            &guest,
+            &BoxControlRequest::DropBuildTable(minimald_rpc::DropBuildTableRequest { session_id }),
+        )
+        .expect("the guest door answers");
+        assert!(matches!(dropped, BoxControlReply::BuildTable { .. }));
+        assert!(registry.row_by_name(&opened.grant_row).is_none());
+        let again = control(
+            &guest,
+            &BoxControlRequest::OpenBuildGrant(minimald_rpc::OpenBuildGrantRequest {
+                session_id,
+                spec_hash: "aa".to_string(),
+            }),
+        )
+        .expect("the guest door answers");
+        assert!(
+            matches!(again, BoxControlReply::NoBuildGrant { .. }),
+            "{again:?}"
+        );
+    }
+
+    /// NET-165, NET-169: a destroyed `host_ip` box's table ends at its
+    /// retirement, and so does every grant open for it, though the guest's
+    /// own drop never arrived. A stopped box keeps its table and its grant.
+    #[test]
+    fn a_destroyed_host_ip_box_ends_its_table_and_grants() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let retire = |session_id, end| {
+            let reply = control(
+                &sock_path,
+                &BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
+                    session_id,
+                    end,
+                }),
+            )
+            .expect("the retire is answered");
+            assert!(
+                matches!(reply, BoxControlReply::HostIpBox { .. }),
+                "{reply:?}"
+            );
+        };
+
+        let stopped = boxes::SessionId::mint();
+        let kept = open_a_grant(&sock_path, stopped);
+        retire(stopped, minimald_rpc::HostIpBoxEnd::Stopped);
+        assert!(registry.build_grants().lookup(stopped, "aa").is_some());
+        assert!(registry.row_by_name(&kept.grant_row).is_some());
+
+        let destroyed = boxes::SessionId::mint();
+        let ended = open_a_grant(&sock_path, destroyed);
+        retire(destroyed, minimald_rpc::HostIpBoxEnd::Destroyed);
+        assert!(registry.build_grants().lookup(destroyed, "aa").is_none());
+        assert!(registry.row_by_name(&ended.grant_row).is_none());
+        assert!(
+            registry.row_by_name(&kept.grant_row).is_some(),
+            "another box's grant stays"
+        );
+    }
+
+    /// NET-165: a grant that opens after its asker stopped waiting ends at
+    /// once, so no row stands that nobody could close.
+    #[test]
+    fn a_grant_too_late_for_its_asker_opens_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let session_id = boxes::SessionId::mint();
+        let first = open_a_grant(&sock_path, session_id);
+        assert_eq!(first.grant_row, format!("build-{session_id}-1"));
+        let Some(asked_at) =
+            std::time::Instant::now().checked_sub(minimald_rpc::BUILD_GRANT_ASK_DEADLINE)
+        else {
+            return;
+        };
+        let reply = open_build_grant(
+            &registry,
+            &answerer,
+            &Arc::new(ApplyOrder::default()),
+            &dir.path().join("audit.log"),
+            &minimald_rpc::OpenBuildGrantRequest {
+                session_id,
+                spec_hash: "aa".to_string(),
+            },
+            asked_at,
+        );
+        assert!(
+            matches!(reply, BoxControlReply::NoBuildGrant { .. }),
+            "{reply:?}"
+        );
+        assert!(
+            registry
+                .row_by_name(&format!("build-{session_id}-2"))
+                .is_none(),
+            "its row is withdrawn"
+        );
+    }
+
+    /// NET-165: the sweep withdraws a grant's row at its host-side deadline,
+    /// and leaves a grant before it.
+    #[test]
+    fn the_sweep_ends_a_grant_at_its_deadline() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let opened = open_a_grant(&sock_path, boxes::SessionId::mint());
+        let order = Arc::new(ApplyOrder::default());
+        let audit = dir.path().join("audit.log");
+        let now = std::time::Instant::now();
+
+        sweep_grant_deadlines(&registry, &answerer, &order, &audit, now);
+        assert!(registry.row_by_name(&opened.grant_row).is_some());
+
+        let past = crate::build_grants::grant_deadline(now, true);
+        sweep_grant_deadlines(&registry, &answerer, &order, &audit, past);
+        assert!(registry.row_by_name(&opened.grant_row).is_none());
+    }
+
+    /// NET-165: only the host door takes a registration. A guest that names
+    /// a build box's row, a host or an egress rule keeps it out of the
+    /// table, held or not.
+    #[test]
+    fn build_box_row_never_sourced_from_guest() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        for hold in [false, true] {
+            let reply = control(
+                &guest,
+                &BoxControlRequest::Register(RegisterBoxRequest {
+                    name: "build-forged-internet".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: Some(boxes::EgressPolicy {
+                        allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                        allow_dns_hosts: Some(Vec::new()),
+                        allow_protocols: None,
+                        deny_subnets: None,
+                    }),
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold,
+                    task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+                    host_ip: false,
+                    stays_detached: false,
+                }),
+            )
+            .expect("the guest door answers");
+            assert!(
+                matches!(reply, BoxControlReply::Error { .. }),
+                "the guest door refuses a registration: {reply:?}"
+            );
+            assert!(registry.row_by_name("build-forged-internet").is_none());
+        }
+    }
+
     /// A held registration whose client commits keeps its row when the
     /// lease connection closes after the commit: the commit, never the
     /// close, is what keeps a live box's row.
@@ -9011,6 +9610,7 @@ mod tests {
                     hold: false,
                     task_slots: 0,
                     host_ip: false,
+                    stays_detached: false,
                 },
             )
             .expect("the registration is answered"),
@@ -9841,6 +10441,7 @@ mod tests {
             registry.clone(),
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();
@@ -9891,6 +10492,7 @@ mod tests {
             registry.clone(),
             Duration::from_millis(50),
             scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
         )
         .expect("the reconcile thread starts");
         calls
@@ -9904,6 +10506,65 @@ mod tests {
             !registry.holds_host_ip_boxes(),
             "a box the guest no longer lists is forgotten"
         );
+        drop(answers);
+    }
+
+    /// NET-169: a pass whose list no longer names a box withdraws the box's
+    /// requester build row. A box the list names keeps its row.
+    #[test]
+    fn host_ip_reconcile_thread_withdraws_the_row_of_a_box_the_guest_dropped() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+        let registry = BoxRegistry::new(SUBNET);
+        let (gone, live) = (reconcile_session(1), reconcile_session(2));
+        let gone_row = minimald_rpc::requester_build_row_name(gone);
+        let live_row = minimald_rpc::requester_build_row_name(live);
+        for row in [&gone_row, &live_row] {
+            registry
+                .register_build_row(
+                    crate::box_registry::ClientBoxSpec {
+                        name: row.clone(),
+                        ingress_ports: Vec::new(),
+                        egress: None,
+                        credentialed_upstream: None,
+                        dynamic_ingress: None,
+                        dynamic_allowed_range: None,
+                    },
+                    crate::box_registry::BuildRow::Requester,
+                )
+                .expect("the plan has an address for the requester row");
+        }
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let rows = registry.clone();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+            move |name: &str| {
+                rows.withdraw_build_row(name);
+            },
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([(
+                live,
+                boxes::BoxState::Stopped,
+            )])))
+            .expect("the reader waits");
+        let deadline = std::time::Instant::now() + read_timeout;
+        while registry.row_by_name(&gone_row).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the row of the box the guest dropped stayed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(registry.row_by_name(&live_row).is_some());
         drop(answers);
     }
 
@@ -9924,6 +10585,7 @@ mod tests {
             registry.clone(),
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();
@@ -9995,6 +10657,7 @@ mod tests {
             registry.clone(),
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();

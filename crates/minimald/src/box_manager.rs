@@ -1297,6 +1297,7 @@ fn box_listing_entry(
         signal,
         pty_enabled,
         lifetime,
+        build_boxes: crate::build_boxes::running_build_boxes(&record.id.to_string()),
     }
 }
 
@@ -2041,7 +2042,12 @@ impl BoxManager {
         // to a working state. Delete them here rather than let
         // them linger and confuse `min ls` / hold their names
         // hostage.
-        reap_unresumable_records(&store).await?;
+        reap_unresumable_records(
+            &store,
+            minimal_state_dir.as_utf8_path().as_std_path(),
+            &net_switch,
+        )
+        .await?;
 
         // BOX-154: no box process outlives the daemon that launched it, so
         // every record still `running` here has no process left. Set each
@@ -3063,7 +3069,11 @@ async fn live_session_ids(
 /// failure is logged and skipped — a leftover record wastes a
 /// name until it's cleaned up manually but shouldn't block
 /// startup.
-async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(), std::io::Error> {
+async fn reap_unresumable_records(
+    store: &crate::store::StoreHandle,
+    state_dir: &std::path::Path,
+    switch: &Mutex<crate::net::SwitchClient>,
+) -> Result<(), std::io::Error> {
     let handles = store.handles().await?;
     for handle in handles {
         let record = match handle.record().await {
@@ -3088,6 +3098,8 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
             continue;
         }
         let id = *handle.id();
+        // NET-165: the box's build table ends with it.
+        crate::build_boxes::drop_table(state_dir, id, switch).await;
         if let Err(e) = handle.delete().await {
             tracing::warn!(
                 session_id = %id,

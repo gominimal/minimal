@@ -131,6 +131,27 @@ pub fn implicit_default_entry(
     })
 }
 
+impl BoxEntry {
+    /// Why this entry cannot be created, for a refusal that ends with exit
+    /// 3, or `None` when it can (BOX-063, BOX-185). The file's other entries
+    /// stay usable either way.
+    #[must_use]
+    pub fn creation_refusal(&self) -> Option<String> {
+        let name = &self.name;
+        match self.box_type.as_deref()? {
+            box_type @ ("agent" | "service" | "container-build") => Some(format!(
+                "box entry {name} has type {box_type}, which this version of min does not \
+                 create. https://github.com/gominimal/inbox/issues/678 tracks it."
+            )),
+            "build" => Some(format!(
+                "box entry {name} has type build, which min does not create from an entry: \
+                 min expands build boxes from packages."
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// The entry tables of a `minimal.toml`. Every other key is ignored here.
 #[derive(Debug, Default, serde::Deserialize)]
 struct EntryTables {
@@ -450,5 +471,69 @@ mod tests {
         // Valid names at the edges of the rule read.
         let edge = format!("[tasks.{}]\n[tasks.a]\n[tasks.0-9]\n", "z".repeat(63));
         assert_eq!(read_entries(edge.as_bytes()).expect("reads").len(), 3);
+    }
+
+    fn entries(toml: &str) -> Vec<BoxEntry> {
+        read_entries(toml.as_bytes()).expect("the entries read")
+    }
+
+    /// BOX-063: session, task and build entries read and validate.
+    #[test]
+    fn session_and_task_entries_expand_and_validate() {
+        let read = entries(indoc::indoc! {r#"
+            [sessions.dev]
+            [tasks.test]
+            [boxes.builder]
+            type = "build"
+        "#});
+        assert_eq!(read.len(), 3);
+        assert!(
+            read.iter()
+                .filter(|entry| entry.box_type.as_deref() != Some("build"))
+                .all(|entry| entry.creation_refusal().is_none())
+        );
+    }
+
+    /// BOX-063: each deferred type is refused by name, and the entries
+    /// beside it stay usable.
+    #[test]
+    fn other_builtin_type_entry_refused_exit3_other_entries_usable() {
+        let read = entries(indoc::indoc! {r#"
+            [sessions.dev]
+            [agents.helper]
+            [services.db]
+            [boxes.image]
+            type = "container-build"
+        "#});
+        let refusal = |name: &str| {
+            read.iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+                .creation_refusal()
+        };
+        assert_eq!(refusal("dev"), None);
+        assert_eq!(
+            refusal("helper").as_deref(),
+            Some(
+                "box entry helper has type agent, which this version of min does not create. \
+                 https://github.com/gominimal/inbox/issues/678 tracks it."
+            )
+        );
+        assert!(refusal("db").unwrap().contains("type service"));
+        assert!(refusal("image").unwrap().contains("type container-build"));
+    }
+
+    /// BOX-185: a hand-written `build` entry validates, and its creation is
+    /// refused: it names no package to derive from.
+    #[test]
+    fn hand_written_build_entry_validates_and_refuses_creation() {
+        let read = entries("[boxes.builder]\ntype = \"build\"\n");
+        assert_eq!(
+            read[0].creation_refusal().as_deref(),
+            Some(
+                "box entry builder has type build, which min does not create from an entry: \
+                 min expands build boxes from packages."
+            )
+        );
     }
 }

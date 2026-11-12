@@ -404,6 +404,10 @@ pub struct Config {
     /// Synthesize the host's resolver into the sandbox, when no provider
     /// decides the network; a provider's plan names its own.
     pub setup_dns_config: bool,
+    /// Host paths bound read-only at the same path.
+    pub read_only_host_paths: Vec<PathBuf>,
+    /// Host files bound read-only at the given sandbox path.
+    pub read_only_files: Vec<(PathBuf, String)>,
     /// What this sandbox's network looks like when no provider decides it.
     ///
     /// Used only when [`network`](Self::network) is `None`. A caller that has a
@@ -643,6 +647,8 @@ impl Config {
         Self {
             name: name.into(),
             setup_dns_config: true,
+            read_only_host_paths: Vec::new(),
+            read_only_files: Vec::new(),
             plan: NetPlan::host(),
             network: None,
             env_vars: HashMap::with_capacity(12),
@@ -735,6 +741,27 @@ impl Config {
     /// Sets the given environment variable, all invocations will see it unless overridden.
     pub fn with_env_var<S1: Into<String>, S2: Into<String>>(mut self, key: S1, val: S2) -> Self {
         self.env_vars.insert(key.into(), val.into());
+        self
+    }
+
+    /// Binds each host path that exists read-only at the same path. A build
+    /// box's fetch process uses this for the program's libraries and the
+    /// trust roots, and nothing else takes it.
+    #[must_use]
+    pub fn with_read_only_host_paths<I: IntoIterator<Item = PathBuf>>(mut self, paths: I) -> Self {
+        self.read_only_host_paths.extend(paths);
+        self
+    }
+
+    /// Binds the host file `host` read-only at `sandbox_path`.
+    #[must_use]
+    pub fn with_read_only_file<P: Into<PathBuf>, S: Into<String>>(
+        mut self,
+        host: P,
+        sandbox_path: S,
+    ) -> Self {
+        self.read_only_files
+            .push((host.into(), sandbox_path.into()));
         self
     }
 

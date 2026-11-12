@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/8640f85e193d11b8feb1ae64a0d4db287e67f064/specs/networking/deployment-and-egress-gateway.md
 arch_sha: "8640f85e193d11b8feb1ae64a0d4db287e67f064"
-updated: 2026-11-03
+updated: 2026-11-10
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -713,53 +713,127 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-080** WHILE a host-address box is declared deny-all THE SYSTEM SHALL complete the daemon's own registry, cache and control-plane lookups on the same host and record them as node-plane traffic.
   tier:     T0
   verify:   cargo nextest run -p minimald daemon_fetch_survives_cohort_deny
-  <!-- S9b/AC2; prose 50; state-driven; un-enrolled, the node-plane set is NET-130's. The node plane's own lookups are the registry, the cache and the control plane only. A source that a box's package declares, `http`, `https` or `gs://`, is a package build's traffic under NET-155 and never node-plane traffic, and the node-plane record does not list it (`no_source_is_recorded_as_node_plane_traffic`) -->
+  <!-- S9b/AC2; prose 50; state-driven; un-enrolled, the node-plane set is NET-130's. The node plane's own lookups are the registry, the cache and the control plane only. A source a package declares is never node-plane traffic: its fetch runs in a build box (NET-155), and the node-plane record does not list it (`a_source_fetch_is_not_recorded_as_node_plane_traffic`). [#2802](https://github.com/gominimal/minimal/issues/2802) tracks this. -->
 
-- **NET-155** WHEN `minimald` runs a package build for a box that has a classifier leaf THE SYSTEM SHALL run the build in that leaf.
+- **NET-155** WHEN `minimald` runs a package build for a box THE SYSTEM SHALL run the build in a build box, in a network namespace of that build box, and never in the host's or the daemon's network namespace.
   tier:     T0
-  verify:   cargo nextest run -p minimald box_package_build_under_box_egress_verdict
-  - IF `minimald` runs a package build for a box that its launch placed in a classifier leaf and that leaf is missing, THEN THE SYSTEM SHALL refuse the build.
-  - WHEN `minimald` runs a package build for a box that has a classifier leaf and the package declares a web or `gs://` source THE SYSTEM SHALL fetch that source in that leaf.
+  verify:   cargo nextest run -p op box_build_never_gets_the_host_plan
+  verify:   cargo nextest run -p minimald box_package_build_runs_in_a_build_box
+  <!-- event-driven; a build box is a box of the `build` Box Type (BOX-185); the build's sandbox has no route but the build box's own, so the build box's egress decides every connection the build opens, whatever the requesting box's network mode. `mip`, which runs outside any box, keeps its host network plan. A build box that needs no network stays in an empty network namespace (the first sub-requirement). A build box with a network has an address of its own, never the host's. Which rules the build box has is NET-165's and NET-169's. -->
+  - WHILE a package's build steps declare neither `needs.dns` nor `needs.internet`, on the package or in its dependencies, THE SYSTEM SHALL run the build steps in an empty network namespace, even when the build box has a network for its source fetch.
     tier:   T0
-    verify: cargo nextest run -p op web_source_fetch_runs_in_the_given_classifier_leaf
-    verify: cargo nextest run -p op a_gs_source_for_a_box_is_fetched_at_the_boxs_place
-    verify: cargo nextest run -p common a_placed_name_query_leaves_from_the_placement
-  - WHEN `minimald` runs a package build for an own-address box and the download cache lacks a web or `gs://` source the package declares THE SYSTEM SHALL fetch that source on a network of the box's own, under the box's egress rules, and ask that network's name servers for the source's host.
+    verify: cargo nextest run -p op build_that_needs_no_network_stays_in_an_empty_namespace
+    <!-- state-driven; decision 5: a build that needs no network stays hermetic. A dependency's `needs` counts, as `SpecBuild` has always read it. A package that uses the network in its build steps declares it in `needs`, in gominimal/pkgs. A patched build keeps its network and counts as workspace (NET-169). -->
+  - IF a package build for a box needs the network and its build box has no network, or its build box follows the box's rules and those rules do not admit a source's host, THEN THE SYSTEM SHALL refuse the build before its first step and before any packet of it leaves, name the package and the box, and name as the next step the command options and the `minimal.toml` setting that give the box that reach, with the source's host when the build names one.
     tier:   T0
-    verify: cargo nextest run -p minimald --run-ignored all a_placed_fetch_leaves_from_the_held_namespace
-    verify: cargo nextest run -p common a_process_in_the_daemons_namespace_is_no_placement
-  - IF the egress rules of a box do not allow the host of a source its package build fetches, THEN THE SYSTEM SHALL fail the build before anything leaves for that host, its name query included, and name the host, the `--allow-dns-hosts` entry that allows it, and the `minimal.toml` setting that does the same.
-    tier:   T0
-    verify: cargo nextest run -p common a_name_the_rules_do_not_allow_sends_no_query
-    verify: cargo nextest run -p op a_fetch_on_a_closed_network_sends_nothing
-    verify: cargo nextest run -p minimald unreachable_source_names_the_package_and_the_host
+    verify: cargo nextest run -p op build_box_with_no_network_refuses_before_any_packet
+    verify: cargo nextest run -p op source_fetch_runs_in_the_build_box
+    verify: cargo nextest run -p minimald box_package_build_runs_in_a_build_box
+    verify: cargo nextest run -p minimald a_box_refuses_a_source_host_it_does_not_list
     verify: cargo nextest run -p minimald admits_name_answers_as_the_gate_does
-  - WHEN `minimald` runs a package build for a box with no network THE SYSTEM SHALL give the build neither the daemon's network nor the daemon's fetch.
-    tier:   T0
-    verify: cargo nextest run -p minimald box_package_build_under_box_egress_verdict_gives_no_network_box_none
-    verify: cargo nextest run -p op a_fetch_on_a_closed_network_sends_nothing
-  - IF a package build for a box with no network declares that it needs the network, itself or through its closure, THEN THE SYSTEM SHALL refuse the build before it fetches a source, and name the reason and the next step.
-    tier:   T0
-    verify: cargo nextest run -p op a_box_with_no_network_refuses_a_build_that_declares_the_need
     verify: cargo nextest run -p minimald unreachable_source_names_the_package_and_the_host
-  - IF the download of a package's source cannot connect within 15 seconds THEN THE SYSTEM SHALL fail the build and name the package, the host and the reason.
+    <!-- unwanted; a `none` box's workspace build, and a deny-all box's; the name lookup of a source host counts as a packet, so nothing resolves first. Whether the rules admit a host is the answer the box's own name query would get (NET-141): a partial `allow_dns_hosts` list refuses a host it does not name. Rules that admit a host only by `allow_subnets` are decided on the build box's network, so such a failure names the host and the reason, as the next sub-requirements state. The daemon writes the error line for every path that starts a box's build: the box's launch, `min package build`, `min add`, a patched build and `materialize`. A `none` box's next step is `--network host_ip`. A deny-all box's names `--allow-dns-hosts` with the source's host, or with a placeholder when the build names none. Where `--allow-dns-hosts` is the step, the refusal also names the `network.egress.allow_dns_hosts` key in `minimal.toml`. [#2802](https://github.com/gominimal/minimal/issues/2802) asks for this on `gs://` sources first. -->
+  - WHEN a build box needs a declared web source or `gs://` source that the download cache does not hold THE SYSTEM SHALL fetch it in a process inside the build box's network namespace, resolve the source's host name through that namespace's resolver, and check its content hash outside the build box before the build uses it.
+    tier:   T0
+    verify: cargo nextest run -p op source_fetch_runs_in_the_build_box
+    verify: cargo nextest run -p op gs_source_fetches_over_https_in_the_build_box
+    <!-- event-driven; [#2802](https://github.com/gominimal/minimal/issues/2802): every source fetch of a box build runs in its build box. The fetch process is the daemon's own program, run as `__build-fetch` with one URL and one hash; it holds no session data and writes one file. A `gs://bucket/object` source is fetched anonymously from `https://storage.googleapis.com/bucket/object`, and `storage.googleapis.com` is the source's host for rules and display. The name query leaves from the build box, under the build box's rules (NET-141). The download cache and its re-hash on every read stay as they are. -->
+  - IF the fetch of a package's source cannot connect, or its connection does not get an answer within 15 seconds, THEN THE SYSTEM SHALL fail the build without a retry and name the package, the host and the reason.
     tier:   T0
     verify: cargo nextest run -p common a_failed_connect_names_the_host
+    verify: cargo nextest run -p common a_refused_connect_is_not_retried
+    verify: cargo nextest run -p common an_unanswered_connect_is_not_retried
     verify: cargo nextest run -p common an_unplaced_connect_to_a_dropping_address_times_out
+    verify: cargo nextest run -p common a_failed_build_box_fetch_names_the_host
     verify: cargo nextest run -p common a_gs_source_fails_when_no_answer_comes
     verify: cargo nextest run -p common only_the_bounds_timeout_reads_as_no_answer
-    verify: cargo nextest run -p common a_placed_connect_shares_its_bound_across_a_hosts_addresses
-    verify: cargo nextest run -p common a_placed_connect_refused_last_counts_the_unanswered
-    verify: cargo nextest run -p common a_placed_connect_carries_unused_time_to_the_next_address
-    verify: cargo nextest run -p common a_placed_connect_counts_its_lookup_against_the_bound
+    verify: cargo nextest run -p op source_fetch_failure_strips_url_credentials
     verify: cargo nextest run -p minimald unreachable_source_names_the_package_and_the_host
-  - IF the egress rules of a box refuse a connection its package build opened, or a source it fetched, to a host name that `--allow-dns-hosts` can admit, THEN THE SYSTEM SHALL state in the build's error the options of a new session that allow that host, and the `minimal.toml` setting that does the same.
+    <!-- unwanted; [#2802](https://github.com/gominimal/minimal/issues/2802): a source that the rules refuse fails its build in seconds, so a refusal, a name the build box's resolver does not answer, and a connection with no answer are never retried. -->
+  - IF a build box's fetch of a source fails after its connection opened, with a server error status, a 429 status or a body cut off, THEN THE SYSTEM SHALL fetch the source again, at most three more times with a wait that doubles before each, and fail the build with the last attempt's error when no attempt succeeds.
     tier:   T0
-    verify: cargo nextest run -p minimald a_refusal_gives_a_next_step_only_where_it_works
-  - IF the destination is a literal address, THEN THE SYSTEM SHALL state no such options.
+    verify: cargo nextest run -p common a_transient_fetch_failure_is_retried_until_it_succeeds
+    verify: cargo nextest run -p common a_persistent_server_error_gives_up_after_the_retries
+    verify: cargo nextest run -p common a_client_error_or_a_hash_mismatch_is_not_retried
+    <!-- unwanted; the remote cache retries a transient fetch with the same count and backoff (`rcache::DEFAULT_FETCH_RETRIES`). Any other status, and a hash mismatch, fail the first attempt, because another attempt gets the same answer. -->
+  - IF a source's host is a literal address THEN THE SYSTEM SHALL state no command options and no `minimal.toml` setting in the refusal.
     tier:   T0
-    verify: cargo nextest run -p minimald a_refusal_gives_a_next_step_only_where_it_works
-  <!-- event-driven, with unwanted-behaviour sub-requirements; a package build run for a box fetches its declared sources under that box's egress verdict: each connection of the fetch leaves from a socket created in the box's leaf, the name query for the source host leaves from a UDP socket created in the same leaf (`a_placed_name_query_leaves_from_the_placement`), and the download cache and the content-hash check stay as they are (`web_source_fetch_runs_in_the_given_classifier_leaf`). A `gs://` source for a box is read anonymously over `https` from `storage.googleapis.com`, through the same placed download, because the Cloud Storage client opens its connections where it runs. A source fetch is a package build's traffic, never node-plane traffic. A deny-all box whose package declares a source has its build fail, and the error names the source host, the box and the entry; a box allowed that host builds the package (`box_build_web_source_under_box_verdict`); the box's egress verdict then decides every connection the build opens, the same as for the box's own processes (NET-079). A build in a deny leaf that cannot reach a destination outside the box zone fails, and its error names the destination and the box (`box_package_build_refusal_names_destination_and_box`); a box-zone name is not subject to egress rules, so a failure to reach one is reported as the build reported it. The live proofs are `package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table` for the build's own connections and `web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table` for its web-source fetch, run by `just test-root-integration`. A placed box whose leaf is gone, a stopped box among them, never builds in the daemon's cgroup. Scope: this requirement binds a build requested for a box, and a build with no box, such as one `mip` runs, keeps its own traffic. Until build boxes exist, a build runs under the rules of the box that requested it. An own-address box has no classifier leaf. Its build runs on a network of the box's own, at a task address of the box, under the box's egress rules, so its verdict decides the build's connections as well. Its source fetch runs on such a network too: the socket of each connection and of each name query is created in that network's namespace, which a sandbox with no program holds up for the fetch and no longer, so the box's rules are the only limit on a native host as well as in a VM. The fetch uses the network's own name servers, never the daemon's resolver or its `hosts` file. A box whose rules admit no destination gets no such network: its fetch sends nothing, and the download cache still serves it. A partial `allow_dns_hosts` list refuses a host it does not name in the same way, with the answer the box's own name query would get (NET-141). Rules that admit a host only by `allow_subnets` are decided on the box's network, so such a failure names the host and the reason and gives no entry. A box with no network has no leaf and no network to attach to. A build that needs neither a network nor an uncached source runs in an empty namespace, so such a box whose packages are all cached keeps working, and the node plane still fetches its packages under NET-080. A declared need counts through the build closure, as it does for a build's network plan. A host-address box with `host_ip_enforcement = none` has no per-box enforcement. Its build and its source fetches run in the daemon's own cgroup with no per-box enforcement either, and the daemon's build log line says so. -->
+    verify: cargo nextest run -p minimald unreachable_source_names_the_package_and_the_host
+    <!-- unwanted; `--allow-dns-hosts` and `allow_dns_hosts` take a name, so neither admits a literal address. -->
+
+- **NET-165** WHEN `min` creates a box THE SYSTEM SHALL make the box's table outside the box host, holding for each spec hash at the pins in the client's own `minimal.toml` that earns a grant (NET-166) its declared sources and whether its build steps get the internet, and SHALL hand that table to the host-side creator before any process of the box exists.
+  tier:     T0
+  verify:   cargo nextest run -p op build_table_reads_the_pinned_commit_only
+  verify:   cargo nextest run -p op package_with_nothing_to_reach_has_no_entry
+  verify:   cargo nextest run -p minimal a_long_table_files_under_the_request_line_limit
+  verify:   cargo nextest run -p minvmd a_table_files_in_parts
+  verify:   cargo nextest run -p common a_box_builds_for_linux_on_the_hosts_architecture
+  <!-- S10a/AC4; event-driven; the trust root, and architecture line 45 ("Expanded by `min`"): the client reads the pin from the project on the client's own filesystem, evaluates each upstream and sideload at that pin in the client's own checkout, for the target the box builds for and not the client's own, and makes the table from that evaluation. A box's `/workbench` is a copy made at creation (`--sync tarball`), so no box process writes the client's `minimal.toml` or the client's checkout. The table holds every package at the pins, not only what a box declares, because a person can add a package to a running box. A Packages Directory package never enters it. A failure to make or hand over the table stops nothing: the box's builds follow NET-169. On a host with no VM the daemon keeps the table in its own state, which no box reaches, and design §7.4 says that host has no point outside the box host. A box on an enrolled host takes an ordinary authorized creation, and the signed feed carries the rules (design §4.3); until EHE lands no enrolled host runs a build box. -->
+  - WHEN a build for a box needs the network THE SYSTEM SHALL send the host-side creator the build's spec hash and nothing else, find that hash in the box's table on the host side, and give the build box an address of its own with the egress of NET-167 or NET-168.
+    tier:   T0
+    verify: cargo nextest run -p minvmd a_grant_opens_from_the_table_on_a_hash_alone
+    verify: cargo nextest run -p minvmd a_hash_outside_the_table_opens_no_grant
+    verify: cargo nextest run -p minimald install_through_minenv_sock_takes_the_same_lookup
+    <!-- event-driven; the owner's ruling on [arch#167](https://github.com/gominimal/arch/issues/167), rules 2 and 4. The lookup is the same at a box's first launch and for `min add` in a running box, and its output is hardlinked as `install` does. -->
+  - WHERE the host is VM-backed, THE SYSTEM SHALL take a box's table only from the client on the host's control socket, and IF the in-VM daemon names a package, a host or an egress rule for a build box THEN THE SYSTEM SHALL keep it out of the table.
+    tier:   T0
+    verify: cargo nextest run -p minvmd build_box_row_never_sourced_from_guest
+    verify: cargo nextest run -p minvmd a_grant_opens_from_the_table_on_a_hash_alone
+    <!-- S10a/AC4; design §7.6: the helper accepts no rule or pin change from a guest; NET-138's discipline. The guest door refuses `register` and the table's filing. -->
+  - WHEN a grant opens THE SYSTEM SHALL end it at a time limit the host side holds, one hour for a source fetch and six hours for a build with the internet, and WHEN the build ends first THE SYSTEM SHALL end it on the guest's signal, and SHALL never extend a grant on a guest's signal.
+    tier:   T0
+    verify: cargo nextest run -p minvmd a_grant_ends_at_its_deadline_or_earlier
+    <!-- event-driven; the build box's wider reach lasts for one build. Each grant is a row of its own, so the gate holds it to its own hosts. At most 32 grants stand open on one VM, and a build past that follows NET-169. -->
+  - WHEN a box ends THE SYSTEM SHALL end its table, and WHILE the box lives THE SYSTEM SHALL keep its table across a restart of the host-side creator.
+    tier:   T0
+    verify: cargo nextest run -p minvmd a_table_survives_a_restart
+    verify: cargo nextest run -p minvmd a_hash_outside_the_table_opens_no_grant
+    <!-- state+event -->
+
+- **NET-166** THE SYSTEM SHALL give a package a table entry only when it, and every package in its transitive closure, come from an upstream or a sideload at the pin a person set outside the box, and SHALL treat every other package as a workspace package.
+  tier:     T0
+  verify:   cargo nextest run -p op an_origin_earns_grants_only_as_the_predicate_says
+  verify:   cargo nextest run -p op workspace_shadow_of_a_registry_name_is_workspace
+  verify:   cargo nextest run -p op registry_package_over_a_workspace_dep_is_workspace
+  <!-- ubiquitous; the owner decided on 2026-11-06 that an upstream earns grants as long as a person set it outside the box, so no list of trusted registries and no default-branch check applies. A person merging a box's edit to `minimal.toml` counts as a person setting it: the next creation reads that pin. A box cannot change what the next creation reads: `/workbench` is a copy going in, and `min box cp` and `git fetch min://` run only when a person runs them. The origin is the layer that defined the spec (`SpecOrigin::Repo`), never the package's name, so `packages/x/build.ncl` in a workspace shadows a registry name and is a workspace package. A package over a workspace dependency is a workspace package too, because the dependency's code runs in its build. An upstream given as a path is not a pinned commit and is workspace. -->
+  - WHEN a box changes an upstream, a pin or a spec THE SYSTEM SHALL give the builds of the changed specs no grant, and they follow NET-169, however the change reaches the build, `refresh` and `min package patched-build` included.
+    tier:   T0
+    verify: cargo nextest run -p op a_box_editing_its_upstream_gets_no_grant
+    verify: cargo nextest run -p minimald grant_applies_only_to_the_expanded_spec_hash
+    <!-- event-driven; rule 5 of the ruling. The table comes only from the client's file at creation, and the daemon's graph reads `/workbench`, which a box process can write. The spec hash folds in the spec's URLs and hashes and every dependency's hash, so a shadow, a patched dependency or a changed `[upstream]` changes the hash of what it touches, and the lookup finds nothing. It leaves out the origin: a spec that a changed pin leaves identical keeps its hash and its entry after a `refresh`, because it is the spec the person pinned, with the same sources and the same steps. A patched build does not look at all. -->
+
+- **NET-167** WHILE a package with a table entry declares neither `needs.dns` nor `needs.internet`, on the package or in its closure, THE SYSTEM SHALL give its build box the hosts of its declared sources, and the hosts those sources redirect to, as its only egress, for its source fetch only.
+  tier:     T0
+  verify:   cargo nextest run -p op registry_build_box_reaches_only_its_declared_hosts
+  verify:   cargo nextest run -p common source_redirect_hosts_join_the_build_box_egress
+  <!-- state-driven; rule 3 of the ruling: the requesting box's rules do not narrow this, so a deny-all box's registry package still builds, and the box stays deny-all. Only the fetch process (NET-155) runs on this network, and the grant ends when the fetch ends, so a build step never sees it. The redirect hosts are an owner decision of 2026-11-06 that goes beyond rule 3's text, which names declared hosts: a source can redirect, as `github.com` answers `codeload.github.com`. The host-side creator follows each declared source at grant time, reading response heads only, and adds each hop's host, for the fetch only. What it widens: a host the declared source's server names at that time, for one fetch process running the daemon's own code, with the content still bound by the declared hash. A hop at fetch time that the creator did not see is dropped, and the build fails with that host named. A source fetch is never node-plane traffic (NET-078). A host-side mirror is future work: it would serve sources where the build box's fetch runs today, at `BuildBox::fetch`, and then the fetch needs no address. -->
+
+- **NET-168** WHILE a package with a table entry declares `needs.dns` or `needs.internet`, on the package or in its closure, THE SYSTEM SHALL give its build box egress to the internet for its fetch and its build steps.
+  tier:     T0
+  verify:   cargo nextest run -p op registry_needs_internet_build_box_gets_internet
+  <!-- state-driven; rules 3 and 9 of the ruling: `needs.internet` means only that build steps need the internet, and a `needs` through the build closure still counts until the sequence in gominimal/pkgs#1370 ends. The always-on infrastructure deny set (NET-067) still applies. The open internet is the interim of design §7.1 and §8, not the end state: it lasts until per-package host lists replace it (design §12 item 15), and then the build box gets its package's listed hosts instead. The flip is tracked in [gominimal/arch#158](https://github.com/gominimal/arch/issues/158). -->
+
+- **NET-169** WHEN `minimald` runs a build for a box whose spec hash the box's table does not hold THE SYSTEM SHALL give the build box the egress rules of the requesting box, whatever the package's origin.
+  tier:     T0
+  verify:   cargo nextest run -p minimald workspace_build_box_follows_the_requester
+  verify:   cargo nextest run -p minimald install_through_minenv_sock_takes_the_same_lookup
+  <!-- event-driven; rule 5 of the ruling: a package written in the workspace, a patched build, and a spec the box changed take this path. A build a box asks for gets the box's own rules, in a build box, and a `none` box's build gets no network. The rules are the requesting box's effective egress (NET-074). On a VM-backed host the build attaches at a task address of the box (NET-138); a host-address box registers one such row set at activation with its own effective egress, retired with its residency, so its build has an address of its own. Never node-plane identity (NET-078). -->
+  - IF a build box on the requesting box's rules is deny-all or the requesting box's network mode is `none`, and the package needs the network, THEN THE SYSTEM SHALL refuse the build as NET-155 states.
+    tier:   T0
+    verify: cargo nextest run -p minimald workspace_build_refused_in_deny_all_box
+    <!-- unwanted; the refusal names the package, the box, and the next step; the live proof is that no frame of the build reaches the gate -->
+
+- **NET-170** THE SYSTEM SHALL give a build box only the package's declared inputs and dependency outputs, and nothing of the box it builds for.
+  tier:     T0
+  verify:   cargo nextest run -p op build_box_carries_no_session_data
+  <!-- ubiquitous; decision 5: the box's part is its `/workbench`, its session home, its session environment and its session secrets. A build box's inputs are the pinned spec, its build args are the spec's, and its environment is the sandbox's own. A build box has no output channel: after every process of the build stops, `minimald` reads the build's directory and takes only what the output globs select, into the local cache under the spec hash, and hardlinks it as `install` does. -->
+
+- **NET-171** WHILE a build box runs THE SYSTEM SHALL list it in `min box list` as a box of type `build` under its requesting box, and WHEN `min session policy` or `min box show` shows a box THE SYSTEM SHALL show the egress its build boxes hold.
+  tier:     T0
+  verify:   cargo nextest run -p minimal build_box_listed_while_it_runs
+  verify:   cargo nextest run -p minimald a_running_build_box_lists_until_its_build_ends
+  verify:   cargo nextest run -p minimal policy_shows_build_box_egress
+  <!-- state+event; the surface that stays, since a healthy start adds no line before the shell (AGENTS.md). The listing names the package; `min session policy` and `min box show` show what each running build box may reach, and that it is the build box's, not the box's: the box's own rules do not change. Nothing prints on a healthy start. -->
 
 - **NET-081** WHERE the host is VM-backed THE SYSTEM SHALL apply per-box source-addressed egress rules derived from the expanded box specs outside the VM.
   tier:     T0
@@ -929,7 +1003,7 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-085** WHERE the host is VM-backed, IF a process with root inside the VM spoofs another box's address THEN THE SYSTEM SHALL confine its reach to the union of resident boxes' declared egress plus the node-plane baseline set the architecture enumerates in design §5.1.
   tier:     T0
   verify:   cargo nextest run -p minvmd vm_escape_bounded_to_resident_union
-  <!-- S10a/AC4; prose 54; feature+unwanted; the union bound is design §4.3 rule 0 and §8; un-enrolled, the baseline set is NET-130's -->
+  <!-- S10a/AC4; prose 54; feature+unwanted; the union bound is design §4.3 rule 0 and §8; un-enrolled, the baseline set is NET-130's. A running build box is a resident box: its row is host-authored (NET-165), box-plane, and counts in the union for as long as its grant stands. On a VM-backed host the union includes the build box's declared hosts for that fetch, or the internet for a package NET-168 covers, for that build. The cost is the ruling's rule 8: on a one-box host, build boxes run on that host, do not count against UC11's limit, and the host's lifetime follows the one box. The window stays. A later Box Spec key for it stays open. A native host has no point outside the box host (design §7.4), so its bound is the honesty attribute's. Box-plane rules stay under the host's ceiling where one exists (design §4.3 rule 4); the ceiling can only narrow a build box. The baseline does not change. -->
 
 - **NET-132** WHERE the host is VM-backed and runs a node-local Box Egress Proxy THE SYSTEM SHALL deliver a box's connection to the proxy at the proxy's own infrastructure address on the switch, beside the gateway, with the box's own switch address as its source.
   tier:     T0
@@ -1167,11 +1241,11 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-130** WHERE the host is un-enrolled THE SYSTEM SHALL take the node-plane baseline set from the host-side helper's built-in enumeration of the categories design §5.1 names, configurable on the host within those categories.
   tier:     T0
   verify:   cargo nextest run -p minvmd unenrolled_baseline_set_from_helper_enumeration
-  <!-- S9b/AC2, S10a/AC4; design §5.1 (the set is carried in the feed) and §7.1 (no feed un-enrolled); optional-feature; NET-080 and NET-085 presuppose it -->
+  <!-- S9b/AC2, S10a/AC4; design §5.1 (the set is carried in the feed) and §7.1 (no feed un-enrolled); optional-feature; NET-080 and NET-085 presuppose it; the set has no per-box entry and no declared-fetch entry: a package's sources are box-plane reach of its build box (NET-155, NET-165; [arch#167](https://github.com/gominimal/arch/issues/167)) -->
   - THE SYSTEM SHALL keep the daemon's own registry and cache endpoints in the enumeration, configurable as to which registry and never absent.
     tier:   T0
     verify: cargo nextest run -p minvmd baseline_enumeration_always_carries_registry_and_cache
-    <!-- ubiquitous within the WHERE; NET-080's package fetch is node-plane traffic under a deny-all host-address box only because these endpoints are always members -->
+    <!-- ubiquitous within the WHERE; NET-080's cache fetch is node-plane traffic under a deny-all host-address box only because these endpoints are always members -->
   - WHEN a box's effective egress is shown THE SYSTEM SHALL show the baseline set beside it.
     tier:   T0
     verify: cargo nextest run -p minimal policy_shows_baseline_set
@@ -1356,7 +1430,7 @@ answering only loopback addresses was the weaker reading considered.
 local reach evaluated under the box's egress rules, default-deny except
 configured host exposures ([design §7.1][design] local names; the two halves of an
 exposure in design v0.9.2 §7.1, NET-159 to NET-162): a deny-all box
-resolves the name and reaches nothing (NET-079), and the daemon's own package
+resolves the name and reaches nothing (NET-079), and the daemon's own cache
 fetch is node-plane traffic, not the box's (NET-080). Making the host's
 loopback a baseline exception for every box was considered and rejected: it
 would give the shared-namespace lane a reach the box never declared. The name
@@ -1518,6 +1592,13 @@ refusal holds only inside the VM, below the escape boundary.
   host-authored table, and the namespace-bypass seal on every box
   ([design §4.3 rule 0 and §8][design])
   covered by: NET-081, NET-082, NET-083, NET-084, NET-085, NET-130, NET-137, NET-138, NET-139
+- **Invariant:** THE SYSTEM SHALL give a build box more egress than its
+  requesting box only from the table the client made at that box's creation,
+  from the pins a person set outside the box.
+  enforced by: the client-only filing on the host's control socket, a lookup
+  by spec hash alone, and origin-based classing that a workspace name cannot
+  shadow
+  covered by: NET-165, NET-166, NET-167, NET-168, NET-169
 - **Invariant:** THE SYSTEM SHALL present each box to the node-local Box Egress
   Proxy from its own source address, and no other process from a box's.
   enforced by: the relay's source-address check, a proxy leg that keeps the

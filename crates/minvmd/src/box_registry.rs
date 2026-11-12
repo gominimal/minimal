@@ -188,6 +188,17 @@ pub const HOST_IP_IDS_FILE: &str = "box-host-ip-ids.json";
 /// version is set aside and reloads no id, like one that does not parse.
 const HOST_IP_IDS_FILE_VERSION: u32 = 1;
 
+/// The file the registry persists the kind of each build row's creation
+/// to ([`BuildRow`]), by box id, beside [`REGISTRY_FILE`]. A file of its
+/// own, for the same reason as [`HELD_NAMES_FILE`]: a daemon that predates
+/// build rows still reads the registry file, and reads a build row's
+/// creation there as an ordinary box's.
+pub const BUILD_ROWS_FILE: &str = "box-build-rows.json";
+
+/// The persisted build rows' format version. A file of any other version
+/// is set aside and reloads no build row, like one that does not parse.
+const BUILD_ROWS_FILE_VERSION: u32 = 1;
+
 /// How long a hold reloaded from [`HELD_NAMES_FILE`] stands unconfirmed
 /// before it is dropped ([`BoxRegistry::expire_unconfirmed_holds`]). Only
 /// a host client re-makes a hold, over the host's control socket: the
@@ -501,6 +512,10 @@ pub struct BoxRecord {
 struct RowLiveness {
     carriers: usize,
     detached_since: Option<Instant>,
+    /// The row is a host-address box's build row (NET-169): no box attaches
+    /// to it between builds, so no detach grace ends it. The box's retirement
+    /// does ([`BoxRegistry::withdraw_build_row`]).
+    stays_detached: bool,
     /// When its creator reinstated the row, while no relay has carried it
     /// since ([`RESUME_ATTACH_BOUND`]). Never set on a row that stood when
     /// it was resumed.
@@ -629,6 +644,9 @@ impl BoxRecord {
             return None;
         }
         let liveness = self.liveness();
+        if liveness.stays_detached {
+            return None;
+        }
         let past = |since: Option<Instant>, bound| {
             since.filter(|since| now.saturating_duration_since(*since) >= bound)
         };
@@ -637,6 +655,14 @@ impl BoxRecord {
                 .then(|| past(liveness.resumed_since, RESUME_ATTACH_BOUND).map(|_| now))
                 .flatten()
         })
+    }
+
+    /// Holds the row as a build row (NET-169): no detach grace and no resume
+    /// bound ends it.
+    fn hold_as_build_row(&self) {
+        let mut liveness = self.liveness();
+        liveness.stays_detached = true;
+        liveness.resumed_since = None;
     }
 
     fn liveness(&self) -> MutexGuard<'_, RowLiveness> {
@@ -1032,6 +1058,21 @@ pub struct ClientBoxSpec {
     pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 
+/// What a build row is for (NET-165, NET-169). A build row is not a box: no
+/// listing shows it, and no detach grace ends it. The kind persists in
+/// [`BUILD_ROWS_FILE`], so a row reloaded after a restart is still known as
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildRow {
+    /// The row a host-address box's own builds attach under. The box's
+    /// retirement withdraws it ([`BoxRegistry::withdraw_build_row`]).
+    Requester,
+    /// The row of one build grant. Its grant lives only in this process, so
+    /// a reload retires the row ([`BoxRegistry::persisting_to`]).
+    Grant,
+}
+
 /// One client box's creation as the registry keeps it past its row and
 /// persists it ([`BoxRegistry::persisting_to`]): the declaration its
 /// creator registered — never a fact the guest reported (NET-138) — with
@@ -1071,6 +1112,10 @@ struct Creation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     task_addresses: Vec<Ipv4Addr>,
     standing: bool,
+    /// The kind of build row the creation is, when it is one. It persists
+    /// in [`BUILD_ROWS_FILE`], never in the registry file.
+    #[serde(skip)]
+    build_row: Option<BuildRow>,
 }
 
 impl Creation {
@@ -1093,6 +1138,7 @@ impl Creation {
             dynamic_allowed_range: spec.dynamic_allowed_range,
             task_addresses,
             standing: true,
+            build_row: None,
         }
     }
 
@@ -1186,15 +1232,32 @@ struct HostIpIdsFile {
     credentialed: Vec<boxes::BoxId>,
 }
 
+/// The persisted build rows ([`BUILD_ROWS_FILE`]): its format version,
+/// then each build row's box id and kind.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildRowsFile {
+    version: u32,
+    build_rows: Vec<BuildRowEntry>,
+}
+
+/// One build row in [`BuildRowsFile`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildRowEntry {
+    box_id: minimald_rpc::BoxId,
+    kind: BuildRow,
+}
+
 /// Writes `file` to `path` the one way any of the registry's persisted
 /// files — the box registry ([`REGISTRY_FILE`]), its held names
-/// ([`HELD_NAMES_FILE`]) and its `host_ip` ids ([`HOST_IP_IDS_FILE`]) — is
-/// ever written: to a sibling temporary file
+/// ([`HELD_NAMES_FILE`]), its `host_ip` ids ([`HOST_IP_IDS_FILE`]) and its
+/// build rows ([`BUILD_ROWS_FILE`]) — is ever written: to a sibling temporary file
 /// created afresh with mode 0600 — what they hold names this user's boxes
 /// and sessions, which is no other user's to read — synced, then renamed
 /// over `path`, and the directory synced, so a crash at any point leaves
 /// either the old file or the new one, whole, and never a partial one.
-fn write_registry_file(
+pub(crate) fn write_registry_file(
     path: &std::path::Path,
     file: &impl serde::Serialize,
 ) -> std::io::Result<()> {
@@ -1275,7 +1338,10 @@ pub struct PersistedBox {
 /// cannot be read, that does not parse, or that is of another version than
 /// [`REGISTRY_FILE_VERSION`] reads as no boxes, and it is never written,
 /// renamed or set aside. The daemon that owns the file decides what to do
-/// with it on its next start. Each box id is listed once, in file order.
+/// with it on its next start. Each box id is listed once, in file order. A
+/// build row ([`BuildRow`]) is not a box and is not listed: the ids in
+/// [`BUILD_ROWS_FILE`] are left out, and a build rows file that cannot be
+/// used leaves nothing out.
 #[must_use]
 pub fn persisted_box_names(state_dir: &std::path::Path) -> Vec<PersistedBox> {
     #[derive(serde::Deserialize)]
@@ -1293,9 +1359,18 @@ pub fn persisted_box_names(state_dir: &std::path::Path) -> Vec<PersistedBox> {
     let Ok(file) = serde_json_lenient::from_slice::<RegistryFile>(&bytes) else {
         return Vec::new();
     };
+    let build_rows: std::collections::HashSet<minimald_rpc::BoxId> =
+        std::fs::read(state_dir.join(BUILD_ROWS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json_lenient::from_slice::<BuildRowsFile>(&bytes).ok())
+            .filter(|file| file.version == BUILD_ROWS_FILE_VERSION)
+            .map(|file| file.build_rows.into_iter().map(|row| row.box_id).collect())
+            .unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
     file.boxes
         .into_iter()
+        // A build row is not a box (NET-169): no listing shows it.
+        .filter(|creation| !build_rows.contains(&creation.box_id))
         .filter(|creation| seen.insert(creation.box_id))
         .map(|creation| PersistedBox {
             name: creation.name,
@@ -1458,6 +1533,54 @@ fn read_host_ip_ids_file(path: &std::path::Path) -> HostIpIds {
         ),
     }
     HostIpIds::default()
+}
+
+/// Reads the build rows persisted at `path`, each box id's kind: none when
+/// there is no file yet. A file that cannot be read, does not parse, or is
+/// of another version than [`BUILD_ROWS_FILE_VERSION`] reloads no build row
+/// and is renamed aside under the same `.unusable-<unix seconds>` suffix,
+/// said as an error line. Its build rows then reload as ordinary boxes.
+fn read_build_rows_file(path: &std::path::Path) -> BTreeMap<BoxId, BuildRow> {
+    let why = match std::fs::read(path) {
+        Ok(bytes) => match serde_json_lenient::from_slice::<BuildRowsFile>(&bytes) {
+            Ok(file) if file.version == BUILD_ROWS_FILE_VERSION => {
+                return file
+                    .build_rows
+                    .into_iter()
+                    .map(|row| (row.box_id.to_bytes(), row.kind))
+                    .collect();
+            }
+            Ok(file) => format!(
+                "version {}, this build reads {BUILD_ROWS_FILE_VERSION}",
+                file.version
+            ),
+            Err(error) => error.to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => error.to_string(),
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unusable-{stamp}"));
+    let aside = std::path::PathBuf::from(aside);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::error!(
+            path = %path.display(),
+            aside = %aside.display(),
+            why,
+            "the persisted build rows are unusable; they are set aside and reload as boxes"
+        ),
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            why,
+            %error,
+            "the persisted build rows are unusable and could not be set aside; \
+             they reload as boxes and the next change writes over them"
+        ),
+    }
+    BTreeMap::new()
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -3184,6 +3307,8 @@ pub struct BoxRegistry {
     /// this registry persists at all: the supervisor's does, in its VM's
     /// state dir; a test's need not.
     persisted_at: Option<Arc<std::path::PathBuf>>,
+    /// The box tables and the open grants of build boxes (NET-165).
+    build_grants: crate::build_grants::BuildGrants,
     /// Serializes the persisted file's writes, so the last write to land
     /// is of the newest creations, whichever handle wrote it.
     persist_turn: Arc<Mutex<()>>,
@@ -3639,6 +3764,7 @@ impl Clone for BoxRegistry {
             egress_deny_all_opt_out: self.egress_deny_all_opt_out,
             creations: Arc::clone(&self.creations),
             persisted_at: self.persisted_at.clone(),
+            build_grants: self.build_grants.clone(),
             persist_turn: Arc::clone(&self.persist_turn),
             row_epoch: Arc::clone(&self.row_epoch),
             proxy_control: self.proxy_control.clone(),
@@ -3687,6 +3813,7 @@ impl BoxRegistry {
             egress_deny_all_opt_out: false,
             creations: Arc::new(Mutex::new(Creations::default())),
             persisted_at: None,
+            build_grants: crate::build_grants::BuildGrants::default(),
             persist_turn: Arc::new(Mutex::new(())),
             row_epoch: Arc::new(AtomicU64::new(0)),
             proxy_control: None,
@@ -3866,7 +3993,11 @@ impl BoxRegistry {
     /// starts, and the row is withdrawn once the bound passes unless the
     /// box's shuttle carries a frame from its address again. A resume
     /// does not extend that bound; once the row has gone, its creator's
-    /// resume reinstates it ([`Self::resume_client_box`]). A
+    /// resume reinstates it ([`Self::resume_client_box`]). A requester build
+    /// row's creation is reinstated the same way, held until its box retires
+    /// ([`BuildRow`]). A build grant's creation is not reloaded at all: its
+    /// grant ended with the previous process. Which creations are build
+    /// rows, and of which kind, reloads from [`BUILD_ROWS_FILE`]. A
     /// dormant creation stays dormant. The hand-out book takes every
     /// creation's switch and task addresses, dormant ones' included, so a
     /// fresh book hands none of them to a new box; their quarantine is not
@@ -3897,6 +4028,9 @@ impl BoxRegistry {
     /// its release does not keep its name answering NODATA for good.
     #[must_use]
     pub fn persisting_to(mut self, path: std::path::PathBuf) -> Self {
+        self.build_grants = self
+            .build_grants
+            .persisting_to(path.with_file_name(crate::build_grants::BUILD_TABLES_FILE));
         let Some(loaded) = read_registry_file(&path) else {
             return self;
         };
@@ -3919,6 +4053,7 @@ impl BoxRegistry {
             );
             *self.host_ip_id_set() = reloaded;
         }
+        let build_rows = read_build_rows_file(&path.with_file_name(BUILD_ROWS_FILE));
         self.persisted_at = Some(Arc::new(path));
         let mut held_loopbacks = std::collections::BTreeMap::new();
         // The file is in name order, not registration order. A standing
@@ -3929,6 +4064,19 @@ impl BoxRegistry {
         let mut loaded = loaded;
         loaded.sort_by_key(|creation| !creation.standing);
         for mut creation in loaded {
+            creation.build_row = build_rows.get(&creation.id()).copied();
+            // A grant's row outlives its grant only in the file: the grant,
+            // its deadline and its withdrawal lived in the previous process.
+            // Its creation is not reloaded, so no row admits its egress and
+            // none of its addresses stays held, and the write below drops it.
+            if creation.build_row == Some(BuildRow::Grant) {
+                tracing::info!(
+                    row = %creation.name,
+                    "retired a build grant's row left from before this start; its grant \
+                     ended with the previous process"
+                );
+                continue;
+            }
             let key = canonical_box_name(&creation.name);
             // A second creation under a name is a superseded one (BOX-004)
             // when it is dormant: it is kept, resumable by its box id. Two
@@ -4006,6 +4154,10 @@ impl BoxRegistry {
         match self.try_register_since(registration, None, None) {
             Ok(record) => {
                 record.liveness().resumed_since = Some(now);
+                // A build row awaits no frame: its box's retirement ends it.
+                if creation.build_row.is_some() {
+                    record.hold_as_build_row();
+                }
                 tracing::info!(
                     box = %record.name(),
                     switch_addr = %record.switch_addr(),
@@ -4093,6 +4245,30 @@ impl BoxRegistry {
             version: REGISTRY_FILE_VERSION,
             boxes: self.creations().all().cloned().collect(),
         };
+        // The build rows first: a crash between the two writes leaves a
+        // build row the registry file does not hold yet, which reloads
+        // nothing, never a build row reloaded as a box.
+        let build_rows = BuildRowsFile {
+            version: BUILD_ROWS_FILE_VERSION,
+            build_rows: file
+                .boxes
+                .iter()
+                .filter_map(|creation| {
+                    creation.build_row.map(|kind| BuildRowEntry {
+                        box_id: creation.box_id,
+                        kind,
+                    })
+                })
+                .collect(),
+        };
+        let rows_path = path.with_file_name(BUILD_ROWS_FILE);
+        if let Err(error) = write_registry_file(&rows_path, &build_rows) {
+            tracing::warn!(
+                path = %rows_path.display(),
+                %error,
+                "could not persist the build rows; a restart reloads them as boxes"
+            );
+        }
         if let Err(error) = write_registry_file(path, &file) {
             tracing::warn!(
                 path = %path.display(),
@@ -4817,19 +4993,25 @@ impl BoxRegistry {
     /// are best-effort: the draw stops while the book is at
     /// [`TASK_SLOT_FLOOR`], and the box registers with however many it got,
     /// which the row's [`BoxRecord::task_addrs`] says.
+    ///
+    /// `build_row` names the kind of build row the registration is, if it is
+    /// one ([`BuildRow`]): its creation records the kind, and no detach grace
+    /// ends its row.
     pub fn register_client_box_since(
         &self,
         spec: ClientBoxSpec,
         loopback_addr: Ipv4Addr,
         task_slots: u8,
         generation: u64,
+        build_row: Option<BuildRow>,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
-        self.register_client_box_as(
+        self.register_client_box_of_kind(
             spec,
             loopback_addr,
             task_slots,
             crate::bep_attach::mint_box_id(),
             Some(generation),
+            build_row,
         )
     }
 
@@ -4991,6 +5173,20 @@ impl BoxRegistry {
         id: BoxId,
         generation: Option<u64>,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
+        self.register_client_box_of_kind(spec, loopback_addr, task_slots, id, generation, None)
+    }
+
+    /// [`Self::register_client_box_as`] for a registration that is a build
+    /// row of the kind `build_row`, when it is one ([`BuildRow`]).
+    fn register_client_box_of_kind(
+        &self,
+        spec: ClientBoxSpec,
+        loopback_addr: Ipv4Addr,
+        task_slots: u8,
+        id: BoxId,
+        generation: Option<u64>,
+        build_row: Option<BuildRow>,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
         // One id names one box (BEP-070): the check runs before any
         // address is spent, so a refused registration leaves nothing
         // behind — no row, no share, no attachment, no spent address.
@@ -5073,13 +5269,32 @@ impl BoxRegistry {
                  than it asked for"
             );
         }
-        let creation = Creation::new(&spec, switch_addr, loopback_addr, task_addrs.clone(), id);
+        let creation = Creation {
+            build_row,
+            ..Creation::new(&spec, switch_addr, loopback_addr, task_addrs.clone(), id)
+        };
         let registration =
             self.client_registration(spec, switch_addr, loopback_addr, task_addrs.clone(), id);
         // A refusal after the draw publishes no row, so no frame of the box
         // was ever attributed: the addresses go straight back, with no
         // quarantine, and the refusal spends nothing.
         self.try_register_since(registration, generation, Some(creation))
+            .inspect(|record| {
+                if build_row.is_some() {
+                    record.hold_as_build_row();
+                }
+                if build_row == Some(BuildRow::Requester) {
+                    let mut resident = self
+                        .host_ip_boxes
+                        .write()
+                        .expect("the resident host_ip boxes' lock is never held across a panic");
+                    resident.admits += 1;
+                    let admit = resident.admits;
+                    resident
+                        .requester_rows_at
+                        .insert(canonical_box_name(&record.name()), admit);
+                }
+            })
             .inspect_err(|_| {
                 for &addr in std::iter::once(&switch_addr).chain(&task_addrs) {
                     self.give_back_switch_addr(addr, false, id);
@@ -5152,6 +5367,30 @@ impl BoxRegistry {
         let loopback_addr = take_next(&self.next_loopback_addr, first, last)
             .ok_or(AllocationError::LoopbackExhausted)?;
         self.register_client_box_at(spec, loopback_addr)
+    }
+
+    /// [`Self::register_client_box`] for a build row of the kind `kind`
+    /// ([`BuildRow`]), as the control socket registers one.
+    #[cfg(test)]
+    pub(crate) fn register_build_row(
+        &self,
+        spec: ClientBoxSpec,
+        kind: BuildRow,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        let slice = self
+            .loopback_slice
+            .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
+        let (first, last) = box_loopback_run(slice);
+        let loopback_addr = take_next(&self.next_loopback_addr, first, last)
+            .ok_or(AllocationError::LoopbackExhausted)?;
+        self.register_client_box_of_kind(
+            spec,
+            loopback_addr,
+            0,
+            crate::bep_attach::mint_box_id(),
+            None,
+            Some(kind),
+        )
     }
 
     /// [`Self::register_client_box`] with `task_slots` task addresses filed
@@ -5290,6 +5529,67 @@ impl BoxRegistry {
             .values()
             .find(|record| canonical_box_name(&record.name()) == asked)
             .map(|record| record.name().to_string())
+    }
+
+    /// The box tables and the open grants of build boxes (NET-165).
+    pub fn build_grants(&self) -> &crate::build_grants::BuildGrants {
+        &self.build_grants
+    }
+
+    /// Withdraws the row a host-address box's builds attach under, with its
+    /// task rows, when the box retires (NET-169). Only a row registered as a
+    /// build row is one: an ordinary box under the same name is left alone.
+    /// A requester build row's dormant creation ends the same way, and its
+    /// addresses go back. With neither, the withdrawal still counts, under
+    /// the row lock, so a registration of the name in flight cannot land
+    /// after it. Returns the name the row was held under and its switch
+    /// address, when one was withdrawn, for the release of its published
+    /// address.
+    pub fn withdraw_build_row(&self, name: &str) -> Option<(String, Ipv4Addr)> {
+        let (switch_addr, loopback_addr, box_id) = {
+            let rows = self
+                .rows
+                .write()
+                .expect("the row lock is never held across a panic, so it cannot be poisoned");
+            let asked = canonical_box_name(name);
+            let live = rows
+                .values()
+                .filter(|record| {
+                    !record.is_task_row()
+                        && record.liveness().stays_detached
+                        && canonical_box_name(&record.name()) == asked
+                })
+                .max_by_key(|record| record.box_id())
+                .map(|record| (record.switch_addr, record.loopback_addr, record.box_id));
+            let found = live.or_else(|| {
+                self.creations()
+                    .all()
+                    .filter(|creation| {
+                        !creation.standing
+                            && creation.build_row == Some(BuildRow::Requester)
+                            && canonical_box_name(&creation.name) == asked
+                    })
+                    .max_by_key(|creation| creation.id())
+                    .map(|creation| {
+                        (
+                            creation.switch_address,
+                            creation.loopback_address,
+                            creation.id(),
+                        )
+                    })
+            });
+            if found.is_none() {
+                self.bump_withdrawal_generation(name);
+            }
+            found
+        }?;
+        match self.withdraw_client_box_held(name, switch_addr, loopback_addr, Some(box_id)) {
+            Ok((_, held)) => Some((held, switch_addr)),
+            Err(error) => {
+                tracing::warn!(box = %name, ?error, "could not withdraw a box's build row");
+                None
+            }
+        }
     }
 
     /// Withdraws the client box's row when the pair `(name, switch_addr,
@@ -5879,12 +6179,16 @@ impl BoxRegistry {
             creation.task_addresses.clone(),
             creation.id(),
         );
+        let build_row = creation.build_row;
         let standing = Creation {
             standing: true,
             ..creation
         };
         let record = self.try_register_since(registration, Some(generation), Some(standing))?;
         record.liveness().resumed_since = Some(now);
+        if build_row.is_some() {
+            record.hold_as_build_row();
+        }
         tracing::info!(
             box = %record.name(),
             switch_addr = %record.switch_addr(),
@@ -7193,19 +7497,78 @@ impl BoxRegistry {
     }
 
     /// Whether any `host_ip` box's rules are held, resident or set aside,
-    /// or any credentialed id waits for its box's destroy to revoke it: a
-    /// reconcile has nothing to do while this is `false`.
+    /// any credentialed id waits for its box's destroy to revoke it, or any
+    /// requester build row waits for its box's end: a reconcile has nothing
+    /// to do while this is `false`.
     #[must_use]
     pub fn holds_host_ip_boxes(&self) -> bool {
-        let resident = self
-            .host_ip_boxes
-            .read()
-            .expect("the resident host_ip boxes' lock is never held across a panic");
-        if !resident.boxes.is_empty() || !resident.dormant.is_empty() {
-            return true;
+        {
+            let resident = self
+                .host_ip_boxes
+                .read()
+                .expect("the resident host_ip boxes' lock is never held across a panic");
+            if !resident.boxes.is_empty() || !resident.dormant.is_empty() {
+                return true;
+            }
+            // The ids' lock after the resident set's, as on the register path.
+            if !self.host_ip_id_set().credentialed.is_empty() {
+                return true;
+            }
         }
-        // The ids' lock after the resident set's, as on the register path.
-        !self.host_ip_id_set().credentialed.is_empty()
+        self.creations()
+            .all()
+            .any(|creation| creation.build_row == Some(BuildRow::Requester))
+    }
+
+    /// The requester build rows whose box the in-VM daemon no longer lists,
+    /// by name (NET-169). A requester row stands until its box's
+    /// retirement ([`Self::withdraw_build_row`]), and a creator that never
+    /// retires the box would leave it for good. A box the guest's list
+    /// leaves out was destroyed there, so its row is one to withdraw.
+    ///
+    /// `guest` is the in-VM daemon's session list, read after `mark`
+    /// ([`Self::host_ip_admit_mark`]). A box the list names, in any state,
+    /// keeps its row. So does a row registered after the mark: the list can
+    /// predate its box. A row reloaded at a start has no mark, and the
+    /// first list read after the start decides it.
+    ///
+    /// The guest controls its list, so a false absence can end a row whose
+    /// box still runs. That only takes network away from the box's builds,
+    /// as a false absence takes a `host_ip` box's own rules away
+    /// ([`Self::reconcile_host_ip_boxes`]).
+    #[must_use]
+    pub fn requester_rows_without_a_box(
+        &self,
+        guest: &BTreeMap<boxes::SessionId, boxes::BoxState>,
+        mark: HostIpAdmitMark,
+    ) -> Vec<String> {
+        let rows: BTreeMap<String, String> = self
+            .creations()
+            .all()
+            .filter(|creation| creation.build_row == Some(BuildRow::Requester))
+            .map(|creation| (canonical_box_name(&creation.name), creation.name.clone()))
+            .collect();
+        let listed: BTreeSet<String> = guest
+            .keys()
+            .map(|session| canonical_box_name(&minimald_rpc::requester_build_row_name(*session)))
+            .collect();
+        let mut resident = self
+            .host_ip_boxes
+            .write()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        resident
+            .requester_rows_at
+            .retain(|name, _| rows.contains_key(name));
+        rows.into_iter()
+            .filter(|(key, _)| !listed.contains(key))
+            .filter(|(key, _)| {
+                resident
+                    .requester_rows_at
+                    .get(key)
+                    .is_none_or(|admit| *admit <= mark.0)
+            })
+            .map(|(_, name)| name)
+            .collect()
     }
 
     /// Sets the binder the node's mirror binds with ([`MirrorBinder`]):
@@ -8324,6 +8687,11 @@ struct HostIpBoxes {
     /// The admit count at each held box's last client admit, resident or
     /// set aside.
     admitted_at: BTreeMap<boxes::SessionId, u64>,
+    /// The admit count at each requester build row's registration, by the
+    /// row's canonical name ([`BoxRegistry::requester_rows_without_a_box`]).
+    /// A registration counts as an admit, so a session list read before it
+    /// never ends its row.
+    requester_rows_at: BTreeMap<String, u64>,
     /// The record the host-side DNS admission table pins the resident
     /// boxes' declared names under: every resident box's DNS hosts and
     /// allowed subnets, keyed to the node's own address. `None` when no
@@ -9926,6 +10294,262 @@ mod tests {
             vec![(web.switch_addr(), false)],
             "the switch address is back in the book, inside its quarantine"
         );
+    }
+
+    /// NET-169: a host-address box's build row outlives the relays that
+    /// carry its builds, so the box's next build still has it. The box's
+    /// retirement withdraws it, with its task rows.
+    #[test]
+    fn a_build_row_stays_detached_until_its_box_retires() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let row = registry
+            .register_build_row(client_spec("build-1"), BuildRow::Requester)
+            .expect("the plan has an address for the box");
+        relay_carried_and_ended(&registry, &[&row]);
+        wait_until(|| row.is_detached(), "the row detaches at its relay's end");
+
+        registry.advance_clock(DETACH_GRACE);
+        assert!(registry.withdraw_expired_detached().is_empty());
+        assert!(registry.row_by_name("build-1").is_some());
+
+        assert!(registry.withdraw_build_row("build-1").is_some());
+        assert!(registry.row_by_name("build-1").is_none());
+        assert!(registry.withdraw_build_row("build-1").is_none());
+    }
+
+    /// NET-169: a box's retirement withdraws only a build row. An ordinary
+    /// box under the build row's name stays.
+    #[test]
+    fn a_retirement_leaves_an_ordinary_box_under_the_build_rows_name() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry
+            .register_client_box(client_spec("build-1"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw_build_row("build-1").is_none());
+        assert!(registry.row_by_name("build-1").is_some());
+    }
+
+    /// NET-169: a retirement that finds no build row still counts as a
+    /// withdrawal, so a registration of the row in flight cannot land after
+    /// it.
+    #[test]
+    fn a_retirement_refuses_a_build_row_registration_in_flight() {
+        let registry = BoxRegistry::new(SUBNET);
+        let claim = registry.begin_registration("build-1");
+        assert!(registry.withdraw_build_row("build-1").is_none());
+        assert!(
+            registry
+                .register_client_box_since(
+                    client_spec("build-1"),
+                    Ipv4Addr::LOCALHOST,
+                    0,
+                    claim.generation(),
+                    Some(BuildRow::Requester),
+                )
+                .is_err(),
+            "the registration began before the retirement"
+        );
+    }
+
+    /// NET-169: a build row is not a box. A VM's persisted records list its
+    /// boxes and no build row, of either kind.
+    #[test]
+    fn a_build_row_never_appears_in_the_listing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry = persisted_registry(&dir);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        registry
+            .register_build_row(client_spec("build-web"), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+        registry
+            .register_build_row(client_spec("build-web-1"), BuildRow::Grant)
+            .expect("the plan has an address for the grant row");
+        drop(registry);
+
+        assert_eq!(
+            persisted_box_names(dir.path()),
+            vec![PersistedBox {
+                name: "web".to_string(),
+                id: minimald_rpc::BoxId::from_bytes(web.box_id()),
+            }],
+        );
+    }
+
+    /// NET-169: the kind of a build row persists in its own file, never in
+    /// the registry file, which a daemon that predates build rows reads and
+    /// would set aside whole for a field it does not know.
+    #[test]
+    fn the_registry_file_never_holds_a_build_row_kind() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry = persisted_registry(&dir);
+        let requester = registry
+            .register_build_row(client_spec("build-web"), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+        let grant = registry
+            .register_build_row(client_spec("build-web-1"), BuildRow::Grant)
+            .expect("the plan has an address for the grant row");
+        drop(registry);
+
+        let file = std::fs::read_to_string(dir.path().join(REGISTRY_FILE))
+            .expect("the registry file reads");
+        assert!(file.contains("build-web-1"), "both creations persist");
+        assert!(!file.contains("build_row"), "{file}");
+        let rows: BuildRowsFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(BUILD_ROWS_FILE)).expect("the build rows file reads"),
+        )
+        .expect("the build rows file parses");
+        let kinds: BTreeMap<BoxId, BuildRow> = rows
+            .build_rows
+            .into_iter()
+            .map(|row| (row.box_id.to_bytes(), row.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            BTreeMap::from([
+                (requester.box_id(), BuildRow::Requester),
+                (grant.box_id(), BuildRow::Grant),
+            ])
+        );
+    }
+
+    /// NET-165, NET-169: a restart keeps a requester build row as one, so no
+    /// resume bound ends it and its box's retirement still withdraws it. A
+    /// grant's row is not reloaded: its grant ended with the previous
+    /// process, so no row stands for it and its switch address is free.
+    #[test]
+    fn a_restart_keeps_a_requester_row_and_retires_a_grant_row() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let before = persisted_registry(&dir);
+        before
+            .register_build_row(client_spec("build-web"), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+        let grant = before
+            .register_build_row(client_spec("build-web-1"), BuildRow::Grant)
+            .expect("the plan has an address for the grant row");
+        drop(before);
+
+        let after = persisted_registry(&dir);
+        assert!(after.row_by_name("build-web-1").is_none(), "no grant row");
+        assert_eq!(after.live_switch_addrs(), 1, "only the requester row's");
+        let next = after
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for another box");
+        assert_eq!(
+            next.switch_addr(),
+            grant.switch_addr(),
+            "the grant row's address is free again"
+        );
+
+        after.advance_clock(RESUME_ATTACH_BOUND);
+        assert!(after.withdraw_expired_detached().is_empty());
+        assert!(
+            after.row_by_name("build-web").is_some(),
+            "no resume bound ends a requester row"
+        );
+        assert!(after.withdraw_build_row("build-web").is_some());
+        assert!(after.row_by_name("build-web").is_none());
+        drop(after);
+        assert!(
+            persisted_registry(&dir).row_by_name("build-web").is_none(),
+            "the retirement ended its creation too"
+        );
+    }
+
+    /// NET-169: a requester build row's dormant creation ends at its box's
+    /// retirement, and its switch address goes back.
+    #[test]
+    fn a_retirement_ends_a_dormant_requester_creation() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let row = persisted_registry(&dir)
+            .register_build_row(client_spec("build-web"), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+        // The creation as a reload that could not publish its row leaves it.
+        let path = dir.path().join(REGISTRY_FILE);
+        let file = std::fs::read_to_string(&path).expect("the registry file");
+        let dormant = file.replace("\"standing\": true", "\"standing\": false");
+        assert_ne!(dormant, file, "the creation stood");
+        std::fs::write(&path, dormant).expect("write the dormant creation");
+
+        let after = persisted_registry(&dir);
+        assert!(after.row_by_name("build-web").is_none(), "it is dormant");
+        assert_eq!(after.live_switch_addrs(), 1, "its address stays held");
+        assert_eq!(
+            after.withdraw_build_row("build-web"),
+            Some(("build-web".to_string(), row.switch_addr()))
+        );
+        assert_eq!(after.live_switch_addrs(), 0, "its address went back");
+        assert!(after.withdraw_build_row("build-web").is_none(), "it ended");
+    }
+
+    /// NET-169: a requester row whose box the guest no longer lists is one
+    /// to withdraw. A box the guest lists, in any state, keeps its row, and
+    /// so does a row registered after the list's mark.
+    #[test]
+    fn a_requester_row_ends_once_the_guest_no_longer_lists_its_box() {
+        let registry = BoxRegistry::new(SUBNET);
+        let (gone, stopped) = (boxes::SessionId::mint(), boxes::SessionId::mint());
+        let gone_row = minimald_rpc::requester_build_row_name(gone);
+        let stopped_row = minimald_rpc::requester_build_row_name(stopped);
+        for row in [&gone_row, &stopped_row] {
+            registry
+                .register_build_row(client_spec(row), BuildRow::Requester)
+                .expect("the plan has an address for the requester row");
+        }
+        registry
+            .register_build_row(client_spec("build-grant-1"), BuildRow::Grant)
+            .expect("the plan has an address for the grant row");
+        registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.holds_host_ip_boxes(), "a requester row waits");
+
+        let guest = BTreeMap::from([(stopped, boxes::BoxState::Stopped)]);
+        let mark = registry.host_ip_admit_mark();
+        assert_eq!(
+            registry.requester_rows_without_a_box(&guest, mark),
+            vec![gone_row.clone()]
+        );
+
+        let late = boxes::SessionId::mint();
+        let late_row = minimald_rpc::requester_build_row_name(late);
+        registry
+            .register_build_row(client_spec(&late_row), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+        assert_eq!(
+            registry.requester_rows_without_a_box(&guest, mark),
+            vec![gone_row.clone()],
+            "a list read before the late row's registration leaves it"
+        );
+        assert!(registry.withdraw_build_row(&gone_row).is_some());
+        assert_eq!(
+            registry.requester_rows_without_a_box(&guest, registry.host_ip_admit_mark()),
+            vec![late_row],
+            "a list read after it decides it"
+        );
+    }
+
+    /// NET-169: a requester row reloaded at a start has no mark, so the
+    /// first list read after the start decides it.
+    #[test]
+    fn a_reloaded_requester_row_ends_on_the_first_list_without_its_box() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let row = minimald_rpc::requester_build_row_name(boxes::SessionId::mint());
+        persisted_registry(&dir)
+            .register_build_row(client_spec(&row), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+
+        let after = persisted_registry(&dir);
+        assert!(after.holds_host_ip_boxes(), "the reloaded row waits");
+        let mark = after.host_ip_admit_mark();
+        assert_eq!(
+            after.requester_rows_without_a_box(&BTreeMap::new(), mark),
+            vec![row.clone()]
+        );
+        assert!(after.withdraw_build_row(&row).is_some());
+        assert!(!after.holds_host_ip_boxes(), "nothing waits any more");
     }
 
     /// The registry a test persists at `dir`, under its default plan.
@@ -11590,7 +12214,7 @@ mod tests {
         let loopback = old.loopback_addr();
         let waiting = registry.clone();
         let registering = std::thread::spawn(move || {
-            waiting.register_client_box_since(client_spec("web"), loopback, 0, generation)
+            waiting.register_client_box_since(client_spec("web"), loopback, 0, generation, None)
         });
         std::thread::sleep(Duration::from_millis(200));
         // A withdrawal under the name lands while the registration waits,

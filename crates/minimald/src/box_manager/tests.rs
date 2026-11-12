@@ -3324,6 +3324,7 @@ async fn show_returns_record_state_identity_and_live_execs() {
             // A session filed with no spec has a terminal.
             pty_enabled: true,
             lifetime: None,
+            build_boxes: Vec::new(),
         }
     );
     assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);

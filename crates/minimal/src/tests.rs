@@ -8720,6 +8720,7 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         signal: None,
         pty_enabled: true,
         lifetime: None,
+        build_boxes: Vec::new(),
     }
 }
 

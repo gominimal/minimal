@@ -1569,6 +1569,57 @@ pub const SESSION_BOX_TYPE: &str = "session";
 /// The Box Type of a box `min task run` creates (BOX-001).
 pub const TASK_BOX_TYPE: &str = "task";
 
+/// The Box Type of a box `min` expands from a Package Build Spec (BOX-185).
+pub const BUILD_BOX_TYPE: &str = "build";
+
+/// The Box Spec of a box of the `build` type (BOX-185): the part a Package
+/// Build Spec does not choose. Everything but the package, its dependencies,
+/// its parent and its egress is the type's own.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BuildBoxSpec {
+    /// Always [`BUILD_BOX_TYPE`].
+    pub box_type: &'static str,
+    /// The requesting box.
+    pub parent: SessionId,
+    /// The package the box builds.
+    pub package: String,
+    /// The build's declared dependencies.
+    pub packages: Vec<String>,
+    /// A build box has no terminal.
+    pub pty_enabled: bool,
+    /// It ends with its build.
+    pub lifetime: &'static str,
+    /// Nothing runs in it but the build.
+    pub exec_enabled: bool,
+    /// It takes no loadout.
+    pub loadout_mode: &'static str,
+    /// What it may reach, `None` for everything.
+    pub egress: Option<EgressPolicy>,
+}
+
+impl BuildBoxSpec {
+    /// The spec of the build box of `package`, for the box `parent`.
+    #[must_use]
+    pub fn derive(
+        parent: SessionId,
+        package: String,
+        packages: Vec<String>,
+        egress: Option<EgressPolicy>,
+    ) -> Self {
+        Self {
+            box_type: BUILD_BOX_TYPE,
+            parent,
+            package,
+            packages,
+            pty_enabled: false,
+            lifetime: "until_complete",
+            exec_enabled: false,
+            loadout_mode: "sealed",
+            egress,
+        }
+    }
+}
+
 impl Record {
     /// The one state the record is in (BOX-011), read from its `status`
     /// and its stored ending.
@@ -2148,6 +2199,34 @@ pub mod box_name {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BOX-185: everything but the package, its dependencies, its parent and
+    /// its egress is the `build` type's own.
+    #[test]
+    fn build_box_spec_derives_from_the_build_spec() {
+        let parent = SessionId::nil();
+        let egress = EgressPolicy::deny_all();
+        let spec = BuildBoxSpec::derive(
+            parent,
+            "claude-code".to_string(),
+            vec!["nodejs".to_string()],
+            Some(egress.clone()),
+        );
+        assert_eq!(
+            spec,
+            BuildBoxSpec {
+                box_type: "build",
+                parent,
+                package: "claude-code".to_string(),
+                packages: vec!["nodejs".to_string()],
+                pty_enabled: false,
+                lifetime: "until_complete",
+                exec_enabled: false,
+                loadout_mode: "sealed",
+                egress: Some(egress),
+            }
+        );
+    }
 
     /// A clock reading at or behind the last mint millisecond never moves
     /// the mint back: a stale reading, a same-millisecond reading and a

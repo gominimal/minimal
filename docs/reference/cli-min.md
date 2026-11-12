@@ -436,6 +436,12 @@ prefix, or session name). Resolved from the daemon, which answers from the polic
 activation; each rule line shows what the session ended up with, not just
 what was typed.
 
+A `build boxes` block follows while a package builds for the box, with one
+line for each build box and what it can reach. That reach is the build box's,
+not the box's. A build box whose network ended reads `no network`. The
+block is in the text output only: `-o json` has no key for it. See
+[build boxes](./build-specs.md#build-boxes).
+
 The egress block resolves every dimension of the box's `egress` declaration
 to its rule or its default:
 

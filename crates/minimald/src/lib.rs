@@ -8,6 +8,7 @@ mod box_actor;
 mod box_manager;
 pub mod box_ops;
 pub mod box_runtime;
+pub mod build_boxes;
 pub mod channel_progress;
 pub mod connection;
 mod diag;

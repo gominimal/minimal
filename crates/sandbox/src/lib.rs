@@ -301,9 +301,13 @@ impl<C: Channel> Sandbox<C> {
         // into lib64/. Create a usr/lib64 → lib symlink in the rootfs so
         // configure scripts detect it and use usr/lib/ instead. Also create
         // the same symlink in the output directory so DESTDIR installs that
-        // still target lib64/ land in lib/ transparently.
+        // still target lib64/ land in lib/ transparently. A sandbox with no
+        // `usr/` of its own, such as a build box's fetch process, has nothing
+        // to link.
         let usr_lib64 = rootfs.join("usr").join("lib64");
-        if !fs::exists(&usr_lib64).unwrap_or(true) {
+        if fs::exists(rootfs.join("usr")).unwrap_or(false)
+            && !fs::exists(&usr_lib64).unwrap_or(true)
+        {
             std::os::unix::fs::symlink("lib", &usr_lib64)
                 .map_err(|e| Error::IO("create usr/lib64 symlink", usr_lib64, e))?;
         }
@@ -2315,13 +2319,60 @@ impl<C: Channel> Sandbox<C> {
             // replaces them.
         }
 
-        if self.needs_bin_symlink()? {
+        // Read-only host paths: a build box's fetch process runs the daemon's
+        // own program, so it needs that program's libraries and the trust
+        // roots (NET-155). A path that a bind fills is no symlink's to fill.
+        let bound_host_path = |path: &str| {
+            self.config
+                .read_only_host_paths
+                .iter()
+                .any(|bound| bound == Path::new(path) && bound.exists())
+        };
+        for path in &self.config.read_only_host_paths {
+            if !path.exists() {
+                continue;
+            }
+            let in_rootfs = self.rootfs().join(path.strip_prefix("/").unwrap_or(path));
+            if path.parent().is_some_and(|parent| parent != Path::new("/")) {
+                std::fs::create_dir_all(&in_rootfs).map_err(|e| {
+                    Error::IO("creating a read-only bind's target", in_rootfs.clone(), e)
+                })?;
+            }
+            let target = path.to_str().ok_or_else(|| {
+                Error::Execution(ExecutionError::MountError {
+                    msg: "Unable to convert path to unicode string",
+                    path: path.clone(),
+                })
+            })?;
+            Self::bind_mount(
+                path,
+                target,
+                BindOpts {
+                    recursive: true,
+                    read_only: true,
+                },
+                &mut container,
+            )?;
+        }
+        for (host, target) in &self.config.read_only_files {
+            Self::bind_mount(
+                host,
+                target,
+                BindOpts {
+                    recursive: false,
+                    read_only: true,
+                },
+                &mut container,
+            )?;
+        }
+
+        if self.needs_bin_symlink()? && !bound_host_path("/bin") {
             container.symlink("/usr/bin", "/bin");
         }
-        if self.needs_lib64_symlink()? {
+        if self.needs_lib64_symlink()? && !bound_host_path("/lib64") {
             container.symlink("/usr/lib", "/lib64");
         }
-        if self.needs_lib_symlink()? {
+        if self.needs_lib_symlink()? && !bound_host_path("/lib") {
             container.symlink("/usr/lib", "/lib");
         }
 
@@ -3352,201 +3403,6 @@ impl Drop for PlannedLaunch {
             handle.spawn(async move { network.abandon().await });
         }
     }
-}
-
-/// A network namespace on a [`Network`](network::Network), held open with no
-/// program in it. A process of this daemon can create sockets in the
-/// namespace, so they leave on that network and under its rules. Dropping it
-/// ends the namespace and releases the network.
-pub struct HeldNetwork {
-    pid: u32,
-    nameservers: Vec<std::net::Ipv4Addr>,
-    #[cfg(target_os = "linux")]
-    _held: std::sync::Mutex<Held>,
-}
-
-impl std::fmt::Debug for HeldNetwork {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HeldNetwork")
-            .field("pid", &self.pid)
-            .field("nameservers", &self.nameservers)
-            .finish_non_exhaustive()
-    }
-}
-
-impl HeldNetwork {
-    /// The process whose `/proc/<pid>/ns` holds the namespace.
-    #[must_use]
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// The name servers the network's plan names, which answer inside the
-    /// namespace.
-    #[must_use]
-    pub fn nameservers(&self) -> &[std::net::Ipv4Addr] {
-        &self.nameservers
-    }
-}
-
-/// What keeps a [`HeldNetwork`] up. The sandbox's process waits at the start
-/// gate and never runs a program, so its rootfs holds nothing to run.
-#[cfg(target_os = "linux")]
-struct Held {
-    child: hakoniwa::Child,
-    guard: Option<Box<dyn NetGuard>>,
-    _gate: StartGate,
-    _sandbox: Sandbox<()>,
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for Held {
-    fn drop(&mut self) {
-        // Killed before the gate goes, so no program ever starts.
-        end_held(&mut self.child);
-        // `Drop` cannot `await`; with no runtime there is nothing to release to.
-        if let (Some(guard), Ok(handle)) =
-            (self.guard.take(), tokio::runtime::Handle::try_current())
-        {
-            handle.spawn(guard.teardown());
-        }
-    }
-}
-
-/// Ends a held process and reaps it. A process that already exited refuses
-/// the kill, and the wait still reaps it.
-#[cfg(target_os = "linux")]
-fn end_held(child: &mut hakoniwa::Child) {
-    if let Err(e) = child.kill() {
-        tracing::debug!(error = %e, "a held process refused the kill");
-    }
-    if let Err(e) = child.wait() {
-        tracing::warn!(error = %e, "could not reap a held process");
-    }
-}
-
-/// The error for a held process that ended before its network was attached.
-#[cfg(target_os = "linux")]
-fn held_process_ended(status: &hakoniwa::ExitStatus) -> Error {
-    Error::Execution(ExecutionError::InvocationFailed {
-        idx: 0,
-        code: status.code,
-        reason: format!(
-            "the held network's process ended before its attach: {}",
-            status.reason
-        ),
-        stderr: String::new(),
-        stdout: String::new(),
-    })
-}
-
-/// The sandbox a [`HeldNetwork`] runs in. Its rootfs is the bare `usr/` that
-/// [`Sandbox::new`] links `usr/lib64` in.
-#[cfg(target_os = "linux")]
-async fn held_sandbox(
-    base_dir: &Path,
-    network: std::sync::Arc<dyn network::Network>,
-) -> Result<Sandbox<()>, Error> {
-    let rootfs = tempfile::tempdir()
-        .map_err(|e| Error::IO("create held rootfs", base_dir.to_path_buf(), e))?;
-    let usr = rootfs.path().join("usr");
-    fs::create_dir(&usr).map_err(|e| Error::IO("create held rootfs usr", usr, e))?;
-    Config::new("held-network")
-        .with_add_rootfs(config::SandboxMapped::TempDir(rootfs))
-        .with_network(network)
-        .build(base_dir, ())
-        .await
-}
-
-/// Starts a sandbox under `base_dir` that holds `network` up with no program
-/// in it.
-///
-/// # Errors
-///
-/// Propagates a failure to plan, spawn or attach. Nothing stays held.
-#[cfg(target_os = "linux")]
-pub async fn hold_network(
-    base_dir: &Path,
-    network: std::sync::Arc<dyn network::Network>,
-) -> Result<HeldNetwork, Error> {
-    let mut sandbox = held_sandbox(base_dir, network).await?;
-    let planned = sandbox.plan_launch().await?;
-    let nameservers = match planned.plan().resolver() {
-        network::Resolver::Nameservers(nameservers) => nameservers.clone(),
-        _ => Vec::new(),
-    };
-    let mut container = sandbox.new_container(planned.plan())?;
-    let gate = sandbox.hold_start(&mut container)?;
-    let mut cmd = sandbox.command(&container, "/held-network", [""; 0], [("", ""); 0])?;
-    // A held process reads and writes nothing, so its stdio is /dev/null. It
-    // must not take the daemon's terminal: hakoniwa binds a terminal stdout
-    // as the box's console, and a daemon whose stdout is a microVM guest's
-    // console has none it can bind there.
-    let null = || {
-        std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .map(hakoniwa::Stdio::from)
-            .map_err(|e| Error::IO("open the held network's stdio", "/dev/null".into(), e))
-    };
-    cmd.stdin(null()?);
-    cmd.stdout(null()?);
-    cmd.stderr(null()?);
-    let mut child = forker::on_fork_thread(move || cmd.spawn())
-        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
-    let pid = child.id();
-    let spawned = network::Spawned::from_child(&mut child);
-    // A held process waits at its start gate, so one that has ended failed
-    // its own setup. Its exit status says why, and neither the attach's
-    // error nor a later read of its namespace carries that.
-    let guard = match planned.attach(spawned).await {
-        Ok(guard) => {
-            // An attach that touches no namespace succeeds over an ended
-            // process too.
-            if let Ok(Some(status)) = child.try_wait() {
-                end_held(&mut child);
-                return Err(held_process_ended(&status));
-            }
-            guard
-        }
-        Err(e) => {
-            let ended = child.try_wait().ok().flatten();
-            end_held(&mut child);
-            return Err(match ended {
-                Some(status) => held_process_ended(&status),
-                None => e,
-            });
-        }
-    };
-    Ok(HeldNetwork {
-        pid,
-        nameservers,
-        _held: std::sync::Mutex::new(Held {
-            child,
-            guard: Some(guard),
-            _gate: gate,
-            _sandbox: sandbox,
-        }),
-    })
-}
-
-/// Sandboxes run only on Linux, so no network is held anywhere else.
-///
-/// # Errors
-///
-/// Always.
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::unused_async)]
-pub async fn hold_network(
-    base_dir: &Path,
-    _network: std::sync::Arc<dyn network::Network>,
-) -> Result<HeldNetwork, Error> {
-    Err(Error::IO(
-        "holding a network",
-        base_dir.to_path_buf(),
-        std::io::Error::from(std::io::ErrorKind::Unsupported),
-    ))
 }
 
 /// The network plan a sandbox's built-in configuration implies. See
@@ -4999,6 +4855,19 @@ ff02::2\tip6-allrouters
         let base = tmp.path().to_path_buf();
         fs::create_dir_all(base.join("synth").join("usr")).unwrap();
         (tmp, base)
+    }
+
+    /// NET-155: a sandbox with no rootfs of its own, as a build box's fetch
+    /// process has, starts: it has no `usr/` to link inside.
+    #[test]
+    fn sandbox_new_takes_a_rootfs_with_no_usr() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(base.join("synth")).unwrap();
+        let config = Config::new("test-no-usr").with_isolated_wd(std::iter::empty());
+        let sandbox = Sandbox::new(base.clone(), config, ());
+        assert!(sandbox.is_ok(), "{:?}", sandbox.err());
+        assert!(!base.join("rootfs").join("usr").exists());
     }
 
     /// `Sandbox::new` must reject a `SandboxMapped::File` entry in `config.rootfs`
@@ -6951,48 +6820,6 @@ int main(int argc, char **argv) {
             first_mark.exists(),
             "the released program never ran: no mark at {}",
             first_mark.display()
-        );
-    }
-
-    /// A held network builds with no package in its rootfs, holds a namespace
-    /// of its own while it lives, and takes its process with it when dropped.
-    /// Building needs no user namespace, so that part holds on every host.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_held_network_holds_its_namespace_until_dropped() {
-        let name = "held-network";
-        let base_dir = box_base_dir(name);
-        let home = tempfile::tempdir_in(&base_dir)
-            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
-        let rec = std::sync::Arc::new(Recorder::default());
-        held_sandbox(home.path(), rec.clone())
-            .await
-            .expect("building the held sandbox");
-
-        if let Some(reason) = user_namespaces_restriction() {
-            eprintln!(
-                "skipping the rest of a_held_network_holds_its_namespace_until_dropped: \
-                 this host denies the unprivileged user namespace every \
-                 sandbox starts by unsharing: {reason}"
-            );
-            return;
-        }
-
-        let held = hold_network(home.path(), rec.clone())
-            .await
-            .expect("holding the network");
-        let proc_dir = PathBuf::from(format!("/proc/{}", held.pid()));
-        assert_ne!(
-            fs::read_link(proc_dir.join("ns/net")).expect("reading the held namespace"),
-            fs::read_link("/proc/self/ns/net").expect("reading this process's namespace"),
-            "the held process shares this process's network namespace"
-        );
-
-        drop(held);
-        assert!(
-            !proc_dir.exists(),
-            "the held process outlived its handle: {}",
-            proc_dir.display()
         );
     }
 

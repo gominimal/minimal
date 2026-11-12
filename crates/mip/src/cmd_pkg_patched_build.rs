@@ -42,8 +42,7 @@ pub async fn cmd_pkg_patched_build(
         remote_cache: remote_cache.as_ref(),
         // NET-155: a command-line patched build runs for no box, so it
         // stays the caller's own traffic.
-        classifier_leaf: None,
-        box_network: None,
+        build_box: None,
     }
     .run(&op::Options {
         cache,

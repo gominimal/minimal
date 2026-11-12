@@ -1,4 +1,4 @@
-use crate::fetchers::{FetchBackend, FetchUrl, GcsUrl, ReqwestUrl};
+use crate::fetchers::{FetchBackend, GcsUrl, ReqwestUrl};
 use crate::file_cache;
 use crate::file_cache::CachingDownloader;
 use anyhow::Result;
@@ -6,112 +6,10 @@ use google_cloud_storage::client::Storage;
 use ot::OpTracker;
 
 use std::fs::File;
-use std::os::fd::OwnedFd;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 /// How long a download waits for one connection to open.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// The host every `gs://` source is read from: the Google Cloud Storage
-/// client's endpoint. The source's URL names a bucket, not a host.
-const GCS_HOST: &str = "storage.googleapis.com";
-
-/// What a placed download says when the egress rules of its placement do
-/// not allow a host. Nothing leaves for that host, not even a name query.
-pub const RULES_REFUSE: &str = "the egress rules do not allow this host";
-
-/// What a placed download says when its placement has no network at all.
-pub const NO_NETWORK: &str = "the box has no network";
-
-/// The `https` URL of an object in a Cloud Storage bucket, for a placed
-/// download. The download reads it anonymously, as [`RemoteStorage`] reads a
-/// `gs://` source. The object's file name stays the last path segment, so
-/// the download cache keeps one entry for either kind of read.
-pub fn gcs_object_url(bucket: &str, object: &str) -> Result<String> {
-    let mut url = url::Url::parse(&format!("https://{GCS_HOST}/"))?;
-    url.path_segments_mut()
-        .map_err(|()| anyhow::anyhow!("{GCS_HOST} takes no path"))?
-        .pop_if_empty()
-        .push(bucket)
-        .extend(object.split('/'));
-    Ok(url.into())
-}
-
-/// Where a placed download opens its connections (NET-155).
-#[derive(Debug, Clone)]
-pub enum Placement {
-    /// It opens none. Every connection fails with this reason before any
-    /// name is resolved, so nothing leaves.
-    Refused(&'static str),
-    /// In the cgroup whose `cgroup.procs` is this path.
-    Cgroup(PathBuf),
-    /// In a network namespace.
-    Namespace(NetNamespace),
-}
-
-impl std::fmt::Display for Placement {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Refused(why) => write!(f, "nowhere: {why}"),
-            Self::Cgroup(procs) => write!(f, "{}", procs.display()),
-            Self::Namespace(_) => f.write_str("a box's network namespace"),
-        }
-    }
-}
-
-/// A network namespace that a placed download opens its sockets in. The
-/// namespace's name servers answer its name queries, so the daemon's own
-/// resolver and `hosts` file play no part.
-#[derive(Clone)]
-pub struct NetNamespace {
-    /// The user namespace that owns `net`. A process needs it to enter `net`.
-    // Only Linux joins a namespace, so only Linux reads `user` and `net`.
-    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
-    user: Arc<OwnedFd>,
-    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
-    net: Arc<OwnedFd>,
-    nameservers: Vec<std::net::SocketAddr>,
-    /// Whether the namespace's egress rules allow a host name.
-    admits_name: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-}
-
-impl std::fmt::Debug for NetNamespace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NetNamespace")
-            .field("nameservers", &self.nameservers)
-            .finish_non_exhaustive()
-    }
-}
-
-impl NetNamespace {
-    /// The namespaces of the running process `pid`. `nameservers` answer on
-    /// port 53 in the namespace, and `admits_name` says whether its egress
-    /// rules allow a host name. Refuses a process that shares this daemon's
-    /// network namespace, because a socket opened there would leave under no
-    /// rule of the box.
-    pub fn of_process(
-        pid: u32,
-        nameservers: &[std::net::Ipv4Addr],
-        admits_name: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    ) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let open = |ns: &str| -> Result<File> { Ok(File::open(format!("/proc/{pid}/ns/{ns}"))?) };
-        let net = open("net")?;
-        if net.metadata()?.ino() == std::fs::metadata("/proc/self/ns/net")?.ino() {
-            anyhow::bail!("process {pid} shares this daemon's network namespace");
-        }
-        Ok(Self {
-            user: Arc::new(open("user")?.into()),
-            net: Arc::new(net.into()),
-            nameservers: nameservers
-                .iter()
-                .map(|ip| std::net::SocketAddr::from((*ip, 53)))
-                .collect(),
-            admits_name,
-        })
-    }
-}
 
 /// [`Storage`], with a bound on the wait for the first answer to a read. The
 /// client has no connect bound of its own. Rules that drop packets leave each
@@ -179,38 +77,19 @@ impl RemoteStorage {
 
     /// Returns the cached copy of `url`, or downloads it, after the sha256
     /// check.
-    ///
-    /// `placement` is where the download's connections must open, e.g. the
-    /// classifier leaf of the box a build runs for (NET-155). Each connection
-    /// then leaves from a socket created there, so the egress rules of the
-    /// placement decide it. `None` opens the connections in the caller's own
-    /// cgroup. The cache lookup and the content-hash check are the same
-    /// either way.
-    ///
-    /// The host name is asked of the placement's name servers, from a UDP
-    /// socket created in the same place, so those rules decide the name
-    /// query too. A cgroup uses the `nameserver` lines of `/etc/resolv.conf`.
     #[tracing::instrument]
     pub async fn download_web_with_verification_and_caching(
         &self,
         url: &str,
         sha256: &str,
-        placement: Option<&Placement>,
         op: &OpTracker,
     ) -> Result<PathBuf> {
-        if let Some(placement) = placement {
-            return self
-                .download_web_placed(url, sha256, placement, op)
-                .await
-                .map(|(path, _connected)| path);
-        }
         self.download_web_within(CONNECT_TIMEOUT, url, sha256, op)
             .await
     }
 
-    /// [`download_web_with_verification_and_caching`](Self::download_web_with_verification_and_caching)
-    /// without a placement, failing when a connection does not open within
-    /// `bound`.
+    /// [`download_web_with_verification_and_caching`](Self::download_web_with_verification_and_caching),
+    /// failing when a connection does not open within `bound`.
     async fn download_web_within(
         &self,
         bound: std::time::Duration,
@@ -226,9 +105,9 @@ impl RemoteStorage {
         // lookup and TLS included, which is what holds the overall bound.
         // It also passes the bound to hyper-util's connector, which divides
         // it evenly by the number of addresses the name answered
-        // (`ConnectingTcpRemote::new`, hyper-util 0.1.20). Unlike the placed
-        // relay, the connector carries no unused time forward, so an address
-        // after one that refused at once still gets only its even share.
+        // (`ConnectingTcpRemote::new`, hyper-util 0.1.20). The connector
+        // carries no unused time forward, so an address after one that
+        // refused at once still gets only its even share.
         // The client says who it is (inbox#1218): ftp.gnu.org answers a request
         // without a `User-Agent` 403.
         let client = crate::fetchers::web_client_builder()
@@ -244,28 +123,26 @@ impl RemoteStorage {
             })
     }
 
-    /// The cached copy of `url`, if the download cache has one.
-    pub fn cached_web(&self, url: &str, sha256: &str) -> Result<Option<PathBuf>> {
-        let filename = ReqwestUrl::try_from(url)?.filename();
-        Ok(self.cache.read_cached(&filename, sha256)?)
+    /// The cached copy of the source named `filename`, if the cache holds
+    /// one with this hash. In offline mode a miss is an error, as it is for
+    /// a download.
+    pub fn cached(&self, filename: &str, sha256: &str) -> Result<Option<PathBuf>> {
+        let cached = self.cache.read_cached(filename, sha256)?;
+        if cached.is_none() && self.cache.is_offline() {
+            return Err(file_cache::FileCacheError::OfflineCacheMiss {
+                sha256: sha256.to_string(),
+                filename: filename.to_string(),
+            }
+            .into());
+        }
+        Ok(cached)
     }
 
-    /// Returns the cached copy of `url`, or downloads it with every
-    /// connection opened at `placement`, after the sha256 check. It is
-    /// [`download_web_with_verification_and_caching`](Self::download_web_with_verification_and_caching)
-    /// with a placement. It returns the file and whether the download asked
-    /// for a connection. `false` says that the download cache served the
-    /// file and no connection opened.
-    #[tracing::instrument]
-    pub async fn download_web_placed(
-        &self,
-        url: &str,
-        sha256: &str,
-        placement: &Placement,
-        op: &OpTracker,
-    ) -> Result<(PathBuf, bool)> {
-        let download = placed::download(&self.cache, url, sha256, placement, op).await?;
-        Ok((download.path, download.connected))
+    /// Moves the file at `from` into the cache under `filename`, after the
+    /// sha256 check. A build box fetched it (NET-155), so the check here is
+    /// the one the daemon relies on.
+    pub fn adopt(&self, filename: &str, sha256: &str, from: &Path) -> Result<PathBuf> {
+        Ok(self.cache.adopt(filename, sha256, from)?)
     }
 
     #[tracing::instrument]
@@ -343,11 +220,10 @@ fn gcs_failure(e: google_cloud_storage::Error, bound: std::time::Duration) -> an
     }
 }
 
-/// A web download's error, naming the host it could not connect to the way a
-/// placed download's does (NET-155). The URL on the error is the request's
-/// last, so a redirect names the host it sent the download to. `bound` is
-/// the connect timeout the client was built with. Any other error is
-/// unchanged.
+/// A web download's error, naming the host it could not connect to
+/// (NET-155). The URL on the error is the request's last, so a redirect
+/// names the host it sent the download to. `bound` is the connect timeout
+/// the client was built with. Any other error is unchanged.
 fn connect_failure(e: reqwest::Error, bound: std::time::Duration) -> anyhow::Error {
     let target = e
         .url()
@@ -369,1734 +245,206 @@ fn connect_failure(e: reqwest::Error, bound: std::time::Duration) -> anyhow::Err
     }
 }
 
-/// A web download whose connections open at a given placement (NET-155).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PlacedDownload {
-    /// The verified file, which can be the download cache's copy.
-    path: PathBuf,
-    /// The download asked for a connection at the placement. `false` when
-    /// the download cache served the file and no connection opened.
-    connected: bool,
+/// The host every `gs://` source is read from: the Google Cloud Storage
+/// client's endpoint. The source's URL names a bucket, not a host. A build
+/// box fetches from it, and its egress rules name it (NET-155, NET-167).
+pub const GCS_HOST: &str = "storage.googleapis.com";
+
+/// What a build box's fetch says when the egress rules it runs under do not
+/// allow a host. Nothing leaves for that host, not even a name query.
+pub const RULES_REFUSE: &str = "the egress rules do not allow this host";
+
+/// What a build box's fetch says when the box it runs for has no network.
+pub const NO_NETWORK: &str = "the box has no network";
+
+/// The `https` URL of an object in a Cloud Storage bucket, which a build box
+/// fetches anonymously, as [`RemoteStorage`] reads a `gs://` source. The
+/// object's file name stays the last path segment, so the download cache
+/// keeps one entry for either kind of read.
+pub fn gcs_object_url(bucket: &str, object: &str) -> Result<String> {
+    let mut url = url::Url::parse(&format!("https://{GCS_HOST}/"))?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("{GCS_HOST} takes no path"))?
+        .pop_if_empty()
+        .push(bucket)
+        .extend(object.trim_start_matches('/').split('/'));
+    Ok(url.into())
 }
 
-/// Web downloads whose connections open at a given placement (NET-155).
+/// How many redirects of one source [`source_hosts`] follows.
+const MAX_REDIRECTS: usize = 10;
+
+/// How long one redirect probe waits for a response's head.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long [`source_hosts`] follows redirects in all. A build waits on it to
+/// open its grant, and gives up on the answer at 60 seconds.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The hosts a build box's fetch of `sources` reaches (NET-167): each declared
+/// host, and each host those sources redirect to now. This is the one place
+/// that decides what a redirect widens. It reads response heads only. A hop it
+/// cannot reach adds nothing: the fetch then fails and names that host.
+pub async fn source_hosts(sources: &[String]) -> std::collections::BTreeSet<String> {
+    let probe = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(PROBE_TIMEOUT)
+        .build();
+    let mut hosts = std::collections::BTreeSet::new();
+    let started = std::time::Instant::now();
+    for source in sources {
+        let Ok(mut at) = reqwest::Url::parse(source) else {
+            continue;
+        };
+        hosts.extend(at.host_str().map(str::to_ascii_lowercase));
+        let Ok(probe) = &probe else { continue };
+        for _ in 0..MAX_REDIRECTS {
+            if started.elapsed() >= PROBE_BUDGET {
+                break;
+            }
+            let Ok(response) = probe.get(at.clone()).send().await else {
+                break;
+            };
+            let next = response
+                .status()
+                .is_redirection()
+                .then(|| response.headers().get(reqwest::header::LOCATION).cloned())
+                .flatten()
+                .and_then(|location| at.join(location.to_str().ok()?).ok());
+            // Dropping the response closes the connection, so no body is read.
+            drop(response);
+            let Some(next) = next else { break };
+            hosts.extend(next.host_str().map(str::to_ascii_lowercase));
+            at = next;
+        }
+    }
+    hosts
+}
+
+/// How long a build box's fetch waits between two reads of a body.
+const FETCH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many times a build box's fetch retries a transient failure, the first
+/// attempt not counted. It is the remote cache's default
+/// (`rcache::DEFAULT_FETCH_RETRIES`).
+const FETCH_RETRIES: u32 = 3;
+
+/// How long a build box's fetch waits before its first retry. The wait
+/// doubles before each retry after it, as the remote cache's does.
+const FETCH_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Downloads `url` to `out` and checks its sha256 (NET-155). This is the
+/// body of the fetch process inside a build box, so it follows redirects and
+/// resolves names in the namespace it runs in, and it holds no cache.
 ///
-/// A socket belongs to the cgroup and the network namespace of the process
-/// that creates it, not of the process that later connects it. The egress
-/// rules match that cgroup, or sit on that namespace's own network. One
-/// thread of this process cannot join another cgroup alone. So a placed
-/// download sends its requests through a relay on loopback, which reqwest
-/// takes as its proxy. For each connection, the relay has a short-lived child
-/// process join the cgroup or enter the namespace and create the socket, then
-/// connects that socket to the destination itself. TLS stays end to end: an
-/// `https` request reaches the relay as a `CONNECT` tunnel.
-mod placed {
-    use super::*;
-    use crate::fetchers::ReqwestUrl;
-    use anyhow::Context;
-    use std::io;
-    use std::net::{IpAddr, SocketAddr};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, PoisonError};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+/// A failure after the connection opened, a server error or a 429 status,
+/// or a body cut off is retried up to [`FETCH_RETRIES`] times, with a
+/// doubling wait between tries. A connection that is refused or gets no
+/// answer, a name that does not resolve, any other status, and a hash
+/// mismatch fail at once: retrying them gives the same answer later.
+///
+/// # Errors
+///
+/// A connection or read failure, a non-success status, a hash mismatch, or a
+/// failed write of `out`. After retries, the last attempt's error.
+pub async fn fetch_to_file(url: &str, sha256: &str, out: &Path) -> Result<()> {
+    let client = fetch_client(CONNECT_TIMEOUT)?;
+    retrying_transient(FETCH_RETRIES, FETCH_BACKOFF_BASE, || {
+        fetch_once(&client, CONNECT_TIMEOUT, url, sha256, out)
+    })
+    .await
+}
 
-    /// The most bytes of a request head the relay reads before it gives up.
-    const MAX_HEAD: usize = 16 * 1024;
+/// The client of a build box's fetch, whose connections open within `bound`.
+fn fetch_client(bound: std::time::Duration) -> Result<reqwest::Client> {
+    Ok(crate::fetchers::web_client_builder()
+        .connect_timeout(bound)
+        .read_timeout(FETCH_READ_TIMEOUT)
+        .build()?)
+}
 
-    /// Downloads `url` into `cache`, with every connection opened at
-    /// `placement`.
-    pub(super) async fn download(
-        cache: &file_cache::FileCache,
-        url: &str,
-        sha256: &str,
-        placement: &Placement,
-        op: &OpTracker,
-    ) -> Result<PlacedDownload> {
-        let url = ReqwestUrl::try_from(url)?;
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .context("could not open the local relay for a placed download")?;
-        let addr = listener.local_addr()?;
-        // Only this download's client knows the token, so no other process
-        // on the host can open a connection through the relay.
-        let auth = format!("Bearer {}", crate::random_alphanumeric(32));
-        // A namespace resolves names on its own network: the hosts file and
-        // the name servers of this daemon play no part.
-        let (hosts, nameservers) = match placement {
-            Placement::Namespace(namespace) => {
-                (PathBuf::from(NO_HOSTS), Some(namespace.nameservers.clone()))
+/// How one attempt of a build box's fetch failed.
+#[derive(Debug)]
+enum FetchAttempt {
+    /// A failure another attempt may not meet.
+    Transient(anyhow::Error),
+    /// A failure every attempt would meet.
+    Final(anyhow::Error),
+}
+
+/// Runs `once` until it succeeds, fails with [`FetchAttempt::Final`], or has
+/// failed `retries` times more than its first attempt. The wait before a
+/// retry is `backoff`, doubled for each retry before it.
+async fn retrying_transient<Fut>(
+    retries: u32,
+    backoff: std::time::Duration,
+    mut once: impl FnMut() -> Fut,
+) -> Result<()>
+where
+    Fut: std::future::Future<Output = Result<(), FetchAttempt>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match once().await {
+            Ok(()) => return Ok(()),
+            Err(FetchAttempt::Transient(_)) if attempt <= retries => {
+                tokio::time::sleep(backoff * 2u32.pow(attempt - 1)).await;
             }
-            _ => (PathBuf::from(HOSTS), None),
-        };
-        let relay = Arc::new(Relay {
-            placement: placement.clone(),
-            hosts,
-            nameservers,
-            connect_timeout: CONNECT_TIMEOUT,
-            head_timeout: HEAD_TIMEOUT,
-            auth: auth.clone(),
-            failure: Mutex::new(None),
-            asked: AtomicBool::new(false),
-        });
-        let _serving = AbortOnDrop(tokio::spawn(serve(listener, relay.clone())));
-
-        let proxy = reqwest::Proxy::all(format!("http://{addr}"))?
-            .custom_http_auth(reqwest::header::HeaderValue::from_str(&auth)?);
-        // No idle connection is kept, so a plain-HTTP connection to the
-        // relay is never reused for another destination.
-        let client = crate::fetchers::web_client_builder()
-            .proxy(proxy)
-            .pool_max_idle_per_host(0)
-            .build()?;
-        let backend = (&client, cache);
-        let path = backend.download(url, sha256, op).await.map_err(|e| {
-            let e = match e {
-                either::Either::Left(e) => anyhow::Error::from(e),
-                either::Either::Right(e) => anyhow::Error::from(e),
-            };
-            // The relay's own failure says which destination the placed
-            // connection could not reach, which reqwest's error does not.
-            match relay
-                .failure
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-            {
-                Some(failure) => e.context(failure),
-                None => e,
-            }
-        })?;
-        Ok(PlacedDownload {
-            path,
-            connected: relay.asked.load(Ordering::SeqCst),
-        })
-    }
-
-    /// Aborts the relay's accept loop when the download ends.
-    struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-    impl Drop for AbortOnDrop {
-        fn drop(&mut self) {
-            self.0.abort();
+            Err(FetchAttempt::Transient(e) | FetchAttempt::Final(e)) => return Err(e),
         }
     }
+}
 
-    struct Relay {
-        /// Where each connection opens.
-        placement: Placement,
-        /// The `hosts` file the relay reads a host name from before it asks
-        /// a name server.
-        hosts: PathBuf,
-        /// The name servers the relay asks in order, from sockets created at
-        /// the placement. `None` takes the `nameserver` lines of
-        /// `/etc/resolv.conf`.
-        nameservers: Option<Vec<SocketAddr>>,
-        /// How long the relay waits for one connection, across the lookup
-        /// of its host and every address the host answers.
-        connect_timeout: std::time::Duration,
-        /// How long the relay waits for the head of a request, so a client
-        /// that connects and sends nothing does not hold a handler task.
-        head_timeout: std::time::Duration,
-        /// The `Proxy-Authorization` value this download's client sends.
-        auth: String,
-        /// The last destination the relay could not reach, and why. A later
-        /// connection that succeeds clears it, so an error that comes after
-        /// is never blamed on an earlier destination.
-        failure: Mutex<Option<String>>,
-        /// The download's client asked the relay for a connection, so the
-        /// download cache did not serve the file.
-        asked: AtomicBool,
-    }
+/// One attempt of [`fetch_to_file`].
+async fn fetch_once(
+    client: &reqwest::Client,
+    bound: std::time::Duration,
+    url: &str,
+    sha256: &str,
+    out: &Path,
+) -> Result<(), FetchAttempt> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
 
-    async fn serve(listener: TcpListener, relay: Arc<Relay>) {
-        loop {
-            let conn = match listener.accept().await {
-                Ok((conn, _)) => conn,
-                Err(e) => {
-                    tracing::debug!(error = %e, "the relay of a placed download could not accept");
-                    // A lasting error, such as EMFILE, returns at once on
-                    // each call. The pause keeps the loop from spinning.
-                    tokio::time::sleep(ACCEPT_RETRY).await;
-                    continue;
-                }
-            };
-            let relay = relay.clone();
-            tokio::spawn(async move {
-                if let Err(e) = relay.handle(conn).await {
-                    tracing::debug!(error = %e, "a relayed connection of a placed download ended");
-                }
-            });
-        }
-    }
-
-    impl Relay {
-        async fn handle(&self, mut client: TcpStream) -> io::Result<()> {
-            let mut head = Vec::with_capacity(1024);
-            let reading = async {
-                loop {
-                    if let Some(at) = head.windows(4).position(|w| w == b"\r\n\r\n") {
-                        return Ok(Some(at + 4));
-                    }
-                    if head.len() >= MAX_HEAD {
-                        return Err(io::Error::other("the request head is too long"));
-                    }
-                    let mut buf = [0u8; 4096];
-                    let n = client.read(&mut buf).await?;
-                    if n == 0 {
-                        return Ok(None);
-                    }
-                    head.extend_from_slice(&buf[..n]);
-                }
-            };
-            let end = match tokio::time::timeout(self.head_timeout, reading).await {
-                Ok(Ok(Some(end))) => end,
-                Ok(Ok(None)) => return Ok(()),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("no request head after {:?}", self.head_timeout),
-                    ));
-                }
-            };
-            let rest = head.split_off(end);
-            let text = String::from_utf8(head).map_err(io::Error::other)?;
-            let mut lines = text.split("\r\n");
-            let request = lines.next().unwrap_or_default();
-            let headers: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
-            let mut parts = request.split(' ');
-            let method = parts.next().unwrap_or_default();
-            let target = parts.next().unwrap_or_default();
-            let version = parts.next().unwrap_or("HTTP/1.1");
-
-            let is_auth = |line: &str| {
-                line.split_once(':').is_some_and(|(name, _)| {
-                    name.trim().eq_ignore_ascii_case("proxy-authorization")
-                })
-            };
-            let authorized = headers.iter().filter(|line| is_auth(line)).any(|line| {
-                line.split_once(':')
-                    .is_some_and(|(_, v)| v.trim() == self.auth)
-            });
-            if !authorized {
-                client
-                    .write_all(
-                        b"HTTP/1.1 407 Proxy Authentication Required\r\ncontent-length: 0\r\n\r\n",
-                    )
-                    .await?;
-                return Ok(());
-            }
-            self.asked.store(true, Ordering::SeqCst);
-
-            let tunnel = method.eq_ignore_ascii_case("CONNECT");
-            let (host, port, forwarded) = if tunnel {
-                let (host, port) = target
-                    .rsplit_once(':')
-                    .and_then(|(h, p)| Some((h.to_string(), p.parse::<u16>().ok()?)))
-                    .ok_or_else(|| io::Error::other(format!("bad tunnel target {target}")))?;
-                (host, port, None)
-            } else {
-                let url = url::Url::parse(target).map_err(io::Error::other)?;
-                let host = url
-                    .host_str()
-                    .ok_or_else(|| io::Error::other("the request names no host"))?
-                    .to_string();
-                let port = url
-                    .port_or_known_default()
-                    .ok_or_else(|| io::Error::other("the request names no port"))?;
-                // The origin gets the request in origin form, without the
-                // relay's own credential.
-                let mut out = format!(
-                    "{method} {} {version}\r\n",
-                    &url[url::Position::BeforePath..]
-                );
-                for line in headers.iter().filter(|l| !is_auth(l)) {
-                    out.push_str(line);
-                    out.push_str("\r\n");
-                }
-                out.push_str("\r\n");
-                (host, port, Some(out))
-            };
-            let host = host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_string();
-
-            let mut upstream = match self.connect(&host, port).await {
-                Ok(upstream) => {
-                    *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                    upstream
-                }
-                Err(e) => {
-                    let failure = format!("could not connect to {host}:{port}: {e}");
-                    tracing::debug!(placement = %self.placement, "{failure}");
-                    *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(failure);
-                    client
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
-                        .await?;
-                    return Ok(());
-                }
-            };
-            match forwarded {
-                None => {
-                    client
-                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                        .await?;
-                }
-                Some(head) => upstream.write_all(head.as_bytes()).await?,
-            }
-            upstream.write_all(&rest).await?;
-            tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
-            Ok(())
-        }
-
-        /// A connection to `host:port` from a socket created at the placement.
-        async fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
-            // Rules that do not allow a host refuse its name query as well,
-            // so the relay sends none and fails at once.
-            if let Some(why) = refusal(&self.placement, host) {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
-            }
-            let deadline = tokio::time::Instant::now() + self.connect_timeout;
-            let addrs = match host.parse::<std::net::IpAddr>() {
-                Ok(ip) => vec![ip],
-                Err(_) => {
-                    // A missing or unreadable hosts file lists no name, as
-                    // it does for the system resolver.
-                    let text = std::fs::read_to_string(&self.hosts).unwrap_or_default();
-                    let listed = hosts_addresses(&text, host);
-                    if listed.is_empty() {
-                        let nameservers = match &self.nameservers {
-                            Some(nameservers) => nameservers.clone(),
-                            None => system_nameservers()?,
-                        };
-                        let lookup = lookup_placed(&self.placement, &nameservers, host);
-                        match tokio::time::timeout_at(deadline, lookup).await {
-                            Ok(found) => found?,
-                            Err(_) => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    format!("no answer after {:?}", self.connect_timeout),
-                                ));
-                            }
-                        }
-                    } else {
-                        listed
-                    }
-                }
-            };
-            // The last error an address returned, the number of addresses
-            // that gave no answer, and whether the last address tried was
-            // one of them.
-            let mut last = None;
-            let mut unanswered = 0;
-            let mut last_unanswered = false;
-            let mut left = addrs.len();
-            for ip in addrs {
-                // A share of the time left each, so a host that answers many
-                // addresses behind rules that drop packets fails within the
-                // bound and not once per address, and an address that fails
-                // at once leaves its time to the ones after it.
-                let share = deadline.saturating_duration_since(tokio::time::Instant::now())
-                    / u32::try_from(left).unwrap_or(u32::MAX);
-                left -= 1;
-                let addr = SocketAddr::new(ip, port);
-                let placement = self.placement.clone();
-                let socket = tokio::task::spawn_blocking(move || {
-                    placed_socket(&placement, addr.is_ipv6(), SocketKind::Stream)
-                })
-                .await
-                .map_err(io::Error::other)??;
-                let socket = std::net::TcpStream::from(socket);
-                socket.set_nonblocking(true)?;
-                // Rules that drop packets, not reject them, leave a connect
-                // waiting for the kernel's retry limit. The deadline bounds it.
-                let connecting = tokio::net::TcpSocket::from_std_stream(socket).connect(addr);
-                match tokio::time::timeout(share, connecting).await {
-                    Ok(Ok(stream)) => return Ok(stream),
-                    Ok(Err(e)) => {
-                        tracing::debug!("could not connect to {addr}: {e}");
-                        last = Some(e);
-                        last_unanswered = false;
-                    }
-                    Err(_) => {
-                        tracing::debug!("no answer from {addr} after {share:?}");
-                        unanswered += 1;
-                        last_unanswered = true;
-                    }
-                }
-            }
-            if last_unanswered {
-                // The last address waited out the time left, so the whole
-                // bound has passed with no answer.
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("no answer after {:?}", self.connect_timeout),
-                ));
-            }
-            match last {
-                // The last address failed with an error of its own, after
-                // earlier ones gave no answer: report both.
-                Some(e) if unanswered > 0 => {
-                    let others = if unanswered == 1 {
-                        "address"
-                    } else {
-                        "addresses"
-                    };
-                    Err(io::Error::new(
-                        e.kind(),
-                        format!("{e}, after no answer from {unanswered} other {others}"),
-                    ))
-                }
-                Some(e) => Err(e),
-                None => Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("{host} has no address"),
-                )),
-            }
-        }
-    }
-
-    /// Why `placement` opens no connection to `host`, if it opens none. A
-    /// namespace's rules decide a literal address when it connects.
-    fn refusal(placement: &Placement, host: &str) -> Option<&'static str> {
-        match placement {
-            Placement::Refused(why) => Some(why),
-            Placement::Namespace(namespace)
-                if host.parse::<IpAddr>().is_err() && !(namespace.admits_name)(host) =>
-            {
-                Some(RULES_REFUSE)
-            }
-            _ => None,
-        }
-    }
-
-    /// How long the relay waits for one answer from the name server.
-    const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// How long the relay's accept loop waits after `accept` fails.
-    const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
-
-    /// How long the relay waits for the head of a request from its client.
-    const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-    /// The file the relay reads host names from before it asks a name server.
-    const HOSTS: &str = "/etc/hosts";
-
-    /// The empty file a relay reads in place of [`HOSTS`] for a namespace.
-    const NO_HOSTS: &str = "/dev/null";
-
-    /// The `nameserver` lines of `/etc/resolv.conf`, in order, on port 53.
-    fn system_nameservers() -> io::Result<Vec<SocketAddr>> {
-        let text = std::fs::read_to_string("/etc/resolv.conf").map_err(|e| {
-            io::Error::new(e.kind(), format!("could not read /etc/resolv.conf: {e}"))
-        })?;
-        let servers = nameservers(&text);
-        if servers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "/etc/resolv.conf names no name server",
-            ));
-        }
-        Ok(servers)
-    }
-
-    /// The `nameserver` lines in the text of a `resolv.conf`, in order, on
-    /// port 53.
-    fn nameservers(text: &str) -> Vec<SocketAddr> {
-        resolv_conf::Config::parse(text)
-            .map(|conf| {
-                conf.nameservers
-                    .iter()
-                    .map(|ip| SocketAddr::new(ip.into(), 53))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The addresses that the text of a `hosts` file gives `host`. A source
-    /// URL names a full host, so no search domain applies.
-    fn hosts_addresses(text: &str, host: &str) -> Vec<IpAddr> {
-        let host = host.trim_end_matches('.');
-        text.lines()
-            .filter_map(|line| {
-                let line = line.split('#').next().unwrap_or_default();
-                let mut fields = line.split_whitespace();
-                let ip: IpAddr = fields.next()?.parse().ok()?;
-                fields
-                    .any(|name| name.trim_end_matches('.').eq_ignore_ascii_case(host))
-                    .then_some(ip)
-            })
-            .collect()
-    }
-
-    /// The addresses of `host`: its A and AAAA records, asked of each of
-    /// `nameservers` in order until one answers, from sockets created at
-    /// `placement`. So the egress rules of the placement decide the query as
-    /// well as the connection (NET-155).
-    async fn lookup_placed(
-        placement: &Placement,
-        nameservers: &[SocketAddr],
-        host: &str,
-    ) -> io::Result<Vec<IpAddr>> {
-        let mut last = None;
-        for &server in nameservers {
-            match lookup_at(placement, server, host).await {
-                Lookup::Found(addrs) => return Ok(addrs),
-                Lookup::Answered(e) => return Err(e),
-                Lookup::Unanswered(e) => {
-                    tracing::debug!(%server, error = %e, "a name server gave no answer; the next one is asked");
-                    last = Some(e);
-                }
-            }
-        }
-        Err(last
-            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no name server to ask")))
-    }
-
-    /// What one name server said about a host.
-    enum Lookup {
-        /// The host's addresses.
-        Found(Vec<IpAddr>),
-        /// The server answered that the host has no address.
-        Answered(io::Error),
-        /// The server gave no usable answer, so the next one is asked.
-        Unanswered(io::Error),
-    }
-
-    /// Asks `server` for the A and AAAA records of `host`, over UDP, and
-    /// again over TCP for an answer that came back truncated.
-    async fn lookup_at(placement: &Placement, server: SocketAddr, host: &str) -> Lookup {
-        use hickory_proto::op::ResponseCode;
-        use hickory_proto::rr::RecordType;
-
-        let socket = match placed_udp(placement, server).await {
-            Ok(socket) => socket,
-            Err(e) => return Lookup::Unanswered(e),
-        };
-        let mut addrs = Vec::new();
-        let mut answered = false;
-        let mut no_such_name = None;
-        let mut last = None;
-        for rtype in [RecordType::A, RecordType::AAAA] {
-            let reply = match ask(&socket, placement, server, host, rtype).await {
-                Ok(reply) => reply,
-                Err(e) => {
-                    last = Some(e);
-                    continue;
-                }
-            };
-            match reply.metadata.response_code {
-                ResponseCode::NoError => {
-                    answered = true;
-                    addrs.extend(addresses(&reply));
-                }
-                code @ ResponseCode::NXDomain => {
-                    answered = true;
-                    no_such_name = Some(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("could not resolve {host}: {code}"),
-                    ));
-                }
-                code => {
-                    last = Some(io::Error::other(format!(
-                        "the name server {server} could not resolve {host}: {code}"
-                    )))
-                }
-            }
-        }
-        if !addrs.is_empty() {
-            Lookup::Found(addrs)
-        } else if answered {
-            Lookup::Answered(no_such_name.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address"))
-            }))
+    let fail = |e: anyhow::Error| FetchAttempt::Final(e);
+    let response = client.get(url).send().await.map_err(|e| {
+        // A connect failure covers a refusal, no answer within `bound`, and
+        // a name the namespace's resolver does not answer, the rules'
+        // refusal included. A bad URL or a redirect loop stays bad.
+        if e.is_connect() || e.is_builder() || e.is_redirect() {
+            FetchAttempt::Final(connect_failure(e, bound))
         } else {
-            Lookup::Unanswered(last.unwrap_or_else(|| {
-                io::Error::other(format!("the name server {server} did not answer"))
-            }))
+            FetchAttempt::Transient(e.into())
         }
-    }
-
-    /// A UDP socket created at the placement and connected to `server`.
-    async fn placed_udp(
-        placement: &Placement,
-        server: SocketAddr,
-    ) -> io::Result<tokio::net::UdpSocket> {
-        let placement = placement.clone();
-        let socket = tokio::task::spawn_blocking(move || {
-            placed_socket(&placement, server.is_ipv6(), SocketKind::Datagram)
-        })
+    })?;
+    let status = response.status();
+    let mut response = response.error_for_status().map_err(|e| {
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            FetchAttempt::Transient(e.into())
+        } else {
+            FetchAttempt::Final(e.into())
+        }
+    })?;
+    let mut file = File::create(out).map_err(|e| fail(e.into()))?;
+    let mut hasher = Sha256::new();
+    // A read that fails is a connection reset or a body cut off.
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(io::Error::other)??;
-        let socket = std::net::UdpSocket::from(socket);
-        socket.set_nonblocking(true)?;
-        let socket = tokio::net::UdpSocket::from_std(socket)?;
-        socket.connect(server).await.map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("could not reach the name server {server}: {e}"),
-            )
-        })?;
-        Ok(socket)
+        .map_err(|e| FetchAttempt::Transient(e.into()))?
+    {
+        hasher.update(&chunk);
+        file.write_all(&chunk).map_err(|e| fail(e.into()))?;
     }
-
-    /// A query for the `rtype` records of `host`: its id and its bytes.
-    fn query(host: &str, rtype: hickory_proto::rr::RecordType) -> io::Result<(u16, Vec<u8>)> {
-        use hickory_proto::op::{Message, Query};
-        use hickory_proto::rr::Name;
-
-        let name = Name::from_utf8(format!("{}.", host.trim_end_matches('.')))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{host}: {e}")))?;
-        let id: u16 = rand::random();
-        let mut query = Message::query();
-        query.metadata.id = id;
-        query.metadata.recursion_desired = true;
-        query.add_query(Query::query(name, rtype));
-        Ok((id, query.to_vec().map_err(io::Error::other)?))
+    file.sync_all().map_err(|e| fail(e.into()))?;
+    let got = hex::encode(hasher.finalize());
+    if got != sha256 {
+        return Err(fail(anyhow::anyhow!(
+            "the hash is {got}, and {sha256} was declared"
+        )));
     }
-
-    /// The answer to the query `id`, if `bytes` carry it. Any other message
-    /// is not trusted.
-    fn reply_to(id: u16, bytes: &[u8]) -> Option<hickory_proto::op::Message> {
-        use hickory_proto::op::{Message, MessageType};
-        Message::from_vec(bytes).ok().filter(|reply| {
-            reply.metadata.id == id && reply.metadata.message_type == MessageType::Response
-        })
-    }
-
-    /// The addresses an answer carries.
-    fn addresses(reply: &hickory_proto::op::Message) -> Vec<IpAddr> {
-        use hickory_proto::rr::RData;
-        reply
-            .answers
-            .iter()
-            .filter_map(|record| match &record.data {
-                RData::A(a) => Some(IpAddr::V4(a.0)),
-                RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Sends one query for `host` on the connected UDP `socket` and returns
-    /// the answer. An answer with the TC bit set is asked again over TCP,
-    /// from a stream socket created at the placement.
-    async fn ask(
-        socket: &tokio::net::UdpSocket,
-        placement: &Placement,
-        server: SocketAddr,
-        host: &str,
-        rtype: hickory_proto::rr::RecordType,
-    ) -> io::Result<hickory_proto::op::Message> {
-        let (id, bytes) = query(host, rtype)?;
-        socket.send(&bytes).await?;
-        let mut buf = vec![0u8; 4096];
-        let reply = tokio::time::timeout(LOOKUP_TIMEOUT, async {
-            loop {
-                let n = socket.recv(&mut buf).await?;
-                if let Some(reply) = reply_to(id, &buf[..n]) {
-                    return Ok::<_, io::Error>(reply);
-                }
-            }
-        })
-        .await
-        .map_err(|_| no_answer(server, host))??;
-        if !reply.metadata.truncation {
-            return Ok(reply);
-        }
-        tracing::debug!(%server, host, "a truncated name answer is asked again over TCP");
-        ask_tcp(placement, server, host, rtype).await
-    }
-
-    /// Sends one query for `host` to `server` over TCP, from a stream socket
-    /// created at the placement, and returns the answer.
-    async fn ask_tcp(
-        placement: &Placement,
-        server: SocketAddr,
-        host: &str,
-        rtype: hickory_proto::rr::RecordType,
-    ) -> io::Result<hickory_proto::op::Message> {
-        let (id, bytes) = query(host, rtype)?;
-        let owned = placement.clone();
-        let socket = tokio::task::spawn_blocking(move || {
-            placed_socket(&owned, server.is_ipv6(), SocketKind::Stream)
-        })
-        .await
-        .map_err(io::Error::other)??;
-        let socket = std::net::TcpStream::from(socket);
-        socket.set_nonblocking(true)?;
-        tokio::time::timeout(LOOKUP_TIMEOUT, async {
-            let mut stream = tokio::net::TcpSocket::from_std_stream(socket)
-                .connect(server)
-                .await?;
-            let len = u16::try_from(bytes.len()).map_err(io::Error::other)?;
-            let mut framed = len.to_be_bytes().to_vec();
-            framed.extend_from_slice(&bytes);
-            stream.write_all(&framed).await?;
-            loop {
-                let mut len = [0u8; 2];
-                stream.read_exact(&mut len).await?;
-                let mut buf = vec![0u8; usize::from(u16::from_be_bytes(len))];
-                stream.read_exact(&mut buf).await?;
-                if let Some(reply) = reply_to(id, &buf) {
-                    return Ok(reply);
-                }
-            }
-        })
-        .await
-        .map_err(|_| no_answer(server, host))?
-    }
-
-    fn no_answer(server: SocketAddr, host: &str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("the name server {server} did not answer for {host}"),
-        )
-    }
-
-    /// The kind of socket a child makes at a placement.
-    #[derive(Debug, Clone, Copy)]
-    enum SocketKind {
-        /// A TCP socket, for a connection.
-        Stream,
-        /// A UDP socket, for a name query.
-        Datagram,
-    }
-
-    /// What the child that makes a socket does first, on descriptors the
-    /// parent opened for it.
-    #[cfg(target_os = "linux")]
-    #[derive(Debug, Clone, Copy)]
-    enum Join {
-        /// Write itself into this `cgroup.procs`.
-        Cgroup(libc::c_int),
-        /// Enter this user namespace, then this network namespace.
-        Namespace(libc::c_int, libc::c_int),
-    }
-
-    /// A socket that a child process created after it joined the placement,
-    /// so the socket belongs to the placement's cgroup or namespace.
-    #[cfg(target_os = "linux")]
-    fn placed_socket(
-        placement: &Placement,
-        v6: bool,
-        kind: SocketKind,
-    ) -> io::Result<std::os::fd::OwnedFd> {
-        use std::os::fd::AsRawFd;
-
-        // Open until the fork, which hands the child the descriptor.
-        let procs_file;
-        let join = match placement {
-            Placement::Refused(why) => {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, *why));
-            }
-            Placement::Cgroup(procs) => {
-                procs_file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(procs)
-                    .map_err(|e| {
-                        io::Error::new(e.kind(), format!("could not open {}: {e}", procs.display()))
-                    })?;
-                Join::Cgroup(procs_file.as_raw_fd())
-            }
-            Placement::Namespace(namespace) => {
-                Join::Namespace(namespace.user.as_raw_fd(), namespace.net.as_raw_fd())
-            }
-        };
-        let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
-        let domain = if v6 { libc::AF_INET6 } else { libc::AF_INET };
-        let ty = match kind {
-            SocketKind::Stream => libc::SOCK_STREAM,
-            SocketKind::Datagram => libc::SOCK_DGRAM,
-        };
-        let theirs_fd = theirs.as_raw_fd();
-        // SAFETY: the child calls only async-signal-safe functions (`write`,
-        // `setns`, `socket`, `sendmsg`, `_exit`) on memory it owns, so the locks other
-        // threads of this process held at the fork never matter to it.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if pid == 0 {
-            // SAFETY: see above. The child never returns.
-            unsafe { socket_child(join, theirs_fd, domain, ty) }
-        }
-        drop(theirs);
-        let received = receive_socket(&ours);
-        let mut status = 0;
-        // SAFETY: `pid` is the child this call forked, reaped exactly once.
-        while unsafe { libc::waitpid(pid, &mut status, 0) } < 0
-            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-        {}
-        match received? {
-            Report::Socket(fd) => Ok(fd),
-            Report::Join(errno) => Err(io::Error::new(
-                io::Error::from_raw_os_error(errno).kind(),
-                format!(
-                    "could not move a process into {placement}: {}",
-                    io::Error::from_raw_os_error(errno)
-                ),
-            )),
-            Report::Create(errno) => Err(io::Error::from_raw_os_error(errno)),
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn placed_socket(
-        _placement: &Placement,
-        _v6: bool,
-        _kind: SocketKind,
-    ) -> io::Result<std::os::fd::OwnedFd> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "a placed download runs only on Linux",
-        ))
-    }
-
-    /// What the child process that creates a placed socket reports.
-    #[cfg(target_os = "linux")]
-    enum Report {
-        Socket(std::os::fd::OwnedFd),
-        /// The child could not join the placement: the errno.
-        Join(i32),
-        /// The child could not create the socket: the errno.
-        Create(i32),
-    }
-
-    /// The child's report: one step byte (0 done, 1 join, 2 create) and an
-    /// errno, little-endian.
-    #[cfg(target_os = "linux")]
-    const REPORT_LEN: usize = 5;
-
-    /// The forked child: joins the placement, creates the socket, sends it
-    /// to the parent over `out`, and exits.
-    ///
-    /// # Safety
-    ///
-    /// Call only in the child of a `fork`. It never returns.
-    #[cfg(target_os = "linux")]
-    unsafe fn socket_child(
-        join: Join,
-        out: libc::c_int,
-        domain: libc::c_int,
-        ty: libc::c_int,
-    ) -> ! {
-        // SAFETY: plain syscalls on descriptors the parent opened for the
-        // child, and on stack memory; no allocation, no lock.
-        unsafe {
-            let mut report = [0u8; REPORT_LEN];
-            let mut fd = -1;
-            let joined = match join {
-                Join::Cgroup(procs) => libc::write(procs, b"0".as_ptr().cast(), 1) == 1,
-                Join::Namespace(user, net) => {
-                    libc::setns(user, libc::CLONE_NEWUSER) == 0
-                        && libc::setns(net, libc::CLONE_NEWNET) == 0
-                }
-            };
-            if !joined {
-                report[0] = 1;
-                report[1..].copy_from_slice(&(*libc::__errno_location()).to_le_bytes());
-            } else {
-                fd = libc::socket(domain, ty | libc::SOCK_CLOEXEC, 0);
-                if fd < 0 {
-                    report[0] = 2;
-                    report[1..].copy_from_slice(&(*libc::__errno_location()).to_le_bytes());
-                }
-            }
-            let mut iov = libc::iovec {
-                iov_base: report.as_mut_ptr().cast(),
-                iov_len: report.len(),
-            };
-            let mut control = [0u64; 4];
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            if fd >= 0 {
-                msg.msg_control = control.as_mut_ptr().cast();
-                msg.msg_controllen = libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as _;
-                let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                (*cmsg).cmsg_level = libc::SOL_SOCKET;
-                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as _;
-                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), fd);
-            }
-            libc::sendmsg(out, &msg, 0);
-            libc::_exit(0)
-        }
-    }
-
-    /// Reads the child's report, and the socket it sent with it.
-    #[cfg(target_os = "linux")]
-    fn receive_socket(sock: &std::os::unix::net::UnixStream) -> io::Result<Report> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-        let mut report = [0u8; REPORT_LEN];
-        let mut iov = libc::iovec {
-            iov_base: report.as_mut_ptr().cast(),
-            iov_len: report.len(),
-        };
-        let mut control = [0u64; 4];
-        // SAFETY: a zeroed `msghdr` is valid; the pointers set next outlive
-        // the `recvmsg` call that reads them.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = size_of_val(&control) as _;
-        let n = loop {
-            // SAFETY: `msg` points at live buffers of the lengths it names.
-            let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            break n;
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut socket = None;
-        // SAFETY: the kernel filled `control` and set `msg_controllen`; the
-        // macros walk only within it.
-        unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                    let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>());
-                    socket = Some(OwnedFd::from_raw_fd(fd));
-                }
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-            }
-        }
-        if n as usize != REPORT_LEN {
-            return Err(io::Error::other(
-                "the process that creates a placed socket exited without a report",
-            ));
-        }
-        let errno = i32::from_le_bytes([report[1], report[2], report[3], report[4]]);
-        match (report[0], socket) {
-            (0, Some(fd)) => Ok(Report::Socket(fd)),
-            (1, _) => Ok(Report::Join(errno)),
-            (2, _) => Ok(Report::Create(errno)),
-            _ => Err(io::Error::other(
-                "the process that creates a placed socket sent no socket",
-            )),
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        /// A loopback address that refuses every connection for as long as
-        /// the returned socket lives: the socket holds the port bound and
-        /// never listens, so a connect is refused, and no other process on
-        /// the host can bind the port meanwhile. A port probed free and then
-        /// released is not that: a parallel test or any daemon can take it
-        /// and accept the connection the test expects refused.
-        #[cfg(target_os = "linux")]
-        fn refusing_addr() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
-            let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            socket
-                .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
-                .unwrap();
-            let addr = socket.local_addr().unwrap();
-            (socket, addr)
-        }
-
-        /// Serves `body` to every HTTP request on a loopback port.
-        async fn serve_body(body: &'static [u8]) -> std::net::SocketAddr {
-            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                loop {
-                    let (mut conn, _) = listener.accept().await.unwrap();
-                    tokio::spawn(async move {
-                        let mut head = Vec::new();
-                        let mut buf = [0u8; 1024];
-                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                            let n = conn.read(&mut buf).await.unwrap();
-                            if n == 0 {
-                                return;
-                            }
-                            head.extend_from_slice(&buf[..n]);
-                        }
-                        let head = String::from_utf8_lossy(&head).to_string();
-                        assert!(
-                            head.starts_with("GET /pkg-1.0.tar.gz HTTP/1.1\r\n"),
-                            "the origin gets the request in origin form: {head}"
-                        );
-                        assert!(
-                            !head.to_ascii_lowercase().contains("proxy-authorization"),
-                            "the relay's credential never reaches the origin: {head}"
-                        );
-                        let agent = crate::fetchers::user_agent().to_ascii_lowercase();
-                        let agent = format!("\r\nuser-agent: {agent}\r\n");
-                        assert!(
-                            head.to_ascii_lowercase().contains(&agent),
-                            "a placed fetch sends the user agent (inbox#1218): {head}"
-                        );
-                        let reply = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        conn.write_all(reply.as_bytes()).await.unwrap();
-                        conn.write_all(body).await.unwrap();
-                    });
-                }
-            });
-            addr
-        }
-
-        /// NET-155: a placed web download reaches its destination through
-        /// the relay, from a socket that a child created after it wrote
-        /// itself into the placement's `cgroup.procs`, and the content-hash
-        /// check still applies. A plain file stands in for `cgroup.procs`:
-        /// the child's write lands in it, and the socket comes back.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_placed_download_connects_from_the_placement() {
-            use sha2::Digest;
-            let body: &'static [u8] = b"the source archive";
-            let sha = hex::encode(sha2::Sha256::digest(body));
-            let addr = serve_body(body).await;
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let cache =
-                file_cache::FileCache::new_with_offline(tmp.path().join("cache"), false).unwrap();
-            let url = format!("http://{addr}/pkg-1.0.tar.gz");
-
-            let placement = &Placement::Cgroup(procs.clone());
-            let fetched = download(&cache, &url, &sha, placement, &OpTracker::new_root())
-                .await
-                .expect("the placed download succeeds");
-            assert_eq!(std::fs::read(&fetched.path).unwrap(), body);
-            assert!(fetched.connected, "the first download opens a connection");
-            assert_eq!(
-                std::fs::read_to_string(&procs).unwrap(),
-                "0",
-                "the child that made the socket joined the placement"
-            );
-
-            // The same source again: the download cache serves it, and the
-            // download says that it opened no connection.
-            std::fs::write(&procs, "").unwrap();
-            let cached = download(&cache, &url, &sha, placement, &OpTracker::new_root())
-                .await
-                .expect("the cache serves the source");
-            assert_eq!(cached.path, fetched.path);
-            assert!(!cached.connected, "a cache hit opens no connection");
-            assert_eq!(std::fs::read_to_string(&procs).unwrap(), "");
-
-            // A destination the placed socket cannot reach names itself.
-            let (_closed, closed_addr) = refusing_addr();
-            let refused = download(
-                &cache,
-                &format!("http://{closed_addr}/other-1.0.tar.gz"),
-                &sha,
-                placement,
-                &OpTracker::new_root(),
-            )
-            .await
-            .expect_err("nothing listens there");
-            assert!(
-                refused
-                    .to_string()
-                    .starts_with(&format!("could not connect to {closed_addr}: ")),
-                "{refused:#}"
-            );
-
-            // A placement whose rules admit nothing resolves no name and
-            // opens no socket: the child never joins the placement.
-            std::fs::write(&procs, "").unwrap();
-            let sealed = download(
-                &cache,
-                "http://downloads.example.invalid/sealed-1.0.tar.gz",
-                &sha,
-                &Placement::Refused(RULES_REFUSE),
-                &OpTracker::new_root(),
-            )
-            .await
-            .expect_err("rules that admit nothing refuse the connection");
-            assert_eq!(
-                sealed.to_string(),
-                "could not connect to downloads.example.invalid:80: \
-                 the egress rules do not allow this host",
-                "{sealed:#}"
-            );
-            assert_eq!(std::fs::read_to_string(&procs).unwrap(), "");
-        }
-
-        /// NET-155: the child that makes a placed socket writes itself into
-        /// the placement's `cgroup.procs` before it creates the socket, and a
-        /// placement it cannot open is refused with its path. A plain file
-        /// stands in for `cgroup.procs`.
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_placed_socket_is_created_in_the_named_cgroup() {
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let placement = Placement::Cgroup(procs.clone());
-            let fd = placed_socket(&placement, false, SocketKind::Stream).expect("a placed socket");
-            let socket = std::net::TcpStream::from(fd);
-            socket.set_nonblocking(true).unwrap();
-            assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
-            let refused = placed_socket(
-                &Placement::Cgroup("/nonexistent/cgroup.procs".into()),
-                false,
-                SocketKind::Stream,
-            )
-            .expect_err("no cgroup, no socket");
-            assert!(
-                refused.to_string().contains("/nonexistent/cgroup.procs"),
-                "{refused}"
-            );
-        }
-
-        /// How a test name server answers over UDP.
-        #[derive(Clone, Copy, PartialEq)]
-        enum Serve {
-            /// It answers every query.
-            Answer,
-            /// It answers every query with SERVFAIL.
-            Fail,
-            /// It answers every query with no record and the TC bit set.
-            Truncate,
-        }
-
-        /// The answer of a test name server: 127.0.0.1 for an A query for
-        /// `pkg.test.`, and no address for every other query.
-        fn answer(request: &hickory_proto::op::Message) -> hickory_proto::op::Message {
-            use hickory_proto::op::{Message, ResponseCode};
-            use hickory_proto::rr::rdata::A;
-            use hickory_proto::rr::{RData, Record, RecordType};
-
-            let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
-            let question = request.queries[0].clone();
-            let known = question.name().to_string() == "pkg.test.";
-            reply.metadata.response_code = if known {
-                ResponseCode::NoError
-            } else {
-                ResponseCode::NXDomain
-            };
-            if known && question.query_type() == RecordType::A {
-                reply.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    60,
-                    RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
-                ));
-            }
-            reply.add_query(question);
-            reply
-        }
-
-        /// A name server on loopback that answers over UDP as `serve` says.
-        async fn serve_names_as(serve: Serve) -> SocketAddr {
-            use hickory_proto::op::{Message, ResponseCode};
-
-            let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let addr = socket.local_addr().unwrap();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                loop {
-                    let (n, from) = socket.recv_from(&mut buf).await.unwrap();
-                    let request = Message::from_vec(&buf[..n]).unwrap();
-                    let reply = match serve {
-                        Serve::Answer => answer(&request),
-                        Serve::Fail | Serve::Truncate => {
-                            let mut reply =
-                                Message::response(request.metadata.id, request.metadata.op_code);
-                            if serve == Serve::Fail {
-                                reply.metadata.response_code = ResponseCode::ServFail;
-                            } else {
-                                reply.metadata.truncation = true;
-                            }
-                            reply.add_query(request.queries[0].clone());
-                            reply
-                        }
-                    };
-                    socket
-                        .send_to(&reply.to_vec().unwrap(), from)
-                        .await
-                        .unwrap();
-                }
-            });
-            addr
-        }
-
-        /// A name server on loopback that answers every query.
-        async fn serve_names() -> SocketAddr {
-            serve_names_as(Serve::Answer).await
-        }
-
-        /// A name server on loopback that truncates every answer over UDP,
-        /// and answers in full over TCP on the same port. It returns the
-        /// address and how many queries came over TCP.
-        async fn serve_names_over_tcp() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
-            use hickory_proto::op::Message;
-            use std::sync::atomic::{AtomicUsize, Ordering};
-
-            let udp = serve_names_as(Serve::Truncate).await;
-            let listener = TcpListener::bind(udp).await.unwrap();
-            let asked = Arc::new(AtomicUsize::new(0));
-            let counter = asked.clone();
-            tokio::spawn(async move {
-                loop {
-                    let (mut conn, _) = listener.accept().await.unwrap();
-                    let counter = counter.clone();
-                    tokio::spawn(async move {
-                        let mut len = [0u8; 2];
-                        conn.read_exact(&mut len).await.unwrap();
-                        let mut buf = vec![0u8; usize::from(u16::from_be_bytes(len))];
-                        conn.read_exact(&mut buf).await.unwrap();
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        let bytes = answer(&Message::from_vec(&buf).unwrap()).to_vec().unwrap();
-                        let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
-                        framed.extend_from_slice(&bytes);
-                        conn.write_all(&framed).await.unwrap();
-                    });
-                }
-            });
-            (udp, asked)
-        }
-
-        /// NET-155: a placed download asks for a host name from a UDP socket
-        /// that a child created after it wrote itself into the placement's
-        /// `cgroup.procs`. So the egress rules of the placement decide the
-        /// name query, not only the connection. A plain file stands in for
-        /// `cgroup.procs`.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_placed_name_query_leaves_from_the_placement() {
-            let nameserver = serve_names().await;
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-
-            let addrs = lookup_placed(&Placement::Cgroup(procs.clone()), &[nameserver], "pkg.test")
-                .await
-                .expect("the name resolves");
-            assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
-            assert_eq!(
-                std::fs::read_to_string(&procs).unwrap(),
-                "0",
-                "the child that made the query socket joined the placement"
-            );
-
-            let missing = lookup_placed(
-                &Placement::Cgroup(procs.clone()),
-                &[nameserver],
-                "missing.test",
-            )
-            .await
-            .expect_err("no such name");
-            assert!(
-                missing
-                    .to_string()
-                    .starts_with("could not resolve missing.test: "),
-                "{missing}"
-            );
-
-            // A placement the child cannot join sends no query.
-            let refused = lookup_placed(
-                &Placement::Cgroup("/nonexistent/cgroup.procs".into()),
-                &[nameserver],
-                "pkg.test",
-            )
-            .await
-            .expect_err("no cgroup, no query");
-            assert!(
-                refused.to_string().contains("/nonexistent/cgroup.procs"),
-                "{refused}"
-            );
-        }
-
-        /// A namespace placement whose descriptors enter nothing, for a test
-        /// that must end before any socket is made.
-        #[cfg(target_os = "linux")]
-        fn inert_namespace(nameserver: SocketAddr, allowed: &'static str) -> Placement {
-            let null = || Arc::new(OwnedFd::from(File::open("/dev/null").unwrap()));
-            Placement::Namespace(NetNamespace {
-                user: null(),
-                net: null(),
-                nameservers: vec![nameserver],
-                admits_name: Arc::new(move |host| host == allowed),
-            })
-        }
-
-        /// NET-155: a namespace's rules refuse a host name before the relay
-        /// makes a socket, so no name query leaves: the error is the rules',
-        /// not the failed join into a namespace these descriptors do not
-        /// name. A host the rules allow goes on to the namespace, and a
-        /// literal address is left to the rules on the namespace's network.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_name_the_rules_do_not_allow_sends_no_query() {
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let nameserver = serve_names().await;
-            let mut relay = test_relay(&procs, CONNECT_TIMEOUT);
-            relay.placement = inert_namespace(nameserver, "allowed.test");
-            relay.nameservers = Some(vec![nameserver]);
-
-            let refused = relay
-                .connect("blocked.test", 443)
-                .await
-                .expect_err("the rules do not allow it");
-            assert_eq!(refused.to_string(), RULES_REFUSE);
-
-            assert_eq!(refusal(&relay.placement, "allowed.test"), None);
-            assert_eq!(refusal(&relay.placement, "203.0.113.7"), None);
-            assert_eq!(
-                refusal(&Placement::Refused(NO_NETWORK), "allowed.test"),
-                Some(NO_NETWORK)
-            );
-        }
-
-        /// NET-155: a process in this daemon's own network namespace is no
-        /// placement, because its sockets would leave under no rule of a box.
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_process_in_the_daemons_namespace_is_no_placement() {
-            let refused = NetNamespace::of_process(std::process::id(), &[], Arc::new(|_| true))
-                .expect_err("this process shares its own namespace");
-            assert!(
-                refused.to_string().contains("shares this daemon's network"),
-                "{refused}"
-            );
-        }
-
-        /// A relay for tests, with its connections placed by a plain file
-        /// that stands in for `cgroup.procs`.
-        #[cfg(target_os = "linux")]
-        fn test_relay(procs: &std::path::Path, connect_timeout: std::time::Duration) -> Relay {
-            Relay {
-                placement: Placement::Cgroup(procs.to_path_buf()),
-                hosts: procs.with_file_name("hosts"),
-                nameservers: None,
-                connect_timeout,
-                head_timeout: HEAD_TIMEOUT,
-                auth: "Bearer test".to_string(),
-                failure: Mutex::new(None),
-                asked: AtomicBool::new(false),
-            }
-        }
-
-        /// A loopback port whose accept queue is full, so the kernel drops
-        /// every new SYN to it, as egress rules that drop packets do.
-        #[cfg(target_os = "linux")]
-        async fn dropping_port() -> (SocketAddr, Vec<TcpStream>, tokio::net::TcpListener) {
-            let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            socket
-                .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
-                .unwrap();
-            let listener = socket.listen(0).unwrap();
-            let addr = listener.local_addr().unwrap();
-            let mut held = Vec::new();
-            loop {
-                let attempt = tokio::time::timeout(
-                    std::time::Duration::from_millis(300),
-                    TcpStream::connect(addr),
-                )
-                .await;
-                match attempt {
-                    Ok(Ok(stream)) => held.push(stream),
-                    _ => break,
-                }
-                assert!(held.len() < 64, "the accept queue never filled");
-            }
-            (addr, held, listener)
-        }
-
-        /// A download without a placement whose connect gets no answer
-        /// fails at its bound, not at the kernel's retry limit, and names
-        /// the address and the bound.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn an_unplaced_connect_to_a_dropping_address_times_out() {
-            let (addr, _held, _listener) = dropping_port().await;
-            let tmp = tempfile::tempdir().unwrap();
-            let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
-                .await
-                .unwrap();
-            let bound = std::time::Duration::from_millis(300);
-
-            let started = std::time::Instant::now();
-            let e = storage
-                .download_web_within(
-                    bound,
-                    &format!("http://{addr}/pkg.tar.gz"),
-                    "0000000000000000000000000000000000000000000000000000000000000000",
-                    &OpTracker::new_root(),
-                )
-                .await
-                .expect_err("the address drops every packet");
-            let took = started.elapsed();
-
-            assert_eq!(
-                e.to_string(),
-                format!("could not connect to {addr}: no answer after 300ms")
-            );
-            assert!(took < bound * 2, "took {took:?}");
-        }
-
-        /// A connect to an address that drops packets ends with `TimedOut`
-        /// at the relay's deadline, not at the kernel's retry limit.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_placed_connect_to_a_dropping_address_times_out() {
-            let (addr, _held, _listener) = dropping_port().await;
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let bound = std::time::Duration::from_millis(500);
-            let relay = test_relay(&procs, bound);
-
-            let started = std::time::Instant::now();
-            let e = relay
-                .connect(&addr.ip().to_string(), addr.port())
-                .await
-                .expect_err("the address drops every packet");
-            let took = started.elapsed();
-            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
-            assert_eq!(e.to_string(), "no answer after 500ms");
-            assert!(took >= bound, "it waited {took:?}");
-            assert!(took < bound * 4, "it waited {took:?}");
-        }
-
-        /// A host with many addresses behind rules that drop packets fails
-        /// within one connect bound, not one bound per address.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_placed_connect_shares_its_bound_across_a_hosts_addresses() {
-            let (addr, _held, _listener) = dropping_port().await;
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let ip = addr.ip();
-            std::fs::write(
-                procs.with_file_name("hosts"),
-                format!("{ip} many.test\n").repeat(4),
-            )
-            .unwrap();
-            let bound = std::time::Duration::from_millis(800);
-            let relay = test_relay(&procs, bound);
-
-            let started = std::time::Instant::now();
-            let e = relay
-                .connect("many.test", addr.port())
-                .await
-                .expect_err("every address drops every packet");
-            let took = started.elapsed();
-            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
-            assert_eq!(e.to_string(), "no answer after 800ms");
-            assert!(took < bound * 2, "it waited {took:?}");
-        }
-
-        /// A host whose last address refuses, after earlier ones gave no
-        /// answer, reports the refusal and how many gave no answer.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_placed_connect_refused_last_counts_the_unanswered() {
-            // The first three drop every packet. Nothing listens on the
-            // port at 127.0.0.2, so the last refuses at once.
-            let (addr, _held, _listener) = dropping_port().await;
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let ip = addr.ip();
-            std::fs::write(
-                procs.with_file_name("hosts"),
-                format!("{ip} many.test\n").repeat(3) + "127.0.0.2 many.test\n",
-            )
-            .unwrap();
-            let bound = std::time::Duration::from_millis(600);
-            let relay = test_relay(&procs, bound);
-
-            let started = std::time::Instant::now();
-            let e = relay
-                .connect("many.test", addr.port())
-                .await
-                .expect_err("no address takes the connection");
-            let took = started.elapsed();
-            assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused, "{e}");
-            assert_eq!(
-                e.to_string(),
-                "Connection refused (os error 111), after no answer from 3 other addresses"
-            );
-            assert!(took < bound, "it waited {took:?}");
-        }
-
-        /// An address that fails at once leaves its time to the next: the
-        /// last address connects after a wait longer than an equal share.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_placed_connect_carries_unused_time_to_the_next_address() {
-            // The port is closed on the first four, which refuse at once.
-            // The last one drops the first SYN, and answers the kernel's
-            // retry about a second later, once the queue has room.
-            let (addr, _held, listener) = dropping_port().await;
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            std::fs::write(
-                procs.with_file_name("hosts"),
-                format!(
-                    "127.0.0.2 many.test\n127.0.0.3 many.test\n127.0.0.4 many.test\n\
-                     127.0.0.5 many.test\n{} many.test\n",
-                    addr.ip()
-                ),
-            )
-            .unwrap();
-            let bound = std::time::Duration::from_millis(3000);
-            let relay = test_relay(&procs, bound);
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let accepted = listener.accept().await;
-                std::future::pending::<()>().await;
-                drop((accepted, listener));
-            });
-
-            let started = std::time::Instant::now();
-            relay
-                .connect("many.test", addr.port())
-                .await
-                .expect("the last address answers within the time left");
-            let took = started.elapsed();
-            assert!(
-                took > bound / 5,
-                "an equal share would not have sufficed: {took:?}"
-            );
-        }
-
-        /// The lookup of a host counts against the bound: name servers that
-        /// never answer end the connection at its deadline, not at theirs.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_placed_connect_counts_its_lookup_against_the_bound() {
-            let silent = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let bound = std::time::Duration::from_millis(300);
-            let mut relay = test_relay(&procs, bound);
-            relay.nameservers = Some(vec![silent.local_addr().unwrap()]);
-
-            let started = std::time::Instant::now();
-            let e = relay
-                .connect("sources.example.com", 443)
-                .await
-                .expect_err("no name server answers");
-            let took = started.elapsed();
-            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
-            assert_eq!(e.to_string(), "no answer after 300ms");
-            assert!(took < bound * 4, "it waited {took:?}");
-        }
-
-        /// Sends one CONNECT to `target` through the relay at `relay`, and
-        /// returns the status line of the answer.
-        #[cfg(target_os = "linux")]
-        async fn tunnel_status(relay: SocketAddr, target: SocketAddr) -> String {
-            let mut conn = TcpStream::connect(relay).await.unwrap();
-            let head =
-                format!("CONNECT {target} HTTP/1.1\r\nproxy-authorization: Bearer test\r\n\r\n");
-            conn.write_all(head.as_bytes()).await.unwrap();
-            let mut answer = Vec::new();
-            let mut buf = [0u8; 256];
-            while !answer.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = conn.read(&mut buf).await.unwrap();
-                assert_ne!(n, 0, "the relay closed before it answered");
-                answer.extend_from_slice(&buf[..n]);
-            }
-            let answer = String::from_utf8_lossy(&answer).to_string();
-            answer.lines().next().unwrap_or_default().to_string()
-        }
-
-        /// A connection that succeeds clears the failure of an earlier one,
-        /// so a later error is not reported as a destination the relay could
-        /// not reach.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_connection_that_succeeds_clears_an_earlier_failure() {
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let relay = Arc::new(test_relay(&procs, CONNECT_TIMEOUT));
-            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let relay_addr = listener.local_addr().unwrap();
-            let _serving = AbortOnDrop(tokio::spawn(serve(listener, relay.clone())));
-
-            let (_closed, closed_addr) = refusing_addr();
-            assert_eq!(
-                tunnel_status(relay_addr, closed_addr).await,
-                "HTTP/1.1 502 Bad Gateway"
-            );
-            let failure = relay.failure.lock().unwrap().clone();
-            assert!(
-                failure.as_deref().is_some_and(
-                    |f| f.starts_with(&format!("could not connect to {closed_addr}: "))
-                ),
-                "{failure:?}"
-            );
-
-            let open = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let open_addr = open.local_addr().unwrap();
-            assert_eq!(
-                tunnel_status(relay_addr, open_addr).await,
-                "HTTP/1.1 200 Connection Established"
-            );
-            assert_eq!(*relay.failure.lock().unwrap(), None);
-        }
-
-        /// The relay takes every `nameserver` that `/etc/resolv.conf`
-        /// names, in order, on port 53.
-        #[test]
-        fn every_nameserver_is_taken_in_order() {
-            let text = "search example.com\nnameserver 10.0.0.53\nnameserver 1.1.1.1\n";
-            assert_eq!(
-                nameservers(text),
-                vec![
-                    "10.0.0.53:53".parse::<SocketAddr>().unwrap(),
-                    "1.1.1.1:53".parse().unwrap()
-                ]
-            );
-            assert!(nameservers("search example.com\n").is_empty());
-        }
-
-        /// A name server that gives no usable answer is passed over, and the
-        /// next one in order is asked.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn the_next_nameserver_is_asked_when_one_does_not_answer() {
-            let failing = serve_names_as(Serve::Fail).await;
-            let answering = serve_names().await;
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-
-            let addrs = lookup_placed(
-                &Placement::Cgroup(procs.clone()),
-                &[failing, answering],
-                "pkg.test",
-            )
-            .await
-            .expect("the second name server answers");
-            assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
-
-            let failed = lookup_placed(&Placement::Cgroup(procs.clone()), &[failing], "pkg.test")
-                .await
-                .expect_err("no name server answers");
-            assert!(
-                failed.to_string().starts_with(&format!(
-                    "the name server {failing} could not resolve pkg.test: "
-                )),
-                "{failed}"
-            );
-        }
-
-        /// An answer with the TC bit set is asked again over TCP, from a
-        /// stream socket created in the placement.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_truncated_answer_is_asked_again_over_tcp() {
-            use std::sync::atomic::Ordering;
-            let (nameserver, asked) = serve_names_over_tcp().await;
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-
-            let addrs = lookup_placed(&Placement::Cgroup(procs.clone()), &[nameserver], "pkg.test")
-                .await
-                .expect("the answer over TCP carries the address");
-            assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
-            assert_eq!(asked.load(Ordering::SeqCst), 2, "A and AAAA, over TCP");
-            assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
-        }
-
-        /// A name in the `hosts` file takes its addresses from there, and the
-        /// relay sends no name query for it.
-        #[test]
-        fn a_name_in_the_hosts_file_is_found_there() {
-            let text = "127.0.0.1 localhost\n# 10.0.0.9 pkg.test\n\
-                        10.0.0.7  mirror.test  Pkg.Test # a comment\n::1 pkg.test\n";
-            assert_eq!(
-                hosts_addresses(text, "pkg.test."),
-                vec![
-                    "10.0.0.7".parse::<IpAddr>().unwrap(),
-                    "::1".parse().unwrap()
-                ]
-            );
-            assert!(hosts_addresses(text, "other.test").is_empty());
-        }
-
-        /// The relay connects to a name in the `hosts` file without a name
-        /// server: it has none to ask.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_placed_connect_to_a_listed_name_sends_no_query() {
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let mut relay = test_relay(&procs, CONNECT_TIMEOUT);
-            relay.nameservers = Some(vec![]);
-            let open = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let port = open.local_addr().unwrap().port();
-
-            relay
-                .connect("pkg.test", port)
-                .await
-                .expect_err("pkg.test is not listed yet, and no name server is asked");
-            std::fs::write(&relay.hosts, "127.0.0.1 pkg.test\n").unwrap();
-            relay
-                .connect("pkg.test", port)
-                .await
-                .expect("the hosts file gives the address");
-        }
-
-        /// A client that connects to the relay and sends nothing is dropped
-        /// at the head deadline, so it does not hold a handler task.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_silent_client_is_dropped_at_the_head_deadline() {
-            let tmp = tempfile::tempdir().unwrap();
-            let procs = tmp.path().join("cgroup.procs");
-            std::fs::write(&procs, "").unwrap();
-            let mut relay = test_relay(&procs, CONNECT_TIMEOUT);
-            let bound = std::time::Duration::from_millis(300);
-            relay.head_timeout = bound;
-            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let _client = TcpStream::connect(listener.local_addr().unwrap())
-                .await
-                .unwrap();
-            let (conn, _) = listener.accept().await.unwrap();
-
-            let started = std::time::Instant::now();
-            let e = relay
-                .handle(conn)
-                .await
-                .expect_err("the client sent no head");
-            let took = started.elapsed();
-            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
-            assert!(took >= bound, "it waited {took:?}");
-            assert!(took < bound * 10, "it waited {took:?}");
-        }
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2148,7 +496,7 @@ mod tests {
         let url = format!("http://{addr}/pkg-1.0.tar.gz");
 
         let fetched = storage
-            .download_web_with_verification_and_caching(&url, &sha, None, &OpTracker::new_root())
+            .download_web_with_verification_and_caching(&url, &sha, &OpTracker::new_root())
             .await
             .expect("the download succeeds");
         assert_eq!(std::fs::read(&fetched).unwrap(), body);
@@ -2160,18 +508,13 @@ mod tests {
         );
         assert!(head.contains(&agent), "{agent:?} in {head}");
     }
-}
 
-#[cfg(test)]
-mod gcs_url_tests {
-    use super::*;
-
-    /// A `gs://` object read through a placed download names the same host
-    /// and file as the Cloud Storage client's read, so the two share the
-    /// download cache. Its name is one path, escaped as the client escapes
-    /// it, and a `%` in it stays literal.
+    /// NET-155: a `gs://` source is the public object at
+    /// `storage.googleapis.com`, under the cache name the client's read
+    /// would give it.
     #[test]
     fn a_gs_object_becomes_a_url_on_the_cloud_storage_host() {
+        use crate::fetchers::FetchUrl as _;
         let url = gcs_object_url("minimal-staging-archives", "a/b/zsh-5.9.2.tar.xz").unwrap();
         assert_eq!(
             url,
@@ -2186,7 +529,7 @@ mod gcs_url_tests {
             .filename()
         );
         assert_eq!(
-            gcs_object_url("b", "with space/100%.tar").unwrap(),
+            gcs_object_url("b", "/with space/100%.tar").unwrap(),
             "https://storage.googleapis.com/b/with%20space/100%25.tar"
         );
     }
@@ -2196,17 +539,28 @@ mod gcs_url_tests {
 mod connect_tests {
     use super::*;
 
+    /// A loopback address that refuses every connection for as long as the
+    /// returned socket lives: the socket holds the port bound and never
+    /// listens, so a connect is refused, and no other process on the host
+    /// can bind the port meanwhile. A port probed free and then released is
+    /// not that: a parallel test or any daemon can take it and accept the
+    /// connection the test expects refused.
+    fn refusing_addr() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        (socket, addr)
+    }
+
     const SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     /// A download that could not connect names the host and the socket's
     /// reason, in the text the daemon reads the host from.
     #[tokio::test]
     async fn a_failed_connect_names_the_host() {
-        let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let addr = closed.local_addr().unwrap();
-        drop(closed);
+        let (_closed, addr) = refusing_addr();
         let tmp = tempfile::tempdir().unwrap();
         let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
             .await
@@ -2216,7 +570,6 @@ mod connect_tests {
             .download_web_with_verification_and_caching(
                 &format!("http://{addr}/pkg.tar.gz"),
                 SHA,
-                None,
                 &OpTracker::new_root(),
             )
             .await
@@ -2225,6 +578,255 @@ mod connect_tests {
         assert!(
             text.starts_with(&format!("could not connect to {addr}: ")),
             "{text}"
+        );
+    }
+
+    /// NET-167: a source's hosts are its own and each host it redirects to.
+    /// The source is at a literal address and redirects to a name, so the
+    /// two hosts differ on one listener.
+    #[tokio::test]
+    async fn source_redirect_hosts_join_the_build_box_egress() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for location in [format!("http://localhost:{port}/two"), String::new()] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await.unwrap();
+                let response = if location.is_empty() {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\n\
+                         connection: close\r\n\r\n"
+                    )
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let hosts = source_hosts(&[format!("http://127.0.0.1:{port}/one")]).await;
+        assert_eq!(
+            hosts.into_iter().collect::<Vec<_>>(),
+            ["127.0.0.1", "localhost"]
+        );
+    }
+
+    /// A build box's fetch that could not connect names the host the same way.
+    #[tokio::test]
+    async fn a_failed_build_box_fetch_names_the_host() {
+        let (_closed, addr) = refusing_addr();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let e = fetch_to_file(
+            &format!("http://{addr}/pkg.tar.gz"),
+            SHA,
+            &tmp.path().join("fetched"),
+        )
+        .await
+        .expect_err("the port is closed");
+        let text = e.to_string();
+        assert!(
+            text.starts_with(&format!("could not connect to {addr}: ")),
+            "{text}"
+        );
+    }
+
+    /// A server that answers its `n`th connection with `replies[n]`, or the
+    /// last reply once they run out, and closes it. Returns its address and
+    /// the count of connections it took.
+    async fn scripted_server(
+        replies: Vec<Vec<u8>>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = taken.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let reply = replies[n.min(replies.len() - 1)].clone();
+                let mut request = [0u8; 2048];
+                let served = async {
+                    if stream.read(&mut request).await? == 0 {
+                        return Ok(());
+                    }
+                    stream.write_all(&reply).await?;
+                    stream.shutdown().await
+                };
+                // A client that hangs up first ends its connection early. The
+                // tests check the count of connections taken, not this.
+                if let Err(e) = served.await {
+                    eprintln!("a scripted connection ended early: {e}");
+                }
+            }
+        });
+        (addr, taken)
+    }
+
+    /// An HTTP reply with `status`, whose head declares `length` bytes of
+    /// body and whose body is `body`.
+    fn reply(status: &str, length: usize, body: &[u8]) -> Vec<u8> {
+        let mut reply =
+            format!("HTTP/1.1 {status}\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n")
+                .into_bytes();
+        reply.extend_from_slice(body);
+        reply
+    }
+
+    fn sha256_hex(body: &[u8]) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(body))
+    }
+
+    /// NET-155: a server error and a body cut off are transient, so the
+    /// fetch tries again and succeeds on the third connection.
+    #[tokio::test]
+    async fn a_transient_fetch_failure_is_retried_until_it_succeeds() {
+        let body = b"the source".to_vec();
+        let (addr, taken) = scripted_server(vec![
+            reply("503 Service Unavailable", 0, b""),
+            reply("200 OK", body.len(), &body[..3]),
+            reply("200 OK", body.len(), &body),
+        ])
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let client = fetch_client(CONNECT_TIMEOUT).unwrap();
+        let url = format!("http://{addr}/pkg.tar.gz");
+        let sha = sha256_hex(&body);
+
+        retrying_transient(3, std::time::Duration::from_millis(10), || {
+            fetch_once(&client, CONNECT_TIMEOUT, &url, &sha, &out)
+        })
+        .await
+        .expect("the third attempt succeeds");
+
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+    }
+
+    /// NET-155: a server error on every attempt gives up after the retries,
+    /// with the last attempt's error.
+    #[tokio::test]
+    async fn a_persistent_server_error_gives_up_after_the_retries() {
+        let (addr, taken) = scripted_server(vec![
+            reply("500 Internal Server Error", 0, b""),
+            reply("502 Bad Gateway", 0, b""),
+            reply("429 Too Many Requests", 0, b""),
+            reply("503 Service Unavailable", 0, b""),
+        ])
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let client = fetch_client(CONNECT_TIMEOUT).unwrap();
+        let url = format!("http://{addr}/pkg.tar.gz");
+
+        let e = retrying_transient(3, std::time::Duration::from_millis(10), || {
+            fetch_once(&client, CONNECT_TIMEOUT, &url, SHA, &out)
+        })
+        .await
+        .expect_err("every attempt fails");
+
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(e.to_string().contains("503 Service Unavailable"), "{e}");
+    }
+
+    /// NET-155: a client error status and a hash mismatch fail the first
+    /// attempt: another attempt would get the same answer.
+    #[tokio::test]
+    async fn a_client_error_or_a_hash_mismatch_is_not_retried() {
+        let backoff = std::time::Duration::from_secs(30);
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let client = fetch_client(CONNECT_TIMEOUT).unwrap();
+        for (status, body) in [("404 Not Found", &b""[..]), ("200 OK", &b"other bytes"[..])] {
+            let (addr, taken) = scripted_server(vec![reply(status, body.len(), body)]).await;
+            let url = format!("http://{addr}/pkg.tar.gz");
+            let started = std::time::Instant::now();
+
+            retrying_transient(3, backoff, || {
+                fetch_once(&client, CONNECT_TIMEOUT, &url, SHA, &out)
+            })
+            .await
+            .expect_err("the attempt fails");
+
+            assert_eq!(
+                taken.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{status}"
+            );
+            assert!(started.elapsed() < backoff, "{status}");
+        }
+    }
+
+    /// NET-155: a refused connection fails at once, with no retry, so a
+    /// source the box's rules refuse fails its build in seconds.
+    #[tokio::test]
+    async fn a_refused_connect_is_not_retried() {
+        let (_closed, addr) = refusing_addr();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let client = fetch_client(CONNECT_TIMEOUT).unwrap();
+        let url = format!("http://{addr}/pkg.tar.gz");
+        let backoff = std::time::Duration::from_secs(30);
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let started = std::time::Instant::now();
+        let e = retrying_transient(3, backoff, || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fetch_once(&client, CONNECT_TIMEOUT, &url, SHA, &out)
+        })
+        .await
+        .expect_err("the port is closed");
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(started.elapsed() < backoff);
+        assert!(
+            e.to_string()
+                .starts_with(&format!("could not connect to {addr}: ")),
+            "{e}"
+        );
+    }
+
+    /// NET-155: a connection that gets no answer fails at its bound, with no
+    /// retry.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unanswered_connect_is_not_retried() {
+        let (addr, _held, _listener) = dropping_port().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("fetched");
+        let bound = std::time::Duration::from_millis(300);
+        let client = fetch_client(bound).unwrap();
+        let url = format!("http://{addr}/pkg.tar.gz");
+        let backoff = std::time::Duration::from_secs(30);
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let started = std::time::Instant::now();
+        let e = retrying_transient(3, backoff, || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fetch_once(&client, bound, &url, SHA, &out)
+        })
+        .await
+        .expect_err("the address drops every packet");
+        let took = started.elapsed();
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(took < bound * 2, "took {took:?}");
+        assert_eq!(
+            e.to_string(),
+            format!("could not connect to {addr}: no answer after 300ms")
         );
     }
 
@@ -2283,5 +885,66 @@ mod connect_tests {
         let clients = google_cloud_storage::Error::timeout("the client's own deadline");
         let text = clients.to_string();
         assert_eq!(gcs_failure(clients, bound).to_string(), text);
+    }
+
+    /// A loopback port whose accept queue is full, so the kernel drops
+    /// every new SYN to it, as egress rules that drop packets do.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn dropping_port() -> (
+        std::net::SocketAddr,
+        Vec<tokio::net::TcpStream>,
+        tokio::net::TcpListener,
+    ) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let listener = socket.listen(0).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut held = Vec::new();
+        loop {
+            let attempt = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(stream)) => held.push(stream),
+                _ => break,
+            }
+            assert!(held.len() < 64, "the accept queue never filled");
+        }
+        (addr, held, listener)
+    }
+
+    /// A download whose connect gets no answer fails at its bound, not at
+    /// the kernel's retry limit, and names the address and the bound.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unplaced_connect_to_a_dropping_address_times_out() {
+        let (addr, _held, _listener) = dropping_port().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
+            .await
+            .unwrap();
+        let bound = std::time::Duration::from_millis(300);
+
+        let started = std::time::Instant::now();
+        let e = storage
+            .download_web_within(
+                bound,
+                &format!("http://{addr}/pkg.tar.gz"),
+                SHA,
+                &OpTracker::new_root(),
+            )
+            .await
+            .expect_err("the address drops every packet");
+        let took = started.elapsed();
+
+        assert_eq!(
+            e.to_string(),
+            format!("could not connect to {addr}: no answer after 300ms")
+        );
+        assert!(took < bound * 2, "took {took:?}");
     }
 }

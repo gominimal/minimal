@@ -14,10 +14,6 @@ use ot::{OpTracker, Operation};
 use sandbox::config::SandboxMapped;
 use tracing::info;
 
-/// What a build says when it needs the network and its box has none
-/// (NET-155).
-pub const NEEDS_NETWORK: &str = "the build needs the network and the box has none";
-
 /// The return value of a successful build of a build-spec.
 pub struct SpecBuildResult {
     pub outputs: PendingDir,
@@ -53,175 +49,16 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// cgroups v2 cpu.weights.
     pub cpu_weight: Option<u64>,
 
-    /// The classifier leaf of the box this build runs for, if any (NET-155).
-    /// When set, the build's sandbox runs in that leaf, so the box's egress
-    /// verdict decides every connection the build makes. When `None`, the
-    /// build runs in the cgroup of its caller, as the caller's own traffic.
-    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// The build box this build runs in, if it runs for a box (NET-155).
+    /// `None` is a build outside any box: `mip`'s, which keeps the plan below.
+    pub build_box: Option<crate::BuildBox>,
 
-    /// The network of the box this build runs for, if the box has no
-    /// classifier leaf and is not a host-address box (NET-155): an
-    /// own-address box, or a box with no network. A build that needs the
-    /// network attaches to it, so the box's egress verdict decides every
-    /// connection the build makes. A build that needs no network stays in
-    /// its empty namespace. `None` keeps the plan below.
-    pub box_network: Option<BuildNetwork>,
-}
-
-/// Makes the network a package build attaches to when it runs for a box with
-/// a network namespace of its own (NET-155). Each build gets a network of its
-/// own, because a network holds the reservation of one sandbox at a time and
-/// the dependency builds of one box can run at the same time.
-///
-/// A box with no network has one of these too. It has nowhere to attach a
-/// build, so a build that needs the network is refused and a source fetch
-/// opens no connection.
-#[derive(Clone)]
-pub struct BuildNetwork {
-    make: std::sync::Arc<dyn Fn() -> std::sync::Arc<dyn sandbox::Network> + Send + Sync>,
-    denies_all: bool,
-    no_network: bool,
-    admits_name: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    /// The namespace the source fetches of this box share while any runs.
-    /// One holds a single task address however many fetches overlap, and the
-    /// box has few of them.
-    fetching: std::sync::Arc<tokio::sync::Mutex<std::sync::Weak<sandbox::HeldNetwork>>>,
-}
-
-impl BuildNetwork {
-    /// A build network that `make` makes again for each build.
-    pub fn new(
-        make: impl Fn() -> std::sync::Arc<dyn sandbox::Network> + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            make: std::sync::Arc::new(make),
-            denies_all: false,
-            no_network: false,
-            admits_name: std::sync::Arc::new(|_| true),
-            fetching: Default::default(),
-        }
-    }
-
-    /// The network of a box that has none: every build stays in an empty
-    /// namespace.
-    #[must_use]
-    pub fn none() -> Self {
-        Self {
-            no_network: true,
-            ..Self::new(|| std::sync::Arc::new(sandbox::NoNet))
-        }
-    }
-
-    /// Records whether the egress rules of the network admit no destination,
-    /// so the caller that reads a failed build can name the refusal.
-    #[must_use]
-    pub fn with_denies_all(mut self, denies_all: bool) -> Self {
-        self.denies_all = denies_all;
-        self
-    }
-
-    /// Whether the egress rules of the network admit no destination.
-    pub fn denies_all(&self) -> bool {
-        self.denies_all
-    }
-
-    /// Records which host names the egress rules of the network allow. It
-    /// is the same answer the box's own name query would get.
-    #[must_use]
-    pub fn with_admits_name(
-        mut self,
-        admits: impl Fn(&str) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        self.admits_name = std::sync::Arc::new(admits);
-        self
-    }
-
-    /// Whether the box has no network to attach a build to.
-    pub fn is_none(&self) -> bool {
-        self.no_network
-    }
-
-    /// A new network for one build.
-    pub fn network(&self) -> std::sync::Arc<dyn sandbox::Network> {
-        (self.make)()
-    }
-
-    /// Why a source fetch on this network opens no connection, if it opens
-    /// none.
-    pub(crate) fn refusal(&self) -> Option<&'static str> {
-        if self.no_network {
-            Some(common::NO_NETWORK)
-        } else if self.denies_all {
-            Some(common::RULES_REFUSE)
-        } else {
-            None
-        }
-    }
-
-    /// The namespace for a source fetch, and what keeps it up, which the
-    /// fetch holds until it ends. `exec_base` holds the namespace's sandbox.
-    pub(crate) async fn hold(
-        &self,
-        exec_base: &std::path::Path,
-    ) -> anyhow::Result<(common::NetNamespace, std::sync::Arc<sandbox::HeldNetwork>)> {
-        let mut fetching = self.fetching.lock().await;
-        let held = match fetching.upgrade() {
-            Some(held) => held,
-            None => {
-                let held =
-                    std::sync::Arc::new(sandbox::hold_network(exec_base, self.network()).await?);
-                *fetching = std::sync::Arc::downgrade(&held);
-                held
-            }
-        };
-        let namespace = common::NetNamespace::of_process(
-            held.pid(),
-            held.nameservers(),
-            self.admits_name.clone(),
-        )?;
-        Ok((namespace, held))
-    }
-}
-
-impl std::fmt::Debug for BuildNetwork {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BuildNetwork")
-            .field("denies_all", &self.denies_all)
-            .finish_non_exhaustive()
-    }
+    /// A patched build (`override_deps` that a person chose): it always gets
+    /// the network, and it counts as workspace (NET-169).
+    pub patched: bool,
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
-    /// Where this build's sources are fetched, if it runs for a box.
-    fn source_place<'b>(
-        &'b self,
-        exec_base: &'b std::path::Path,
-    ) -> Option<crate::SourcePlace<'b>> {
-        match (&self.classifier_leaf, &self.box_network) {
-            (Some(leaf), _) => Some(crate::SourcePlace::Leaf(leaf)),
-            (None, Some(network)) => Some(crate::SourcePlace::Network { network, exec_base }),
-            (None, None) => None,
-        }
-    }
-
-    /// Whether this build, or any package in its closure, declares that it
-    /// needs the network. It reads the graph, not the plan: the plan of a
-    /// build with `override_deps` gives every build the network.
-    fn declares_network(&self, graph: &graph::Graph) -> bool {
-        let declares = |bsr: &BuildSpecRef| {
-            graph.get(bsr).is_some_and(|build| {
-                ["dns", "internet"]
-                    .iter()
-                    .any(|need| build.abstract_deps.get(*need).is_some())
-            })
-        };
-        declares(self.spec)
-            || Transitives::new(graph, self.spec, true)
-                .transitive_runtime_deps
-                .keys()
-                .any(declares)
-    }
-
     async fn build_deps_mapped<'b>(
         &mut self,
         build: &BuildSpec,
@@ -240,7 +77,8 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         source,
                         remote_fetcher: self.remote_fetcher,
                         into: None,
-                        place: self.source_place(&opts.exec_base),
+                        build_box: self.build_box.as_ref(),
+                        package: &build.name,
                     }
                     .run(&Options {
                         ot: Some(op.to_owned()),
@@ -281,17 +119,24 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         opts: &Options<'a>,
     ) -> Result<(HashSet<SandboxMapped>, bool, bool), Error> {
         if let Some(deps) = &self.override_deps {
+            // Outside a box, a build with overridden dependencies has always
+            // had the network. In a box only a patched build does: any other
+            // build's own `needs` decide (NET-155).
+            let (needs_dns, needs_internet) = if self.build_box.is_none() || self.patched {
+                (true, true)
+            } else {
+                crate::build_box::declared_needs(opts.graph, self.spec)
+            };
             return Ok((
                 deps.iter().map(|p| SandboxMapped::Dir(p.clone())).collect(),
-                true,
-                true,
+                needs_dns,
+                needs_internet,
             ));
         }
 
         let mut dependencies = HashSet::new();
         let transitives = Transitives::new(opts.graph, self.spec, true);
 
-        let (mut needs_dns, mut need_internet) = (false, false);
         let build_deps: Vec<_> = transitives.transitive_runtime_deps.into_iter().collect();
         for (bsr, dep_info) in build_deps.into_iter() {
             match dep_info.outputs {
@@ -336,38 +181,9 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     ));
                 }
             }
-
-            needs_dns |= opts
-                .graph
-                .get(&bsr)
-                .unwrap()
-                .abstract_deps
-                .get("dns")
-                .is_some();
-            need_internet |= opts
-                .graph
-                .get(&bsr)
-                .unwrap()
-                .abstract_deps
-                .get("internet")
-                .is_some();
         }
 
-        // We should also consider if the spec being-built needs internet, rather than just its deps.
-        needs_dns |= opts
-            .graph
-            .get(self.spec)
-            .unwrap()
-            .abstract_deps
-            .get("dns")
-            .is_some();
-        need_internet |= opts
-            .graph
-            .get(self.spec)
-            .unwrap()
-            .abstract_deps
-            .get("internet")
-            .is_some();
+        let (needs_dns, need_internet) = crate::build_box::declared_needs(opts.graph, self.spec);
 
         Ok((dependencies, needs_dns, need_internet))
     }
@@ -438,7 +254,8 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 source,
                 remote_fetcher: self.remote_fetcher,
                 into: Some(out_dir),
-                place: self.source_place(&opts.exec_base),
+                build_box: self.build_box.as_ref(),
+                package: &build.name,
             }
             .run(opts)
             .await;
@@ -534,9 +351,15 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         let _ = writer.flush().await;
     }
 
-    /// The sandbox configuration this build runs in. A build placed for a box
-    /// (NET-155) carries that box's classifier leaf, so its sandbox joins the
-    /// box's leaf and not the leaf of the process that starts it.
+    /// The sandbox configuration this build runs in. A build for a box runs
+    /// in its build box (NET-155): an empty network namespace when it needs
+    /// no network, and the build box's own network when it does, never the
+    /// host's. Only a build outside any box gets the host plan.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of a build that needs the network its build box does not
+    /// have, before anything of the build runs.
     fn sandbox_config(
         &self,
         build: &BuildSpec,
@@ -545,19 +368,20 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         needs_dns: bool,
         needs_internet: bool,
         daemon_id: Option<&String>,
-    ) -> sandbox::config::Config {
+    ) -> Result<sandbox::config::Config, Error> {
+        let needs_network = needs_dns || needs_internet;
         let mut config = sandbox::config::Config::new(&build.name)
             .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter())
             .with_dns(needs_dns)
             // A build that needs neither DNS nor the internet runs in an empty
-            // network namespace; anything else shares the host's. Said as a plan
-            // rather than as a mode: a build is not a PTask and has never had
-            // one, and the sandbox layer acts on plans.
-            .with_plan(if !needs_dns && !needs_internet {
-                sandbox::NetPlan::isolated()
-            } else {
+            // network namespace. Said as a plan rather than as a mode: a build
+            // is not a PTask and has never had one, and the sandbox layer acts
+            // on plans.
+            .with_plan(if needs_network && self.build_box.is_none() {
                 sandbox::NetPlan::host()
+            } else {
+                sandbox::NetPlan::isolated()
             });
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());
@@ -568,17 +392,15 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         if let Some(id) = daemon_id {
             config = config.with_daemon_id(id.clone());
         }
-        if let Some(leaf) = &self.classifier_leaf {
-            config = config.with_classifier_leaf(leaf.clone());
-        }
-        // NET-155: a build that needs the network, for an own-address box,
-        // runs on that box's network and under its egress verdict.
-        if let Some(network) = &self.box_network
-            && (needs_dns || needs_internet)
+        if let Some(build_box) = &self.build_box
+            && needs_network
         {
+            let Some(network) = build_box.opened() else {
+                return Err(build_box.needs_network());
+            };
             config = config.with_network(network.network());
         }
-        config
+        Ok(config)
     }
 }
 
@@ -611,16 +433,23 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             )));
         }
 
-        // NET-155: a box with no network has none to give this build, and
-        // the daemon's is not the box's to use.
-        if self.box_network.as_ref().is_some_and(BuildNetwork::is_none)
-            && self.declares_network(opts.graph)
-        {
-            return Err(Error::Other(anyhow!(NEEDS_NETWORK)));
-        }
-
         let inputs = self.build_deps_mapped(build, opts, &build_op).await?;
         let (rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
+
+        // A build that declares no network has fetched all it will: its
+        // grant ends here, and its steps run with no address (NET-167). A
+        // process on the build box's network waits for room on it.
+        let _network_slot = match &self.build_box {
+            Some(build_box) if needs_dns || needs_internet => match build_box.network().await {
+                Some(network) => Some(network.slot().await),
+                None => None,
+            },
+            Some(build_box) => {
+                build_box.close().await;
+                None
+            }
+            None => None,
+        };
 
         let channel = ();
 
@@ -631,7 +460,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             needs_dns,
             needs_internet,
             opts.daemon_id.as_ref(),
-        );
+        )?;
         let mut sandbox = config.build(&opts.exec_base, channel).await?;
         sandbox.keep_dir(true);
 
@@ -754,9 +583,8 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
-            _place: Option<crate::SourcePlace<'_>>,
             _op: &OpTracker,
-        ) -> anyhow::Result<(PathBuf, bool)> {
+        ) -> anyhow::Result<PathBuf> {
             unreachable!("source fetch must not happen on these build paths")
         }
 
@@ -780,10 +608,9 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
-            _place: Option<crate::SourcePlace<'_>>,
             _op: &OpTracker,
-        ) -> anyhow::Result<(PathBuf, bool)> {
-            Ok((self.0.clone(), false))
+        ) -> anyhow::Result<PathBuf> {
+            Ok(self.0.clone())
         }
 
         async fn download_gcs(
@@ -815,8 +642,8 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
-            classifier_leaf: None,
-            box_network: None,
+            build_box: None,
+            patched: false,
         }
     }
 
@@ -895,55 +722,6 @@ mod tests {
         );
     }
 
-    /// NET-155: a box with no network refuses a build that declares it needs
-    /// the network, itself or through its closure, before any source is
-    /// fetched. The test reads the declaration, not the plan, because
-    /// `override_deps` gives every build a network plan. A build with no
-    /// such need goes on, and no other box's build is refused here.
-    #[test]
-    fn a_box_with_no_network_refuses_a_build_that_declares_the_need() {
-        let dg = graph_from(indoc! {r#"
-            let {BuildSpec, Needs, ..} = import "minimal.ncl" in
-            {
-                name = "needs-net",
-                build_deps = [],
-                needs = { internet = {} } | Needs,
-                cmd = "curl https://example.invalid/",
-            } | BuildSpec
-        "#});
-        let bsr = *dg.by_name("needs-net").unwrap();
-        let tmp = TempDir::new().unwrap();
-        let cache = Cache::at_dir(tmp.path()).unwrap();
-        let fetcher = UnusedFetcher;
-        let opts = Options {
-            cache,
-            graph: &dg,
-            exec_base: "/not-exists".into(),
-            ot: None,
-            daemon_id: None,
-        };
-
-        let mut build = spec_build(&bsr, &fetcher);
-        build.override_deps = Some(BTreeSet::new());
-        build.box_network = Some(BuildNetwork::none());
-        let refused = futures::executor::block_on(build.run(&opts))
-            .err()
-            .expect("a box with no network refuses the build");
-        assert_eq!(refused.to_string(), format!("other: {NEEDS_NETWORK}"));
-
-        let dg = graph_from(indoc! {r#"
-            let {BuildSpec, ..} = import "minimal.ncl" in
-            {
-                name = "offline",
-                build_deps = [],
-                cmd = "true",
-            } | BuildSpec
-        "#});
-        let bsr = *dg.by_name("offline").unwrap();
-        let offline = spec_build(&bsr, &fetcher);
-        assert!(!offline.declares_network(&dg));
-    }
-
     /// A non-extracted source reaches the sandbox's writable /build as a private
     /// copy of the cached file. A hardlink there would be the download cache's own
     /// inode, so a build appending to its input changed the cached source for any
@@ -979,8 +757,8 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
-            classifier_leaf: None,
-            box_network: None,
+            build_box: None,
+            patched: false,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -995,51 +773,122 @@ mod tests {
         assert_eq!(deps, vec![SandboxMapped::FileCopy(cached)]);
     }
 
-    /// NET-155: a spec build placed for a box runs its sandbox in that box's
-    /// classifier leaf. A build with no placement names no leaf, so its
-    /// sandbox stays in the cgroup of the process that starts it.
-    #[test]
-    fn spec_build_runs_in_the_given_classifier_leaf() {
-        let dg = graph_from(indoc! {r#"
+    fn network_build() -> Graph {
+        graph_from(indoc! {r#"
             let {BuildSpec, ..} = import "minimal.ncl" in
             {
                 name = "downloads-at-build",
                 build_deps = [],
                 cmd = "curl https://example.invalid/",
             } | BuildSpec
-        "#});
+        "#})
+    }
+
+    fn build_box(network: Option<crate::BuildNetwork>) -> crate::BuildBox {
+        crate::BuildBox::on_network("/nonexistent".into(), network)
+    }
+
+    fn some_network() -> crate::BuildNetwork {
+        crate::BuildNetwork::new(|| {
+            std::sync::Arc::new(sandbox::NoNet) as std::sync::Arc<dyn sandbox::Network>
+        })
+    }
+
+    /// NET-155: a build for a box runs on its build box's network and never
+    /// gets the host plan. Only a build outside any box does.
+    #[test]
+    fn box_build_never_gets_the_host_plan() {
+        let dg = network_build();
         let bsr = *dg.by_name("downloads-at-build").unwrap();
         let build = dg.get(&bsr).unwrap();
         let fetcher = UnusedFetcher;
-        let leaf = sandbox::config::ClassifierLeaf::under(
-            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
-            "box-1",
-            sandbox::config::Verdict::Deny,
-        );
 
-        let mut placed = spec_build(&bsr, &fetcher);
-        placed.classifier_leaf = Some(leaf.clone());
-        let config = placed.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
-        assert_eq!(config.classifier_leaf, Some(leaf));
-
-        let unplaced = spec_build(&bsr, &fetcher);
-        let config = unplaced.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
-        assert_eq!(config.classifier_leaf, None);
-        assert!(config.network.is_none());
-
-        // An own-address box has no leaf. Its build runs on the box's own
-        // network when the build needs the network, and in an empty
-        // namespace when it does not.
-        let mut on_box_network = spec_build(&bsr, &fetcher);
-        on_box_network.box_network = Some(BuildNetwork::new(|| {
-            std::sync::Arc::new(sandbox::NoNet) as std::sync::Arc<dyn sandbox::Network>
-        }));
-        let config =
-            on_box_network.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
-        assert_eq!(config.classifier_leaf, None);
+        let mut in_a_box = spec_build(&bsr, &fetcher);
+        in_a_box.build_box = Some(build_box(Some(some_network())));
+        let config = in_a_box
+            .sandbox_config(build, Vec::new(), HashSet::new(), true, true, None)
+            .unwrap();
         assert!(config.network.is_some());
-        let config =
-            on_box_network.sandbox_config(build, Vec::new(), HashSet::new(), false, false, None);
+        assert_ne!(config.plan, sandbox::NetPlan::host());
+
+        let outside = spec_build(&bsr, &fetcher);
+        let config = outside
+            .sandbox_config(build, Vec::new(), HashSet::new(), true, true, None)
+            .unwrap();
         assert!(config.network.is_none());
+        assert_eq!(config.plan, sandbox::NetPlan::host());
+    }
+
+    /// NET-155: a build that needs no network stays in an empty namespace,
+    /// whichever network its build box has.
+    #[test]
+    fn build_that_needs_no_network_stays_in_an_empty_namespace() {
+        let dg = network_build();
+        let bsr = *dg.by_name("downloads-at-build").unwrap();
+        let build = dg.get(&bsr).unwrap();
+        let fetcher = UnusedFetcher;
+
+        for network in [Some(some_network()), None] {
+            let mut in_a_box = spec_build(&bsr, &fetcher);
+            in_a_box.build_box = Some(build_box(network));
+            let config = in_a_box
+                .sandbox_config(build, Vec::new(), HashSet::new(), false, false, None)
+                .unwrap();
+            assert!(config.network.is_none());
+            assert_eq!(config.plan, sandbox::NetPlan::isolated());
+        }
+    }
+
+    /// NET-155: a build that needs the network its build box does not have
+    /// is refused before its sandbox exists, so no packet leaves.
+    #[test]
+    fn build_box_with_no_network_refuses_before_any_packet() {
+        let dg = network_build();
+        let bsr = *dg.by_name("downloads-at-build").unwrap();
+        let build = dg.get(&bsr).unwrap();
+        let fetcher = UnusedFetcher;
+
+        let mut in_a_box = spec_build(&bsr, &fetcher);
+        in_a_box.build_box = Some(build_box(None));
+        let refused = in_a_box
+            .sandbox_config(build, Vec::new(), HashSet::new(), true, false, None)
+            .expect_err("the build needs a network its build box does not have");
+        assert_eq!(
+            refused.to_string(),
+            format!("other: {}", crate::NEEDS_NETWORK_RULES)
+        );
+    }
+
+    /// NET-155: in a box, a build's own `needs` decide its network even when
+    /// its dependencies come ready-made. Only a patched build keeps the
+    /// network, and outside a box every such build keeps it.
+    #[tokio::test]
+    async fn override_deps_needs_follow_the_spec_in_a_box() {
+        let dg = network_build();
+        let bsr = *dg.by_name("downloads-at-build").unwrap();
+        let fetcher = UnusedFetcher;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("cache")).unwrap();
+        let opts = crate::Options {
+            cache: lcache::Cache::at_dir(tmp.path().join("cache")).unwrap(),
+            graph: &dg,
+            exec_base: tmp.path().to_path_buf(),
+            ot: None,
+            daemon_id: None,
+        };
+        let build = dg.get(&bsr).unwrap();
+
+        let mut sb = spec_build(&bsr, &fetcher);
+        sb.override_deps = Some(Default::default());
+        let (_, dns, internet) = sb.rootfs_mapped(build, &opts).await.unwrap();
+        assert!(dns && internet, "outside a box nothing changes");
+
+        sb.build_box = Some(build_box(Some(some_network())));
+        let (_, dns, internet) = sb.rootfs_mapped(build, &opts).await.unwrap();
+        assert!(!dns && !internet, "in a box the spec's needs decide");
+
+        sb.patched = true;
+        let (_, dns, internet) = sb.rootfs_mapped(build, &opts).await.unwrap();
+        assert!(dns && internet, "a patched build keeps the network");
     }
 }

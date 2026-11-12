@@ -1250,6 +1250,7 @@ mod tests {
                 hold: false,
                 task_slots: 0,
                 host_ip: false,
+                stays_detached: false,
             },
         )
         .await
