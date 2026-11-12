@@ -67,7 +67,8 @@ pub mod attr {
     pub const SIGN: u32 = 1 << 18;
 
     /// Every attribute that custody needs on each proxy key.
-    pub const CUSTODY: u32 = FIXED_TPM | FIXED_PARENT | SENSITIVE_DATA_ORIGIN | USER_WITH_AUTH | NO_DA;
+    pub const CUSTODY: u32 =
+        FIXED_TPM | FIXED_PARENT | SENSITIVE_DATA_ORIGIN | USER_WITH_AUTH | NO_DA;
 }
 
 const TPM_ALG_ECC: u16 = 0x0023;
@@ -257,7 +258,11 @@ fn ecc_point(key: &ProxyPublicKey) -> Vec<u8> {
     let sec1 = key.to_sec1_bytes();
     let (x, y) = sec1[1..].split_at(FIELD_LEN);
     let mut out = Vec::with_capacity(2 + 2 * (2 + FIELD_LEN));
-    out.extend_from_slice(&u16::try_from(2 * (2 + FIELD_LEN)).unwrap_or(0).to_be_bytes());
+    out.extend_from_slice(
+        &u16::try_from(2 * (2 + FIELD_LEN))
+            .unwrap_or(0)
+            .to_be_bytes(),
+    );
     for half in [x, y] {
         out.extend_from_slice(&u16::try_from(FIELD_LEN).unwrap_or(0).to_be_bytes());
         out.extend_from_slice(half);
@@ -389,9 +394,7 @@ impl TpmStore {
     fn work_dir(&self) -> io::Result<WorkDir> {
         self.make_dir()?;
         let n = WORK_DIRS.fetch_add(1, Ordering::Relaxed);
-        let path = self
-            .dir
-            .join(format!(".work-{}-{n}", std::process::id()));
+        let path = self.dir.join(format!(".work-{}-{n}", std::process::id()));
         fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(WorkDir(path))
     }
@@ -409,7 +412,12 @@ impl TpmStore {
         result
     }
 
-    fn run_once(&self, tool: &str, args: &[OsString], stdin: Option<&[u8]>) -> Result<(), ToolError> {
+    fn run_once(
+        &self,
+        tool: &str,
+        args: &[OsString],
+        stdin: Option<&[u8]>,
+    ) -> Result<(), ToolError> {
         let mut child = Command::new(tool)
             .args(args)
             .env("TPM2TOOLS_TCTI", &self.tcti)
@@ -443,7 +451,11 @@ impl TpmStore {
             Some(code) => ToolError::Tpm(format!("{tool} failed with TPM response code {code}")),
             None => ToolError::Other(format!(
                 "{tool} failed: {}",
-                stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output")
+                stderr
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("no output")
             )),
         })
     }
@@ -519,11 +531,14 @@ impl TpmStore {
 
     fn generate_files(&self, role: Role, slot: Slot) -> Result<TpmKey, KeyError> {
         let store_err = |detail: String| KeyError::Store { role, detail };
-        let auth = new_auth().map_err(|err| store_err(format!("the OS random source failed: {err}")))?;
+        let auth =
+            new_auth().map_err(|err| store_err(format!("the OS random source failed: {err}")))?;
         let work = self
             .work_dir()
             .map_err(|err| store_err(format!("did not make the TPM work directory: {err}")))?;
-        let primary = self.primary(&work.0).map_err(|err| err.into_key_error(role))?;
+        let primary = self
+            .primary(&work.0)
+            .map_err(|err| err.into_key_error(role))?;
         let public = work.0.join("new.pub");
         let private = work.0.join("new.priv");
         let template = key_template(role);
@@ -556,7 +571,8 @@ impl TpmStore {
         bytes.extend(read(&private)?);
         let key_path = self.key_path(role, slot);
         let auth_path = self.auth_path(role, slot);
-        let written = write_private(&auth_path, &auth).and_then(|()| write_private(&key_path, &bytes));
+        let written =
+            write_private(&auth_path, &auth).and_then(|()| write_private(&key_path, &bytes));
         if let Err(err) = written {
             let _ = fs::remove_file(&key_path);
             let _ = fs::remove_file(&auth_path);
@@ -629,7 +645,10 @@ impl TpmKey {
     }
 
     fn load(&self) -> Result<(), KeyError> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.reload(&mut state)
     }
 
@@ -646,7 +665,10 @@ impl TpmKey {
     /// context that an earlier command saved, loads the key again from its
     /// blob and runs `op` once more.
     fn with_context<T>(&self, op: impl Fn(&Path) -> Result<T, ToolError>) -> Result<T, KeyError> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fresh = !state.0;
         if fresh {
             self.reload(&mut state)?;
@@ -701,9 +723,7 @@ impl HeldKey for TpmKey {
     fn probe(&self) -> Result<(), KeyError> {
         match self.role {
             Role::Sealing => self.agree(&self.public).map(drop),
-            Role::Root | Role::Signing => {
-                crate::ca::CaKey::sign(self, b"bep key probe").map(drop)
-            }
+            Role::Root | Role::Signing => crate::ca::CaKey::sign(self, b"bep key probe").map(drop),
         }
     }
 }
@@ -719,8 +739,10 @@ impl crate::ca::CaKey for TpmKey {
             let args: Vec<OsString> = args(&["-c"], &[ctx])
                 .into_iter()
                 .chain(
-                    ["-p", "file:-", "-g", "sha256", "-s", "ecdsa", "-d", "-f", "plain"]
-                        .map(OsString::from),
+                    [
+                        "-p", "file:-", "-g", "sha256", "-s", "ecdsa", "-d", "-f", "plain",
+                    ]
+                    .map(OsString::from),
                 )
                 .chain(args(&["-o"], &[&out]))
                 .chain([digest_path.as_os_str().to_owned()])
@@ -811,8 +833,8 @@ impl KeyStore for TpmStore {
                 detail: "the store holds no key to move".into(),
             });
         }
-        let moved = fs::rename(self.auth_path(role, from), self.auth_path(role, to))
-            .and_then(|()| {
+        let moved =
+            fs::rename(self.auth_path(role, from), self.auth_path(role, to)).and_then(|()| {
                 fs::rename(&key_from, &key_to).inspect_err(|_| {
                     let _ = fs::rename(self.auth_path(role, to), self.auth_path(role, from));
                 })
@@ -873,7 +895,13 @@ mod tests {
             }
             assert_eq!(template.attributes & attr::RESTRICTED, 0, "{role}");
             let names = template.attribute_names();
-            for name in ["fixedtpm", "fixedparent", "noda", "userwithauth", "sensitivedataorigin"] {
+            for name in [
+                "fixedtpm",
+                "fixedparent",
+                "noda",
+                "userwithauth",
+                "sensitivedataorigin",
+            ] {
                 assert!(names.split('|').any(|n| n == name), "{role}: {names}");
             }
             assert!(template.algorithm.starts_with("ecc256:"));
@@ -890,7 +918,12 @@ mod tests {
         assert_eq!(used, full.len());
         assert_eq!(public.key, key);
         check_public(Role::Root, &public).expect("every attribute");
-        for missing in [attr::NO_DA, attr::FIXED_TPM, attr::FIXED_PARENT, attr::USER_WITH_AUTH] {
+        for missing in [
+            attr::NO_DA,
+            attr::FIXED_TPM,
+            attr::FIXED_PARENT,
+            attr::USER_WITH_AUTH,
+        ] {
             let area = public_area(key_template(Role::Root).attributes & !missing, &key);
             let (public, _) = parse_public(&area).expect("a public area");
             assert!(check_public(Role::Root, &public).is_err(), "{missing:#x}");
@@ -910,7 +943,10 @@ mod tests {
         write_private(&path, &a).expect("write");
         let mode = fs::metadata(&path).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        let dir_mode = fs::metadata(store.dir()).expect("meta").permissions().mode();
+        let dir_mode = fs::metadata(store.dir())
+            .expect("meta")
+            .permissions()
+            .mode();
         assert_eq!(dir_mode & 0o777, 0o700);
         assert_eq!(fs::read(&path).expect("read"), *a);
     }
@@ -932,7 +968,9 @@ mod tests {
     #[test]
     fn tpm_outputs_read_as_the_proxy_expects() {
         assert_eq!(
-            response_code("ERROR:esys:src/tss2-esys/api/Esys_Sign.c:3 Esys_Sign_Finish() Received a non-TPM Error ErrorCode (0x000009a2)"),
+            response_code(
+                "ERROR:esys:src/tss2-esys/api/Esys_Sign.c:3 Esys_Sign_Finish() Received a non-TPM Error ErrorCode (0x000009a2)"
+            ),
             Some("0x000009a2")
         );
         assert_eq!(response_code("Tss2_Tcti_Swtpm_Init() Cannot connect"), None);
@@ -942,7 +980,10 @@ mod tests {
         assert_eq!(point.len(), 2 + 2 * (2 + FIELD_LEN));
         let sec1 = key.to_sec1_bytes();
         assert_eq!(*shared_x(&point).expect("x"), sec1[1..=FIELD_LEN].to_vec());
-        assert_eq!(*shared_x(&sec1[1..]).expect("x"), sec1[1..=FIELD_LEN].to_vec());
+        assert_eq!(
+            *shared_x(&sec1[1..]).expect("x"),
+            sec1[1..=FIELD_LEN].to_vec()
+        );
 
         let raw = [7u8; 64];
         let der = der_signature(&raw).expect("der");
