@@ -191,7 +191,9 @@ async fn box_has_terminal(
 /// `ESC \`), the DCS, SOS, PM and APC strings, the other escape sequences,
 /// and the C0 control codes except tab, line feed and carriage return. A
 /// sequence can be split across chunks: the state carries over. A line
-/// feed ends an OSC, DCS, SOS, PM or APC string that has no end. Bytes of
+/// feed ends an OSC, DCS, SOS, PM or APC string that has no end. A line
+/// feed or a carriage return ends a CSI or escape sequence that has no
+/// final byte, and stays as text. Bytes of
 /// 0x80 and up pass through, so UTF-8 text stays whole.
 #[derive(Debug, Default)]
 pub(crate) struct ControlStripper {
@@ -264,6 +266,12 @@ impl ControlStripper {
             },
             EscapeIntermediate => match byte {
                 Self::ESC => Escape,
+                // A sequence with no final byte must not hide the rest of the
+                // log, so a line end ends it and is kept as text.
+                b'\n' | b'\r' => {
+                    text.push(byte);
+                    Ground
+                }
                 0x20..=0x2f => EscapeIntermediate,
                 0x30..=0x7e => Ground,
                 0x00..=0x1f | 0x7f => EscapeIntermediate,
@@ -274,6 +282,10 @@ impl ControlStripper {
             },
             Csi => match byte {
                 Self::ESC => Escape,
+                b'\n' | b'\r' => {
+                    text.push(byte);
+                    Ground
+                }
                 0x40..=0x7e => Ground,
                 0x00..=0x3f | 0x7f => Csi,
                 _ => {

@@ -13256,6 +13256,14 @@ async fn box_logs_piped_pty_transcript_has_no_control_codes() {
     let mut text = Vec::new();
     ControlStripper::default().strip(b"a\x1b]0;title\nnext line\n", &mut text);
     assert_eq!(text, b"a\nnext line\n");
+    // A CSI or escape sequence with no final byte stops at the line end,
+    // so the next line still shows.
+    let mut text = Vec::new();
+    ControlStripper::default().strip(b"a\x1b[12\nnext line\n", &mut text);
+    assert_eq!(text, b"a\nnext line\n");
+    let mut text = Vec::new();
+    ControlStripper::default().strip(b"a\x1b(\rnext\x1b[1;\nline\n", &mut text);
+    assert_eq!(text, b"a\rnext\nline\n");
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
     let state = tempfile::tempdir().expect("a temp daemon state dir");
