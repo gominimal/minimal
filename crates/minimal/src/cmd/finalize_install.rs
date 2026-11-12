@@ -1088,6 +1088,7 @@ pub(crate) mod linux {
     /// identities as two cgroup matches and translates nothing, and an
     /// association later adds the reserved addresses to the same matches
     /// without a reinstall.
+    #[cfg(test)]
     pub(crate) fn classifier_item_over(
         facts: &ClassifierFacts,
         operator: &str,
@@ -1503,6 +1504,7 @@ pub(crate) mod linux {
     /// sudoers drop-in are installed root-owned. Otherwise it names the
     /// helper's path and carries the classifier step, which installs both,
     /// or it is blocked by what blocks that step.
+    #[cfg(test)]
     pub(crate) fn quic443_helper_item_over(
         helper: Quic443HelperFacts,
         classifier: &ClassifierFacts,
