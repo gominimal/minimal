@@ -312,10 +312,14 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p bep a_locked_secret_service_refuses_start
     <!-- unwanted; the remedy is not `bep --replace-key`, because the keys still exist; no command unlocks the keyring for every desktop, so the message states the situation -->
-  - IF a proxy key is in Secret Service and Secret Service cannot be reached THEN THE SYSTEM SHALL refuse to start and report that no Secret Service is running in this session.
+  - IF a proxy key is in Secret Service and Secret Service cannot be reached THEN THE SYSTEM SHALL refuse to start, report that Secret Service cannot be reached from this session, and report that the proxy starts from the desktop session that holds the login keyring.
     tier:   T0
     verify: cargo nextest run -p bep an_unreachable_secret_service_refuses_start
-    <!-- unwanted; distinct from a locked keyring, because unlocking does not help when no session bus or keyring daemon runs, as in a plain SSH session; the remedy is to start the proxy from the desktop session that holds the keyring -->
+    <!-- unwanted; distinct from a locked keyring, because unlocking does not help when no session bus or keyring daemon runs, as in a plain SSH session; the keys still exist, so the remedy is where the proxy starts, never `bep --replace-key` -->
+  - IF a proxy key is in a TPM and the TPM cannot load it THEN THE SYSTEM SHALL refuse to start, report that the TPM cannot load the key of that role, and name `bep --replace-key <role>` with that role.
+    tier:   T0
+    verify: cargo nextest run -p bep a_tpm_key_the_tpm_cannot_load_refuses_start
+    <!-- unwanted; a TPM that is missing, cleared or replaced cannot load the blob, and the key is then lost, so replacement is the remedy, as BEP-060's refusal names it; the proxy never generates the key again by itself and never falls back to Secret Service (BEP-089); a `noDA` key is not refused by dictionary-attack lockout, so lockout is not this case -->
 
 - **BEP-090** WHILE the proxy holds a key in Secret Service THE SYSTEM SHALL report on `min auth status` that key's role and that it is a software key, which a program running as the operator's user can copy.
   tier:     T0
