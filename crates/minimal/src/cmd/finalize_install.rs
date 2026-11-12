@@ -754,6 +754,24 @@ pub(crate) mod linux {
          min host stop local0, which stops each running box and then the daemon. Then run min ls, \
          which starts the daemon again.";
 
+    /// [`DAEMON_RUNNING_NOTE`] for the daemon of `minimal_dir`, the
+    /// `--minimal-dir` this run was given: both commands carry the flag, so
+    /// they stop and start the daemon the step placed, not the default one.
+    /// No quoting is needed: the socket path is the directory joined with
+    /// more names, and the block refuses a socket path outside
+    /// `[A-Za-z0-9._/-]` before it renders this note.
+    pub(crate) fn daemon_running_note(minimal_dir: Option<&str>) -> String {
+        match minimal_dir {
+            None => DAEMON_RUNNING_NOTE.to_string(),
+            Some(dir) => DAEMON_RUNNING_NOTE
+                .replace(
+                    "min host stop local0,",
+                    &format!("min host stop local0 --minimal-dir {dir},"),
+                )
+                .replace("min ls,", &format!("min ls --minimal-dir {dir},")),
+        }
+    }
+
     /// What the step's `--place-listener` prints when no process holds the
     /// daemon's socket, so no daemon is running: the classifier block prints
     /// [`DAEMON_RUNNING_NOTE`] for any other outcome, on a host where it
@@ -1075,6 +1093,18 @@ pub(crate) mod linux {
         operator: &str,
         socket: &str,
     ) -> Item {
+        classifier_item_over_in(facts, operator, socket, None)
+    }
+
+    /// [`classifier_item_over`] for the daemon of `minimal_dir`, the
+    /// `--minimal-dir` this run was given, which the block's restart note
+    /// names (see [`daemon_running_note`]).
+    pub(crate) fn classifier_item_over_in(
+        facts: &ClassifierFacts,
+        operator: &str,
+        socket: &str,
+        minimal_dir: Option<&str>,
+    ) -> Item {
         if let Some(uid) = facts.other_owner {
             return Item::cannot(
                 CLASSIFIER_ID,
@@ -1236,6 +1266,7 @@ pub(crate) mod linux {
                             operator,
                             socket,
                             facts.requested_mask.or(facts.recorded_mask),
+                            &daemon_running_note(minimal_dir),
                         ),
                     );
                 }
@@ -1301,7 +1332,7 @@ pub(crate) mod linux {
     /// `--ct-mark-mask` both now and in the boot unit: the mask's record
     /// lives in cgroupfs, which a reboot empties, so the unit is what keeps
     /// the operator's bits across one.
-    fn classifier_steps(operator: &str, socket: &str, mask: Option<u32>) -> String {
+    fn classifier_steps(operator: &str, socket: &str, mask: Option<u32>, note: &str) -> String {
         let mask = mask
             .map(|bits| format!(" --ct-mark-mask 0x{bits:08x}"))
             .unwrap_or_default();
@@ -1413,7 +1444,7 @@ pub(crate) mod linux {
              case \"$place_units:$place_out\" in\n\
              no:*) ;;\n\
              *'{PLACE_NO_HOLDER}'*) ;;\n\
-             *) echo '{DAEMON_RUNNING_NOTE}' ;;\n\
+             *) echo '{note}' ;;\n\
              esac\n"
         )
     }
@@ -1478,18 +1509,31 @@ pub(crate) mod linux {
         operator: &str,
         socket: &str,
     ) -> Item {
+        quic443_helper_item_over_in(helper, classifier, operator, socket, None)
+    }
+
+    /// [`quic443_helper_item_over`] for the daemon of `minimal_dir`, as
+    /// [`classifier_item_over_in`].
+    pub(crate) fn quic443_helper_item_over_in(
+        helper: Quic443HelperFacts,
+        classifier: &ClassifierFacts,
+        operator: &str,
+        socket: &str,
+        minimal_dir: Option<&str>,
+    ) -> Item {
         if helper.helper_root_owned && helper.sudoers_root_owned {
             return Item::done(QUIC443_HELPER_ID, QUIC443_HELPER_LABEL);
         }
         // The classifier item as if its table were absent: its step is the
         // one that installs the helper, so its script or its cause is ours.
-        let step = classifier_item_over(
+        let step = classifier_item_over_in(
             &ClassifierFacts {
                 table_present: false,
                 ..*classifier
             },
             operator,
             socket,
+            minimal_dir,
         );
         match step.script {
             // The wording is the task's diagnostics line (#2607).
@@ -1551,9 +1595,14 @@ pub(crate) mod linux {
                 Err(_) => false,
             },
         };
+        let minimal_dir = global
+            .minimal_dir
+            .as_deref()
+            .map(|dir| dir.display().to_string());
+        let minimal_dir = minimal_dir.as_deref();
         [
-            classifier_item_over(&facts, &operator, &socket),
-            quic443_helper_item_over(helper, &facts, &operator, &socket),
+            classifier_item_over_in(&facts, &operator, &socket, minimal_dir),
+            quic443_helper_item_over_in(helper, &facts, &operator, &socket, minimal_dir),
         ]
     }
 
@@ -3787,6 +3836,41 @@ mod tests {
                 "{cgroup:?}"
             );
         }
+    }
+
+    /// gominimal/minimal#3305: a run given `--minimal-dir` placed that
+    /// directory's daemon, so the restart note's two commands carry the same
+    /// flag, and a run without one names neither.
+    #[test]
+    fn the_restart_note_names_the_minimal_dir_it_was_given() {
+        use linux::{
+            Cgroup2Mount, ClassifierFacts, DAEMON_RUNNING_NOTE, classifier_item_over_in,
+            daemon_running_note,
+        };
+        assert_eq!(daemon_running_note(None), DAEMON_RUNNING_NOTE);
+        let dir = "/home/alice/m";
+        let note = daemon_running_note(Some(dir));
+        assert!(note.contains("Run min host stop local0 --minimal-dir /home/alice/m, which"));
+        assert!(note.contains("Then run min ls --minimal-dir /home/alice/m, which starts"));
+        assert!(!note.contains('\''));
+        let facts = ClassifierFacts {
+            table_present: false,
+            recorded_mask: None,
+            requested_mask: None,
+            copy_current: false,
+            units_enabled: Some(false),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+            unplaced_daemon: None,
+            placer_listening: Some(true),
+        };
+        let sock = "/home/alice/m/providers/local-minimald0/ssh.sock";
+        let script = classifier_item_over_in(&facts, "alice", sock, Some(dir))
+            .script
+            .expect("a missing item carries its block");
+        assert!(script.contains(&format!("echo '{note}'")), "{script}");
+        assert!(!script.contains(DAEMON_RUNNING_NOTE), "{script}");
     }
 
     #[test]
