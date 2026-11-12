@@ -39,6 +39,14 @@ command -v python3 >/dev/null 2>&1 || { echo "publish-snapshot: python3 is requi
 root="$(git rev-parse --show-toplevel)"
 here="$(cd "$(dirname "$0")" && pwd)"
 snapshot="$(cd "$(dirname "$snapshot")" && pwd)/$(basename "$snapshot")"
+# A snapshot is tens of KiB; one over the cap is not parsed or published, so
+# an artifact cannot bloat the history branch every later run fetches.
+max_bytes=$((8 * 1024 * 1024))
+size="$(wc -c < "$snapshot" | tr -d ' ')"
+if [ "$size" -gt "$max_bytes" ]; then
+    echo "publish-snapshot: refusing a snapshot of $size bytes; the limit is $max_bytes" >&2
+    exit 2
+fi
 
 # Refuse what is not history. The checks are the snapshot's own fields, so a
 # caller cannot publish a darwin run by naming the file differently.

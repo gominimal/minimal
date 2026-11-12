@@ -892,6 +892,11 @@ PY
         [ "$status" -eq 2 ] && grep -q 'fails the schema' "$tmp/pub-schema.out" \
             && ok "a snapshot with $mut is refused by the schema" || bad "schema $mut exit $status: $(cat "$tmp/pub-schema.out")"
     done
+    # An oversized snapshot is refused before it is parsed.
+    python3 -c "import json,sys; s=json.load(open(sys.argv[1])); s['pad']='x'*(8*1024*1024); json.dump(s,open(sys.argv[2],'w'))" "$tmp/pub-snap.json" "$tmp/pub-big.json"
+    status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-big.json" --date 2026-10-16 >"$tmp/pub-big.out" 2>&1) || status=$?
+    [ "$status" -eq 2 ] && grep -q 'the limit is' "$tmp/pub-big.out" \
+        && ok "an oversized snapshot is refused" || bad "oversized snapshot exit $status: $(cat "$tmp/pub-big.out")"
     # The artifact is untrusted: a field that would leave history/ is refused
     # before anything is written, and so is a dirty flag that is not a boolean.
     local bad_sha before_tree
