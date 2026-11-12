@@ -76,7 +76,10 @@ pub(crate) fn entry_loadout_gate(
         .as_ref()
         .map(|types| types.project().keys().cloned().collect())
         .unwrap_or_default();
-    let resolved = types.and_then(|types| mfile::expand::expandable_type(entry, &types));
+    let resolved = match types {
+        Ok(types) => mfile::expand::expandable_type(entry, &types),
+        Err(error) => Err(error),
+    };
     let (type_defaults, type_constraints) = match resolved {
         Ok(resolved) => (resolved.defaults, resolved.constraints),
         // A built-in type name keeps its built-in defaults. Any other name
@@ -87,7 +90,7 @@ pub(crate) fn entry_loadout_gate(
                 tracing::debug!(%error, "the loadout gate reads the entry with its built-in type");
                 (layer, Vec::new())
             }
-            None => return Err(mfile::Error::BoxType(error)),
+            None => return Err(mfile::Error::BoxType(Box::new(error))),
         },
     };
     let layers = mfile::expand::Layers {

@@ -88,7 +88,7 @@ pub enum Error {
     },
     /// The entry's Box Type does not resolve, or the entry cannot use it.
     /// Exits 3.
-    BoxType(crate::box_types::BoxTypeError),
+    BoxType(Box<crate::box_types::BoxTypeError>),
     /// A selected loadout sets a variable to a resolved value other than
     /// the one the layers up to and including the entry, or another
     /// selected loadout, give it (BOX-183). Carries the variable and the
