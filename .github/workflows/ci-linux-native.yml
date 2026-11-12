@@ -270,11 +270,18 @@ jobs:
       - name: Run bep TPM proofs (auto-discovered)
         env:
           BEP_TPM_TCTI: swtpm:host=localhost,port=2321
-        # --no-tests=warn until the first *_tpm_integration binary lands with
-        # the TPM key store; that task flips it to fail in a follow-up edit.
+        # nextest refuses a binary() filter that names no binary, so the step
+        # runs only once a *_tpm_integration file exists; from then on
+        # `--no-tests=fail` reds the job if the convention matches nothing.
         run: |
+          shopt -s nullglob
+          proofs=(crates/bep/tests/*_tpm_integration.rs)
+          if (( ${#proofs[@]} == 0 )); then
+            echo "No crates/bep/tests/*_tpm_integration.rs yet: nothing to run."
+            exit 0
+          fi
           cargo nextest run -p bep --profile ci \
-            --run-ignored all --no-tests=warn -E 'binary(/_tpm_integration$/)'
+            --run-ignored all --no-tests=fail -E 'binary(/_tpm_integration$/)'
 
   # Single required status check for this lane (branch-protection context:
   # ci-linux-native-success). Green when every gating job succeeded OR was
