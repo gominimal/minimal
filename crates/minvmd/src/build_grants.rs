@@ -7,7 +7,7 @@
 //! box's own under a host-side deadline. A guest signal can end a grant
 //! early, and nothing extends one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -72,6 +72,10 @@ struct State {
     reserved: BTreeMap<String, boxes::SessionId>,
     /// Counts grants, so each row has a name of its own.
     opened: u64,
+    /// The boxes whose table [`BuildGrants::drop_table`] ended in this
+    /// process. A box id is never used again, so a part of a table filed
+    /// after its box's end is dropped, never a table.
+    ended: BTreeSet<boxes::SessionId>,
 }
 
 /// The box tables and the open grants, shared by every clone.
@@ -134,9 +138,18 @@ impl BuildGrants {
     }
 
     /// Files `table` for the box `session_id`, beside what it already holds:
-    /// a table too long for one request line comes in parts.
+    /// a table too long for one request line comes in parts. A part for a
+    /// box whose table ended files nothing: the box is gone, and its part
+    /// arrived after the end.
     pub fn file(&self, session_id: boxes::SessionId, table: BuildGrantTable) {
         self.change_tables(|state| {
+            if state.ended.contains(&session_id) {
+                tracing::info!(
+                    session = %session_id,
+                    "dropped a part of a build table that arrived after its box ended"
+                );
+                return false;
+            }
             state.tables.entry(session_id).or_default().extend(table);
             true
         });
@@ -149,6 +162,7 @@ impl BuildGrants {
     pub fn drop_table(&self, session_id: boxes::SessionId) -> Vec<WithdrawBoxRequest> {
         let mut withdrawals = Vec::new();
         self.change_tables(|state| {
+            state.ended.insert(session_id);
             state
                 .reserved
                 .retain(|_, reserved_for| *reserved_for != session_id);
@@ -437,6 +451,28 @@ mod tests {
         assert!(grants.lookup(id, "aa").is_some());
         grants.drop_table(id);
         assert!(grants.next_row(id).is_none(), "the table ended");
+    }
+
+    /// NET-165: a part of a table that arrives after its box's table ended
+    /// files nothing, so no table stands for a box that is gone.
+    #[test]
+    fn a_part_filed_after_the_table_ends_files_nothing() {
+        let grants = BuildGrants::default();
+        let id = boxes::SessionId::mint();
+        grants.file(id, table("aa", false));
+        grants.drop_table(id);
+        grants.file(id, table("bb", false));
+        assert!(grants.lookup(id, "aa").is_none());
+        assert!(grants.lookup(id, "bb").is_none());
+        assert!(grants.next_row(id).is_none(), "no table stands");
+
+        let early = boxes::SessionId::mint();
+        grants.drop_table(early);
+        grants.file(early, table("aa", false));
+        assert!(
+            grants.lookup(early, "aa").is_none(),
+            "a box that ended before its first part has no table either"
+        );
     }
 
     /// NET-165: a box's table survives the VM host daemon.
