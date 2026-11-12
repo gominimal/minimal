@@ -253,11 +253,21 @@ pub(crate) async fn box_spec_to(
     });
     let entries = match entries {
         Ok(entries) => entries,
-        // A project file that does not load names no entry, so the
-        // argument can only be a box address. When no box answers to it,
-        // the project file error is the useful one.
+        // A project file that does not load blocks the entry form. Only a
+        // target that cannot name an entry reads as a box address: a
+        // qualified address, a full box id, or `self`. When no box answers
+        // to it, the project file error is the useful one.
         Err(project_error) => {
             if !given_override_flags(&args, true).is_empty() {
+                return Err(project_error);
+            }
+            let only_a_box = matches!(
+                super::box_verbs::parse_box_address(&target),
+                super::box_verbs::BoxAddress::Qualified { .. }
+            ) || boxes::SessionId::parse_str(&target).is_ok()
+                || target == "self";
+            if !only_a_box {
+                tracing::info!(verb = "box spec", target = %target, outcome = "project file invalid");
                 return Err(project_error);
             }
             let format = args.output.unwrap_or_default();

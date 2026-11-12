@@ -15853,10 +15853,21 @@ async fn box_spec_argument_directory_then_entry_then_box() {
         .expect_err("a directory is not a project argument");
     assert_eq!(spec_refusal_code(&error), 4, "{error:#}");
 
-    // A minimal.toml that does not load names no entry. The argument is a
-    // box address, and with no such box the project file error stands.
+    // A minimal.toml that does not load blocks the entry form. A bare name
+    // can be an entry, so it is the project file error (exit 3), even
+    // though box `build` exists.
     std::fs::write(elsewhere.path().join(mfile::MFILE_NAME), "[tasks.build\n").unwrap();
-    let text = box_spec_text(&other, &["min", "box", "spec", "build"])
+    let error = box_spec_text(&other, &["min", "box", "spec", "build"])
+        .await
+        .expect_err("a bare name is an entry name first");
+    assert!(
+        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        "{error:#}"
+    );
+    // A full box id cannot name an entry, so the box renders past the
+    // invalid file.
+    let id_text = id.to_string();
+    let text = box_spec_text(&other, &["min", "box", "spec", &id_text])
         .await
         .expect("the box renders past an invalid minimal.toml");
     assert!(
