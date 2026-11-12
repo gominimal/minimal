@@ -15,13 +15,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if ! command -v tpm2_getcap >/dev/null; then
+    echo "error: tpm2_getcap is not on PATH. On Debian and Ubuntu: sudo apt-get install tpm2-tools" >&2
+    exit 1
+fi
+
 if [[ -z "${BEP_TPM_TCTI:-}" ]]; then
-    for tool in swtpm tpm2_getcap; do
-        if ! command -v "$tool" >/dev/null; then
-            echo "error: $tool is not on PATH. On Debian and Ubuntu: sudo apt-get install swtpm swtpm-tools tpm2-tools libtss2-dev" >&2
-            exit 1
-        fi
-    done
+    if ! command -v swtpm >/dev/null; then
+        echo "error: swtpm is not on PATH. On Debian and Ubuntu: sudo apt-get install swtpm swtpm-tools libtss2-dev" >&2
+        exit 1
+    fi
     port="${BEP_TPM_PORT:-2321}"
     state="$(mktemp -d)"
     pidfile="$state/swtpm.pid"
@@ -38,15 +41,18 @@ if [[ -z "${BEP_TPM_TCTI:-}" ]]; then
         --server type=tcp,port="$port" --ctrl type=tcp,port="$((port + 1))" \
         --flags not-need-init,startup-clear --pid file="$pidfile" --daemon
     export BEP_TPM_TCTI="swtpm:host=localhost,port=$port"
-    # Capture before printing: a pipe into head can SIGPIPE tpm2_getcap.
-    caps="$(TPM2TOOLS_TCTI="$BEP_TPM_TCTI" tpm2_getcap properties-fixed)"
-    printf '%s\n' "$caps" | sed -n '1,4p'
 fi
 
 echo "TPM: $BEP_TPM_TCTI"
+# Check the TPM answers, whether this script started it or BEP_TPM_TCTI named
+# it, and before any proof exists, so the lane keeps proving its TPM comes up.
+# Capture before printing: a pipe into head can SIGPIPE tpm2_getcap.
+if ! caps="$(TPM2TOOLS_TCTI="$BEP_TPM_TCTI" tpm2_getcap properties-fixed)"; then
+    echo "error: the TPM at $BEP_TPM_TCTI does not answer." >&2
+    exit 1
+fi
+printf '%s\n' "$caps" | sed -n '1,4p'
 
-# The TPM is checked above even when no proof exists yet, so the lane keeps
-# proving its TPM comes up.
 shopt -s nullglob
 proofs=(crates/bep/tests/*_tpm_integration.rs)
 if ((${#proofs[@]} == 0)); then
