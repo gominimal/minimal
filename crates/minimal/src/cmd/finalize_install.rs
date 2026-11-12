@@ -750,9 +750,9 @@ pub(crate) mod linux {
     /// placed, but one started by an earlier release does not. No single quote:
     /// the block echoes it in one.
     pub(crate) const DAEMON_RUNNING_NOTE: &str = "note: a Minimal daemon is running. If a box \
-         you start next still says this machine cannot enforce its egress, restart the daemon: \
-         min stop (it refuses while boxes are live: stop them first, or min stop --force ends \
-         them), and your next min command starts it again.";
+         you start next still says this machine cannot enforce it yet, restart the daemon. Run \
+         min host stop local0, which stops each running box and then the daemon. Your next min \
+         command starts the daemon again.";
 
     /// What the step's `--place-listener` prints when no process holds the
     /// daemon's socket, so no daemon is running: the classifier block prints
@@ -4162,13 +4162,11 @@ mod tests {
             )),
             "the step still says {PLACE_NO_HOLDER:?} when no process holds the socket"
         );
-        // The note says to restart with plain `min stop` first and what `--force` costs, and
-        // the block can echo it whole.
-        assert!(
-            DAEMON_RUNNING_NOTE
-                .contains("restart the daemon: min stop (it refuses while boxes are live")
-        );
-        assert!(DAEMON_RUNNING_NOTE.contains("min stop --force ends them)"));
+        // The note names the one command that stops the running boxes and then the daemon,
+        // and the block can echo it whole.
+        assert!(DAEMON_RUNNING_NOTE.contains("restart the daemon. Run min host stop local0,"));
+        assert!(DAEMON_RUNNING_NOTE.contains("stops each running box and then the daemon."));
+        assert!(!DAEMON_RUNNING_NOTE.contains("--force"));
         assert!(!DAEMON_RUNNING_NOTE.contains("sessions survive"));
         assert!(!DAEMON_RUNNING_NOTE.contains('\''));
     }
