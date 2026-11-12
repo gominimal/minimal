@@ -386,8 +386,8 @@ fn gate(
             held_by: held.map(|(box_type, _)| box_type),
         });
     }
-    // The daemon log names the box's mode at creation; this is the client's
-    // record of the same decision.
+    // The client's record of the decision. `minimald` does not log the
+    // box's loadout mode.
     tracing::debug!(entry = %entry.name, loadout_mode = ?mode, "loadout gate");
     Ok(mode)
 }
