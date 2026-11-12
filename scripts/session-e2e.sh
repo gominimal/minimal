@@ -17124,7 +17124,7 @@ rt_leg_cohort() {
 
 rt_leg_quarantine() {
   local qu_leg="$RT_CASE/quarantine" qu_bep qu_dir qu_seg qu_name qu_out qu_try
-  local qu_sockets qu_listener qu_control
+  local qu_sockets qu_listener qu_control qu_named
   if [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
     not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 on a host whose audit log may be moved aside to run it. The manual macOS lane runs it (#2500)"
     return 0
@@ -17164,9 +17164,22 @@ rt_leg_quarantine() {
     fail
   fi
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  if [[ "$qu_out" != *"--quarantine-unreadable"* ]] \
-     && ! grep -qF -- '--quarantine-unreadable' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
-    echo "::error::the refused creation names no way out: neither its error nor the proxy log names 'bep serve --quarantine-unreadable'"
+  # The proxy can write its refusal to bep.log after the activate fails,
+  # so wait up to 15 s for it before the leg fails.
+  qu_named=""
+  if [[ "$qu_out" == *"--quarantine-unreadable"* ]]; then
+    qu_named=1
+  else
+    for qu_try in $(seq 1 15); do
+      [ "$qu_try" -gt 1 ] && sleep 1
+      if grep -qF -- '--quarantine-unreadable' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
+        qu_named=1
+        break
+      fi
+    done
+  fi
+  if [ -z "$qu_named" ]; then
+    echo "::error::the refused creation names no way out: neither its error nor the proxy log names 'bep serve --quarantine-unreadable' within 15 s"
     printf '%s\n' "$qu_out"
     fail
   fi
