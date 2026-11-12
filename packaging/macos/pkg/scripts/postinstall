@@ -63,9 +63,11 @@ if [ -e "$helpers/Minimal.app" ]; then mv "$helpers/Minimal.app" "$helpers/Minim
 mv "$t" "$helpers/Minimal.app"
 rm -rf "$helpers/Minimal.app.old"
 
-# 2. The resolver: *.min.internal to the box-name service on 127.0.0.1:7656.
+# 2. The resolver file (*.min.internal to the box-name service on
+#    127.0.0.1:7656) is written last, in step 5, once the service holds that
+#    port: the port is unprivileged, so a resolver file with nothing of ours
+#    behind it sends every user's box names to whichever program binds it.
 mkdir -p /etc/resolver /Library/LaunchDaemons
-printf 'nameserver 127.0.0.1\nport 7656\n' > /etc/resolver/min.internal
 
 # 3. The role account the box-name service runs as: no home, no shell, no
 #    password, hidden, with a uid and gid below 500 (hidden from the login
@@ -237,18 +239,25 @@ while [ "$i" -lt 20 ]; do
     i=$((i + 1))
 done
 if ! { [ -S "$run/answerer.sock" ] && running; }; then
-    # Another program holding the service's port is the one cause the service
-    # recovers from without help: it exits while the port is held, launchd
-    # starts it again, and the first start after the port is free answers.
-    # The install stands; the admin is told which program to stop.
+    # The service is not answering, so nothing may point at its port: an
+    # earlier install's resolver file goes, and this install fails. With the
+    # file in place, whichever program holds the port (any user can bind it)
+    # would answer every user's box names. The admin is told which program
+    # holds it, when one does; the service itself is loaded and takes the
+    # port as soon as it is free, and installing again writes the file.
+    rm -f /etc/resolver/min.internal
     holder="$(/usr/sbin/lsof -nP -iUDP:7656 2>/dev/null \
-        | awk 'NR > 1 && $1 != "launchd" && $1 != "minzoned" { print $1 " (pid " $2 ")"; exit }')"
-    if [ -z "$holder" ]; then
+        | awk 'NR > 1 && $1 != "launchd" { print $1 " (pid " $2 ", user " $3 ")"; exit }')"
+    if [ -n "$holder" ]; then
+        echo "minimal: $holder holds UDP port 7656, which the DNS service for boxes answers on. Stop that program and install again: until then box names (<box>.min.internal) do not resolve" >&2
+    else
         echo "minimal: the DNS service did not start within 5 s (launchctl print system/dev.gominimal.zone)" >&2
-        exit 1
     fi
-    echo "minimal: $holder holds UDP port 7656, which the DNS service for boxes answers on; box names (<box>.min.internal) will not resolve until that program stops, and need nothing more after it does" >&2
+    exit 1
 fi
+# Only now: the service holds the port the file names.
+printf 'nameserver 127.0.0.1\nport 7656\n' > /etc/resolver/min.internal
+chmod 0644 /etc/resolver/min.internal
 
 # 6. Users who installed with curl keep an older min at ~/.local/bin/min,
 #    which their shell finds before /usr/local/bin. Nothing here touches a
