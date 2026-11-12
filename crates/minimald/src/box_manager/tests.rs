@@ -6919,9 +6919,11 @@ async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
         );
     }
 
-    // A spec that names a type with no built-in root is refused: it has no
-    // constraints to check, so it never passes unchecked.
-    let unknown: [(serde_json_lenient::Value, &str, &str); 2] = [
+    // A spec that names a type with no built-in root, or the wrong one, is
+    // refused: it has no root to trust, so it never passes unchecked. A
+    // built-in type is its own root, so a `task` spec cannot claim the
+    // `session` root and keep a terminal.
+    let unknown: [(serde_json_lenient::Value, &str, &str); 3] = [
         (
             spec_of("rc-custom-no-root", "ci", &pty(true)),
             "box.type",
@@ -6933,6 +6935,14 @@ async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
             }),
             "type.root",
             "nope",
+        ),
+        (
+            spec_of("rc-builtin-other-root", "task", &|spec| {
+                pty(true)(spec);
+                spec["type"] = serde_json_lenient::json!({ "root": "session" });
+            }),
+            "type.root",
+            "session",
         ),
     ];
     for (spec, key, value) in unknown {
@@ -6971,7 +6981,7 @@ async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
         let line = logged
             .lines()
             .find(|line| {
-                line.contains("names a type with no built-in root")
+                line.contains("does not name its type's built-in root")
                     && line.contains(&format!("key=\"{key}\" value={value} "))
             })
             .unwrap_or_else(|| panic!("{entry}: the daemon log names the refusal:\n{logged}"));

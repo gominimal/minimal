@@ -1415,16 +1415,22 @@ impl std::error::Error for RootConstraintRefusal {}
 /// `io` for `pty_enabled` or `box` for `loadout_mode`.
 const FLAT_KEY_SECTIONS: [&str; 6] = ["box", "execution", "install", "io", "nesting", "network"];
 
-/// The refusal of a create whose spec names a Box Type with no built-in
-/// root (BOX-160): `box.type` is not a built-in type and `type.root` is
-/// absent, or `type.root` is not a built-in type. With no root the daemon
-/// has no constraints to check the spec against, so it refuses the spec.
+/// The refusal of a create whose spec does not name its Box Type's
+/// built-in root (BOX-160). Either `box.type` is not a built-in type and
+/// `type.root` is absent, or `type.root` is not a built-in type, or
+/// `box.type` is a built-in type and `type.root` names a different one.
+/// A built-in type is its own root, so a different `type.root` would
+/// check the spec against the wrong constraints. In each case the daemon
+/// has no root it can trust, so it refuses the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnknownRootRefusal {
     /// The key that names the type, `box.type` or `type.root`.
     pub(crate) key: &'static str,
     /// The value the spec carries at `key`, as one line of text.
     pub(crate) value: String,
+    /// The built-in `box.type` that a different `type.root` contradicts,
+    /// when that is the reason for the refusal.
+    pub(crate) builtin_type: Option<&'static str>,
 }
 
 impl UnknownRootRefusal {
@@ -1439,7 +1445,20 @@ impl UnknownRootRefusal {
 
 impl std::fmt::Display for UnknownRootRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { key, value } = self;
+        let Self {
+            key,
+            value,
+            builtin_type,
+        } = self;
+        if let Some(builtin_type) = builtin_type {
+            return write!(
+                f,
+                "The box spec sets `box.type` to `{builtin_type}` and `type.root` to `{value}`. \
+                 The built-in type `{builtin_type}` is its own root. \
+                 No box was created. Remove `type.root` from the spec, \
+                 or set it to `{builtin_type}`, then create the box again."
+            );
+        }
         let builtins: Vec<String> = mfile::box_types::BUILTIN_BOX_TYPES
             .iter()
             .map(|b| format!("`{b}`"))
@@ -1472,15 +1491,17 @@ enum AdmissionRootRefusal {
 }
 
 /// The spec's Box Type and the built-in type it is built on (BOX-071): the
-/// type is `box.type`, and the root is `type.root`, or the type itself when
-/// the type is a built-in one. A spec with no `box.type` is of
+/// type is `box.type`. A built-in type is its own root (Gatehouse §6.3.2),
+/// so the root of a built-in `box.type` is the type itself, and the root
+/// of a project type is `type.root`. A spec with no `box.type` is of
 /// `verb_type`, the type the creating verb files the box under.
 ///
 /// # Errors
 ///
-/// [`UnknownRootRefusal`] when the root is not a built-in type: a
-/// `type.root` that is not one, or no `type.root` and a `box.type` that is
-/// not one. A spec that names a type with no root never passes unchecked.
+/// [`UnknownRootRefusal`] when the spec does not name a built-in root: a
+/// built-in `box.type` with a different `type.root`, a `type.root` that is
+/// not a built-in type, or a project type with no `type.root`. A spec that
+/// names a type with no root, or the wrong one, never passes unchecked.
 fn spec_type_root(
     spec: &serde_json_lenient::Value,
     verb_type: &str,
@@ -1491,13 +1512,28 @@ fn spec_type_root(
         .get("box")
         .and_then(|b| b.get("type"))
         .map_or_else(|| verb_type.to_owned(), text);
-    let (key, root) = match spec.get("type").and_then(|t| t.get("root")) {
-        Some(root) => ("type.root", text(root)),
+    let type_root = spec.get("type").and_then(|t| t.get("root")).map(text);
+    if let Some(builtin_type) = mfile::box_types::builtin(&box_type) {
+        return match type_root {
+            Some(root) if root != builtin_type => Err(UnknownRootRefusal {
+                key: "type.root",
+                value: root,
+                builtin_type: Some(builtin_type),
+            }),
+            _ => Ok((box_type, builtin_type)),
+        };
+    }
+    let (key, root) = match type_root {
+        Some(root) => ("type.root", root),
         None => ("box.type", box_type.clone()),
     };
     match mfile::box_types::builtin(&root) {
         Some(root) => Ok((box_type, root)),
-        None => Err(UnknownRootRefusal { key, value: root }),
+        None => Err(UnknownRootRefusal {
+            key,
+            value: root,
+            builtin_type: None,
+        }),
     }
 }
 
@@ -4311,7 +4347,8 @@ impl BoxManager {
                     key = refusal.key,
                     value = %refusal.value,
                     exit_code = refusal.exit_code(),
-                    "refused a create: the box spec names a type with no built-in root"
+                    builtin_type = refusal.builtin_type,
+                    "refused a create: the box spec does not name its type's built-in root"
                 );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
