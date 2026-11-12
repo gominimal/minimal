@@ -484,7 +484,7 @@ fn state_dirs_from_env_vars(env_vars: &BTreeMap<String, String>) -> BTreeSet<Str
     env_vars
         .values()
         .filter_map(|v| v.strip_prefix("/state/"))
-        .filter(|p| !p.is_empty() && !p.contains('/'))
+        .filter(|p| mfile::File::validate_state_component(p).is_ok())
         .map(str::to_owned)
         .collect()
 }
@@ -7145,6 +7145,18 @@ exit $rc
     #[test]
     fn state_dirs_from_env_vars_ignores_bare_state() {
         let env = BTreeMap::from([("WEIRD".to_string(), "/state/".to_string())]);
+        assert!(state_dirs_from_env_vars(&env).is_empty());
+    }
+
+    /// `.` and `..` are single components by the `/`-count alone, but
+    /// joining them onto the state base would leave it, so they are
+    /// dropped like any other unusable prefix.
+    #[test]
+    fn state_dirs_from_env_vars_drops_dot_components() {
+        let env = BTreeMap::from([
+            ("DOT".to_string(), "/state/.".to_string()),
+            ("DOTDOT".to_string(), "/state/..".to_string()),
+        ]);
         assert!(state_dirs_from_env_vars(&env).is_empty());
     }
 
