@@ -15760,11 +15760,45 @@ async fn start_attach_resume_end_to_end() {
                 panic!("the create failed: {error}\n{ran}")
             }
         };
+        // The contribution comes from the same prep `activate_box` runs, over
+        // a `rust` loadout on disk, so a loadout the prep drops fails here.
+        let config = tempfile::tempdir().unwrap();
+        let loadouts_dir = config.path().join("minimal/loadouts");
+        std::fs::create_dir_all(&loadouts_dir).unwrap();
+        std::fs::write(loadouts_dir.join("rust.toml"), "description = \"r\"\n").unwrap();
+        let global = GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let inputs = loadouts::prepare_activation_inputs_with_config(
+            &boxes::client::config::Config::default(),
+            &global,
+            root,
+            start_loadout_selection(&args),
+            loadouts::HookPrep::Enforce,
+            Some(boxes::core::policy::UserPolicy::default()),
+        )
+        .unwrap_or_else(|e| panic!("the loadouts compose: {e:#}\n{ran}"));
+        assert_eq!(inputs.loadout_names, ["rust"], "{ran}");
+        let mut contribution = inputs.contribution;
+        assert!(
+            contribution.orientation.loadouts_display.contains("rust"),
+            "the contribution names the rust loadout: {:?}\n{ran}",
+            contribution.orientation.loadouts_display
+        );
+        contribution.entry = session_box_entry(root, options.entry.as_deref(), true)
+            .expect("the entry expands")
+            .map(Box::new);
+        assert!(
+            contribution.entry.is_some(),
+            "the entry rides on the contribution\n{ran}"
+        );
         minimald::test_harness::unwrap_ready(
             daemon
                 .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
                     session_id: web,
-                    contribution: Default::default(),
+                    contribution,
                 })
                 .await
                 .unwrap(),
