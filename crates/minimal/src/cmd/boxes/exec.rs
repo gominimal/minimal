@@ -667,6 +667,24 @@ where
     Ok(status)
 }
 
+/// The `ssh -tt` command that `min box exec -t`'s terminal attach runs to
+/// reach the exec `exec_id` in the box `id`. It carries the session keys
+/// from `config_dir`, the same command `min box attach --exec` runs
+/// (BCLI-068).
+///
+/// # Errors
+///
+/// When the session-key config is not valid, or ssh's command cannot be
+/// built.
+pub(crate) fn exec_terminal_ssh(
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    exec_id: &minimald_rpc::exec::ExecId,
+    config_dir: Option<&std::path::Path>,
+) -> Result<std::process::Command, anyhow::Error> {
+    super::attach::exec_attach_ssh(sock, id, exec_id, config_dir)
+}
+
 /// Connects this process's terminal to the tty exec that `attach_wire`
 /// resumes, through `ssh -tt` and the terminal relay `min session attach`
 /// uses. It sends the session keys from `config_dir`, as `min box attach
@@ -678,7 +696,7 @@ async fn attach_exec_terminal(
     exec_id: &minimald_rpc::exec::ExecId,
     config_dir: Option<&std::path::Path>,
 ) -> Result<i32, anyhow::Error> {
-    let ssh = super::attach::exec_attach_ssh(sock, id, exec_id, config_dir)?;
+    let ssh = exec_terminal_ssh(sock, id, exec_id, config_dir)?;
     tokio::task::spawn_blocking(move || {
         interactive_attach(ssh, true, crate::attach::TerminalUnwind::arm, |ssh| {
             let real = minimal_client::tty_relay::RealTty::acquire()

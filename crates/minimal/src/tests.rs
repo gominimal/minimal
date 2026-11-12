@@ -10248,6 +10248,53 @@ async fn exec_attach_detach_key_returns_0_exec_keeps_running() {
     assert_eq!(ending.code, 0);
 }
 
+/// BCLI-068: `min box exec -t`'s first attach sends the configured session
+/// keys. With `detach = "q"` in the config, its ssh carries the leader and
+/// detach env vars and forwards both with `SendEnv`.
+#[tokio::test]
+async fn box_exec_t_attach_sends_configured_session_keys() {
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let exec_id = minimald_rpc::exec::ExecId::parse(AN_EXEC_ID).unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"q\"\n",
+    )
+    .unwrap();
+
+    let ssh = exec_terminal_ssh(&alpha.host.sock, web, &exec_id, Some(config.path()))
+        .expect("the exec -t attach's ssh");
+    let args: Vec<String> = ssh
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let envs: std::collections::BTreeMap<String, String> = ssh
+        .get_envs()
+        .filter_map(|(name, value)| {
+            Some((
+                name.to_string_lossy().into_owned(),
+                value?.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect();
+    assert_eq!(args.first().map(String::as_str), Some("-tt"), "{args:?}");
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    assert!(args.contains(&wire), "the exec attach's request: {args:?}");
+    let defaults = boxes::keys::SessionKeys::default();
+    for (name, value) in [
+        (boxes::keys::LEADER_ENV, defaults.leader.as_config_str()),
+        (boxes::keys::DETACH_KEY_ENV, "q".to_owned()),
+    ] {
+        assert_eq!(envs.get(name), Some(&value), "{name}: {envs:?}");
+        assert!(
+            args.contains(&format!("SendEnv={name}")),
+            "{name}: {args:?}"
+        );
+    }
+}
+
 /// BCLI-068: `min box stop` ends the attached exec by its signal, which the
 /// daemon reports as 1, before it writes the stopped record. The command
 /// reads the box again, and ends with 254 and the stop's line. A removed
