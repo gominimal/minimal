@@ -472,10 +472,7 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::planned_session_request = asserts nothing",
             // A unit test's request, never sent: it checks the fresh instance.
             "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
-            // A test's request, sent only to the in-process test daemon,
-            // which is this build: it starts the box the end-to-end test
-            // attaches to and resumes.
-            "tests.rs::start_attach_resume_end_to_end = asserts nothing",
+            "tests.rs::start_attach_resume_end_to_end = asserts",
         ]
     );
 }
@@ -15744,6 +15741,7 @@ async fn start_attach_resume_end_to_end() {
             args.network.into(),
             policy,
         );
+        request.must_match_version = minimal_client::version_assertion();
         request.config.name = minimal_client::box_name::request_name(args.name.as_deref());
         request.config.creating_verb = CreatingVerb::Session;
         stamp_session_spec_as(
