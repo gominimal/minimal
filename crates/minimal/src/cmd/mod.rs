@@ -38,6 +38,9 @@ mod session;
 // activation registered with the VM host daemon; the withdrawal lives with
 // the session commands, as does the host-kind rule its gate keys on.
 pub(crate) use box_verbs::{daemon_host_kind, vm_host_control_sock, withdraw_box_row};
+// The `min box spec` render, for the in-process daemon tests.
+#[cfg(test)]
+pub(crate) use box_spec::box_spec_to;
 
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
@@ -410,7 +413,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             }
         },
         Some(Command::Box(BoxArgs { command })) => match command {
-            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
+            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args).await,
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
             BoxCommand::Start(args) => cmd_box_start(&cli.global_args, args).await,
