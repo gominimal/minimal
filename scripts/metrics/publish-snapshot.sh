@@ -17,7 +17,7 @@
 # GIT_AUTHOR_EMAIL (the Actions bot by default) and pushes `HEAD:<branch>`
 # from a temporary worktree. The checked-out branch is never touched. A
 # snapshot whose mode is not `full`, or whose tree was dirty, is refused: a
-# darwin or a partial run is not the history.
+# darwin or a partial run is not the history. So is one schema.py rejects.
 set -euo pipefail
 
 snapshot="${1:-}"
@@ -72,6 +72,23 @@ case "$(git -C "$root" rev-parse HEAD)" in
     *) echo "publish-snapshot: refusing git.sha7 '$sha7'; this checkout is at $(git -C "$root" rev-parse --short=7 HEAD)" >&2
        exit 2 ;;
 esac
+# The whole document must be a valid v1 snapshot (schema.py), so only a
+# well-formed snapshot reaches the history the gate reads its baseline from.
+# This checks shape, not truth: a collector that was subverted can still
+# write well-formed numbers, and nothing at publish time can tell.
+# -B: importing schema must not leave a __pycache__ in the checkout.
+python3 -B - "$here" "$snapshot" <<'PY' || exit 2
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import schema
+try:
+    problems = schema.validate(json.load(open(sys.argv[2])))
+except Exception as e:  # a malformed field can trip the validator itself
+    problems = [f"{type(e).__name__}: {e}"]
+for p in problems:
+    print(f"publish-snapshot: refusing a snapshot that fails the schema: {p}", file=sys.stderr)
+sys.exit(1 if problems else 0)
+PY
 [ -n "$date" ] || date="$(date -u +%Y-%m-%d)"
 # [[ =~ ]] anchors the whole string; grep -x would pass one good line of many.
 # The shape check comes first so only digits and dashes reach Python, which

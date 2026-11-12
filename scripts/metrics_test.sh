@@ -848,7 +848,7 @@ publish_targets_history_ref_only() {   # the publish script pushes to the histor
     git -c init.templateDir= init -q --bare "$remote" 2>/dev/null
     git -c init.templateDir= init -q "$repo" 2>/dev/null
     mkdir -p "$repo/scripts/metrics"
-    cp "$here/metrics/publish-snapshot.sh" "$here/metrics/prune.py" "$repo/scripts/metrics/"
+    cp "$here/metrics/publish-snapshot.sh" "$here/metrics/prune.py" "$here/metrics/schema.py" "$repo/scripts/metrics/"
     echo "main" > "$repo/README.md"
     git -C "$repo" add -A && git -C "$repo" commit -q -m "main" && git -C "$repo" branch -M main
     git -C "$repo" remote add origin "$remote" && git -C "$repo" push -q origin main
@@ -883,6 +883,15 @@ PY
     python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["git"]["dirty"]=True; json.dump(s,open(sys.argv[2],"w"))' "$tmp/pub-snap.json" "$tmp/pub-dirty.json"
     status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-dirty.json" >/dev/null 2>&1) || status=$?
     [ "$status" -eq 2 ] && ok "a dirty-tree snapshot is refused" || bad "dirty snapshot exit $status"
+    # A snapshot schema.py rejects is refused, including one malformed enough
+    # to trip the validator.
+    local mut
+    for mut in 's["schema_version"]=2' 's["gates"]="x"'; do
+        python3 -c "import json,sys; s=json.load(open(sys.argv[1])); $mut; json.dump(s,open(sys.argv[2],'w'))" "$tmp/pub-snap.json" "$tmp/pub-schema.json"
+        status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-schema.json" --date 2026-10-16 >"$tmp/pub-schema.out" 2>&1) || status=$?
+        [ "$status" -eq 2 ] && grep -q 'fails the schema' "$tmp/pub-schema.out" \
+            && ok "a snapshot with $mut is refused by the schema" || bad "schema $mut exit $status: $(cat "$tmp/pub-schema.out")"
+    done
     # The artifact is untrusted: a field that would leave history/ is refused
     # before anything is written, and so is a dirty flag that is not a boolean.
     local bad_sha before_tree
