@@ -12,6 +12,13 @@
 //! opens.
 
 pub mod audit;
+
+/// The first line of the message `bep serve` prints when it refuses to
+/// start over an audit log line it cannot read (BEP-068). `minvmd` looks
+/// for this line in the proxy's log to explain a failed start, so both
+/// sides use this one string.
+pub const UNREADABLE_AUDIT_LOG_REFUSAL: &str =
+    "bep did not start, because its audit log has lines that it cannot read.";
 pub mod boxes;
 pub mod ca;
 pub mod control;
