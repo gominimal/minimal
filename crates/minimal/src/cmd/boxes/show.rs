@@ -55,7 +55,7 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
 /// One box as `min box show -o` writes it (BCLI-033): the `min/v1/box`
 /// object with the fields the text form shows, and the box's live execs
 /// as `min/v1/exec` objects in `execs`. A value the record does not carry
-/// is `null` in JSON, and is left out of YAML.
+/// is `null` in JSON, and is left out of YAML and TOML, which have no null.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct ShownBoxDoc {
     schema: &'static str,
@@ -140,8 +140,8 @@ pub(crate) fn shown_box_doc(
     }
 }
 
-/// Writes one box in `format`: one pretty JSON object or one YAML
-/// mapping. Both carry the same document.
+/// Writes one box in `format`: one pretty JSON object, one YAML mapping,
+/// or one TOML table. All three carry the same document.
 ///
 /// # Errors
 ///
@@ -158,6 +158,10 @@ pub(crate) fn render_box_show_as(
         BoxShowOutputFormat::Json => {
             serde_json_lenient::to_writer_pretty(&mut *out, &doc)?;
             writeln!(out)
+        }
+        BoxShowOutputFormat::Toml => {
+            let text = toml::to_string(&doc).map_err(std::io::Error::other)?;
+            out.write_all(text.as_bytes())
         }
         BoxShowOutputFormat::Yaml => {
             let text = toml::to_string(&doc).map_err(std::io::Error::other)?;

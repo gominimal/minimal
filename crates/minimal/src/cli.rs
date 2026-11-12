@@ -774,6 +774,8 @@ pub enum BoxShowOutputFormat {
     Json,
     /// YAML: one mapping for the box
     Yaml,
+    /// TOML: one table for the box
+    Toml,
 }
 
 // BOX-013 (BCLI-059), BOX-151 (BCLI-055):

@@ -1238,6 +1238,7 @@ mod tests {
         for (output, machine) in [
             (Some(minimal::BoxShowOutputFormat::Json), true),
             (Some(minimal::BoxShowOutputFormat::Yaml), true),
+            (Some(minimal::BoxShowOutputFormat::Toml), true),
             (None, false),
         ] {
             let cli = minimal::Cli {

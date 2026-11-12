@@ -15372,14 +15372,21 @@ fn without_nulls(value: serde_json_lenient::Value) -> serde_json_lenient::Value 
     }
 }
 
-// BCLI-033: `min box show -o yaml` carries the document that `-o json`
-// carries, with the values the record does not carry left out.
+// BCLI-033: `min box show -o yaml` and `-o toml` carry the document that
+// `-o json` carries, with the values the record does not carry left out.
 #[tokio::test]
-async fn box_show_output_yaml_matches_json() {
+async fn box_show_output_yaml_and_toml_match_json() {
     box_with_two_execs!(alpha, _state, _shell, _job);
     let json = box_show_rendered(&alpha.host, "web", Some(BoxShowOutputFormat::Json)).await;
     let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("one JSON doc");
     let doc = without_nulls(doc);
+
+    let toml_text = box_show_rendered(&alpha.host, "web", Some(BoxShowOutputFormat::Toml)).await;
+    let from_toml: serde_json_lenient::Value = serde_json_lenient::to_value(
+        toml::from_str::<toml::Table>(&toml_text).expect("one TOML doc"),
+    )
+    .expect("TOML as JSON");
+    assert_eq!(from_toml, doc, "{toml_text}");
 
     // The YAML mapping, key by key in the order of the JSON fields.
     let yaml = box_show_rendered(&alpha.host, "web", Some(BoxShowOutputFormat::Yaml)).await;
