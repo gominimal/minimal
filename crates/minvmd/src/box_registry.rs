@@ -188,6 +188,17 @@ pub const HOST_IP_IDS_FILE: &str = "box-host-ip-ids.json";
 /// version is set aside and reloads no id, like one that does not parse.
 const HOST_IP_IDS_FILE_VERSION: u32 = 1;
 
+/// The file the registry persists the kind of each build row's creation
+/// to ([`BuildRow`]), by box id, beside [`REGISTRY_FILE`]. A file of its
+/// own, for the same reason as [`HELD_NAMES_FILE`]: a daemon that predates
+/// build rows still reads the registry file, and reads a build row's
+/// creation there as an ordinary box's.
+pub const BUILD_ROWS_FILE: &str = "box-build-rows.json";
+
+/// The persisted build rows' format version. A file of any other version
+/// is set aside and reloads no build row, like one that does not parse.
+const BUILD_ROWS_FILE_VERSION: u32 = 1;
+
 /// How long a hold reloaded from [`HELD_NAMES_FILE`] stands unconfirmed
 /// before it is dropped ([`BoxRegistry::expire_unconfirmed_holds`]). Only
 /// a host client re-makes a hold, over the host's control socket: the
@@ -1048,8 +1059,9 @@ pub struct ClientBoxSpec {
 }
 
 /// What a build row is for (NET-165, NET-169). A build row is not a box: no
-/// listing shows it, and no detach grace ends it. Its creation records the
-/// kind, so a row reloaded after a restart is still known as one.
+/// listing shows it, and no detach grace ends it. The kind persists in
+/// [`BUILD_ROWS_FILE`], so a row reloaded after a restart is still known as
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildRow {
@@ -1100,8 +1112,9 @@ struct Creation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     task_addresses: Vec<Ipv4Addr>,
     standing: bool,
-    /// The kind of build row the creation is, when it is one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The kind of build row the creation is, when it is one. It persists
+    /// in [`BUILD_ROWS_FILE`], never in the registry file.
+    #[serde(skip)]
     build_row: Option<BuildRow>,
 }
 
@@ -1219,10 +1232,27 @@ struct HostIpIdsFile {
     credentialed: Vec<boxes::BoxId>,
 }
 
+/// The persisted build rows ([`BUILD_ROWS_FILE`]): its format version,
+/// then each build row's box id and kind.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildRowsFile {
+    version: u32,
+    build_rows: Vec<BuildRowEntry>,
+}
+
+/// One build row in [`BuildRowsFile`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildRowEntry {
+    box_id: minimald_rpc::BoxId,
+    kind: BuildRow,
+}
+
 /// Writes `file` to `path` the one way any of the registry's persisted
 /// files — the box registry ([`REGISTRY_FILE`]), its held names
-/// ([`HELD_NAMES_FILE`]) and its `host_ip` ids ([`HOST_IP_IDS_FILE`]) — is
-/// ever written: to a sibling temporary file
+/// ([`HELD_NAMES_FILE`]), its `host_ip` ids ([`HOST_IP_IDS_FILE`]) and its
+/// build rows ([`BUILD_ROWS_FILE`]) — is ever written: to a sibling temporary file
 /// created afresh with mode 0600 — what they hold names this user's boxes
 /// and sessions, which is no other user's to read — synced, then renamed
 /// over `path`, and the directory synced, so a crash at any point leaves
@@ -1309,7 +1339,9 @@ pub struct PersistedBox {
 /// [`REGISTRY_FILE_VERSION`] reads as no boxes, and it is never written,
 /// renamed or set aside. The daemon that owns the file decides what to do
 /// with it on its next start. Each box id is listed once, in file order. A
-/// build row ([`BuildRow`]) is not a box and is not listed.
+/// build row ([`BuildRow`]) is not a box and is not listed: the ids in
+/// [`BUILD_ROWS_FILE`] are left out, and a build rows file that cannot be
+/// used leaves nothing out.
 #[must_use]
 pub fn persisted_box_names(state_dir: &std::path::Path) -> Vec<PersistedBox> {
     #[derive(serde::Deserialize)]
@@ -1327,11 +1359,18 @@ pub fn persisted_box_names(state_dir: &std::path::Path) -> Vec<PersistedBox> {
     let Ok(file) = serde_json_lenient::from_slice::<RegistryFile>(&bytes) else {
         return Vec::new();
     };
+    let build_rows: std::collections::HashSet<minimald_rpc::BoxId> =
+        std::fs::read(state_dir.join(BUILD_ROWS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json_lenient::from_slice::<BuildRowsFile>(&bytes).ok())
+            .filter(|file| file.version == BUILD_ROWS_FILE_VERSION)
+            .map(|file| file.build_rows.into_iter().map(|row| row.box_id).collect())
+            .unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
     file.boxes
         .into_iter()
         // A build row is not a box (NET-169): no listing shows it.
-        .filter(|creation| creation.build_row.is_none())
+        .filter(|creation| !build_rows.contains(&creation.box_id))
         .filter(|creation| seen.insert(creation.box_id))
         .map(|creation| PersistedBox {
             name: creation.name,
@@ -1494,6 +1533,54 @@ fn read_host_ip_ids_file(path: &std::path::Path) -> HostIpIds {
         ),
     }
     HostIpIds::default()
+}
+
+/// Reads the build rows persisted at `path`, each box id's kind: none when
+/// there is no file yet. A file that cannot be read, does not parse, or is
+/// of another version than [`BUILD_ROWS_FILE_VERSION`] reloads no build row
+/// and is renamed aside under the same `.unusable-<unix seconds>` suffix,
+/// said as an error line. Its build rows then reload as ordinary boxes.
+fn read_build_rows_file(path: &std::path::Path) -> BTreeMap<BoxId, BuildRow> {
+    let why = match std::fs::read(path) {
+        Ok(bytes) => match serde_json_lenient::from_slice::<BuildRowsFile>(&bytes) {
+            Ok(file) if file.version == BUILD_ROWS_FILE_VERSION => {
+                return file
+                    .build_rows
+                    .into_iter()
+                    .map(|row| (row.box_id.to_bytes(), row.kind))
+                    .collect();
+            }
+            Ok(file) => format!(
+                "version {}, this build reads {BUILD_ROWS_FILE_VERSION}",
+                file.version
+            ),
+            Err(error) => error.to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => error.to_string(),
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unusable-{stamp}"));
+    let aside = std::path::PathBuf::from(aside);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::error!(
+            path = %path.display(),
+            aside = %aside.display(),
+            why,
+            "the persisted build rows are unusable; they are set aside and reload as boxes"
+        ),
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            why,
+            %error,
+            "the persisted build rows are unusable and could not be set aside; \
+             they reload as boxes and the next change writes over them"
+        ),
+    }
+    BTreeMap::new()
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -3909,7 +3996,8 @@ impl BoxRegistry {
     /// resume reinstates it ([`Self::resume_client_box`]). A requester build
     /// row's creation is reinstated the same way, held until its box retires
     /// ([`BuildRow`]). A build grant's creation is not reloaded at all: its
-    /// grant ended with the previous process. A
+    /// grant ended with the previous process. Which creations are build
+    /// rows, and of which kind, reloads from [`BUILD_ROWS_FILE`]. A
     /// dormant creation stays dormant. The hand-out book takes every
     /// creation's switch and task addresses, dormant ones' included, so a
     /// fresh book hands none of them to a new box; their quarantine is not
@@ -3965,6 +4053,7 @@ impl BoxRegistry {
             );
             *self.host_ip_id_set() = reloaded;
         }
+        let build_rows = read_build_rows_file(&path.with_file_name(BUILD_ROWS_FILE));
         self.persisted_at = Some(Arc::new(path));
         let mut held_loopbacks = std::collections::BTreeMap::new();
         // The file is in name order, not registration order. A standing
@@ -3975,6 +4064,7 @@ impl BoxRegistry {
         let mut loaded = loaded;
         loaded.sort_by_key(|creation| !creation.standing);
         for mut creation in loaded {
+            creation.build_row = build_rows.get(&creation.id()).copied();
             // A grant's row outlives its grant only in the file: the grant,
             // its deadline and its withdrawal lived in the previous process.
             // Its creation is not reloaded, so no row admits its egress and
@@ -4155,6 +4245,30 @@ impl BoxRegistry {
             version: REGISTRY_FILE_VERSION,
             boxes: self.creations().all().cloned().collect(),
         };
+        // The build rows first: a crash between the two writes leaves a
+        // build row the registry file does not hold yet, which reloads
+        // nothing, never a build row reloaded as a box.
+        let build_rows = BuildRowsFile {
+            version: BUILD_ROWS_FILE_VERSION,
+            build_rows: file
+                .boxes
+                .iter()
+                .filter_map(|creation| {
+                    creation.build_row.map(|kind| BuildRowEntry {
+                        box_id: creation.box_id,
+                        kind,
+                    })
+                })
+                .collect(),
+        };
+        let rows_path = path.with_file_name(BUILD_ROWS_FILE);
+        if let Err(error) = write_registry_file(&rows_path, &build_rows) {
+            tracing::warn!(
+                path = %rows_path.display(),
+                %error,
+                "could not persist the build rows; a restart reloads them as boxes"
+            );
+        }
         if let Err(error) = write_registry_file(path, &file) {
             tracing::warn!(
                 path = %path.display(),
@@ -10186,6 +10300,43 @@ mod tests {
                 name: "web".to_string(),
                 id: minimald_rpc::BoxId::from_bytes(web.box_id()),
             }],
+        );
+    }
+
+    /// NET-169: the kind of a build row persists in its own file, never in
+    /// the registry file, which a daemon that predates build rows reads and
+    /// would set aside whole for a field it does not know.
+    #[test]
+    fn the_registry_file_never_holds_a_build_row_kind() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry = persisted_registry(&dir);
+        let requester = registry
+            .register_build_row(client_spec("build-web"), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+        let grant = registry
+            .register_build_row(client_spec("build-web-1"), BuildRow::Grant)
+            .expect("the plan has an address for the grant row");
+        drop(registry);
+
+        let file = std::fs::read_to_string(dir.path().join(REGISTRY_FILE))
+            .expect("the registry file reads");
+        assert!(file.contains("build-web-1"), "both creations persist");
+        assert!(!file.contains("build_row"), "{file}");
+        let rows: BuildRowsFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(BUILD_ROWS_FILE)).expect("the build rows file reads"),
+        )
+        .expect("the build rows file parses");
+        let kinds: BTreeMap<BoxId, BuildRow> = rows
+            .build_rows
+            .into_iter()
+            .map(|row| (row.box_id.to_bytes(), row.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            BTreeMap::from([
+                (requester.box_id(), BuildRow::Requester),
+                (grant.box_id(), BuildRow::Grant),
+            ])
         );
     }
 
