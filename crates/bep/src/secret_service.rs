@@ -141,11 +141,28 @@ impl SecretService {
         };
         let status = self.wait(role, &mut child)?;
         let deadline = Instant::now() + DRAIN_GRACE;
+        let (stdout, stdout_ended) = stdout.collect(deadline);
+        let (stderr, stderr_ended) = stderr.collect(deadline);
         let out = Output {
             status,
-            stdout: stdout.collect(deadline),
-            stderr: stderr.collect(deadline),
+            stdout,
+            stderr,
         };
+        if !(stdout_ended && stderr_ended) {
+            // A pipe that is still open can still carry the key, so the
+            // output read so far is never taken as the whole answer.
+            tracing::warn!(role = %role, store = STORE, "an output pipe of secret-tool stayed open after it exited; the call failed");
+            if !blank(&out.stderr) {
+                return Err(failure(role, &out));
+            }
+            return Err(KeyError::Store {
+                role,
+                detail: format!(
+                    "an output pipe of `{SECRET_TOOL}` stayed open after it exited ({})",
+                    out.status
+                ),
+            });
+        }
         match written {
             // A `secret-tool` that fails before it reads its input (a locked
             // keyring, no session bus) closes the pipe. Its exit status and
@@ -226,7 +243,9 @@ impl SecretService {
         let text = std::str::from_utf8(&stdout).map_err(|_| unreadable(role))?;
         let text = text.trim();
         if text.is_empty() {
-            return Ok(None);
+            // Only exit 1 with no message and no listed item is an empty
+            // slot. Exit 0 with no secret is not one.
+            return Err(unreadable(role));
         }
         let bytes = Zeroizing::new(
             base64::engine::general_purpose::STANDARD
@@ -279,22 +298,18 @@ struct Drain {
 
 impl Drain {
     /// What the thread read by `deadline`, or by the end of the pipe if
-    /// that is first. A pipe that another process holds open past
-    /// `deadline` does not stop the caller: the thread reads on, detached,
-    /// until that process closes the pipe.
-    fn collect(self, deadline: Instant) -> Vec<u8> {
+    /// that is first, and whether the pipe reached its end by `deadline`.
+    /// A pipe that another process holds open past `deadline` does not
+    /// stop the caller: the thread reads on, detached, until that process
+    /// closes the pipe.
+    fn collect(self, deadline: Instant) -> (Vec<u8>, bool) {
         let wait = deadline.saturating_duration_since(Instant::now());
-        if self.done.recv_timeout(wait).is_err() {
-            tracing::warn!(
-                store = STORE,
-                "an output pipe of secret-tool stayed open after it exited; using the output read so far"
-            );
-        }
+        let ended = self.done.recv_timeout(wait).is_ok();
         let mut buf = self
             .buf
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *buf)
+        (std::mem::take(&mut *buf), ended)
     }
 }
 
@@ -646,17 +661,44 @@ esac
         .unwrap();
         let store = SecretService::with_program("/bin/sh", [script]);
         let started = Instant::now();
-        let out = store
+        let err = store
             .run(Role::Root, &["lookup", ATTRIBUTE, "x"], None)
-            .unwrap();
+            .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(matches!(
-            failure(Role::Root, &out),
+            err,
             KeyError::Unreachable {
                 role: Role::Root,
                 ..
             }
         ));
+    }
+
+    // BEP-089
+    #[test]
+    fn a_lookup_whose_pipe_stays_open_is_not_an_empty_slot() {
+        for exit in ["exit 0", "exit 1"] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("secret-tool");
+            // The background `sleep` holds stdout open, so the key can
+            // still be on its way when the tool exits with no output.
+            std::fs::write(&script, format!("sleep 30 &\n{exit}\n")).unwrap();
+            let store = SecretService::with_program("/bin/sh", [script]);
+            let started = Instant::now();
+            let found = store.lookup(Role::Root, Slot::Held);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(found.is_err(), "{exit}: {found:?}");
+        }
+    }
+
+    // BEP-089
+    #[test]
+    fn a_lookup_that_exits_0_with_no_secret_is_not_an_empty_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("secret-tool");
+        std::fs::write(&script, "exit 0\n").unwrap();
+        let store = SecretService::with_program("/bin/sh", [script]);
+        assert!(store.lookup(Role::Root, Slot::Held).is_err());
     }
 
     #[test]
