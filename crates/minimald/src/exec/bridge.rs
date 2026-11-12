@@ -2609,8 +2609,8 @@ mod detach_tests {
     /// the terminal's side of the input, which holds what clients type.
     fn live_tty_entry(dir: &tempfile::TempDir) -> (Arc<ExecEntry>, HeldInputReader) {
         let id = crate::exec::process::mint_exec_id();
-        let transcript = camino::Utf8PathBuf::from_path_buf(dir.path().join(id.as_str()))
-            .expect("a UTF-8 path");
+        let transcript =
+            camino::Utf8PathBuf::from_path_buf(dir.path().join(id.as_str())).expect("a UTF-8 path");
         std::fs::write(&transcript, b"").expect("the transcript is written");
         let (terminal, typed) = ExecTerminal::new(HeldInputLimits::for_daemon());
         let entry = Arc::new(ExecEntry::new(
@@ -2664,9 +2664,7 @@ mod detach_tests {
         let first = tokio::spawn({
             let entry = Arc::clone(&entry);
             let session = session.clone();
-            async move {
-                attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await
-            }
+            async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
         });
         tx.send(typed(b"ab\x1dd")).unwrap();
         let status = tokio::time::timeout(std::time::Duration::from_secs(10), first)
@@ -2679,7 +2677,10 @@ mod detach_tests {
         client.read_to_end(&mut seen).await.unwrap();
         let seen = String::from_utf8_lossy(&seen);
         assert!(
-            seen.contains(&format!("Detached from exec {}. It keeps running.", entry.id)),
+            seen.contains(&format!(
+                "Detached from exec {}. It keeps running.",
+                entry.id
+            )),
             "{seen:?}"
         );
         assert_eq!(
@@ -2696,9 +2697,7 @@ mod detach_tests {
         let second = tokio::spawn({
             let entry = Arc::clone(&entry);
             let session = session.clone();
-            async move {
-                attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await
-            }
+            async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
         });
         tx.send(typed(b"hi")).unwrap();
         let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
