@@ -23333,16 +23333,25 @@ proof_a_build_box_fetches_its_source() {
   # VM lane the line names the box's session, not the package: it names the
   # spec hash, which the box computes from the resolved graph, and nothing
   # this script runs prints that hash.
-  if [ -n "$bbf_native" ]; then
-    bbf_grant="$(bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
-      | grep -F -- 'opened the network of a build box' \
-      | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' \
-      | grep -F -- "package: \\\"$bbf_pkg\\\"" | tail -n1)"
-  else
-    bbf_grant="$(bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
-      | grep -F -- 'opened a build grant' \
-      | grep -F -- "\"session\":\"$bbf_sid\"" | tail -n1)"
-  fi
+  bbf_grant_line() {
+    if [ -n "$bbf_native" ]; then
+      bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+        | grep -F -- 'opened the network of a build box' \
+        | grep -F -- '"box_name":"e2e-bbf"' | grep -F -- '"granted":true' \
+        | grep -F -- "package: \\\"$bbf_pkg\\\"" | tail -n1
+    else
+      bbf_grant_log | tail -n "+$((bbf_log_mark + 1))" \
+        | grep -F -- 'opened a build grant' \
+        | grep -F -- "\"session\":\"$bbf_sid\"" | tail -n1
+    fi
+  }
+  # The daemon's file writer is asynchronous, so the line can land after the
+  # build returns: wait for it, as esu_wait_gate_line does.
+  for _ in $(seq 1 40); do
+    bbf_grant="$(bbf_grant_line)"
+    [ -z "$bbf_grant" ] || break
+    sleep 0.25
+  done
   if [ -z "$bbf_grant" ]; then
     echo "::error::the build of $bbf_pkg passed, but no build grant line for box e2e-bbf appeared in the daemon's log after the build began"
     bbf_logs
