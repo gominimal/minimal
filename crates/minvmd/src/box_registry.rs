@@ -5283,6 +5283,17 @@ impl BoxRegistry {
                 if build_row.is_some() {
                     record.hold_as_build_row();
                 }
+                if build_row == Some(BuildRow::Requester) {
+                    let mut resident = self
+                        .host_ip_boxes
+                        .write()
+                        .expect("the resident host_ip boxes' lock is never held across a panic");
+                    resident.admits += 1;
+                    let admit = resident.admits;
+                    resident
+                        .requester_rows_at
+                        .insert(canonical_box_name(&record.name()), admit);
+                }
             })
             .inspect_err(|_| {
                 for &addr in std::iter::once(&switch_addr).chain(&task_addrs) {
@@ -7486,19 +7497,78 @@ impl BoxRegistry {
     }
 
     /// Whether any `host_ip` box's rules are held, resident or set aside,
-    /// or any credentialed id waits for its box's destroy to revoke it: a
-    /// reconcile has nothing to do while this is `false`.
+    /// any credentialed id waits for its box's destroy to revoke it, or any
+    /// requester build row waits for its box's end: a reconcile has nothing
+    /// to do while this is `false`.
     #[must_use]
     pub fn holds_host_ip_boxes(&self) -> bool {
-        let resident = self
-            .host_ip_boxes
-            .read()
-            .expect("the resident host_ip boxes' lock is never held across a panic");
-        if !resident.boxes.is_empty() || !resident.dormant.is_empty() {
-            return true;
+        {
+            let resident = self
+                .host_ip_boxes
+                .read()
+                .expect("the resident host_ip boxes' lock is never held across a panic");
+            if !resident.boxes.is_empty() || !resident.dormant.is_empty() {
+                return true;
+            }
+            // The ids' lock after the resident set's, as on the register path.
+            if !self.host_ip_id_set().credentialed.is_empty() {
+                return true;
+            }
         }
-        // The ids' lock after the resident set's, as on the register path.
-        !self.host_ip_id_set().credentialed.is_empty()
+        self.creations()
+            .all()
+            .any(|creation| creation.build_row == Some(BuildRow::Requester))
+    }
+
+    /// The requester build rows whose box the in-VM daemon no longer lists,
+    /// by name (NET-169). A requester row stands until its box's
+    /// retirement ([`Self::withdraw_build_row`]), and a creator that never
+    /// retires the box would leave it for good. A box the guest's list
+    /// leaves out was destroyed there, so its row is one to withdraw.
+    ///
+    /// `guest` is the in-VM daemon's session list, read after `mark`
+    /// ([`Self::host_ip_admit_mark`]). A box the list names, in any state,
+    /// keeps its row. So does a row registered after the mark: the list can
+    /// predate its box. A row reloaded at a start has no mark, and the
+    /// first list read after the start decides it.
+    ///
+    /// The guest controls its list, so a false absence can end a row whose
+    /// box still runs. That only takes network away from the box's builds,
+    /// as a false absence takes a `host_ip` box's own rules away
+    /// ([`Self::reconcile_host_ip_boxes`]).
+    #[must_use]
+    pub fn requester_rows_without_a_box(
+        &self,
+        guest: &BTreeMap<boxes::SessionId, boxes::BoxState>,
+        mark: HostIpAdmitMark,
+    ) -> Vec<String> {
+        let rows: BTreeMap<String, String> = self
+            .creations()
+            .all()
+            .filter(|creation| creation.build_row == Some(BuildRow::Requester))
+            .map(|creation| (canonical_box_name(&creation.name), creation.name.clone()))
+            .collect();
+        let listed: BTreeSet<String> = guest
+            .keys()
+            .map(|session| canonical_box_name(&minimald_rpc::requester_build_row_name(*session)))
+            .collect();
+        let mut resident = self
+            .host_ip_boxes
+            .write()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        resident
+            .requester_rows_at
+            .retain(|name, _| rows.contains_key(name));
+        rows.into_iter()
+            .filter(|(key, _)| !listed.contains(key))
+            .filter(|(key, _)| {
+                resident
+                    .requester_rows_at
+                    .get(key)
+                    .is_none_or(|admit| *admit <= mark.0)
+            })
+            .map(|(_, name)| name)
+            .collect()
     }
 
     /// Sets the binder the node's mirror binds with ([`MirrorBinder`]):
@@ -8617,6 +8687,11 @@ struct HostIpBoxes {
     /// The admit count at each held box's last client admit, resident or
     /// set aside.
     admitted_at: BTreeMap<boxes::SessionId, u64>,
+    /// The admit count at each requester build row's registration, by the
+    /// row's canonical name ([`BoxRegistry::requester_rows_without_a_box`]).
+    /// A registration counts as an admit, so a session list read before it
+    /// never ends its row.
+    requester_rows_at: BTreeMap<String, u64>,
     /// The record the host-side DNS admission table pins the resident
     /// boxes' declared names under: every resident box's DNS hosts and
     /// allowed subnets, keyed to the node's own address. `None` when no
@@ -10407,6 +10482,74 @@ mod tests {
         );
         assert_eq!(after.live_switch_addrs(), 0, "its address went back");
         assert!(after.withdraw_build_row("build-web").is_none(), "it ended");
+    }
+
+    /// NET-169: a requester row whose box the guest no longer lists is one
+    /// to withdraw. A box the guest lists, in any state, keeps its row, and
+    /// so does a row registered after the list's mark.
+    #[test]
+    fn a_requester_row_ends_once_the_guest_no_longer_lists_its_box() {
+        let registry = BoxRegistry::new(SUBNET);
+        let (gone, stopped) = (boxes::SessionId::mint(), boxes::SessionId::mint());
+        let gone_row = minimald_rpc::requester_build_row_name(gone);
+        let stopped_row = minimald_rpc::requester_build_row_name(stopped);
+        for row in [&gone_row, &stopped_row] {
+            registry
+                .register_build_row(client_spec(row), BuildRow::Requester)
+                .expect("the plan has an address for the requester row");
+        }
+        registry
+            .register_build_row(client_spec("build-grant-1"), BuildRow::Grant)
+            .expect("the plan has an address for the grant row");
+        registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.holds_host_ip_boxes(), "a requester row waits");
+
+        let guest = BTreeMap::from([(stopped, boxes::BoxState::Stopped)]);
+        let mark = registry.host_ip_admit_mark();
+        assert_eq!(
+            registry.requester_rows_without_a_box(&guest, mark),
+            vec![gone_row.clone()]
+        );
+
+        let late = boxes::SessionId::mint();
+        let late_row = minimald_rpc::requester_build_row_name(late);
+        registry
+            .register_build_row(client_spec(&late_row), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+        assert_eq!(
+            registry.requester_rows_without_a_box(&guest, mark),
+            vec![gone_row.clone()],
+            "a list read before the late row's registration leaves it"
+        );
+        assert!(registry.withdraw_build_row(&gone_row).is_some());
+        assert_eq!(
+            registry.requester_rows_without_a_box(&guest, registry.host_ip_admit_mark()),
+            vec![late_row],
+            "a list read after it decides it"
+        );
+    }
+
+    /// NET-169: a requester row reloaded at a start has no mark, so the
+    /// first list read after the start decides it.
+    #[test]
+    fn a_reloaded_requester_row_ends_on_the_first_list_without_its_box() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let row = minimald_rpc::requester_build_row_name(boxes::SessionId::mint());
+        persisted_registry(&dir)
+            .register_build_row(client_spec(&row), BuildRow::Requester)
+            .expect("the plan has an address for the requester row");
+
+        let after = persisted_registry(&dir);
+        assert!(after.holds_host_ip_boxes(), "the reloaded row waits");
+        let mark = after.host_ip_admit_mark();
+        assert_eq!(
+            after.requester_rows_without_a_box(&BTreeMap::new(), mark),
+            vec![row.clone()]
+        );
+        assert!(after.withdraw_build_row(&row).is_some());
+        assert!(!after.holds_host_ip_boxes(), "nothing waits any more");
     }
 
     /// The registry a test persists at `dir`, under its default plan.
