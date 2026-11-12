@@ -1359,6 +1359,302 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
         .map_err(|e| BoxManagerError::other(format!("could not serialize the box spec: {e}")))
 }
 
+/// The refusal of a create whose spec carries a value that the constraints
+/// of its type's built-in root exclude (BOX-160). The daemon checks this
+/// at admission, whatever the client checked before it sent the spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootConstraintRefusal {
+    /// The spec's Box Type, its `box.type`.
+    pub(crate) box_type: String,
+    /// The built-in type that `box_type` is built on.
+    pub(crate) root: String,
+    /// The key's dotted path in the spec, such as `io.pty_enabled`.
+    pub(crate) key: String,
+    /// The value the spec carries, as one line of JSON.
+    pub(crate) value: String,
+    /// The values the root allows, as the message names them.
+    pub(crate) allowed: String,
+}
+
+impl RootConstraintRefusal {
+    /// The exit code of the refusal: 3, a configuration error.
+    pub(crate) const EXIT_CODE: i32 = 3;
+
+    /// The exit code of the refusal.
+    pub(crate) fn exit_code(&self) -> i32 {
+        Self::EXIT_CODE
+    }
+}
+
+impl std::fmt::Display for RootConstraintRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            box_type,
+            root,
+            key,
+            value,
+            allowed,
+        } = self;
+        let kind = if box_type == root {
+            format!("A box of the built-in type `{root}`")
+        } else {
+            format!("A box of type `{box_type}`, which extends the built-in type `{root}`,")
+        };
+        write!(
+            f,
+            "The box spec sets `{key}` to `{value}`. \
+             {kind} allows {allowed} for `{key}`. \
+             No box was created. Change the value in minimal.toml, then create the box again."
+        )
+    }
+}
+
+impl std::error::Error for RootConstraintRefusal {}
+
+/// The top-level spec sections that can carry a flat setting, such as
+/// `io` for `pty_enabled` or `box` for `loadout_mode`.
+const FLAT_KEY_SECTIONS: [&str; 6] = ["box", "execution", "install", "io", "nesting", "network"];
+
+/// The refusal of a create whose spec does not name its Box Type's
+/// built-in root (BOX-160). Either `box.type` is not a built-in type and
+/// `type.root` is absent, or `type.root` is not a built-in type, or
+/// `box.type` is a built-in type and `type.root` names a different one.
+/// A built-in type is its own root, so a different `type.root` would
+/// check the spec against the wrong constraints. In each case the daemon
+/// has no root it can trust, so it refuses the spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnknownRootRefusal {
+    /// The key that names the type, `box.type` or `type.root`.
+    pub(crate) key: &'static str,
+    /// The value the spec carries at `key`, as one line of text.
+    pub(crate) value: String,
+    /// The built-in `box.type` that a different `type.root` contradicts,
+    /// when that is the reason for the refusal.
+    pub(crate) builtin_type: Option<&'static str>,
+}
+
+impl UnknownRootRefusal {
+    /// The exit code of the refusal: 3, a configuration error.
+    pub(crate) const EXIT_CODE: i32 = RootConstraintRefusal::EXIT_CODE;
+
+    /// The exit code of the refusal.
+    pub(crate) fn exit_code(&self) -> i32 {
+        Self::EXIT_CODE
+    }
+}
+
+impl std::fmt::Display for UnknownRootRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            key,
+            value,
+            builtin_type,
+        } = self;
+        if let Some(builtin_type) = builtin_type {
+            return write!(
+                f,
+                "The box spec sets `box.type` to `{builtin_type}` and `type.root` to `{value}`. \
+                 The built-in type `{builtin_type}` is its own root. \
+                 No box was created. Remove `type.root` from the spec, \
+                 or set it to `{builtin_type}`, then create the box again."
+            );
+        }
+        let builtins: Vec<String> = mfile::box_types::BUILTIN_BOX_TYPES
+            .iter()
+            .map(|b| format!("`{b}`"))
+            .collect();
+        let situation = if *key == "type.root" {
+            format!("The box spec sets `type.root` to `{value}`, which is not a built-in type.")
+        } else {
+            format!(
+                "The box spec sets `box.type` to `{value}`, \
+                 but it does not name the built-in type that `{value}` extends."
+            )
+        };
+        write!(
+            f,
+            "{situation} The built-in types are {}. No box was created.",
+            builtins.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownRootRefusal {}
+
+/// Why the admission check of BOX-160 refuses a create.
+#[derive(Debug)]
+enum AdmissionRootRefusal {
+    /// The spec names a type with no built-in root.
+    UnknownRoot(UnknownRootRefusal),
+    /// The spec carries a value its root's constraints exclude.
+    Constraint(RootConstraintRefusal),
+}
+
+/// The spec's Box Type and the built-in type it is built on (BOX-071): the
+/// type is `box.type`. A built-in type is its own root (Gatehouse §6.3.2),
+/// so the root of a built-in `box.type` is the type itself, and the root
+/// of a project type is `type.root`. A spec with no `box.type` is of
+/// `verb_type`, the type the creating verb files the box under.
+///
+/// # Errors
+///
+/// [`UnknownRootRefusal`] when the spec does not name a built-in root: a
+/// built-in `box.type` with a different `type.root`, a `type.root` that is
+/// not a built-in type, or a project type with no `type.root`. A spec that
+/// names a type with no root, or the wrong one, never passes unchecked.
+fn spec_type_root(
+    spec: &serde_json_lenient::Value,
+    verb_type: &str,
+) -> Result<(String, &'static str), UnknownRootRefusal> {
+    let text =
+        |v: &serde_json_lenient::Value| v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+    let box_type = spec
+        .get("box")
+        .and_then(|b| b.get("type"))
+        .map_or_else(|| verb_type.to_owned(), text);
+    let type_root = spec.get("type").and_then(|t| t.get("root")).map(text);
+    if let Some(builtin_type) = mfile::box_types::builtin(&box_type) {
+        return match type_root {
+            Some(root) if root != builtin_type => Err(UnknownRootRefusal {
+                key: "type.root",
+                value: root,
+                builtin_type: Some(builtin_type),
+            }),
+            _ => Ok((box_type, builtin_type)),
+        };
+    }
+    let (key, root) = match type_root {
+        Some(root) => ("type.root", root),
+        None => ("box.type", box_type.clone()),
+    };
+    match mfile::box_types::builtin(&root) {
+        Some(root) => Ok((box_type, root)),
+        None => Err(UnknownRootRefusal {
+            key,
+            value: root,
+            builtin_type: None,
+        }),
+    }
+}
+
+/// The values a constraint that is not a table admits: a list's items, or
+/// the value itself.
+fn admitted(constraint: &serde_json_lenient::Value) -> &[serde_json_lenient::Value] {
+    match constraint {
+        serde_json_lenient::Value::Array(items) => items,
+        other => std::slice::from_ref(other),
+    }
+}
+
+/// The values a constraint allows, as the refusal names them.
+fn constraint_words(constraint: &serde_json_lenient::Value) -> String {
+    let words: Vec<String> = admitted(constraint)
+        .iter()
+        .map(|v| format!("`{v}`"))
+        .collect();
+    match words.as_slice() {
+        [] => "no value".to_owned(),
+        [one] => format!("only {one}"),
+        [rest @ .., last] => format!("only {} or {last}", rest.join(", ")),
+    }
+}
+
+/// The first place in `value`, at key path `path`, that `constraint`
+/// excludes: the path, the value and the constraint that excludes it. A
+/// table constrains only the keys it names. A list value is checked item
+/// by item.
+fn first_excluded(
+    path: &str,
+    constraint: &serde_json_lenient::Value,
+    value: &serde_json_lenient::Value,
+) -> Option<(String, String, serde_json_lenient::Value)> {
+    use serde_json_lenient::Value;
+    let exclude = |value: &Value| Some((path.to_owned(), value.to_string(), constraint.clone()));
+    match (constraint, value) {
+        (Value::Object(c), Value::Object(v)) => c.iter().find_map(|(k, cv)| {
+            v.get(k)
+                .and_then(|vv| first_excluded(&format!("{path}.{k}"), cv, vv))
+        }),
+        (Value::Object(_), _) => exclude(value),
+        (_, Value::Array(items)) => items
+            .iter()
+            .find(|item| !admitted(constraint).contains(item))
+            .and_then(exclude),
+        _ if admitted(constraint).contains(value) => None,
+        _ => exclude(value),
+    }
+}
+
+/// Checks a create's spec against the constraints of its type's built-in
+/// root (BOX-160), at admission. A flat setting is checked at its flat
+/// key and under each section that carries it. The check reads the spec
+/// and never changes it.
+///
+/// A spec with no `box.type` is of `verb_type`, the type the creating
+/// verb files the box under. The daemon files the record under
+/// `verb_type` whatever `box.type` says, so the spec is also checked
+/// against the constraints of `verb_type`. A spec cannot pass as one type
+/// and be filed as another that excludes its values.
+///
+/// # Errors
+///
+/// [`AdmissionRootRefusal::UnknownRoot`] when the spec names a type with
+/// no built-in root, and [`AdmissionRootRefusal::Constraint`] for the
+/// first value a constraint excludes, naming the type, its root and the key.
+fn root_constraint_refusal(
+    spec: &serde_json_lenient::Value,
+    verb_type: &str,
+) -> Result<(), AdmissionRootRefusal> {
+    let (box_type, root) =
+        spec_type_root(spec, verb_type).map_err(AdmissionRootRefusal::UnknownRoot)?;
+    builtin_root_refusal(spec, box_type, root)?;
+    match mfile::box_types::builtin(verb_type) {
+        Some(verb_root) if verb_root != root => {
+            builtin_root_refusal(spec, verb_root.to_owned(), verb_root)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Checks `spec` against the constraints of the built-in `root`, for a
+/// box of type `box_type`.
+fn builtin_root_refusal(
+    spec: &serde_json_lenient::Value,
+    box_type: String,
+    root: &str,
+) -> Result<(), AdmissionRootRefusal> {
+    let constraints = serde_json_lenient::to_value(mfile::box_types::builtin_constraints(root))
+        .expect("a TOML table serializes as JSON");
+    let Some(constraints) = constraints.as_object() else {
+        return Ok(());
+    };
+    for (key, constraint) in constraints {
+        let mut places = vec![(key.clone(), spec.get(key))];
+        if !constraint.is_object() {
+            for section in FLAT_KEY_SECTIONS {
+                if let Some(nested) = spec.get(section).and_then(|s| s.get(key)) {
+                    places.push((format!("{section}.{key}"), Some(nested)));
+                }
+            }
+        }
+        for (path, value) in places {
+            let Some(value) = value else {
+                continue;
+            };
+            if let Some((key, value, constraint)) = first_excluded(&path, constraint, value) {
+                return Err(AdmissionRootRefusal::Constraint(RootConstraintRefusal {
+                    box_type,
+                    root: root.to_owned(),
+                    key,
+                    value,
+                    allowed: constraint_words(&constraint),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The Box Spec sections that a spec can carry and that this daemon does
 /// not enforce (BOX-076): the top-level key, the key inside it when the
 /// section is one key of a table, and the section as the log names it.
@@ -3890,6 +4186,8 @@ impl BoxManager {
             // BOX-140: the identity the box runs under.
             identity = IDENTITY_MODE_NONE,
             fresh,
+            // BOX-160: the admission refusal, when the create is refused.
+            refusal = tracing::field::Empty,
         )
     )]
     async fn create_session(
@@ -4027,6 +4325,60 @@ impl BoxManager {
                 std::io::ErrorKind::PermissionDenied,
                 refusal,
             ));
+        }
+        // BOX-160: the daemon re-checks the spec against its root's
+        // constraints at admission, whatever the client checked. The
+        // refusal comes before the record exists, so it leaves nothing.
+        // A spec with no `box.type` is checked as the type the creating
+        // verb files the box under, so leaving the type out skips nothing.
+        let verb_type = match config.creating_verb {
+            minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
+            minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
+        };
+        let session_name = config
+            .name
+            .as_deref()
+            .unwrap_or(crate::rpc::ANONYMOUS_SESSION);
+        match spec
+            .as_ref()
+            .map(|spec| root_constraint_refusal(spec, verb_type))
+        {
+            Some(Err(AdmissionRootRefusal::Constraint(refusal))) => {
+                span.record("refusal", tracing::field::display(&refusal));
+                tracing::info!(
+                    session_name,
+                    box_type = %refusal.box_type,
+                    root = %refusal.root,
+                    key = %refusal.key,
+                    value = %refusal.value,
+                    exit_code = refusal.exit_code(),
+                    "refused a create: the box spec carries a value its type's built-in root excludes"
+                );
+                // The reply carries the refusal's text but not its code,
+                // so `min` exits 1 and not 3 (#3313).
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    refusal,
+                ));
+            }
+            Some(Err(AdmissionRootRefusal::UnknownRoot(refusal))) => {
+                span.record("refusal", tracing::field::display(&refusal));
+                tracing::info!(
+                    session_name,
+                    key = refusal.key,
+                    value = %refusal.value,
+                    exit_code = refusal.exit_code(),
+                    builtin_type = refusal.builtin_type,
+                    "refused a create: the box spec does not name its type's built-in root"
+                );
+                // The reply carries the refusal's text but not its code,
+                // so `min` exits 1 and not 3 (#3313).
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    refusal,
+                ));
+            }
+            Some(Ok(())) | None => {}
         }
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
