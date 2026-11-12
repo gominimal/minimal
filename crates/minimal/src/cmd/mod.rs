@@ -38,6 +38,9 @@ mod session;
 // activation registered with the VM host daemon; the withdrawal lives with
 // the session commands, as does the host-kind rule its gate keys on.
 pub(crate) use box_verbs::{daemon_host_kind, vm_host_control_sock, withdraw_box_row};
+// The `min box spec` render, for the in-process daemon tests.
+#[cfg(test)]
+pub(crate) use box_spec::box_spec_to;
 
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
@@ -122,6 +125,7 @@ fn command_verb(command: Option<&Command>) -> &'static str {
         Some(Command::Session(SessionArgs { command })) => match command {
             SessionCommand::List(_) => "session list",
             SessionCommand::Activate(_) => "session activate",
+            SessionCommand::Start(_) => "session start",
             SessionCommand::Attach(_) => "session attach",
             SessionCommand::Exec(_) => "session exec",
             SessionCommand::Run(_) => "session run",
@@ -130,23 +134,33 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             SessionCommand::Policy(_) => "session policy",
             SessionCommand::SetupZed(_) => "session setup-zed",
             SessionCommand::Hooks(_) => "session hooks",
+            SessionCommand::Logs(_) => "session logs",
         },
         Some(Command::Loadout(_)) => "loadout list",
-        Some(Command::Task(_)) => "task run",
-        Some(Command::Run(_)) => "run",
+        Some(Command::Task(TaskArgs { command })) => match command {
+            TaskCommand::Run(_) => "task run",
+            TaskCommand::List(_) => "task list",
+            TaskCommand::Logs(_) => "task logs",
+        },
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(_) => "box spec",
             BoxCommand::Audit(_) => "box audit",
             BoxCommand::List(_) => "box list",
+            BoxCommand::Start(_) => "box start",
+            BoxCommand::Run(_) => "box run",
             BoxCommand::Show(_) => "box show",
             BoxCommand::Stop(_) => "box stop",
             BoxCommand::Rm(_) => "box rm",
+            BoxCommand::Restart(_) => "box restart",
             BoxCommand::Attach(_) => "box attach",
+            BoxCommand::Resume(_) => "box resume",
             BoxCommand::Exec(_) => "box exec",
+            BoxCommand::Wait(_) => "box wait",
             BoxCommand::Events(_) => "box events",
             BoxCommand::Cp(_) => "box cp",
             BoxCommand::Rename(_) => "box rename",
             BoxCommand::Prune(_) => "box prune",
+            BoxCommand::Logs(_) => "box logs",
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => "host list",
@@ -181,6 +195,7 @@ fn command_verb(command: Option<&Command>) -> &'static str {
         },
         Some(Command::Login(_)) => "login",
         Some(Command::Version) => "version",
+        Some(Command::UpdateCheck(_)) => "update-check",
         #[cfg(debug_assertions)]
         Some(Command::Spin(_)) => "spin",
         #[cfg(debug_assertions)]
@@ -372,6 +387,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Session(SessionArgs { command })) => match command {
             SessionCommand::List(args) => cmd_ls(&cli.global_args, args).await,
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
+            SessionCommand::Start(args) => cmd_session_start(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
             SessionCommand::Exec(args) => cmd_exec(&cli.global_args, args).await,
             SessionCommand::Run(args) => cmd_session_run(&cli.global_args, args).await,
@@ -380,27 +396,47 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
             SessionCommand::SetupZed(args) => cmd_session_setup_zed(&cli.global_args, args).await,
             SessionCommand::Hooks(args) => cmd_session_hooks(&cli.global_args, args).await,
+            SessionCommand::Logs(args) => {
+                let session = Some(boxes::SESSION_BOX_TYPE);
+                cmd_box_logs(&cli.global_args, args, session, "session logs").await
+            }
         },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         })) => loadouts::cmd_loadout_list(args, &cli.global_args),
         Some(Command::Task(TaskArgs { command })) => match command {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
+            TaskCommand::List(args) => task::cmd_task_list(&cli.global_args, args).await,
+            TaskCommand::Logs(args) => {
+                let task = Some(boxes::TASK_BOX_TYPE);
+                cmd_box_logs(&cli.global_args, args, task, "task logs").await
+            }
         },
-        Some(Command::Run(args)) => task::cmd_run(&args),
         Some(Command::Box(BoxArgs { command })) => match command {
-            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
+            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args).await,
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
+            BoxCommand::Start(args) => cmd_box_start(&cli.global_args, args).await,
+            BoxCommand::Run(args) => task::cmd_box_run(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
-            BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
+            BoxCommand::Stop(args) => match args.exec.as_deref() {
+                Some(exec) => cmd_box_stop_exec(&cli.global_args, &args.target, exec).await,
+                None => cmd_box_stop(&cli.global_args, args).await,
+            },
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
+            BoxCommand::Restart(args) => cmd_box_restart(&cli.global_args, args).await,
             BoxCommand::Attach(args) => cmd_box_attach(&cli.global_args, args).await,
+            BoxCommand::Resume(args) => cmd_box_resume(&cli.global_args, args).await,
             BoxCommand::Exec(args) => cmd_box_exec(&cli.global_args, args).await,
+            BoxCommand::Wait(args) => cmd_box_wait(&cli.global_args, args).await,
             BoxCommand::Events(args) => cmd_box_events(&cli.global_args, args).await,
             BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
             BoxCommand::Rename(args) => cmd_box_rename(&cli.global_args, args).await,
             BoxCommand::Prune(args) => cmd_box_prune(&cli.global_args, args).await,
+            BoxCommand::Logs(args) => match args.exec.as_deref() {
+                Some(exec) => cmd_box_logs_exec(&cli.global_args, &args.logs.target, exec).await,
+                None => cmd_box_logs(&cli.global_args, args.logs, None, "box logs").await,
+            },
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => {
@@ -453,6 +489,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // not held across the daemon handshake, where a spawned task's
         // logging may need stdout too.
         Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
+        Some(Command::UpdateCheck(args)) => {
+            crate::update_check::cmd_update_check(&cli.global_args, args).await
+        }
         #[cfg(debug_assertions)]
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         #[cfg(debug_assertions)]
@@ -463,9 +502,12 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             );
             Ok(())
         }
-        Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}")),
+        // An `Other` error keeps its type, so `failure_exit_code` in
+        // `main.rs` finds an `InitRefusal` and exits with its code.
+        Some(Command::Init(args)) => cmd_init(&cli.global_args, args).await.map_err(|e| match e {
+            mctx::Error::Other(e) => e,
+            e => anyhow::anyhow!("{e}"),
+        }),
         Some(Command::Add(args)) => cmd_add(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),

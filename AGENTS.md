@@ -177,10 +177,6 @@ Verified against the current tree; sources in parentheses.
   guest `minimald`, but the justfile passes none, so every guest daemon the
   recipes ship carries the default feature set; with a prebuilt
   `MINIMALD_BIN`, `TARGET`/`FEATURES` are ignored.
-- **macOS `--output` must stay under the repo.** On macOS the `minimal` shim
-  runs the CLI inside a VM and only syncs the project dir back to the host,
-  so `materialize --output` paths outside the repo tree are not visible to
-  it (`crates/minvmd/README.md`).
 - **SIGTTOU wedges foreground boots.** With a TTY on stdin and
   `MINVMD_BOOT_LOG` unset, libkrun's console setup `tcsetattr()`s the
   terminal from a background process group, so SIGTTOU stops the whole group
@@ -204,10 +200,7 @@ Verified against the current tree; sources in parentheses.
 - **`min` vs `minimal` naming.** The CLI crate is `minimal` but its binary is
   `min`; build with `-p minimal`, run `target/debug/min`. Cargo never
   removes old binary names, so a stale pre-rename `target/debug/minimal` can
-  linger; don't invoke or PATH-resolve it. On macOS, `minimal` on `PATH` is
-  typically the distribution shim (`~/.minimal/shim/bin/minimal`), distinct
-  from anything this repo builds (justfile comments,
-  `crates/minvmd/README.md`).
+  linger; don't invoke or PATH-resolve it.
 
 ## CI lane map
 

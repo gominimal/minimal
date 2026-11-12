@@ -54,6 +54,20 @@ pub struct Task {
 }
 
 impl Task {
+    /// Refuses a task that sets `interactive = true`: interactive work is a
+    /// session's (BOX-054).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InteractiveTask`], which exits 3 and names the
+    /// `[sessions.<name>]` entry to declare instead.
+    pub fn refuse_interactive(&self, name: &str) -> Result<(), crate::Error> {
+        if self.interactive {
+            return Err(crate::Error::InteractiveTask(name.to_owned()));
+        }
+        Ok(())
+    }
+
     /// Returns a clone of this task with all action strings mapped through `f`,
     /// enabling interpolation of task parameters (e.g. nickel `%{name}` expansion).
     pub fn map_exec_strings<E>(
@@ -296,6 +310,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(t.vars.get("my_var"), Some(&EnvVarValue::Inherit),);
+    }
+
+    // BOX-054: a task that sets `interactive = true` fails with exit 3 and
+    // names the `[sessions.*]` entry to declare instead.
+    #[test]
+    fn interactive_task_exit3_names_session() {
+        let err = crate::File::from_toml_bytes(
+            indoc! {r#"
+            [tasks.shell]
+            interactive = true
+            exec = "bash -l"
+            "#}
+            .as_bytes(),
+        )
+        .and_then(|f| f.validate().map(|()| f))
+        .expect_err("an interactive task is refused");
+        assert_eq!(err.exit_code(), Some(3), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "`[tasks.shell]` in minimal.toml sets `interactive = true`, and a \
+             task cannot be interactive. Declare the entry as `[sessions.shell]` \
+             instead."
+        );
+
+        let t: Task = toml::from_str("exec = \"bash\"\ninteractive = false").unwrap();
+        t.refuse_interactive("shell")
+            .expect("a task that is not interactive");
+
+        // The project's own file is refused from disk too. The package
+        // graph reads the same file as a layer: the default package
+        // repository declares interactive tasks, and the user cannot fix
+        // that file, so the graph load reads it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::MFILE_NAME),
+            "[tasks.shell]\ninteractive = true\nexec = \"bash -l\"\n",
+        )
+        .unwrap();
+        let err = crate::File::from_dir(dir.path()).expect_err("the project file is refused");
+        assert_eq!(err.exit_code(), Some(3), "{err}");
+        let layer = crate::File::from_dir_for_graph(dir.path()).expect("a graph layer reads");
+        assert!(layer.tasks["shell"].interactive);
     }
 
     /// Tests the interpolation path used by task_invocations when parsed_args is Some:

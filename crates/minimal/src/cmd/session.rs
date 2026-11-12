@@ -35,13 +35,125 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         .map_err(activate_refusal)
 }
 
+/// `min session start [<entry>]`: create a box from a session entry and
+/// attach this terminal to it, or print its id and return (BCLI-029).
+pub async fn cmd_session_start(
+    global: &GlobalArgs,
+    args: SessionStartArgs,
+) -> Result<(), anyhow::Error> {
+    start_entry(global, args.into()).await
+}
+
+/// The entry `min session start` starts (BCLI-071): the typed session
+/// entry, else the session entry named `default`, else the project's only
+/// session entry. The count includes the implicit `default` session entry.
+///
+/// The lookups of an explicit entry come first, in the order of
+/// `pick_session_entry` (`boxes/create.rs`): a typed project entry, then
+/// with no entry typed a project session entry named `default`.
+///
+/// # Errors
+///
+/// [`SessionEntryUndecided::TypeUnresolved`] when the typed entry's own
+/// type is unresolved, or from [`start_candidates`] when the pick depends
+/// on the implicit `default` or on the session count: an entry of a project
+/// Box Type can be a session. Else a [`StartEntryRefusal`] when no session
+/// entry can be picked.
+pub(crate) fn pick_session_start_entry(
+    entries: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, anyhow::Error> {
+    if let Some(typed) = typed {
+        if let Some(entry) = entries.iter().find(|entry| entry.name == typed) {
+            return if is_session_entry(entry) {
+                Ok(entry.clone())
+            } else if type_unresolved(entry) {
+                Err(type_unresolved_refusal(entry).into())
+            } else {
+                Err(StartEntryRefusal::NotSession {
+                    entry: entry.name.clone(),
+                    box_type: entry.box_type.clone(),
+                }
+                .into())
+            };
+        }
+        if typed != mfile::entry::DEFAULT_ENTRY_NAME {
+            return Err(StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: typed.to_string(),
+                entries: listed_entries(entries)
+                    .into_iter()
+                    .filter(is_session_entry)
+                    .map(|entry| entry.name)
+                    .collect(),
+            }
+            .into());
+        }
+    } else if let Some(default) = entries
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME && is_session_entry(entry))
+    {
+        return Ok(default.clone());
+    }
+    // Only the implicit `default` or the session count is left to decide.
+    let candidates = start_candidates(entries)?;
+    pick_session_candidate(entries, &candidates, typed).map_err(Into::into)
+}
+
+/// The pick of [`pick_session_start_entry`] from the `candidates` that
+/// [`start_candidates`] gives for `entries`.
+fn pick_session_candidate(
+    entries: &[mfile::entry::BoxEntry],
+    candidates: &[mfile::entry::BoxEntry],
+    typed: Option<&str>,
+) -> Result<mfile::entry::BoxEntry, StartEntryRefusal> {
+    let sessions: Vec<&mfile::entry::BoxEntry> =
+        candidates.iter().filter(|e| is_session_entry(e)).collect();
+    let names = || sessions.iter().map(|entry| entry.name.clone()).collect();
+    if let Some(typed) = typed {
+        return match candidates.iter().find(|entry| entry.name == typed) {
+            Some(entry) if is_session_entry(entry) => Ok(entry.clone()),
+            Some(entry) => Err(StartEntryRefusal::NotSession {
+                entry: entry.name.clone(),
+                box_type: entry.box_type.clone(),
+            }),
+            None => Err(StartEntryRefusal::Unknown {
+                verb: StartVerb::Session,
+                entry: typed.to_string(),
+                entries: names(),
+            }),
+        };
+    }
+    if let Some(default) = sessions
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok((*default).clone());
+    }
+    match sessions.as_slice() {
+        [only] => Ok((*only).clone()),
+        // No session entry and no implicit `default`: an entry of another
+        // type holds the name `default` (BOX-165).
+        [] => Err(StartEntryRefusal::DefaultBlocked {
+            box_type: entries
+                .iter()
+                .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+                .and_then(|entry| entry.box_type.clone()),
+        }),
+        _ => Err(StartEntryRefusal::Several {
+            verb: StartVerb::Session,
+            entries: names(),
+        }),
+    }
+}
+
 /// The error `min session activate` ends with (NET-144). When the daemon
 /// refused the activation because a declared host port is already in use,
 /// the refusal's own text replaces the whole chain: it names the port, its
 /// holder and the next step, and the stage and RPC context around it add
 /// nothing a person can act on. The activate cleanup has already destroyed
 /// the box by then. Any other error passes through as it is.
-fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
     let refusal = error
         .chain()
         .find_map(|cause| minimald_rpc::PortInUseRefusal::find_in(&cause.to_string()));
@@ -51,69 +163,12 @@ fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Attach to an existing session. Both interactive and `--command` paths
-/// shell out to `ssh` — the daemon's shell_request handler mints a PTY-backed
-/// session shell, and ssh handles termios/PTY management for us.
-///
-/// When `args.session` is `None`, the session is resolved from the current
-/// working directory (or the only existing session), opening an interactive
-/// picker when the choice is ambiguous; see [`attach::resolve_for_attach`]
-/// and [`resolve_smart_attach`].
-///
-/// When `args.session` names a box, the name alone decides where to look
-/// (NET-058): the selected VM's daemon first — the common case costs nothing
-/// beyond the one lookup it always made — and, when that daemon does not know
-/// the name, [`attach::resolve_box_vm`] resolves the VM that owns it across
-/// every VM's socket, so no global flag is needed to reach a box on another
-/// VM.
+/// `min session attach [<box>]`: `min box attach` that sees only boxes of
+/// type session (BCLI-032). A named box resolves among the session boxes,
+/// and with none named the project's session box with a terminal is the
+/// one. A stopped or exited box resumes as the attach starts (BCLI-007).
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
-
-    let mut client = client::Client::connect(&sock)
-        .await
-        .context("Failed to connect to minimald")?;
-    // Connects directly rather than through `connect_daemon` (it needs `sock`
-    // for the ssh hand-off), so the gate is applied by hand — with no session
-    // named, this path creates one, and a skewed activation is #1251 exactly.
-    // Both arms below gate on the build the daemon reports on the lookup they
-    // were already making, so the gate costs no round trip of its own.
-    let (id, name, sock) = match args.session {
-        Some(ref s) => {
-            let (record, sock) =
-                resolve_attach_target_version_gated(global, &mut client, sock, s).await?;
-            (record.id, record.name, sock)
-        }
-        None => match resolve_smart_attach(
-            &list_sessions_version_gated(&mut client).await?.sessions,
-            global,
-        )? {
-            SmartAttach::Attach(entry) => (entry.id, entry.name, sock),
-            SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
-            SmartAttach::NoSessions => {
-                bail!("no sessions exist; use 'min session activate' to create one")
-            }
-        },
-    };
-
-    tracing::info!(
-        session_id = %id,
-        session_name = ?name,
-        "found session"
-    );
-
-    let host_asks = host_asks_box(global, name.as_deref());
-    box_via_ssh(
-        daemon_host_kind(global),
-        &sock,
-        id,
-        None,
-        global.config_dir.as_deref(),
-        host_asks.as_deref(),
-    )
-    .await
+    cmd_session_attach(global, args.session.as_deref()).await
 }
 
 /// Executes a command in an existing session.
@@ -195,23 +250,30 @@ pub async fn cmd_session_run(
         "found session"
     );
 
-    box_via_ssh(
+    // The task's `env_vars`, gated against the user policy and resolved
+    // against this shell, as `min task run` resolves them (inbox#778). The
+    // daemon's environment is not the caller's, so it is never asked.
+    let task_env = crate::task::session_run_task_env(
+        global,
+        r.project_path.as_utf8_path(),
+        &args.task,
+        |k| std::env::var(k),
+    )?;
+
+    task_via_ssh(
         daemon_host_kind(global),
         &sock,
         r.id,
         // No owns-box flag (NET-131): the task runs in a session someone
         // else keeps, so its end stays with whoever holds it.
-        Some(
-            minimald_rpc::exec::ExecRequest::TaskRun {
-                task: args.task,
-                owns_box: false,
-                args: vec![],
-                cwd: String::new(),
-            }
-            .encode(),
-        ),
-        None,
-        None,
+        minimald_rpc::exec::ExecRequest::TaskRun {
+            task: args.task,
+            owns_box: false,
+            args: vec![],
+            cwd: String::new(),
+        }
+        .encode(),
+        &task_env,
     )
     .await
 }
@@ -576,6 +638,7 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         record.id,
         record.name.as_deref(),
         record.box_addresses,
+        record.box_id,
         args.force,
     )
     .await
@@ -729,21 +792,14 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
 
     match resp {
         minimald_rpc::Errorable::Ok(_) => {
-            // A `host_ip` box holds its name in the zone (NODATA) in place
-            // of a row: the hold moves with the name, so the old name no box
-            // owns answers NXDOMAIN again and the new one is the one the
-            // destroy releases.
-            if holds_name(&record) {
-                let control_sock =
-                    vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
-                move_held_box_name(
-                    control_sock,
-                    record.id,
-                    record.name.as_deref(),
-                    &args.new_name,
-                )
-                .await;
-            }
+            // The VM host keeps the box under the name it was registered
+            // by until it is told: a `host_ip` box's zone hold (NODATA) and
+            // an own-address box's row both move with the name, so the old
+            // name answers NXDOMAIN again and the new one is the one the
+            // box answers under and the destroy releases (#1116).
+            let control_sock =
+                vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+            rename_box_with_vm_host(control_sock, &record, &args.new_name).await;
             println!(
                 "Renamed session {} ({}) → {}",
                 record.id,

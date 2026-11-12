@@ -942,6 +942,179 @@ fn declared_by(packages: &BTreeMap<String, String>, declared: &str, task: &str) 
     }
 }
 
+/// A patch path in the session home that passes through a symbolic link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SymlinkedPatch {
+    /// The link, relative to the home: the patch path itself or a parent.
+    pub(crate) link: PathBuf,
+    /// Where the link points, when it could be read.
+    pub(crate) target: Option<PathBuf>,
+}
+
+/// Why a patch path in the session home is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnsafePatch {
+    /// The path has a `..` component.
+    ParentDir,
+    /// The path passes through a symbolic link.
+    Symlink(SymlinkedPatch),
+}
+
+/// Finds why the patch at `path` cannot be mounted from the session `home`,
+/// or `None` when nothing on it is unsafe.
+///
+/// A path with a `..` component is refused wherever it points. The link walk
+/// in [`find_symlinked_patch`] checks the path as written and stops at the
+/// first missing component, while the sandbox creates that component and the
+/// kernel then resolves the `..` after it, and any link beyond, itself.
+pub(crate) fn find_unsafe_patch(home: &Path, path: &Path) -> std::io::Result<Option<UnsafePatch>> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Ok(Some(UnsafePatch::ParentDir));
+    }
+    Ok(find_symlinked_patch(home, path)?.map(UnsafePatch::Symlink))
+}
+
+/// Finds the first symbolic link on `path` below `home`, walking one
+/// component at a time without following any link (inbox#1129). `path` has
+/// no `..` component; [`find_unsafe_patch`] refuses one first.
+///
+/// The rule is no links at all, not no escapes: a link that stays inside the
+/// home is refused too, because the sandbox resolves the mount point through
+/// it against a different root than the bind source. A path outside `home`
+/// is not the box's to change and is not checked. The walk stops at the first
+/// component that does not exist: a read-write patch creates the rest, and
+/// nothing below a missing directory can be a link yet. It stops too at a
+/// component below a regular file, which cannot be a link either; the sandbox
+/// then fails that patch with an error that names who declared it.
+///
+/// The check runs before the sandbox mounts, so it catches a link that is in
+/// place when the task is set up, and not one that the box makes between this
+/// walk and the mount.
+pub(crate) fn find_symlinked_patch(
+    home: &Path,
+    path: &Path,
+) -> std::io::Result<Option<SymlinkedPatch>> {
+    let Ok(rel) = path.strip_prefix(home) else {
+        return Ok(None);
+    };
+    let mut at = home.to_path_buf();
+    let mut link = PathBuf::new();
+    for component in rel.components() {
+        at.push(component);
+        link.push(component);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Ok(Some(SymlinkedPatch {
+                    link,
+                    target: std::fs::read_link(&at).ok(),
+                }));
+            }
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+/// The refusal for a patch through a symbolic link: the patch as declared,
+/// who declared it, the link and its target, and the one way out. The box
+/// chose the target, so its control characters are escaped.
+pub(crate) fn symlinked_patch_refusal(found: &SymlinkedPatch, declared: &str, by: &str) -> String {
+    let link = found.link.display();
+    let target = found
+        .target
+        .as_ref()
+        .map(|t| format!(" to `{}`", printable(&t.to_string_lossy())))
+        .unwrap_or_default();
+    format!(
+        "refused the patch `{declared}` from {by}: `~/{link}` in the session's home is a \
+         symbolic link{target}. A patch is never mounted through a symbolic link. Replace \
+         `~/{link}` in the session with a real directory or file."
+    )
+}
+
+/// The refusal for a patch path with a `..` component: the patch as
+/// declared, who declared it, and the one way out.
+pub(crate) fn parent_dir_patch_refusal(declared: &str, by: &str) -> String {
+    format!(
+        "refused the patch `{declared}` from {by}: the path contains `..`. A patch path \
+         cannot contain `..`. Declare the patch without `..`."
+    )
+}
+
+/// `text` with each control character escaped (`\n`, `\u{1b}`), so a link
+/// target the box chose cannot move the cursor or fake a line in the error.
+fn printable(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
+}
+
+/// Refuses the first patch whose path in the session home has a `..`
+/// component or passes through a symbolic link, naming the patch as it was
+/// declared (inbox#1129).
+fn refuse_unsafe_patches(
+    home: &Path,
+    fs_mappings: &[common::FsMapping],
+    declarations: &BTreeMap<String, Vec<DeclaredMapping<'_>>>,
+    packages: &BTreeMap<String, String>,
+    task: &str,
+) -> Result<(), Error> {
+    for mapping in fs_mappings {
+        let path = Path::new(&mapping.host_path);
+        let found = find_unsafe_patch(home, path).map_err(|e| {
+            Error::IO(
+                "checking a patch path for symbolic links",
+                path.to_path_buf(),
+                e,
+            )
+        })?;
+        let Some(found) = found else { continue };
+        let declared = declarations
+            .get(&mapping.host_path)
+            .and_then(|d| d.first())
+            .map_or(mapping.host_path.as_str(), |d| d.declared.as_str());
+        let by = declared_by(packages, declared, task);
+        let refusal = match &found {
+            UnsafePatch::ParentDir => {
+                tracing::warn!(task, patch = declared, "refusing a patch path with `..`");
+                parent_dir_patch_refusal(declared, &by)
+            }
+            UnsafePatch::Symlink(link) => {
+                tracing::warn!(
+                    task,
+                    patch = declared,
+                    link = %link.link.display(),
+                    "refusing a patch through a symbolic link in the session home"
+                );
+                symlinked_patch_refusal(link, declared, &by)
+            }
+        };
+        return Err(Error::Other(anyhow::anyhow!("{refusal}")));
+    }
+    Ok(())
+}
+
 /// One declared patch entry that shares an expanded host path with
 /// possibly other entries. A directory mapping and a file mapping can
 /// expand to the same path — `Config::validate` processes directories
@@ -1145,6 +1318,25 @@ impl<'a> Env<'a> {
                 declarations.entry(expanded).or_default().push(mapping);
                 declarations
             });
+
+        // A box owns its home, so code it runs can turn any path there into a
+        // symbolic link. The sandbox follows such a link for the bind source
+        // and resolves the mount point through it as well, so a patch through
+        // a link is mounted somewhere other than where it was declared, or the
+        // task fails to start with nothing said (inbox#1129). A `..` in a
+        // patch path is refused too, since the walk cannot see past it. Only a
+        // session home is the box's; an ambient home is the invoking user's own.
+        if matches!(args.home, PatchHome::Session(_))
+            && let Some(home) = home.as_deref()
+        {
+            refuse_unsafe_patches(
+                home,
+                &fs_mappings,
+                &declarations,
+                &fs_mapping_packages,
+                args.name,
+            )?;
+        }
 
         let mut config = apply_wd_layout(
             sandbox::config::Config::new(args.name),
@@ -1445,6 +1637,211 @@ mod tests {
             patches.to_fs_mappings(Some(Path::new("/"))).is_err(),
             "a pid-1 daemon with no session home to offer must still refuse `/`"
         );
+    }
+
+    /// A home with a plain directory, a final link, a link through a parent
+    /// and a link that stays inside the home (inbox#1129).
+    fn linked_home() -> TempDir {
+        let home = tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("plain/inner")).unwrap();
+        std::os::unix::fs::symlink("/etc", h.join("e810")).unwrap();
+        std::os::unix::fs::symlink("/tmp", h.join("l810")).unwrap();
+        std::fs::create_dir(h.join("real")).unwrap();
+        std::os::unix::fs::symlink(h.join("real"), h.join("h810")).unwrap();
+        home
+    }
+
+    #[test]
+    fn a_plain_directory_patch_is_not_refused() {
+        let home = linked_home();
+        let h = home.path();
+        assert_eq!(find_symlinked_patch(h, &h.join("plain")).unwrap(), None);
+        assert_eq!(
+            find_symlinked_patch(h, &h.join("plain/inner")).unwrap(),
+            None
+        );
+        assert_eq!(
+            find_symlinked_patch(h, &h.join("plain/missing/deeper")).unwrap(),
+            None,
+            "a path that does not exist yet has no link on it"
+        );
+        assert_eq!(
+            find_symlinked_patch(h, Path::new("/etc/hostname")).unwrap(),
+            None,
+            "a path outside the home is not the box's and is not checked"
+        );
+    }
+
+    #[test]
+    fn a_final_component_symlink_is_refused() {
+        let home = linked_home();
+        let h = home.path();
+        assert_eq!(
+            find_symlinked_patch(h, &h.join("e810")).unwrap(),
+            Some(SymlinkedPatch {
+                link: "e810".into(),
+                target: Some("/etc".into())
+            })
+        );
+    }
+
+    #[test]
+    fn a_symlinked_parent_is_refused() {
+        let home = linked_home();
+        let h = home.path();
+        let found = find_symlinked_patch(h, &h.join("l810/out810p-1")).unwrap();
+        assert_eq!(
+            found,
+            Some(SymlinkedPatch {
+                link: "l810".into(),
+                target: Some("/tmp".into())
+            }),
+            "the link named is the parent, not the patch path"
+        );
+    }
+
+    #[test]
+    fn a_symlink_inside_the_home_is_still_refused() {
+        let home = linked_home();
+        let h = home.path();
+        let found = find_symlinked_patch(h, &h.join("h810")).unwrap();
+        assert_eq!(
+            found.map(|f| f.link),
+            Some(PathBuf::from("h810")),
+            "the rule is no links, not no escapes"
+        );
+    }
+
+    #[test]
+    fn a_parent_dir_component_is_refused_before_the_walk() {
+        let home = linked_home();
+        let h = home.path();
+        assert_eq!(
+            find_unsafe_patch(h, &h.join("new810/../l810/out810p-2")).unwrap(),
+            Some(UnsafePatch::ParentDir),
+            "`new810` is missing, so the walk alone would stop before `l810`"
+        );
+        assert!(!h.join("new810").exists(), "the check creates nothing");
+        assert_eq!(
+            find_unsafe_patch(h, &h.join("plain/../plain")).unwrap(),
+            Some(UnsafePatch::ParentDir),
+            "`..` is refused even where it resolves to a plain directory"
+        );
+        assert_eq!(
+            find_unsafe_patch(h, &h.join("l810/out")).unwrap(),
+            Some(UnsafePatch::Symlink(SymlinkedPatch {
+                link: "l810".into(),
+                target: Some("/tmp".into())
+            }))
+        );
+        assert_eq!(find_unsafe_patch(h, &h.join("plain")).unwrap(), None);
+    }
+
+    #[test]
+    fn the_refusal_names_the_patch_and_the_link() {
+        let found = SymlinkedPatch {
+            link: "l810".into(),
+            target: Some("/tmp".into()),
+        };
+        assert_eq!(
+            symlinked_patch_refusal(&found, "~/l810/out810p-1", "task `parent`"),
+            "refused the patch `~/l810/out810p-1` from task `parent`: `~/l810` in the session's \
+             home is a symbolic link to `/tmp`. A patch is never mounted through a symbolic \
+             link. Replace `~/l810` in the session with a real directory or file."
+        );
+    }
+
+    #[test]
+    fn refuse_unsafe_patches_names_the_declaration() {
+        let home = linked_home();
+        let h = home.path();
+        let patches = EnvPatches {
+            dir: [
+                ("~/plain".to_string(), mfile::PatchSetting::ReadOnly),
+                (
+                    "~/l810/out810p-1".to_string(),
+                    mfile::PatchSetting::ReadWrite,
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mappings = patches.to_fs_mappings(Some(h)).unwrap();
+        let declared = "~/l810/out810p-1".to_string();
+        let declarations = BTreeMap::from([(
+            format!("{}/l810/out810p-1", h.display()),
+            vec![DeclaredMapping {
+                declared: &declared,
+                is_file: false,
+                read_only: false,
+            }],
+        )]);
+        let err = refuse_unsafe_patches(h, &mappings, &declarations, &BTreeMap::new(), "parent")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refused the patch `~/l810/out810p-1` from task `parent`")
+                && err.contains("`~/l810`")
+                && err.contains("symbolic link"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_refusal_escapes_control_characters_in_the_link_target() {
+        let found = SymlinkedPatch {
+            link: "l810".into(),
+            target: Some("/tmp/\u{1b}[2J\nfake".into()),
+        };
+        let refusal = symlinked_patch_refusal(&found, "~/l810/out", "task `parent`");
+        assert!(
+            refusal.contains("to `/tmp/\\u{1b}[2J\\nfake`"),
+            "got: {refusal}"
+        );
+        assert!(!refusal.chars().any(char::is_control), "got: {refusal:?}");
+    }
+
+    /// A patch below a regular file is left to the sandbox, whose error
+    /// names who declared it, rather than failing the walk unattributed.
+    #[test]
+    fn a_patch_below_a_regular_file_is_not_a_walk_error() {
+        let home = linked_home();
+        let h = home.path();
+        std::fs::write(h.join("file810"), "").unwrap();
+        assert_eq!(
+            find_symlinked_patch(h, &h.join("file810/sub")).unwrap(),
+            None
+        );
+        let patches = EnvPatches {
+            dir: [("~/file810/sub".to_string(), mfile::PatchSetting::ReadWrite)].into(),
+            ..Default::default()
+        };
+        let mappings = patches.to_fs_mappings(Some(h)).unwrap();
+        refuse_unsafe_patches(h, &mappings, &BTreeMap::new(), &BTreeMap::new(), "parent").unwrap();
+    }
+
+    #[test]
+    fn refuse_unsafe_patches_refuses_a_parent_dir() {
+        let home = linked_home();
+        let h = home.path();
+        let patches = EnvPatches {
+            dir: [(
+                "~/new810/../l810/out810p-2".to_string(),
+                mfile::PatchSetting::ReadWrite,
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let mappings = patches.to_fs_mappings(Some(h)).unwrap();
+        let err = refuse_unsafe_patches(h, &mappings, &BTreeMap::new(), &BTreeMap::new(), "parent")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("from task `parent`: the path contains `..`"),
+            "got: {err}"
+        );
+        assert!(!h.join("new810").exists(), "the refusal creates nothing");
     }
 
     /// A patch path a package declared is attributed to that package; one

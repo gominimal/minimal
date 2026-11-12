@@ -330,6 +330,7 @@ mod tests {
             exit_code: None,
             signal: None,
             pty_enabled: true,
+            lifetime: None,
         }
     }
 
@@ -468,6 +469,7 @@ State:      stopped
 Reason:     stopped
 Exit code:  -
 Signal:     15
+Disk:       -
 Identity:   none
 Provider:   local
 Host:       local0
@@ -478,7 +480,11 @@ Host:       local0
         let shown = ShowBoxResponse {
             record: task.clone(),
             identity: BoxIdentity::Unknown,
-            live_execs: vec!["exec-1".to_string()],
+            live_execs: vec![minimald_rpc::LiveExec {
+                id: "exec-1".to_string(),
+                argv: vec!["sleep".to_string(), "60".to_string()],
+                mode: minimald_rpc::exec::ExecMode::Detached,
+            }],
             disk_bytes: None,
         };
         let mut out = Vec::new();
@@ -495,10 +501,12 @@ State:      exited
 Reason:     exit
 Exit code:  0
 Signal:     -
+Disk:       -
 Identity:   unknown
 Provider:   local
 Host:       local0
-Live execs: exec-1
+Live execs:
+  exec-1  detached  sleep 60
 "
         );
 

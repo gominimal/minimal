@@ -169,21 +169,24 @@ pub(crate) async fn destroy_all_boxes(
     let mut failures = 0;
     for session in sessions {
         // The record carries the pair the box's registration handed back
-        // (T66), which the destroy-side withdrawal presents; a session that
-        // registered no box holds none, and the withdrawal stays silent for
-        // it. A record the daemon cannot answer destroys the session all the
-        // same — nothing is left on this path to withdraw the row by.
-        let box_addresses = get_session_record(client, &session.id.to_string())
+        // (T66), and the box id beside it, which the destroy-side withdrawal
+        // presents; a session that registered no box holds none, and the
+        // withdrawal stays silent for it. A record the daemon cannot answer
+        // destroys the session all the same — nothing is left on this path
+        // to withdraw the row by.
+        let record = get_session_record(client, &session.id.to_string())
             .await
             .ok()
-            .and_then(|resp| resp.record)
-            .and_then(|record| record.box_addresses);
+            .and_then(|resp| resp.record);
+        let box_addresses = record.as_ref().and_then(|record| record.box_addresses);
+        let box_id = record.as_ref().and_then(|record| record.box_id);
         if let Err(error) = destroy_box(
             client,
             global,
             session.id,
             session.name.as_deref(),
             box_addresses,
+            box_id,
             force,
         )
         .await
@@ -210,6 +213,7 @@ pub(crate) async fn destroy_box(
     id: boxes::SessionId,
     name: Option<&str>,
     box_addresses: Option<boxes::BoxAddresses>,
+    box_id: Option<boxes::BoxId>,
     force: bool,
 ) -> Result<(), anyhow::Error> {
     use minimald_rpc::{DestroySession, DestroySessionRequest};
@@ -236,15 +240,20 @@ pub(crate) async fn destroy_box(
             }
             // The session is gone; the row its activation bought outlives it on
             // the VM host daemon, and its creator withdraws it here (T66) —
-            // presenting the pair the registration handed back. Best-effort: a
-            // withdrawal that cannot be made leaves the row published and warns
-            // rather than failing a destroy that already succeeded.
+            // presenting the pair the registration handed back and the box id
+            // beside it. The id is what proves a session renamed since its
+            // registration: the host keeps the row under the name it was
+            // registered by (#1116). The id goes only with a pair: a box with
+            // no row withdraws nothing here. Best-effort: a withdrawal that
+            // cannot be made leaves the row published and warns rather than
+            // failing a destroy that already succeeded.
             // A box that registered no row held its name in the zone instead
             // (`host_ip`); the same destroy releases it, best-effort the same
             // way.
             let control_sock =
                 vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
-            withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
+            let row_id = box_addresses.and(box_id);
+            withdraw_box_row(control_sock.clone(), name, box_addresses, row_id).await;
             release_held_box_name(control_sock, id, name, box_addresses).await;
         }
         minimald_rpc::Errorable::Err { error } => {
@@ -838,7 +847,8 @@ pub async fn cmd_box_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyh
     // kept the box, which need not be the selected one.
     let control_sock = box_host_control_sock(&host);
     let name = removed.name.as_deref();
-    withdraw_box_row(control_sock.clone(), name, removed.box_addresses, None).await;
+    let row_id = removed.box_addresses.and(removed.box_id);
+    withdraw_box_row(control_sock.clone(), name, removed.box_addresses, row_id).await;
     release_held_box_name(control_sock, removed.id, name, removed.box_addresses).await;
     // The line goes last, so a closed stdout cannot skip the cleanup above.
     writeln!(std::io::stdout().lock(), "Removed {}.", args.target)?;
@@ -852,6 +862,9 @@ pub(crate) struct RemovedBox {
     pub(crate) id: boxes::SessionId,
     pub(crate) name: Option<String>,
     pub(crate) box_addresses: Option<boxes::BoxAddresses>,
+    /// The id the box's registration handed back beside the pair, which
+    /// the withdrawal presents so a renamed box's row is still its own.
+    pub(crate) box_id: Option<boxes::BoxId>,
 }
 
 /// Resolves the address `target` over `hosts` and reaps that box on the
@@ -891,13 +904,15 @@ pub(crate) async fn rm_listed_box(
         return Err(refusal());
     }
     // The record carries the pair the box's registration handed back,
-    // which the withdrawal after the reap presents. A record the daemon
-    // cannot answer reaps the box all the same.
-    let box_addresses = get_session_record(client, &id.to_string())
+    // and the box id beside it, which the withdrawal after the reap
+    // presents. A record the daemon cannot answer reaps the box all the
+    // same.
+    let record = get_session_record(client, &id.to_string())
         .await
         .ok()
-        .and_then(|resp| resp.record)
-        .and_then(|record| record.box_addresses);
+        .and_then(|resp| resp.record);
+    let box_addresses = record.as_ref().and_then(|record| record.box_addresses);
+    let box_id = record.as_ref().and_then(|record| record.box_id);
     let name = listing
         .iter()
         .find(|entry| entry.box_id == id)
@@ -926,6 +941,7 @@ pub(crate) async fn rm_listed_box(
         id,
         name,
         box_addresses,
+        box_id,
     })
 }
 
@@ -971,8 +987,8 @@ pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<
     let hosts = crate::cmd::list::local_hosts(global)?;
     let resolved = resolve_box_on_hosts(hosts, &args.target, "box rename").await?;
     let mut client = gated_box_host_client(&resolved.host).await?;
-    // The record says whether the box holds its name in the VM host's zone,
-    // which the hold then moves to the new name.
+    // The record says how the box holds its name on the VM host (a zone
+    // hold or a host row), which then moves to the new name (#1116).
     let record = get_session_record(&mut client, &resolved.box_id.to_string())
         .await
         .ok()
@@ -986,15 +1002,9 @@ pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<
         &args.new_name,
     )
     .await?;
-    if let Some(record) = record.filter(holds_name) {
+    if let Some(record) = record {
         let control_sock = box_host_control_sock(&resolved.host);
-        move_held_box_name(
-            control_sock,
-            record.id,
-            record.name.as_deref(),
-            &args.new_name,
-        )
-        .await;
+        rename_box_with_vm_host(control_sock, &record, &args.new_name).await;
     }
     Ok(())
 }
@@ -1031,6 +1041,123 @@ pub(crate) async fn rename_listed_box(
                 Some(refusal) => Err(refusal.into()),
                 None => Err(box_rpc_error(target, error)),
             }
+        }
+    }
+}
+
+/// `min box restart <box>`: stops a box whose spec sets
+/// `lifetime = "until_stopped"`, if it runs, and starts it again from its
+/// stored spec under the same id and name (BCLI-074, BOX-176). A refusal
+/// returns as a [`minimald_rpc::RestartRefusal`], and the process exits
+/// with the code it carries.
+pub async fn cmd_box_restart(
+    global: &GlobalArgs,
+    args: BoxRestartArgs,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    restart_box_on_hosts(hosts, &mut out, &args.target).await?;
+    Ok(())
+}
+
+/// Resolves the address `target` over `hosts` and restarts that box on
+/// the host that keeps it, as BOX-176 defines. Returns the box
+/// and its host.
+pub(crate) async fn restart_box_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    out: &mut impl std::io::Write,
+    target: &str,
+) -> Result<ResolvedBox, anyhow::Error> {
+    restart_box_on_hosts_with(hosts, out, target, async |client, request| {
+        client
+            .oneshot_rpc::<minimald_rpc::RestartBox>(request)
+            .await
+    })
+    .await
+}
+
+/// [`restart_box_on_hosts`], with `send` to put the `RestartBox` request
+/// to the host that keeps the box.
+pub(crate) async fn restart_box_on_hosts_with(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    out: &mut impl std::io::Write,
+    target: &str,
+    send: impl AsyncFnOnce(
+        &mut client::Client,
+        minimald_rpc::RestartBoxRequest,
+    ) -> Result<RestartBoxAnswer, anyhow::Error>,
+) -> Result<ResolvedBox, anyhow::Error> {
+    let resolved = resolve_box_on_hosts(hosts, target, "box restart").await?;
+    let mut client = gated_box_host_client(&resolved.host).await?;
+    crate::output::record_box_id(&resolved.box_id.to_string());
+    let request = minimald_rpc::RestartBoxRequest {
+        id: resolved.box_id,
+    };
+    let answer = send(&mut client, request)
+        .await
+        .context("RestartBox RPC failed")?;
+    finish_restart(out, resolved.box_id, target, answer)?;
+    Ok(resolved)
+}
+
+/// The daemon's answer to a `RestartBox` request.
+pub(crate) type RestartBoxAnswer = minimald_rpc::Errorable<minimald_rpc::RestartBoxResponse>;
+
+/// The refusal `min box restart` prints when the daemon answers
+/// `Lifetime` (BCLI-074): the box's stored spec does not set
+/// `lifetime = "until_stopped"`. That includes a box with no stored spec,
+/// so the text claims no more than that. It names `min box run`, the hint
+/// BCLI-009 chooses by `lifetime`.
+pub(crate) fn restart_lifetime_refusal(target: &str) -> minimald_rpc::RestartRefusal {
+    minimald_rpc::RestartRefusal {
+        kind: minimald_rpc::RestartRefusalKind::Lifetime,
+        exit_code: 2,
+        message: format!(
+            "The spec of {target} does not set lifetime = \"until_stopped\", \
+             so min box restart cannot restart it. \
+             Run it again with min box run <entry>."
+        ),
+    }
+}
+
+/// Ends a restart of the box `id`, which the address `target` resolved
+/// to, on the daemon's `answer` (BOX-176). Writes one line to `out` when
+/// the box runs again. A refusal returns as a
+/// [`minimald_rpc::RestartRefusal`]: the lifetime refusal with the
+/// client's hint, any other refusal as the daemon wrote it.
+fn finish_restart(
+    out: &mut impl std::io::Write,
+    id: boxes::SessionId,
+    target: &str,
+    answer: RestartBoxAnswer,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::{Errorable, RestartBoxResponse};
+
+    match answer {
+        Errorable::Ok(RestartBoxResponse::Restarted { was_running }) => {
+            tracing::info!(verb = "box restart", box_id = %id, was_running, outcome = "restarted");
+            writeln!(out, "Restarted {target}.")?;
+            Ok(())
+        }
+        Errorable::Ok(RestartBoxResponse::Refused(refusal)) => {
+            tracing::info!(
+                verb = "box restart",
+                box_id = %id,
+                outcome = "refused",
+                refusal = refusal.kind.name(),
+                "{refusal}"
+            );
+            match refusal.kind {
+                minimald_rpc::RestartRefusalKind::Lifetime => {
+                    Err(restart_lifetime_refusal(target).into())
+                }
+                _ => Err(refusal.into()),
+            }
+        }
+        Errorable::Err { error } => {
+            tracing::info!(verb = "box restart", box_id = %id, outcome = "failed", "{error}");
+            Err(box_rpc_error(target, error))
         }
     }
 }
@@ -1116,13 +1243,24 @@ pub(crate) fn prune_question(
     }
 }
 
-/// `min box prune [--older-than <d>] [--parent <box>] [--yes]`: removes
-/// the stopped and exited boxes that match, as BOX-021 defines. With
-/// `--parent`, only the host that keeps that box is pruned. Without it,
-/// every local host that is running is pruned.
+/// `min box prune [--older-than <d>] [--parent <box>] [--yes] [--dry-run]`:
+/// removes the stopped and exited boxes that match, as BOX-021 defines.
+/// With `--parent`, only the host that keeps that box is pruned. Without
+/// it, every local host that is running is pruned. With `--dry-run`, it
+/// lists the boxes that match with the disk each holds, and removes none
+/// (BCLI-006). A dry run removes nothing, so it asks nothing.
 pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<(), anyhow::Error> {
-    let gate = prune_gate(args.yes, global.no_input, std::io::stdin().is_terminal())
-        .inspect_err(|_| tracing::info!(verb = "box prune", outcome = "refused", "no --yes"))?;
+    let mode = if args.dry_run {
+        PruneMode::DryRun
+    } else {
+        PruneMode::Remove
+    };
+    let gate = if mode == PruneMode::DryRun {
+        PruneGate::Proceed
+    } else {
+        prune_gate(args.yes, global.no_input, std::io::stdin().is_terminal())
+            .inspect_err(|_| tracing::info!(verb = "box prune", outcome = "refused", "no --yes"))?
+    };
     if gate == PruneGate::Confirm {
         let question = prune_question(args.older_than, args.parent.as_deref());
         if !confirm(&question, false)? {
@@ -1142,23 +1280,51 @@ pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<()
     };
     let request = box_prune_request(args.older_than, parent);
     let mut out = std::io::stdout().lock();
-    let tally = prune_hosts(hosts, parent.is_some(), request, &mut out).await?;
+    let tally = prune_hosts(hosts, parent.is_some(), request, mode, &mut out).await?;
+    let mut err = std::io::stderr().lock();
+    if mode == PruneMode::DryRun {
+        tracing::info!(
+            verb = "box prune",
+            parent = ?parent,
+            matched = tally.reaped,
+            disk_bytes = tally.disk_bytes,
+            unmeasured = tally.unmeasured,
+            failed_hosts = tally.failed_hosts.len(),
+            outcome = "dry run"
+        );
+        return finish_prune_dry_run(&tally, &mut out, &mut err);
+    }
     tracing::info!(
         verb = "box prune",
+        parent = ?parent,
         reaped = tally.reaped,
         failed = tally.failed,
         failed_hosts = tally.failed_hosts.len(),
         outcome = "pruned"
     );
-    finish_prune(&tally, &mut out, &mut std::io::stderr().lock())
+    finish_prune(&tally, &mut out, &mut err)
+}
+
+/// Whether `min box prune` removes the boxes that match or, under
+/// `--dry-run`, only lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PruneMode {
+    /// Remove the boxes that match.
+    Remove,
+    /// List the boxes that match with the disk each holds, and remove none.
+    DryRun,
 }
 
 /// What `min box prune` did across its hosts: how many boxes it removed and
 /// did not, how many hosts it pruned, and each host it could not prune with
-/// the reason.
+/// the reason. Under `--dry-run`, `reaped` counts the boxes that matched,
+/// `disk_bytes` sums the disk they hold, and `unmeasured` counts the ones
+/// whose disk the daemon did not measure.
 #[derive(Debug, Default)]
 pub(crate) struct PruneTally {
     pub reaped: usize,
+    pub disk_bytes: u64,
+    pub unmeasured: usize,
     pub failed: usize,
     pub pruned_hosts: usize,
     pub failed_hosts: Vec<(String, anyhow::Error)>,
@@ -1172,6 +1338,7 @@ pub(crate) async fn prune_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     by_parent: bool,
     request: minimald_rpc::PruneBoxesRequest,
+    mode: PruneMode,
     out: &mut impl std::io::Write,
 ) -> Result<PruneTally, anyhow::Error> {
     let mut tally = PruneTally::default();
@@ -1187,10 +1354,25 @@ pub(crate) async fn prune_hosts(
                 Err(client::ProbeRefusal::Unreachable(e)) => Err(e),
             }
         };
-        let pruned = match client {
-            Ok(None) => continue,
-            Ok(Some(mut client)) => prune_host(&mut client, &host, out, request.clone()).await,
-            Err(e) => Err(e),
+        let pruned = match (client, mode) {
+            (Ok(None), _) => continue,
+            (Ok(Some(mut client)), PruneMode::Remove) => {
+                prune_host(&mut client, &host, out, request.clone()).await
+            }
+            (Ok(Some(mut client)), PruneMode::DryRun) => {
+                preview_prune_host(&mut client, out, request.clone())
+                    .await
+                    .map(|matched| {
+                        for entry in &matched {
+                            match entry.disk_bytes {
+                                Some(bytes) => tally.disk_bytes += bytes,
+                                None => tally.unmeasured += 1,
+                            }
+                        }
+                        (matched.len(), 0)
+                    })
+            }
+            (Err(e), _) => Err(e),
         };
         match pruned {
             Ok((reaped, failed)) => {
@@ -1251,6 +1433,78 @@ pub(crate) fn finish_prune(
     Ok(())
 }
 
+/// Ends `min box prune --dry-run` from its `tally`: one line on `err` for
+/// each host it could not ask, the sum of the disk the matched boxes hold,
+/// and how many of them the sum leaves out. With nothing matched and no
+/// host failed, it says so. A host that failed ends it with an error.
+pub(crate) fn finish_prune_dry_run(
+    tally: &PruneTally,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> Result<(), anyhow::Error> {
+    for (host, e) in &tally.failed_hosts {
+        writeln!(err, "Could not check host {host}: {e:#}")?;
+    }
+    if tally.reaped == 0 {
+        // A host that failed was not checked and can hold boxes that
+        // match, so the no-match line prints only when every host answered.
+        if tally.failed_hosts.is_empty() {
+            writeln!(
+                out,
+                "No stopped or exited box matched, so prune would remove nothing."
+            )?;
+        }
+    } else {
+        writeln!(out, "Total: {}", format_disk(tally.disk_bytes))?;
+        match tally.unmeasured {
+            0 => {}
+            1 => writeln!(out, "The total leaves out 1 box whose disk is unknown.")?,
+            n => writeln!(out, "The total leaves out {n} boxes whose disk is unknown.")?,
+        }
+        writeln!(out, "Nothing was removed.")?;
+    }
+    if !tally.failed_hosts.is_empty() {
+        let hosts = tally.pruned_hosts + tally.failed_hosts.len();
+        bail!(
+            "The dry run failed on {} of {hosts} {}.",
+            tally.failed_hosts.len(),
+            if hosts == 1 { "host" } else { "hosts" }
+        );
+    }
+    Ok(())
+}
+
+/// Asks the host `client` serves which boxes a prune with `request`
+/// removes, and writes one line for each to `out` with the disk it holds.
+/// Removes nothing. Returns the boxes that matched.
+pub(crate) async fn preview_prune_host(
+    client: &mut client::Client,
+    out: &mut impl std::io::Write,
+    request: minimald_rpc::PruneBoxesRequest,
+) -> Result<Vec<minimald_rpc::PrunePreviewEntry>, anyhow::Error> {
+    use minimald_rpc::{Errorable, PreviewPrune};
+
+    let preview = match client
+        .oneshot_rpc::<PreviewPrune>(request)
+        .await
+        .context("PreviewPrune RPC failed")?
+    {
+        Errorable::Ok(preview) => preview,
+        Errorable::Err { error } => bail!("{error}"),
+    };
+    for entry in &preview.matched {
+        let disk = entry
+            .disk_bytes
+            .map_or_else(|| "disk unknown".to_owned(), format_disk);
+        let record = &entry.record;
+        match &record.name {
+            Some(name) => writeln!(out, "Would remove {name} ({}): {disk}", record.box_id)?,
+            None => writeln!(out, "Would remove {}: {disk}", record.box_id)?,
+        }
+    }
+    Ok(preview.matched)
+}
+
 /// Prunes the host `client` serves with `request`, writes one line for each
 /// box it removed to `out` and one line for each it did not to stderr, and
 /// retires the row or the name hold each removed box leaves on the VM host
@@ -1274,7 +1528,13 @@ pub(crate) async fn prune_host(
                     .await
                     .ok()
                     .and_then(|resp| resp.record);
-                addresses.insert(entry.box_id, record.and_then(|r| r.box_addresses));
+                addresses.insert(
+                    entry.box_id,
+                    (
+                        record.as_ref().and_then(|r| r.box_addresses),
+                        record.as_ref().and_then(|r| r.box_id),
+                    ),
+                );
             }
         }
     }
@@ -1289,8 +1549,9 @@ pub(crate) async fn prune_host(
     let control_sock = box_host_control_sock(host);
     for entry in &pruned.reaped {
         let name = entry.name.as_deref();
-        let box_addresses = addresses.get(&entry.box_id).copied().flatten();
-        withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
+        let (box_addresses, box_id) = addresses.get(&entry.box_id).copied().unwrap_or_default();
+        let row_id = box_addresses.and(box_id);
+        withdraw_box_row(control_sock.clone(), name, box_addresses, row_id).await;
         release_held_box_name(control_sock.clone(), entry.box_id, name, box_addresses).await;
     }
     write_prune_lines(out, &pruned)?;
@@ -1341,19 +1602,19 @@ mod tests {
         let global = GlobalArgs::default();
 
         // The first destroy wins the race.
-        destroy_box(&mut client, &global, id, Some("web"), None, false)
+        destroy_box(&mut client, &global, id, Some("web"), None, None, false)
             .await
             .expect("the first destroy succeeds");
 
         // The loser is told the session is already gone: under `--force`
         // that is the goal state, reported and not a failure.
-        destroy_box(&mut client, &global, id, Some("web"), None, true)
+        destroy_box(&mut client, &global, id, Some("web"), None, None, true)
             .await
             .expect("a forced destroy of a destroyed session succeeds");
 
         // Without `--force` the same answer is an error — one that names
         // the session rather than forwarding the daemon's internals.
-        let err = destroy_box(&mut client, &global, id, Some("web"), None, false)
+        let err = destroy_box(&mut client, &global, id, Some("web"), None, None, false)
             .await
             .expect_err("an unforced destroy of a destroyed session fails");
         assert!(
@@ -1761,9 +2022,15 @@ mod tests {
         ];
 
         let mut out = Vec::new();
-        let tally = prune_hosts(hosts, false, box_prune_request(None, None), &mut out)
-            .await
-            .expect("only a write to out can end the walk");
+        let tally = prune_hosts(
+            hosts,
+            false,
+            box_prune_request(None, None),
+            PruneMode::Remove,
+            &mut out,
+        )
+        .await
+        .expect("only a write to out can end the walk");
         assert_eq!((tally.reaped, tally.failed, tally.pruned_hosts), (1, 0, 1));
         assert_eq!(tally.failed_hosts.len(), 1);
         assert_eq!(tally.failed_hosts[0].0, "broken0");

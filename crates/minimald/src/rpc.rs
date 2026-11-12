@@ -677,6 +677,26 @@ async fn serve_create_session(
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
                     error: e.to_string(),
                 },
+                // BOX-081: a brokered secret on a host with no identity
+                // plane (identity none) that no node-local proxy serves.
+                // That is every brokered secret when no proxy is present,
+                // and every secret that is not a GitHub grant when one is.
+                // The reply carries the refusal's text, so the client reads
+                // the cause and not a closed channel. It does not carry the
+                // refusal code, so `min` exits 1 and not 5 (#3276).
+                Err(e) if crate::box_manager::unenrolled_refusal(&e).is_some() => {
+                    let refusal = crate::box_manager::unenrolled_refusal(&e)
+                        .expect("the guard matched an un-enrolled refusal");
+                    tracing::info!(
+                        identity = crate::box_manager::IDENTITY_MODE_NONE,
+                        code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                        exit_code = refusal.exit_code(),
+                        "create refused: a brokered secret on a host with no identity plane"
+                    );
+                    Errorable::Err {
+                        error: refusal.to_string(),
+                    }
+                }
                 // BOX-002: a create minvmd gave no id is refused with a
                 // reply. The internal arm below closes the channel, and the
                 // client then reads an empty reply with no cause in it.
@@ -1117,6 +1137,7 @@ async fn serve_answerer_control(
                 }
                 BoxControlRequest::Register(_)
                 | BoxControlRequest::Withdraw(_)
+                | BoxControlRequest::RenameBox(_)
                 | BoxControlRequest::HoldBoxName(_)
                 | BoxControlRequest::ReleaseBoxName(_)
                 | BoxControlRequest::AdmitHostIpBox(_)
@@ -1436,6 +1457,43 @@ async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
         .await
 }
 
+/// `RestartBox`: restarts a box whose spec sets `lifetime =
+/// "until_stopped"` (BOX-176). A box that a check refuses answers a typed
+/// [`minimald_rpc::RestartRefusal`] and is left as it was. A start that
+/// fails answers its error and leaves the box `stopped`.
+async fn serve_restart_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::RestartBox
+        .handle_channel(c, async |req: minimald_rpc::RestartBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            match mngr.restart_box(req.id).await {
+                Ok(was_running) => {
+                    tracing::info!(session_id = %req.id, was_running, "session restarted");
+                    Ok(Errorable::Ok(minimald_rpc::RestartBoxResponse::Restarted {
+                        was_running,
+                    }))
+                }
+                Err(crate::box_actor::RestartError::Refused(refusal)) => {
+                    tracing::info!(
+                        session_id = %req.id,
+                        refusal = refusal.kind.name(),
+                        exit_code = refusal.exit_code,
+                        "session restart refused"
+                    );
+                    Ok(Errorable::Ok(minimald_rpc::RestartBoxResponse::Refused(
+                        refusal,
+                    )))
+                }
+                Err(crate::box_actor::RestartError::Failed(error)) => {
+                    tracing::info!(session_id = %req.id, %error, "session restart failed");
+                    Ok(Errorable::Err {
+                        error: error.to_string(),
+                    })
+                }
+            }
+        })
+        .await
+}
+
 /// An RPC to stop one exec in a running box (BOX-151). The exec's process
 /// group gets SIGTERM, a wait, then SIGKILL. The box and its other execs
 /// keep running. The answer comes when the exec has ended.
@@ -1646,6 +1704,32 @@ async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(),
                 Ok(boxes) => Errorable::Ok(minimald_rpc::ListBoxesResponse { boxes }),
                 Err(e) => Errorable::Err {
                     error: format!("The box records could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
+/// `GetBoxSpec`: the spec a box was created with, as stored beside its
+/// record (BCLI-022).
+async fn serve_get_box_spec(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::GetBoxSpec
+        .handle_channel(c, async |req: minimald_rpc::GetBoxSpecRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.get_box_spec(req.id).await {
+                Ok(Some(spec)) => Errorable::Ok(minimald_rpc::GetBoxSpecResponse { spec }),
+                Ok(None) => Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.id.as_ref()
+                    ),
+                },
+                Err(e) => Errorable::Err {
+                    error: format!("The box's spec could not be read: {e}"),
                 },
             })
         })
@@ -3508,12 +3592,14 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | minimald_rpc::StopBox::NAME
+        | minimald_rpc::RestartBox::NAME
         | StopExec::NAME
         | minimald_rpc::ReapBox::NAME
         | minimald_rpc::PruneBoxes::NAME
         | minimald_rpc::PreviewPrune::NAME
         | minimald_rpc::ListBoxes::NAME
         | minimald_rpc::ShowBox::NAME
+        | minimald_rpc::GetBoxSpec::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -3595,12 +3681,14 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
+        minimald_rpc::RestartBox::NAME => serve!(serve_restart_box(s, channel)),
         StopExec::NAME => serve!(serve_stop_exec(s, channel)),
         minimald_rpc::ReapBox::NAME => serve!(serve_reap_box(s, channel)),
         minimald_rpc::PruneBoxes::NAME => serve!(serve_prune_boxes(s, channel)),
         minimald_rpc::PreviewPrune::NAME => serve!(serve_preview_prune(s, channel)),
         minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
         minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
+        minimald_rpc::GetBoxSpec::NAME => serve!(serve_get_box_spec(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),

@@ -24,19 +24,50 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Error;
-use crate::entry::BoxEntry;
+use crate::box_types::{BoxTypeError, BoxTypes, ResolvedType};
+use crate::entry::{BoxEntry, EntryTable};
 use crate::error::{EntryHeader, SpecKeyProblem};
 
 /// The built-in Box Types. A `[defaults.<name>]` table for one of these,
 /// or for a project type, is that type's defaults, not a `[defaults]` key.
-pub const BUILTIN_BOX_TYPES: [&str; 6] = [
-    "session",
-    "task",
-    "agent",
-    "service",
-    "build",
-    "container-build",
-];
+pub use crate::box_types::BUILTIN_BOX_TYPES;
+
+/// The built-in roots whose entries this release expands (BOX-063).
+pub const EXPANDABLE_ROOTS: [&str; 2] = ["session", "task"];
+
+/// Resolves the type of `entry` and checks that this release expands it:
+/// its type, or its type's built-in root, is `session` or `task`, and it
+/// does not come from `[agents.*]` or `[services.*]` (BOX-063).
+///
+/// The check is per entry, so a refused entry leaves the file's other
+/// entries usable. The resolved type's
+/// [`defaults`](crate::box_types::ResolvedType::defaults) are the entry's
+/// [`Layers::type_defaults`].
+///
+/// # Errors
+///
+/// [`BoxTypeError::Unsupported`] for an entry of another root, and the
+/// errors of [`BoxTypes::resolve_entry`] for an entry whose type does not
+/// resolve. Each exits 3.
+pub fn expandable_type(entry: &BoxEntry, types: &BoxTypes) -> Result<ResolvedType, BoxTypeError> {
+    let refuse = |box_type: &str, root: &'static str| BoxTypeError::Unsupported {
+        table: entry.table.key(),
+        entry: entry.name.clone(),
+        box_type: box_type.to_owned(),
+        root,
+    };
+    // A sugar table for a refused type is refused whatever its `type`.
+    match entry.table {
+        EntryTable::Agents => return Err(refuse("agent", "agent")),
+        EntryTable::Services => return Err(refuse("service", "service")),
+        EntryTable::Boxes | EntryTable::Sessions | EntryTable::Tasks => {}
+    }
+    let resolved = types.resolve_entry(entry)?;
+    if !EXPANDABLE_ROOTS.contains(&resolved.root) {
+        return Err(refuse(&resolved.name, resolved.root));
+    }
+    Ok(resolved)
+}
 
 /// One layer of an entry's expansion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -127,6 +158,9 @@ impl ValueOrigin {
 pub struct ExpansionReport {
     /// The origin of each top-level key's value, by key.
     pub values: BTreeMap<String, ValueOrigin>,
+    /// Whether the expanded entry is the implicit default session entry,
+    /// which the file does not declare (BOX-165).
+    pub implicit: bool,
 }
 
 /// The layers of one entry that are not in the entry's own table. Each
@@ -219,7 +253,8 @@ impl Expansion {
 ///
 /// [`Error::InvalidSpecKey`] for the first key, in key order, that is not
 /// a box setting or has a value of the wrong shape. It names the layer
-/// that set the bad value.
+/// that set the bad value. The same error, before any loadout applies,
+/// when `loadout_mode` is a string other than `sealed` or `open`.
 pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     // The `[upstream]` table is the registry pin, so it sets the one spec
     // key `upstream` and nothing else. An empty table sets nothing.
@@ -237,11 +272,100 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     ordered.push((Origin::of(Layer::Defaults), &layers.defaults));
     ordered.push((Origin::of(Layer::DefaultsType), &layers.defaults_type));
     ordered.push((Origin::of(Layer::Entry), &entry.body));
-    ordered.push((Origin::of(Layer::Loadouts), &layers.loadouts));
+    // BOX-166, BOX-167, BOX-170: the layers up to and including the entry
+    // set `loadout_mode`, and the mode alone decides whether the selected
+    // loadouts apply. A loadout cannot open the gate that admits it.
+    let sealed = toml::Table::new();
+    let loadouts = match loadout_mode(entry, &ordered)? {
+        Some(LoadoutMode::Open) => &layers.loadouts,
+        Some(LoadoutMode::Sealed) | None => &sealed,
+    };
+    ordered.push((Origin::of(Layer::Loadouts), loadouts));
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
-    let expansion = fold(&ordered);
+    let mut expansion = fold(&ordered);
+    expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
+}
+
+/// Whether an entry takes its selected loadouts: the `loadout_mode` box
+/// setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadoutMode {
+    /// The entry takes no loadout (BOX-166).
+    Sealed,
+    /// The entry takes each selected loadout whole (BOX-167).
+    Open,
+}
+
+impl LoadoutMode {
+    /// The values `loadout_mode` accepts, as the file writes them.
+    pub const ACCEPTED: &'static [&'static str] = &["sealed", "open"];
+
+    /// The mode a file writes as `value`, or `None` for any other value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sealed" => Some(Self::Sealed),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+}
+
+/// The `loadout_mode` that `ordered`, the layers up to and including the
+/// entry, set. It is the flat key or the `[box]` section's key, whichever
+/// a later layer set. `None` when no layer sets it, and the gate treats
+/// `None` as sealed, so the entry takes no loadout.
+///
+/// A value that is not a string reads as [`LoadoutMode::Sealed`], so no
+/// loadout applies, and [`check_keys`] then refuses its shape.
+///
+/// # Errors
+///
+/// [`Error::InvalidSpecKey`] with [`SpecKeyProblem::UnknownValue`] for a
+/// string other than `sealed` or `open`, naming the layer that set it
+/// (BOX-174).
+fn loadout_mode(
+    entry: &BoxEntry,
+    ordered: &[(Origin, &toml::Table)],
+) -> Result<Option<LoadoutMode>, Error> {
+    let before = fold(ordered);
+    let rank = |key: &str| -> Option<(usize, &Origin)> {
+        let origin = before.report.values.get(key)?.first()?;
+        let at = ordered.iter().position(|(o, _)| o == origin)?;
+        Some((at, origin))
+    };
+    let flat = before
+        .spec
+        .get("loadout_mode")
+        .and_then(|v| Some((v, rank("loadout_mode")?)));
+    let nested = before
+        .spec
+        .get("box")
+        .and_then(toml::Value::as_table)
+        .and_then(|b| b.get("loadout_mode"))
+        .and_then(|v| Some((v, rank("box")?)));
+    let (key, value, origin) = match (flat, nested) {
+        (Some((_, (f, _))), Some((v, (n, o)))) if n > f => ("box.loadout_mode", v, o),
+        (Some((v, (_, o))), _) => ("loadout_mode", v, o),
+        (None, Some((v, (_, o)))) => ("box.loadout_mode", v, o),
+        (None, None) => return Ok(None),
+    };
+    let Some(found) = value.as_str() else {
+        return Ok(Some(LoadoutMode::Sealed));
+    };
+    match LoadoutMode::parse(found) {
+        Some(mode) => Ok(Some(mode)),
+        None => Err(Error::InvalidSpecKey {
+            key: key.to_owned(),
+            layer: layer_words(entry, Some(origin)),
+            problem: SpecKeyProblem::UnknownValue {
+                found: found.to_owned(),
+                accepted: LoadoutMode::ACCEPTED,
+            },
+        }),
+    }
 }
 
 /// The client sections that a project file can carry but never sets. The
@@ -351,7 +475,7 @@ fn canonical_value(value: &toml::Value) -> toml::Value {
 enum Shape {
     Str,
     Bool,
-    StrOrInt,
+    Duration,
     StrList,
     StrOrStrList,
     Table,
@@ -365,7 +489,7 @@ impl Shape {
         match self {
             Shape::Str => "a string",
             Shape::Bool => "true or false",
-            Shape::StrOrInt => "a string or a whole number",
+            Shape::Duration => crate::duration::TIMEOUT_TAKES,
             Shape::StrList => "a list of strings",
             Shape::StrOrStrList => "a string or a list of strings",
             Shape::Table => "a table",
@@ -377,11 +501,13 @@ impl Shape {
     /// `None` when `value` has this shape, else what the value is, as the
     /// error message names it.
     fn mismatch(self, value: &toml::Value) -> Option<&'static str> {
+        if let Shape::Duration = self {
+            return crate::duration::spec_timeout(value).err();
+        }
         let all_strings = |items: &[toml::Value]| items.iter().all(toml::Value::is_str);
         let fits = match (self, value) {
             (Shape::Str, toml::Value::String(_))
             | (Shape::Bool, toml::Value::Boolean(_))
-            | (Shape::StrOrInt, toml::Value::String(_) | toml::Value::Integer(_))
             | (Shape::StrOrStrList, toml::Value::String(_))
             | (Shape::Table | Shape::TableOrList, toml::Value::Table(_))
             | (Shape::List | Shape::TableOrList, toml::Value::Array(_)) => true,
@@ -398,7 +524,7 @@ impl Shape {
 }
 
 /// What a value is, as the error message names it.
-const fn value_words(value: &toml::Value) -> &'static str {
+pub(crate) const fn value_words(value: &toml::Value) -> &'static str {
     match value {
         toml::Value::String(_) => "a string",
         toml::Value::Integer(_) => "a whole number",
@@ -462,13 +588,19 @@ const SPEC_KEYS: &[(&str, Shape)] = &[
     ("restart", Shape::Str),
     ("secrets", Shape::Table),
     ("state_key", Shape::Str),
-    ("timeout", Shape::StrOrInt),
+    ("timeout", Shape::Duration),
     ("type", Shape::Str),
     ("upstream", Shape::Table),
     ("vars", Shape::Table),
     ("vars_lenient", Shape::List),
     ("volumes", Shape::StrList),
 ];
+
+/// Whether `key` is a box setting an expanded spec can carry, so a
+/// `[defaults]` table that sets it is read by expansion (BOX-048).
+pub(crate) fn is_spec_key(key: &str) -> bool {
+    SPEC_KEYS.iter().any(|(k, _)| *k == key)
+}
 
 /// Checks every key of the expanded spec, in key order.
 fn check_keys(entry: &BoxEntry, expansion: &Expansion) -> Result<(), Error> {
@@ -483,7 +615,17 @@ fn check_keys(entry: &BoxEntry, expansion: &Expansion) -> Result<(), Error> {
                     check_upstream(entry, value, origin)?;
                     continue;
                 }
-                None => continue,
+                // BOX-076: a section's own keys follow the Box Spec schema.
+                None => match crate::spec::check_section(key, value) {
+                    Ok(()) => continue,
+                    Err(bad) => {
+                        return Err(Error::InvalidSpecKey {
+                            key: bad.key,
+                            layer: layer_words(entry, origin.and_then(ValueOrigin::first)),
+                            problem: bad.problem,
+                        });
+                    }
+                },
                 Some(found) => SpecKeyProblem::WrongShape {
                     expected: shape.words(),
                     found,
@@ -590,7 +732,7 @@ fn layer_words(entry: &BoxEntry, origin: Option<&Origin>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::read_entries;
+    use crate::entry::{DEFAULT_ENTRY_NAME, EntryTable, implicit_default_entry, read_entries};
     use proptest::prelude::*;
 
     fn table(src: &str) -> toml::Table {
@@ -801,16 +943,16 @@ mod tests {
         let file = r#"
             [defaults]
             packages = ["d"]
-            timeout = "defaults"
+            timeout = "1s"
             machine = { cpus = 3 }
 
             [defaults.session]
             packages = ["ds"]
-            timeout = "defaults.session"
+            timeout = "2s"
 
             [sessions.dev]
             packages = ["e"]
-            timeout = "entry"
+            timeout = "3s"
         "#;
         let layers = || Layers {
             upstream: table(
@@ -819,19 +961,23 @@ mod tests {
             type_defaults: vec![
                 (
                     "session".to_owned(),
-                    table("packages = [\"u\"]\ntimeout = \"upstream\"\npty_enabled = false"),
+                    crate::box_types::builtin_defaults("session"),
+                ),
+                (
+                    "session".to_owned(),
+                    table("packages = [\"u\"]\ntimeout = \"4s\"\npty_enabled = false"),
                 ),
                 (
                     "rust-dev".to_owned(),
-                    table("packages = [\"t1\"]\ntimeout = \"t1\""),
+                    table("packages = [\"t1\"]\ntimeout = \"5s\""),
                 ),
                 (
                     "rust-dev-plus".to_owned(),
-                    table("packages = [\"t2\"]\ntimeout = \"t2\""),
+                    table("packages = [\"t2\"]\ntimeout = \"6s\""),
                 ),
             ],
-            loadouts: table("packages = [\"l\", \"u\"]\ntimeout = \"loadouts\""),
-            overrides: table("timeout = \"overrides\"\nmachine = { memory = \"1G\" }"),
+            loadouts: table("packages = [\"l\", \"u\"]\ntimeout = \"7s\""),
+            overrides: table("timeout = \"8s\"\nmachine = { memory = \"1G\" }"),
             ..Layers::default()
         };
         let all = expand_in(file, "dev", layers()).expect("expands");
@@ -839,7 +985,7 @@ mod tests {
             strings(all.spec.get("packages")),
             ["u", "t1", "t2", "d", "ds", "e", "l"]
         );
-        assert_eq!(all.spec["timeout"].as_str(), Some("overrides"));
+        assert_eq!(all.spec["timeout"].as_str(), Some("8s"));
         assert_eq!(
             all.spec["machine"],
             toml::Value::Table(table("memory = \"1G\""))
@@ -862,23 +1008,23 @@ mod tests {
         let mut l = layers();
         l.overrides = toml::Table::new();
         let e = expand_in(file, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("loadouts"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("7s"));
         assert_eq!(e.spec["machine"], toml::Value::Table(table("cpus = 3")));
         l.loadouts = toml::Table::new();
         let e = expand_in(file, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("entry"));
-        let file_no_entry_timeout = file.replace("timeout = \"entry\"", "");
+        assert_eq!(e.spec["timeout"].as_str(), Some("3s"));
+        let file_no_entry_timeout = file.replace("timeout = \"3s\"", "");
         let e = expand_in(&file_no_entry_timeout, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("defaults.session"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("2s"));
         let only_upstream_and_types = "[sessions.dev]\n";
         let e = expand_in(only_upstream_and_types, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("t2"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("6s"));
         l.type_defaults.pop();
         let e = expand_in(only_upstream_and_types, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("t1"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("5s"));
         l.type_defaults.pop();
         let e = expand_in(only_upstream_and_types, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("upstream"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("4s"));
         l.type_defaults.clear();
         let e = expand_in(only_upstream_and_types, "dev", l).expect("expands");
         assert_eq!(e.spec.get("timeout"), None);
@@ -939,6 +1085,10 @@ mod tests {
 
     fn example_layers() -> Layers {
         Layers {
+            type_defaults: vec![(
+                "session".to_owned(),
+                crate::box_types::builtin_defaults("session"),
+            )],
             loadouts: table("packages = [\"zellij\"]"),
             overrides: table("timeout = \"30m\""),
             ..Layers::default()
@@ -956,6 +1106,7 @@ mod tests {
         assert_eq!(
             bytes,
             indoc::indoc! {r#"
+                loadout_mode = "open"
                 packages = ["git", "ripgrep", "helix", "fish", "zellij"]
                 pty_enabled = true
                 timeout = "30m"
@@ -1040,7 +1191,15 @@ mod tests {
     // shape, exits 3 and names the key and the layer that set it.
     #[test]
     fn invalid_key_exit3_names_key_and_layer() {
-        let cases: [(&str, Layers, &str); 9] = [
+        let cases: [(&str, Layers, &str); 10] = [
+            (
+                "[sessions.dev]\ntimeout = \"2 days\"\n",
+                Layers::default(),
+                "`[sessions.dev]` in minimal.toml sets `timeout` to a string that is \
+                 not a duration, but `timeout` takes a whole number of seconds, or a \
+                 string of a whole number followed by s, m or h, such as \"30s\", \
+                 \"5m\" or \"1h\". Fix the value.",
+            ),
             (
                 "[defaults]\ntimeot = \"2h\"\n[sessions.dev]\n",
                 Layers::default(),
@@ -1074,8 +1233,9 @@ mod tests {
                     ..Layers::default()
                 },
                 "the `defaults` table of `[box_types.rust-dev]` sets `timeout` to a \
-                 decimal number, but `timeout` takes a string or a whole number. \
-                 Fix the value.",
+                 decimal number, but `timeout` takes a whole number of seconds, or a \
+                 string of a whole number followed by s, m or h, such as \"30s\", \
+                 \"5m\" or \"1h\". Fix the value.",
             ),
             (
                 "[sessions.dev]\n",
@@ -1151,7 +1311,7 @@ mod tests {
         // Every key a built-in type's defaults set, and the Box Spec
         // sections an entry can set, are box settings.
         let ok = expand_in(
-            "[sessions.dev]\nio = { stdin = \"null\" }\n\
+            "[sessions.dev]\nio = { stdin_mimetype = \"text/plain\" }\n\
              [[sessions.dev.file_imports]]\nsrc = \"a\"\ndst = \"/a\"\n\
              [[sessions.dev.vars_lenient]]\nname = \"my.var\"\nvalue = \"1\"\n",
             "dev",
@@ -1159,7 +1319,7 @@ mod tests {
                 type_defaults: vec![(
                     "session".to_owned(),
                     table(
-                        "loadout_mode = \"merge\"\nexec_enabled = true\n\
+                        "loadout_mode = \"open\"\nexec_enabled = true\n\
                          restart = \"never\"\ngithub_token_mode = \"none\"\n\
                          nesting = { allowed = true }",
                     ),
@@ -1197,6 +1357,10 @@ mod tests {
         let layers = Layers {
             upstream: table("commit = \"abc123\""),
             type_defaults: vec![
+                (
+                    "session".to_owned(),
+                    crate::box_types::builtin_defaults("session"),
+                ),
                 ("session".to_owned(), table("lifetime = \"until_complete\"")),
                 (
                     "rust-dev".to_owned(),
@@ -1258,6 +1422,570 @@ mod tests {
             "layer",
         ] {
             assert!(!bytes.contains(word), "{word} in {bytes}");
+        }
+    }
+
+    /// The built-in root of a type, for the implicit default tests: each
+    /// built-in type is its own root, and `rust-dev` has the root `session`.
+    fn test_root(t: &str) -> Option<&'static str> {
+        BUILTIN_BOX_TYPES
+            .into_iter()
+            .find(|b| *b == t)
+            .or((t == "rust-dev").then_some("session"))
+    }
+
+    /// The implicit default entry of `file`, if the file needs one.
+    fn implicit_in(file: &str) -> Option<BoxEntry> {
+        let entries = read_entries(file.as_bytes()).expect("entries read");
+        implicit_default_entry(&entries, test_root)
+    }
+
+    // BOX-165: a project with no session entry expands an implicit
+    // `[sessions.default]` from its other layers, with no entry layer.
+    #[test]
+    fn no_session_entry_expands_implicit_default_session() {
+        let file = r#"
+            [defaults]
+            packages = ["git"]
+            timeout = "2h"
+
+            [defaults.session]
+            packages = ["fish"]
+            pty_enabled = true
+
+            [defaults.task]
+            timeout = "5m"
+
+            [tasks.test]
+            exec = ["cargo", "test"]
+
+            [boxes.ci]
+            type = "build"
+        "#;
+        let entry = implicit_in(file).expect("an implicit default entry");
+        assert_eq!(entry.name, DEFAULT_ENTRY_NAME);
+        assert_eq!(entry.table, EntryTable::Sessions);
+        assert_eq!(entry.box_type.as_deref(), Some("session"));
+        assert!(entry.body.is_empty(), "{:?}", entry.body);
+        assert!(entry.implicit);
+
+        let doc = table(file);
+        let defaults = doc["defaults"].as_table().expect("a table");
+        let layers = Layers {
+            upstream: table("commit = \"abc123\""),
+            type_defaults: vec![("session".to_owned(), table("lifetime = \"until_complete\""))],
+            ..Layers::default()
+        }
+        .with_file_defaults(defaults, entry.box_type.as_deref(), &BTreeSet::new());
+        let e = expand(&entry, &layers).expect("expands");
+
+        assert_eq!(strings(e.spec.get("packages")), ["git", "fish"]);
+        assert_eq!(e.spec["timeout"].as_str(), Some("2h"));
+        assert_eq!(e.spec["pty_enabled"].as_bool(), Some(true));
+        assert_eq!(e.spec["lifetime"].as_str(), Some("until_complete"));
+        assert!(e.spec.contains_key("upstream"));
+        assert!(!e.spec.contains_key("exec"), "{:?}", e.spec);
+        // No value comes from an entry layer.
+        for (key, origin) in &e.report.values {
+            let origins = match origin {
+                ValueOrigin::Value(o) => vec![o],
+                ValueOrigin::List(items) => items.iter().collect(),
+            };
+            assert!(
+                origins.iter().all(|o| o.layer != Layer::Entry),
+                "{key}: {origin:?}"
+            );
+        }
+
+        // A project with no minimal.toml has no entries, and gets one too.
+        let none = implicit_default_entry(&[], test_root).expect("an implicit entry");
+        assert_eq!(none, entry);
+        let e = expand(&none, &Layers::default()).expect("expands");
+        assert!(e.spec.is_empty(), "{:?}", e.spec);
+        assert!(e.report.implicit);
+
+        // A session entry, direct or through a type rooted at `session`,
+        // means no implicit entry.
+        for file in [
+            "[sessions.dev]\n",
+            "[boxes.dev]\ntype = \"session\"\n",
+            "[boxes.dev]\ntype = \"rust-dev\"\n",
+            "[sessions.default]\n",
+        ] {
+            assert_eq!(implicit_in(file), None, "{file}");
+        }
+    }
+
+    // BOX-165: an entry named `default` whose type is not rooted at
+    // `session` blocks the implicit default.
+    #[test]
+    fn non_session_default_entry_blocks_implicit_default() {
+        for file in [
+            "[tasks.default]\nexec = [\"true\"]\n",
+            "[boxes.default]\ntype = \"build\"\n",
+            "[boxes.default]\ntype = \"unknown-type\"\n",
+            "[boxes.default]\n",
+            "[agents.default]\n",
+        ] {
+            assert_eq!(implicit_in(file), None, "{file}");
+        }
+        // Another name with the same type does not block it.
+        assert!(implicit_in("[tasks.other]\n").is_some());
+    }
+
+    // BOX-161: the report of the implicit default entry marks it implicit,
+    // and the report of a declared entry does not.
+    #[test]
+    fn implicit_default_entry_reported_as_implicit() {
+        let file = "[defaults.session]\npty_enabled = true\n";
+        let entry = implicit_in(file).expect("an implicit default entry");
+        let layers = Layers::default().with_file_defaults(
+            table(file)["defaults"].as_table().expect("a table"),
+            Some("session"),
+            &BTreeSet::new(),
+        );
+        let implicit = expand(&entry, &layers).expect("expands");
+        assert!(implicit.report.implicit);
+        assert_eq!(
+            implicit.report.values["pty_enabled"],
+            ValueOrigin::Value(Origin::of(Layer::DefaultsType))
+        );
+
+        // The mark is beside the spec, never in its bytes.
+        let bytes = implicit.spec_bytes().expect("writes");
+        assert!(!bytes.contains("implicit"), "{bytes}");
+
+        let declared = expand_in(
+            "[sessions.default]\n[defaults.session]\npty_enabled = true\n",
+            "default",
+            Layers::default(),
+        )
+        .expect("expands");
+        assert!(!declared.report.implicit);
+    }
+
+    /// Expands entry `name` of `file` as a client does: resolves its type
+    /// against the file's `[box_types]`, then folds the type chain's
+    /// defaults and the file's `[defaults]` under the entry.
+    fn expand_typed(file: &str, name: &str) -> Result<Result<Expansion, Error>, BoxTypeError> {
+        expand_typed_with(file, name, toml::Table::new())
+    }
+
+    /// [`expand_typed`], with `loadouts` as the selected loadouts' layer.
+    fn expand_typed_with(
+        file: &str,
+        name: &str,
+        loadouts: toml::Table,
+    ) -> Result<Result<Expansion, Error>, BoxTypeError> {
+        let doc = table(file);
+        let types = BoxTypes::from_file(&doc)?;
+        let entries = read_entries(file.as_bytes()).expect("entries read");
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let resolved = expandable_type(entry, &types)?;
+        let project_types = types.project().keys().cloned().collect();
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let layers = Layers {
+            type_defaults: resolved.defaults,
+            loadouts,
+            ..Layers::default()
+        }
+        .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+        Ok(expand(entry, &layers))
+    }
+
+    const TYPED_FILE: &str = r#"
+        [defaults]
+        packages = ["git"]
+
+        [box_types.ci]
+        extends = "task"
+        defaults = { timeout = "10m", packages = ["make"] }
+
+        [box_types.ci-rust]
+        extends = "ci"
+        defaults = { packages = ["rust"] }
+
+        [box_types.helper]
+        extends = "agent"
+
+        [box_types.web]
+        extends = "service"
+
+        [defaults.ci-rust]
+        pty_enabled = false
+
+        [sessions.dev]
+        pty_enabled = true
+
+        [tasks.lint]
+        timeout = "1m"
+
+        [boxes.check]
+        type = "ci-rust"
+
+        [boxes.bad]
+        type = "ci"
+        not_a_setting = 1
+
+        [agents.bot]
+
+        [services.api]
+
+        [boxes.builder]
+        type = "build"
+
+        [boxes.image]
+        type = "container-build"
+
+        [boxes.assistant]
+        type = "helper"
+
+        [boxes.frontend]
+        type = "web"
+
+        [boxes.plain-agent]
+        type = "agent"
+    "#;
+
+    // BOX-063: entries whose type, or whose type's built-in root, is
+    // `session` or `task` expand, and their keys are validated.
+    #[test]
+    fn session_and_task_entries_expand_and_validate() {
+        let dev = expand_typed(TYPED_FILE, "dev")
+            .expect("resolves")
+            .expect("expands");
+        assert_eq!(dev.spec["type"].as_str(), Some("session"));
+        assert_eq!(dev.spec["pty_enabled"].as_bool(), Some(true));
+        assert_eq!(strings(dev.spec.get("packages")), ["git"]);
+
+        let lint = expand_typed(TYPED_FILE, "lint")
+            .expect("resolves")
+            .expect("expands");
+        assert_eq!(lint.spec["timeout"].as_str(), Some("1m"));
+
+        // A type that extends `task` through `ci`: the chain's defaults,
+        // root first, then `[defaults]`, `[defaults.ci-rust]` and the entry.
+        let check = expand_typed(TYPED_FILE, "check")
+            .expect("resolves")
+            .expect("expands");
+        assert_eq!(check.spec["type"].as_str(), Some("ci-rust"));
+        assert_eq!(check.spec["timeout"].as_str(), Some("10m"));
+        assert_eq!(check.spec["pty_enabled"].as_bool(), Some(false));
+        assert_eq!(strings(check.spec.get("packages")), ["make", "rust", "git"]);
+        assert_eq!(
+            check.report.values["timeout"],
+            ValueOrigin::Value(Origin::type_defaults("ci"))
+        );
+
+        // Validation still runs on an entry of a type rooted at `task`.
+        let err = expand_typed(TYPED_FILE, "bad")
+            .expect("resolves")
+            .expect_err("an unknown key fails");
+        assert_eq!(err.exit_code(), Some(3), "{err}");
+        assert!(err.to_string().contains("not_a_setting"), "{err}");
+
+        // An entry type that no table defines fails with exit 3.
+        let err = expand_typed("[boxes.x]\ntype = \"nope\"\n", "x").expect_err("fails");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "`[boxes.x]` has the type `nope`, which is not a built-in type and not in `[box_types]`."
+        );
+        let err = expand_typed("[boxes.x]\n", "x").expect_err("fails");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "`[boxes.x]` sets no `type`. Set `type` to `session`, `task` or a type in `[box_types]`."
+        );
+    }
+
+    // BOX-063: an entry of `agent`, `service`, `build` or `container-build`,
+    // directly or as the built-in root of its type, or from `[agents.*]` or
+    // `[services.*]`, is refused with exit 3 naming the type and the epic.
+    // The file's other entries stay usable.
+    #[test]
+    fn other_builtin_type_entry_refused_exit3_other_entries_usable() {
+        for (name, header, box_type, root) in [
+            ("bot", "[agents.bot]", "agent", "agent"),
+            ("api", "[services.api]", "service", "service"),
+            ("builder", "[boxes.builder]", "build", "build"),
+            (
+                "image",
+                "[boxes.image]",
+                "container-build",
+                "container-build",
+            ),
+            ("assistant", "[boxes.assistant]", "helper", "agent"),
+            ("frontend", "[boxes.frontend]", "web", "service"),
+            ("plain-agent", "[boxes.plain-agent]", "agent", "agent"),
+        ] {
+            let err = expand_typed(TYPED_FILE, name).expect_err(name);
+            assert_eq!(err.exit_code(), 3, "{name}");
+            assert!(
+                matches!(&err, BoxTypeError::Unsupported { root: r, .. } if *r == root),
+                "{name}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with(&format!("`{header}` has the type `{box_type}`")),
+                "{msg}"
+            );
+            assert!(msg.contains("gominimal/inbox#678"), "{msg}");
+            assert!(msg.contains(&format!("a box of type `{root}`")), "{msg}");
+        }
+        assert_eq!(
+            expand_typed(TYPED_FILE, "assistant")
+                .expect_err("refused")
+                .to_string(),
+            "`[boxes.assistant]` has the type `helper`, which extends `agent`. \
+             This release cannot create a box of type `agent`. \
+             gominimal/inbox#678 tracks it. \
+             The other entries of minimal.toml are not affected."
+        );
+
+        // The refused entries leave the session and task entries usable.
+        for name in ["dev", "lint", "check"] {
+            expand_typed(TYPED_FILE, name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    /// A selected-loadouts layer that sets each part a loadout carries.
+    fn whole_loadout() -> toml::Table {
+        table(
+            "packages = [\"zellij\"]\n\
+             patches = { \"~/.bashrc\" = \"alias l=ls\" }\n\
+             vars = { EDITOR = \"hx\" }\n\
+             vars_lenient = [{ name = \"my.var\", value = \"1\" }]\n\
+             lifecycle_hooks = [{ on = \"start\", run = \"echo hi\" }]\n",
+        )
+    }
+
+    /// The keys of [`whole_loadout`].
+    const LOADOUT_KEYS: [&str; 5] = [
+        "packages",
+        "patches",
+        "vars",
+        "vars_lenient",
+        "lifecycle_hooks",
+    ];
+
+    /// Asserts that `expansion` carries no part of [`whole_loadout`].
+    fn assert_no_loadout(expansion: &Expansion, what: &str) {
+        for key in LOADOUT_KEYS {
+            let from_loadout = match expansion.report.values.get(key) {
+                Some(ValueOrigin::Value(o)) => o.layer == Layer::Loadouts,
+                Some(ValueOrigin::List(items)) => items.iter().any(|o| o.layer == Layer::Loadouts),
+                None => false,
+            };
+            assert!(!from_loadout, "{what}: {key} came from a loadout");
+        }
+        let packages = expansion.spec.get("packages");
+        assert!(
+            packages.is_none_or(|p| !strings(Some(p)).contains(&"zellij")),
+            "{what}: {:?}",
+            expansion.spec.get("packages")
+        );
+    }
+
+    /// Asserts that `expansion` carries every part of [`whole_loadout`].
+    fn assert_whole_loadout(expansion: &Expansion, what: &str) {
+        assert!(
+            strings(expansion.spec.get("packages")).contains(&"zellij"),
+            "{what}: {:?}",
+            expansion.spec.get("packages")
+        );
+        assert_eq!(
+            expansion.spec["vars"]["EDITOR"].as_str(),
+            Some("hx"),
+            "{what}"
+        );
+        for key in LOADOUT_KEYS {
+            assert!(expansion.spec.contains_key(key), "{what}: {key} is missing");
+        }
+    }
+
+    // BOX-166: a sealed entry takes no loadout at the selected-loadouts
+    // layer, whatever that layer carries.
+    #[test]
+    fn sealed_spec_applies_no_loadout() {
+        let file = "[tasks.lint]\n\n[sessions.locked]\nloadout_mode = \"sealed\"\n";
+        for name in ["lint", "locked"] {
+            let e = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect("expands");
+            assert_eq!(e.spec["loadout_mode"].as_str(), Some("sealed"), "{name}");
+            assert_no_loadout(&e, name);
+        }
+    }
+
+    // BOX-167: an open entry takes the selected loadout whole: packages,
+    // config-file patches, vars, vars_lenient and lifecycle hooks.
+    #[test]
+    fn open_spec_applies_whole_loadout() {
+        let file = "[sessions.dev]\n\n[tasks.lint]\nloadout_mode = \"open\"\n";
+        for name in ["dev", "lint"] {
+            let e = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect("expands");
+            assert_eq!(e.spec["loadout_mode"].as_str(), Some("open"), "{name}");
+            assert_whole_loadout(&e, name);
+        }
+    }
+
+    // BOX-170: the gate reads `loadout_mode` from the layers up to and
+    // including the entry, never the type name. A session set to sealed
+    // takes nothing, a type that extends task and sets open takes the
+    // loadout, and each layer before the entry can set the mode.
+    #[test]
+    fn loadout_gate_follows_setting_not_type_name() {
+        let file = r#"
+            [box_types.ci-open]
+            extends = "task"
+            defaults = { loadout_mode = "open" }
+
+            [box_types.dev-sealed]
+            extends = "session"
+            defaults = { loadout_mode = "sealed" }
+
+            [defaults.task]
+            loadout_mode = "open"
+
+            [sessions.locked]
+            loadout_mode = "sealed"
+
+            [sessions.boxed]
+            box = { loadout_mode = "sealed" }
+
+            [boxes.ci]
+            type = "ci-open"
+
+            [boxes.dev]
+            type = "dev-sealed"
+
+            [boxes.reopened]
+            type = "dev-sealed"
+            loadout_mode = "open"
+
+            [tasks.lint]
+
+            [agents.helper]
+        "#;
+        for name in ["locked", "boxed", "dev"] {
+            let e = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect("expands");
+            assert_no_loadout(&e, name);
+        }
+        // The agent root supplies no `loadout_mode`, and the gate seals an
+        // entry whose layers set none. This release refuses `[agents.*]`
+        // before expansion, so expand the entry past that check.
+        let helper = Layers {
+            type_defaults: vec![(
+                "agent".to_owned(),
+                crate::box_types::builtin_defaults("agent"),
+            )],
+            loadouts: whole_loadout(),
+            ..Layers::default()
+        };
+        let e = expand_in(file, "helper", helper).expect("expands");
+        assert_eq!(e.spec.get("loadout_mode"), None);
+        assert_no_loadout(&e, "helper");
+        for name in ["ci", "reopened", "lint"] {
+            let e = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect("expands");
+            assert_whole_loadout(&e, name);
+        }
+
+        // A loadout that sets `loadout_mode` cannot open a sealed entry.
+        let mut opening = whole_loadout();
+        opening.insert("loadout_mode".to_owned(), "open".into());
+        let e = expand_typed_with(file, "locked", opening)
+            .expect("the type resolves")
+            .expect("expands");
+        assert_no_loadout(&e, "locked, with a loadout that sets open");
+
+        // The report carries the mode and the layer that set it.
+        let e = expand_typed_with(file, "dev", toml::Table::new())
+            .expect("the type resolves")
+            .expect("expands");
+        assert_eq!(
+            e.report.values["loadout_mode"],
+            ValueOrigin::Value(Origin::type_defaults("dev-sealed"))
+        );
+    }
+
+    // BOX-174: a `loadout_mode` other than `sealed` or `open` fails the
+    // expansion with exit 3 before any loadout applies. The error names
+    // the key, the value, the layer that set it and the accepted values.
+    #[test]
+    fn unknown_loadout_mode_refused_exit3() {
+        let file = r#"
+            [box_types.ci]
+            extends = "task"
+            defaults = { loadout_mode = "merge" }
+
+            [defaults.session]
+            loadout_mode = "Open"
+
+            [sessions.dev]
+
+            [sessions.mine]
+            loadout_mode = "everything"
+
+            [sessions.boxed]
+            box = { loadout_mode = "merge" }
+
+            [boxes.ci]
+            type = "ci"
+        "#;
+        let cases = [
+            (
+                "dev",
+                "`[defaults.session]` in minimal.toml sets `loadout_mode` to \"Open\". \
+                 `loadout_mode` accepts only `sealed` or `open`. Fix the value.",
+            ),
+            (
+                "mine",
+                "`[sessions.mine]` in minimal.toml sets `loadout_mode` to \"everything\". \
+                 `loadout_mode` accepts only `sealed` or `open`. Fix the value.",
+            ),
+            (
+                "boxed",
+                "`[sessions.boxed]` in minimal.toml sets `box.loadout_mode` to \"merge\". \
+                 `box.loadout_mode` accepts only `sealed` or `open`. Fix the value.",
+            ),
+            (
+                "ci",
+                "the `defaults` table of `[box_types.ci]` sets `loadout_mode` to \"merge\". \
+                 `loadout_mode` accepts only `sealed` or `open`. Fix the value.",
+            ),
+        ];
+        for (name, msg) in cases {
+            let err = expand_typed_with(file, name, whole_loadout())
+                .expect("the type resolves")
+                .expect_err("an unknown mode is refused");
+            assert!(
+                matches!(
+                    &err,
+                    Error::InvalidSpecKey {
+                        problem: SpecKeyProblem::UnknownValue { .. },
+                        ..
+                    }
+                ),
+                "{name}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{name}");
+            assert_eq!(err.to_string(), msg, "{name}");
         }
     }
 }

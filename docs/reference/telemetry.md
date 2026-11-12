@@ -14,6 +14,10 @@ Telemetry is **off** unless you turn it on. In that state minimal exports
 nothing and writes nothing, and the process has no telemetry thread or
 connection.
 
+One thing is separate from the export and **on** until 1.0: the daily
+[update check](#update-check), which tells you when your channel has a newer
+release and counts installs. It has its own switch, below.
+
 The requirements behind this page are in
 [spec 25](https://github.com/gominimal/minimal/blob/main/docs/specs/25-spec-telemetry/25-spec-telemetry.md).
 
@@ -24,7 +28,8 @@ local spool:
 
 ```sh
 export MINIMAL_TELEMETRY=1
-min stop   # daemons keep the settings they started with; see below
+min host list          # prints your host names, such as local0
+min host stop local0   # daemons keep the settings they started with; see below
 min ls
 ```
 
@@ -33,7 +38,7 @@ To also send them to a collector, name its OTLP/HTTP endpoint:
 ```sh
 export MINIMAL_TELEMETRY=1
 export MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-min stop
+min host stop local0
 min ls
 ```
 
@@ -42,7 +47,7 @@ min ls
 **Daemons keep the settings they started with.** `minimald` and `minvmd`
 read the telemetry variables once, when they start, from the environment of
 the `min` command that started them. Changing a variable in your shell does
-not change a daemon that is already running. Run `min stop`, and the next
+not change a daemon that is already running. Run `min host stop <host>`, and the next
 `min` command starts the daemon again with your current settings.
 
 ## Pointing at a collector
@@ -176,7 +181,7 @@ level and above, from every part of minimal. That includes command and
 request names, session ids and names, paths (which can include your user
 name), host names, timing, and errors.
 
-- The command line of a session exec goes on its span only after the secret
+- The command line of an exec in a box goes on its span only after the secret
   scrubber that `min bug` also uses runs over it. The scrubber masks
   `Authorization` and `Proxy-Authorization` header values, credentials in
   URLs, and tokens with well-known prefixes (GitHub, `sk-`, Slack, AWS access
@@ -237,12 +242,92 @@ with, so its state can differ. The file records:
 
 With telemetry off, that file is the only change to `min bug`.
 
+## Update check
+
+Once a day, the first `min` command makes one request to
+`https://update.minimal.dev/v1/<channel>/<key>` and caches the answer. When
+the channel has moved on, one line on stderr names the channel's current
+release and points here for the update steps, once per new release:
+
+```
+min 0.7.1: the stable channel is now at 0.7.2. How to update: https://docs.minimal.dev/reference/telemetry#update-check
+```
+
+The line goes to stderr only when stderr is a terminal, and it waits for a
+short command whose output leaves it in view, such as `min ls`, `min dirs`
+or `min init`. A command that takes the terminal (bare `min`,
+`min run`, `min session attach`, `min task`, `min box`, the dashboard) never
+prints it, so if you only use those, the line is not shown. stdout, the exit
+code and the command's timing are never touched: the request is made by a
+detached `min update-check --background` with a 2 second budget and no
+retry, and the command that spawned it does not wait. An endpoint that is
+down, slow, or answers 404 produces nothing.
+
+The request carries six fields, and a `User-Agent: min` header that is the
+same for every install:
+
+| field | value |
+|---|---|
+| channel | `stable`, `unstable`, `nightly`; `pinned` for an install made with `--version`; `source` for a binary that no install record describes (a development build, or a copy of `min` other than the one the installer put in place). Only a channel install is ever notified |
+| key | the channel pointer this build was installed from, written by the installer to `<state>/minimal/install.toml`; for a build without one, the commit hash in `min version` |
+| os, arch | `linux`/`macos`, `x86_64`/`aarch64` |
+| install | `installer`, or the package that shipped `<prefix>/share/minimal/install.toml` |
+| id | a random UUID minted on the first run, stored in `<state>/minimal/update-check.json`; delete the file to rotate it |
+
+The endpoint also sees the country and network (ASN) of the request, as any
+web request shows, and does not store the address. The service source is
+`workers/update-check/` in the gominimal/webapp repository, beside the
+other edge Workers.
+
+`min update-check --dry-run` prints the exact request that would be made
+and the switch that stops it, if one is set. `min update-check` with no
+flag makes the request now and prints the answer.
+
+**Updating.** An install made by the installer updates by running the
+installer again for your channel. It replaces the binaries in place and
+keeps your loadouts and settings. It also restarts the Minimal daemon, which
+ends any active sessions: when sessions are running, it lists them and asks
+on your terminal first ([Upgrade](../guide/install.md#upgrade) has the details):
+
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
+```
+
+Use `unstable` or `nightly` in place of `stable` for those channels. An
+install made with `--version` is pinned and gets no notice; run the
+installer with the version you want. An install from a package manager
+updates through that package manager.
+
+**Turning the check off**, any one of these:
+
+| switch | where |
+|---|---|
+| `[telemetry]` `enabled = false` | `config.toml` in the config directory (`min dirs`), or `/etc/minimal/config.toml` for every user of the machine; either turns it off |
+| `MINIMAL_TELEMETRY=0` | environment (`false`, `no` and `off` also count) |
+| `OTEL_SDK_DISABLED=true` | environment: turns off everything, this included |
+| `DO_NOT_TRACK=1` | environment, the cross-tool convention |
+| `CI` set | environment: a CI job that installs `min` is not an install to count |
+
+An install's first `min` command never makes the request, and the
+installer's own `min` calls never take part in the check. With a terminal,
+the first short command (the rule above: `min ls`, not bare `min`) prints a
+one-line disclosure of the above, even when earlier commands were a script's
+or an agent's, and the request waits for a later command; until that line
+has been shown, commands with a terminal send nothing. The installer's closing card carries the
+same disclosure for every install, `--version` ones included, so an install
+whose commands never have a terminal has read it there. Installs from a
+package manager see the terminal line instead of the card. A `config.toml`
+that exists but does not parse, yours or the organization's, turns the check
+off until it is fixed.
+
+At 1.0 the default flips to off.
+
 ## Turning it off
 
 | Scope | How |
 |---|---|
 | One command | Unset `MINIMAL_TELEMETRY`, or set `DO_NOT_TRACK` to any non-empty value, or set `OTEL_SDK_DISABLED=true`. |
-| The daemons | Run `min stop` and start the next command from a shell where telemetry is off. A running daemon keeps the setting it started with, and records nothing for a command that runs with telemetry off. |
+| The daemons | Run `min host stop <host>` and start the next command from a shell where telemetry is off. A running daemon keeps the setting it started with, and records nothing for a command that runs with telemetry off. |
 | One signal | `MINIMAL_OTEL_TRACES_EXPORTER=none` or `MINIMAL_OTEL_LOGS_EXPORTER=none`. |
 | The spool only | `MINIMAL_OTEL_SPOOL=0`. |
 | One project | There is no setting in `minimal.toml`. Set the variables in that project's shell environment. The daemons are shared by all your projects, so they follow whichever command started them. |
@@ -330,7 +415,7 @@ given, so it needs the full path. Check that headers your collector needs are in
 `MINIMAL_OTEL_EXPORTER_OTLP_HEADERS` for a `MINIMAL_` endpoint, or in
 `OTEL_EXPORTER_OTLP_HEADERS` for a plain one.
 
-**A change did not take effect.** Run `min stop`: the daemons still have the
+**A change did not take effect.** Run `min host stop <host>`: the daemons still have the
 settings they started with.
 
 ## Privacy

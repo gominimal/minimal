@@ -1774,6 +1774,37 @@ async fn configure_loadout_scaffolds_missing_mfile_into_composition() {
     );
 }
 
+/// The default `minimal.toml` the daemon scaffolds into an empty
+/// workspace writes its packages under `[defaults.session]`, not the
+/// legacy `[session]` table, so the session's own file prints no hint
+/// and still loads its packages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_scaffold_writes_entry_tables() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    session(&mngr, id)
+        .await
+        .configure_loadout(WireContribution::default())
+        .await
+        .expect("configuring against a missing mfile should still succeed");
+
+    let paths = session(&mngr, id).await.paths().await.unwrap();
+    let src = tokio::fs::read_to_string(paths.working.as_utf8_path().join(mfile::MFILE_NAME))
+        .await
+        .expect("the scaffold wrote a minimal.toml");
+    let headers: Vec<&str> = src
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('['))
+        .collect();
+    assert_eq!(headers, ["[defaults.session]"], "{src}");
+    let file = mfile::File::from_toml_bytes(src.as_bytes()).expect("the scaffold loads");
+    assert_eq!(
+        file.session.expect("[defaults.session] reads").packages,
+        ["base", "vim"]
+    );
+}
+
 /// A `[session]` block that contributes a package is picked up
 /// by [`ProjectComposable`] and lands in the composition. With
 /// the non-empty-composition guard gone, the record now
@@ -3199,6 +3230,71 @@ async fn show_returns_record_state_identity_and_live_execs() {
     assert_eq!(running.identity, minimald_rpc::BoxIdentity::None);
     // No exec runs in the box.
     assert!(running.live_execs.is_empty(), "{:?}", running.live_execs);
+
+    // A detached and a tty exec run in it: each is listed with its id, argv
+    // and PTY flag, in id order, and an ended one leaves the list.
+    let start = |exec_id: &str, mode, argv: &[&str]| {
+        let entry = std::sync::Arc::new(crate::exec::ExecEntry::new(
+            minimald_rpc::exec::ExecId::parse(exec_id).unwrap(),
+            id,
+            mode,
+            argv.iter().map(|word| (*word).to_owned()).collect(),
+            camino::Utf8PathBuf::from("/nonexistent/execs").join(exec_id),
+            None,
+        ));
+        crate::exec::register_exec(std::sync::Arc::clone(&entry));
+        entry
+    };
+    let detached = start(
+        "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        minimald_rpc::exec::ExecMode::Detached,
+        &["sleep", "60"],
+    );
+    let tty = start(
+        "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c",
+        minimald_rpc::exec::ExecMode::Tty,
+        &["bash"],
+    );
+    let live = |rows: &[minimald_rpc::LiveExec]| -> Vec<(String, Vec<String>, minimald_rpc::exec::ExecMode)> {
+        rows.iter()
+            .map(|exec| (exec.id.clone(), exec.argv.clone(), exec.mode))
+            .collect()
+    };
+    let shown = mngr.show_box(id).await.unwrap().expect("retained");
+    assert_eq!(
+        live(&shown.live_execs),
+        vec![
+            (
+                "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b".to_owned(),
+                vec!["sleep".to_owned(), "60".to_owned()],
+                minimald_rpc::exec::ExecMode::Detached
+            ),
+            (
+                "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c".to_owned(),
+                vec!["bash".to_owned()],
+                minimald_rpc::exec::ExecMode::Tty
+            ),
+        ]
+    );
+    detached.finish(crate::exec::ExecExit {
+        code: Some(0),
+        reason: crate::exec::ExecExitReason::Exited,
+    });
+    let shown = mngr.show_box(id).await.unwrap().expect("retained");
+    assert_eq!(
+        live(&shown.live_execs),
+        vec![(
+            "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c".to_owned(),
+            vec!["bash".to_owned()],
+            minimald_rpc::exec::ExecMode::Tty
+        )],
+        "the ended exec left the list"
+    );
+    // A stop ends every exec in the box (BOX-013).
+    tty.finish(crate::exec::ExecExit {
+        code: None,
+        reason: crate::exec::ExecExitReason::Exited,
+    });
     drop(mngr);
 
     set_record_state(
@@ -3227,6 +3323,7 @@ async fn show_returns_record_state_identity_and_live_execs() {
             signal: None,
             // A session filed with no spec has a terminal.
             pty_enabled: true,
+            lifetime: None,
         }
     );
     assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
@@ -3344,6 +3441,59 @@ async fn box_listing_and_show_carry_pty_enabled() {
             .unwrap()
             .expect("the box is retained");
         assert_eq!(shown.record.pty_enabled, pty, "read: {:?}", shown.record);
+        assert_eq!(&shown.record, listed, "the read and the listing agree");
+    }
+}
+
+/// BCLI-009: the listing and the read carry the `lifetime` the box's
+/// stored spec sets, so a client can choose its hint by it. A spec that
+/// sets no lifetime, and a box filed with no spec, carry none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_and_list_replies_carry_lifetime() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = |lifetime: Option<&str>| match lifetime {
+        Some(lifetime) => serde_json_lenient::json!({
+            "v": 1,
+            "io": {"pty_enabled": false},
+            "box": {"lifetime": lifetime},
+        }),
+        None => serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": false}}),
+    };
+    let mut boxes = Vec::new();
+    for (name, lifetime) in [
+        ("agent", Some("until_stopped")),
+        ("job", Some("until_exit")),
+        ("plain", None),
+    ] {
+        let id = mngr
+            .create_box_with_spec(
+                rooted_config(name, "/home/dev/proj"),
+                Some(spec(lifetime)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        boxes.push((id, lifetime));
+    }
+    let unspecced = mngr
+        .create_session(rooted_config("unspecced", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    boxes.push((unspecced, None));
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    for (id, lifetime) in boxes {
+        let listed = listing
+            .iter()
+            .find(|entry| entry.box_id == id)
+            .unwrap_or_else(|| panic!("the listing holds {id}"));
+        assert_eq!(listed.lifetime.as_deref(), lifetime, "listing: {listed:?}");
+        let shown = mngr
+            .show_box(id)
+            .await
+            .unwrap()
+            .expect("the box is retained");
         assert_eq!(&shown.record, listed, "the read and the listing agree");
     }
 }
@@ -3574,6 +3724,82 @@ fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
     spec.entry = entry.to_string();
     spec.name = name.map(str::to_string);
     serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// BOX-076: a spec with sections the daemon does not enforce is stored
+/// whole, the box is created, and the daemon log warns once for each such
+/// section, naming it. A spec with none of them warns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unenforced_sections_warn_once_each_naming_section() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    let mut spec = task_spec("lint", None);
+    let object = spec.as_object_mut().expect("a spec is an object");
+    for key in ["file_imports", "file_exports", "github_imports"] {
+        object.insert(
+            key.to_string(),
+            serde_json_lenient::json!([{ "src": "a", "dst": "/a" }]),
+        );
+    }
+    object.insert(
+        "otel".to_string(),
+        serde_json_lenient::json!({ "endpoint": "http://localhost:4317" }),
+    );
+    object["network"]
+        .as_object_mut()
+        .expect("a spec has a network table")
+        .insert(
+            "vpn_network_names".to_string(),
+            serde_json_lenient::json!(["corp"]),
+        );
+    let id = mngr
+        .create_box_with_spec(unnamed_config(), Some(spec.clone()), None, None)
+        .await
+        .expect("a spec with unenforced sections creates its box");
+
+    let spec_path = mngr.box_events(id).await.unwrap().object.spec_path();
+    let bytes = std::fs::read(spec_path.as_utf8_path()).expect("the spec is stored");
+    let stored: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&bytes).expect("the stored spec is JSON");
+    assert_eq!(stored, spec, "the stored spec carries every section");
+
+    let plain = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("fmt", None)), None, None)
+        .await
+        .expect("a plain spec creates its box");
+
+    let logged = log.contents();
+    let warnings = |id: SessionId| -> Vec<String> {
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("WARN")
+                    && line.contains("a section this daemon does not enforce")
+                    && line.contains(&id.to_string())
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let warned = warnings(id);
+    for section in [
+        "[[file_imports]]",
+        "[[file_exports]]",
+        "[[github_imports]]",
+        "[otel]",
+        "[network] vpn_network_names",
+    ] {
+        let naming = warned
+            .iter()
+            .filter(|line| line.contains(&format!("section=\"{section}\"")))
+            .count();
+        assert_eq!(naming, 1, "one warning names {section}:\n{logged}");
+    }
+    assert_eq!(warned.len(), 5, "one warning per section:\n{logged}");
+    assert!(
+        warnings(plain).is_empty(),
+        "a spec with no unenforced section warns nothing:\n{logged}"
+    );
 }
 
 /// The name the record of box `id` carries.
@@ -5366,6 +5592,283 @@ async fn host_ip_create_rereads_a_stale_unreadable_fact() {
     );
 }
 
+/// Resets the process-global classifier stand-ins, the fact and the cgroup
+/// it was read in on drop, a failed assert included, before the fact
+/// window's lock is released. A watch still running is aborted first. The
+/// tree drops after the reset, so no stand-in names a removed path.
+struct ResetClassifierStandins(Option<TempDir>, Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for ResetClassifierStandins {
+    fn drop(&mut self) {
+        if let Some(watch) = self.1.take() {
+            watch.abort();
+        }
+        *CREATE_CLASSIFIER_TREE_STANDIN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        *CREATE_OWN_CGROUP_STANDIN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        crate::box_runtime::clear_classifier_reading_standin();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_fact_cgroup();
+        drop(self.0.take());
+    }
+}
+
+/// A watch the test started, stopped and awaited, so the recorded cgroup's
+/// lock is free before the next phase.
+async fn stop_watch(reset: &mut ResetClassifierStandins) {
+    if let Some(watch) = reset.1.take() {
+        watch.abort();
+        let _ = watch.await;
+    }
+}
+
+/// gominimal/inbox#1054: the daemon's start-up wiring
+/// (`read_fact_and_watch_placement`, as `main` calls it). A guest daemon
+/// reads no cgroup and starts no watch, nor does a host whose cgroup is
+/// unreadable. A native daemon records the cgroup it stood in *before* its
+/// start-up reading, so a placement that lands while the reading runs is
+/// still a move; then its watch re-reads the classifier fact when it moves
+/// into its leaf, so the creates that follow answer over the host as it is
+/// now and not with the cause read before the move. The same cgroup, or an
+/// unreadable one, is no move and re-reads nothing.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the fact is process-global, so the guard must span the awaited watch it is set for"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
+    use crate::net::classifier::{Cause, Decision, Reading};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let capture = crate::test_harness::captured_log();
+    let (tree, root, mountinfo) = stand_in_classifier_tree();
+    let mut reset = ResetClassifierStandins(Some(tree), None);
+    // The table refuses once the daemon can place the probe.
+    crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    const BEFORE: &str = "/user.slice/user-1000.slice";
+    const LEAF: &str = "/minimald.slice/daemon";
+    let cgroup = Arc::new(Mutex::new(Some(BEFORE.to_string())));
+    let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let own_cgroup = {
+        let cgroup = Arc::clone(&cgroup);
+        let calls = Arc::clone(&calls);
+        move || {
+            calls.lock().unwrap().push("cgroup");
+            cgroup.lock().unwrap().clone()
+        }
+    };
+    // What the running daemon read at start, before the install.
+    let start_reading = |moves_to: Option<&'static str>| {
+        let cgroup = Arc::clone(&cgroup);
+        let calls = Arc::clone(&calls);
+        move || {
+            calls.lock().unwrap().push("read");
+            crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+                Cause::StepNotInstalled,
+            ));
+            if let Some(leaf) = moves_to {
+                *cgroup.lock().unwrap() = Some(leaf.to_string());
+            }
+        }
+    };
+    let poll = Duration::from_millis(10);
+    let wait_for_re_read = || async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box() {
+            assert!(
+                Instant::now() < deadline,
+                "the moved daemon re-read the fact within the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The fact is set inside the re-read, but the watch still logs and
+        // records the move after it, holding the recorded cgroup's lock
+        // until then; taking the lock waits for that, so a watch stopped
+        // next has already logged and recorded the move.
+        let _ = crate::box_runtime::fact_cgroup().await;
+    };
+
+    // A guest daemon: the reading runs, and nothing else.
+    let watch = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        true,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(watch.is_none(), "a guest daemon starts no watch");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["read"],
+        "a guest daemon reads no cgroup"
+    );
+    assert_eq!(crate::box_runtime::fact_cgroup().await, None);
+
+    // A native daemon whose cgroup is unreadable: nothing to compare.
+    calls.lock().unwrap().clear();
+    *cgroup.lock().unwrap() = None;
+    let watch = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(watch.is_none(), "an unreadable cgroup starts no watch");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["cgroup", "read"],
+        "the cgroup is read before the start-up reading"
+    );
+    assert_eq!(crate::box_runtime::fact_cgroup().await, None);
+
+    // A native daemon, not moved by its reading.
+    *cgroup.lock().unwrap() = Some(BEFORE.to_string());
+    reset.1 = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(reset.1.is_some(), "a native daemon watches its cgroup");
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(BEFORE)
+    );
+    // Not moved, then unreadable: neither is a move.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    *cgroup.lock().unwrap() = None;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::StepNotInstalled),
+        "a daemon that did not move keeps the fact it read"
+    );
+    // The install's placement moves the daemon into its leaf.
+    *cgroup.lock().unwrap() = Some(LEAF.to_string());
+    wait_for_re_read().await;
+    assert_eq!(crate::box_runtime::host_ip_enforcement_fact().cause, None);
+    stop_watch(&mut reset).await;
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(LEAF)
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line
+            .contains("this daemon moved to another cgroup, so it re-read the classifier fact")
+            && line.contains(LEAF)
+            && line.contains("the cgroup watch")),
+        "the move is one line naming the cgroup it moved to:\n{logged}"
+    );
+
+    // A placement that lands while the start-up reading runs: the cgroup
+    // recorded is the one read before it, so the watch still sees a move.
+    *cgroup.lock().unwrap() = Some(BEFORE.to_string());
+    reset.1 = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(Some(LEAF)),
+    )
+    .await;
+    wait_for_re_read().await;
+    stop_watch(&mut reset).await;
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(LEAF)
+    );
+}
+
+/// gominimal/inbox#1054: a host-address create that finds the daemon in
+/// another cgroup than the one its fact was read in re-reads the fact
+/// itself, so a create in the second after `min finalize-install` placed
+/// the daemon does not wait for the cgroup watch's next poll. The move is
+/// recorded, so the next create in the same cgroup answers as stored.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the fact is process-global, so the guard must span the awaited \
+              creates it is set for"
+)]
+#[tokio::test]
+async fn a_host_address_create_after_a_move_re_reads_the_classifier_fact() {
+    use crate::net::classifier::{Cause, Decision, Reading};
+    let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (_state, _cache, mngr) = manager().await;
+    let capture = crate::test_harness::captured_log();
+    let (tree, root, mountinfo) = stand_in_classifier_tree();
+    let _reset = ResetClassifierStandins(Some(tree), None);
+    *CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((root, mountinfo));
+    crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    let host_ip = |name: &str| {
+        let mut config = sample_config();
+        config.name = Some(name.to_string());
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy = boxes::BoxPolicy::new(Some(boxes::EgressPolicy::deny_all()), None);
+        config
+    };
+    // The daemon read the host outside its leaf, before the install, and
+    // the install has since placed it.
+    crate::box_runtime::set_fact_cgroup(Some("/user.slice/user-1000.slice".to_string())).await;
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::StepNotInstalled,
+    ));
+    *CREATE_OWN_CGROUP_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some("/minimald.slice/daemon".to_string());
+    mngr.create_session(host_ip("moved"), None)
+        .await
+        .expect("a deny-all host-address box is created");
+    let fact = crate::box_runtime::host_ip_enforcement_fact();
+    assert!(
+        fact.can_decide_per_box() && fact.cause.is_none(),
+        "the create re-read the host after the move"
+    );
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some("/minimald.slice/daemon"),
+        "the create recorded the cgroup it re-read in"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.contains("host-address create re-read the classifier fact because the daemon")
+            && logged.contains("a host-address create"),
+        "the create says it re-read because the daemon moved:\n{logged}"
+    );
+
+    // No move since: the next create answers as stored.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::StepNotInstalled,
+    ));
+    mngr.create_session(host_ip("not-moved"), None)
+        .await
+        .expect("a create over a stored cause is not refused at create");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::StepNotInstalled),
+        "a create in the cgroup the fact was read in does not re-read"
+    );
+}
+
 /// The directory of box `id` and its workspace, through a store over
 /// `state_dir`, with the workspace made when the box has none yet.
 async fn box_dir_and_tree(
@@ -5687,4 +6190,605 @@ async fn show_reports_disk_a_reap_frees() {
 
     let logged = log.contents();
     assert!(logged.contains("read a box record"), "{logged}");
+}
+
+/// The client trace the request in the tests below adopts.
+#[cfg(target_os = "linux")]
+const CLIENT_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+
+/// An `rpc` span that adopted a client's `TRACEPARENT`, as the RPC handler's
+/// does: the request a test makes a hand-over or a publish move from.
+#[cfg(target_os = "linux")]
+fn request_span() -> tracing::Span {
+    let request = tracing::info_span!(
+        "rpc",
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    let traceparent = format!("00-{CLIENT_TRACE}-b7ad6b7169203331-01");
+    let ctx = minimald_rpc::trace::TraceContext::parse_traceparent(&traceparent);
+    crate::exec::adopt_trace(&request, ctx);
+    request
+}
+
+/// The one span named `name` whose `field` is `value`, once a task the
+/// test does not await has opened it.
+#[cfg(target_os = "linux")]
+async fn logged(
+    log: &crate::test_harness::SpanLog,
+    name: &str,
+    field: &str,
+    value: &str,
+) -> crate::test_harness::LoggedSpan {
+    let turn = std::time::Duration::from_millis(10);
+    for _ in 0..500 {
+        if !log.find(name, field, value).is_empty() {
+            break;
+        }
+        tokio::time::sleep(turn).await;
+    }
+    log.one(name, field, value)
+}
+
+/// The one span named `name`.
+#[cfg(target_os = "linux")]
+fn only(log: &crate::test_harness::SpanLog, name: &str) -> crate::test_harness::LoggedSpan {
+    let mut found = log.spans();
+    found.retain(|s| s.name == name);
+    assert_eq!(found.len(), 1, "{name}: {found:?}");
+    found.remove(0)
+}
+
+/// Two boxes publish port 8080 at `node`. `first` published it first and
+/// holds it until its next publish drops the port, which hands the port to
+/// `second` (NET-129).
+#[cfg(target_os = "linux")]
+fn hand_over_8080(
+    mngr: &BoxManagerHandle,
+    node: std::net::Ipv4Addr,
+    first: SessionId,
+    second: SessionId,
+) {
+    let ports = std::collections::BTreeSet::from([8080u16]);
+    let registry = mngr.hostnames();
+    let mut registry = registry.write().expect("registry lock");
+    for (session, name) in [(first, "first"), (second, "second")] {
+        registry.publish_own_address(session, name, node, ports.clone());
+        registry.register_own_ip(session, name, ports.clone());
+    }
+    assert!(registry.holds_shared_port(first, node, 8080));
+    let ports = std::collections::BTreeSet::from([9090u16]);
+    registry.publish_own_address(first, "first", node, ports);
+    assert!(registry.holds_shared_port(second, node, 8080));
+}
+
+/// TEL-030, TEL-022: the manager's lifetime loops run under its root, and
+/// the work the daemon does by itself joins the root's trace: the boot
+/// resume, sent from no span as `Server::run` sends it, and a hand-over no
+/// request made. Each was a root of its own, a stray trace in every
+/// telemetry-on lab run (`sessions.hand_overs`, `sessions.publish_moves`,
+/// `sessions.manager.message` ResumeActive; lab job 01958).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_managers_own_work_runs_in_its_root_trace() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let (_state, _cache, mngr) = manager().await;
+
+    let root = only(&log, "sessions.manager");
+    assert!(
+        root.parent.is_none(),
+        "the manager's span is a root: {root:?}"
+    );
+    let root_trace = root.field("trace_id").expect("the root's ids");
+    let root_span = root.field("span_id").expect("the root's ids");
+    for name in ["sessions.hand_overs", "sessions.publish_moves"] {
+        let found = only(&log, name);
+        let parent = log.parent_of(&found).expect("a loop's parent");
+        assert_eq!(parent.name, "sessions.manager", "{name}");
+    }
+
+    assert_eq!(mngr.resume_active_sessions().await.unwrap(), 0);
+    let resume = log.one("sessions.manager.message", "kind", "ResumeActive");
+    assert_eq!(resume.field("trace_id"), Some(root_trace));
+    assert_eq!(resume.field("parent_span_id"), Some(root_span));
+
+    let node = std::net::Ipv4Addr::new(127, 0, 64, 200);
+    hand_over_8080(&mngr, node, SessionId::mint(), SessionId::mint());
+    let hand_over = logged(&log, "sessions.hand_over", "port", "8080").await;
+    assert_eq!(hand_over.field("trace_id"), Some(root_trace));
+    assert_eq!(hand_over.field("parent_span_id"), Some(root_span));
+}
+
+/// TEL-030: the manager's root closes when its mainloop ends, and so do
+/// the hand-over and publish-move loops under it. A loop that outlived the
+/// mainloop held the root open until the runtime's drop, so a daemon whose
+/// drop came after its last flush never exported the root, and the boot
+/// work in its trace read as orphans instead of joined spans.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_managers_root_closes_when_its_mainloop_ends() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let (_state, _cache, mngr) = manager().await;
+    assert_eq!(mngr.resume_active_sessions().await.unwrap(), 0);
+    assert!(!only(&log, "sessions.manager").closed, "open while serving");
+
+    // The last handle gone, the mainloop's receiver ends.
+    drop(mngr);
+    let names = [
+        "sessions.manager",
+        "sessions.hand_overs",
+        "sessions.publish_moves",
+    ];
+    let turn = std::time::Duration::from_millis(10);
+    for _ in 0..500 {
+        if names.iter().all(|name| only(&log, name).closed) {
+            break;
+        }
+        tokio::time::sleep(turn).await;
+    }
+    for name in names {
+        let span = only(&log, name);
+        assert!(span.closed, "{name} outlives the mainloop: {span:?}");
+    }
+}
+
+/// TEL-022: a hand-over and a publish move are handled in the trace of the
+/// request that made them, as children of its span, and the manager
+/// messages their handling sends are children of theirs: not in the
+/// manager's lifetime trace, and not in a trace of their own.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_hand_over_and_a_publish_move_join_the_requests_trace() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let (_state, _cache, mngr) = manager().await;
+    let request = request_span();
+    let rpc = log.one("rpc", "trace_id", CLIENT_TRACE);
+
+    let node = std::net::Ipv4Addr::new(127, 0, 64, 200);
+    let (first, second) = (SessionId::mint(), SessionId::mint());
+    request.in_scope(|| hand_over_8080(&mngr, node, first, second));
+    let hand_over = logged(&log, "sessions.hand_over", "port", "8080").await;
+    assert_eq!(hand_over.field("trace_id"), Some(CLIENT_TRACE));
+    assert_eq!(hand_over.field("parent_span_id"), rpc.field("span_id"));
+    assert!(
+        hand_over.parent.is_none(),
+        "the hand-over's span is not held under the loop's: {hand_over:?}"
+    );
+    let lookup = logged(&log, "sessions.manager.message", "kind", "GetSession").await;
+    assert_eq!(lookup.field("trace_id"), Some(CLIENT_TRACE));
+    assert_eq!(lookup.field("parent_span_id"), hand_over.field("span_id"));
+
+    let mover = SessionId::mint();
+    let to = std::net::Ipv4Addr::new(127, 0, 64, 201);
+    let from = std::net::Ipv4Addr::LOCALHOST;
+    {
+        let registry = mngr.hostnames();
+        let mut registry = registry.write().expect("registry lock");
+        let ports = std::collections::BTreeSet::from([7070u16]);
+        registry.publish_own_address(mover, "mover", to, ports);
+        let moved = request.in_scope(|| registry.hand_over_moved_publish(mover, from));
+        assert_eq!(moved.len(), 1, "{moved:?}");
+    }
+    let moved = logged(&log, "sessions.publish_move", "trace_id", CLIENT_TRACE).await;
+    assert_eq!(moved.field("parent_span_id"), rpc.field("span_id"));
+    let lookup = logged(&log, "sessions.manager.message", "kind", "GetRunning").await;
+    assert_eq!(lookup.field("trace_id"), Some(CLIENT_TRACE));
+    assert_eq!(lookup.field("parent_span_id"), moved.field("span_id"));
+}
+
+/// A task spec whose `[secrets]` table holds `secrets`, as the client
+/// expands it (BOX-071).
+fn spec_with_secrets(entry: &str, secrets: serde_json_lenient::Value) -> serde_json_lenient::Value {
+    let mut spec = task_spec(entry, None);
+    spec.as_object_mut()
+        .expect("a spec is an object")
+        .insert("secrets".to_string(), secrets);
+    spec
+}
+
+/// A brokered secret, as `[secrets.<name>] source = "broker"` expands.
+fn broker_secret() -> serde_json_lenient::Value {
+    serde_json_lenient::json!({ "source": "broker", "scopes": ["github:repo"] })
+}
+
+/// A store reference with the `upstream` and `inject` expansion written
+/// into it (BOX-071, BOX-141).
+fn store_secret() -> serde_json_lenient::Value {
+    serde_json_lenient::json!({
+        "source": "store",
+        "store": "keychain",
+        "id": "npm-token",
+        "upstream": { "hosts": ["registry.npmjs.org"] },
+        "inject": { "header": "Authorization", "format": "Bearer {}" },
+    })
+}
+
+/// BOX-081: on a host with no identity plane, a create whose spec carries
+/// a `source = "broker"` secret is refused with exit 5 and the
+/// `gatehouse_unenrolled_node` code when no node-local proxy serves the
+/// box. The refusal files no record, and the daemon log names the
+/// refused secret. The host is never enrolled here, so the enumeration
+/// covers the other two facts: whether a proxy serves the box, and
+/// whether the spec carries a brokered secret, a store reference or none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_secret_unenrolled_exit5() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    const ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n";
+    // The secret names are unique to this test, so the log lines it counts
+    // are its own when tests share one subscriber (libtest).
+    let gh = || serde_json_lenient::json!({ "x5-gh": broker_secret() });
+    let cases = [
+        // (secrets, the create's root certificate, the refused secrets)
+        (gh(), None, vec!["x5-gh"]),
+        (
+            serde_json_lenient::json!({ "x5-gh": broker_secret(), "npm": store_secret() }),
+            None,
+            vec!["x5-gh"],
+        ),
+        (gh(), Some(ROOT_PEM), vec![]),
+        (
+            serde_json_lenient::json!({ "npm": store_secret() }),
+            None,
+            vec![],
+        ),
+        (
+            serde_json_lenient::json!({ "npm": store_secret() }),
+            Some(ROOT_PEM),
+            vec![],
+        ),
+        (serde_json_lenient::json!({}), None, vec![]),
+        (serde_json_lenient::json!({}), Some(ROOT_PEM), vec![]),
+        // A certificate that is not one well-formed block does not count
+        // as the proxy's, so the brokered secret is still refused.
+        (gh(), Some(""), vec!["x5-gh"]),
+        (gh(), Some("not a certificate"), vec!["x5-gh"]),
+        // A node-local proxy serves only a GitHub grant, so a brokered
+        // secret with no `github:` scope is refused beside it.
+        (
+            serde_json_lenient::json!({ "x5-aws": broker_secret_aws() }),
+            Some(ROOT_PEM),
+            vec!["x5-aws"],
+        ),
+        (
+            serde_json_lenient::json!({ "x5-gh": broker_secret(), "x5-aws": broker_secret_aws() }),
+            Some(ROOT_PEM),
+            vec!["x5-aws"],
+        ),
+        (
+            serde_json_lenient::json!({ "x5-aws": broker_secret_aws() }),
+            None,
+            vec!["x5-aws"],
+        ),
+    ];
+    let expected_lines = cases.iter().filter(|(_, _, r)| !r.is_empty()).count();
+    for (n, (secrets, certificate, refused)) in cases.into_iter().enumerate() {
+        let entry = format!("case-{n}");
+        let mut config = unnamed_config();
+        config.root_certificate = certificate.map(str::to_string);
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let created = mngr
+            .create_box_with_spec(config, Some(spec_with_secrets(&entry, secrets)), None, None)
+            .await;
+        if refused.is_empty() {
+            let id = created.unwrap_or_else(|e| panic!("{entry} is created: {e}"));
+            let filed = mngr.get_record(BoxKeyPredicate::Id(id)).await.unwrap();
+            assert!(filed.is_some(), "{entry} files its record");
+            continue;
+        }
+        let err = created.expect_err("a brokered secret nothing serves is refused");
+        let refusal = unenrolled_refusal(&err).expect("the error is the un-enrolled refusal");
+        assert_eq!(refusal.exit_code(), 5, "{entry}");
+        assert_eq!(
+            refusal
+                .refusals
+                .iter()
+                .map(|r| r.code())
+                .collect::<Vec<_>>(),
+            vec![Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)],
+            "{entry}"
+        );
+        let text = err.to_string();
+        for name in ["x5-gh", "x5-aws"] {
+            assert_eq!(
+                text.contains(name),
+                refused.contains(&name),
+                "{entry}: the refusal names only the refused secrets: {text}"
+            );
+        }
+        assert!(
+            !text.contains("npm"),
+            "the refusal does not name a store reference: {text}"
+        );
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{entry}: a refused create files no record"
+        );
+    }
+
+    let logged = log.contents();
+    let refusals: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains("the spec carries a brokered secret"))
+        .filter(|line| line.contains("x5-"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        expected_lines,
+        "one log line per refusal:\n{logged}"
+    );
+    for line in refusals {
+        assert!(
+            line.contains("\"x5-gh\"") || line.contains("\"x5-aws\""),
+            "the log names the secret: {line}"
+        );
+        assert!(
+            line.contains("gatehouse_unenrolled_node"),
+            "the log names the code: {line}"
+        );
+        assert!(line.contains("exit_code=5"), "{line}");
+        assert!(line.contains("identity=\"none\""), "{line}");
+    }
+}
+
+/// A brokered secret with no `github:` scope.
+fn broker_secret_aws() -> serde_json_lenient::Value {
+    serde_json_lenient::json!({ "source": "broker", "scopes": ["aws:s3"] })
+}
+
+/// BOX-081 over the socket: the create reply carries the refusal's text,
+/// and the daemon files no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_secret_unenrolled_exit5_reply_over_socket() {
+    use crate::test_harness::{TestServer, create_session_req};
+    use minimald_rpc::{CreateSession, Errorable};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut req = create_session_req("brokered", "/uwu");
+    req.config.name = None;
+    req.spec = Some(spec_with_secrets(
+        "brokered",
+        serde_json_lenient::json!({ "gh": broker_secret() }),
+    ));
+    match client.call::<CreateSession>(&req).await {
+        Errorable::Err { error } => {
+            assert!(error.contains("gh"), "{error}");
+            assert!(
+                error.contains("no Box Egress Proxy serves boxes on this machine"),
+                "{error}"
+            );
+        }
+        Errorable::Ok(reply) => panic!("the create is refused, not {reply:?}"),
+    }
+    let mngr = server.state.sessions_manager().await;
+    assert!(mngr.list_boxes(None).await.unwrap().is_empty());
+}
+
+/// BOX-141: on a host with no identity plane, a `source = "store"`
+/// reference, with its `upstream` and `inject` expansion, passes through
+/// to the daemon unchanged: the box is created and its stored spec holds
+/// the reference key for key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_secret_passed_through_unenrolled() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = spec_with_secrets(
+        "stored",
+        serde_json_lenient::json!({ "npm": store_secret() }),
+    );
+    let id = mngr
+        .create_box_with_spec(unnamed_config(), Some(spec.clone()), None, None)
+        .await
+        .expect("a store reference creates its box");
+
+    let spec_path = mngr.box_events(id).await.unwrap().object.spec_path();
+    let bytes = std::fs::read(spec_path.as_utf8_path()).expect("the spec is stored");
+    let stored: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&bytes).expect("the stored spec is JSON");
+    assert_eq!(stored["secrets"]["npm"], store_secret());
+    assert_eq!(stored, spec, "the stored spec is the spec the create sent");
+    let shown = mngr
+        .show_box(id)
+        .await
+        .unwrap()
+        .expect("the box is retained");
+    assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
+}
+
+/// BOX-140: on a host with no identity plane, every operation on a box
+/// runs over the local socket, which only its owner can open: creation,
+/// listing and reading the record, exec, rename, stop, reading the events
+/// and a stopped box's files, resume, restart, reaping and pruning. The
+/// record reports the identity none, and no file named `identity.sock` is
+/// in the box.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unenrolled_operations_over_file_mode_trust() {
+    use crate::test_harness::{TestServer, connect_uds};
+    use minimald_rpc::exec::{ExecMode, ExecRequest, ExecSpec};
+    use minimald_rpc::{
+        Errorable, PruneBoxes, PruneBoxesRequest, ReadEventsUpdate, ReapBox, ReapBoxRequest,
+        RenameSession, RenameSessionRequest, RenameSessionResponse, RestartBox, RestartBoxRequest,
+        RestartBoxResponse, ShowBox, ShowBoxRequest, StopBox, StopBoxRequest,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let server = TestServer::new().await;
+    // The daemon's local socket, open to its owner alone: the file mode is
+    // the only trust the un-enrolled host has.
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("minimald.sock");
+    server.listen_on_uds(&sock).await;
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let mut client = connect_uds(&sock).await;
+
+    let stop = |id: SessionId| StopBoxRequest { id, force: true };
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.pty_enabled = true;
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+
+    // Creation, listing, and the record with the identity none.
+    let id = create_box_by_verb(
+        &mut client,
+        "plain",
+        minimald_rpc::CreatingVerb::Session,
+        Some(spec),
+    )
+    .await;
+    assert_eq!(listed(&mut client, id).await.state, "running");
+    let shown = match client.call::<ShowBox>(&ShowBoxRequest { id }).await {
+        Errorable::Ok(shown) => shown,
+        Errorable::Err { error } => panic!("ShowBox failed: {error}"),
+    };
+    assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
+    assert_eq!(
+        serde_json_lenient::to_value(shown.identity).unwrap()["kind"],
+        "none",
+        "the record reports `identity: none`"
+    );
+
+    // Attach, then exec into the box.
+    attach_until_echo(&mut client, id).await;
+    let exec = ExecRequest::Exec(ExecSpec {
+        argv: vec!["/bin/sh".into(), "-c".into(), "echo exec-ran".into()],
+        mode: ExecMode::Attached,
+        timeout_secs: None,
+    });
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &exec.encode(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the exec ends")
+    .expect("the daemon takes the exec");
+    assert_eq!(outcome.exit_status, Some(0), "{outcome:?}");
+    assert!(
+        String::from_utf8_lossy(&outcome.stdout).contains("exec-ran"),
+        "{outcome:?}"
+    );
+
+    // No identity socket anywhere in the box's directories.
+    let mngr = server.state.sessions_manager().await;
+    let paths = session(&mngr, id).await.paths().await.unwrap();
+    let box_dir = mngr.box_events(id).await.unwrap().object.spec_path();
+    let box_dir = box_dir
+        .as_utf8_path()
+        .parent()
+        .unwrap()
+        .as_std_path()
+        .to_path_buf();
+    let roots = [
+        std::path::Path::new(paths.working.as_str()),
+        std::path::Path::new(paths.home.as_str()),
+        std::path::Path::new(paths.cache.as_str()),
+        box_dir.as_path(),
+    ];
+    assert_eq!(crate::env::find_identity_socket(&roots), None);
+
+    // Rename.
+    let reply = client
+        .call::<RenameSession>(&RenameSessionRequest {
+            id,
+            new_name: "renamed".to_string(),
+        })
+        .await;
+    assert_eq!(reply, Errorable::Ok(RenameSessionResponse));
+    assert_eq!(
+        listed(&mut client, id).await.name.as_deref(),
+        Some("renamed")
+    );
+
+    // Stop, then read the events and the stopped box's files.
+    let workspace_file = std::path::Path::new(paths.working.as_str()).join("kept.txt");
+    std::fs::write(&workspace_file, "kept").unwrap();
+    match client.call::<StopBox>(&stop(id)).await {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("StopBox failed: {error}"),
+    }
+    assert_eq!(listed(&mut client, id).await.state, "stopped");
+    let mut lines = open_events_read(&mut client, id, false).await;
+    let mut kinds = Vec::new();
+    while let Some(update) = next_update(&mut lines).await {
+        match update {
+            ReadEventsUpdate::Event { event } => kinds.push(event.kind),
+            ReadEventsUpdate::Done => break,
+            other => panic!("the read ends with Done, not {other:?}"),
+        }
+    }
+    for kind in [
+        BoxEventType::Created,
+        BoxEventType::Renamed,
+        BoxEventType::Exited,
+    ] {
+        assert!(kinds.contains(&kind), "{kind:?} in {kinds:?}");
+    }
+    let sftp = client.open_sftp(id).await;
+    let read = sftp
+        .read(format!("{}/kept.txt", crate::env::WORKSPACE_ROOT))
+        .await
+        .expect("a stopped box's file reads");
+    assert_eq!(read, b"kept");
+    drop(sftp);
+
+    // Resume by attach, then restart.
+    attach_until_echo(&mut client, id).await;
+    assert_eq!(listed(&mut client, id).await.state, "running");
+    let reply = client.call::<RestartBox>(&RestartBoxRequest { id }).await;
+    assert!(
+        matches!(reply, Errorable::Ok(RestartBoxResponse::Restarted { .. })),
+        "{reply:?}"
+    );
+    assert_eq!(listed(&mut client, id).await.state, "running");
+
+    // Reap.
+    let reply = client
+        .call::<ReapBox>(&ReapBoxRequest { id, force: true })
+        .await;
+    match reply {
+        Errorable::Ok(reaped) => assert_eq!(reaped.reaped.box_id, id),
+        Errorable::Err { error } => panic!("ReapBox failed: {error}"),
+    }
+
+    // Prune.
+    let pruned = create_box_by_verb(
+        &mut client,
+        "pruned",
+        minimald_rpc::CreatingVerb::Task,
+        None,
+    )
+    .await;
+    match client.call::<StopBox>(&stop(pruned)).await {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("StopBox failed: {error}"),
+    }
+    match client
+        .call::<PruneBoxes>(&PruneBoxesRequest::default())
+        .await
+    {
+        Errorable::Ok(reply) => {
+            let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+            assert_eq!(reaped, vec![pruned]);
+        }
+        Errorable::Err { error } => panic!("PruneBoxes failed: {error}"),
+    }
+    assert!(mngr.list_boxes(None).await.unwrap().is_empty());
 }

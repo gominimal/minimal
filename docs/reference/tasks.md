@@ -216,16 +216,13 @@ error: task 'deploy' declares `env_vars.TOKEN = { inherit = true }`, but TOKEN
 is not set in this shell; export it before running the task
 ```
 
-This applies to `min task run`. Two other ways of running a declared task
-still resolve `inherit` against the daemon's environment:
+This applies to `min task run`. It reads the task's declaration from the
+project's `minimal.toml` on your machine. A `minimal.toml` on your machine
+that does not parse refuses the run before the task's box is created.
 
-- `min run <task>`, from *inside* a session, has no invoking client to read
-  from.
-- `min session run <session> <task>` runs against a session you already have,
-  over the attach transport, which forwards only `MINIMAL_SESSION_ID` and your
-  locale.
-
-So prefer an explicit value for tasks meant to be run either of those ways.
+`min run <task>`, from *inside* a session, has no invoking client to read
+from, so it still resolves `inherit` against the daemon's environment. Prefer
+an explicit value for tasks meant to be run that way.
 
 ### Environment variables and your policy {#policy}
 
@@ -384,10 +381,11 @@ Usage: mip run greeter --name <name> --greeting <greeting>
 $> min task run greeter --name Alice --greeting hi
 ```
 
-`min task run` reads its own options (`--path`, `--help`) before the task's. To pass a
-task argument with one of those names, put it after `--`, as in
-`min task run deploy -- --path prod`. The project directory is the `--path` option, not a
-positional argument.
+`min task run` reads its own options (such as `--detach` and `--help`) before the
+task's. To pass a task argument with one of those names, put it after `--`, as
+in `min task run deploy -- --detach prod`. The project directory is the global
+`-C <dir>` option, as in `min -C ../app task run deploy`, not a positional
+argument.
 
 Each argument's datatype may be:
 
@@ -410,13 +408,12 @@ exec = "echo Hello %{name}"
 
 A task has no `--network` flag of its own. It uses the network of the
 session that runs it, which the session's
-[`--network` mode](./cli-min.md#session-activate) sets:
+[`--network` mode](./cli-min.md#session-start) sets:
 
 - `min task run` composes an ephemeral session with the default mode,
   `host_ip`.
-- `min run <task>` inside a session and
-  [`min session run <session> <task>`](./cli-min.md#session-run) run the task
-  in a session that already exists. The task takes that session's mode.
+- `min run <task>` inside a session runs the task in a session that already
+  exists. The task takes that session's mode.
 
 `host_ip` (the default) shares the host's network namespace. The task
 reaches everything the host reaches. This includes the host-side hostname
