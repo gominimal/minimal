@@ -253,14 +253,14 @@ Steering and the interception CA
     verify: cargo nextest run -p bep root_recertified_under_same_key_and_subject
     <!-- Gatehouse §6.10: re-certification is not rotation; a running box keeps validating the names its root already permitted and reaches an added authority once re-created; the certificates below the root carry a key-identifier-only authority key identifier, so they chain to either issue of it -->
 
-- **BEP-014** WHILE the proxy is a release build that holds its keys in a hardware key store THE SYSTEM SHALL hold the signing CA private key there as a non-exportable key and write no copy of it that another machine can load.
+- **BEP-014** WHILE the proxy is a release build, other than a Linux proxy that holds the key in Secret Service, THE SYSTEM SHALL hold the signing CA private key in the host's hardware key store as a non-exportable key and write no copy of it that another machine can load.
   tier:     T0
   verify:   cargo nextest run -p bep signing_key_is_non_exportable_and_has_no_file
-  <!-- the hardware key store is the Secure Enclave on macOS and TPM 2.0 on Linux (BEP-088); a TPM key's wrapped blob on disk is a file, but only the TPM that made it can load it, so it is not a copy another machine can load; a Linux host with no usable TPM holds software keys in Secret Service, where this requirement does not apply (BEP-088, BEP-090) -->
+  <!-- the hardware key store is the Secure Enclave on macOS and TPM 2.0 on Linux (BEP-088); a TPM key's wrapped blob on disk is a file, but only the TPM that made it can load it, so it is not a copy another machine can load; a Linux host with no usable TPM holds software keys in Secret Service, the one exception (BEP-088, BEP-090); a macOS release build has no exception: it holds its keys in the Secure Enclave, and `bep::keys::custody` refuses an exportable key in a release build, so a release build never runs on login-keychain keys -->
 
   <!-- a debug build keeps an exportable key, and writes a warning for each role at each start: the macOS login keychain lets the process that made a key export it although `kSecAttrIsExtractable` is false (the probe on #2436), and the keychain that enforces it needs an entitlement that only a Developer ID signature carries, so a debug build would never start on a developer's Mac; decided 2026-10-31, this note is the record, and the architecture's key-custody rule stays as it is; `bep::keys::custody` is the one decision, at the keychain's generation, at `bep::keys::load` for a stored sealing key, and at the CA's key check for the root and signing keys -->
 
-- **BEP-059** WHILE the proxy is a release build that holds its keys in a hardware key store THE SYSTEM SHALL generate the proxy's sealing key and the root CA key non-exportable in that store, hold them there across proxy restarts, and write no copy of them that another machine can load.
+- **BEP-059** WHILE the proxy is a release build, other than a Linux proxy that holds the keys in Secret Service, THE SYSTEM SHALL generate the proxy's sealing key and the root CA key non-exportable in the host's hardware key store, hold them there across proxy restarts, and write no copy of them that another machine can load.
   tier:     T0
   verify:   cargo nextest run -p bep sealing_and_root_keys_persist_non_exportable
   <!-- Gatehouse §6.10 un-enrolled lifecycle and the hardware-backed custody bullet -->
@@ -295,7 +295,7 @@ Steering and the interception CA
   tier:     T0
   verify:   cargo nextest run -p bep linux_key_store_is_the_tpm_where_usable_else_secret_service
   <!-- Gatehouse §6.10 hardware-backed custody is a SHOULD "where the host offers it", and names TPM 2.0 for Linux; the fallback is the owner's decision of 2026-11-12, after the experiment on #2436; the store is chosen by trying it at generation, not by finding a device: a TPM that is present but refuses to create a key, because an owner authorization is set or it is in lockout, is not usable; the choice is made at generation only, never at a later start (BEP-089) -->
-  - WHERE the proxy generates a key in a TPM THE SYSTEM SHALL make the key fixed to that TPM, exempt from dictionary-attack lockout, and usable only with an authorization value held in a file that only the proxy's user reads.
+  - WHERE the proxy generates a key in a TPM THE SYSTEM SHALL make the key fixed to that TPM, exempt from dictionary-attack lockout, and usable only with an authorization value of at least 128 bits from the OS CSPRNG, held in a file that only the proxy's user reads.
     tier:   T0
     verify: cargo nextest run -p bep --run-ignored ignored-only a_tpm_key_is_fixed_exempt_from_lockout_and_needs_its_authorization
     <!-- `fixedTPM|fixedParent` and `noDA`; a host that loses power can put the TPM into dictionary-attack lockout, and in the experiment a key without `noDA` was unusable for the TPM's 1000-second recovery time; without its own authorization value, any member of the `tss` group can load and use the key; the test lives in a `crates/bep/tests/*_tpm_integration.rs` binary, ignored unless a TPM is named, and runs against `swtpm` in the Linux native lane and in a local VM; ECDH needs the TPM's own interface, because `tpm2-pkcs11` has no ECDH mechanism -->
@@ -308,15 +308,19 @@ Steering and the interception CA
   tier:     T0
   verify:   cargo nextest run -p bep a_held_key_is_never_moved_to_another_store
   <!-- a key generated in another store is a replacement (BEP-060), and replacement is an operator command; so a TPM that becomes usable later does not take over a Secret Service key, and a TPM that stops working does not cause a fallback; `bep --replace-key <role>` generates in whichever store BEP-088 chooses at that time -->
-  - IF the proxy's keys are in Secret Service and Secret Service is locked or cannot be reached THEN THE SYSTEM SHALL refuse to start and report that the login keyring must be unlocked.
+  - IF a proxy key is in Secret Service and the keyring that holds it is locked THEN THE SYSTEM SHALL refuse to start and report that the login keyring must be unlocked.
     tier:   T0
     verify: cargo nextest run -p bep a_locked_secret_service_refuses_start
     <!-- unwanted; the remedy is not `bep --replace-key`, because the keys still exist; no command unlocks the keyring for every desktop, so the message states the situation -->
+  - IF a proxy key is in Secret Service and Secret Service cannot be reached THEN THE SYSTEM SHALL refuse to start and report that no Secret Service is running in this session.
+    tier:   T0
+    verify: cargo nextest run -p bep an_unreachable_secret_service_refuses_start
+    <!-- unwanted; distinct from a locked keyring, because unlocking does not help when no session bus or keyring daemon runs, as in a plain SSH session; the remedy is to start the proxy from the desktop session that holds the keyring -->
 
-- **BEP-090** WHILE the proxy holds its keys in Secret Service THE SYSTEM SHALL report on `min auth status` that the proxy's keys are software keys, which a program running as the operator's user can copy.
+- **BEP-090** WHILE the proxy holds a key in Secret Service THE SYSTEM SHALL report on `min auth status` that key's role and that it is a software key, which a program running as the operator's user can copy.
   tier:     T0
   verify:   cargo nextest run -p minimal auth_status_reports_software_key_custody
-  <!-- the reduced custody is reported where it stays, never before a box shell; the published material of BEP-072 carries which store holds the keys, so the client reads it without opening the store -->
+  <!-- the reduced custody is reported where it stays, never before a box shell; the store is per key, because BEP-089 lets one role be replaced into another store; the published material of BEP-072 carries which store holds each key, so the client reads it without opening the store -->
 
 - **BEP-015** WHILE a box with steering `proxy_env` holds a sealed GitHub member THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no tool configuration in the box beyond what the box carries at creation.
   tier:     T0
