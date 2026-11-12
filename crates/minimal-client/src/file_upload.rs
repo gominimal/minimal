@@ -55,12 +55,19 @@ pub fn is_vcs_root(dir: &Path) -> bool {
 /// returned as the file holds it: a caller that prints it escapes it.
 pub fn linked_worktree_gitdir(dir: &Path) -> Option<String> {
     let marker = dir.join(".git");
-    if !marker.is_file() {
+    // the walk's own test (`DirEntry::file_type`, which follows no symlink):
+    // a `.git` that is a symlink travels as the symlink it is
+    if !std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file()) {
         return None;
     }
-    let text = std::fs::read_to_string(&marker).ok()?;
-    let pointer = text.lines().next()?.trim();
+    // git writes the pointer as bytes: a host path need not be UTF-8, and
+    // the file is left out either way; a byte that is not UTF-8 shows as
+    // U+FFFD where the pointer is printed
+    let bytes = std::fs::read(&marker).ok()?;
+    let line = bytes.split(|b| *b == b'\n').next()?;
+    let pointer = String::from_utf8_lossy(line);
     pointer
+        .trim()
         .strip_prefix("gitdir:")
         .map(|path| path.trim().to_string())
         .filter(|path| !path.is_empty())
@@ -1497,6 +1504,36 @@ mod tests {
         std::fs::remove_file(dir.path().join(".git")).unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         assert_eq!(linked_worktree_gitdir(dir.path()), None);
+    }
+
+    /// The pointer is read as the bytes git wrote: a host path that is not
+    /// UTF-8 is still a pointer, shown with U+FFFD for the byte, and the file
+    /// is still left out; and a `.git` that is a symlink to a pointer file is
+    /// no pointer here, as it is none to the walk, which follows no symlink,
+    /// so it travels as the symlink it is and the person is told nothing.
+    #[tokio::test]
+    async fn linked_worktree_gitdir_reads_bytes_and_follows_no_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            b"gitdir: /home/me/r\xffepo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        let pointer = linked_worktree_gitdir(dir.path()).expect("a pointer");
+        assert_eq!(pointer, "/home/me/r\u{FFFD}epo/.git/worktrees/x");
+        let paths = stream_and_list(dir.path()).await;
+        assert!(!paths.iter().any(|p| p == ".git"), "{paths:?}");
+
+        std::fs::remove_file(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join("pointer"),
+            "gitdir: /home/me/repo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("pointer", dir.path().join(".git")).unwrap();
+        assert_eq!(linked_worktree_gitdir(dir.path()), None);
+        let paths = stream_and_list(dir.path()).await;
+        assert!(paths.iter().any(|p| p == ".git"), "{paths:?}");
     }
 
     /// gominimal/inbox#854: a linked worktree's `.git` file is left out of
