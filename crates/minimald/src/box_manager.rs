@@ -4354,6 +4354,8 @@ impl BoxManager {
                     exit_code = refusal.exit_code(),
                     "refused a create: the box spec carries a value its type's built-in root excludes"
                 );
+                // The reply carries the refusal's text but not its code,
+                // so `min` exits 1 and not 3 (#3313).
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     refusal,
@@ -4369,6 +4371,8 @@ impl BoxManager {
                     builtin_type = refusal.builtin_type,
                     "refused a create: the box spec does not name its type's built-in root"
                 );
+                // The reply carries the refusal's text but not its code,
+                // so `min` exits 1 and not 3 (#3313).
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     refusal,
