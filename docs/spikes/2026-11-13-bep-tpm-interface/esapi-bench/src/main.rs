@@ -202,6 +202,8 @@ fn main() {
     for h in [sk, ek, srk] {
         ctx.flush_context(h.into()).unwrap();
     }
+    // Close the TCTI too: a raw device such as /dev/tpm0 takes one open.
+    drop(ctx);
     // A restart: new context, primary, load the blob, one use, flush.
     let cold = |is_sign: bool| -> Vec<f64> {
         (0..n)

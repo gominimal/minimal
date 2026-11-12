@@ -13,8 +13,12 @@ make -s install >/dev/null 2>&1
 for a in /opt/tss/lib/*.a; do printf '%s ' "${a##*/}"; done; echo
 cp -r /src /b && cd /b && rm -rf target
 echo "== static build against tpm2-tss --enable-nodl"
-PKG_CONFIG_PATH=/opt/tss/lib/pkgconfig PKG_CONFIG_ALL_STATIC=1 RUSTFLAGS="-C target-feature=+crt-static -L /opt/tss/lib -C link-arg=-Wl,--start-group -C link-arg=-ltss2-esys -C link-arg=-ltss2-tctildr -C link-arg=-ltss2-sys -C link-arg=-ltss2-mu -C link-arg=-ltss2-rc -C link-arg=-ltss2-tcti-device -C link-arg=-lcrypto -C link-arg=-Wl,--end-group" cargo build --release -q --target aarch64-alpine-linux-musl 2>&1 | grep -E "^error|undefined|multiple|ld:" | grep -v "^error: could not" | head -12 || true
+PKG_CONFIG_PATH=/opt/tss/lib/pkgconfig PKG_CONFIG_ALL_STATIC=1 RUSTFLAGS="-C target-feature=+crt-static -L /opt/tss/lib -C link-arg=-Wl,--start-group -C link-arg=-ltss2-esys -C link-arg=-ltss2-tctildr -C link-arg=-ltss2-sys -C link-arg=-ltss2-mu -C link-arg=-ltss2-rc -C link-arg=-ltss2-tcti-device -C link-arg=-lcrypto -C link-arg=-Wl,--end-group" cargo build --release -q --target aarch64-alpine-linux-musl >/tmp/cargo.log 2>&1 || {
+    grep -E "^error|undefined|multiple|ld:" /tmp/cargo.log | grep -v "^error: could not" | head -12
+    echo "error: the static build failed" >&2
+    exit 1
+}
 B=target/aarch64-alpine-linux-musl/release/esapi-bench
-[ -f "$B" ] || { echo "no binary"; exit 0; }
+[ -f "$B" ] || { echo "error: the build made no binary" >&2; exit 1; }
 file "$B" | sed 's/BuildID.*//'; wc -c <"$B"
 cp "$B" /out/esapi-bench-static-device

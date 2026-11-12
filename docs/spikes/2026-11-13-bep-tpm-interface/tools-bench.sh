@@ -48,14 +48,18 @@ times() {
     for _ in $(seq "$runs"); do us "$@"; done | summary
 }
 # Load a key from its blob as a restarted process would: storage key, load, use.
+# shellcheck disable=SC2329 # called through `times`
+# Returns the first failure, after the flush, so `us` drops the sample.
 from_blob() {
-    local key="$1"
+    local key="$1" r=0
     shift
-    f tpm2_createprimary -C o -G ecc256 -c p.ctx >/dev/null
-    f tpm2_load -C p.ctx -u "$key.pub" -r "$key.priv" -c k.ctx >/dev/null
-    tpm2_flushcontext -t
-    f "$@" >/dev/null
-    tpm2_flushcontext -t
+    f tpm2_createprimary -C o -G ecc256 -c p.ctx >/dev/null || return
+    f tpm2_load -C p.ctx -u "$key.pub" -r "$key.priv" -c k.ctx >/dev/null || r=$?
+    tpm2_flushcontext -t || true
+    ((r == 0)) || return "$r"
+    f "$@" >/dev/null || r=$?
+    tpm2_flushcontext -t || true
+    return "$r"
 }
 
 auth="hex:$(head -c16 /dev/urandom | xxd -p)"
@@ -90,25 +94,33 @@ printf 'ECDSA, from blob (primary+load+sign):    '; times from_blob s tpm2_sign 
 printf 'ECDH,  from blob (primary+load+zgen):    '; times from_blob e tpm2_ecdhzgen -c k.ctx -p "$auth" -u peer.pt -o z
 
 # Checks: the signature verifies, Z matches OpenSSL's, the TPM refuses to
-# duplicate the key, and it refuses a wrong authorization.
+# duplicate the key, and it refuses a wrong authorization. A failed check
+# fails the run, so its timings do not count.
+failed=0
+fail() { echo "check: $1 (bad)"; failed=1; }
 f tpm2_sign -c s.ctx -p "$auth" -g sha256 -d dig -f plain -o sig.der >/dev/null
 f tpm2_readpublic -c s.ctx -f pem -o s.pem >/dev/null
-openssl dgst -sha256 -verify s.pem -signature sig.der msg >/dev/null && echo "check: signature verifies with OpenSSL"
+if openssl dgst -sha256 -verify s.pem -signature sig.der msg >/dev/null; then
+    echo "check: signature verifies with OpenSSL"
+else
+    fail "SIGNATURE DOES NOT VERIFY"
+fi
 f tpm2_ecdhzgen -c e.ctx -p "$auth" -u peer.pt -o z >/dev/null
 f tpm2_readpublic -c e.ctx -f pem -o e.pem >/dev/null
 openssl pkeyutl -derive -inkey peer.pem -peerkey e.pem -out zo 2>/dev/null
 if [[ "$(dd if=z bs=1 skip=4 count=32 2>/dev/null | xxd -p -c64)" == "$(xxd -p -c64 zo)" ]]; then
     echo "check: ECDH Z matches OpenSSL"
 else
-    echo "check: ECDH Z DIFFERS (bad)"
+    fail "ECDH Z DIFFERS"
 fi
 if f tpm2_duplicate -C srk.ctx -c s.ctx -G null -p "session:" -u d.pub -r d.priv -s d.seed >/dev/null 2>&1; then
-    echo "check: DUPLICATION ALLOWED (bad)"
+    fail "DUPLICATION ALLOWED"
 else
     echo "check: duplication refused"
 fi
 if f tpm2_sign -c s.ctx -p "hex:00" -g sha256 -d dig -o sig >/dev/null 2>&1; then
-    echo "check: WRONG AUTH ACCEPTED (bad)"
+    fail "WRONG AUTH ACCEPTED"
 else
     echo "check: wrong auth refused"
 fi
+exit "$failed"
