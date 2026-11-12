@@ -948,7 +948,20 @@ pub(crate) async fn resolve_box_of_type(
             Ok(resolved)
         }
         Err(refusal) => {
-            tracing::info!(verb, address, box_type, outcome = "refused", "{refusal}");
+            for listing in &listings {
+                if let Err(why) = &listing.boxes {
+                    tracing::info!(verb, host = %listing.host.host, "host did not answer: {why}");
+                }
+            }
+            // The same outcome names `resolve_box_on_hosts` records, so an
+            // unreachable host reads apart from a missing box in the log.
+            let outcome = match &refusal {
+                BoxAddressRefusal::Ambiguous { .. }
+                | BoxAddressRefusal::AmbiguousIdStart { .. } => "ambiguous",
+                BoxAddressRefusal::NotFound { .. } => "not found",
+                BoxAddressRefusal::Unreachable { .. } => "host unreachable",
+            };
+            tracing::info!(verb, address, box_type, outcome, "{refusal}");
             Err(refusal.into())
         }
     }
