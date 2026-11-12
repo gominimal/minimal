@@ -8,11 +8,11 @@
 # moves plane, change both.
 #
 # Every workspace member must appear in exactly one layer, or the
-# `layers.unassigned` gate fails (QM-008). A forbidden edge that the tree
+# `layers.unassigned` gate fails. A forbidden edge that the tree
 # carries today is listed under [[exception]] with the issue that tracks
 # its removal; exceptions count toward the `layers.exceptions` ratchet,
 # which may not grow, and never toward `layers.unexcepted`, which must be
-# zero (QM-007).
+# zero.
 
 schema = 1
 

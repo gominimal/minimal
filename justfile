@@ -362,7 +362,7 @@ clippy:
 clippy-strict BASE="":
     scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
-# Architectural-health measurement (spec 31, metrics/README.md). The snapshot
+# Architectural-health measurement (metrics/README.md). The snapshot
 # lands in .scratch/metrics/<mode>/; `full` compiles (clippy, coverage, module
 # graphs), `static` does not. On macOS the compiling collectors take the darwin
 # crate pair and the snapshot is marked darwin. Exit 2 is a failed gate, 3 an
@@ -406,7 +406,7 @@ metrics-dashboard HISTORY=".scratch/metrics/history":
     python3 scripts/metrics/dashboard.py {{HISTORY}} .scratch/metrics/dashboard
 
 # Keeps every snapshot of the last ninety days and the earliest of each month
-# beyond that, decided from the file names alone (QM-015). `--dry-run` lists
+# beyond that, decided from the file names alone. `--dry-run` lists
 # without deleting; `--today YYYY-MM-DD` sets the reference date (default: the
 # newest snapshot's).
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the metrics pipeline's tools at their pinned versions (spec 31).
+# Install the metrics pipeline's tools at their pinned versions.
 #
 # One pin per tool, here and nowhere else. `run.sh` records the versions it
 # finds into the snapshot, so a reader can tell a drifted tool from a
@@ -14,7 +14,7 @@
 #   --experimental  also install the experimental collectors (rustqual,
 #                   cargo-anatomy). Without it `--check` lists them as
 #                   optional and they never count as missing: what they
-#                   measure is recorded, never gated (QM-005), so a host
+#                   measure is recorded, never gated, so a host
 #                   without them still writes a complete snapshot.
 #   --only TOOL     consider only this tool (repeatable), so a task that needs
 #                   two tools installs those two at their pins and no others.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Snapshot schema version 1 (spec 31, QM-001).
+"""Snapshot schema version 1.
 
 A hand-rolled validator, stdlib only: the one dependency a JSON Schema
 library would add is not worth an install step on every host that runs
@@ -33,7 +33,7 @@ CRATE_BLOCKS: dict[str, tuple[str, ...]] = {
     "deps": ("internal", "unused"),
     "mutants": ("tested", "caught", "missed"),
     "crap": ("functions", "over_threshold"),
-    # Recorded, never gated (QM-005): one sub-block per tool, each null when
+    # Recorded, never gated: one sub-block per tool, each null when
     # that tool did not run; the whole block is null when neither did.
     "experimental": ("rustqual", "anatomy"),
 }

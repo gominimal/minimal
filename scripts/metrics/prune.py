@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prune a snapshot history: daily for ninety days, then monthly (spec 31, QM-015).
+"""Prune a snapshot history: daily for ninety days, then monthly.
 
 The history is a directory of `YYYY-MM-DD-<sha7>.json` files, one per
 nightly run, so the file name alone says when a snapshot was taken and
@@ -14,8 +14,8 @@ Usage: prune.py <history_dir> [--dry-run] [--today YYYY-MM-DD]
 
 Files that do not follow the naming scheme are left alone and named on
 stderr. `--dry-run` prints what would go and removes nothing. `keep` is the
-decision as a pure function; the harness checks the spec's property
-against it.
+decision as a pure function; the harness checks the retention
+property against it.
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ def newest(names: list[str], when=commit_time) -> str | None:
     The name gives only the day, and the sha7 after it orders two snapshots
     of one day at random, so a tie is broken by `when(sha7)`, the committer
     time of the commit the snapshot measured (the snapshot itself carries no
-    time: it is byte-stable, QM-006). A commit `when` cannot resolve sorts
+    time: it is byte-stable). A commit `when` cannot resolve sorts
     first. Without a dated name, the last name in sorted order.
     """
     snaps = [n for n in names if dated(n) is not None]

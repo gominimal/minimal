@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Architectural-health snapshot: run the collectors, hand their output to
-# collect.py, and in the grading modes grade the result with diff.py (spec 31).
+# collect.py, and in the grading modes grade the result with diff.py.
 #
 # Usage: scripts/metrics/run.sh MODE [BASE] [OPTIONS] [-p CRATE ...]
 #
@@ -10,14 +10,14 @@
 #             gate    grade the change without a compiler: layers, size and
 #                     hotspots, then the report against the base ref. The
 #                     review runtime's probe and the tail of `agent-verify`
-#                     (.minimal/minimal.toml); QM-012.
+#                     (.minimal/minimal.toml).
 #             diff    gate plus clippy over the crates the change touched;
 #                     `just metrics-diff`. --coverage adds llvm-cov over the
 #                     same crates.
 #             mutants [BASE]
 #                     the static collectors plus cargo-mutants over the lines
 #                     changed since the merge-base with BASE (default
-#                     origin/main). Linux only (QM-017).
+#                     origin/main). Linux only.
 #   BASE              gate, diff and mutants: the ref to grade against. Empty
 #                     or absent means the merge-base with origin/main (then
 #                     main), the rule scripts/clippy-strict.sh follows.
@@ -40,12 +40,12 @@
 #
 # The experimental step (full mode only) runs rustqual per crate and
 # cargo-anatomy once when they are on PATH. What they measure is recorded and
-# read by no gate (QM-005), so neither can fail the run; a missing tool is a
+# read by no gate, so neither can fail the run; a missing tool is a
 # skip, a tool that falls over on one crate leaves an error in that crate's
 # block.
 #
 # Every collector that cannot run is recorded in the snapshot as not measured
-# with its reason, and the run still writes the snapshot (QM-001). Exit codes:
+# with its reason, and the run still writes the snapshot. Exit codes:
 #   0  snapshot written, verdict pass or warn
 #   2  snapshot written, verdict fail (in the grading modes: the report's)
 #   3  snapshot written, but a collector could not run (read it as incomplete)
@@ -374,7 +374,7 @@ else
     t0="$(now)"
     status=0
     # Test sources, fuzz targets, build scripts and generated code are kept
-    # out of the denominator (QM-004). The lcov file is for the tools that
+    # out of the denominator. The lcov file is for the tools that
     # read coverage per function (cargo-crap) and for a person's viewer.
     # --ignore-run-fail: a test that fails under the instrumented build (a
     # hard-coded target/debug path, a host-dependent probe) must not take
@@ -388,7 +388,7 @@ else
     junit="$(find target/llvm-cov-target -path '*nextest/coverage/junit.xml' 2>/dev/null | head -n1 || true)"
     if [ -n "$junit" ]; then
         # A truncated or malformed junit leaves the file empty; it is then not
-        # passed on, so collect.py still writes the snapshot (QM-001).
+        # passed on, so collect.py still writes the snapshot.
         python3 - "$junit" <<'PY' > "$work/coverage-tests.json" 2> "$work/coverage-tests.err" || : > "$work/coverage-tests.json"
 import json, sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.argv[1]).getroot()
@@ -467,7 +467,7 @@ fi
 
 # ------------------------------------------------------------- experimental
 # Coupling and design metrics from young tools, recorded per crate and read
-# by no gate (QM-005). Nothing in this step can fail the run: a missing tool
+# by no gate. Nothing in this step can fail the run: a missing tool
 # is a skip, a tool that cannot run is a skip with its reason, and a crate
 # rustqual chokes on carries the error in its own block.
 if [ "$want_experimental" -eq 0 ]; then
@@ -542,7 +542,7 @@ else
         # them (the base-ref reasoning is there): the merge-base with
         # origin/main unless BASE says otherwise, the working tree rather
         # than HEAD so an uncommitted edit counts, -U0 so a hunk is the
-        # lines the change touched and nothing around them (QM-017). A
+        # lines the change touched and nothing around them. A
         # brand-new file is untracked, so it is not in the diff; it is listed
         # as outside the scope instead.
         [ -n "$base" ] || base="$(git merge-base origin/main HEAD 2>/dev/null || git merge-base main HEAD)"
@@ -562,7 +562,7 @@ else
         # The nightly tests the lines changed since the previous snapshot: a
         # workspace shard is thousands of mutants and a night is not enough
         # for one, while yesterday's changes are bounded and are what the
-        # history should say something about (QM-017). `--since` names the
+        # history should say something about. `--since` names the
         # reference; `auto` takes the newest snapshot in the history dir,
         # then the merge-base with origin/main on a branch, and skips when
         # neither names a commit other than HEAD.
@@ -646,8 +646,7 @@ run_mode="$mode"
 rm -f "$out/snapshot.json"
 status=0
 # The grading modes append their report to the step summary; the others
-# append the snapshot's own page (QM-011 covers the report; this is the
-# nightly's glance at the run).
+# append the snapshot's own page (the nightly's glance at the run).
 summary_args=()
 [ "$grading" -eq 1 ] || summary_args=(--summary)
 python3 "$here/collect.py" --out "$out" --mode "$run_mode" --metadata "$work/metadata.json" ${summary_args[@]+"${summary_args[@]}"} \

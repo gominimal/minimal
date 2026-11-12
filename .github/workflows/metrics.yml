@@ -1,6 +1,6 @@
 name: metrics
 
-# Architectural-health snapshot (docs/specs/31-spec-quality-metrics), in a
+# Architectural-health snapshot (metrics/README.md), in a
 # workflow of its own so it runs on demand as well as nightly: dispatch it
 # alone, or nightly-tests.yml calls it via workflow_call. Only a run on main
 # publishes to `metrics-data`; a run on another branch still uploads the
@@ -36,7 +36,7 @@ jobs:
       status: ${{ steps.snapshot.outputs.status }}
     # Coverage is a cold instrumented workspace build plus the suite; the
     # module graphs load every crate through rust-analyzer; mutants test one
-    # shard. The spec's bound (QM-N02) is this value.
+    # shard. The nightly's wall-clock bound is this value.
     timeout-minutes: 120
     # Here rather than on the caller: a job that calls a reusable workflow
     # cannot set continue-on-error, so this keeps nightly-tests green.

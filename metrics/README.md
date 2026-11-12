@@ -1,7 +1,6 @@
 # Quality metrics
 
-The architectural-health measurement of this workspace
-([spec 31](../docs/specs/31-spec-quality-metrics/31-spec-quality-metrics.md)).
+The architectural-health measurement of this workspace.
 `just metrics` writes one snapshot of the tree; the nightly run adds its
 snapshot to the `metrics-data` branch; a change is graded against the newest
 snapshot and thresholds of its base ref. This directory holds what a person
@@ -222,7 +221,7 @@ Neither feeds a gate, and `thresholds.toml` has no key for them: the tools
 are young and their numbers move between releases, so a gate on them would
 make the verdict depend on a tool's release notes rather than on the tree.
 The snapshot records them, and the history decides whether a gate is
-warranted (QM-005). `remote-proto` is left out of rustqual because its code
+warranted. `remote-proto` is left out of rustqual because its code
 is generated into `OUT_DIR` and has no source to read; it stays in
 cargo-anatomy, which reads the dependency graph.
 
@@ -243,7 +242,7 @@ suite fails on is *caught*; one the suite passes with is *missed*; one that
 runs past the timeout is *timeout*; one that does not compile is *unviable*.
 The score is `caught / (caught + missed + timeout)`, in percent, and `tested`
 is that denominator. An unviable mutant says nothing about the tests, so it
-is counted but stays out of the score. The scope follows the mode (QM-017):
+is counted but stays out of the score. The scope follows the mode:
 
 - `mutants` mode tests the lines the change added or edited, as a `git diff`
   from the merge-base with the base ref handed to `--in-diff`; `scope` is
@@ -338,6 +337,6 @@ job is non-blocking until a week of snapshots says it is quiet.
 
 ## Writing about it
 
-Prose here and in the spec is Vale-linted. Name the items or point at the
+Prose here is Vale-linted. Name the items or point at the
 command that lists them (`just crates`, the lint array in
 `scripts/clippy-strict.sh`) rather than stating a count.

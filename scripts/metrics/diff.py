@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Grade a head snapshot against its base ref (spec 31, QM-009 to QM-013).
+"""Grade a head snapshot against its base ref.
 
 `run.sh gate` and `run.sh diff` write a snapshot of the working tree with
 collect.py and then hand it here. This file reads two things the change
 cannot write — the thresholds at the merge-base with the base ref and the
 newest snapshot on the history ref — grades the head snapshot against the
-stricter of the base's thresholds and the change's own (QM-009), and writes:
+stricter of the base's thresholds and the change's own, and writes:
 
   report.md     the grade a person or an agent reads; appended to
-                $GITHUB_STEP_SUMMARY when that names a writable file (QM-011)
-  report.json   the same content as data (QM-010)
+                $GITHUB_STEP_SUMMARY when that names a writable file
+  report.json   the same content as data
   meta.json     wall-clock data, kept apart so report.json is byte-identical
-                for an identical tree, base ref and thresholds (QM-006)
+                for an identical tree, base ref and thresholds
 
 The gates are re-evaluated with collect.py's `evaluate_gates`, not a copy of
 it, so a snapshot and a report never disagree on what a gate means. With no
@@ -149,7 +149,7 @@ def _stricter_ratchet(base: dict, head: dict):
 
 
 def stricter(base: dict, head: dict) -> tuple[dict, dict[str, str]]:
-    """The effective thresholds: per gate, the stricter of base and head (QM-009).
+    """The effective thresholds: per gate, the stricter of base and head.
 
     Floors take the max, ceilings and ratchet tolerances the min; a gate only
     one side declares is kept. So a change can tighten the bar it is graded by

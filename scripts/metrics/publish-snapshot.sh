@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Publish one snapshot to the metrics history ref (spec 31, QM-014).
+# Publish one snapshot to the metrics history ref.
 #
 # The history is the orphan branch `metrics-data`: `history/<date>-<sha7>.json`
 # per nightly run plus a README, nothing else, unprotected, and never main.
 # The gate reads its baseline from there (`git show origin/metrics-data:...`),
-# so a change cannot edit the numbers it is graded against (QM-009), and the
+# so a change cannot edit the numbers it is graded against, and the
 # repository rule that nothing commits to main outside a reviewed pull request
 # holds without a bot token or a code-owner carve-out.
 #
@@ -17,7 +17,7 @@
 # GIT_AUTHOR_EMAIL (the Actions bot by default) and pushes `HEAD:<branch>`
 # from a temporary worktree. The checked-out branch is never touched. A
 # snapshot whose mode is not `full`, or whose tree was dirty, is refused: a
-# darwin or a partial run is not the history (QM-013).
+# darwin or a partial run is not the history.
 set -euo pipefail
 
 snapshot="${1:-}"
@@ -98,7 +98,7 @@ else
     cat > "$work/wt/README.md" <<'EOF'
 # metrics-data
 
-The quality-metrics history of `gominimal/minimal` (spec 31). One snapshot per
+The quality-metrics history of `gominimal/minimal`. One snapshot per
 nightly run under `history/`, named by date and short commit, written by
 `scripts/metrics/publish-snapshot.sh` from the nightly workflow. Nothing else
 lives here, and nothing here is edited by hand: the gate reads the newest

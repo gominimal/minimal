@@ -1,10 +1,10 @@
-# Quality thresholds (spec 31). `scripts/metrics/collect.py` evaluates these
+# Quality thresholds. `scripts/metrics/collect.py` evaluates these
 # against a snapshot; `scripts/metrics/diff.py` grades a change against the
 # newest snapshot of its base ref. Gate names are dotted paths into the
 # snapshot's `workspace` and `layers` blocks.
 #
 # A change is graded by the STRICTER of this file at the merge-base with
-# the base ref and this file in the change (QM-009), so a pull request may
+# the base ref and this file in the change, so a pull request may
 # tighten a gate at once and may loosen one only after the loosening is on
 # the base ref.
 #
@@ -64,7 +64,7 @@ too-many-arguments-threshold = 7
 [crap]
 threshold = 30
 
-# Hotspots (QM-018): files ranked by commits in the window multiplied by
+# Hotspots: files ranked by commits in the window multiplied by
 # their findings (complexity hits + strict hits + uncovered lines / 100).
 [hotspots]
 window_days = 90

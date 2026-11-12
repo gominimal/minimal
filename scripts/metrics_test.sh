@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# metrics_test.sh — harness for scripts/metrics/ (spec 31).
+# metrics_test.sh — harness for scripts/metrics/.
 #
 # Every case runs over fixtures under scripts/metrics/testdata; no tool is
 # invoked, no crate is compiled, no network. Cases are named after the
-# requirement they check (the spec's `verify:` lines name them). Run them all
+# behaviour they check. Run them all
 # with `bash scripts/metrics_test.sh`, one with `bash scripts/metrics_test.sh
 # <case>`, or the lot through `just test-shell` and the workspace suite
 # (crates/common/tests/shell_harnesses.rs).
@@ -58,7 +58,7 @@ standard=(--clippy "$data/clippy.json" --clippy-complete --coverage "$data/llvm-
 
 # ------------------------------------------------------------------- cases
 
-snapshot_validates() {   # QM-001
+snapshot_validates() {
     local out="$tmp/validates"
     run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
     if [ -f "$out/snapshot.json" ] && python3 "$schema" "$out/snapshot.json" >/dev/null; then
@@ -81,7 +81,7 @@ PY
     fi
 }
 
-missing_tool_is_not_measured() {   # QM-001 failure clause
+missing_tool_is_not_measured() {
     local out="$tmp/missing"
     run_collect "$out" --tokei "$data/tokei.json" --not-measured "coverage=cargo-llvm-cov not installed" \
         --not-measured "clippy=static mode" >/dev/null 2>&1 || true
@@ -101,7 +101,7 @@ missing_tool_is_not_measured() {   # QM-001 failure clause
         || bad "run.sh exit $status with a broken cargo"
 }
 
-verdict_is_worst_gate() {   # QM-002, property over every gate combination
+verdict_is_worst_gate() {   # property over every gate combination
     python3 - "$collect" <<'PY'
 import importlib.util, itertools, sys
 spec = importlib.util.spec_from_file_location("collect", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -118,7 +118,7 @@ PY
     [ $? -eq 0 ] && ok "verdict is the worst gate over every combination of up to three gates" || bad "verdict property"
 }
 
-strict_counts_and_promotable() {   # QM-003
+strict_counts_and_promotable() {
     local out="$tmp/strict"
     run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
     local snap="$out/snapshot.json"
@@ -142,7 +142,7 @@ strict_counts_and_promotable() {   # QM-003
         && ok "a crate outside the scope carries no clippy block" || bad "out-of-scope clippy block"
 }
 
-coverage_excludes_tests_and_generated() {   # QM-004
+coverage_excludes_tests_and_generated() {
     local out="$tmp/cov"
     run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
     local snap="$out/snapshot.json"
@@ -155,7 +155,7 @@ coverage_excludes_tests_and_generated() {   # QM-004
         && ok "the workspace floor reads the llvm-cov totals" || bad "coverage gate"
 }
 
-experimental_never_changes_verdict() {   # QM-005
+experimental_never_changes_verdict() {
     local out="$tmp/exp"
     run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
     python3 - "$out/snapshot.json" "$collect" "$data/thresholds-basic.toml" <<'PY'
@@ -201,7 +201,7 @@ PY
         && ok "with neither tool the block is null" || bad "block not null without the tools"
 }
 
-experimental_missing_tool_is_not_measured() {   # QM-005 with QM-001's failure clause: absent tools are recorded, never faked
+experimental_missing_tool_is_not_measured() {   # absent tools are recorded, never faked
     if ! (cd "$root" && cargo metadata --format-version 1 --no-deps --offline >/dev/null 2>&1); then
         echo "skip - cargo metadata --offline does not run here, and run.sh needs it"
         return
@@ -225,7 +225,7 @@ experimental_missing_tool_is_not_measured() {   # QM-005 with QM-001's failure c
         || bad "exit 3 for a missing experimental tool: $(grep FAILED "$tmp/run-exp.err" | head -n1)"
 }
 
-report_is_byte_stable() {   # QM-006
+report_is_byte_stable() {
     run_collect "$tmp/stable1" "${standard[@]}" >/dev/null 2>&1 || true
     sleep 1
     run_collect "$tmp/stable2" "${standard[@]}" >/dev/null 2>&1 || true
@@ -248,7 +248,7 @@ report_is_byte_stable() {   # QM-006
     grep -q '"generated"' "$tmp/report-stable1/meta.json" && ok "the report's time lives in its meta.json" || bad "no time in report meta"
 }
 
-forbidden_edge_is_reported() {   # QM-007
+forbidden_edge_is_reported() {
     # The fixture tree is clean; seed a session->build style edge: common (leaf) -> graph.
     python3 - "$data/small-metadata.json" "$tmp/bad-meta.json" <<'PY'
 import json, sys
@@ -271,7 +271,7 @@ PY
     [ "$status" -eq 0 ] && ok "the repo's own layers.toml holds against the committed metadata fixture" || bad "repo layers exit $status"
 }
 
-excepted_edge_is_counted_not_failed() {   # QM-007 exception clause
+excepted_edge_is_counted_not_failed() {
     cat > "$tmp/exc-layers.toml" <<'EOF'
 schema = 1
 [layers]
@@ -341,7 +341,7 @@ PY
     [ "$status" -eq 0 ] && ok "a non-member package is not a crate to place" || bad "non-member exit $status: $out"
 }
 
-unassigned_crate_fails() {   # QM-008
+unassigned_crate_fails() {
     cat > "$tmp/un-layers.toml" <<'EOF'
 schema = 1
 [layers]
@@ -360,7 +360,7 @@ EOF
         && ok "the layers.unassigned gate fails in the snapshot" || bad "unassigned gate"
 }
 
-hotspots_rank_churn_times_findings() {   # QM-018
+hotspots_rank_churn_times_findings() {
     # A throwaway repo whose history gives a.rs 3 commits and b.rs 1; clippy
     # findings favour b.rs. churn x findings must still rank a.rs first when
     # a.rs has findings, and a file with no findings scores 0.
@@ -397,7 +397,7 @@ PY
     [ "$(py "$snap" "s['hotspots']['findings_included']")" = "True" ] && ok "findings_included is true with clippy" || bad "findings flag"
 }
 
-hotspots_without_coverage() {   # QM-018 fallback clause: no findings source at all ranks on churn
+hotspots_without_coverage() {   # no findings source at all ranks on churn
     local repo="$tmp/hot"
     [ -d "$repo" ] || hotspots_rank_churn_times_findings >/dev/null
     (cd "$repo" && python3 "$collect" --out "$tmp/hot-static" --mode static --root "$repo" --metadata "$tmp/hot-meta.json" \
@@ -432,7 +432,7 @@ print(m.module_cycles([Path(sys.argv[2])]))' "$collect" "$data/structural.dot")"
     [ "$cycles" = "[]" ] && ok "root and test-module edges are structural, not cycles" || bad "structural filter: $cycles"
 }
 
-darwin_scope_lists_uncovered_crates() {   # QM-013: the snapshot side; the report side lands with the diff grader
+darwin_scope_lists_uncovered_crates() {   # the snapshot side; the report side lands with the diff grader
     local out="$tmp/darwin"
     printf 'graph\n' > "$tmp/scope-graph.txt"
     run_collect "$out" "${standard[@]}" --mode darwin --scope "$tmp/scope-graph.txt" >/dev/null 2>&1 || true
@@ -444,7 +444,7 @@ darwin_scope_lists_uncovered_crates() {   # QM-013: the snapshot side; the repor
         && ok "static collectors still cover every crate" || bad "size missing outside scope"
 }
 
-prune_keeps_daily_then_monthly() {   # QM-015, property over generated histories
+prune_keeps_daily_then_monthly() {   # property over generated histories
     # keep(f) iff age(f, today) <= 90 days or f is the earliest snapshot of its
     # month: checked against generated names over about 400 days, with gaps,
     # doubled days and several reference dates.
@@ -536,7 +536,7 @@ PY
     unset -f gc
 }
 
-dashboard_renders_offline_with_tables() {   # QM-016
+dashboard_renders_offline_with_tables() {
     local out="$tmp/dash"
     python3 "$dashboard" "$data/history" "$out" >/dev/null 2>&1 || { bad "dashboard.py failed over the fixtures"; return; }
     [ -f "$out/index.html" ] && ok "index.html written" || { bad "no index.html"; return; }
@@ -658,7 +658,7 @@ run_mutants_mode() {
     (cd "$repo" && PATH="$repo/fakebin:$PATH" bash scripts/metrics/run.sh mutants main --out "$repo/.scratch/mut" >/dev/null 2>&1) || true
 }
 
-mutants_scope_follows_mode() {   # QM-017
+mutants_scope_follows_mode() {
     # collect.py: per-crate counts and the score over the fixture, scope as given.
     run_collect "$tmp/mut-diff" --mutants "$data/outcomes.json" --mutants-scope in-diff >/dev/null 2>&1 || true
     local snap="$tmp/mut-diff/snapshot.json"
@@ -723,7 +723,7 @@ PY
         && ok "--no-mutants runs nothing and leaves the block null" || bad "--no-mutants"
 }
 
-untracked_file_is_listed() {   # QM-017 untracked clause
+untracked_file_is_listed() {
     run_mutants_mode
     local repo="$tmp/mut" snap="$tmp/mut/.scratch/mut/snapshot.json"
     [ -f "$snap" ] || { bad "mutants mode wrote no snapshot"; return; }
@@ -740,7 +740,7 @@ untracked_file_is_listed() {   # QM-017 untracked clause
         && ok "no score, so the floor is not evaluated" || bad "floor evaluated without a score"
 }
 
-truncated_junit_keeps_the_snapshot() {   # QM-001: a bad test report is not a lost snapshot
+truncated_junit_keeps_the_snapshot() {   # a bad test report is not a lost snapshot
     mutants_repo
     local repo="$tmp/mut" fake="$tmp/junit-fakebin"
     if ! ls "$(rustc --print target-libdir 2>/dev/null)"/libprofiler_builtins-*.rlib >/dev/null 2>&1; then
@@ -842,7 +842,7 @@ PY
         && ok "one more function over the threshold than the baseline fails the ratchet" || bad "crap ratchet against baseline"
 }
 
-publish_targets_history_ref_only() {   # QM-014: the publish script pushes to the history branch and never to main
+publish_targets_history_ref_only() {   # the publish script pushes to the history branch and never to main
     local remote="$tmp/pub-remote" repo="$tmp/pub-repo"
     export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
     git -c init.templateDir= init -q --bare "$remote" 2>/dev/null
@@ -915,7 +915,7 @@ x' '2026-02-30' '2026-13-01'; do
     [ "$(git -C "$remote" rev-parse main)" = "$main_before" ] && ok "main is still untouched after every publish" || bad "main moved later"
 }
 
-nightly_budget_is_declared() {   # QM-N02: the nightly job's wall clock is the spec's bound
+nightly_budget_is_declared() {   # the nightly job's wall clock is bounded by its timeout
     local wf="$root/.github/workflows/metrics.yml" nightly="$root/.github/workflows/nightly-tests.yml"
     [ -f "$wf" ] || { echo "skip - no metrics workflow in this tree"; return; }
     local budget
@@ -995,7 +995,7 @@ PY
 # coverage 60 %), the base's floor of 60 fails where the head's 50 would pass,
 # and the head's tolerance of 0 fails the strict ratchet where the base's 1
 # would warn: each side is stricter somewhere, so the report proves both
-# directions of QM-009.
+# directions of the stricter-thresholds rule.
 grade_repo="$tmp/grade"
 grade_head="$tmp/grade-head"
 make_grade_repo() {
@@ -1080,7 +1080,7 @@ grade() {
 
 # ---------------------------------------------------------- grading cases
 
-base_thresholds_win_when_stricter() {   # QM-009
+base_thresholds_win_when_stricter() {
     local out="$tmp/stricter" status=0
     grade "$out" >/dev/null 2>&1 || status=$?
     [ "$status" -eq 2 ] && ok "a change graded by the base's stricter floor exits 2" || bad "exit $status"
@@ -1133,7 +1133,7 @@ PY
     [ $? -eq 0 ] && ok "effective(B, H) is at least as strict as B and as H over two hundred random pairs" || bad "stricter property"
 }
 
-no_baseline_means_not_evaluated() {   # QM-009 failure clause
+no_baseline_means_not_evaluated() {
     local out="$tmp/nobase" status=0
     grade "$out" --history-ref no-such-ref >/dev/null 2>&1 || status=$?
     local rep="$out/report.json"
@@ -1145,7 +1145,7 @@ no_baseline_means_not_evaluated() {   # QM-009 failure clause
     grep -q "no-such-ref" "$out/report.md" && ok "the report names the history ref it looked at" || bad "history ref not named"
 }
 
-report_carries_every_section() {   # QM-010
+report_carries_every_section() {
     local out="$tmp/sections"
     grade "$out" >/dev/null 2>&1 || true
     local md="$out/report.md" rep="$out/report.json"
@@ -1186,7 +1186,7 @@ PY
     [ "$(py "$rep" "s['not_measured']")" = "{'hotspots': 'disabled'}" ] && ok "collectors that did not run are listed" || bad "not_measured: $(py "$rep" "s['not_measured']")"
 }
 
-step_summary_is_appended() {   # QM-011
+step_summary_is_appended() {
     local summary="$tmp/step-summary.md"
     printf 'prior content\n' > "$summary"
     (cd "$grade_repo" && GITHUB_STEP_SUMMARY="$summary" python3 "$diff" --head "$grade_head" --out "$tmp/summary-out" \
@@ -1214,7 +1214,7 @@ gate_base_arg() {
     fi
 }
 
-gate_runs_without_rustc() {   # QM-012
+gate_runs_without_rustc() {
     command -v cargo >/dev/null 2>&1 || { echo "skip - cargo not on PATH; the gate needs cargo metadata"; return; }
     # rustc and cargo-clippy exit 99 and log every call; cargo itself is real,
     # so `cargo metadata --no-deps` still reads the manifests.
@@ -1242,7 +1242,7 @@ gate_runs_without_rustc() {   # QM-012
         && ok "the compiling collectors and cargo-shear are recorded as not measured" || bad "not_measured: $(py "$tmp/gate-norustc/snapshot.json" "s['run']['not_measured']")"
 }
 
-darwin_scope_lists_uncovered_crates_in_report() {   # QM-013: the report side
+darwin_scope_lists_uncovered_crates_in_report() {   # the report side
     [ -d "$grade_repo" ] || make_grade_repo
     printf 'graph\n' > "$tmp/scope-graph-only.txt"
     local head="$tmp/darwin-head"
@@ -1268,7 +1268,7 @@ darwin_scope_lists_uncovered_crates_in_report() {   # QM-013: the report side
         && ok "a scoped ratchet re-sums the baseline over the same crates" || bad "scoped ratchet: $(py "$out/report.json" "s['gates']['ratchet:clippy.strict.total']")"
 }
 
-gate_fits_probe_budget() {   # QM-N01
+gate_fits_probe_budget() {
     command -v cargo >/dev/null 2>&1 || { echo "skip - cargo not on PATH; the gate needs cargo metadata"; return; }
     local status=0 start elapsed
     start="$(date +%s)"

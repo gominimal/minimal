@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn raw tool output into one snapshot document (spec 31).
+"""Turn raw tool output into one snapshot document.
 
 `run.sh` runs the tools and hands their files here; this file knows the
 shape of each tool's output, attributes every finding to a crate, evaluates
@@ -11,9 +11,9 @@ the gates in metrics/thresholds.toml and writes:
   meta.json          wall-clock data: start time, durations, hostname
 
 Times live in meta.json and nowhere else, so snapshot.json is byte-identical
-for an identical tree, baseline and thresholds (QM-006). A collector whose
+for an identical tree, baseline and thresholds. A collector whose
 file was not given is recorded under `run.not_measured` with the reason
-`run.sh` passed, and its blocks are null (QM-001).
+`run.sh` passed, and its blocks are null.
 
 Exit 0 when the verdict is pass or warn, 2 when it is fail, 1 for a crash or
 an unreadable input. Stdlib only.
@@ -373,7 +373,7 @@ def collect_shear(path: Path | None, attr: Attributor):
 
 
 # ------------------------------------------------------------ experimental
-# Recorded, never read by a gate (QM-005): `metric()` has no entry for these
+# Recorded, never read by a gate: `metric()` has no entry for these
 # blocks and `evaluate_gates` reads nothing but `metric()`. Neither tool
 # installed in the sandbox this was written in, so the shapes come from the
 # tools' published docs (testdata/SHAPES.md) and every lookup is a `.get`.
@@ -585,7 +585,7 @@ def hotspots(
     attr: Attributor,
     root: Path,
 ) -> dict:
-    """Rank files by churn x findings (QM-018).
+    """Rank files by churn x findings.
 
     findings = complexity hits + strict hits + uncovered lines / 100. Each
     component is monotone, so a file that is worse on every axis never ranks
@@ -864,7 +864,7 @@ def main(argv: list[str] | None = None) -> int:
         "--mutants-scope",
         choices=("in-diff", "since", "shard", "workspace"),
         default="workspace",
-        help="what the mutants run covered (QM-017)",
+        help="what the mutants run covered",
     )
     ap.add_argument("--mutants-shard", metavar="K/N", help="the shard a nightly run tested")
     ap.add_argument("--mutants-since", metavar="SHA7", help="the reference commit of a `since` run")
@@ -1032,7 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     # The untracked list is recorded whenever run.sh produced one, even when
     # cargo-mutants itself did not run: a new file outside the scope is a
-    # fact about the change, not about the tool (QM-017).
+    # fact about the change, not about the tool.
     untracked = read_lines(args.mutants_untracked) if args.mutants_untracked else None
     if mutants is not None:
         totals = Counter()
