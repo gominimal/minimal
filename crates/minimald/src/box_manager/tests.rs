@@ -3398,7 +3398,7 @@ async fn box_listing_and_show_carry_pty_enabled() {
         .unwrap();
     let headless = mngr
         .create_box_with_spec(
-            rooted_config("headless", "/home/dev/proj"),
+            as_task(rooted_config("headless", "/home/dev/proj")),
             Some(spec(false)),
             None,
             None,
@@ -3467,7 +3467,7 @@ async fn show_and_list_replies_carry_lifetime() {
     ] {
         let id = mngr
             .create_box_with_spec(
-                rooted_config(name, "/home/dev/proj"),
+                as_task(rooted_config(name, "/home/dev/proj")),
                 Some(spec(lifetime)),
                 None,
                 None,
@@ -3715,6 +3715,13 @@ fn unnamed_config() -> minimald_rpc::BoxConfig {
     config
 }
 
+/// `config` under the task verb. A spec with no terminal is refused under
+/// the session verb, whose built-in root allows only a terminal (BOX-160).
+fn as_task(mut config: minimald_rpc::BoxConfig) -> minimald_rpc::BoxConfig {
+    config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    config
+}
+
 /// The JSON spec of a `[tasks.<entry>]` box, with `name` as its
 /// `[box] name` when set.
 fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
@@ -3754,7 +3761,7 @@ async fn unenforced_sections_warn_once_each_naming_section() {
             serde_json_lenient::json!(["corp"]),
         );
     let id = mngr
-        .create_box_with_spec(unnamed_config(), Some(spec.clone()), None, None)
+        .create_box_with_spec(as_task(unnamed_config()), Some(spec.clone()), None, None)
         .await
         .expect("a spec with unenforced sections creates its box");
 
@@ -3765,7 +3772,12 @@ async fn unenforced_sections_warn_once_each_naming_section() {
     assert_eq!(stored, spec, "the stored spec carries every section");
 
     let plain = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("fmt", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("fmt", None)),
+            None,
+            None,
+        )
         .await
         .expect("a plain spec creates its box");
 
@@ -3819,7 +3831,7 @@ async fn create_names_box_from_box_name_else_entry() {
 
     let named = mngr
         .create_box_with_spec(
-            unnamed_config(),
+            as_task(unnamed_config()),
             Some(task_spec("lint", Some("dev"))),
             None,
             None,
@@ -3829,7 +3841,12 @@ async fn create_names_box_from_box_name_else_entry() {
     assert_eq!(record_name(&mngr, named).await.as_deref(), Some("dev"));
 
     let entry = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("lint", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("lint", None)),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -3839,7 +3856,7 @@ async fn create_names_box_from_box_name_else_entry() {
     );
 
     // The spec's `[box] name` comes before a name the request sends.
-    let mut config = unnamed_config();
+    let mut config = as_task(unnamed_config());
     config.name = Some("given".to_string());
     let over = mngr
         .create_box_with_spec(config, Some(task_spec("other", Some("web"))), None, None)
@@ -3847,7 +3864,7 @@ async fn create_names_box_from_box_name_else_entry() {
         .unwrap();
     assert_eq!(record_name(&mngr, over).await.as_deref(), Some("web"));
 
-    let mut config = unnamed_config();
+    let mut config = as_task(unnamed_config());
     config.name = Some("legacy".to_string());
     let legacy = mngr
         .create_box_with_spec(config, None, None, None)
@@ -3864,14 +3881,19 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     let log = crate::test_harness::captured_log();
     let (state, _cache, mngr) = manager().await;
     let holder = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
     for asked in ["dev", "DEV"] {
         let err = mngr
             .create_box_with_spec(
-                unnamed_config(),
+                as_task(unnamed_config()),
                 Some(task_spec("lint", Some(asked))),
                 None,
                 None,
@@ -3924,7 +3946,12 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     )
     .await;
     let reuse = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .expect("a stopped holder leaves the name free");
     assert_ne!(reuse, holder);
@@ -3938,7 +3965,7 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
     let (_state, _cache, mngr) = manager().await;
     let refused = mngr
         .create_box_with_spec(
-            unnamed_config(),
+            as_task(unnamed_config()),
             Some(task_spec("lint", Some("My_Box"))),
             None,
             None,
@@ -3957,7 +3984,7 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
 
     let id = mngr
         .create_box_with_spec(
-            unnamed_config(),
+            as_task(unnamed_config()),
             Some(task_spec("build_all", None)),
             None,
             None,
@@ -3979,7 +4006,7 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
         async move {
             let id = mngr
                 .create_fresh_box_with_spec(
-                    unnamed_config(),
+                    as_task(unnamed_config()),
                     Some(task_spec(entry, None)),
                     None,
                     None,
@@ -3992,7 +4019,12 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
 
     // A running `dev` holds the name: a fresh run is not refused.
     let dev = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(fresh("dev").await, "dev-1");
@@ -4001,7 +4033,7 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
     // A gap is filled first, and a stopped record still uses its suffix.
     let three = mngr
         .create_box_with_spec(
-            unnamed_config(),
+            as_task(unnamed_config()),
             Some(task_spec("lint", Some("Dev-4"))),
             None,
             None,
@@ -4074,7 +4106,12 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
 
     // Stop a box named `dev`.
     let old = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(answers_to(&mngr, "dev").await, Some(old));
@@ -4088,7 +4125,12 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
 
     // Start a new `dev`: the stopped one leaves the name free.
     let new = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .expect("a stopped `dev` does not hold the name");
     assert_ne!(new, old, "the new `dev` has an id of its own");
@@ -4350,7 +4392,7 @@ async fn fresh_instance_mint_finds_its_registration_after_the_rename() {
     crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
 
     let grant_config = |key: &str| {
-        let mut config = unnamed_config();
+        let mut config = as_task(unnamed_config());
         config.network = boxes::NetworkMode::HostNet;
         config.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
         config.host_ip_registration = Some(key.to_string());
@@ -6472,7 +6514,7 @@ async fn broker_secret_unenrolled_exit5() {
     let expected_lines = cases.iter().filter(|(_, _, r)| !r.is_empty()).count();
     for (n, (secrets, certificate, refused)) in cases.into_iter().enumerate() {
         let entry = format!("case-{n}");
-        let mut config = unnamed_config();
+        let mut config = as_task(unnamed_config());
         config.root_certificate = certificate.map(str::to_string);
         let before = mngr.list_boxes(None).await.unwrap().len();
         let created = mngr
@@ -6586,7 +6628,7 @@ async fn store_secret_passed_through_unenrolled() {
         serde_json_lenient::json!({ "npm": store_secret() }),
     );
     let id = mngr
-        .create_box_with_spec(unnamed_config(), Some(spec.clone()), None, None)
+        .create_box_with_spec(as_task(unnamed_config()), Some(spec.clone()), None, None)
         .await
         .expect("a store reference creates its box");
 
@@ -6791,4 +6833,220 @@ async fn unenrolled_operations_over_file_mode_trust() {
         Errorable::Err { error } => panic!("PruneBoxes failed: {error}"),
     }
     assert!(mngr.list_boxes(None).await.unwrap().is_empty());
+}
+
+/// BOX-160: the daemon re-checks a create's spec against the constraints
+/// of its type's built-in root at admission, whatever the client checked.
+/// A spec that breaks one is refused with exit 3 naming the type, its root
+/// and the key, files no record, and the daemon log names the refusal. A
+/// spec inside its root's constraints is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    // A spec of `box_type` whose entry is `entry`, edited by `edit`.
+    let spec_of = |entry: &str, box_type: &str, edit: &dyn Fn(&mut serde_json_lenient::Value)| {
+        let mut spec = task_spec(entry, None);
+        spec["box"]["type"] = serde_json_lenient::json!(box_type);
+        edit(&mut spec);
+        spec
+    };
+    let pty = |on: bool| {
+        move |spec: &mut serde_json_lenient::Value| {
+            spec["io"]["pty_enabled"] = serde_json_lenient::json!(on);
+        }
+    };
+    // The refused type, root, key and value.
+    type Refused = Option<(&'static str, &'static str, &'static str, &'static str)>;
+    let session = unnamed_config;
+    let task = || as_task(unnamed_config());
+    let cases: Vec<(minimald_rpc::BoxConfig, serde_json_lenient::Value, Refused)> = vec![
+        // (the creating verb's config, spec, the refused type, root, key
+        // and value)
+        (
+            task(),
+            spec_of("rc-task-pty", "task", &pty(true)),
+            Some(("task", "task", "io.pty_enabled", "true")),
+        ),
+        (
+            task(),
+            spec_of("rc-task-flat", "task", &|spec| {
+                spec["pty_enabled"] = serde_json_lenient::json!(true);
+            }),
+            Some(("task", "task", "pty_enabled", "true")),
+        ),
+        (
+            session(),
+            spec_of("rc-session-nopty", "session", &pty(false)),
+            Some(("session", "session", "io.pty_enabled", "false")),
+        ),
+        // A project type is checked against its built-in root.
+        (
+            task(),
+            spec_of("rc-derived", "ci", &|spec| {
+                pty(true)(spec);
+                spec["type"] = serde_json_lenient::json!({ "root": "task" });
+            }),
+            Some(("ci", "task", "io.pty_enabled", "true")),
+        ),
+        (
+            task(),
+            spec_of("rc-build-nesting", "build", &|spec| {
+                spec["nesting"] = serde_json_lenient::json!({ "allowed": true });
+            }),
+            Some(("build", "build", "nesting.allowed", "true")),
+        ),
+        // A spec with no `box.type` is checked as the creating verb's
+        // type, here `session`.
+        (
+            session(),
+            spec_of("rc-no-type", "session", &|spec| {
+                pty(false)(spec);
+                spec["box"].as_object_mut().unwrap().remove("type");
+            }),
+            Some(("session", "session", "io.pty_enabled", "false")),
+        ),
+        // The session verb files the box as `session` whatever `box.type`
+        // says, so a `task` spec under it is checked against `session` too.
+        (
+            session(),
+            spec_of("rc-task-as-session", "task", &pty(false)),
+            Some(("session", "session", "io.pty_enabled", "false")),
+        ),
+        // Inside the root's constraints: created.
+        (task(), spec_of("rc-task-ok", "task", &pty(false)), None),
+        (
+            session(),
+            spec_of("rc-session-ok", "session", &pty(true)),
+            None,
+        ),
+    ];
+    for (config, spec, refused) in cases {
+        let entry = spec["entry"].as_str().unwrap_or_default().to_owned();
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let created = mngr
+            .create_box_with_spec(config, Some(spec), None, None)
+            .await;
+        let Some((box_type, root, key, value)) = refused else {
+            created.unwrap_or_else(|e| panic!("{entry} is created: {e}"));
+            continue;
+        };
+        let err = created.expect_err("a spec its root excludes is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{entry}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<RootConstraintRefusal>())
+            .unwrap_or_else(|| panic!("{entry}: the error is the root refusal: {err}"));
+        assert_eq!(refusal.exit_code(), 3, "{entry}");
+        assert_eq!(
+            (
+                refusal.box_type.as_str(),
+                refusal.root.as_str(),
+                refusal.key.as_str(),
+                refusal.value.as_str()
+            ),
+            (box_type, root, key, value),
+            "{entry}"
+        );
+        let text = err.to_string();
+        for word in [
+            format!("`{box_type}`"),
+            format!("`{root}`"),
+            format!("`{key}`"),
+        ] {
+            assert!(
+                text.contains(&word),
+                "{entry}: the refusal names {word}: {text}"
+            );
+        }
+        assert!(!text.contains("BOX-"), "{entry}: {text}");
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{entry}: a refused create files no record"
+        );
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("its type's built-in root excludes")
+                    && line.contains(&format!("box_type={box_type} root={root} key={key} "))
+            })
+            .unwrap_or_else(|| panic!("{entry}: the daemon log names the refusal:\n{logged}"));
+        assert!(line.contains("exit_code=3"), "{line}");
+        assert!(
+            line.contains("refusal="),
+            "the create span records it: {line}"
+        );
+    }
+
+    // A spec that names a type with no built-in root, or the wrong one, is
+    // refused: it has no root to trust, so it never passes unchecked. A
+    // built-in type is its own root, so a `task` spec cannot claim the
+    // `session` root and keep a terminal.
+    let unknown: [(serde_json_lenient::Value, &str, &str); 3] = [
+        (
+            spec_of("rc-custom-no-root", "ci", &pty(true)),
+            "box.type",
+            "ci",
+        ),
+        (
+            spec_of("rc-root-not-builtin", "ci", &|spec| {
+                spec["type"] = serde_json_lenient::json!({ "root": "nope" });
+            }),
+            "type.root",
+            "nope",
+        ),
+        (
+            spec_of("rc-builtin-other-root", "task", &|spec| {
+                pty(true)(spec);
+                spec["type"] = serde_json_lenient::json!({ "root": "session" });
+            }),
+            "type.root",
+            "session",
+        ),
+    ];
+    for (spec, key, value) in unknown {
+        let entry = spec["entry"].as_str().unwrap_or_default().to_owned();
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let err = mngr
+            .create_box_with_spec(unnamed_config(), Some(spec), None, None)
+            .await
+            .expect_err("a type with no built-in root is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{entry}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<UnknownRootRefusal>())
+            .unwrap_or_else(|| panic!("{entry}: the error is the root refusal: {err}"));
+        assert_eq!(refusal.exit_code(), 3, "{entry}");
+        assert_eq!(
+            (refusal.key, refusal.value.as_str()),
+            (key, value),
+            "{entry}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("`{key}`")) && text.contains(&format!("`{value}`")),
+            "{entry}: the refusal names the key and the value: {text}"
+        );
+        assert!(
+            text.contains("`session`") && !text.contains("BOX-"),
+            "{text}"
+        );
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{entry}: a refused create files no record"
+        );
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("does not name its type's built-in root")
+                    && line.contains(&format!("key=\"{key}\" value={value} "))
+            })
+            .unwrap_or_else(|| panic!("{entry}: the daemon log names the refusal:\n{logged}"));
+        assert!(line.contains("exit_code=3"), "{line}");
+    }
 }
