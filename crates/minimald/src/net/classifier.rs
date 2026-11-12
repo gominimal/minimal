@@ -10150,9 +10150,8 @@ mod tests {
             .expect_err("refused");
         assert!(error.to_string().contains("no such table"), "{error}");
 
-        // An nft that refuses before reading its whole script (the write ends in EPIPE, which won the
-        // race over its stderr once in 213 lab runs and once on a Lima host) still reports what it said.
-        // A script past the pipe's buffer makes the early exit certain.
+        // An nft that refuses before reading its whole script still reports what it said: a script past
+        // the pipe's buffer makes nft exit before it reads it, and the write then ends in EPIPE.
         let big = "# padding\n".repeat(20_000);
         let error = run_nft_script(&refusing, &big)
             .await
