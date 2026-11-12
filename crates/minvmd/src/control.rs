@@ -684,6 +684,8 @@ pub fn spawn_guest_reports_door_with_proxy(
     let reconcile = spawn_host_ip_reconcile(
         boxes.clone(),
         control_sock_path.with_file_name(paths::SSH_SOCK_FILE),
+        answerer.clone(),
+        audit_path.clone(),
     )?;
     tracing::info!(
         sock = %sock_path.display(),
@@ -1062,26 +1064,43 @@ impl HostIpReconcileNudge {
 /// `guest_rpc_sock` and hands it to
 /// [`BoxRegistry::reconcile_host_ip_boxes`]. A read that fails changes
 /// nothing: a failed read is no evidence that a box ended.
+///
+/// The same list ends the requester build row of a box it no longer
+/// names (NET-169, [`BoxRegistry::requester_rows_without_a_box`]): the
+/// box's retirement normally withdraws it, and its creator may never send
+/// one. Each withdrawal takes its turn in an order of the thread's own,
+/// as each door's do.
 fn spawn_host_ip_reconcile(
     boxes: BoxRegistry,
     guest_rpc_sock: PathBuf,
+    answerer: AnswererStatus,
+    audit_path: PathBuf,
 ) -> std::io::Result<HostIpReconcileNudge> {
-    spawn_host_ip_reconcile_with(boxes, HOST_IP_RECONCILE_INTERVAL, move || {
-        read_guest_box_states(&guest_rpc_sock)
-    })
+    let order = Arc::new(ApplyOrder::default());
+    let rows = boxes.clone();
+    spawn_host_ip_reconcile_with(
+        boxes,
+        HOST_IP_RECONCILE_INTERVAL,
+        move || read_guest_box_states(&guest_rpc_sock),
+        move |name| {
+            order.apply(|| withdraw_requester_row(&rows, &answerer, &audit_path, name));
+        },
+    )
 }
 
 /// [`spawn_host_ip_reconcile`] with its timer and its session-list read
 /// given, so a test can drive the thread without an in-VM daemon.
-fn spawn_host_ip_reconcile_with<R>(
+fn spawn_host_ip_reconcile_with<R, W>(
     boxes: BoxRegistry,
     interval: Duration,
     mut read_guest: R,
+    mut withdraw_row: W,
 ) -> std::io::Result<HostIpReconcileNudge>
 where
     R: FnMut() -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>>
         + Send
         + 'static,
+    W: FnMut(&str) + Send + 'static,
 {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -1133,6 +1152,14 @@ where
                             && since.is_none_or(|since| {
                                 boxes.host_ip_admitted_after(&outcome.dropped, since)
                             });
+                        for row in boxes.requester_rows_without_a_box(&guest, mark) {
+                            tracing::info!(
+                                row = %row,
+                                trigger = %trigger,
+                                "withdrawing the build row of a box the VM no longer lists"
+                            );
+                            withdraw_row(&row);
+                        }
                     }
                     Err(error) if !failing => {
                         failing = true;
@@ -1433,12 +1460,7 @@ fn serve_request(
             // the range unless a live row or a registration owns it.
             order.apply(|| {
                 let name = minimald_rpc::requester_build_row_name(request.session_id);
-                if let Some((held, switch_address)) = boxes.withdraw_build_row(&name) {
-                    boxes.release_withdrawn_unless_owned(&held, || {
-                        answerer.release_address(&held);
-                    });
-                    flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
-                }
+                withdraw_requester_row(boxes, answerer, audit_path, &name);
             });
             // A destroyed box's table ends with it, and so does every grant
             // still open for it, as the guest's own drop ends them: that
@@ -1936,6 +1958,24 @@ fn sweep_grant_deadlines(
     for withdrawal in boxes.build_grants().take_expired(now) {
         tracing::info!(row = %withdrawal.name, "a build grant reached its deadline");
         order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+    }
+}
+
+/// Withdraws the requester build row `name` (NET-169), in the caller's
+/// turn: its published address returns to the range unless a live row or a
+/// registration owns it, and its audit window ends, as any box's
+/// withdrawal ends one.
+fn withdraw_requester_row(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    audit_path: &Path,
+    name: &str,
+) {
+    if let Some((held, switch_address)) = boxes.withdraw_build_row(name) {
+        boxes.release_withdrawn_unless_owned(&held, || {
+            answerer.release_address(&held);
+        });
+        flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
     }
 }
 
@@ -10401,6 +10441,7 @@ mod tests {
             registry.clone(),
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();
@@ -10451,6 +10492,7 @@ mod tests {
             registry.clone(),
             Duration::from_millis(50),
             scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
         )
         .expect("the reconcile thread starts");
         calls
@@ -10464,6 +10506,65 @@ mod tests {
             !registry.holds_host_ip_boxes(),
             "a box the guest no longer lists is forgotten"
         );
+        drop(answers);
+    }
+
+    /// NET-169: a pass whose list no longer names a box withdraws the box's
+    /// requester build row. A box the list names keeps its row.
+    #[test]
+    fn host_ip_reconcile_thread_withdraws_the_row_of_a_box_the_guest_dropped() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+        let registry = BoxRegistry::new(SUBNET);
+        let (gone, live) = (reconcile_session(1), reconcile_session(2));
+        let gone_row = minimald_rpc::requester_build_row_name(gone);
+        let live_row = minimald_rpc::requester_build_row_name(live);
+        for row in [&gone_row, &live_row] {
+            registry
+                .register_build_row(
+                    crate::box_registry::ClientBoxSpec {
+                        name: row.clone(),
+                        ingress_ports: Vec::new(),
+                        egress: None,
+                        credentialed_upstream: None,
+                        dynamic_ingress: None,
+                        dynamic_allowed_range: None,
+                    },
+                    crate::box_registry::BuildRow::Requester,
+                )
+                .expect("the plan has an address for the requester row");
+        }
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let rows = registry.clone();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+            move |name: &str| {
+                rows.withdraw_build_row(name);
+            },
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([(
+                live,
+                boxes::BoxState::Stopped,
+            )])))
+            .expect("the reader waits");
+        let deadline = std::time::Instant::now() + read_timeout;
+        while registry.row_by_name(&gone_row).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the row of the box the guest dropped stayed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(registry.row_by_name(&live_row).is_some());
         drop(answers);
     }
 
@@ -10484,6 +10585,7 @@ mod tests {
             registry.clone(),
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();
@@ -10555,6 +10657,7 @@ mod tests {
             registry.clone(),
             NOT_SOON,
             scripted_guest_reader(calls_tx, answers_rx),
+            |_: &str| {},
         )
         .expect("the reconcile thread starts");
         nudge.nudge();
