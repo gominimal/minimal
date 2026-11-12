@@ -751,8 +751,8 @@ pub(crate) mod linux {
     /// the block echoes it in one.
     pub(crate) const DAEMON_RUNNING_NOTE: &str = "note: a Minimal daemon is running. If a box \
          you start next still says this machine cannot enforce it yet, restart the daemon. Run \
-         min host stop local0, which stops each running box and then the daemon. Your next min \
-         command starts the daemon again.";
+         min host stop local0, which stops each running box and then the daemon. Then run min ls, \
+         which starts the daemon again.";
 
     /// What the step's `--place-listener` prints when no process holds the
     /// daemon's socket, so no daemon is running: the classifier block prints
@@ -4166,6 +4166,8 @@ mod tests {
         // and the block can echo it whole.
         assert!(DAEMON_RUNNING_NOTE.contains("restart the daemon. Run min host stop local0,"));
         assert!(DAEMON_RUNNING_NOTE.contains("stops each running box and then the daemon."));
+        // Not every command starts the daemon: `min host stop` on a stopped host does not.
+        assert!(DAEMON_RUNNING_NOTE.contains("Then run min ls, which starts the daemon again."));
         assert!(!DAEMON_RUNNING_NOTE.contains("--force"));
         assert!(!DAEMON_RUNNING_NOTE.contains("sessions survive"));
         assert!(!DAEMON_RUNNING_NOTE.contains('\''));
