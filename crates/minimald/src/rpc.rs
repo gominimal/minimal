@@ -1710,6 +1710,32 @@ async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(),
         .await
 }
 
+/// `GetBoxSpec`: the spec a box was created with, as stored beside its
+/// record (BCLI-022).
+async fn serve_get_box_spec(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::GetBoxSpec
+        .handle_channel(c, async |req: minimald_rpc::GetBoxSpecRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.get_box_spec(req.id).await {
+                Ok(Some(spec)) => Errorable::Ok(minimald_rpc::GetBoxSpecResponse { spec }),
+                Ok(None) => Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.id.as_ref()
+                    ),
+                },
+                Err(e) => Errorable::Err {
+                    error: format!("The box's spec could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
 /// `ShowBox`: one box record with its state, identity and live execs
 /// (BOX-159).
 async fn serve_show_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
@@ -3573,6 +3599,7 @@ pub async fn handle_ssh_rpc(
         | minimald_rpc::PreviewPrune::NAME
         | minimald_rpc::ListBoxes::NAME
         | minimald_rpc::ShowBox::NAME
+        | minimald_rpc::GetBoxSpec::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -3661,6 +3688,7 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::PreviewPrune::NAME => serve!(serve_preview_prune(s, channel)),
         minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
         minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
+        minimald_rpc::GetBoxSpec::NAME => serve!(serve_get_box_spec(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),

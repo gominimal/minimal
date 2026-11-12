@@ -731,6 +731,65 @@ impl BoxManagerHandle {
 }
 
 impl BoxManagerHandle {
+    /// The spec box `id` was created with: the stored copy beside its
+    /// record (BOX-068), for `GetBoxSpec` (BCLI-022). `id` resolves as
+    /// [`Self::show_box`] resolves it. `None` for an id no retained record
+    /// names. `Some(None)` for a box with no stored spec.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the records or the spec file cannot be read, and
+    /// `InvalidData` for a spec file that is not JSON.
+    pub async fn get_box_spec(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<Option<serde_json_lenient::Value>>, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "box.spec",
+            session_id = %id,
+            found = tracing::field::Empty,
+            stored = tracing::field::Empty
+        );
+        async {
+            let Some(record) = self.retained_record(id).await? else {
+                tracing::Span::current().record("found", false);
+                tracing::info!(session_id = %id, found = false, "read a box spec");
+                return Ok(None);
+            };
+            tracing::Span::current().record("found", true);
+            let (send, recv) = Responder::channel();
+            // A send error means the manager is gone: the recv fails as well.
+            let _ = self
+                .sender
+                .send(ManagerMessage::EventsSource(record.id, send))
+                .await;
+            let object = recv.await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    minimald_rpc::SHUTDOWN_REFUSAL,
+                )
+            })??;
+            let Some(object) = object else {
+                // The box was reaped between the two reads.
+                tracing::info!(session_id = %id, found = false, "read a box spec");
+                return Ok(None);
+            };
+            let bytes = object.load_spec()?;
+            tracing::Span::current().record("stored", bytes.is_some());
+            tracing::info!(session_id = %id, found = true, stored = bytes.is_some(), "read a box spec");
+            bytes
+                .map(|bytes| {
+                    serde_json_lenient::from_slice(&bytes)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                })
+                .transpose()
+                .map(Some)
+        }
+        .instrument(span)
+        .await
+    }
+
     /// The retained record that `id` names, read as [`Self::show_box`]
     /// reads it: as a record's `box_id` first and as its `id` second.
     async fn retained_record(
@@ -5902,6 +5961,39 @@ mod create_stamp_tests {
                 .is_none(),
             "a refused spec files no record"
         );
+    }
+
+    /// BCLI-022: `GetBoxSpec` answers with the spec stored beside the
+    /// box's record, as the creating client sent it. A box with no stored
+    /// spec answers with none, and an id no record names finds no box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_box_spec_returns_stored_spec() {
+        let (_state, _cache, mngr) = manager().await;
+        let spec = serde_json_lenient::json!({
+            "v": 0,
+            "entry": "default",
+            "box": {"type": "session", "lifetime": "until_complete"},
+            "install": {"packages": ["git"]},
+            "network": {"mode": "own_ip"},
+        });
+        let id = mngr
+            .create_box_with_spec(
+                config("specced", "/home/dev/proj"),
+                Some(spec.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mngr.get_box_spec(id).await.unwrap(), Some(Some(spec)));
+
+        let id = mngr
+            .create_box_with_spec(config("no-spec", "/home/dev/proj"), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(mngr.get_box_spec(id).await.unwrap(), Some(None));
+
+        assert_eq!(mngr.get_box_spec(SessionId::mint()).await.unwrap(), None);
     }
 
     async fn record(mngr: &BoxManagerHandle, id: SessionId) -> boxes::Record {

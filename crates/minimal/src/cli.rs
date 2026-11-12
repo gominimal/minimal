@@ -450,8 +450,11 @@ pub struct BoxArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum BoxCommand {
-    /// Show how a project's box reaches GitHub through the local proxy:
-    /// the proxy's root certificate fingerprint, each secret with its hosts,
+    /// Show the spec of an entry of the project before a start, or the
+    /// spec a box was created with. An entry's spec names the minimal.toml
+    /// table or flag that set each value. With no entry or box named, show
+    /// how the project's box reaches GitHub through the local proxy: the
+    /// proxy's root certificate fingerprint, each secret with its hosts,
     /// the steering mode and the UDP 443 stance
     Spec(BoxSpecArgs),
     /// Show what the local proxy recorded for one box: each request it
@@ -1131,22 +1134,33 @@ pub enum BoxAuditOutputFormat {
     Jsonl,
 }
 
+// BCLI-021, BCLI-022, BCLI-023 and BEP-038:
+// `min box spec [<entry>|<box>] [-o toml|json|yaml]`, with the override
+// flags of `min box start`. The project form keeps only `--network`.
 #[derive(Debug, Args)]
 pub struct BoxSpecArgs {
-    /// The project directory whose minimal.toml declares the box
-    /// (default: --repo-dir, or the current directory)
-    pub path: Option<PathBuf>,
-    // The same flag as `min session activate --network`, from the same
-    // definition, so the preview is of the box that activation creates.
-    #[arg(
-        long,
-        value_name = NETWORK_VALUE_NAME,
-        value_parser = parse_network_mode,
-        default_value = NETWORK_DEFAULT,
-        help = NETWORK_HELP,
-        long_help = NETWORK_LONG_HELP
-    )]
-    pub network: CliNetworkMode,
+    /// An entry of the project's minimal.toml, else a box: its id, the
+    /// start of its id, or its name, as `min box list` prints them. With
+    /// none, show the project's proxy rows. Use --repo-dir to name another
+    /// project
+    pub target: Option<String>,
+    /// The format of an entry's or a box's spec (default: toml)
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxSpecOutputFormat>,
+    #[command(flatten)]
+    pub overrides: StartOverrideArgs,
+}
+
+/// The format `min box spec` writes an entry's or a box's spec in.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+pub enum BoxSpecOutputFormat {
+    /// TOML, with a comment that names the source of each value
+    #[default]
+    Toml,
+    /// One JSON object
+    Json,
+    /// One YAML document
+    Yaml,
 }
 
 #[derive(Debug, Args)]
@@ -1259,6 +1273,8 @@ pub struct TaskRunArgs {
     pub network: Option<CliNetworkMode>,
     #[command(flatten)]
     pub egress: EgressArgs,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
     /// Start the box, print its id and return. The task gets no input.
     #[arg(long)]
     pub detach: bool,
@@ -1292,6 +1308,8 @@ pub struct BoxRunArgs {
     pub network: Option<CliNetworkMode>,
     #[command(flatten)]
     pub egress: EgressArgs,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
     /// Arguments to the entry, passed through to its declared `args`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
@@ -1373,8 +1391,80 @@ pub struct StartOverrideArgs {
     /// Repeatable. With any `--loadout`, the client config's
     /// `[loadouts].default_loadouts` are not applied. A task entry does not
     /// take it
-    #[arg(long = "loadout", value_name = "NAME")]
+    // BCLI-075: `--no-loadouts` with `--loadout` is a usage error, exit 2.
+    // The conflict is declared here because the run verbs take
+    // `--no-loadouts` and no `--loadout`.
+    #[arg(long = "loadout", value_name = "NAME", conflicts_with = "no_loadouts")]
     pub loadout: Vec<String>,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
+}
+
+// The override flags that `min box start`, `min session start`, `min task
+// run` and `min box run` take beside `--network` and the egress flags, as
+// `min session activate` takes them (BCLI-024, BCLI-075, BCLI-076). They
+// are the rest of activate's `[network]` flags, `--no-loadouts` and
+// `--no-hooks`.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct BoxOverrideArgs {
+    /// How the box's requests to publish a port while it runs are decided:
+    /// `allow` publishes a port the box asks for with `min net expose` or
+    /// listens on inside `--dynamic-range`, `ask` puts each request to the
+    /// person attached to the box, and `deny`, the same as leaving the flag
+    /// unset, refuses every request. Sets the box's
+    /// `network.dynamic_ingress`. Requires `--network own_ip`.
+    #[arg(
+        long = "dynamic-ingress",
+        value_name = "allow|ask|deny",
+        value_parser = parse_dynamic_ingress_mode
+    )]
+    pub dynamic_ingress: Option<boxes::DynamicIngress>,
+    /// Port range `LO-HI`, both ends included, in which
+    /// `--dynamic-ingress allow` accepts requests, e.g. `8000-8443`. A
+    /// request outside it is refused. Requires `--dynamic-ingress`.
+    #[arg(
+        long = "dynamic-range",
+        value_name = "LO-HI",
+        value_parser = parse_dynamic_range,
+        requires = "dynamic_ingress"
+    )]
+    pub dynamic_range: Option<(u16, u16)>,
+    /// Let the box reach the Box Egress Proxy, whatever its
+    /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
+    /// box sends to the proxy's address is dropped, unless minimal.toml
+    /// grants the box a secret through the proxy. Takes effect with
+    /// `--network own_ip`, and with `--network host_ip` on a host that runs
+    /// boxes in a VM.
+    #[arg(long)]
+    pub credentialed_upstream: bool,
+    /// Whether the box can send UDP to port 443, the traffic of HTTP/3.
+    /// `block` always blocks it, and `allow` always allows it. `auto`, the
+    /// same as leaving the flag unset, blocks it only when the box has a
+    /// credentialed upstream. Sets the box's `network.quic443`, in place of
+    /// the value in minimal.toml.
+    #[arg(
+        long = "quic443",
+        value_name = "auto|block|allow",
+        value_parser = parse_quic443
+    )]
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// Add this VPN network name to the box's `network.vpn_network_names`.
+    /// Repeatable. The box keeps the names, but this version of minimald
+    /// does not connect the box to a VPN.
+    #[arg(long = "vpn-network-names", value_name = "NAME")]
+    pub vpn_network_names: Vec<String>,
+    /// Apply no loadouts, and not the client config's
+    /// `[loadouts].default_loadouts` either
+    #[arg(long)]
+    pub no_loadouts: bool,
+    /// Run none of the box's lifecycle hooks, from the loadouts or from
+    /// minimal.toml. The choice is kept with the box, so it also holds
+    /// when the box is attached or detached, and when it ends
+    #[arg(long)]
+    pub no_hooks: bool,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
@@ -1936,6 +2026,20 @@ pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<boxes::DynamicIngr
         "ask" => Ok(boxes::DynamicIngress::Ask),
         other => Err(format!(
             "dynamic ingress: unknown mode '{other}' (expected allow, ask, or deny)"
+        )),
+    }
+}
+
+/// Parse a `--quic443` value into the box's stance on UDP to port 443
+/// (BCLI-024, BEP-018).
+pub(crate) fn parse_quic443(raw: &str) -> Result<boxes::core::bep::Quic443, String> {
+    use boxes::core::bep::Quic443;
+    match raw {
+        "auto" => Ok(Quic443::Auto),
+        "block" => Ok(Quic443::Block),
+        "allow" => Ok(Quic443::Allow),
+        other => Err(format!(
+            "unknown value '{other}'. Use auto, block or allow."
         )),
     }
 }

@@ -70,6 +70,12 @@ pub enum SpecKeyProblem {
         expected: &'static str,
         found: &'static str,
     },
+    /// The value is a string, but not one the key accepts. Carries the
+    /// value the layer wrote and the values the key accepts, in order.
+    UnknownValue {
+        found: String,
+        accepted: &'static [&'static str],
+    },
 }
 
 /// The naming rule that an entry name breaks.
@@ -244,6 +250,15 @@ impl fmt::Display for Error {
                     "{layer} sets `{key}` to {found}, but `{key}` takes \
                      {expected}. Fix the value."
                 ),
+                SpecKeyProblem::UnknownValue { found, accepted } => {
+                    let accepted: Vec<String> = accepted.iter().map(|a| format!("`{a}`")).collect();
+                    write!(
+                        f,
+                        "{layer} sets `{key}` to {found:?}. `{key}` accepts only \
+                         {}. Fix the value.",
+                        accepted.join(" or ")
+                    )
+                }
             },
             Error::LegacyTable { path, legacy } => {
                 match path {

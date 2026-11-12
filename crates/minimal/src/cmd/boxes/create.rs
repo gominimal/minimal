@@ -51,12 +51,12 @@ pub fn box_registered_start_line(
 /// apply to, so a stance or range on a `host_ip` or `none` box would be a
 /// declaration `min session policy` shows and nothing ever honours. The
 /// CLI reference documents the flags as requiring `--network own_ip`.
-pub(super) fn refuse_dynamic_ingress_off_own_ip(
-    network: crate::cli::CliNetworkMode,
+pub(crate) fn refuse_dynamic_ingress_off_own_ip(
+    network: impl Into<boxes::NetworkMode>,
     mode: Option<boxes::DynamicIngress>,
     range: Option<(u16, u16)>,
 ) -> Result<(), anyhow::Error> {
-    if network != crate::cli::CliNetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
+    if network.into() != boxes::NetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
         anyhow::bail!(
             "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with \
              its own IP address can publish ports"
@@ -805,12 +805,21 @@ pub(crate) fn plan_start(
             args.ingress.clone_from(&overrides.ingress);
             args.egress.clone_from(&overrides.egress);
             args.loadout.clone_from(&overrides.loadout);
+            // BCLI-075, BCLI-076: the rest of activate's override flags.
+            let other = &overrides.other;
+            args.dynamic_ingress = other.dynamic_ingress;
+            args.dynamic_range = other.dynamic_range;
+            args.credentialed_upstream = other.credentialed_upstream;
+            args.no_loadouts = other.no_loadouts;
+            args.no_hooks = other.no_hooks;
             Ok(StartPlan::Session {
                 options: ActivationOptions {
                     offer_scaffold: false,
                     entry: Some(entry.name.clone()),
                     box_name: start.name.clone(),
                     fresh_instance: start.new,
+                    quic443: other.quic443,
+                    vpn_network_names: other.vpn_network_names.clone(),
                 },
                 entry: entry.name,
                 args,
@@ -861,6 +870,7 @@ pub(crate) fn plan_start(
                 args: Vec::new(),
                 network: start.overrides.network,
                 egress: start.overrides.egress.clone(),
+                other: start.overrides.other.clone(),
             },
             entry: entry.name,
         }),
@@ -952,6 +962,7 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
         ingress = ?start.overrides.ingress,
         egress = ?start.overrides.egress,
         loadouts = ?start.overrides.loadout,
+        other_overrides = ?start.overrides.other,
         "starting a box from the entry"
     );
     match plan {
@@ -999,6 +1010,12 @@ pub struct ActivationOptions {
     pub box_name: Option<String>,
     /// Ask for a fresh instance, `<name>-<n>` (BCLI-070).
     pub fresh_instance: bool,
+    /// The `--quic443` of a start (BCLI-024). `min session activate` does
+    /// not take the flag.
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// The `--vpn-network-names` of a start (BCLI-024). `min session
+    /// activate` does not take the flag.
+    pub vpn_network_names: Vec<String>,
 }
 
 impl From<bool> for ActivationOptions {
@@ -2690,6 +2707,52 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
+/// list of the spec on `request` (BCLI-024). A name the list already holds
+/// is not added again. The daemon stores the list with the box's spec, and
+/// does not enforce it (BOX-076). Nothing changes when `names` is empty.
+///
+/// # Errors
+///
+/// Fails when `names` is not empty and the request carries no spec, so a
+/// name is never dropped without a word. Fails too when the spec on
+/// `request` has a `network` that is not a table, or a
+/// `network.vpn_network_names` that is not a list.
+pub(crate) fn add_vpn_network_names(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    names: &[String],
+) -> Result<(), anyhow::Error> {
+    use serde_json_lenient::Value;
+    if names.is_empty() {
+        return Ok(());
+    }
+    let Some(spec) = request.spec.as_mut() else {
+        anyhow::bail!(
+            "Cannot use --vpn-network-names here: this box does not store a `[network]` \
+             section. Run the command again without --vpn-network-names."
+        );
+    };
+    let network = spec
+        .as_object_mut()
+        .context("The box spec is not a table")?
+        .entry("network")
+        .or_insert_with(|| Value::Object(serde_json_lenient::Map::new()))
+        .as_object_mut()
+        .context("The box spec's network is not a table")?;
+    let list = network
+        .entry("vpn_network_names")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("The box spec's network.vpn_network_names is not a list")?;
+    for name in names {
+        let value = Value::String(name.clone());
+        if !list.contains(&value) {
+            list.push(value);
+        }
+    }
+    Ok(())
+}
+
 /// Marks `request` as a fresh instance (BCLI-070, BOX-163). The daemon
 /// names the box `<name>-<n>`, with the smallest `n` no retained box uses,
 /// and never refuses it for a held name. The client invents no name, so the
@@ -3137,7 +3200,8 @@ pub(crate) async fn activate_box(
                 // BEP-018: the declared stance is a setting of every box, lane
                 // or not, so a declared `block` reaches the gate of a box with
                 // no credentialed upstream.
-                quic443: project_quic443,
+                // BCLI-024: `--quic443` replaces the declared stance.
+                quic443: options.quic443.or(project_quic443),
                 ..network_override_policy(&args, port_mappings, egress.policy)
             };
 
@@ -3336,6 +3400,7 @@ pub(crate) async fn activate_box(
                 options.entry.as_deref(),
                 options.box_name.as_deref(),
             )?;
+            add_vpn_network_names(&mut request, &options.vpn_network_names)?;
 
             let Some(root) = upload_root else {
                 return Ok::<_, anyhow::Error>(UploadPlan::Skip);
