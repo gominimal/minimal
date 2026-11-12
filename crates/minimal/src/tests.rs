@@ -16254,8 +16254,7 @@ async fn box_spec_entry_gates_loadouts_as_start() {
 
     // BOX-172: an open task entry takes its default loadouts, as
     // `min task run` does, so one that sets `loadout_mode` refuses.
-    let (_project, global) =
-        spec_project("[tasks.opened]\necho = 'x'\nloadout_mode = 'open'\n");
+    let (_project, global) = spec_project("[tasks.opened]\necho = 'x'\nloadout_mode = 'open'\n");
     let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
     std::fs::create_dir_all(&loadouts).unwrap();
     std::fs::write(loadouts.join("default.toml"), "loadout_mode = \"open\"\n").unwrap();

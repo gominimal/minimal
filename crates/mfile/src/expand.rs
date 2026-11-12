@@ -383,7 +383,11 @@ fn gate(
             loadouts: layers.named_loadouts.clone(),
             layer: set.as_ref().map(|s| s.layer.clone()),
             entry: EntryHeader(entry.table.key(), &entry.name).to_string(),
-            held_by: held.map(|(box_type, _)| box_type),
+            // A constraint holds the box sealed only when it does not
+            // admit `open`. One that admits `open` leaves the remedy open.
+            held_by: held
+                .filter(|(_, admitted)| !admitted.iter().any(|a| a == "open"))
+                .map(|(box_type, _)| box_type),
         });
     }
     // The client's record of the decision. `minimald` does not log the
@@ -2244,8 +2248,15 @@ mod tests {
 
             [boxes.ci]
             type = "ci"
+
+            [box_types.either]
+            extends = "task"
+            constraints = { loadout_mode = ["sealed", "open"] }
+
+            [boxes.either]
+            type = "either"
         "#;
-        let cases: [(&str, &[&str], &str); 3] = [
+        let cases: [(&str, &[&str], &str); 4] = [
             (
                 "lint",
                 &["dev"],
@@ -2270,6 +2281,16 @@ mod tests {
                  Run the command without `--loadout`. `[box_types.ci]` constrains \
                  `loadout_mode` to `sealed`, so `[boxes.ci]` cannot set it to \
                  `open`.",
+            ),
+            // A constraint that admits `open` does not hold the box sealed,
+            // so the message keeps the remedy.
+            (
+                "either",
+                &["dev"],
+                "`--loadout` names loadout `dev`, but this box takes no loadout. \
+                 The built-in `task` box type sets `loadout_mode` to `sealed`. \
+                 Run the command without `--loadout`, or set \
+                 `loadout_mode = \"open\"` in `[boxes.either]`.",
             ),
         ];
         for (name, named, msg) in cases {

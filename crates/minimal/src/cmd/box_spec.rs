@@ -675,9 +675,8 @@ fn expand_entry(
     // The box's loadout mode, read before any loadout as the start reads
     // it, for a task entry too. A sealed box selects no loadout (BOX-171,
     // BOX-173).
-    let loadout_mode =
-        crate::loadouts::entry_loadout_gate(Some(&bytes), entry, &overrides.loadout)
-            .map_err(invalid)?;
+    let loadout_mode = crate::loadouts::entry_loadout_gate(Some(&bytes), entry, &overrides.loadout)
+        .map_err(invalid)?;
     let cfg = crate::config::read_client_config(global)?;
     let active = crate::loadouts::resolve_active_loadouts(
         crate::loadouts::gate_selection(
