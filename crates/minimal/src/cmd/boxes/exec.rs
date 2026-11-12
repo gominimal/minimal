@@ -85,6 +85,9 @@ pub(crate) enum TtyAttach {
     Terminal {
         sock: std::path::PathBuf,
         id: boxes::SessionId,
+        /// Where the session-key config is read from, so the attach sends
+        /// the user's detach keys.
+        config_dir: Option<std::path::PathBuf>,
     },
     /// Through an exec channel, with the caller's stdio as pipes. Only the
     /// scripted tests take it: `min box exec -t` refuses a stdin that is not
@@ -188,6 +191,7 @@ pub async fn cmd_box_exec(global: &GlobalArgs, args: BoxExecArgs) -> Result<(), 
         daemon_host_kind(global),
         &request,
         stdin_is_tty,
+        global.config_dir.as_deref(),
         input,
         &mut stdout,
         &mut stderr,
@@ -248,15 +252,18 @@ fn stdin_pump() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 /// BOX-149 defines, and returns the exit code to end with. The command's
 /// output goes to `out` and `err`. A tty exec attaches this process's
 /// terminal, and is refused before the box resolves when `terminal` is
-/// not set. A refusal returns as a
+/// not set. The terminal attach sends the session keys from `config_dir`,
+/// so the detach keys end it and leave the exec running. A refusal returns as a
 /// [`BoxExecRefusal`], and an exec that its own timeout ended as a
 /// [`BoxExecTimedOut`]. The verb, the box id and the outcome go on the
 /// command's span.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn box_exec_on_hosts<O, E>(
     hosts: Vec<crate::cmd::list::LocalHost>,
     kind: paths::HostKind,
     request: &BoxExecRequest,
     terminal: bool,
+    config_dir: Option<&std::path::Path>,
     input: ExecInput,
     out: &mut O,
     err: &mut E,
@@ -268,7 +275,7 @@ where
     refuse_tty_without_terminal(request, terminal)?;
     let resolved = resolve_box_on_hosts(hosts, &request.target, "box exec").await?;
     crate::output::record_box_id(&resolved.box_id.to_string());
-    let ran = exec_in_resolved_box(&resolved, kind, request, input, out, err).await;
+    let ran = exec_in_resolved_box(&resolved, kind, request, config_dir, input, out, err).await;
     record_exec_outcome(resolved.box_id, request, &ran);
     ran
 }
@@ -306,6 +313,7 @@ async fn exec_in_resolved_box<O, E>(
     resolved: &ResolvedBox,
     kind: paths::HostKind,
     request: &BoxExecRequest,
+    config_dir: Option<&std::path::Path>,
     input: ExecInput,
     out: &mut O,
     err: &mut E,
@@ -340,6 +348,7 @@ where
     let attach = TtyAttach::Terminal {
         sock: sock.to_path_buf(),
         id,
+        config_dir: config_dir.map(std::path::Path::to_path_buf),
     };
     exec_over(&mut channels, request, attach, input, out, err).await
 }
@@ -399,17 +408,22 @@ where
             };
             err.write_all(format!("{exec_id}\n").as_bytes()).await?;
             err.flush().await?;
-            let attach_wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
             let status = match attach {
                 #[cfg(test)]
                 TtyAttach::Pipes => {
+                    let attach_wire =
+                        minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
                     let channel = channels.open(&attach_wire).await?;
                     let relayed = relay_box_channel(channel, input, out, err, false).await?;
                     relayed_status(target, relayed, err).await?
                 }
-                TtyAttach::Terminal { sock, id } => {
+                TtyAttach::Terminal {
+                    sock,
+                    id,
+                    config_dir,
+                } => {
                     drop(input);
-                    attach_exec_terminal(&sock, id, &attach_wire).await?
+                    attach_exec_terminal(&sock, id, &exec_id, config_dir.as_deref()).await?
                 }
             };
             // The attach ends with 124 for an exec that its timeout ended,
@@ -655,14 +669,16 @@ where
 
 /// Connects this process's terminal to the tty exec that `attach_wire`
 /// resumes, through `ssh -tt` and the terminal relay `min session attach`
-/// uses. Returns ssh's exit status, which is the exec's.
+/// uses. It sends the session keys from `config_dir`, as `min box attach
+/// --exec` does (BCLI-068). Returns ssh's exit status: the exec's, or 0
+/// after a detach.
 async fn attach_exec_terminal(
     sock: &std::path::Path,
     id: boxes::SessionId,
-    attach_wire: &str,
+    exec_id: &minimald_rpc::exec::ExecId,
+    config_dir: Option<&std::path::Path>,
 ) -> Result<i32, anyhow::Error> {
-    let ssh = minimal_client::attach::attach_command(sock, id, Some(attach_wire), None)?;
-    let ssh = with_forced_tty(&ssh);
+    let ssh = super::attach::exec_attach_ssh(sock, id, exec_id, config_dir)?;
     tokio::task::spawn_blocking(move || {
         interactive_attach(ssh, true, crate::attach::TerminalUnwind::arm, |ssh| {
             let real = minimal_client::tty_relay::RealTty::acquire()
@@ -672,20 +688,6 @@ async fn attach_exec_terminal(
     })
     .await
     .context("the terminal attach's thread failed")?
-}
-
-/// `ssh` with `-tt` before its other arguments, so ssh asks for a terminal
-/// for the command that `attach_command` gave it.
-fn with_forced_tty(ssh: &std::process::Command) -> std::process::Command {
-    let mut forced = std::process::Command::new(ssh.get_program());
-    forced.arg("-tt").args(ssh.get_args());
-    for (name, value) in ssh.get_envs() {
-        match value {
-            Some(value) => forced.env(name, value),
-            None => forced.env_remove(name),
-        };
-    }
-    forced
 }
 
 // The daemon's texts for an exec id it has no exec of (`no_exec_message`,

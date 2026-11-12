@@ -11488,6 +11488,7 @@ async fn run_box_exec_on_host_with(
         cmd::daemon_host_kind(&host.global),
         request,
         terminal,
+        host.global.config_dir.as_deref(),
         None,
         &mut stdout,
         &mut stderr,
