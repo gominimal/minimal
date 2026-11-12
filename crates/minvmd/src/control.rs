@@ -1439,6 +1439,15 @@ fn serve_request(
                     flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
                 }
             });
+            // A destroyed box's table ends with it, and so does every grant
+            // still open for it, as the guest's own drop ends them: that
+            // drop may never have arrived. A stopped box keeps its table,
+            // for its builds when it starts again.
+            if request.end == minimald_rpc::HostIpBoxEnd::Destroyed {
+                for withdrawal in boxes.build_grants().drop_table(request.session_id) {
+                    order.apply(|| withdraw_grant_row(boxes, answerer, audit_path, withdrawal));
+                }
+            }
             // A host-address box has no switch: its audit window, filed by
             // its box id, ends with it (NET-046).
             flush_guest_audit(
@@ -9328,6 +9337,46 @@ mod tests {
         assert!(
             matches!(again, BoxControlReply::NoBuildGrant { .. }),
             "{again:?}"
+        );
+    }
+
+    /// NET-165, NET-169: a destroyed `host_ip` box's table ends at its
+    /// retirement, and so does every grant open for it, though the guest's
+    /// own drop never arrived. A stopped box keeps its table and its grant.
+    #[test]
+    fn a_destroyed_host_ip_box_ends_its_table_and_grants() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let retire = |session_id, end| {
+            let reply = control(
+                &sock_path,
+                &BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
+                    session_id,
+                    end,
+                }),
+            )
+            .expect("the retire is answered");
+            assert!(
+                matches!(reply, BoxControlReply::HostIpBox { .. }),
+                "{reply:?}"
+            );
+        };
+
+        let stopped = boxes::SessionId::mint();
+        let kept = open_a_grant(&sock_path, stopped);
+        retire(stopped, minimald_rpc::HostIpBoxEnd::Stopped);
+        assert!(registry.build_grants().lookup(stopped, "aa").is_some());
+        assert!(registry.row_by_name(&kept.grant_row).is_some());
+
+        let destroyed = boxes::SessionId::mint();
+        let ended = open_a_grant(&sock_path, destroyed);
+        retire(destroyed, minimald_rpc::HostIpBoxEnd::Destroyed);
+        assert!(registry.build_grants().lookup(destroyed, "aa").is_none());
+        assert!(registry.row_by_name(&ended.grant_row).is_none());
+        assert!(
+            registry.row_by_name(&kept.grant_row).is_some(),
+            "another box's grant stays"
         );
     }
 
