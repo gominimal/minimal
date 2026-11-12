@@ -3112,6 +3112,12 @@ pub struct BoxListingEntry {
     /// sends none, and the box reads as one with no terminal.
     #[serde(default)]
     pub pty_enabled: bool,
+    /// The `lifetime` the box's stored spec sets, such as `until_stopped`,
+    /// so a client can name the command that starts the box again
+    /// (BCLI-009). `None` for a spec that sets none, a box filed with no
+    /// spec, and a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
     /// The build boxes running for this box now (NET-171).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub build_boxes: Vec<RunningBuildBox>,
@@ -3212,6 +3218,35 @@ impl OneshotSshRpc for ShowBox {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox");
     type Request<'a> = ShowBoxRequest;
     type Response = Errorable<ShowBoxResponse>;
+}
+
+/// An RPC to read the spec a box was created with: the stored copy beside
+/// its record (BOX-068), for `min box spec <box>` (BCLI-022).
+pub struct GetBoxSpec;
+
+/// The request for a [`GetBoxSpec`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBoxSpecRequest {
+    /// The box to read, as a listing reports its id.
+    pub id: SessionId,
+}
+
+/// The response for a [`GetBoxSpec`] RPC. An id that no retained record
+/// names is the [`Errorable::Err`] that starts with
+/// [`UNKNOWN_SESSION_ID_LEAD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GetBoxSpecResponse {
+    /// The stored spec, as its creating client sent it. `None` for a box
+    /// with no stored spec: one created before specs were stored, or by a
+    /// client that sent none.
+    #[serde(default)]
+    pub spec: Option<serde_json_lenient::Value>,
+}
+
+impl OneshotSshRpc for GetBoxSpec {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetBoxSpec");
+    type Request<'a> = GetBoxSpecRequest;
+    type Response = Errorable<GetBoxSpecResponse>;
 }
 
 /// An RPC to reap one box: delete its record, its events and its
@@ -4361,6 +4396,7 @@ mod box_listing_tests {
             exit_code: None,
             signal: None,
             pty_enabled: true,
+            lifetime: None,
             build_boxes: Vec::new(),
         }
     }

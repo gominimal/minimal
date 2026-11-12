@@ -51,12 +51,12 @@ pub fn box_registered_start_line(
 /// apply to, so a stance or range on a `host_ip` or `none` box would be a
 /// declaration `min session policy` shows and nothing ever honours. The
 /// CLI reference documents the flags as requiring `--network own_ip`.
-pub(super) fn refuse_dynamic_ingress_off_own_ip(
-    network: crate::cli::CliNetworkMode,
+pub(crate) fn refuse_dynamic_ingress_off_own_ip(
+    network: impl Into<boxes::NetworkMode>,
     mode: Option<boxes::DynamicIngress>,
     range: Option<(u16, u16)>,
 ) -> Result<(), anyhow::Error> {
-    if network != crate::cli::CliNetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
+    if network.into() != boxes::NetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
         anyhow::bail!(
             "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with \
              its own IP address can publish ports"
@@ -94,6 +94,9 @@ pub struct ProjectFileInvalid {
 
 impl std::fmt::Display for ProjectFileInvalid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cause is in this text and `source()` returns none, so `{}`
+        // and the printer's `{:#}` each show it once. The mfile error's own
+        // cause (the io error of `Error::IO`) is in its Display already.
         write!(
             f,
             "Cannot start the box: the project's {name} does not load: {error}",
@@ -103,11 +106,7 @@ impl std::fmt::Display for ProjectFileInvalid {
     }
 }
 
-impl std::error::Error for ProjectFileInvalid {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
+impl std::error::Error for ProjectFileInvalid {}
 
 /// The session entry of the project's `minimal.toml` that egress is read from
 /// (NET-060): `[sessions.default]`, or `[boxes.default]` with
@@ -806,12 +805,21 @@ pub(crate) fn plan_start(
             args.ingress.clone_from(&overrides.ingress);
             args.egress.clone_from(&overrides.egress);
             args.loadout.clone_from(&overrides.loadout);
+            // BCLI-075, BCLI-076: the rest of activate's override flags.
+            let other = &overrides.other;
+            args.dynamic_ingress = other.dynamic_ingress;
+            args.dynamic_range = other.dynamic_range;
+            args.credentialed_upstream = other.credentialed_upstream;
+            args.no_loadouts = other.no_loadouts;
+            args.no_hooks = other.no_hooks;
             Ok(StartPlan::Session {
                 options: ActivationOptions {
                     offer_scaffold: false,
                     entry: Some(entry.name.clone()),
                     box_name: start.name.clone(),
                     fresh_instance: start.new,
+                    quic443: other.quic443,
+                    vpn_network_names: other.vpn_network_names.clone(),
                 },
                 entry: entry.name,
                 args,
@@ -862,6 +870,7 @@ pub(crate) fn plan_start(
                 args: Vec::new(),
                 network: start.overrides.network,
                 egress: start.overrides.egress.clone(),
+                other: start.overrides.other.clone(),
             },
             entry: entry.name,
         }),
@@ -953,6 +962,7 @@ pub async fn start_entry(global: &GlobalArgs, start: StartEntry) -> Result<(), a
         ingress = ?start.overrides.ingress,
         egress = ?start.overrides.egress,
         loadouts = ?start.overrides.loadout,
+        other_overrides = ?start.overrides.other,
         "starting a box from the entry"
     );
     match plan {
@@ -1000,6 +1010,12 @@ pub struct ActivationOptions {
     pub box_name: Option<String>,
     /// Ask for a fresh instance, `<name>-<n>` (BCLI-070).
     pub fresh_instance: bool,
+    /// The `--quic443` of a start (BCLI-024). `min session activate` does
+    /// not take the flag.
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// The `--vpn-network-names` of a start (BCLI-024). `min session
+    /// activate` does not take the flag.
+    pub vpn_network_names: Vec<String>,
 }
 
 impl From<bool> for ActivationOptions {
@@ -1383,6 +1399,158 @@ fn entry_egress(
         mode,
         layer: Some(layer),
     })
+}
+
+/// The expanded session entry of the project at `project`, for the daemon
+/// to compose the box from (BOX-068). `entry` names the entry. With no
+/// name, the session entry pick applies, and the implicit `default` entry
+/// answers a project that declares none (BOX-165).
+///
+/// `None` for a project with no `minimal.toml`. The daemon then composes
+/// from what it reads itself, as it did before entries.
+///
+/// # Errors
+///
+/// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
+/// Fails with [`SessionEntryUndecided`] (exit 2) when no single session
+/// entry can be picked.
+pub(crate) fn session_box_entry(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    hooks_enabled: bool,
+) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
+    let Some(bytes) = project_file_bytes(project)? else {
+        return Ok(None);
+    };
+    let entries =
+        mfile::entry::read_entries(&bytes).map_err(|error| ProjectFileInvalid { error })?;
+    let typed = entry.and_then(|name| entries.iter().find(|entry| entry.name == name));
+    let picked = match typed {
+        Some(entry) => entry.clone(),
+        // An undecided pick refuses the start. It never falls back to the
+        // project's `[session]` table.
+        None => pick_session_entry(&entries)?,
+    };
+    box_entry(project, &bytes, picked, hooks_enabled).map(Some)
+}
+
+/// The expanded `[tasks.<task>]` entry of the project at `project`, for the
+/// daemon to compose the task box from (BOX-068). `None` when the project
+/// declares no such entry.
+///
+/// # Errors
+///
+/// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
+pub(crate) fn task_box_entry(
+    project: &camino::Utf8Path,
+    task: &str,
+    hooks_enabled: bool,
+) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
+    let Some(bytes) = project_file_bytes(project)? else {
+        return Ok(None);
+    };
+    let entries =
+        mfile::entry::read_entries(&bytes).map_err(|error| ProjectFileInvalid { error })?;
+    let Some(entry) = entries.into_iter().find(|entry| {
+        entry.name == task && entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE)
+    }) else {
+        return Ok(None);
+    };
+    box_entry(project, &bytes, entry, hooks_enabled).map(Some)
+}
+
+/// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
+/// `[defaults.<type>]` (BOX-048, BOX-064), with a legacy `[session]` table
+/// read as `[defaults.session]` (BOX-050), and takes the lists the daemon
+/// composes from the expanded spec.
+///
+/// A list the spec has no key for stays `None`. A task entry sends only
+/// `packages` and `lifecycle_hooks`. It sends no `vars`, `vars_lenient` or
+/// `patches`. `min task run` reads only the `[tasks.<name>]` table, so those
+/// keys from `[defaults]` and `[defaults.task]` do not reach a task box.
+/// gominimal/minimal#3266 tracks that gap. With hooks off (`--no-hooks`), no
+/// `lifecycle_hooks` list is sent.
+fn box_entry(
+    project: &camino::Utf8Path,
+    bytes: &[u8],
+    entry: mfile::entry::BoxEntry,
+    hooks_enabled: bool,
+) -> anyhow::Result<boxes::wire::request::WireBoxEntry> {
+    let format_error = |error| ProjectFileInvalid {
+        error: mfile::Error::Format(error),
+    };
+    let mut doc: toml::Table = toml::from_slice(bytes).map_err(format_error)?;
+    // The hint for a legacy table is printed when the file loads
+    // (`mfile::File`), so the hints this rewrite returns are not printed
+    // again.
+    mfile::legacy::canonicalize(&mut doc, mfile::legacy::this_release())
+        .map_err(|error| ProjectFileInvalid { error })?;
+    let defaults = doc
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let project_types: std::collections::BTreeSet<String> = doc
+        .get("box_types")
+        .and_then(toml::Value::as_table)
+        .map(|types| types.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut layers = mfile::expand::Layers::default().with_file_defaults(
+        &defaults,
+        entry.box_type.as_deref(),
+        &project_types,
+    );
+    // BOX-183, BOX-184: the merge compares resolved values, so each
+    // `inherit` name takes this process's value. A name it does not set
+    // stays out, and the merge falls back to the `default`.
+    // Gap (BOX-183, residual of T125, issue #3302): `layers.loadouts` stays
+    // empty here. So the loadout var conflict refusal in `merge_vars` does
+    // not run before `min box create`, `min session start` or `min task run`
+    // creates the box.
+    layers.host_vars = mfile::expand::inherited_var_names(&entry, &layers)
+        .into_iter()
+        .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
+        .collect();
+    let expansion =
+        mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
+    let spec = &expansion.spec;
+    fn list<T: serde::de::DeserializeOwned>(
+        spec: &toml::Table,
+        key: &str,
+    ) -> Result<Option<T>, toml::de::Error> {
+        spec.get(key)
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+    }
+    let box_type = entry
+        .box_type
+        .clone()
+        .unwrap_or_else(|| boxes::SESSION_BOX_TYPE.to_owned());
+    let project_path = paths::HostAbsPath::try_new(project.to_path_buf())
+        .context("Invalid project root")?
+        .into();
+    let mut wire = boxes::wire::request::WireBoxEntry::new(&entry.name, &box_type, project_path);
+    wire.packages = list(spec, "packages").map_err(format_error)?;
+    if hooks_enabled {
+        wire.lifecycle_hooks = list(spec, "lifecycle_hooks").map_err(format_error)?;
+    }
+    // A task entry sends no `vars`, `vars_lenient` or `patches`, so the
+    // `[defaults]` and `[defaults.task]` values for them do not reach the
+    // task box. gominimal/minimal#3266 tracks that gap.
+    if box_type != boxes::TASK_BOX_TYPE {
+        wire.vars = list(spec, "vars").map_err(format_error)?;
+        wire.vars_lenient = list(spec, "vars_lenient").map_err(format_error)?;
+        wire.patches = list(spec, "patches").map_err(format_error)?;
+    }
+    tracing::info!(
+        entry = %wire.name,
+        box_type = %wire.box_type,
+        implicit = entry.implicit,
+        packages = ?wire.packages,
+        "expanded the box's entry"
+    );
+    Ok(wire)
 }
 
 /// The refusal for a `[network]` key that the network module cannot read:
@@ -2554,6 +2722,52 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
+/// list of the spec on `request` (BCLI-024). A name the list already holds
+/// is not added again. The daemon stores the list with the box's spec, and
+/// does not enforce it (BOX-076). Nothing changes when `names` is empty.
+///
+/// # Errors
+///
+/// Fails when `names` is not empty and the request carries no spec, so a
+/// name is never dropped without a word. Fails too when the spec on
+/// `request` has a `network` that is not a table, or a
+/// `network.vpn_network_names` that is not a list.
+pub(crate) fn add_vpn_network_names(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    names: &[String],
+) -> Result<(), anyhow::Error> {
+    use serde_json_lenient::Value;
+    if names.is_empty() {
+        return Ok(());
+    }
+    let Some(spec) = request.spec.as_mut() else {
+        anyhow::bail!(
+            "Cannot use --vpn-network-names here: this box does not store a `[network]` \
+             section. Run the command again without --vpn-network-names."
+        );
+    };
+    let network = spec
+        .as_object_mut()
+        .context("The box spec is not a table")?
+        .entry("network")
+        .or_insert_with(|| Value::Object(serde_json_lenient::Map::new()))
+        .as_object_mut()
+        .context("The box spec's network is not a table")?;
+    let list = network
+        .entry("vpn_network_names")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("The box spec's network.vpn_network_names is not a list")?;
+    for name in names {
+        let value = Value::String(name.clone());
+        if !list.contains(&value) {
+            list.push(value);
+        }
+    }
+    Ok(())
+}
+
 /// Marks `request` as a fresh instance (BCLI-070, BOX-163). The daemon
 /// names the box `<name>-<n>`, with the smallest `n` no retained box uses,
 /// and never refuses it for a held name. The client invents no name, so the
@@ -3069,7 +3283,8 @@ pub(crate) async fn activate_box(
                 // BEP-018: the declared stance is a setting of every box, lane
                 // or not, so a declared `block` reaches the gate of a box with
                 // no credentialed upstream.
-                quic443: project_quic443,
+                // BCLI-024: `--quic443` replaces the declared stance.
+                quic443: options.quic443.or(project_quic443),
                 ..network_override_policy(&args, port_mappings, egress.policy)
             };
 
@@ -3243,6 +3458,16 @@ pub(crate) async fn activate_box(
         })
         .await?;
 
+    // BOX-068: the box's expanded entry rides on the contribution, and the
+    // daemon composes the project's part of the box from it. One span
+    // covers the expansion and the compose call that sends it.
+    use tracing::Instrument as _;
+    let entry_span = tracing::info_span!("box_entry", box_type = boxes::SESSION_BOX_TYPE);
+    let mut contribution = contribution;
+    contribution.entry = entry_span
+        .in_scope(|| session_box_entry(&project_root, options.entry.as_deref(), !args.no_hooks))?
+        .map(Box::new);
+
     // The upload decision needs no TTY — the interactive `Confirm` is answered
     // at the upload step, once the session exists — so it is resolved here,
     // still before the create. A `$HOME` whose lifecycle hooks a skip would
@@ -3258,6 +3483,7 @@ pub(crate) async fn activate_box(
                 options.entry.as_deref(),
                 options.box_name.as_deref(),
             )?;
+            add_vpn_network_names(&mut request, &options.vpn_network_names)?;
 
             let Some(root) = upload_root else {
                 return Ok::<_, anyhow::Error>(UploadPlan::Skip);
@@ -4008,6 +4234,7 @@ pub(crate) async fn activate_box(
                     session_id: id,
                     contribution,
                 })
+                .instrument(entry_span.clone())
                 .await;
             let configured = match configured {
                 // A transport failure abandons the activation and its row (T66).

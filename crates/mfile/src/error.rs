@@ -54,6 +54,21 @@ pub enum Error {
     /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
     /// the task name. Exits 3.
     InteractiveTask(String),
+    /// A selected loadout sets a variable to a resolved value other than
+    /// the one the layers up to and including the entry, or another
+    /// selected loadout, give it (BOX-183). Carries the variable and the
+    /// two sources, as the message names them. Exits 3.
+    LoadoutVarConflict {
+        name: String,
+        first: String,
+        second: String,
+    },
+    /// One layer sets a variable twice, to different values (BOX-184).
+    /// Carries the variable and the layer, as the message names it. Exits 3.
+    DuplicateVar {
+        name: String,
+        layer: String,
+    },
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -69,6 +84,12 @@ pub enum SpecKeyProblem {
     WrongShape {
         expected: &'static str,
         found: &'static str,
+    },
+    /// The value is a string, but not one the key accepts. Carries the
+    /// value the layer wrote and the values the key accepts, in order.
+    UnknownValue {
+        found: String,
+        accepted: &'static [&'static str],
     },
 }
 
@@ -120,7 +141,9 @@ impl Error {
             Error::InvalidEntryName { .. }
             | Error::InvalidSpecKey { .. }
             | Error::LegacyTable { .. }
-            | Error::InteractiveTask(_) => Some(3),
+            | Error::InteractiveTask(_)
+            | Error::LoadoutVarConflict { .. }
+            | Error::DuplicateVar { .. } => Some(3),
             _ => None,
         }
     }
@@ -132,6 +155,8 @@ impl fmt::Display for Error {
             Error::IO(ctx, path, e) => {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
+            // `Display` carries the parse error and `source()` returns none,
+            // so `{}` and `{:#}` each print its snippet once.
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
             Error::LinkConfig {
                 path, line, table, ..
@@ -242,6 +267,15 @@ impl fmt::Display for Error {
                     "{layer} sets `{key}` to {found}, but `{key}` takes \
                      {expected}. Fix the value."
                 ),
+                SpecKeyProblem::UnknownValue { found, accepted } => {
+                    let accepted: Vec<String> = accepted.iter().map(|a| format!("`{a}`")).collect();
+                    write!(
+                        f,
+                        "{layer} sets `{key}` to {found:?}. `{key}` accepts only \
+                         {}. Fix the value.",
+                        accepted.join(" or ")
+                    )
+                }
             },
             Error::LegacyTable { path, legacy } => {
                 match path {
@@ -261,6 +295,23 @@ impl fmt::Display for Error {
                 EntryHeader("tasks", name),
                 EntryHeader("sessions", name)
             ),
+            Error::LoadoutVarConflict {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "The variable `{name}` has two different values. {first} sets one \
+                 value, and {second} sets the other. A loadout cannot change a \
+                 variable that is already set. Remove `{name}` from one of them, \
+                 or add `{name}` to the `ignore` list under `[vars]` in \
+                 user_policy.toml to drop every value of `{name}`."
+            ),
+            Error::DuplicateVar { name, layer } => write!(
+                f,
+                "{layer} sets the variable `{name}` twice, to different values. \
+                 Remove one of the two settings."
+            ),
         }
     }
 }
@@ -269,7 +320,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::IO(_, _, e) => Some(e),
-            Error::Format(e) => Some(e),
+            // `Display` carries the parse error, so a chain printer such as
+            // `{:#}` prints it once.
+            Error::Format(_) => None,
             // The serde error only restates serde's internal enum name,
             // which the Display above replaces; it stays for Debug.
             Error::LinkConfig { .. } => None,
@@ -282,6 +335,40 @@ impl std::error::Error for Error {
             Error::InvalidSpecKey { .. } => None,
             Error::LegacyTable { .. } => None,
             Error::InteractiveTask(_) => None,
+            Error::LoadoutVarConflict { .. } => None,
+            Error::DuplicateVar { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::error::Error as _;
+
+    /// Renders an error the way anyhow's `{:#}` does: the error, then each
+    /// cause in its `source()` chain, joined with `": "`.
+    fn render_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut out = e.to_string();
+        let mut cur = e.source();
+        while let Some(cause) = cur {
+            out.push_str(": ");
+            out.push_str(&cause.to_string());
+            cur = cause.source();
+        }
+        out
+    }
+
+    #[test]
+    fn format_error_display_carries_toml_error_once() {
+        let err = crate::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("an unterminated table header must not parse");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+        let shown = err.to_string();
+        assert_eq!(shown.matches("TOML parse error").count(), 1, "{shown}");
+        assert_eq!(shown.matches("[boxes.dev").count(), 1, "{shown}");
+        assert!(err.source().is_none());
+        let chained = render_chain(&err);
+        assert_eq!(chained.matches("TOML parse error").count(), 1, "{chained}");
     }
 }

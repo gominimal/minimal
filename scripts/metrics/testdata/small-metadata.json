@@ -1,0 +1,93 @@
+{
+ "packages": [
+  {
+   "name": "graph",
+   "id": "path+file:///x/crates/graph#graph@0.1.0",
+   "manifest_path": "/x/crates/graph/Cargo.toml",
+   "description": "graph",
+   "dependencies": [
+    {
+     "name": "decode",
+     "kind": null
+    },
+    {
+     "name": "common",
+     "kind": null
+    }
+   ],
+   "targets": [
+    {
+     "kind": [
+      "lib"
+     ],
+     "name": "graph"
+    }
+   ]
+  },
+  {
+   "name": "decode",
+   "id": "path+file:///x/crates/decode#decode@0.1.0",
+   "manifest_path": "/x/crates/decode/Cargo.toml",
+   "description": "decode",
+   "dependencies": [
+    {
+     "name": "common",
+     "kind": null
+    },
+    {
+     "name": "graph",
+     "kind": "dev"
+    }
+   ],
+   "targets": [
+    {
+     "kind": [
+      "lib"
+     ],
+     "name": "decode"
+    }
+   ]
+  },
+  {
+   "name": "common",
+   "id": "path+file:///x/crates/common#common@0.1.0",
+   "manifest_path": "/x/crates/common/Cargo.toml",
+   "description": "common",
+   "dependencies": [],
+   "targets": [
+    {
+     "kind": [
+      "lib"
+     ],
+     "name": "common"
+    }
+   ]
+  },
+  {
+   "name": "mip",
+   "id": "path+file:///x/crates/mip#mip@0.1.0",
+   "manifest_path": "/x/crates/mip/Cargo.toml",
+   "description": "mip",
+   "dependencies": [
+    {
+     "name": "graph",
+     "kind": null
+    }
+   ],
+   "targets": [
+    {
+     "kind": [
+      "bin"
+     ],
+     "name": "mip"
+    }
+   ]
+  }
+ ],
+ "workspace_members": [
+  "path+file:///x/crates/graph#graph@0.1.0",
+  "path+file:///x/crates/decode#decode@0.1.0",
+  "path+file:///x/crates/common#common@0.1.0",
+  "path+file:///x/crates/mip#mip@0.1.0"
+ ]
+}

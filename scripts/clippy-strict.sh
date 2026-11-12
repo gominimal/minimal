@@ -61,32 +61,23 @@ lints=(
     clippy::allow_attributes_without_reason
 )
 
+# Resolved before the cd: `$0` may be relative to where the caller stood.
+here="$(cd "$(dirname "$0")" && pwd)"
 cd "$(git rev-parse --show-toplevel)"
+
+# The base ref, the changed lines and the changed crates come from the library
+# the metrics grader (scripts/metrics/run.sh) shares with this gate, so the two
+# agree on which lines are the branch's own. The library's comments say why
+# the default base is `origin/main` and not the local `main`. lint-shell.sh
+# checks the library as a script of its own, so it is not followed from here.
+# shellcheck disable=SC1091
+. "$here/lib/changed-lines.sh"
 
 base="${1:-}"
 if [ "$#" -gt 0 ]; then
     shift
 fi
-if [ -z "$base" ]; then
-    # `origin/main`, not the local `main`. A branch that merges `origin/main`
-    # leaves the local ref where it was — agent sandboxes and worktrees never
-    # check main out at all — and the merge-base against a ref that stale
-    # predates the main commits the branch merged in, so every line of those
-    # commits reads as a line this branch changed. The gate then reports
-    # diagnostics on other people's code, under a heading saying they are
-    # yours. That is what it looked like: on the branch adding this comment,
-    # a local `main` ten commits behind turned a change touching no Rust at
-    # all into 14 changed Rust files across `minimald`, `sessions` and
-    # `switch`.
-    #
-    # The remote ref is the safe one by construction: `origin/main` cannot be
-    # behind anything the branch merged, because merging it required fetching
-    # it first, and a fetch only moves it forward. Stale means the base is
-    # merely older than the newest main, never older than this branch's own
-    # first commit. The local ref is kept as a fallback for a clone with no
-    # remote.
-    base="$(git merge-base origin/main HEAD 2>/dev/null || git merge-base main HEAD)"
-fi
+base="$(changed_lines_base "$base")"
 
 explicit_scope=("$@")
 
@@ -101,41 +92,25 @@ err_file="$(mktemp)"
 untracked_file="$(mktemp)"
 trap 'rm -f "$diff_file" "$out_file" "$err_file" "$untracked_file"' EXIT
 
-# Changed lines in the new revision, as "path<TAB>start<TAB>end" (1-based,
-# inclusive). -U0 gives one hunk per contiguous edit; a zero-length new range is
-# a pure deletion, which has no lines to report on. The comparison is against
-# the working tree, not HEAD: this gate is meant to run before committing, so an
-# uncommitted edit has to count. Diffing from the merge-base keeps the base
-# branch's own commits out of the comparison.
-# --no-ext-diff/--no-textconv keep this parseable when a developer has a diff
-# renderer (e.g. difftastic) or textconv configured, which would otherwise
-# replace the hunk headers.
+# Changed lines in the new revision (a -U0 diff against the working tree, so an
+# uncommitted edit counts; changed-lines.sh says why) plus the untracked Rust
+# files, which the diff cannot see.
 merge_base="$(git merge-base "$base" HEAD)"
-git diff -U0 --no-color --no-ext-diff --no-textconv --diff-filter=d \
-    "$merge_base" -- '*.rs' > "$diff_file"
-
-# A brand-new file is untracked, so it does not appear in the diff above.
-git ls-files --others --exclude-standard -- '*.rs' > "$untracked_file"
+changed_lines_diff "$merge_base" "$diff_file"
+changed_lines_untracked "$untracked_file"
 
 if [ ! -s "$diff_file" ] && [ ! -s "$untracked_file" ]; then
     echo "clippy-strict: no Rust changes since ${base}"
     exit 0
 fi
 
-# The crates the changed files belong to, one name per line out of
-# `crates/<name>/...` with other paths ignored. This drives the scope, and it
-# also lets the gate say what a pinned scope leaves out. Deleted paths are
-# filtered out, or a crate the branch removed would reach `cargo clippy -p` and
-# fail the run before the remaining change was checked. Selecting crates is the
-# difference between a few minutes and a cold workspace build; `-p` still checks
-# every dependency of those crates, so a warning in a shared crate is caught.
-# Paths outside `crates/` leave the list empty, which falls back to the
-# workspace.
-# shellcheck disable=SC2086
-changed_crates=$( { git diff --name-only --no-ext-diff --diff-filter=d \
-                        "$merge_base" -- '*.rs'
-                    cat "$untracked_file"; } \
-    | sed -n 's|^crates/\([^/][^/]*\)/.*|\1|p' | sort -u )
+# The crates the changed files belong to, one name per line. This drives the
+# scope, and it also lets the gate say what a pinned scope leaves out.
+# Selecting crates is the difference between a few minutes and a cold
+# workspace build; `-p` still checks every dependency of those crates, so a
+# warning in a shared crate is caught. Paths outside `crates/` leave the list
+# empty, which falls back to the workspace.
+changed_crates=$(changed_crates "$merge_base" "$untracked_file")
 
 # An explicit scope wins: macOS pins one because the Linux-only crates do not
 # build there.
@@ -186,53 +161,22 @@ fi
 # it — and is said as such rather than read as clean.
 HITS_EXIT=2
 hits_status=0
-python3 - "$HITS_EXIT" "$out_file" "$diff_file" "$untracked_file" "${lints[@]}" <<'PY' || hits_status=$?
+python3 - "$HITS_EXIT" "$out_file" "$diff_file" "$untracked_file" "$here/metrics" "${lints[@]}" <<'PY' || hits_status=$?
 import json
 import sys
 
 hits_exit = int(sys.argv[1])
 out_path, diff_path, untracked_path = sys.argv[2], sys.argv[3], sys.argv[4]
-strict = set(sys.argv[5:])
+# The range parsing is shared with the metrics grader (changed_lines.py), so
+# the two gates agree on which lines are the branch's own.
+sys.path.insert(0, sys.argv[5])
+import changed_lines  # noqa: E402
 
-# path -> [(start, end)] of lines added or changed in the new revision.
-changed = {}
-current = None
-for raw in open(diff_path, encoding="utf-8", errors="replace"):
-    if raw.startswith("+++ "):
-        target = raw[4:].strip()
-        current = None if target == "/dev/null" else (
-            target[2:] if target.startswith("b/") else target)
-        if current is not None:
-            changed.setdefault(current, [])
-    elif raw.startswith("@@") and current is not None:
-        try:
-            plus = raw.split("+", 1)[1].split("@@", 1)[0].strip()
-            start, _, count = plus.partition(",")
-            start = int(start)
-            count = int(count) if count else 1
-        except (IndexError, ValueError):
-            continue
-        if count > 0:
-            changed[current].append((start, start + count - 1))
+strict = set(sys.argv[6:])
 
-# Every line of an untracked file is new.
-for raw in open(untracked_path, encoding="utf-8", errors="replace"):
-    path = raw.strip()
-    if path:
-        changed[path] = [(1, sys.maxsize)]
-
-
-def ranges_for(path):
-    ranges = changed.get(path)
-    if ranges:
-        return ranges
-    # Clippy's paths are workspace-relative in practice; fall back to a suffix
-    # match in case a crate reports a package-relative path.
-    for known, known_ranges in changed.items():
-        if path.endswith("/" + known) or known.endswith("/" + path):
-            return known_ranges
-    return None
-
+# path -> [(start, end)] of lines added or changed in the new revision; every
+# line of an untracked file is new.
+changed = changed_lines.parse_ranges(diff_path, untracked_path)
 
 hits = []
 seen = set()
@@ -262,8 +206,7 @@ for raw in open(out_path, encoding="utf-8", errors="replace"):
     line = span.get("line_start")
     if line is None:
         continue
-    ranges = ranges_for(path)
-    if not ranges or not any(start <= line <= end for start, end in ranges):
+    if not changed_lines.in_ranges(changed, path, line):
         continue
     if (path, line, code) in seen:
         continue

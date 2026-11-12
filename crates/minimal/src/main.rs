@@ -294,6 +294,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
         return minimal::BoxRenameRefusal::EXIT_CODE;
     }
+    // BCLI-074: `min box restart` refused, such as for a box that runs to
+    // completion (exit 2). The refusal carries its own code, never 0.
+    if let Some(refusal) = e.downcast_ref::<minimald_rpc::RestartRefusal>() {
+        return refusal.exit_code.max(1);
+    }
     // BCLI-005: `min box prune` off a terminal without `--yes`.
     if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
         return minimal::PruneNeedsYes::EXIT_CODE;
@@ -323,6 +328,14 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
         return 3;
     }
+    // BCLI-019, BCLI-020: `min type` of a project whose box types do not
+    // load exits 3, and `min type show` of a name that is no type exits 4.
+    if e.downcast_ref::<minimal::BoxTypesInvalid>().is_some() {
+        return minimal::BoxTypesInvalid::EXIT_CODE;
+    }
+    if e.downcast_ref::<minimal::BoxTypeNotFound>().is_some() {
+        return minimal::BoxTypeNotFound::EXIT_CODE;
+    }
     // BEP-007: a GitHub grant the box cannot receive in its environment.
     if e.downcast_ref::<minimal::GrantNotDelivered>().is_some() {
         return 3;
@@ -341,7 +354,8 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
     }
-    // BCLI-068: `min box attach` refused, or its connection failed.
+    // BCLI-068, BCLI-007, BCLI-009, BCLI-032: `min box attach`, `min box
+    // resume` or `min session attach` refused, or its connection failed.
     if let Some(refused) = e.downcast_ref::<minimal::BoxAttachRefusal>() {
         return refused.exit_code();
     }
@@ -459,6 +473,14 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             code,
             format!("{e:#}"),
             hint,
+        ));
+    }
+    // BCLI-020: `min type show` of a name that is no type is `not_found`.
+    if e.downcast_ref::<minimal::BoxTypeNotFound>().is_some() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            "not_found",
+            format!("{e:#}"),
+            minimal::BoxTypeNotFound::HINT.to_string(),
         ));
     }
     // BCLI-053: an exec that its own timeout ended is `timeout`.
@@ -639,6 +661,13 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Events(args),
         })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
+        // BCLI-019, BCLI-020: `min type list|show -o json|yaml|toml`.
+        Some(minimal::Command::Type(minimal::TypeArgs {
+            command: minimal::TypeCommand::List(minimal::TypeListArgs { output }),
+        })) => output.is_some(),
+        Some(minimal::Command::Type(minimal::TypeArgs {
+            command: minimal::TypeCommand::Show(args),
+        })) => args.output.is_some(),
         _ => false,
     }
 }
@@ -673,6 +702,50 @@ mod tests {
     use super::*;
     use minimal::Command;
 
+    /// BCLI-019, BCLI-020: `min type` exits 3 when the project's box types
+    /// do not load, and 4 for a name that is no type. Its `-o` forms are a
+    /// machine mode, and the unknown name is `not_found` there.
+    #[test]
+    fn type_refusals_exit_3_and_4() {
+        let parse = toml::from_str::<toml::Table>("[").unwrap_err();
+        let invalid = anyhow::Error::new(minimal::BoxTypesInvalid {
+            doing: "list the box types",
+            cause: minimal::BoxTypesCause::Parse {
+                path: "minimal.toml".into(),
+                error: parse,
+            },
+        });
+        assert_eq!(failure_exit_code(&invalid), 3);
+        let not_found = anyhow::Error::new(minimal::BoxTypeNotFound {
+            name: "nope".to_owned(),
+        });
+        assert_eq!(failure_exit_code(&not_found), 4);
+        let MachineModeAnswer::Object(failure) = machine_mode_answer(&not_found) else {
+            panic!("a not-found refusal is an error object");
+        };
+        assert_eq!(failure.code(), "not_found");
+
+        for (output, machine) in [(Some(minimal::TypeOutputFormat::Yaml), true), (None, false)] {
+            let list = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Type(minimal::TypeArgs {
+                    command: minimal::TypeCommand::List(minimal::TypeListArgs { output }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&list), machine);
+            let show = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Type(minimal::TypeArgs {
+                    command: minimal::TypeCommand::Show(minimal::TypeShowArgs {
+                        name: "session".to_owned(),
+                        output,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&show), machine);
+        }
+    }
+
     /// A bare `min` (no subcommand) keeps stdout clean: the non-TTY twin
     /// promises pipelines an empty stdout, so its tracing must go to stderr.
     #[test]
@@ -703,6 +776,7 @@ mod tests {
                 path: None,
                 network: None,
                 egress: minimal::EgressArgs::default(),
+                other: minimal::BoxOverrideArgs::default(),
                 detach: false,
                 args: vec![],
             }),
@@ -1418,6 +1492,57 @@ mod tests {
         }
     }
 
+    /// BCLI-007, BCLI-009, BCLI-032: the refusals of `min box resume` and
+    /// `min session attach` end the run with their exit codes.
+    #[test]
+    fn resume_and_session_attach_refusals_map_to_exit_codes() {
+        let id = boxes::SessionId::parse_str("0199f000-0000-7000-8000-000000000001").unwrap();
+        for (refusal, code) in [
+            (
+                minimal::BoxAttachRefusal::NoTerminalToResume {
+                    address: "web".to_owned(),
+                    until_stopped: true,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NotResumable {
+                    address: "web".to_owned(),
+                    state: "running".to_owned(),
+                    pty_enabled: true,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NotResumable {
+                    address: "web".to_owned(),
+                    state: "running".to_owned(),
+                    pty_enabled: false,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NameHeld {
+                    address: "web".to_owned(),
+                    name: "web".to_owned(),
+                    holder: id,
+                    box_id: id,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::AmbiguousSessions {
+                    candidates: Vec::new(),
+                },
+                2,
+            ),
+            (minimal::BoxAttachRefusal::NoSessionCandidate, 4),
+        ] {
+            let err = anyhow::Error::new(refusal);
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
     /// #1790: a VM host that could not be reached ends the run with 7 —
     /// provider/host unreachable — found through every context the
     /// activation adds over it, and a machine-mode run answers it with the
@@ -1534,6 +1659,51 @@ mod tests {
         };
         let e = anyhow::Error::new(invalid).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// An invalid project `minimal.toml` that does not parse prints its TOML
+    /// parse error once, and the run ends with exit 3.
+    #[test]
+    fn invalid_project_file_prints_toml_error_once() {
+        let error = mfile::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("the file does not parse");
+        assert!(matches!(error, mfile::Error::Format(_)), "{error:?}");
+        let e = anyhow::Error::new(minimal::ProjectFileInvalid { error })
+            .context("activating the session");
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(
+            printed.contains(
+                "Cannot start the box: the project's minimal.toml does not load: \
+                 invalid TOML: TOML parse error"
+            ),
+            "{printed}"
+        );
+        assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
+        assert_eq!(printed.matches("invalid TOML").count(), 1, "{printed}");
+        assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
+    }
+
+    /// A project `minimal.toml` that cannot be read prints its io error
+    /// once, and the run ends with exit 3.
+    #[test]
+    fn invalid_project_file_prints_toml_error_once_for_io() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied here");
+        let error = mfile::Error::IO("minimal file", "/p/minimal.toml".into(), io);
+        let e = anyhow::Error::new(minimal::ProjectFileInvalid { error })
+            .context("activating the session");
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(printed.contains("/p/minimal.toml"), "{printed}");
+        assert_eq!(
+            printed.matches("access denied here").count(),
+            1,
+            "{printed}"
+        );
     }
 
     /// A broken pipe anywhere in the error chain is classified as such, so

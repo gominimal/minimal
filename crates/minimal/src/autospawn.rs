@@ -60,8 +60,20 @@ const BOOT_NARRATION: &str = "Starting the Minimal VM (first run only, ~1 min)â€
 /// The actionable error for a failed or timed-out `minvmd run --detach`: it
 /// names the daemon, tells the user to retry, and points at `min bug` for a
 /// diagnostic bundle. `stderr` is minvmd's own captured failure output.
+/// When it carries the proxy's refusal over an unreadable audit log, the
+/// error keeps that whole refusal, with its `--quarantine-unreadable` step,
+/// and asks for that step before a retry: a bare retry meets the same
+/// refusal.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn boot_failure_error(stderr: &str) -> io::Error {
+    if stderr.contains(bep::UNREADABLE_AUDIT_LOG_REFUSAL) {
+        return io::Error::other(format!(
+            "the Minimal VM (minvmd) failed to start: {}\n\
+             Do the `--quarantine-unreadable` step above, then re-run your command. \
+             If it keeps failing, run `min bug` to collect a diagnostic bundle.",
+            stderr.trim()
+        ));
+    }
     io::Error::other(format!(
         "the Minimal VM (minvmd) failed to start: {}. Re-run your command to retry; \
          if it keeps failing, run `min bug` to collect a diagnostic bundle.",
@@ -485,6 +497,26 @@ mod tests {
             "points at the diagnostic bundle: {msg}"
         );
         assert!(msg.contains("Re-run"), "suggests retrying: {msg}");
+    }
+
+    /// D1229: minvmd's report of the proxy's unreadable audit log refusal
+    /// reaches the user whole, with the step that names the flag.
+    #[test]
+    fn boot_failure_error_keeps_the_quarantine_step() {
+        let stderr = format!(
+            "Error: the detached supervisor exited during startup (exit status: 1).\n\
+             {}\nTo move that segment into /a/quarantine and start, \
+             run `bep serve` again with `--quarantine-unreadable`.\n",
+            bep::UNREADABLE_AUDIT_LOG_REFUSAL
+        );
+        let msg = boot_failure_error(&stderr).to_string();
+        assert!(msg.contains(bep::UNREADABLE_AUDIT_LOG_REFUSAL), "{msg}");
+        assert!(
+            msg.contains("run `bep serve` again with `--quarantine-unreadable`"),
+            "{msg}"
+        );
+        assert!(!msg.contains("Re-run your command to retry"), "{msg}");
+        assert!(msg.contains("min bug"), "{msg}");
     }
 
     /// The state dir a `--minimal-dir` override resolves to.

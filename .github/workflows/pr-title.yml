@@ -1,0 +1,45 @@
+name: PR title
+
+on:
+  pull_request:
+    branches: ["main", "release/**"]
+    types: [opened, edited, reopened, synchronize]
+  merge_group:
+    branches: ["main", "release/**"]
+
+permissions: {}
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # A squash merge lands the title as the subject, and next-version.sh
+      # reads the bump from subjects. Not commitlint: subject-case refuses the
+      # capital in `feat(boxes): T102 — Add a thing`. Types match
+      # commitlint.config.cjs.
+      #
+      # A merge group has no PR title, so this step skips and the job passes.
+      # The title was linted before the PR queued, and a required check that
+      # never reports on the group stalls the queue.
+      - name: Check the title
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^()]+\))?!?: [^[:space:]]'
+          if [[ ! "$TITLE" =~ $re ]]; then
+            echo "::error::Use a Conventional Commit subject: fix(boxes): summary, or feat(boxes): T102 — summary. A title from the Revert button needs retitling to revert: summary. See docs/commit-conventions.md."
+            exit 1
+          fi
+          # Length warns and never fails: about a third of agent titles would
+          # go over, and nothing that reads subjects needs a cap. 92 leaves
+          # room for the ` (#1234)` GitHub appends, so the subject on main
+          # stays near commitlint's 100.
+          if (( ${#TITLE} > 92 )); then
+            echo "::warning::This title is ${#TITLE} characters. Aim for 92 or fewer, so the squash subject on main stays near 100. Not required."
+          fi

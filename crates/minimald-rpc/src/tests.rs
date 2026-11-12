@@ -2178,6 +2178,7 @@ fn reap_and_prune_requests_round_trip() {
         exit_code: None,
         signal: Some(15),
         pty_enabled: false,
+        lifetime: None,
         build_boxes: Vec::new(),
     };
     let reap = ReapBoxResponse {
@@ -2230,6 +2231,7 @@ fn preview_prune_and_show_disk_round_trip() {
         exit_code: Some(0),
         signal: None,
         pty_enabled: true,
+        lifetime: None,
         build_boxes: Vec::new(),
     };
     let preview = PreviewPruneResponse {

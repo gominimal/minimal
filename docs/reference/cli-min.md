@@ -41,10 +41,10 @@ These apply to every subcommand.
 
 ## Commands
 
-### `session list` (aliases: `min ls`, `min session ls`)
+### `ls`
 
 ```
-min session list [--raw] [--json]
+min ls [--raw] [--json]
 ```
 
 Lists sessions. `--raw` prints raw session IDs one per line for piping
@@ -87,10 +87,22 @@ per such port after the table:
 With `--json` the entry lists those ports under `shared_port_collisions`,
 each with `port` and `held_by`, and the key is absent when there are none.
 
-`min ls` is the same command kept bare at the top level — a deliberate
-exception to the `min <noun> <verb>` convention, since it is the
-highest-traffic command in the CLI; `min session ls` is the noun-level alias.
-All three spellings take the same flags and produce identical output.
+`min ls` stays bare at the top level. It is a deliberate exception to the
+`min <noun> <verb>` convention, because it is the highest-traffic command in
+the CLI and scripts read its `--raw` output. It is not an alias of
+`min session list`.
+
+### `session list` (alias: `min session ls`)
+
+```
+min session list [--all] [-o json]
+```
+
+Lists the session boxes of the current project, in any state. It is
+`min box list` limited to session boxes, with the same columns and the same
+flags. `--all` lists the session boxes of every project. `-o json` writes the
+boxes as one JSON array. It does not take `--raw` or `--json`. Use `min ls`
+for those.
 
 ### `dash`
 
@@ -224,7 +236,14 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box is `host_ip` |
 | `--ingress <EXT:INT[/PROTO]>` | Override of the entry's `network.ingress`: each use adds one port mapping, `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Requires `--network own_ip` |
 | `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | Overrides of the entry's `network.egress` keys, as on [`session activate`](#session-activate): a list flag adds to the entry's list, `--allow-protocols` replaces it, and `--deny-all-egress` empties the allow lists |
+| `--dynamic-ingress <allow\|ask\|deny>` | Override of the entry's `network.dynamic_ingress`: the stance that decides the box's own requests to publish a port, as on [`session activate`](#session-activate). Requires `--network own_ip` |
+| `--dynamic-range <LO-HI>` | Override of the port range in the entry's `network.ingress` inside which `--dynamic-ingress allow` publishes, as on [`session activate`](#session-activate). Requires `--dynamic-ingress` |
+| `--credentialed-upstream` | Declare a credentialed upstream for the box, so the box can reach the Box Egress Proxy, as on [`session activate`](#session-activate). Without the flag, the box has one only when `minimal.toml` grants it a secret through the proxy |
+| `--quic443 <auto\|block\|allow>` | Override of the entry's `network.quic443`: whether the box can send UDP to port 443, the traffic of HTTP/3. `block` always blocks it, `allow` always allows it, and `auto` blocks it only when the box has a credentialed upstream. `min session activate` does not take this flag |
+| `--vpn-network-names <NAME>` | Adds a name to the box's `network.vpn_network_names`. Repeatable. The box keeps the names, but `minimald` does not connect the box to a VPN yet. `min session activate` does not take this flag |
 | `--loadout <NAME>` | Apply the named loadout. Repeatable. With any `--loadout`, the config file's `default_loadouts` are not applied |
+| `--no-loadouts` | Apply no loadouts, and not the config file's `default_loadouts` either. Cannot be combined with `--loadout` |
+| `--no-hooks` | Run none of the box's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from the loadouts or from `minimal.toml`. The box keeps hooks off, so the choice also holds when the box is attached or detached, and when it ends |
 
 Each override flag changes only the key it names. The other
 `network.egress` keys of the entry stay as the entry declares them. A session
@@ -234,9 +253,14 @@ result: `min box show <box> --network` prints the `[network]` section that
 the box was created with.
 
 `min box start [ENTRY]` takes the same flags. For a task entry, it takes
-`--network` and the egress flags, and with no `--network` the box takes the
-entry's `network.mode`. A task entry refuses `--ingress` and `--loadout` with
-exit code 2.
+every flag in the table except `--ingress` and `--loadout`, and with no
+`--network` the box takes the entry's `network.mode`. A task entry refuses
+`--ingress` and `--loadout` with exit code 2.
+
+`min task run <task>` and `min box run <entry>` take the same flags as a
+task entry's start: `--network`, the egress flags, `--dynamic-ingress`,
+`--dynamic-range`, `--credentialed-upstream`, `--quic443`,
+`--vpn-network-names`, `--no-loadouts` and `--no-hooks`. Put them before the task's first argument.
 
 Without `ENTRY`, the command starts the session entry named `default`. When
 no session entry has that name, it starts the project's only session entry. A
@@ -255,6 +279,7 @@ The command refuses these starts before it creates a box:
 | Without `ENTRY`: no session entry, and an entry of another type is named `default` | 2 |
 | An entry in `minimal.toml` has a type that is not built in, or a `[boxes.<name>]` entry has no `type`. The command refuses only when `ENTRY` names that entry, or when the start must count the entries to pick one | 2 |
 | No terminal, and no `--detach` | 2 |
+| `--no-loadouts` and `--loadout` together | 2 |
 | A running box holds the box's name. Pass `--new` or `--name` to create the box | 2 |
 
 An invalid `minimal.toml` ends the command with exit code 3.
@@ -592,13 +617,41 @@ and for a session nobody is attached to.
 ### `box spec`
 
 ```
-min box spec [--network <none|host_ip|own_ip>] [PATH]
+min box spec [OPTIONS] <ENTRY>
+min box spec [-o <toml|json|yaml>] <BOX>
+min box spec [--network <none|host_ip|own_ip>]
 ```
 
-Shows how the box that the project at `PATH` declares reaches GitHub through
-the local Box Egress Proxy. `PATH` defaults to `--repo-dir`, or to the current
-directory. The rows are the proxy's root certificate fingerprint, each secret
-with its hosts, the steering mode, and the UDP 443 stance.
+With an argument, the command reads it as an entry of the project's
+`minimal.toml`. When the project has no entry of that name, it reads the
+argument as a box address: an id, the start of an id, or a name, as
+`min box list` prints them. It never reads the argument as a directory. To
+use another project, give `--repo-dir <DIR>` (short `-C`).
+
+`min box spec <ENTRY>` shows the spec that `min box start <ENTRY>` sends to
+the host, before any box exists. A comment or a `sources` field names the
+layer that set each value. A secret shows only as its reference, never as its
+value. The output also names the loadouts that `min box start` applies. When
+the entry declares a broker secret, the Box Egress Proxy rows follow.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--output <toml\|json\|yaml>` | `-o` | The format of the spec. The default is `toml` |
+| `--network`, `--ingress`, `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | | Overrides of the entry's `[network]` keys, as on [`session start`](#session-start) |
+| `--loadout <NAME>` | | Apply the named loadout, as on [`session start`](#session-start). Repeatable |
+
+A task entry refuses `--ingress` and `--loadout` with exit code 2, as
+`min box start` does.
+
+`min box spec <BOX>` shows the spec that the box was created with, as its
+host stores it. It takes `-o` and no override flag. An override flag with a
+box gives exit code 2.
+
+`min box spec` with no argument shows how the box of the project reaches
+GitHub through the local Box Egress Proxy. The rows are the proxy's root
+certificate fingerprint, each secret with its hosts, the steering mode, and
+the UDP 443 stance. This form takes `--network` and no other override flag.
+Another override flag gives exit code 2.
 
 | Flag | Short | Description |
 |------|-------|-------------|
@@ -609,6 +662,36 @@ the same `--network` value refuses it for the same reason. For example, on a
 VM-backed host, `min box spec --network own_ip` accepts `steering = "both"`.
 With no `--network` flag, it refuses that spec because a `host_ip` box has no
 box DNS resolver, and `min session activate` with no flag refuses it too.
+
+### `type list` (alias: `ls`) and `type show`
+
+```
+min type list [-o json|yaml|toml]
+min type show <NAME> [-o json|yaml|toml]
+```
+
+`min type list` lists the box types that the project can use. These are the
+built-in types and each type of the project's `[box_types]` in
+`minimal.toml`. Each row shows the type's source, `builtin` or `project`, the
+type it extends, and the built-in type at the end of its chain.
+
+`min type show <NAME>` shows one type. It shows the type that it extends,
+and the chain of types from the built-in type to this type. It lists each
+default and each constraint with the type that sets it and the source of
+that type.
+
+The commands read the `minimal.toml` in `--repo-dir`. Without `--repo-dir`,
+they read the first one in the current directory or a parent directory.
+Outside a project, they show the built-in types only.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--output <json\|yaml\|toml>` | `-o` | Write `min/v1/type` objects in this format, in place of text. `min type list` writes a JSON array, a YAML sequence, or a TOML `[[types]]` table for each type |
+
+| Exit code | Meaning |
+|---|---|
+| 3 | The project's `minimal.toml` does not load, is not valid TOML, or has a type in `[box_types]` that does not resolve |
+| 4 | `min type show` names a type that does not exist |
 
 ### `net forward`
 
@@ -747,7 +830,9 @@ the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
 When both apply, both lines print, the login line last. When the step that
 enforces deny-all egress installs while a daemon is running, on a host with
-systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress, restart the daemon: min stop (it refuses while boxes are live: stop them first, or min stop --force ends them), and your next min command starts it again.`
+systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress yet, restart the daemon. Run min host stop local0, which stops each running box and then the daemon. Then run min ls, which starts the daemon again.`
+When `min finalize-install` runs with `--minimal-dir`, both commands in the
+note carry the same `--minimal-dir`, made absolute.
 A daemon of this release reads the machine again once the step places it, so
 the restart is for a daemon started by an earlier release. Without systemd no
 unit places a restarted daemon, so the script does not advise a restart.

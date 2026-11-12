@@ -22,7 +22,7 @@ use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
 use tracing::Instrument as _;
 
-use crate::{BoxRunArgs, GlobalArgs, TaskListArgs, TaskRunArgs};
+use crate::{BoxListArgs, BoxRmArgs, BoxRunArgs, BoxStopArgs, GlobalArgs, TaskRunArgs};
 
 /// A task's non-zero exit status, carried as a typed error so `main.rs` can
 /// downcast it and terminate with the task's own code instead of printing an
@@ -90,7 +90,7 @@ fn entrypoint_run_request(task: &str, cwd: &str) -> minimald_rpc::exec::ExecRequ
 /// spec, with the arguments the user typed after the task name appended to
 /// its entrypoint, `min task run <task> <args...>`. `None` for an
 /// interactive task, whose type denies a terminal.
-fn task_box_spec(
+pub(crate) fn task_box_spec(
     task: &str,
     declared: &mfile::Task,
     flags: mfile::spec::SpecFlags,
@@ -224,6 +224,47 @@ fn task_box_network(
         hints: project_egress.hints,
         mode_layer,
     })
+}
+
+/// Applies the run's other `[network]` override flags to the box's
+/// network (BCLI-024): `--dynamic-ingress` and `--dynamic-range` set the
+/// ingress policy, `--credentialed-upstream` declares the lane to the
+/// Box Egress Proxy, and `--quic443` sets the stance on UDP to port 443.
+/// Each flag changes only its own key. `--vpn-network-names` is applied to
+/// the spec, by [`crate::add_vpn_network_names`], which refuses it when
+/// the box has no spec.
+///
+/// # Errors
+///
+/// A dynamic ingress flag on a box that is not `own_ip`, as an activation
+/// refuses it.
+pub(crate) fn apply_run_overrides(
+    network: &mut TaskBoxNetwork,
+    other: &crate::BoxOverrideArgs,
+) -> Result<(), anyhow::Error> {
+    crate::refuse_dynamic_ingress_off_own_ip(
+        network.mode,
+        other.dynamic_ingress,
+        other.dynamic_range,
+    )?;
+    if other.dynamic_ingress.is_some() || other.dynamic_range.is_some() {
+        let ingress = network
+            .policy
+            .ingress
+            .get_or_insert_with(boxes::IngressPolicy::default);
+        ingress.dynamic_ingress = other.dynamic_ingress;
+        ingress.dynamic_allowed_range = other.dynamic_range;
+    }
+    // A task entry declares no secret grants on this path, so the flag is
+    // the only source of the declaration, with the default proxy settings.
+    if other.credentialed_upstream && network.policy.credentialed_upstream.is_none() {
+        network.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+    }
+    // `--quic443` replaces the stance, and no flag keeps the declared one.
+    if other.quic443.is_some() {
+        network.policy.quic443 = other.quic443;
+    }
+    Ok(())
 }
 
 /// The egress flags `flags` holds, by name.
@@ -476,6 +517,8 @@ pub(crate) struct RunEntry {
     pub detach: bool,
     pub network: Option<crate::CliNetworkMode>,
     pub egress: crate::EgressArgs,
+    /// The rest of activate's override flags (BCLI-024, BCLI-075, BCLI-076).
+    pub other: crate::BoxOverrideArgs,
     pub args: Vec<String>,
 }
 
@@ -488,6 +531,7 @@ impl From<TaskRunArgs> for RunEntry {
             detach: args.detach,
             network: args.network,
             egress: args.egress,
+            other: args.other,
             args: args.args,
         }
     }
@@ -502,6 +546,7 @@ impl From<BoxRunArgs> for RunEntry {
             detach: args.detach,
             network: args.network,
             egress: args.egress,
+            other: args.other,
             args: args.args,
         }
     }
@@ -561,7 +606,10 @@ pub(crate) async fn detach_run(
 /// The declaration comes back rather than being discarded because the
 /// client needs its `env_vars` to resolve them here — see
 /// [`resolve_task_env`].
-fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyhow::Error> {
+pub(crate) fn declared_task(
+    dir: &camino::Utf8Path,
+    task: &str,
+) -> Result<mfile::Task, anyhow::Error> {
     // Rejected before any lookup: the daemon trims the task name out of the
     // exec command string, so a name with leading/trailing whitespace can
     // never round-trip into the box — even if minimal.toml declares it.
@@ -1259,75 +1307,23 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     run_entry(global, args.into()).await.map(drop)
 }
 
-/// `min task list [--all]` (BCLI-015): the task boxes of the current
-/// project, or of every project, in any state. The daemon keeps a task's
-/// record after the task ends, so an exited task stays in the list until
-/// `min box prune` or `min box rm` removes it.
-pub async fn cmd_task_list(global: &GlobalArgs, args: TaskListArgs) -> Result<(), anyhow::Error> {
-    let scope = if args.all {
-        None
-    } else {
-        let cwd = crate::attach::cwd_host_path(global)?;
-        Some(crate::cmd::box_list_scope(cwd.as_ref())?)
-    };
-    crate::cmd::ensure_daemon(global)?;
-    let hosts = crate::cmd::local_hosts(global)?;
-    let mut out = std::io::stdout().lock();
-    let mut err = std::io::stderr().lock();
-    task_list_on_hosts(hosts, scope, &mut out, &mut err).await
+/// `min task list [--all]` (BCLI-015, BCLI-030): `min box list`, with
+/// only the task boxes of the current project, or of every project. The
+/// daemon keeps a task's record after the task ends, so an exited task
+/// stays in the list until `min box prune` or `min box rm` removes it.
+pub async fn cmd_task_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), anyhow::Error> {
+    crate::cmd::cmd_typed_box_list(global, args, boxes::TASK_BOX_TYPE, "task list").await
 }
 
-/// `min task list` over the local `hosts`: the `min box list` listing,
-/// filtered to the task boxes of `project_root`, or of every project when
-/// it is `None`. It prints the same table, state labels and empty-list
-/// lines as `min box list`. A host that does not answer is named on `err`,
-/// and the list goes on without it. The selected host that does not answer
-/// ends the command, as it does for `min box list`.
-pub(crate) async fn task_list_on_hosts(
-    hosts: Vec<crate::cmd::LocalHost>,
-    project_root: Option<paths::HostAbsPath>,
-    out: &mut dyn std::io::Write,
-    err: &mut dyn std::io::Write,
-) -> Result<(), anyhow::Error> {
-    let mut tasks = Vec::new();
-    for host in hosts {
-        let records = match crate::cmd::read_host_boxes(&host).await? {
-            Ok(records) => records,
-            Err(why) if host.selected => {
-                tracing::info!(verb = "task list", outcome = "error", host = %host.host, "{why}");
-                bail!("{why}");
-            }
-            Err(why) => {
-                tracing::info!(
-                    verb = "task list",
-                    outcome = "host unreachable",
-                    host = %host.host,
-                    "{why}"
-                );
-                writeln!(err, "{}", crate::cmd::unreachable_host_line(&host.host))?;
-                continue;
-            }
-        };
-        tasks.extend(
-            records
-                .into_iter()
-                .filter(|entry| entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE))
-                .filter(|entry| {
-                    project_root
-                        .as_ref()
-                        .is_none_or(|root| entry.project_root.as_ref() == Some(root))
-                })
-                .map(|record| crate::cmd::ListedBox {
-                    provider: host.provider.to_string(),
-                    host: host.host.clone(),
-                    record,
-                }),
-        );
-    }
-    tracing::info!(verb = "task list", outcome = "ok", tasks = tasks.len());
-    let mut out = out;
-    crate::cmd::render_box_list(&mut out, &tasks, project_root.is_some())?;
-    Ok(())
+/// `min task stop <box>` (BCLI-030): `min box stop`, filtered to task
+/// boxes.
+pub async fn cmd_task_stop(global: &GlobalArgs, args: BoxStopArgs) -> Result<(), anyhow::Error> {
+    crate::cmd::cmd_typed_box_stop(global, args, boxes::TASK_BOX_TYPE, "task stop").await
+}
+
+/// `min task rm <box>` (BCLI-030): `min box rm`, filtered to task boxes.
+pub async fn cmd_task_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyhow::Error> {
+    crate::cmd::cmd_typed_box_rm(global, args, boxes::TASK_BOX_TYPE, "task rm").await
 }
 
 /// `min box run <entry>`: the run of [`cmd_task_run`], from an entry the
@@ -1391,6 +1387,8 @@ pub(crate) async fn run_entry(
         &args.egress,
         crate::daemon_host_kind(global),
     )?;
+    let mut box_network = box_network;
+    apply_run_overrides(&mut box_network, &args.other)?;
     // A legacy key spelling still loads, with its hint. This command prints
     // its own lines on stderr, and runs no shell for them to precede.
     for hint in &box_network.hints {
@@ -1426,9 +1424,9 @@ pub(crate) async fn run_entry(
 
     crate::ensure_daemon(global)?;
 
-    // Same default as an activate with no flags, matching the loadout
-    // handling below: `min task run` has no `--no-hooks` of its own, so its
-    // hooks behave like any other session's. The constructor turns them on.
+    // The constructor turns hooks on. `--no-hooks` turns them off, as on
+    // an activation (BCLI-076): the stored spec and the expanded entry then
+    // carry no hook.
     //
     // BCLI-070, BOX-163: every run is a fresh instance. The daemon names the
     // box `<task>-<n>` from the spec's entry, with the smallest `n` no
@@ -1440,6 +1438,7 @@ pub(crate) async fn run_entry(
         box_network.policy,
     );
     crate::request_fresh_instance(&mut request);
+    request.config.hooks_enabled = !args.other.no_hooks;
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
     request.must_match_version = minimal_client::version_assertion();
@@ -1473,6 +1472,9 @@ pub(crate) async fn run_entry(
         // cleaned as the daemon cleans a spec's entry.
         request.config.name = Some(interactive_task_box_name(&args.entry));
     }
+    // With no spec, a `--vpn-network-names` value has no place to go, so
+    // the helper refuses it rather than drop it.
+    crate::add_vpn_network_names(&mut request, &args.other.vpn_network_names)?;
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
@@ -1480,7 +1482,8 @@ pub(crate) async fn run_entry(
     crate::stamp_project_root(&mut request, &upload_root)?;
 
     // Loadouts and user policy: the same defaults as an activate with no
-    // loadout flags — the config's `default_loadouts` apply. Resolved before
+    // loadout flags — the config's `default_loadouts` apply, unless
+    // `--no-loadouts` selects none (BCLI-075). Resolved before
     // the daemon connection so a broken loadout fails loudly client-side, and
     // through the same shared helper an activate uses so the staged hook
     // scripts and the finalize budget match. The helper gets the resolved
@@ -1490,12 +1493,17 @@ pub(crate) async fn run_entry(
     // `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
     // reach the daemon inside the uploaded mfile, and this command never
     // refused a project whose hook script the staging check rejects.
-    let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
+    let selection = crate::loadouts::LoadoutSelection::from_flags(&[], args.other.no_loadouts);
+    let hook_prep = if args.other.no_hooks {
+        crate::loadouts::HookPrep::Disabled
+    } else {
+        crate::loadouts::HookPrep::StageOnly
+    };
     let inputs = crate::loadouts::prepare_activation_inputs(
         global,
         &upload_root,
         selection,
-        crate::loadouts::HookPrep::StageOnly,
+        hook_prep,
         Some(amended_policy),
     )?;
     inputs.announce_loadouts();
@@ -1504,8 +1512,17 @@ pub(crate) async fn run_entry(
     let compose_options = inputs.compose_options;
     let hook_scripts = inputs.hook_scripts;
     let finalize_hook_budget = inputs.hook_budget;
-    let contribution = inputs.contribution;
+    let mut contribution = inputs.contribution;
     let user_policy = inputs.user_policy;
+    // BOX-068: the task's expanded entry rides on the contribution, and the
+    // daemon composes the project's part of the box from it. One span
+    // covers the expansion and the compose call that sends it.
+    let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
+    contribution.entry = entry_span
+        .in_scope(|| {
+            crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
+        })?
+        .map(Box::new);
     // Sent only for a task that declares `inherit_cwd`; any other task
     // starts at the root of the uploaded tree.
     let task_cwd = if declared.inherit_cwd {
@@ -1556,7 +1573,7 @@ pub(crate) async fn run_entry(
     // before it runs anything (NET-085), or the host gate drops
     // every frame it sends outside the VM. The guard retires it on an early
     // return; the run's end retires it through `release_task_name_hold`.
-    let mut host_ip_residency = crate::HostIpResidency::admit(
+    let mut host_ip_residency = crate::HostIpResidency::admit_declaring(
         crate::vm_host_control_sock(
             crate::daemon_host_kind(global),
             global.minimal_dir.as_deref(),
@@ -1564,6 +1581,7 @@ pub(crate) async fn run_entry(
         id,
         request.config.network,
         request.config.policy.egress.as_ref(),
+        request.config.policy.credentialed_upstream.is_some(),
     )
     .await;
     // The daemon named the box `<task>-<n>`. A box whose name cannot be read
@@ -1593,7 +1611,12 @@ pub(crate) async fn run_entry(
         &utf8_path,
         &upload_root,
         decision,
-        crate::DroppedHooksPolicy::Warn,
+        // `--no-hooks` already turned the hooks off, so a skip drops none.
+        if args.other.no_hooks {
+            crate::DroppedHooksPolicy::Ignore
+        } else {
+            crate::DroppedHooksPolicy::Warn
+        },
     )
     .await?;
 
@@ -1607,6 +1630,7 @@ pub(crate) async fn run_entry(
             session_id: id,
             contribution,
         })
+        .instrument(entry_span)
         .await
         .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error))?;
     let configured = match configured {
@@ -2839,6 +2863,7 @@ mod tests {
             path: None,
             network: None,
             egress: crate::EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
             detach: false,
             args: vec![],
         };
@@ -2888,6 +2913,7 @@ mod tests {
             path: None,
             network: None,
             egress: crate::EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
             detach: false,
             args: vec![],
         };
@@ -3123,6 +3149,7 @@ mod tests {
             path: None,
             network: None,
             egress: crate::EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
             detach: false,
             args: vec![],
         };

@@ -1,0 +1,177 @@
+{
+ "data": [
+  {
+   "files": [
+    {
+     "filename": "/x/crates/graph/src/lib.rs",
+     "summary": {
+      "lines": {
+       "count": 100,
+       "covered": 80,
+       "percent": 80.0
+      },
+      "functions": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      },
+      "regions": {
+       "count": 10,
+       "covered": 5,
+       "percent": 50.0
+      },
+      "branches": {
+       "count": 0,
+       "covered": 0,
+       "percent": 0
+      },
+      "instantiations": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      }
+     }
+    },
+    {
+     "filename": "/x/crates/graph/src/plan.rs",
+     "summary": {
+      "lines": {
+       "count": 50,
+       "covered": 10,
+       "percent": 20.0
+      },
+      "functions": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      },
+      "regions": {
+       "count": 10,
+       "covered": 5,
+       "percent": 50.0
+      },
+      "branches": {
+       "count": 0,
+       "covered": 0,
+       "percent": 0
+      },
+      "instantiations": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      }
+     }
+    },
+    {
+     "filename": "/x/crates/graph/tests/it.rs",
+     "summary": {
+      "lines": {
+       "count": 30,
+       "covered": 30,
+       "percent": 100.0
+      },
+      "functions": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      },
+      "regions": {
+       "count": 10,
+       "covered": 5,
+       "percent": 50.0
+      },
+      "branches": {
+       "count": 0,
+       "covered": 0,
+       "percent": 0
+      },
+      "instantiations": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      }
+     }
+    },
+    {
+     "filename": "/x/crates/decode/src/lib.rs",
+     "summary": {
+      "lines": {
+       "count": 200,
+       "covered": 100,
+       "percent": 50.0
+      },
+      "functions": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      },
+      "regions": {
+       "count": 10,
+       "covered": 5,
+       "percent": 50.0
+      },
+      "branches": {
+       "count": 0,
+       "covered": 0,
+       "percent": 0
+      },
+      "instantiations": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      }
+     }
+    },
+    {
+     "filename": "/x/crates/decode/build.rs",
+     "summary": {
+      "lines": {
+       "count": 10,
+       "covered": 10,
+       "percent": 100.0
+      },
+      "functions": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      },
+      "regions": {
+       "count": 10,
+       "covered": 5,
+       "percent": 50.0
+      },
+      "branches": {
+       "count": 0,
+       "covered": 0,
+       "percent": 0
+      },
+      "instantiations": {
+       "count": 4,
+       "covered": 2,
+       "percent": 50.0
+      }
+     }
+    }
+   ],
+   "totals": {
+    "lines": {
+     "count": 350,
+     "covered": 190,
+     "percent": 54.285714285714285
+    },
+    "functions": {
+     "count": 12,
+     "covered": 6,
+     "percent": 50.0
+    },
+    "regions": {
+     "count": 30,
+     "covered": 15,
+     "percent": 50.0
+    }
+   }
+  }
+ ],
+ "type": "llvm.coverage.json.export",
+ "version": "2.0.1"
+}

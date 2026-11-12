@@ -8136,7 +8136,7 @@ echo "::endgroup::"
 #      which stays listed as exited (BOX-038),
 #   3. a re-attach resumes the exited box, and killing the ssh transport
 #      mid-attach (the `min proxy` ProxyCommand,
-#      as a dropped connection) exits 255 and leaves the terminal's termios
+#      as a dropped connection) exits 7 (BCLI-068) and leaves the terminal's termios
 #      (its `stty -g`) exactly as it was before the attach,
 #   4. the session outlives the drop, its shell's `exit` ends the box as
 #      exited, and `min session destroy` then removes it.
@@ -8206,10 +8206,10 @@ echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte p
 # 3. Re-attach, which resumes the exited box, and kill the transport
 # mid-attach.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=255 \
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=7 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-drop.err")" || {
-  echo "::error::the transport-drop attach did not exit 255"
+  echo "::error::the transport-drop attach did not exit 7"
   echo "--- transcript ---"; printf '%s\n' "$relay_out"
   echo "--- stderr ---"; cat "$WORK/relay-drop.err" 2>/dev/null || true
   fail
@@ -8219,7 +8219,7 @@ if [[ "$relay_out" != *OUTER_STTY_UNCHANGED* ]]; then
   echo "--- transcript ---"; printf '%s\n' "$relay_out"
   fail
 fi
-echo "a dropped transport exited 255 and left the terminal's stty -g unchanged"
+echo "a dropped transport exited 7 and left the terminal's stty -g unchanged"
 
 # 4. The session outlived the drop. Its shell's `exit` ends the box, and the
 # destroy removes it.
@@ -14379,7 +14379,7 @@ proof_bep_first_slice_end_to_end() {
   mkdir "$GRANT_SEED_DIR/.git"
 
   # 1. `min box spec` (BEP-038).
-  if ! fs_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
+  if ! fs_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
     echo "::error::'min box spec' of the demo project failed"
     cat "$WORK/$fs_case.spec.err" 2>/dev/null || true
     fs_fail
@@ -14656,7 +14656,7 @@ proof_bep_store_reference_end_to_end() {
     printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
-  if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+  if ! sr_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
     echo "::error::'min box spec' of the store-reference project failed"
     cat "$WORK/$sr_case.spec.err" 2>/dev/null || true
     sr_fail
@@ -15238,7 +15238,7 @@ proof_bep_signing_rotation_keeps_running_box_working() {
   # The root CA fingerprint from `min box spec` of the project ($1 = the
   # round, for the error).
   sr_root_fingerprint() {
-    if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+    if ! sr_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
       echo "::error::'min box spec' of the grant project failed $1 the rotation" >&2
       cat "$WORK/$sr_case.spec.err" >&2 2>/dev/null || true
       return 1
@@ -17132,7 +17132,7 @@ rt_leg_cohort() {
 
 rt_leg_quarantine() {
   local qu_leg="$RT_CASE/quarantine" qu_bep qu_dir qu_seg qu_name qu_out qu_try
-  local qu_sockets qu_listener qu_control
+  local qu_sockets qu_listener qu_control qu_named
   if [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
     not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 on a host whose audit log may be moved aside to run it. The manual macOS lane runs it (#2500)"
     return 0
@@ -17172,9 +17172,22 @@ rt_leg_quarantine() {
     fail
   fi
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  if [[ "$qu_out" != *"--quarantine-unreadable"* ]] \
-     && ! grep -qF -- '--quarantine-unreadable' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
-    echo "::error::the refused creation names no way out: neither its error nor the proxy log names 'bep serve --quarantine-unreadable'"
+  # The proxy can write its refusal to bep.log after the activate fails,
+  # so wait up to 15 s for it before the leg fails.
+  qu_named=""
+  if [[ "$qu_out" == *"--quarantine-unreadable"* ]]; then
+    qu_named=1
+  else
+    for qu_try in $(seq 1 15); do
+      [ "$qu_try" -gt 1 ] && sleep 1
+      if grep -qF -- '--quarantine-unreadable' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
+        qu_named=1
+        break
+      fi
+    done
+  fi
+  if [ -z "$qu_named" ]; then
+    echo "::error::the refused creation names no way out: neither its error nor the proxy log names 'bep serve --quarantine-unreadable' within 15 s"
     printf '%s\n' "$qu_out"
     fail
   fi

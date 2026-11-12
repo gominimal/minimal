@@ -65,9 +65,12 @@ pub enum Command {
     /// List sessions
     //
     // Deliberate exception to the `<noun> <verb>` convention (documented in
-    // docs/reference/cli.md): `min session list` is the canonical spelling,
-    // and `min ls` — the highest-traffic command in the CLI — keeps this bare
-    // top-level form as its visible alias. Not an oversight — do not remove it.
+    // docs/reference/cli.md): `min ls` — the highest-traffic command in the
+    // CLI — keeps this bare top-level form, with its `--raw` and `--json`
+    // flags, for the scripts that read it. It is not an alias of
+    // `min session list`, which is `min box list` filtered to session boxes
+    // (BCLI-030) and takes the `min box list` flags. Not an oversight — do
+    // not remove it.
     Ls(LsArgs),
     /// Shut down the minimald daemon
     //
@@ -87,6 +90,7 @@ pub enum Command {
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
     /// Box subcommands: show what a box will get
+    #[command(visible_alias = "boxes")]
     Box(BoxArgs),
     /// Host subcommands: the daemons on this machine that run boxes
     #[command(visible_alias = "hosts")]
@@ -94,6 +98,9 @@ pub enum Command {
     /// Provider subcommands: the kinds of local host this machine runs
     #[command(visible_alias = "providers")]
     Provider(ProviderArgs),
+    /// Type subcommands: the box types this project can use
+    #[command(visible_alias = "types")]
+    Type(TypeArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Print important directories and file paths for debugging
@@ -129,6 +136,7 @@ pub enum Command {
     /// Sign in to GitHub, and show the sign-in that boxes use
     Auth(AuthArgs),
     /// Store, list and remove the secrets that boxes reference by name
+    #[command(visible_alias = "secrets")]
     Secret(SecretArgs),
     // NET-109: `min login` is the alias for `min auth login`, so it takes
     // the same arguments and runs the same sign-in.
@@ -221,15 +229,20 @@ pub struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
-    /// List sessions
+    // BCLI-030: `min box list`, filtered to session boxes.
+    /// List the session boxes of the current project, in any state, as
+    /// `min box list` lists boxes. `--all` lists the session boxes of every
+    /// project
     #[command(visible_alias = "ls")]
-    List(LsArgs),
+    List(BoxListArgs),
     /// Activate (create) a new session
     Activate(ActivateArgs),
     /// Create a box from a session entry of the project and attach this
     /// terminal to it. `--detach` creates the box, prints its id and returns
     Start(SessionStartArgs),
-    /// Attach to an existing session
+    /// Attach this terminal to a session box's terminal. With no box named,
+    /// attach to this project's running session box that has a terminal,
+    /// else to its only stopped or exited one, which starts again
     Attach(AttachArgs),
     /// Execute a command in an existing session
     Exec(ExecArgs),
@@ -274,6 +287,15 @@ pub enum SessionCommand {
     /// showing new output until the session is removed or the command is
     /// interrupted
     Logs(BoxLogsArgs),
+    // BCLI-030: `min box stop`, filtered to session boxes.
+    /// Stop a running session box and keep it, as `min box stop` does.
+    /// `--force` kills every process in the box at once, with no grace
+    /// period
+    Stop(BoxStopArgs),
+    // BCLI-030: `min box rm`, filtered to session boxes.
+    /// Remove a stopped or exited session box, as `min box rm` does. A
+    /// running box is refused unless `--force` is given
+    Rm(BoxRmArgs),
 }
 
 #[derive(Debug, Args)]
@@ -445,8 +467,11 @@ pub struct BoxArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum BoxCommand {
-    /// Show how a project's box reaches GitHub through the local proxy:
-    /// the proxy's root certificate fingerprint, each secret with its hosts,
+    /// Show the spec of an entry of the project before a start, or the
+    /// spec a box was created with. An entry's spec names the minimal.toml
+    /// table or flag that set each value. With no entry or box named, show
+    /// how the project's box reaches GitHub through the local proxy: the
+    /// proxy's root certificate fingerprint, each secret with its hosts,
     /// the steering mode and the UDP 443 stance
     Spec(BoxSpecArgs),
     /// Show what the local proxy recorded for one box: each request it
@@ -470,10 +495,20 @@ pub enum BoxCommand {
     /// files. A running box is refused unless `--force` is given, which
     /// stops the box at once and then removes it
     Rm(BoxRmArgs),
+    /// Stop a box that runs until it is stopped, if it runs, and start it
+    /// again from the settings it was created with. The box keeps its id,
+    /// its name and its files. A box that runs to completion cannot
+    /// restart: run it again with `min box run`
+    Restart(BoxRestartArgs),
     /// Attach this terminal to a box's terminal. With no box named, attach
     /// to this project's running box that has a terminal, else to its only
     /// stopped or exited one, which starts again
     Attach(BoxAttachArgs),
+    /// Start a stopped or exited box that has a terminal again, from the
+    /// spec it was created with, and attach this terminal to it. A box that
+    /// is not stopped or exited is refused. Attach to a running box with
+    /// `min box attach`
+    Resume(BoxResumeArgs),
     /// Create a box from an entry of the project. A box with a terminal
     /// attaches this terminal to it, unless `--detach` is given. Any other
     /// box starts with no input, and the command prints its id and returns
@@ -646,6 +681,53 @@ pub struct ProviderListArgs {
     pub all: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct TypeArgs {
+    #[command(subcommand)]
+    pub command: TypeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TypeCommand {
+    /// List the box types: the built-in types and the types this
+    /// project's minimal.toml defines, each with where it comes from
+    #[command(visible_alias = "ls")]
+    List(TypeListArgs),
+    /// Show one box type: the type it extends, and its defaults and
+    /// constraints, each with the type that sets it
+    Show(TypeShowArgs),
+}
+
+// BCLI-019: `min type list [-o json|yaml|toml]`.
+#[derive(Debug, Default, Args)]
+pub struct TypeListArgs {
+    /// Write the types in this format instead of a table
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<TypeOutputFormat>,
+}
+
+// BCLI-020: `min type show <name> [-o json|yaml|toml]`.
+#[derive(Debug, Args)]
+pub struct TypeShowArgs {
+    /// The type, as `min type list` prints it (`session`, `task`, or a
+    /// type of this project)
+    pub name: String,
+    /// Write the type in this format instead of text
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<TypeOutputFormat>,
+}
+
+/// The formats `min type list` and `min type show` write, beside text.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum TypeOutputFormat {
+    /// JSON: one object for each type
+    Json,
+    /// YAML: one mapping for each type
+    Yaml,
+    /// TOML: one table for each type
+    Toml,
+}
+
 // BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
 #[derive(Debug, Args)]
 pub struct BoxListArgs {
@@ -695,6 +777,14 @@ pub struct BoxStopArgs {
     pub exec: Option<String>,
 }
 
+// BOX-176 (BCLI-074): `min box restart <box>`.
+#[derive(Debug, Args)]
+pub struct BoxRestartArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+}
+
 // BCLI-068: `min box attach [<box>] [--exec <id>]`.
 #[derive(Debug, Args)]
 pub struct BoxAttachArgs {
@@ -706,6 +796,14 @@ pub struct BoxAttachArgs {
     /// exec id it printed. Needs a box
     #[arg(long = "exec", value_name = "EXEC_ID", requires = "target")]
     pub exec: Option<String>,
+}
+
+// BCLI-007, BCLI-009: `min box resume <box>`.
+#[derive(Debug, Args)]
+pub struct BoxResumeArgs {
+    /// The box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min box list` prints them
+    pub target: String,
 }
 
 // BOX-019 (BCLI-060, BCLI-004): `min box rm <box> [--force]`.
@@ -1053,22 +1151,33 @@ pub enum BoxAuditOutputFormat {
     Jsonl,
 }
 
+// BCLI-021, BCLI-022, BCLI-023 and BEP-038:
+// `min box spec [<entry>|<box>] [-o toml|json|yaml]`, with the override
+// flags of `min box start`. The project form keeps only `--network`.
 #[derive(Debug, Args)]
 pub struct BoxSpecArgs {
-    /// The project directory whose minimal.toml declares the box
-    /// (default: --repo-dir, or the current directory)
-    pub path: Option<PathBuf>,
-    // The same flag as `min session activate --network`, from the same
-    // definition, so the preview is of the box that activation creates.
-    #[arg(
-        long,
-        value_name = NETWORK_VALUE_NAME,
-        value_parser = parse_network_mode,
-        default_value = NETWORK_DEFAULT,
-        help = NETWORK_HELP,
-        long_help = NETWORK_LONG_HELP
-    )]
-    pub network: CliNetworkMode,
+    /// An entry of the project's minimal.toml, else a box: its id, the
+    /// start of its id, or its name, as `min box list` prints them. With
+    /// none, show the project's proxy rows. Use --repo-dir to name another
+    /// project
+    pub target: Option<String>,
+    /// The format of an entry's or a box's spec (default: toml)
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxSpecOutputFormat>,
+    #[command(flatten)]
+    pub overrides: StartOverrideArgs,
+}
+
+/// The format `min box spec` writes an entry's or a box's spec in.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+pub enum BoxSpecOutputFormat {
+    /// TOML, with a comment that names the source of each value
+    #[default]
+    Toml,
+    /// One JSON object
+    Json,
+    /// One YAML document
+    Yaml,
 }
 
 #[derive(Debug, Args)]
@@ -1136,22 +1245,24 @@ pub enum TaskCommand {
     /// or egress flag after a task argument is refused. A task argument
     /// that shares a flag's name goes after `--`.
     Run(TaskRunArgs),
-    /// List the task boxes of the current project, in any state. A task
-    /// that ended shows its exit code, as `exited (exit 3)`, until
-    /// `min box prune` removes it. `--all` lists the tasks of every project
-    List(TaskListArgs),
+    // BCLI-015, BCLI-030: `min box list`, filtered to task boxes.
+    /// List the task boxes of the current project, in any state, as
+    /// `min box list` lists boxes. A task that ended shows its exit code,
+    /// as `exited (exit 3)`, until `min box prune` removes it. `--all`
+    /// lists the tasks of every project
+    List(BoxListArgs),
     /// Show what a task printed, from its start. `-f` keeps showing new
     /// output until the task's box is removed or the command is interrupted
     Logs(BoxLogsArgs),
-}
-
-// BCLI-015: `min task list [--all]`.
-#[derive(Debug, Args)]
-pub struct TaskListArgs {
-    /// List the tasks of every project, not only the tasks of the current
-    /// project
-    #[arg(long)]
-    pub all: bool,
+    // BCLI-030: `min box stop`, filtered to task boxes.
+    /// Stop a running task box and keep it, as `min box stop` does.
+    /// `--force` kills every process in the box at once, with no grace
+    /// period
+    Stop(BoxStopArgs),
+    // BCLI-030: `min box rm`, filtered to task boxes.
+    /// Remove a stopped or exited task box, as `min box rm` does. A running
+    /// box is refused unless `--force` is given
+    Rm(BoxRmArgs),
 }
 
 // BCLI-069 gives `--name` to `min task run` too. It is not here yet: the
@@ -1181,6 +1292,8 @@ pub struct TaskRunArgs {
     pub network: Option<CliNetworkMode>,
     #[command(flatten)]
     pub egress: EgressArgs,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
     /// Start the box, print its id and return. The task gets no input.
     #[arg(long)]
     pub detach: bool,
@@ -1214,6 +1327,8 @@ pub struct BoxRunArgs {
     pub network: Option<CliNetworkMode>,
     #[command(flatten)]
     pub egress: EgressArgs,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
     /// Arguments to the entry, passed through to its declared `args`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
@@ -1295,8 +1410,80 @@ pub struct StartOverrideArgs {
     /// Repeatable. With any `--loadout`, the client config's
     /// `[loadouts].default_loadouts` are not applied. A task entry does not
     /// take it
-    #[arg(long = "loadout", value_name = "NAME")]
+    // BCLI-075: `--no-loadouts` with `--loadout` is a usage error, exit 2.
+    // The conflict is declared here because the run verbs take
+    // `--no-loadouts` and no `--loadout`.
+    #[arg(long = "loadout", value_name = "NAME", conflicts_with = "no_loadouts")]
     pub loadout: Vec<String>,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
+}
+
+// The override flags that `min box start`, `min session start`, `min task
+// run` and `min box run` take beside `--network` and the egress flags, as
+// `min session activate` takes them (BCLI-024, BCLI-075, BCLI-076). They
+// are the rest of activate's `[network]` flags, `--no-loadouts` and
+// `--no-hooks`.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct BoxOverrideArgs {
+    /// How the box's requests to publish a port while it runs are decided:
+    /// `allow` publishes a port the box asks for with `min net expose` or
+    /// listens on inside `--dynamic-range`, `ask` puts each request to the
+    /// person attached to the box, and `deny`, the same as leaving the flag
+    /// unset, refuses every request. Sets the box's
+    /// `network.dynamic_ingress`. Requires `--network own_ip`.
+    #[arg(
+        long = "dynamic-ingress",
+        value_name = "allow|ask|deny",
+        value_parser = parse_dynamic_ingress_mode
+    )]
+    pub dynamic_ingress: Option<boxes::DynamicIngress>,
+    /// Port range `LO-HI`, both ends included, in which
+    /// `--dynamic-ingress allow` accepts requests, e.g. `8000-8443`. A
+    /// request outside it is refused. Requires `--dynamic-ingress`.
+    #[arg(
+        long = "dynamic-range",
+        value_name = "LO-HI",
+        value_parser = parse_dynamic_range,
+        requires = "dynamic_ingress"
+    )]
+    pub dynamic_range: Option<(u16, u16)>,
+    /// Let the box reach the Box Egress Proxy, whatever its
+    /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
+    /// box sends to the proxy's address is dropped, unless minimal.toml
+    /// grants the box a secret through the proxy. Takes effect with
+    /// `--network own_ip`, and with `--network host_ip` on a host that runs
+    /// boxes in a VM.
+    #[arg(long)]
+    pub credentialed_upstream: bool,
+    /// Whether the box can send UDP to port 443, the traffic of HTTP/3.
+    /// `block` always blocks it, and `allow` always allows it. `auto`, the
+    /// same as leaving the flag unset, blocks it only when the box has a
+    /// credentialed upstream. Sets the box's `network.quic443`, in place of
+    /// the value in minimal.toml.
+    #[arg(
+        long = "quic443",
+        value_name = "auto|block|allow",
+        value_parser = parse_quic443
+    )]
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// Add this VPN network name to the box's `network.vpn_network_names`.
+    /// Repeatable. The box keeps the names, but this version of minimald
+    /// does not connect the box to a VPN.
+    #[arg(long = "vpn-network-names", value_name = "NAME")]
+    pub vpn_network_names: Vec<String>,
+    /// Apply no loadouts, and not the client config's
+    /// `[loadouts].default_loadouts` either
+    #[arg(long)]
+    pub no_loadouts: bool,
+    /// Run none of the box's lifecycle hooks, from the loadouts or from
+    /// minimal.toml. The choice is kept with the box, so it also holds
+    /// when the box is attached or detached, and when it ends
+    #[arg(long)]
+    pub no_hooks: bool,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
@@ -1862,6 +2049,20 @@ pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<boxes::DynamicIngr
     }
 }
 
+/// Parse a `--quic443` value into the box's stance on UDP to port 443
+/// (BCLI-024, BEP-018).
+pub(crate) fn parse_quic443(raw: &str) -> Result<boxes::core::bep::Quic443, String> {
+    use boxes::core::bep::Quic443;
+    match raw {
+        "auto" => Ok(Quic443::Auto),
+        "block" => Ok(Quic443::Block),
+        "allow" => Ok(Quic443::Allow),
+        other => Err(format!(
+            "unknown value '{other}'. Use auto, block or allow."
+        )),
+    }
+}
+
 /// Parse a `--dynamic-range <lo>-<hi>` value (NET-043) into the inclusive
 /// `(lo, hi)` pair the create request's `dynamic_allowed_range` carries.
 /// A malformed value (no `-`, a non-numeric end, a port outside u16), an
@@ -1933,10 +2134,9 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID, unique id prefix, or session name). When
-    /// omitted, `min session attach` resolves a session from the current
-    /// working directory (or the only existing session), and opens an interactive picker if the choice is
-    /// ambiguous. See `--no-input` to skip the picker in scripts.
+    /// The session box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min session list` prints them. Omit it to
+    /// attach to this project's session box
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
 }

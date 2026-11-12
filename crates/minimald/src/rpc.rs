@@ -677,6 +677,26 @@ async fn serve_create_session(
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
                     error: e.to_string(),
                 },
+                // BOX-081: a brokered secret on a host with no identity
+                // plane (identity none) that no node-local proxy serves.
+                // That is every brokered secret when no proxy is present,
+                // and every secret that is not a GitHub grant when one is.
+                // The reply carries the refusal's text, so the client reads
+                // the cause and not a closed channel. It does not carry the
+                // refusal code, so `min` exits 1 and not 5 (#3276).
+                Err(e) if crate::box_manager::unenrolled_refusal(&e).is_some() => {
+                    let refusal = crate::box_manager::unenrolled_refusal(&e)
+                        .expect("the guard matched an un-enrolled refusal");
+                    tracing::info!(
+                        identity = crate::box_manager::IDENTITY_MODE_NONE,
+                        code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+                        exit_code = refusal.exit_code(),
+                        "create refused: a brokered secret on a host with no identity plane"
+                    );
+                    Errorable::Err {
+                        error: refusal.to_string(),
+                    }
+                }
                 // BOX-002: a create minvmd gave no id is refused with a
                 // reply. The internal arm below closes the channel, and the
                 // client then reads an empty reply with no cause in it.
@@ -1718,6 +1738,32 @@ async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(),
                 Ok(boxes) => Errorable::Ok(minimald_rpc::ListBoxesResponse { boxes }),
                 Err(e) => Errorable::Err {
                     error: format!("The box records could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
+/// `GetBoxSpec`: the spec a box was created with, as stored beside its
+/// record (BCLI-022).
+async fn serve_get_box_spec(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::GetBoxSpec
+        .handle_channel(c, async |req: minimald_rpc::GetBoxSpecRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.get_box_spec(req.id).await {
+                Ok(Some(spec)) => Errorable::Ok(minimald_rpc::GetBoxSpecResponse { spec }),
+                Ok(None) => Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.id.as_ref()
+                    ),
+                },
+                Err(e) => Errorable::Err {
+                    error: format!("The box's spec could not be read: {e}"),
                 },
             })
         })
@@ -3588,6 +3634,7 @@ pub async fn handle_ssh_rpc(
         | minimald_rpc::PreviewPrune::NAME
         | minimald_rpc::ListBoxes::NAME
         | minimald_rpc::ShowBox::NAME
+        | minimald_rpc::GetBoxSpec::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -3677,6 +3724,7 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::PreviewPrune::NAME => serve!(serve_preview_prune(s, channel)),
         minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
         minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
+        minimald_rpc::GetBoxSpec::NAME => serve!(serve_get_box_spec(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
@@ -3845,6 +3893,8 @@ mod create_naming_tests {
     fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
         let mut request = create_session_req("unused", "/tmp");
         request.config.name = None;
+        // A `task` spec is created under the task verb (BOX-160).
+        request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
         let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
         spec.box_type = boxes::TASK_BOX_TYPE.to_string();
         spec.pty_enabled = false;
