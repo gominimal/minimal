@@ -1069,6 +1069,22 @@ impl RegisteredTables {
             let name = canonical(&row.name);
             // An address-only row holds no name, so the name rules below
             // never refuse it: only its address is claimed.
+            //
+            // First the name's form. Every rule below compares in the
+            // canonical form, and the view normalizes once more when it
+            // holds a row: a name that is not yet in its final form (a
+            // second root dot) would pass each rule as a new name and then
+            // replace the row of the name it normalizes to, another user's
+            // or the answerer's own.
+            if !row.address_only && !is_settled_name(&name) {
+                refused.push(RefusedRow {
+                    name: row.name,
+                    reason: "not a name in the zone's form: one root dot at most, and no \
+                             empty label"
+                        .to_string(),
+                });
+                continue;
+            }
             if !row.address_only && reserved.contains(&name) {
                 refused.push(RefusedRow {
                     name: row.name,
@@ -1624,6 +1640,12 @@ impl HostAnswerer {
                 continue;
             }
             let name = canonical(&row.name);
+            // A row whose name the view would normalize into another name
+            // never reaches it: the publish rules refuse such a row, and
+            // the fold does not depend on that.
+            if !is_settled_name(&name) {
+                continue;
+            }
             if let Some(kept_by) = held.get(&name) {
                 refused.insert(name.clone());
                 // One warn per standing clash, not one per lookup that
@@ -1747,6 +1769,14 @@ fn registration(connection: u64) -> String {
 fn canonical(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
     lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
+}
+
+/// Whether `name`, already [`canonical`], is in the one form the view holds
+/// names in: normalizing it again changes nothing, and no label is empty.
+/// Only such a name may be compared with the names already held, because
+/// anything else is some other name once the view has normalized it.
+fn is_settled_name(name: &str) -> bool {
+    !name.is_empty() && name.split('.').all(|label| !label.is_empty())
 }
 
 /// Where a datagram from `peer` originated (NET-006): the listener binds
@@ -4900,6 +4930,50 @@ mod tests {
             "the same user replaces its own row: {:?}",
             again.refused
         );
+    }
+
+    /// A name is one user's whatever dots trail it. `canonical` strips one
+    /// root dot and the view strips one more, so `web.min.internal..` once
+    /// passed every publish rule as a new name and then replaced another
+    /// user's `web.min.internal` in the view, and the same spelling took the
+    /// names the answerer reserves (differential review, B-1).
+    #[test]
+    fn trailing_dots_do_not_take_another_users_name_or_a_reserved_one() {
+        let tables = Arc::new(RegisteredTables::new());
+        let alice = qualified_node("vm-a", 501);
+        let bob = qualified_node("vm-b", 502);
+        let a = Ipv4Addr::new(127, 0, 64, 10);
+        let b = Ipv4Addr::new(127, 0, 64, 11);
+        let reserved = [HOST_NAME.to_string()];
+        let first = tables.install_validated(1, &alice, vec![published_row("web", a)], &reserved);
+        assert!(first.refused.is_empty(), "{:?}", first.refused);
+        let dotted = |name: &str, dots: &str| RegisteredRow {
+            name: format!("{name}.{}{dots}", zone_answer::ZONE_APEX),
+            ..published_row(name, b)
+        };
+        for dots in ["..", "...", "."] {
+            for name in ["web", "WEB", "host"] {
+                let second = tables.install_validated(2, &bob, vec![dotted(name, dots)], &reserved);
+                assert_eq!(
+                    second.refused.len(),
+                    1,
+                    "{name:?} with {dots:?} must be refused: held {:?}",
+                    second.held
+                );
+            }
+        }
+        // A row of no label, or of an empty one, is no name in the zone.
+        for odd in ["", ".", "..min.internal", "web..min.internal"] {
+            let row = RegisteredRow {
+                name: odd.to_string(),
+                ..published_row("x", b)
+            };
+            let out = tables.install_validated(2, &bob, vec![row], &reserved);
+            assert_eq!(out.refused.len(), 1, "{odd:?}: held {:?}", out.held);
+        }
+        // The owner's own spelling with the root dot is still theirs.
+        let again = tables.install_validated(3, &alice, vec![dotted("web", ".")], &reserved);
+        assert!(again.refused.is_empty(), "{:?}", again.refused);
     }
 
     /// The admission: the service's own uid always; root on the shared
