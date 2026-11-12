@@ -877,41 +877,73 @@ pub(crate) async fn box_stop_exec_on_hosts(
         let exec_id = exec_id_arg(target, exec_text)?;
         let resolved = resolve_box_on_hosts(hosts, target, VERB).await?;
         box_id = Some(resolved.box_id);
-        crate::output::record_box_id(&resolved.box_id.to_string());
-        let mut client = gated_box_host_client(&resolved.host).await?;
-        let request = StopExecRequest {
-            box_id: resolved.box_id,
-            exec_id: exec_id.to_string(),
-        };
-        let stopped = match client
-            .oneshot_rpc::<StopExec>(request)
-            .await
-            .context("StopExec RPC failed")?
-        {
-            minimald_rpc::Errorable::Ok(stopped) => stopped,
-            minimald_rpc::Errorable::Err { error } => {
-                return Err(if error.contains(NO_EXEC_MARK) {
-                    BoxExecIdRefusal::Unknown {
-                        target: target.to_owned(),
-                        exec_id: exec_id.to_string(),
-                    }
-                    .into()
-                } else if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) {
-                    BoxAddressRefusal::NotFound {
-                        address: target.to_owned(),
-                    }
-                    .into()
-                } else {
-                    anyhow::anyhow!("{error}")
-                });
-            }
-        };
-        write_exec_stop_line(out, target, exec_id.as_str(), stopped.already_ended)?;
-        Ok(())
+        send_stop_exec(&resolved, out, target, &exec_id).await
     }
     .await;
     record_exec_id_outcome(VERB, box_id, exec_text, &result);
     result
+}
+
+/// The stop of one exec in a box the caller already resolved, for a verb
+/// that resolves the box by its own rules. `target` is the address the
+/// person typed, and the printed line and each refusal name it. `verb`
+/// goes to the log with the box id and the outcome.
+pub(crate) async fn box_stop_exec_in_resolved(
+    resolved: &ResolvedBox,
+    out: &mut impl std::io::Write,
+    target: &str,
+    exec_text: &str,
+    verb: &'static str,
+) -> Result<(), anyhow::Error> {
+    let result = async {
+        let exec_id = exec_id_arg(target, exec_text)?;
+        send_stop_exec(resolved, out, target, &exec_id).await
+    }
+    .await;
+    record_exec_id_outcome(verb, Some(resolved.box_id), exec_text, &result);
+    result
+}
+
+/// Sends StopExec for `exec_id` to the box `resolved`, and writes the one
+/// line of `min box stop --exec` to `out`. `target` names the box in the
+/// line and in each refusal.
+async fn send_stop_exec(
+    resolved: &ResolvedBox,
+    out: &mut impl std::io::Write,
+    target: &str,
+    exec_id: &minimald_rpc::exec::ExecId,
+) -> Result<(), anyhow::Error> {
+    crate::output::record_box_id(&resolved.box_id.to_string());
+    let mut client = gated_box_host_client(&resolved.host).await?;
+    let request = StopExecRequest {
+        box_id: resolved.box_id,
+        exec_id: exec_id.to_string(),
+    };
+    let stopped = match client
+        .oneshot_rpc::<StopExec>(request)
+        .await
+        .context("StopExec RPC failed")?
+    {
+        minimald_rpc::Errorable::Ok(stopped) => stopped,
+        minimald_rpc::Errorable::Err { error } => {
+            return Err(if error.contains(NO_EXEC_MARK) {
+                BoxExecIdRefusal::Unknown {
+                    target: target.to_owned(),
+                    exec_id: exec_id.to_string(),
+                }
+                .into()
+            } else if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) {
+                BoxAddressRefusal::NotFound {
+                    address: target.to_owned(),
+                }
+                .into()
+            } else {
+                anyhow::anyhow!("{error}")
+            });
+        }
+    };
+    write_exec_stop_line(out, target, exec_id.as_str(), stopped.already_ended)?;
+    Ok(())
 }
 
 /// `min box stop <box> --exec <id>`: stops one exec and leaves the box

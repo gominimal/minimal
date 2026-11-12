@@ -41,10 +41,10 @@ These apply to every subcommand.
 
 ## Commands
 
-### `session list` (aliases: `min ls`, `min session ls`)
+### `ls`
 
 ```
-min session list [--raw] [--json]
+min ls [--raw] [--json]
 ```
 
 Lists sessions. `--raw` prints raw session IDs one per line for piping
@@ -87,10 +87,22 @@ per such port after the table:
 With `--json` the entry lists those ports under `shared_port_collisions`,
 each with `port` and `held_by`, and the key is absent when there are none.
 
-`min ls` is the same command kept bare at the top level — a deliberate
-exception to the `min <noun> <verb>` convention, since it is the
-highest-traffic command in the CLI; `min session ls` is the noun-level alias.
-All three spellings take the same flags and produce identical output.
+`min ls` stays bare at the top level. It is a deliberate exception to the
+`min <noun> <verb>` convention, because it is the highest-traffic command in
+the CLI and scripts read its `--raw` output. It is not an alias of
+`min session list`.
+
+### `session list` (alias: `min session ls`)
+
+```
+min session list [--all] [-o json]
+```
+
+Lists the session boxes of the current project, in any state. It is
+`min box list` limited to session boxes, with the same columns and the same
+flags. `--all` lists the session boxes of every project. `-o json` writes the
+boxes as one JSON array. It does not take `--raw` or `--json`. Use `min ls`
+for those.
 
 ### `dash`
 

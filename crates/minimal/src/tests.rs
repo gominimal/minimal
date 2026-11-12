@@ -1372,40 +1372,35 @@ fn no_provider_defaults_to_the_host_backend() {
     assert!(!cli.global_args.use_minvmd());
 }
 
-/// `min session list` is the canonical `<noun> list` spelling of the
-/// flagship list command; `min ls` (top-level) and `min session ls`
-/// (noun-level) are visible aliases. All three parse to the same `LsArgs`,
-/// so `--raw`/`--json` reach the one `cmd_ls` implementation identically.
+/// `min session list` is `min box list` filtered to session boxes
+/// (BCLI-030), and `min session ls` is its visible alias. They take the
+/// flags of `min box list`. The bare `min ls` keeps its own `--raw` and
+/// `--json` flags.
 #[test]
-fn session_list_spellings_all_reach_ls() {
+fn session_list_spellings_reach_box_list() {
     use clap::Parser as _;
-    let ls_args = |args: &[&str]| -> LsArgs {
+    let list_args = |args: &[&str]| -> BoxListArgs {
         match Cli::try_parse_from(args).unwrap().command {
-            Some(Command::Ls(a))
-            | Some(Command::Session(SessionArgs {
+            Some(Command::Session(SessionArgs {
                 command: SessionCommand::List(a),
             })) => a,
-            _ => panic!("expected an ls command for {args:?}"),
+            _ => panic!("expected `min session list` for {args:?}"),
         }
     };
-
-    for spelling in [
-        ["min", "session", "list"].as_slice(),
-        ["min", "session", "ls"].as_slice(),
-        ["min", "ls"].as_slice(),
-    ] {
-        let a = ls_args(spelling);
-        assert!(
-            !a.raw && !a.json,
-            "{spelling:?} must default both flags off"
-        );
+    for spelling in [["min", "session", "list"], ["min", "session", "ls"]] {
+        let a = list_args(&spelling);
+        assert!(!a.all && a.output.is_none(), "{spelling:?}");
     }
+    let a = list_args(&["min", "session", "list", "--all", "-o", "json"]);
+    assert!(a.all && a.output == Some(BoxListOutputFormat::Json));
 
-    // `--raw`/`--json` are accepted on the canonical and the bare form alike.
-    let canonical = ls_args(&["min", "session", "list", "--raw"]);
-    assert!(canonical.raw && !canonical.json);
-    let bare = ls_args(&["min", "ls", "--json"]);
-    assert!(bare.json && !bare.raw);
+    match Cli::try_parse_from(["min", "ls", "--json"])
+        .unwrap()
+        .command
+    {
+        Some(Command::Ls(a)) => assert!(a.json && !a.raw),
+        _ => panic!("expected `min ls`"),
+    }
 }
 
 /// `setup-zed` takes the session the way every other session verb does —
@@ -13257,9 +13252,15 @@ async fn task_list_shows_exited_until_pruned() {
     let list = async |scope: Option<&str>| {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let scope = scope.map(|root| paths::HostAbsPath::try_new(root).unwrap());
-        crate::task::task_list_on_hosts(local_hosts(&global).unwrap(), scope, &mut out, &mut err)
-            .await
-            .expect("the task list");
+        typed_list_on_hosts(
+            boxes::TASK_BOX_TYPE,
+            local_hosts(&global).unwrap(),
+            scope,
+            &mut out,
+            &mut err,
+        )
+        .await
+        .expect("the task list");
         assert_eq!(String::from_utf8_lossy(&err), "", "nothing on stderr");
         String::from_utf8(out).unwrap()
     };
@@ -13282,7 +13283,8 @@ async fn task_list_shows_exited_until_pruned() {
     // A listing of another project does not show the task.
     assert_eq!(
         list(Some("/another/project")).await,
-        format!("{}\n", crate::cmd::EMPTY_PROJECT_LIST)
+        "This project has no task boxes. Run `min task list --all` to list the task boxes \
+         of every project.\n"
     );
 
     // The exited task stays until a prune removes it.
@@ -13296,10 +13298,361 @@ async fn task_list_shows_exited_until_pruned() {
     )
     .await
     .expect("the prune");
-    assert_eq!(
-        list(None).await,
-        format!("{}\n", crate::cmd::EMPTY_HOST_LIST)
+    assert_eq!(list(None).await, "No task boxes on this machine.\n");
+}
+
+/// The typed listing of `min session list` and `min task list` over the
+/// local `hosts`, as the commands run it, with the table rendering.
+async fn typed_list_on_hosts(
+    box_type: &str,
+    hosts: Vec<LocalHost>,
+    project_root: Option<paths::HostAbsPath>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Result<(), anyhow::Error> {
+    let request = cmd::TypedBoxList {
+        box_type,
+        verb: "test list",
+        project_root,
+        output: None,
+    };
+    cmd::typed_box_list_on_hosts(hosts, request, out, err).await
+}
+
+/// The argument ids of `min <path>`, sorted, for a comparison of two
+/// command forms.
+fn arg_ids(path: &[&str]) -> Vec<String> {
+    use clap::CommandFactory as _;
+    let mut cmd = Cli::command();
+    for name in path {
+        cmd = cmd
+            .find_subcommand(name)
+            .unwrap_or_else(|| panic!("`min {}` exists", path.join(" ")))
+            .clone();
+    }
+    let mut ids: Vec<String> = cmd
+        .get_arguments()
+        .filter(|arg| !arg.is_global_set())
+        .map(|arg| arg.get_id().to_string())
+        .filter(|id| id != "help")
+        .collect();
+    ids.sort();
+    ids
+}
+
+// BCLI-030: `min session list|start|attach|logs|stop|rm` and
+// `min task run|list|logs|stop|rm` are the `min box` forms, filtered to
+// boxes of that type. `min session list` prints the same columns as
+// `min box list`, with only the session boxes. A stop or a removal under
+// one type noun does not reach a box of the other type.
+#[tokio::test]
+async fn type_noun_verbs_alias_box_forms() {
+    use clap::CommandFactory as _;
+
+    // Every verb the requirement names exists under its noun.
+    let cli = Cli::command();
+    for (noun, verbs) in [
+        (
+            "session",
+            ["list", "start", "attach", "logs", "stop", "rm"].as_slice(),
+        ),
+        ("task", ["run", "list", "logs", "stop", "rm"].as_slice()),
+    ] {
+        let noun_cmd = cli.find_subcommand(noun).expect("the type noun");
+        for verb in verbs {
+            assert!(
+                noun_cmd.find_subcommand(verb).is_some(),
+                "`min {noun} {verb}` exists"
+            );
+        }
+        // The list, stop and rm forms take the flags of the `min box` form.
+        for verb in ["list", "stop", "rm"] {
+            assert_eq!(
+                arg_ids(&[noun, verb]),
+                arg_ids(&["box", verb]),
+                "`min {noun} {verb}` takes the arguments of `min box {verb}`"
+            );
+        }
+    }
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let web = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let build = create_configured_task(&mut daemon, "build", project).await;
+    let hosts = || local_hosts(&global).unwrap();
+
+    // `min session list` and `min task list`: the `min box list` header,
+    // with only the boxes of the noun's type.
+    let mut all = Vec::new();
+    for host in hosts() {
+        let records = cmd::read_host_boxes(&host).await.unwrap().unwrap();
+        all.extend(records.into_iter().map(|record| cmd::ListedBox {
+            provider: host.provider.to_string(),
+            host: host.host.clone(),
+            record,
+        }));
+    }
+    let mut box_list = Vec::new();
+    cmd::render_box_list(&mut box_list, &all, false).unwrap();
+    let box_list = String::from_utf8(box_list).unwrap();
+    let columns = |text: &str| -> Vec<String> {
+        let header = text.lines().next().expect("a header");
+        header.split_whitespace().map(str::to_owned).collect()
+    };
+    for (box_type, shown, hidden) in [
+        (boxes::SESSION_BOX_TYPE, web, build),
+        (boxes::TASK_BOX_TYPE, build, web),
+    ] {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        typed_list_on_hosts(box_type, hosts(), None, &mut out, &mut err)
+            .await
+            .expect("the typed list");
+        assert!(err.is_empty(), "nothing on stderr");
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(columns(&text), columns(&box_list), "{text}\n{box_list}");
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(rows.len(), 1, "one {box_type} box:\n{text}");
+        assert!(rows[0].starts_with(&shown.to_string()), "{text}");
+        assert!(!text.contains(&hidden.to_string()), "{text}");
+    }
+
+    // A type noun does not reach a box of the other type: the address is
+    // refused as one that no box holds, and the box keeps running.
+    let stop = |target: &str| BoxStopArgs {
+        target: target.to_owned(),
+        force: false,
+        exec: None,
+    };
+    let rm = |target: &str| BoxRmArgs {
+        target: target.to_owned(),
+        force: true,
+    };
+    let session = boxes::SESSION_BOX_TYPE;
+    let task = boxes::TASK_BOX_TYPE;
+    for (box_type, other) in [(session, "build"), (task, "web")] {
+        let mut out = Vec::new();
+        let err = cmd::typed_box_stop_on_hosts(hosts(), &mut out, &stop(other), box_type, "stop")
+            .await
+            .expect_err("a box of another type is not found");
+        assert!(
+            matches!(
+                err.downcast_ref::<BoxAddressRefusal>(),
+                Some(BoxAddressRefusal::NotFound { .. })
+            ),
+            "{err:#}"
+        );
+        assert!(out.is_empty());
+        let err = cmd::typed_box_rm_on_hosts(hosts(), &rm(other), box_type, "rm")
+            .await
+            .expect_err("a box of another type is not removed");
+        assert!(
+            matches!(
+                err.downcast_ref::<BoxAddressRefusal>(),
+                Some(BoxAddressRefusal::NotFound { .. })
+            ),
+            "{err:#}"
+        );
+    }
+
+    // With `--exec`, the exec stop reaches the box the type noun resolved.
+    // A task box that holds, as its name, the start of the session box's id
+    // is not the box the exec stop reads.
+    let web_start: String = web.simple().to_string().chars().take(8).collect();
+    let decoy = create_configured_task(&mut daemon, &web_start, project).await;
+    let mut out = Vec::new();
+    let exec_stop = BoxStopArgs {
+        target: web_start.clone(),
+        force: false,
+        exec: Some(FIRST_EXEC_ID.to_owned()),
+    };
+    let err = cmd::typed_box_stop_on_hosts(hosts(), &mut out, &exec_stop, session, "stop")
+        .await
+        .expect_err("the session box runs no such exec");
+    match err.downcast_ref::<BoxExecIdRefusal>() {
+        Some(BoxExecIdRefusal::Unknown { target, .. }) => {
+            assert_eq!(
+                target, &web_start,
+                "the refusal names the address the person typed"
+            );
+        }
+        other => panic!("an unknown exec in the session box, not {other:?}: {err:#}"),
+    }
+    assert!(out.is_empty());
+    cmd::typed_box_rm_on_hosts(hosts(), &rm(&decoy.to_string()), task, "rm")
+        .await
+        .expect("the decoy task box goes");
+
+    // With `--exec`, each noun prints the line of `min box stop --exec`,
+    // and the line names the box as the person typed it.
+    let native = hosts().into_iter().next().expect("the native host");
+    for (box_type, name, id) in [(session, "web", web), (task, "build", build)] {
+        let listed = server.list_running_exec(id, FIRST_EXEC_ID, &["sleep", "600"], false);
+        let exec_stop = BoxStopArgs {
+            target: name.to_owned(),
+            force: false,
+            exec: Some(FIRST_EXEC_ID.to_owned()),
+        };
+        let mut out = Vec::new();
+        let stop = cmd::typed_box_stop_on_hosts(hosts(), &mut out, &exec_stop, box_type, "stop");
+        let end = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            listed.end();
+        };
+        let (stopped, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(stop, end)
+        })
+        .await
+        .expect("the stop returns when the exec ends");
+        assert!(
+            stopped.expect("the exec stop succeeds").is_none(),
+            "an exec stop, not a box stop"
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "Exec {FIRST_EXEC_ID} in {name} ended before the stop, \
+                 so the stop changed nothing.\n"
+            )
+        );
+    }
+
+    // A stopped session box and a running task box hold the same name, and
+    // the task box runs an exec. A session stop with `--exec` does not stop
+    // the task box's exec.
+    let twin_session =
+        minimald::test_harness::create_configured_session(&mut daemon, "twin", project).await;
+    let mut out = Vec::new();
+    cmd::typed_box_stop_on_hosts(hosts(), &mut out, &stop("twin"), session, "stop")
+        .await
+        .expect("the session box stops")
+        .expect("a box stop");
+    let twin_task = create_configured_task(&mut daemon, "twin", project).await;
+    let _task_exec = server.list_running_exec(twin_task, FIRST_EXEC_ID, &["sleep", "600"], false);
+    let exec_stop = BoxStopArgs {
+        target: "twin".to_owned(),
+        force: false,
+        exec: Some(FIRST_EXEC_ID.to_owned()),
+    };
+    let mut out = Vec::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cmd::typed_box_stop_on_hosts(hosts(), &mut out, &exec_stop, session, "stop"),
+    )
+    .await
+    .expect("the session stop does not wait on the task box's exec");
+    assert!(
+        result.is_err(),
+        "the stopped session box runs no exec: {:?}",
+        String::from_utf8_lossy(&out)
     );
+    assert!(out.is_empty());
+    let text = box_show_text(&native, &twin_task.to_string()).await;
+    assert_eq!(
+        live_exec_rows(&text),
+        [
+            "Live execs:".to_owned(),
+            format!("  {FIRST_EXEC_ID}  detached  sleep 600"),
+        ],
+        "the task box's exec runs on\n{text}"
+    );
+    for (box_type, id) in [(task, twin_task), (session, twin_session)] {
+        cmd::typed_box_rm_on_hosts(hosts(), &rm(&id.to_string()), box_type, "rm")
+            .await
+            .expect("the twin box goes");
+    }
+
+    // Under its own noun, each box stops with the line of `min box stop`,
+    // and then goes, as `min box rm` removes it.
+    for (box_type, name, id) in [(session, "web", web), (task, "build", build)] {
+        let mut out = Vec::new();
+        let stopped =
+            cmd::typed_box_stop_on_hosts(hosts(), &mut out, &stop(name), box_type, "stop")
+                .await
+                .expect("the box stops")
+                .expect("a box stop, not an exec stop");
+        assert_eq!(stopped.box_id, id);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Stopped {name}.\n")
+        );
+        let (_, removed) = cmd::typed_box_rm_on_hosts(hosts(), &rm(name), box_type, "rm")
+            .await
+            .expect("the box goes");
+        assert_eq!(removed.id, id);
+    }
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    typed_list_on_hosts(session, hosts(), None, &mut out, &mut err)
+        .await
+        .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains(&web.to_string()), "{text}");
+}
+
+// BCLI-027: every countable noun takes its plural, and the plural parses
+// to the same command as the singular. A new noun with subcommands must be
+// classified here as countable or not.
+#[test]
+fn plural_nouns_accepted() {
+    use clap::CommandFactory as _;
+    use clap::Parser as _;
+
+    let countable = [
+        ("session", "sessions"),
+        ("loadout", "loadouts"),
+        ("task", "tasks"),
+        ("box", "boxes"),
+        ("host", "hosts"),
+        ("provider", "providers"),
+        ("secret", "secrets"),
+    ];
+    // Nouns that do not count: a network, a sign-in, diagnostics, the mesh
+    // and the completions (already plural).
+    let uncountable = ["net", "auth", "diag", "mesh", "completions"];
+
+    let cli = Cli::command();
+    let mut nouns: Vec<&str> = cli
+        .get_subcommands()
+        .filter(|cmd| cmd.has_subcommands() && !cmd.is_hide_set())
+        .map(|cmd| cmd.get_name())
+        .collect();
+    nouns.retain(|noun| !uncountable.contains(noun));
+    nouns.sort_unstable();
+    let mut expected: Vec<&str> = countable.iter().map(|(noun, _)| *noun).collect();
+    expected.sort_unstable();
+    assert_eq!(
+        nouns, expected,
+        "every noun is classified as countable or not"
+    );
+
+    for (noun, plural) in countable {
+        let cmd = cli.find_subcommand(noun).expect("the noun");
+        assert!(
+            cmd.get_visible_aliases().any(|alias| alias == plural),
+            "`min {plural}` is a visible alias of `min {noun}`"
+        );
+        let verb = cmd
+            .get_subcommands()
+            .find(|verb| verb.get_name() == "list")
+            .map(|verb| verb.get_name().to_owned());
+        if let Some(verb) = verb {
+            // clap resolves an alias to the command's own name, so the
+            // plural reaches the same subcommand as the singular.
+            let path = |typed: &str| {
+                let matches = Cli::command()
+                    .try_get_matches_from(["min", typed, &verb])
+                    .unwrap_or_else(|e| panic!("`min {typed} {verb}` parses: {e}"));
+                let (name, sub) = matches.subcommand().expect("a noun");
+                (name.to_owned(), sub.subcommand_name().map(str::to_owned))
+            };
+            assert_eq!(path(noun), path(plural), "`min {plural} {verb}`");
+            assert_eq!(path(plural), (noun.to_owned(), Some(verb.clone())));
+            assert!(Cli::try_parse_from(["min", plural, &verb]).is_ok());
+        }
+    }
 }
 
 /// The cross-VM name resolution the tests above drive, with the example
@@ -15493,7 +15846,8 @@ async fn task_run_logs_wait_list_end_to_end() {
 
             let list = async |ran: &mut Transcript| {
                 let (mut out, mut err) = (Vec::new(), Vec::new());
-                let listed = crate::task::task_list_on_hosts(
+                let listed = typed_list_on_hosts(
+                    boxes::TASK_BOX_TYPE,
                     local_hosts(&global).unwrap(),
                     None,
                     &mut out,
@@ -15541,7 +15895,7 @@ async fn task_run_logs_wait_list_end_to_end() {
             prune.unwrap_or_else(|e| panic!("the prune: {e:#}\n{ran}"));
             assert_eq!(
                 list(ran).await,
-                format!("{}\n", crate::cmd::EMPTY_HOST_LIST),
+                "No task boxes on this machine.\n",
                 "the prune removes the task\n{ran}"
             );
         };
