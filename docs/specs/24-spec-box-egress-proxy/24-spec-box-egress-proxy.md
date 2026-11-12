@@ -69,6 +69,12 @@ The `host_ip` lane on a host that runs its boxes in a VM, with `dns` as its
 default steering, is BEP-082 to BEP-087. The direct TLS path that `dns`
 steering needs is BEP-080 and BEP-081.
 
+The epic asks for one host store, the macOS Keychain. The Linux key custody of
+BEP-088 to BEP-090 comes from the architecture instead. Gatehouse §6.10 asks
+for hardware custody where the host offers it, and names TPM 2.0 for Linux.
+The owner chose the Secret Service fallback on 2026-11-12, after the experiment
+on [#2436](https://github.com/gominimal/minimal/issues/2436).
+
 ## Users and stories
 
 **Roles:** developer on an un-enrolled laptop, developer working in a box, developer reviewing what a box may reach
@@ -282,10 +288,10 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p bep key_replacement_kills_outstanding_members
     <!-- the recreate-to-re-mint rule of Gatehouse §8.3 -->
-  - IF the host keychain refuses the proxy a key it holds for the proxy THEN THE SYSTEM SHALL refuse to start and name `bep --replace-key` with the role of each refused key.
+  - IF the macOS keychain refuses the proxy a key it holds for the proxy THEN THE SYSTEM SHALL refuse to start and name `bep --replace-key` with the role of each refused key.
     tier:   T0
     verify: cargo nextest run -p bep refused_key_names_the_replacement_command
-    <!-- unwanted; the keychain admits a key to the program that generated it, so a rebuilt proxy is a different program and is refused its predecessor's keys; the replacement is this requirement's operator command, and it runs without the files a serving proxy reads, since the case it exists for is a proxy that will not start -->
+    <!-- unwanted; the keychain admits a key to the program that generated it, so a rebuilt proxy is a different program and is refused its predecessor's keys; the replacement is this requirement's operator command, and it runs without the files a serving proxy reads, since the case it exists for is a proxy that will not start; a Linux key store's refusals are BEP-089's: a locked or unreachable Secret Service keeps its keys and names no replacement, and a TPM that cannot load a key names it -->
 
 - **BEP-061** WHEN the signing CA rotates under an unchanged root THE SYSTEM SHALL keep every running box's trust anchor valid with no change inside the box.
   tier:     T0
@@ -295,7 +301,7 @@ Steering and the interception CA
   tier:     T0
   verify:   cargo nextest run -p bep linux_key_store_is_the_tpm_where_usable_else_secret_service
   <!-- Gatehouse §6.10 hardware-backed custody is a SHOULD "where the host offers it", and names TPM 2.0 for Linux; the fallback is the owner's decision of 2026-11-12, after the experiment on #2436; the store is chosen by trying it at generation, not by finding a device: a TPM that is present but refuses to create a key, because an owner authorization is set or it is in lockout, is not usable; the choice is made at generation only, never at a later start (BEP-089) -->
-  - WHERE the proxy generates a key in a TPM THE SYSTEM SHALL make the key fixed to that TPM, exempt from dictionary-attack lockout, and usable only with an authorization value of at least 128 bits from the OS CSPRNG, held in a file that only the proxy's user reads.
+  - WHERE the proxy generates a key in a TPM THE SYSTEM SHALL make the key fixed to that TPM, exempt from dictionary-attack lockout, and usable only by the proxy's user, through an authorization value of at least 128 bits from the OS CSPRNG that the proxy reads from a file only its user can read.
     tier:   T0
     verify: cargo nextest run -p bep --run-ignored ignored-only a_tpm_key_is_fixed_exempt_from_lockout_and_needs_its_authorization
     <!-- `fixedTPM|fixedParent` and `noDA`; a host that loses power can put the TPM into dictionary-attack lockout, and in the experiment a key without `noDA` was unusable for the TPM's 1000-second recovery time; without its own authorization value, any member of the `tss` group can load and use the key; the test lives in a `crates/bep/tests/*_tpm_integration.rs` binary, ignored unless a TPM is named, and runs against `swtpm` in the Linux native lane and in a local VM; ECDH needs the TPM's own interface, because `tpm2-pkcs11` has no ECDH mechanism -->
@@ -325,6 +331,10 @@ Steering and the interception CA
   tier:     T0
   verify:   cargo nextest run -p minimal auth_status_reports_software_key_custody
   <!-- the reduced custody is reported where it stays, never before a box shell; the store is per key, because BEP-089 lets one role be replaced into another store; the published material of BEP-072 carries which store holds each key, so the client reads it without opening the store -->
+  - THE SYSTEM SHALL publish, beside the material of BEP-072, which store holds each of the proxy's keys.
+    tier:   T0
+    verify: cargo nextest run -p bep the_published_identity_names_each_key_store
+    <!-- ubiquitous; the client reads the store without opening it, as BEP-072 requires; macOS publishes the keychain for every key -->
 
 - **BEP-015** WHILE a box with steering `proxy_env` holds a sealed GitHub member THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no tool configuration in the box beyond what the box carries at creation.
   tier:     T0
@@ -1111,7 +1121,12 @@ observes directly in the box's environment and filesystem (BEP-002, BEP-007,
 BEP-033), and unattended key and store access confined to the proxy identity is
 enforced by keychain access control rather than by a decision function this code
 owns (BEP-014, BEP-051, BEP-059), so a property test would restate the
-keychain's contract.
+keychain's contract. The same holds for the TPM and Secret Service (BEP-088,
+BEP-089): the key's attributes and the authorization value are the store's
+contract. The one decision this code owns there is the store choice. Its
+inputs are whether the TPM works, the state of the keyring, and whether a key
+is already held. Example tests enumerate those few states in full, so a
+property adds nothing.
 
 **Three-layer CA, keys in the keychain.** A self-signed root as the injected
 anchor, a keychain-held signing CA that rotates freely, and per-hostname leaves
@@ -1152,7 +1167,9 @@ path-segment selector do not, because reachability was the authorization and
 Gatehouse §12.11 dismissed that shape. The shipped `:7654` Host-header router
 is the closest code; the proxy stands beside it as its own crate.
 
-**Linux keys: the TPM first, Secret Service after.** The experiment on
+**Linux keys: the TPM first, Secret Service after.** In BEP-014 and BEP-059,
+the host's hardware key store is the Secure Enclave on macOS. On Linux it is a
+TPM 2.0. The experiment on
 [#2436](https://github.com/gominimal/minimal/issues/2436) ran on a cloud VM
 with a virtual TPM and on Lima with `swtpm`. A TPM 2.0 key did the sealing
 key's ECDH and the ECDSA of the signing CA. The TPM refused to duplicate the key,
@@ -1256,7 +1273,7 @@ per-request Keychain access control.
   enforced by: audit record construction from the decision only; `min box spec` and `min secret` render identifiers and references only
   covered by: BEP-004, BEP-038, BEP-040, BEP-050, BEP-052
 
-- **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone.
+- **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone, which on a Linux host is the proxy's OS user.
   enforced by: keychain access control bound to the proxy's code signature on macOS, a TPM key's authorization value in a file only the proxy's user reads on Linux, and process separation
   covered by: BEP-014, BEP-051, BEP-059, BEP-060, BEP-072, BEP-088, BEP-089
   <!-- On Linux the proxy's identity is its OS user. Today that is the operator's login user, and a key in Secret Service has no control per program. So on a Linux host this invariant holds only up to the operator's user (Design reasoning, "Process identity on Linux is the user"). -->
