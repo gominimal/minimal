@@ -322,14 +322,18 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p bep an_unreachable_secret_service_refuses_start
     <!-- unwanted; distinct from a locked keyring, because unlocking does not help when no session bus or keyring daemon runs, as in a plain SSH session; the keys still exist, so the remedy is where the proxy starts, never `bep --replace-key` -->
-  - IF a proxy key is in a TPM and the TPM cannot be reached THEN THE SYSTEM SHALL refuse to start, report that the TPM cannot be reached, and not name `bep --replace-key`.
+  - IF a proxy key is in a TPM and the TPM cannot be reached, or answers that it cannot load an object now, THEN THE SYSTEM SHALL refuse to start, report that the TPM cannot load the key of that role now, and not name `bep --replace-key`.
     tier:   T0
     verify: cargo nextest run -p bep an_unreachable_tpm_refuses_start_and_keeps_the_key
-    <!-- unwanted; a TPM that is disabled in firmware, not yet ready, or whose device the proxy's user cannot open, can come back with the key intact, so replacing it would throw away a key that still works; the proxy never generates the key again by itself and never falls back to Secret Service (BEP-089) -->
-  - IF a proxy key is in a TPM and the TPM refuses to load it THEN THE SYSTEM SHALL refuse to start, report that this TPM no longer holds the key of that role, and name `bep --replace-key <role>` with that role.
+    <!-- unwanted; a TPM that is disabled in firmware, not yet ready, or whose device the proxy's user cannot open, and a TPM that answers a load with a response the TCG library defines as temporary, such as `TPM_RC_OBJECT_MEMORY` or `TPM_RC_RETRY`, can load the key later, so replacing it would throw away a key that still works; the proxy never generates the key again by itself and never falls back to Secret Service -->
+  - IF a proxy key is in a TPM and its key file or its authorization file is missing or unreadable, or the TPM refuses the key file as not its own, THEN THE SYSTEM SHALL refuse to start, report which of the three it is for that role, and name `bep --replace-key <role>` with that role.
     tier:   T0
     verify: cargo nextest run -p bep a_tpm_key_the_tpm_cannot_load_refuses_start
-    <!-- unwanted; a TPM that answers but cannot load the blob was cleared or is another TPM, and the key is then lost, so replacement is the remedy, as BEP-060's refusal names it; a `noDA` key is not refused by dictionary-attack lockout, so lockout is not this case -->
+    <!-- unwanted; each is a lost key: a key file that the TPM refuses as not its own (an integrity or hierarchy error) belongs to a cleared TPM or another one, and without its file or its authorization value no TPM can use the key; replacement is the remedy, as BEP-060's refusal names it; a `noDA` key is not refused by dictionary-attack lockout, so lockout is not this case -->
+  - IF the proxy holds a key for one role and its store holds no key for another role THEN THE SYSTEM SHALL refuse to start, report that the store no longer holds the key of that role, and name `bep --replace-key <role>` with that role.
+    tier:   T0
+    verify: cargo nextest run -p bep a_missing_role_key_refuses_start_and_names_replacement
+    <!-- unwanted; an unlocked, reachable keyring with no entry for a role, or a TPM key directory with no file for it, while another role's key is held, is a lost key and never a first start, so the proxy never generates it at start (BEP-060); only a host that holds no key for any role is a first start -->
 
 - **BEP-090** WHILE the proxy holds a key in Secret Service THE SYSTEM SHALL report on `min auth status` that key's role and that it is a software key, which a program running as the operator's user can copy.
   tier:     T0
