@@ -12,7 +12,7 @@
 //! gives it, so this command and the expansion cannot disagree.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use mfile::box_types::{BUILTIN_BOX_TYPES, BoxTypeError, BoxTypes, ResolvedType, builtin};
@@ -596,12 +596,18 @@ pub fn write_type_detail_as(
 /// The directory the commands look for the project in, and whether the
 /// search walks up from it. `--repo-dir` names the project root, as
 /// `min init` reads it, so the search stays there. Without it the search
-/// walks up from the current directory.
-fn project_dir(global: &GlobalArgs) -> (PathBuf, bool) {
+/// walks up from `cwd`, which must be absolute: `Path::parent` of a
+/// relative `.` never reaches the real parent directory.
+fn project_dir(global: &GlobalArgs, cwd: &Path) -> (PathBuf, bool) {
     match &global.repo_dir {
         Some(dir) => (dir.clone(), false),
-        None => (PathBuf::from("."), true),
+        None => (cwd.to_path_buf(), true),
     }
+}
+
+/// The current directory, absolute, for the upward search.
+fn current_dir() -> anyhow::Result<PathBuf> {
+    std::env::current_dir().context("reading the current directory")
 }
 
 /// The box types of the project in `dir`, or only the built-in types when
@@ -668,7 +674,20 @@ pub fn cmd_type_list(
     args: &TypeListArgs,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let (dir, search_ancestors) = project_dir(global);
+    cmd_type_list_in(global, &current_dir()?, args, out)
+}
+
+/// `min type list`, run in the absolute directory `cwd`.
+///
+/// # Errors
+/// As [`cmd_type_list`].
+pub fn cmd_type_list_in(
+    global: &GlobalArgs,
+    cwd: &Path,
+    args: &TypeListArgs,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let (dir, search_ancestors) = project_dir(global, cwd);
     let types = load_types(&dir, search_ancestors, "list the box types")?;
     let rows = type_rows(&types);
     match args.output {
@@ -689,7 +708,20 @@ pub fn cmd_type_show(
     args: &TypeShowArgs,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let (dir, search_ancestors) = project_dir(global);
+    cmd_type_show_in(global, &current_dir()?, args, out)
+}
+
+/// `min type show <name>`, run in the absolute directory `cwd`.
+///
+/// # Errors
+/// As [`cmd_type_show`].
+pub fn cmd_type_show_in(
+    global: &GlobalArgs,
+    cwd: &Path,
+    args: &TypeShowArgs,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let (dir, search_ancestors) = project_dir(global, cwd);
     let types = load_types(&dir, search_ancestors, "show the box type")?;
     if !types.contains(&args.name) {
         return Err(BoxTypeNotFound {

@@ -17227,6 +17227,36 @@ fn type_list_shows_builtin_and_project_types_with_source() {
     let text = String::from_utf8(out).unwrap();
     assert!(!text.contains("project"), "{text}");
 
+    // Without `--repo-dir`, the search walks up from the current directory:
+    // run in a subdirectory of the project, both verbs find its types.
+    let deep = nested.join("a").join("b");
+    std::fs::create_dir_all(&deep).unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list_in(
+        &GlobalArgs::default(),
+        &deep,
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect("the list renders from a subdirectory");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.lines().any(|l| l.starts_with("rust-dev ")), "{text}");
+    assert!(text.lines().any(|l| l.starts_with("base ")), "{text}");
+    let mut out = Vec::new();
+    cmd::types::cmd_type_show_in(
+        &GlobalArgs::default(),
+        &deep,
+        &TypeShowArgs {
+            name: "rust-dev".to_owned(),
+            output: None,
+        },
+        &mut out,
+    )
+    .expect("`min type show rust-dev` finds the project type from a subdirectory");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("rust-dev"), "{text}");
+    assert!(text.contains("project"), "{text}");
+
     // A type name with a control character prints escaped, so a cloned
     // `minimal.toml` cannot send terminal control sequences.
     let hostile = tempfile::tempdir().unwrap();
