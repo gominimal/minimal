@@ -2039,6 +2039,92 @@ async fn finalize_without_compose_time_names_evaluates_the_graph() {
     assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
 }
 
+/// A local git repo holding an empty upstream layer, committed once.
+/// Returns the repo dir and the full commit, for an `[upstream]` pin
+/// that resolves offline.
+fn local_upstream_repo() -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join(mfile::MFILE_NAME), "").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "upstream"]);
+    let commit = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    (dir, commit)
+}
+
+/// A refusal for a package the pinned upstream does not declare keeps
+/// its old text and adds one note naming the `[upstream]` repo, the
+/// short `locked_commit` and `min update` — on the fast path (names
+/// captured at compose) and on the fallback that evaluates the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_refusal_names_the_upstream_pin() {
+    let (upstream, commit) = local_upstream_repo();
+    let repo = upstream.path().to_str().unwrap().to_owned();
+    for fallback in [false, true] {
+        let (_state, _cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_config(), None).await.unwrap();
+        seed_workspace_package(&mngr, id, "pkg-ok").await;
+        seed_workspace_mfile(
+            &mngr,
+            id,
+            &format!(
+                "[upstream]\nrepo = \"{repo}\"\nlocked_commit = \"{commit}\"\n\n\
+                 [session]\npackages = [\"pkg-ok\", \"no-such-pkg-up\"]\n"
+            ),
+        )
+        .await;
+        let handle = session(&mngr, id).await;
+        handle
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect("packages gate nothing at compose");
+        handle
+            .check_packages_at_finalize(PACKAGE_CHECK_DEADLINE)
+            .await;
+        if fallback {
+            handle.forget_composed_graph_names().await;
+        }
+        let err = handle
+            .finalize()
+            .await
+            .expect_err("a package absent at the pin must not activate");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-up (declared by project")
+                && msg.contains("; the session was not activated"),
+            "the old refusal text stays (fallback: {fallback}), got {msg:?}"
+        );
+        assert!(
+            msg.contains(&repo) && msg.contains(&commit[..7]) && !msg.contains(&commit),
+            "the note names the repo and the short pin (fallback: {fallback}), got {msg:?}"
+        );
+        assert_eq!(
+            msg.matches("min update").count(),
+            1,
+            "the note appears once (fallback: {fallback}), got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
+    }
+}
+
 async fn status_of(mngr: &BoxManagerHandle, id: SessionId) -> boxes::BoxState {
     mngr.get_record(BoxKeyPredicate::Id(id))
         .await
