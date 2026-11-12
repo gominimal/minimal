@@ -65,9 +65,12 @@ pub enum Command {
     /// List sessions
     //
     // Deliberate exception to the `<noun> <verb>` convention (documented in
-    // docs/reference/cli.md): `min session list` is the canonical spelling,
-    // and `min ls` — the highest-traffic command in the CLI — keeps this bare
-    // top-level form as its visible alias. Not an oversight — do not remove it.
+    // docs/reference/cli.md): `min ls` — the highest-traffic command in the
+    // CLI — keeps this bare top-level form, with its `--raw` and `--json`
+    // flags, for the scripts that read it. It is not an alias of
+    // `min session list`, which is `min box list` filtered to session boxes
+    // (BCLI-030) and takes the `min box list` flags. Not an oversight — do
+    // not remove it.
     Ls(LsArgs),
     /// Shut down the minimald daemon
     //
