@@ -16145,7 +16145,7 @@ async fn retained_box_management_end_to_end() {
 async fn start_attach_resume_end_to_end() {
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreatingVerb, Errorable,
-        FinalizeSession, FinalizeSessionRequest,
+        FinalizeSession, FinalizeSessionRequest, GetSessionHooks, GetSessionHooksRequest,
     };
     use tracing::Instrument as _;
 
@@ -16249,7 +16249,16 @@ async fn start_attach_resume_end_to_end() {
         let config = tempfile::tempdir().unwrap();
         let loadouts_dir = config.path().join("minimal/loadouts");
         std::fs::create_dir_all(&loadouts_dir).unwrap();
-        std::fs::write(loadouts_dir.join("rust.toml"), "description = \"r\"\n").unwrap();
+        // The hook is the loadout's mark on the box: the daemon reports it
+        // back with its source, so the test reads the loadout off the box.
+        std::fs::write(
+            loadouts_dir.join("rust.toml"),
+            "description = \"r\"\n\n\
+             [[lifecycle_hooks]]\n\
+             description = \"rust mark\"\n\
+             on_detach = { type = \"inline\", value = \"true\" }\n",
+        )
+        .unwrap();
         let global = GlobalArgs {
             config_dir: Some(config.path().to_path_buf()),
             no_input: true,
@@ -16315,6 +16324,29 @@ async fn start_attach_resume_end_to_end() {
                 .and_then(|egress| egress.allow_dns_hosts.clone()),
             Some(vec!["a.example".to_owned()]),
             "the entry's egress stays\n{ran}"
+        );
+        // The daemon holds the composed `rust` loadout for the box.
+        let hooks = match daemon
+            .call::<GetSessionHooks>(&GetSessionHooksRequest::Id(web))
+            .await
+        {
+            Errorable::Ok(hooks) => hooks,
+            Errorable::Err { error } => panic!("the box's hooks: {error}\n{ran}"),
+        };
+        let from_rust: Vec<_> = hooks
+            .iter()
+            .filter(|h| {
+                matches!(
+                    &h.source,
+                    boxes::wire::primitives::WireSource::UserLoadout { name } if name == "rust"
+                )
+            })
+            .map(|h| h.hook.description.clone())
+            .collect();
+        assert_eq!(
+            from_rust,
+            [Some("rust mark".to_owned())],
+            "the box carries the rust loadout's hook: {hooks:?}\n{ran}"
         );
 
         // `min box attach web`, then the bare `min box attach`, each reach
