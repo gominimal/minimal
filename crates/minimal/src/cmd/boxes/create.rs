@@ -1503,6 +1503,10 @@ fn box_entry(
     // BOX-183, BOX-184: the merge compares resolved values, so each
     // `inherit` name takes this process's value. A name it does not set
     // stays out, and the merge falls back to the `default`.
+    // Gap (BOX-183, residual of T125, issue #3302): `layers.loadouts` stays
+    // empty here. So the loadout var conflict refusal in `merge_vars` does
+    // not run before `min box create`, `min session start` or `min task run`
+    // creates the box.
     layers.host_vars = mfile::expand::inherited_var_names(&entry, &layers)
         .into_iter()
         .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
