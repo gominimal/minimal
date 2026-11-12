@@ -97,6 +97,11 @@ impl std::fmt::Display for ProjectFileInvalid {
         // The cause is in this text and `source()` returns none, so `{}`
         // and the printer's `{:#}` each show it once. The mfile error's own
         // cause (the io error of `Error::IO`) is in its Display already.
+        // A loadout file is not the project's file, so its refusal does not
+        // say that the project's file does not load.
+        if let mfile::Error::LoadoutSetsLoadoutMode { .. } = self.error {
+            return write!(f, "Cannot start the box: {}", self.error);
+        }
         write!(
             f,
             "Cannot start the box: the project's {name} does not load: {error}",
@@ -1211,6 +1216,85 @@ pub(crate) struct ProjectEgress {
     /// of an earlier one, so one table holds all of it. `None` when no
     /// layer declares `network`.
     pub(crate) layer: Option<String>,
+}
+
+/// The loadout mode of the session box a start creates, from the project
+/// at `project`: the entry the start names, else the entry
+/// [`pick_session_entry`] picks. With no project file, or no session entry
+/// the pick decides, the bare session entry applies. `named` is the
+/// start's `--loadout` list.
+///
+/// # Errors
+///
+/// Exit 3 ([`ProjectFileInvalid`]) for the refusals of
+/// [`loadouts::entry_loadout_gate`], before any loadout file is read.
+pub(crate) fn session_loadout_mode(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    named: &[String],
+) -> anyhow::Result<mfile::expand::LoadoutMode> {
+    let bytes = project_file_bytes(project)?;
+    let entries = match &bytes {
+        Some(bytes) => {
+            mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?
+        }
+        None => Vec::new(),
+    };
+    let typed = entry.and_then(|name| entries.iter().find(|e| e.name == name));
+    let picked = match typed {
+        Some(entry) => Some(entry.clone()),
+        None => pick_session_entry(&entries).ok(),
+    };
+    let entry = picked.unwrap_or_else(|| {
+        bare_entry(
+            entry.unwrap_or(mfile::entry::DEFAULT_ENTRY_NAME),
+            mfile::entry::EntryTable::Sessions,
+            boxes::SESSION_BOX_TYPE,
+        )
+    });
+    loadouts::entry_loadout_gate(bytes.as_deref(), &entry, named)
+        .map_err(|error| ProjectFileInvalid { error }.into())
+}
+
+/// The loadout mode of the box `min task run` creates for task `task` in
+/// the project at `project`: its `[tasks.<task>]` entry, or the bare task
+/// entry when the project declares none. A task takes no `--loadout`.
+///
+/// # Errors
+///
+/// As [`session_loadout_mode`].
+pub(crate) fn task_loadout_mode(
+    project: &camino::Utf8Path,
+    task: &str,
+) -> anyhow::Result<mfile::expand::LoadoutMode> {
+    let bytes = project_file_bytes(project)?;
+    let declared = match &bytes {
+        Some(bytes) => mfile::entry::read_entries(bytes)
+            .map_err(|error| ProjectFileInvalid { error })?
+            .into_iter()
+            .find(|e| e.name == task && e.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE)),
+        None => None,
+    };
+    let entry = declared
+        .unwrap_or_else(|| bare_entry(task, mfile::entry::EntryTable::Tasks, boxes::TASK_BOX_TYPE));
+    loadouts::entry_loadout_gate(bytes.as_deref(), &entry, &[])
+        .map_err(|error| ProjectFileInvalid { error }.into())
+}
+
+/// An entry the file does not declare: `[<table>.<name>]` of `box_type`,
+/// with no keys of its own.
+fn bare_entry(
+    name: &str,
+    table: mfile::entry::EntryTable,
+    box_type: &str,
+) -> mfile::entry::BoxEntry {
+    mfile::entry::BoxEntry {
+        name: name.to_owned(),
+        table,
+        box_type: Some(box_type.to_owned()),
+        body: toml::Table::new(),
+        implicit: true,
+    }
 }
 
 /// The project's [`ProjectEgress`]. The layers are `[defaults]`,
@@ -3327,7 +3411,12 @@ pub(crate) async fn activate_box(
             // sizes the finalize hook budget, so `min session activate`,
             // `min task run`, and the dashboard share it.
             let policy_path = config::user_policy_path(global);
-            let selection = start_loadout_selection(&args);
+            // BOX-173, BOX-175, BOX-181: the box's loadout mode, read before
+            // any loadout file. A sealed box selects none and prints nothing
+            // about its skipped defaults (BOX-171).
+            let mode =
+                session_loadout_mode(&project_root, options.entry.as_deref(), &args.loadout)?;
+            let selection = loadouts::gate_selection(start_loadout_selection(&args), mode);
             // The project root the upload will carry, so the project's own
             // hooks are checked and its `[session]` timeouts size the finalize
             // budget; a subdirectory invocation must not look empty.

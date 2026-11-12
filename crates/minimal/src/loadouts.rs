@@ -39,6 +39,95 @@ impl LoadoutSelection {
     }
 }
 
+/// The loadout gate of `entry`, the entry a box creation expands, in the
+/// `minimal.toml` whose bytes are `bytes`. It reads the layers up to and
+/// including the entry, the type chain's constraints and `named`, the
+/// loadouts a `--loadout` flag names, and never a loadout file. So a
+/// sealed box reads no default loadout (BOX-175).
+///
+/// An entry whose type does not resolve takes the defaults of its type
+/// name when that name is built in, and no type layer otherwise. The start
+/// refuses such an entry elsewhere, so the gate does not refuse it first.
+///
+/// # Errors
+///
+/// The refusals of [`mfile::expand::loadout_gate`], each with exit 3, and
+/// a legacy table this release no longer reads.
+pub(crate) fn entry_loadout_gate(
+    bytes: Option<&[u8]>,
+    entry: &mfile::entry::BoxEntry,
+    named: &[String],
+) -> Result<mfile::expand::LoadoutMode, mfile::Error> {
+    let mut doc = match bytes {
+        Some(bytes) => toml::from_slice::<toml::Table>(bytes).map_err(mfile::Error::Format)?,
+        None => toml::Table::new(),
+    };
+    // The hint for a legacy table prints when the file loads, so the hints
+    // this rewrite returns do not print again.
+    mfile::legacy::canonicalize(&mut doc, mfile::legacy::this_release())?;
+    let defaults = doc
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let (type_defaults, type_constraints, project_types) =
+        match mfile::box_types::BoxTypes::from_file(&doc) {
+            Ok(types) => {
+                let project_types = types.project().keys().cloned().collect();
+                match mfile::expand::expandable_type(entry, &types) {
+                    Ok(resolved) => (resolved.defaults, resolved.constraints, project_types),
+                    Err(error) => {
+                        tracing::debug!(%error, "the loadout gate reads the entry without its type");
+                        (builtin_type_layer(entry), Vec::new(), project_types)
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "the loadout gate reads the entry without its type");
+                (
+                    builtin_type_layer(entry),
+                    Vec::new(),
+                    std::collections::BTreeSet::new(),
+                )
+            }
+        };
+    let layers = mfile::expand::Layers {
+        type_defaults,
+        type_constraints,
+        named_loadouts: named.to_vec(),
+        ..mfile::expand::Layers::default()
+    }
+    .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+    let mode = mfile::expand::loadout_gate(entry, &layers)?;
+    tracing::info!(entry = %entry.name, loadout_mode = ?mode, "the box's loadout mode");
+    Ok(mode)
+}
+
+/// The type layer of an entry whose type does not resolve: the built-in
+/// defaults of its type name, when the name is built in.
+fn builtin_type_layer(entry: &mfile::entry::BoxEntry) -> Vec<(String, toml::Table)> {
+    entry
+        .box_type
+        .as_deref()
+        .and_then(mfile::box_types::builtin)
+        .map(|root| vec![(root.to_owned(), mfile::box_types::builtin_defaults(root))])
+        .unwrap_or_default()
+}
+
+/// `selection` under the box's loadout `mode`. A sealed box selects no
+/// loadout, so its default loadouts are never read and nothing prints
+/// about them (BOX-171, BOX-175). [`entry_loadout_gate`] already refused
+/// a `--loadout` for a sealed box (BOX-173).
+pub(crate) fn gate_selection(
+    selection: LoadoutSelection,
+    mode: mfile::expand::LoadoutMode,
+) -> LoadoutSelection {
+    match mode {
+        mfile::expand::LoadoutMode::Open => selection,
+        mfile::expand::LoadoutMode::Sealed => LoadoutSelection::None,
+    }
+}
+
 /// Filename stem and `name` of the built-in `default` loadout.
 const BUILTIN_DEFAULT_NAME: &str = "default";
 
@@ -548,9 +637,16 @@ impl ActivationInputs {
     /// Print the "Applying loadouts" orientation line the CLI emits at
     /// session start. Never called by the dashboard, which owns its screen.
     pub(crate) fn announce_loadouts(&self) {
-        if !self.loadout_names.is_empty() {
-            eprintln!("Applying loadouts: {}", self.loadout_names.join(", "));
+        if let Some(line) = self.loadouts_line() {
+            eprintln!("{line}");
         }
+    }
+
+    /// The line [`Self::announce_loadouts`] prints, or `None` when no
+    /// loadout applies, so a sealed box prints nothing (BOX-171).
+    pub(crate) fn loadouts_line(&self) -> Option<String> {
+        (!self.loadout_names.is_empty())
+            .then(|| format!("Applying loadouts: {}", self.loadout_names.join(", ")))
     }
 }
 
@@ -626,6 +722,16 @@ pub(crate) fn prepare_activation_inputs_with_config(
     let initial_policy = user_policy.clone();
     let compose_options = compose_options_from_config(cfg);
     let active = resolve_active_loadouts(selection, cfg, global)?;
+    // BOX-172: the gate read the mode before any loadout, so a loadout's
+    // `loadout_mode` would do nothing. Refuse it, so its author learns.
+    if let Some(loadout) = active.loadouts.iter().find(|l| l.sets_loadout_mode()) {
+        return Err(crate::ProjectFileInvalid {
+            error: mfile::Error::LoadoutSetsLoadoutMode {
+                loadout: Some(loadout.name().as_ref().to_owned()),
+            },
+        }
+        .into());
+    }
     let loadout_names = active
         .loadouts
         .iter()
