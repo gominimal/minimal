@@ -1591,7 +1591,10 @@ fn first_excluded(
 /// and never changes it.
 ///
 /// A spec with no `box.type` is of `verb_type`, the type the creating
-/// verb files the box under.
+/// verb files the box under. The daemon files the record under
+/// `verb_type` whatever `box.type` says, so the spec is also checked
+/// against the constraints of `verb_type`. A spec cannot pass as one type
+/// and be filed as another that excludes its values.
 ///
 /// # Errors
 ///
@@ -1604,6 +1607,22 @@ fn root_constraint_refusal(
 ) -> Result<(), AdmissionRootRefusal> {
     let (box_type, root) =
         spec_type_root(spec, verb_type).map_err(AdmissionRootRefusal::UnknownRoot)?;
+    builtin_root_refusal(spec, box_type, root)?;
+    match mfile::box_types::builtin(verb_type) {
+        Some(verb_root) if verb_root != root => {
+            builtin_root_refusal(spec, verb_root.to_owned(), verb_root)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Checks `spec` against the constraints of the built-in `root`, for a
+/// box of type `box_type`.
+fn builtin_root_refusal(
+    spec: &serde_json_lenient::Value,
+    box_type: String,
+    root: &str,
+) -> Result<(), AdmissionRootRefusal> {
     let constraints = serde_json_lenient::to_value(mfile::box_types::builtin_constraints(root))
         .expect("a TOML table serializes as JSON");
     let Some(constraints) = constraints.as_object() else {
