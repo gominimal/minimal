@@ -661,6 +661,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Events(args),
         })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
+        // BCLI-033: a `min box show -o json|yaml|toml` failure is one
+        // `min/v1/error` object.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Show(args),
+        })) => args.output.is_some(),
         // BCLI-019, BCLI-020: `min type list|show -o json|yaml|toml`.
         Some(minimal::Command::Type(minimal::TypeArgs {
             command: minimal::TypeCommand::List(minimal::TypeListArgs { output }),
@@ -1213,6 +1218,45 @@ mod tests {
             1,
             "one object, one line, nothing else: {line}"
         );
+    }
+
+    /// BCLI-033: under `min box show -o json`, a box that is not found is
+    /// one `min/v1/error` object on stderr. The text form is not a machine
+    /// mode.
+    #[test]
+    fn box_show_output_json_writes_box_with_execs_refusal_as_error_object() {
+        for (output, machine) in [
+            (Some(minimal::BoxShowOutputFormat::Json), true),
+            (Some(minimal::BoxShowOutputFormat::Yaml), true),
+            (Some(minimal::BoxShowOutputFormat::Toml), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Show(minimal::BoxShowArgs {
+                        target: "web".to_owned(),
+                        network: false,
+                        output,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+        let refusal = anyhow::Error::from(minimal::BoxAddressRefusal::NotFound {
+            address: "web".to_owned(),
+        });
+        let MachineModeAnswer::Object(failure) = machine_mode_answer(&refusal) else {
+            panic!("a not-found box is an error object");
+        };
+        let line = machine_mode_error_line(&failure).unwrap();
+        let object: serde_json_lenient::Value = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(object["schema"], "min/v1/error", "{line}");
+        assert!(
+            object["message"].as_str().unwrap().contains("web"),
+            "{line}"
+        );
+        assert_eq!(failure_exit_code(&refusal), 4);
     }
 
     #[test]
