@@ -107,7 +107,7 @@ use minimald_rpc::{
     RenameBoxRequest, WithdrawBoxRequest, WithdrawPortRequest,
 };
 
-use crate::box_registry::{AllocationError, BoxRegistry, ClientBoxSpec};
+use crate::box_registry::{AllocationError, BoxRegistry, BuildRow, ClientBoxSpec};
 use crate::net::answerer::AnswererStatus;
 
 /// The control socket's file name inside the host dir, beside
@@ -1258,7 +1258,8 @@ fn serve_request(
     // ended. The read-only verbs and the answerer handover take no ticket.
     match (request, door) {
         (BoxControlRequest::Register(request), ControlDoor::Host) => {
-            let reply = registration_reply(boxes, answerer, order, request);
+            let build_row = request.stays_detached.then_some(BuildRow::Requester);
+            let reply = registration_reply(boxes, answerer, order, request, build_row);
             write_reply(stream, &reply)
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host)
@@ -1771,12 +1772,14 @@ fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Opt
 }
 
 /// Register a box in its door's apply order and build the reply: the one
-/// registration path the one-shot and the held verb share.
+/// registration path the one-shot and the held verb share. `build_row`
+/// names the kind of build row the registration is, when it is one.
 fn registration_reply(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     order: &Arc<ApplyOrder>,
     request: RegisterBoxRequest,
+    build_row: Option<BuildRow>,
 ) -> BoxControlReply {
     // A `host_ip` box leaves the VM from the node's own address (BEP-082):
     // it gets a box id and no address, so the answerer is not asked.
@@ -1792,9 +1795,8 @@ fn registration_reply(
     // registration in its turn. The claim ends with the turn.
     let claim = boxes.begin_registration(&request.name);
     match allocate_box_address(answerer, &request.name) {
-        Ok(loopback_addr) => {
-            order.apply(move || register_box(boxes, answerer, request, loopback_addr, claim))
-        }
+        Ok(loopback_addr) => order
+            .apply(move || register_box(boxes, answerer, request, loopback_addr, claim, build_row)),
         Err(reply) => reply,
     }
 }
@@ -1853,6 +1855,7 @@ fn open_build_grant(
             host_ip: false,
             stays_detached: true,
         },
+        Some(BuildRow::Grant),
     );
     let BoxControlReply::Registered(registered) = registered else {
         grants.unreserve(&row);
@@ -2076,7 +2079,8 @@ fn serve_held_registration(
     slot: crate::box_registry::GaugeGuard,
 ) -> std::io::Result<()> {
     let name = request.name.clone();
-    let reply = registration_reply(boxes, answerer, order, request);
+    let build_row = request.stays_detached.then_some(BuildRow::Requester);
+    let reply = registration_reply(boxes, answerer, order, request, build_row);
     let BoxControlReply::Registered(registered) = &reply else {
         return write_reply(&mut stream, &reply);
     };
@@ -2524,6 +2528,7 @@ fn register_box(
     request: RegisterBoxRequest,
     loopback_addr: std::net::Ipv4Addr,
     claim: crate::box_registry::RegistrationClaim,
+    build_row: Option<BuildRow>,
 ) -> BoxControlReply {
     // The declaration as the row received it; `null` for a box with no
     // egress section. A plain struct of strings serialises infallibly.
@@ -2549,11 +2554,9 @@ fn register_box(
         loopback_addr,
         request.task_slots,
         claim.generation(),
+        build_row,
     ) {
         Ok(record) => {
-            if request.stays_detached {
-                boxes.keep_when_detached(record.switch_addr());
-            }
             tracing::info!(
                 box = %record.name(),
                 box_id = %crate::bep_attach::BoxIdText(&record.box_id()),
