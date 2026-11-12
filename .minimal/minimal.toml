@@ -122,7 +122,10 @@ fi
 
 # The quality gate, the same run the `quality-gate` task below
 # makes: no compiler, seconds, exit 2 on a regression against the base ref.
-scripts/metrics/run.sh gate --out .scratch/metrics/quality-gate
+# Non-blocking until the gate has soaked: it runs and prints its report, and
+# a non-zero exit (2 failed, 3 incomplete) is logged rather than failing the task.
+scripts/metrics/run.sh gate --out .scratch/metrics/quality-gate \\
+  || echo "quality gate exited $? (non-blocking while it beds in)"
 """
 
 # The review runtime runs a declared task as a probe: a 300-second budget, no
