@@ -5,8 +5,9 @@
 //! so code it runs can turn any path in them into a symbolic link at any
 //! moment, including between a check of the path and the mount that uses it.
 //! A bind made by path resolves the path again when the mount runs, so a
-//! check before it (minimal#3031 refuses a link already in place) narrows the
-//! window and cannot close it. hakoniwa binds by path, before `pivot_root`,
+//! check before it, of what the path is when the daemon looks, narrows the
+//! window and cannot close it (a rule refusing a link in place up front is
+//! proposed as minimal#3031, not merged). hakoniwa binds by path, before `pivot_root`,
 //! with both the source and the mount point resolved in the daemon's view:
 //! a source in a tree can be sent out of it, and a mount point under a tree
 //! walks the box's names, so hakoniwa's `mkdir_p`/`touch` of a missing one
@@ -85,9 +86,10 @@ const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x40;
 /// How a patch path is resolved beneath its tree: never outside it (no `..`
 /// or link out of it, no absolute link) and never through a `/proc` magic
 /// link. A relative link that stays in the tree is followed, as ARCH asks in
-/// inbox#1152: #3031's "no links at all" is a rule about what a patch may
-/// name, refused up front with its own message, and this layer is the
-/// boundary that holds whatever the box does after that check.
+/// inbox#1152: a rule about what a patch may name (no link in place at all,
+/// as minimal#3031 proposes, not yet merged) would be refused up front with
+/// its own message; this layer is the boundary that holds whatever the box
+/// does, with or without such a check.
 const RESOLVE_IN_TREE: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
 
 /// How many times a resolve the kernel aborted with `EAGAIN` (a rename raced
@@ -287,12 +289,61 @@ pub(crate) fn refusal(e: &io::Error) -> Option<&Refused> {
     e.get_ref()?.downcast_ref()
 }
 
-/// The errno of `e`, a refusal's included.
+/// The errno of `e`, a refusal's or an explained failure's included.
 pub(crate) fn errno_of(e: &io::Error) -> Option<i32> {
     if let Some(errno) = e.raw_os_error() {
         return Some(errno);
     }
+    if let Some(f) = e.get_ref().and_then(|inner| inner.downcast_ref::<Failed>()) {
+        return Some(f.errno);
+    }
     refusal(e).map(Refused::errno)
+}
+
+/// A bind the kernel refused for a cause the person can act on, as the
+/// sentence the box's stderr shows in place of the errno, which names none.
+/// The errno stays with it for the closure's report line.
+#[derive(Debug)]
+struct Failed {
+    errno: i32,
+    text: String,
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for Failed {}
+
+/// `e`, from a bind of the patch at `target`, as what it most likely means
+/// and what to do: the remount's `EPERM` when the box swapped the path for
+/// a mount or a link between the daemon's check and the mount, `ENOENT`
+/// when a source went away after the check, `ENOTDIR` when a name on the
+/// path is a file. Any other error, and a refusal, stays as it is.
+pub(crate) fn explain_failure(target: &str, e: io::Error) -> io::Error {
+    let Some(errno) = e.raw_os_error() else {
+        return e;
+    };
+    let text = match errno {
+        libc::EPERM | libc::EACCES => format!(
+            "`{target}` changed under the daemon between its check and the mount (a mount or \
+             a link the box put there), so the patch was not placed. Start the box again, and \
+             keep that path a plain directory or file."
+        ),
+        libc::ENOENT => format!(
+            "what the patch at `{target}` is made from went away after the daemon checked it, \
+             so the patch was not placed. Put it back, or remove the patch from the session, \
+             and start the box again."
+        ),
+        libc::ENOTDIR => format!(
+            "a name on the path to `{target}` is a file, not a directory, so the patch was not \
+             placed. Name the patch by a path through directories."
+        ),
+        _ => return e,
+    };
+    io::Error::other(Failed { errno, text })
 }
 
 /// `why` as the error a refused resolve or walk of `rel` returns.
@@ -500,11 +551,13 @@ pub(crate) fn bind_all(binds: &[SessionBind]) -> Result<(), (String, io::Error)>
                 let root = root.map_err(|e| (format!("opening `{mount}`"), e))?;
                 let view = TreeView::of(mount, name);
                 let source = resolve(root.as_fd(), view, rel);
-                source.map_err(|e| (bind.failure(Step::Source), e))?
+                source
+                    .map_err(|e| (bind.failure(Step::Source), explain_failure(&bind.target, e)))?
             }
             Source::Staged { stage } => {
                 let staged = open_path(Path::new(stage), !bind.is_file);
-                staged.map_err(|e| (bind.failure(Step::Source), e))?
+                staged
+                    .map_err(|e| (bind.failure(Step::Source), explain_failure(&bind.target, e)))?
             }
         };
         sources.push(source);
@@ -513,7 +566,12 @@ pub(crate) fn bind_all(binds: &[SessionBind]) -> Result<(), (String, io::Error)>
     for (bind, source) in binds.iter().zip(&sources) {
         let mount = &bind.mount;
         let root = open_dir(Path::new(mount)).map_err(|e| (format!("opening `{mount}`"), e))?;
-        let failed = |e: io::Error| (bind.failure(Step::MountPoint), e);
+        let failed = |e: io::Error| {
+            (
+                bind.failure(Step::MountPoint),
+                explain_failure(&bind.target, e),
+            )
+        };
         let view = TreeView::of(mount, bind.name);
         let target = resolve_or_create(root.as_fd(), view, &bind.rel, bind.is_file);
         let target = target.map_err(failed)?;
@@ -1300,6 +1358,32 @@ mod tests {
             identity_of(&home.join("x")),
             "`..` inside stays in"
         );
+    }
+
+    /// A kernel error at a bind the person can act on is shown as what it
+    /// means and what to do, not as its errno; the errno stays for the
+    /// closure's report, and an error that means nothing in particular, or a
+    /// refusal, is left as it is.
+    #[test]
+    fn a_kernel_error_at_a_bind_is_explained_with_its_next_step() {
+        let eperm = explain_failure("/home/.config/x", io::Error::from_raw_os_error(libc::EPERM));
+        let text = eperm.to_string();
+        assert!(text.contains("changed under the daemon"), "{text}");
+        assert!(text.contains("Start the box again"), "{text}");
+        assert!(!text.contains("os error"), "{text}");
+        assert_eq!(errno_of(&eperm), Some(libc::EPERM));
+        let enoent = explain_failure(
+            "/home/.config/x",
+            io::Error::from_raw_os_error(libc::ENOENT),
+        );
+        assert!(
+            enoent
+                .to_string()
+                .contains("went away after the daemon checked it")
+        );
+        assert_eq!(errno_of(&enoent), Some(libc::ENOENT));
+        let eio = explain_failure("/home/.config/x", io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(eio.raw_os_error(), Some(libc::EIO));
     }
 
     /// What the closure says it was doing: reading a tree patch's source,

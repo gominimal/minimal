@@ -6146,6 +6146,52 @@ ff02::2\tip6-allrouters
         );
     }
 
+    /// inbox#1152, the daemon's side: a mapping it must create in the
+    /// session's home is made beneath the home, so a dangling link there that
+    /// leaves the home refuses the sandbox and makes nothing outside it. A
+    /// revert of that path to `fs::write` would follow the link out, and this
+    /// is the test that fails then.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_created_mapping_never_follows_a_link_out_of_the_home() {
+        let (_tmp, base) = make_base_with_synth();
+        let trees = tempfile::TempDir::new().unwrap();
+        let home = trees.path().join("home");
+        let working = trees.path().join("working");
+        let outside = trees.path().join("outside");
+        for dir in [&home, &working, &outside] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink("../outside/x.json", home.join("x.json")).unwrap();
+        let mapping = common::FsMapping {
+            host_path: home.join("x.json").to_str().unwrap().to_string(),
+            sandbox_path: Some("/home/x.json".to_string()),
+            read_only: false,
+            is_file: true,
+            create_if_missing: true,
+            ..Default::default()
+        };
+        let config = Config::new("test-create-beneath")
+            .with_dns(false)
+            .with_session_dirs_mapped(home.clone(), working, vec![mapping]);
+        let err = Sandbox::new(base, config, ())
+            .err()
+            .expect("a link out of the home refuses the sandbox");
+        let text = err.to_string();
+        assert!(text.contains("session's home or workbench"), "{text}");
+        assert!(
+            !outside.join("x.json").exists(),
+            "nothing is made outside the home"
+        );
+        assert!(
+            fs::symlink_metadata(home.join("x.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link is left as the box made it"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
