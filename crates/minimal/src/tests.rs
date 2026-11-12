@@ -13608,6 +13608,7 @@ fn plural_nouns_accepted() {
         ("host", "hosts"),
         ("provider", "providers"),
         ("secret", "secrets"),
+        ("type", "types"),
     ];
     // Nouns that do not count: a network, a sign-in, diagnostics, the mesh
     // and the completions (already plural).
