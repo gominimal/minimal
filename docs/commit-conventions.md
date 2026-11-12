@@ -64,7 +64,7 @@ BREAKING CHANGE: Planner::order now returns Result instead of panicking.
 
 Pull request titles use the same `<type>[optional scope][!]: <description>` format, because a squash merge makes the title the commit subject. `scripts/next-version.sh` reads the version bump from that subject.
 
-The `pr-title` check lints titles on pull requests to `main` and `release/**`. It checks the type and the shape, not the case or the length, because the runtime keeps the task key in the titles it opens:
+The `pr-title` check lints titles on pull requests to `main` and to release lines cut after it landed. `release/0.7.x` predates it, so check titles there by hand. It checks the type and the shape, not the case or the length, because the runtime keeps the task key in the titles it opens:
 
 ```
 feat(boxes): T102 — Add CWD-relative path types
