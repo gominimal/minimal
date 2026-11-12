@@ -709,6 +709,7 @@ mod tests {
                 path: None,
                 network: None,
                 egress: minimal::EgressArgs::default(),
+                other: minimal::BoxOverrideArgs::default(),
                 detach: false,
                 args: vec![],
             }),

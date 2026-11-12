@@ -1114,7 +1114,7 @@ mod tests {
             type = "session"
             name = "dev"
             lifetime = "until_stopped"
-            loadout_mode = "merge"
+            loadout_mode = "open"
             volumes = ["cache"]
 
             [sessions.dev.io]

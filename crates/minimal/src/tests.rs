@@ -472,6 +472,15 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::planned_session_request = asserts nothing",
             // A unit test's request, never sent: it checks the fresh instance.
             "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
+            // A unit test's request, never sent: it checks the run path's
+            // `--quic443` and `--vpn-network-names` on the spec.
+            "tests.rs::start_and_run_take_every_network_key_flag = asserts nothing",
+            // A unit test's request, never sent: it checks the run path's
+            // `--no-hooks` on the stored spec.
+            "tests.rs::start_no_hooks_stores_no_hooks = asserts nothing",
+            // A unit test's request, never sent: it checks that
+            // `--vpn-network-names` is refused when the request has no spec.
+            "tests.rs::vpn_network_names_without_a_spec_is_refused = asserts nothing",
         ]
     );
 }
@@ -2168,6 +2177,7 @@ async fn run_pty_entry_exit2_hints_start_new() {
                 detach: false,
                 network: None,
                 egress: EgressArgs::default(),
+                other: crate::BoxOverrideArgs::default(),
                 args: vec![],
             },
         )
@@ -2180,6 +2190,7 @@ async fn run_pty_entry_exit2_hints_start_new() {
                 path: None,
                 network: None,
                 egress: EgressArgs::default(),
+                other: crate::BoxOverrideArgs::default(),
                 detach: true,
                 args: vec![],
             },
@@ -2257,6 +2268,7 @@ fn run_and_start_new_request_fresh_instance() {
         path: None,
         network: Some(CliNetworkMode::OwnIp),
         egress: egress.clone(),
+        other: crate::BoxOverrideArgs::default(),
         detach: false,
         args: vec![],
     });
@@ -2266,6 +2278,7 @@ fn run_and_start_new_request_fresh_instance() {
         detach: false,
         network: Some(CliNetworkMode::OwnIp),
         egress,
+        other: crate::BoxOverrideArgs::default(),
         args: vec![],
     });
     assert_eq!(task_run.entry, box_run.entry);
@@ -2499,6 +2512,7 @@ async fn unattached_start_closes_stdin_and_hints_run_logs_wait() {
             args: vec![],
             network: None,
             egress: crate::EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
         },
         "the start takes the detached run, which closes the box's stdin"
     );
@@ -13991,7 +14005,14 @@ fn planned_session_request(
     let (port_mappings, flags) = flag_network_overrides(args).expect("the flags parse");
     let project = project_egress(root, options.entry.as_deref()).expect("the project loads");
     let egress = effective_egress(project.policy, flags, args.egress.deny_all_egress);
-    let policy = network_override_policy(args, port_mappings, egress.policy);
+    // As `activate_box` sets them, for a project with no secret grants.
+    let policy = boxes::BoxPolicy {
+        credentialed_upstream: args
+            .credentialed_upstream
+            .then(boxes::CredentialedUpstream::default),
+        quic443: options.quic443,
+        ..network_override_policy(args, port_mappings, egress.policy)
+    };
     let mut request = minimald_rpc::CreateSessionRequest::new(
         String::new(),
         paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
@@ -13999,10 +14020,34 @@ fn planned_session_request(
         policy,
     );
     request.config.name = minimal_client::box_name::request_name(None);
+    request.config.hooks_enabled = !args.no_hooks;
     stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    add_vpn_network_names(&mut request, &options.vpn_network_names).unwrap();
     // Each create in a test is a fresh instance, so no name is held.
     request_fresh_instance(&mut request);
     request
+}
+
+// BCLI-024: a `--vpn-network-names` value on a request with no spec is
+// refused, never dropped. With no names, the request stays as it was.
+#[test]
+fn vpn_network_names_without_a_spec_is_refused() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp")).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    assert!(request.spec.is_none());
+    add_vpn_network_names(&mut request, &[]).expect("no names is no change");
+    let error = add_vpn_network_names(&mut request, &["corp".to_string()])
+        .expect_err("a name with no spec is refused");
+    assert_eq!(
+        error.to_string(),
+        "Cannot use --vpn-network-names here: this box does not store a `[network]` \
+         section. Run the command again without --vpn-network-names."
+    );
+    assert!(request.spec.is_none());
 }
 
 // BCLI-024: the `[network]` override flags of `min box start` and `min
@@ -14200,6 +14245,445 @@ fn start_loadout_flag_selects_loadouts_layer() {
         "Cannot start build with --loadout. A box from a task entry does not take \
          --loadout. Run min box start build without --loadout."
     );
+}
+
+/// The long flags that the `min` verb at `path` takes, as `--<long>`.
+fn verb_long_flags(path: &[&str]) -> std::collections::BTreeSet<String> {
+    use clap::CommandFactory as _;
+    let mut command = Cli::command();
+    command.build();
+    let verb = path.iter().fold(&command, |command, name| {
+        command
+            .find_subcommand(name)
+            .unwrap_or_else(|| panic!("min has the verb {path:?}"))
+    });
+    verb.get_arguments()
+        .filter_map(clap::Arg::get_long)
+        .map(|long| format!("--{long}"))
+        .collect()
+}
+
+/// The run `argv` types, as `min task run` or `min box run`.
+fn parsed_run(argv: &[&str]) -> task::RunEntry {
+    match Cli::try_parse_from(argv).expect("the run parses").command {
+        Some(Command::Task(TaskArgs {
+            command: TaskCommand::Run(args),
+        })) => args.into(),
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Run(args),
+        })) => args.into(),
+        _ => panic!("not a run: {argv:?}"),
+    }
+}
+
+// BCLI-024, BCLI-075, BCLI-076: `min box start`, `min session start`, `min
+// task run` and `min box run` take every override flag `min session
+// activate` takes, and a start stores the values those flags give.
+#[tokio::test]
+async fn start_and_run_take_every_network_key_flag() {
+    let activate = verb_long_flags(&["session", "activate"]);
+    // The flags of activate that do not override a key of the box.
+    let not_overrides = ["--name", "--sync", "--no-prompt", "--attach", "--help"];
+    // The run path takes no `--ingress` (#3163) and no `--loadout` (#3237).
+    let not_on_run = ["--ingress", "--loadout"];
+    for verb in [
+        ["session", "start"],
+        ["box", "start"],
+        ["task", "run"],
+        ["box", "run"],
+    ] {
+        let flags = verb_long_flags(&verb);
+        for flag in &activate {
+            let flag = flag.as_str();
+            if not_overrides.contains(&flag) || (verb[1] == "run" && not_on_run.contains(&flag)) {
+                continue;
+            }
+            assert!(
+                flags.contains(flag),
+                "min {} {} takes {flag}",
+                verb[0],
+                verb[1]
+            );
+        }
+        // Two `[network]` keys have a flag that activate does not take.
+        for flag in ["--quic443", "--vpn-network-names"] {
+            assert!(
+                flags.contains(flag),
+                "min {} {} takes {flag}",
+                verb[0],
+                verb[1]
+            );
+        }
+    }
+
+    let toml = "[sessions.default.network.egress]\n\
+                allow_dns_hosts = [\"a.example\"]\n";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, global, server) = show_network_daemon().await;
+    let mut daemon = server.connect().await;
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+
+    for verb in ["box", "session"] {
+        let start = parsed_start(&[
+            "min",
+            verb,
+            "start",
+            "--network",
+            "own_ip",
+            "--dynamic-ingress",
+            "allow",
+            "--dynamic-range",
+            "8000-8443",
+            "--credentialed-upstream",
+            "--quic443",
+            "block",
+            "--vpn-network-names",
+            "corp",
+            "--vpn-network-names",
+            "lab",
+        ]);
+        let StartPlan::Session { args, options, .. } =
+            plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+        else {
+            panic!("{verb}: the default entry is a session");
+        };
+        assert_eq!(args.dynamic_ingress, Some(boxes::DynamicIngress::Allow));
+        assert_eq!(args.dynamic_range, Some((8000, 8443)));
+        assert!(args.credentialed_upstream, "{verb}");
+        assert_eq!(options.quic443, Some(boxes::core::bep::Quic443::Block));
+        assert_eq!(options.vpn_network_names, ["corp", "lab"], "{verb}");
+
+        let request = planned_session_request(&args, &options, root);
+        let spec: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+        let ingress = spec.network.policy.ingress.clone().expect("ingress is set");
+        assert_eq!(ingress.dynamic_ingress, Some(boxes::DynamicIngress::Allow));
+        assert_eq!(ingress.dynamic_allowed_range, Some((8000, 8443)));
+        assert!(ingress.port_mappings.is_empty(), "{verb}");
+        assert!(
+            spec.network.policy.credentialed_upstream.is_some(),
+            "{verb}"
+        );
+        assert_eq!(
+            spec.network.policy.quic443,
+            Some(boxes::core::bep::Quic443::Block),
+            "{verb}"
+        );
+        // A list flag adds one name for each use.
+        assert_eq!(
+            request.spec.as_ref().unwrap()["network"]["vpn_network_names"],
+            serde_json_lenient::json!(["corp", "lab"]),
+            "{verb}"
+        );
+        // A key no flag names keeps the entry's value.
+        assert_eq!(
+            spec.network.policy.egress.clone().unwrap().allow_dns_hosts,
+            Some(vec!["a.example".to_owned()]),
+            "{verb}"
+        );
+
+        // The daemon keeps the overridden values on the box's record.
+        let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+            minimald_rpc::Errorable::Ok(created) => created.id,
+            minimald_rpc::Errorable::Err { error } => panic!("{verb}: the create failed: {error}"),
+        };
+        let record = stored_box_record(&mut client, id)
+            .await
+            .expect("the record is read")
+            .expect("the box has a record");
+        assert_eq!(record.policy, spec.network.policy, "{verb}");
+    }
+
+    // The run path applies `--quic443` and `--vpn-network-names` too.
+    for verb in ["task", "box"] {
+        let run = parsed_run(&[
+            "min",
+            verb,
+            "run",
+            "--quic443",
+            "allow",
+            "--vpn-network-names",
+            "corp",
+            "--vpn-network-names",
+            "lab",
+            "build",
+        ]);
+        let mut network = task::TaskBoxNetwork {
+            mode: boxes::NetworkMode::HostNet,
+            policy: boxes::BoxPolicy {
+                quic443: Some(boxes::core::bep::Quic443::Block),
+                ..boxes::BoxPolicy::default()
+            },
+            hints: Vec::new(),
+            mode_layer: None,
+        };
+        task::apply_run_overrides(&mut network, &run.other).expect("the flags are taken");
+        // A scalar flag replaces the declared value.
+        assert_eq!(
+            network.policy.quic443,
+            Some(boxes::core::bep::Quic443::Allow),
+            "{verb}"
+        );
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+            network.mode,
+            network.policy,
+        );
+        let spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
+        put_spec(&mut request, &spec).unwrap();
+        add_vpn_network_names(&mut request, &run.other.vpn_network_names).unwrap();
+        let sent = request.spec.as_ref().unwrap();
+        assert_eq!(sent["network"]["quic443"], "allow", "{verb}");
+        assert_eq!(
+            sent["network"]["vpn_network_names"],
+            serde_json_lenient::json!(["corp", "lab"]),
+            "{verb}"
+        );
+        // The spec with the names still reads as a box spec.
+        serde_json_lenient::from_value::<mfile::spec::BoxSpec>(sent.clone())
+            .expect("the spec reads");
+    }
+
+    // A task entry's start passes the flags to the run path.
+    let tasks = start_entries("[tasks.build]\necho = 'x'\n");
+    let start = parsed_start(&[
+        "min",
+        "box",
+        "start",
+        "build",
+        "--network",
+        "own_ip",
+        "--dynamic-ingress",
+        "ask",
+        "--credentialed-upstream",
+        "--quic443",
+        "block",
+        "--vpn-network-names",
+        "corp",
+    ]);
+    let StartPlan::Detached { run, .. } = plan_start(&start, &tasks, true).unwrap() else {
+        panic!("a task box starts detached");
+    };
+    assert_eq!(run.other.dynamic_ingress, Some(boxes::DynamicIngress::Ask));
+    assert!(run.other.credentialed_upstream);
+    assert_eq!(run.other.quic443, Some(boxes::core::bep::Quic443::Block));
+    assert_eq!(run.other.vpn_network_names, ["corp"]);
+}
+
+// BCLI-076: `--no-hooks` on a start empties the composed lifecycle-hook
+// list. The expanded entry sends no hook, and the stored spec and the
+// box's record keep hooks off.
+#[tokio::test]
+async fn start_no_hooks_stores_no_hooks() {
+    let toml = "[[sessions.default.lifecycle_hooks]]\n\
+                on_activate = { type = \"inline\", value = \"echo hi\" }\n";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    // Without the flag, the entry's hook is sent.
+    let entry = session_box_entry(root, Some("default"), true)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+    assert!(
+        entry
+            .lifecycle_hooks
+            .as_ref()
+            .is_some_and(|hooks| !hooks.is_empty()),
+        "the entry declares a hook: {entry:?}"
+    );
+
+    let (_state, global, server) = show_network_daemon().await;
+    let mut daemon = server.connect().await;
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+    for verb in ["box", "session"] {
+        let start = parsed_start(&["min", verb, "start", "--no-hooks"]);
+        let StartPlan::Session { args, options, .. } =
+            plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+        else {
+            panic!("{verb}: the default entry is a session");
+        };
+        assert!(args.no_hooks, "{verb}");
+        let entry = session_box_entry(root, options.entry.as_deref(), !args.no_hooks)
+            .expect("the entry expands")
+            .expect("the project declares the entry");
+        assert_eq!(entry.lifecycle_hooks, None, "{verb}: no hook is sent");
+
+        let request = planned_session_request(&args, &options, root);
+        assert!(!request.config.hooks_enabled, "{verb}");
+        let spec: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+        assert!(!spec.hooks_enabled, "{verb}: the stored spec runs no hook");
+
+        let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+            minimald_rpc::Errorable::Ok(created) => created.id,
+            minimald_rpc::Errorable::Err { error } => panic!("{verb}: the create failed: {error}"),
+        };
+        let record = stored_box_record(&mut client, id)
+            .await
+            .expect("the record is read")
+            .expect("the box has a record");
+        assert!(!record.hooks_enabled, "{verb}: the record runs no hook");
+    }
+
+    // A task entry's start and both run verbs carry the flag to the run
+    // path, which sends hooks off and no hook.
+    let tasks = start_entries("[tasks.build]\necho = 'x'\n");
+    let StartPlan::Detached { run, .. } = plan_start(
+        &parsed_start(&["min", "box", "start", "build", "--no-hooks"]),
+        &tasks,
+        true,
+    )
+    .unwrap() else {
+        panic!("a task box starts detached");
+    };
+    assert!(run.other.no_hooks);
+    let task_project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        task_project.path().join(mfile::MFILE_NAME),
+        "[tasks.build]\necho = 'x'\n",
+    )
+    .unwrap();
+    let task_root = camino::Utf8Path::from_path(task_project.path()).unwrap();
+    for verb in ["task", "box"] {
+        let run = parsed_run(&["min", verb, "run", "--no-hooks", "build"]);
+        assert!(run.other.no_hooks, "{verb}");
+        // The request and spec as `task::run_entry` builds them.
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(task_root.to_owned()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+        request.config.hooks_enabled = !run.other.no_hooks;
+        let declared = task::declared_task(task_root, &run.entry).expect("the task is declared");
+        let spec = task::task_box_spec(
+            &run.entry,
+            &declared,
+            crate::spec_flags(&request),
+            &run.args,
+        )
+        .expect("a non-interactive task has a spec");
+        crate::put_spec(&mut request, &spec).expect("the spec encodes");
+        let stored: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+        assert!(
+            !stored.hooks_enabled,
+            "{verb}: the stored spec runs no hook"
+        );
+    }
+}
+
+// BCLI-075: `--no-loadouts` leaves the selected-loadouts layer empty, and
+// with `--loadout` it is a usage error, exit 2, that names both flags.
+#[test]
+fn start_no_loadouts_with_loadout_exit2() {
+    for verb in ["box", "session"] {
+        let Err(error) =
+            Cli::try_parse_from(["min", verb, "start", "--no-loadouts", "--loadout", "rust"])
+        else {
+            panic!("{verb}: --no-loadouts with --loadout is refused");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(error.exit_code(), 2, "{verb}");
+        let text = error.to_string();
+        assert!(
+            text.contains("--no-loadouts") && text.contains("--loadout <NAME>"),
+            "{verb}: the refusal names both flags: {text}"
+        );
+
+        let StartPlan::Session { args, .. } = plan_start(
+            &parsed_start(&["min", verb, "start", "--no-loadouts"]),
+            &[],
+            true,
+        )
+        .expect("the start is planned") else {
+            panic!("{verb}: the implicit default entry is a session");
+        };
+        assert_eq!(
+            start_loadout_selection(&args),
+            loadouts::LoadoutSelection::None,
+            "{verb}"
+        );
+    }
+    for verb in ["task", "box"] {
+        let run = parsed_run(&["min", verb, "run", "--no-loadouts", "build"]);
+        assert!(run.other.no_loadouts, "{verb}");
+    }
+}
+
+// BCLI-024: `min task run` and `min box run` take `--dynamic-ingress`,
+// `--dynamic-range` and `--credentialed-upstream`, and the run path puts
+// them on the box's policy.
+#[test]
+fn run_verbs_take_dynamic_ingress_and_credentialed_upstream() {
+    for verb in ["task", "box"] {
+        let run = parsed_run(&[
+            "min",
+            verb,
+            "run",
+            "--network",
+            "own_ip",
+            "--dynamic-ingress",
+            "allow",
+            "--dynamic-range",
+            "8000-8443",
+            "--credentialed-upstream",
+            "build",
+            "x",
+        ]);
+        assert_eq!(run.args, vec!["x".to_owned()], "{verb}");
+        assert_eq!(
+            run.other.dynamic_ingress,
+            Some(boxes::DynamicIngress::Allow)
+        );
+        assert_eq!(run.other.dynamic_range, Some((8000, 8443)));
+        assert!(run.other.credentialed_upstream, "{verb}");
+
+        let mut network = task::TaskBoxNetwork {
+            mode: boxes::NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy::new(None, None),
+            hints: Vec::new(),
+            mode_layer: None,
+        };
+        task::apply_run_overrides(&mut network, &run.other).expect("an own_ip box takes them");
+        let ingress = network.policy.ingress.clone().expect("ingress is set");
+        assert_eq!(ingress.dynamic_ingress, Some(boxes::DynamicIngress::Allow));
+        assert_eq!(ingress.dynamic_allowed_range, Some((8000, 8443)));
+        assert!(network.policy.credentialed_upstream.is_some(), "{verb}");
+
+        // A box that is not `own_ip` refuses the dynamic flags, as an
+        // activation refuses them.
+        let mut network = task::TaskBoxNetwork {
+            mode: boxes::NetworkMode::HostNet,
+            policy: boxes::BoxPolicy::new(None, None),
+            hints: Vec::new(),
+            mode_layer: None,
+        };
+        let error = task::apply_run_overrides(&mut network, &run.other)
+            .expect_err("a host_ip box refuses dynamic ingress");
+        assert_eq!(
+            error.to_string(),
+            "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with \
+             its own IP address can publish ports"
+        );
+
+        // `--credentialed-upstream` alone declares the lane on any mode.
+        let alone = parsed_run(&["min", verb, "run", "--credentialed-upstream", "build"]);
+        task::apply_run_overrides(&mut network, &alone.other).expect("the flag alone is taken");
+        assert!(network.policy.credentialed_upstream.is_some(), "{verb}");
+        assert!(network.policy.ingress.is_none(), "{verb}");
+
+        // `--dynamic-range` needs `--dynamic-ingress`.
+        let Err(error) =
+            Cli::try_parse_from(["min", verb, "run", "--dynamic-range", "8000-8443", "build"])
+        else {
+            panic!("{verb}: --dynamic-range alone is refused");
+        };
+        assert_eq!(error.exit_code(), 2, "{verb}");
+    }
 }
 
 // BCLI-025: `min box show <box> --network` renders the `[network]` section
