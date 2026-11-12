@@ -649,8 +649,7 @@ fn expand_entry(
     // flags, from the functions it calls.
     let overrides = &args.overrides;
     let network_label = sources.get("network").cloned();
-    let mut loadouts = None;
-    let (mode, mode_source, egress, ingress) = if box_type == boxes::TASK_BOX_TYPE {
+    if box_type == boxes::TASK_BOX_TYPE {
         // `min box start` refuses these two flags for a task entry, so the
         // spec refuses them the same way (`StartEntryRefusal::FlagUnsupported`).
         let unsupported = [
@@ -669,6 +668,41 @@ fn expand_entry(
             }
             .into());
         }
+    }
+    // The loadouts `min box start` or `min task run` selects, read from
+    // the same client config. A missing or malformed loadout fails here as
+    // it fails the start. Folding their values into the spec is #3236.
+    // The box's loadout mode, read before any loadout as the start reads
+    // it, for a task entry too. A sealed box selects no loadout (BOX-171,
+    // BOX-173).
+    let loadout_mode =
+        crate::loadouts::entry_loadout_gate(Some(&bytes), entry, &overrides.loadout)
+            .map_err(invalid)?;
+    let cfg = crate::config::read_client_config(global)?;
+    let active = crate::loadouts::resolve_active_loadouts(
+        crate::loadouts::gate_selection(
+            crate::loadouts::LoadoutSelection::from_flags(&overrides.loadout, false),
+            loadout_mode,
+        ),
+        &cfg,
+        global,
+    )?;
+    // BOX-172: a loadout that sets `loadout_mode` fails the start, so it
+    // fails the spec the same way.
+    if let Some(loadout) = active.loadouts.iter().find(|l| l.sets_loadout_mode()) {
+        return Err(invalid(mfile::Error::LoadoutSetsLoadoutMode {
+            loadout: Some(loadout.name().as_ref().to_owned()),
+        })
+        .into());
+    }
+    let loadouts = Some(
+        active
+            .loadouts
+            .iter()
+            .map(|loadout| loadout.name().as_ref().to_owned())
+            .collect(),
+    );
+    let (mode, mode_source, egress, ingress) = if box_type == boxes::TASK_BOX_TYPE {
         let project_egress = super::box_verbs::task_project_egress(&root, &entry.name)?;
         let flags = super::box_verbs::flag_egress(&overrides.egress)?;
         let egress = super::box_verbs::effective_egress(
@@ -686,38 +720,6 @@ fn expand_entry(
         };
         (mode, source, egress.policy, None)
     } else {
-        // The loadouts `min box start` selects, read from the same client
-        // config. A missing or malformed loadout fails here as it fails
-        // the start. Folding their values into the spec is #3236.
-        // The box's loadout mode, read before any loadout as `min box start`
-        // reads it. A sealed box selects no loadout (BOX-171, BOX-173).
-        let loadout_mode =
-            crate::loadouts::entry_loadout_gate(Some(&bytes), entry, &overrides.loadout)
-                .map_err(invalid)?;
-        let cfg = crate::config::read_client_config(global)?;
-        let active = crate::loadouts::resolve_active_loadouts(
-            crate::loadouts::gate_selection(
-                crate::loadouts::LoadoutSelection::from_flags(&overrides.loadout, false),
-                loadout_mode,
-            ),
-            &cfg,
-            global,
-        )?;
-        // BOX-172: a loadout that sets `loadout_mode` fails the start, so it
-        // fails the spec the same way.
-        if let Some(loadout) = active.loadouts.iter().find(|l| l.sets_loadout_mode()) {
-            return Err(invalid(mfile::Error::LoadoutSetsLoadoutMode {
-                loadout: Some(loadout.name().as_ref().to_owned()),
-            })
-            .into());
-        }
-        loadouts = Some(
-            active
-                .loadouts
-                .iter()
-                .map(|loadout| loadout.name().as_ref().to_owned())
-                .collect(),
-        );
         let mut activate = crate::ActivateArgs::unflagged();
         if let Some(network) = overrides.network {
             activate.network = network;

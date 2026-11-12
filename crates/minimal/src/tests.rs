@@ -16193,7 +16193,8 @@ async fn box_spec_entry_gates_loadouts_as_start() {
         "[sessions.locked]\nloadout_mode = 'sealed'\n\n\
          [sessions.dev]\nloadout_mode = 'open'\n\n\
          [box_types.ci]\nextends = 'session'\nconstraints = { loadout_mode = 'sealed' }\n\n\
-         [boxes.ci]\ntype = 'ci'\nloadout_mode = 'open'\n",
+         [boxes.ci]\ntype = 'ci'\nloadout_mode = 'open'\n\n\
+         [tasks.lint]\necho = 'x'\n",
     );
     let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
     std::fs::create_dir_all(&loadouts).unwrap();
@@ -16219,6 +16220,12 @@ async fn box_spec_entry_gates_loadouts_as_start() {
         .expect("a sealed entry reads no default loadout");
     assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
 
+    // A sealed task entry reads no default loadout, as `min task run` does.
+    let toml = box_spec_text(&global, &["min", "box", "spec", "lint"])
+        .await
+        .expect("a sealed task entry reads no default loadout");
+    assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
+
     let error = box_spec_text(
         &global,
         &["min", "box", "spec", "dev", "--loadout", "moder"],
@@ -16241,6 +16248,26 @@ async fn box_spec_entry_gates_loadouts_as_start() {
     let invalid = spec_project_error(&error);
     assert!(
         matches!(invalid, mfile::Error::ConstraintViolated { .. }),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    // BOX-172: an open task entry takes its default loadouts, as
+    // `min task run` does, so one that sets `loadout_mode` refuses.
+    let (_project, global) =
+        spec_project("[tasks.opened]\necho = 'x'\nloadout_mode = 'open'\n");
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(loadouts.join("default.toml"), "loadout_mode = \"open\"\n").unwrap();
+    let error = box_spec_text(&global, &["min", "box", "spec", "opened"])
+        .await
+        .expect_err("an open task entry refuses a loadout that sets loadout_mode");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::LoadoutSetsLoadoutMode { loadout: Some(name) } if name == "default"
+        ),
         "{invalid:?}"
     );
     assert_eq!(invalid.exit_code(), Some(3));
