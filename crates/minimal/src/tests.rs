@@ -15182,6 +15182,16 @@ fn exec_box_dir(state: &std::path::Path, id: boxes::SessionId) -> std::path::Pat
 
 /// `min box show <target>` against `host`, as the command renders it.
 async fn box_show_text(host: &LocalHost, target: &str) -> String {
+    box_show_rendered(host, target, None).await
+}
+
+/// `min box show <target>` against `host`, as the command renders it in
+/// `format`, or as text without one.
+async fn box_show_rendered(
+    host: &LocalHost,
+    target: &str,
+    format: Option<BoxShowOutputFormat>,
+) -> String {
     use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
 
     let ResolvedBox { host, box_id: id } =
@@ -15198,7 +15208,11 @@ async fn box_show_text(host: &LocalHost, target: &str) -> String {
         Errorable::Err { error } => panic!("ShowBox failed: {error}"),
     };
     let mut out = Vec::new();
-    render_box_show(&mut out, &shown, host.provider, &host.host).expect("the render");
+    match format {
+        None => render_box_show(&mut out, &shown, host.provider, &host.host),
+        Some(format) => render_box_show_as(&mut out, format, &shown, host.provider, &host.host),
+    }
+    .expect("the render");
     String::from_utf8(out).expect("UTF-8 text")
 }
 
@@ -15257,6 +15271,154 @@ async fn box_show_lists_live_execs() {
         ],
         "the ended exec leaves the list\n{text}"
     );
+}
+
+/// A box `web` on a test host with two live execs, one that holds a
+/// terminal and one detached. The host and its state dir live as long as
+/// the returned guards.
+macro_rules! box_with_two_execs {
+    ($alpha:ident, $state:ident, $shell:ident, $job:ident) => {
+        let ($alpha, $state) = exec_attach_host("alpha.local-minvmd0").await;
+        let web = $alpha.create("web", Some(false)).await;
+        let $shell = $alpha
+            .server
+            .list_running_exec(web, FIRST_EXEC_ID, &["sh", "-i"], true);
+        let $job = $alpha.server.list_running_exec(
+            web,
+            SECOND_EXEC_ID,
+            &["sh", "-c", "sleep 600; echo done"],
+            false,
+        );
+    };
+}
+
+// BCLI-033, BCLI-053: `min box show <box> -o json` writes one `min/v1/box`
+// object with the fields the text form shows. Its `execs` field lists each
+// live exec as a `min/v1/exec` object. `-o` does not go with `--network`.
+#[tokio::test]
+async fn box_show_output_json_writes_box_with_execs() {
+    match box_exec_id_command(&["show", "web", "-o", "json"]) {
+        BoxCommand::Show(args) => {
+            assert_eq!(args.target, "web");
+            assert_eq!(args.output, Some(BoxShowOutputFormat::Json));
+        }
+        _ => panic!("not `min box show`"),
+    }
+    assert!(
+        Cli::try_parse_from(["min", "box", "show", "web", "-o", "json", "--network"]).is_err(),
+        "-o and --network do not go together"
+    );
+
+    box_with_two_execs!(alpha, _state, _shell, _job);
+    let text = box_show_text(&alpha.host, "web").await;
+    let json = box_show_rendered(&alpha.host, "web", Some(BoxShowOutputFormat::Json)).await;
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("one JSON doc");
+    assert_eq!(doc["schema"], "min/v1/box", "{json}");
+    assert_eq!(doc["name"], "web", "{json}");
+    assert_eq!(doc["state"], "running", "{json}");
+    // Each field the text form shows carries the same value.
+    for (label, field) in [
+        ("ID", "id"),
+        ("Name", "name"),
+        ("Type", "type"),
+        ("Parent", "parent"),
+        ("Project", "project"),
+        ("State", "state"),
+        ("Identity", "identity"),
+        ("Provider", "provider"),
+        ("Host", "host"),
+    ] {
+        let shown = text
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{label}:")))
+            .unwrap_or_else(|| panic!("no {label} in {text}"))
+            .trim();
+        let value = doc[field].as_str().unwrap_or(NO_VALUE);
+        assert_eq!(value, shown, "{field} in {json}");
+    }
+    assert_eq!(
+        doc["execs"],
+        serde_json_lenient::json!([
+            {
+                "schema": "min/v1/exec",
+                "id": FIRST_EXEC_ID,
+                "mode": "terminal",
+                "argv": ["sh", "-i"],
+            },
+            {
+                "schema": "min/v1/exec",
+                "id": SECOND_EXEC_ID,
+                "mode": "detached",
+                "argv": ["sh", "-c", "sleep 600; echo done"],
+            },
+        ]),
+        "{json}"
+    );
+}
+
+/// `value` with every `null` member of an object left out, as YAML and
+/// TOML carry a document.
+fn without_nulls(value: serde_json_lenient::Value) -> serde_json_lenient::Value {
+    use serde_json_lenient::Value;
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, member)| !member.is_null())
+                .map(|(key, member)| (key, without_nulls(member)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(without_nulls).collect()),
+        other => other,
+    }
+}
+
+// BCLI-033: `min box show -o yaml` carries the document that `-o json`
+// carries, with the values the record does not carry left out.
+#[tokio::test]
+async fn box_show_output_yaml_matches_json() {
+    box_with_two_execs!(alpha, _state, _shell, _job);
+    let json = box_show_rendered(&alpha.host, "web", Some(BoxShowOutputFormat::Json)).await;
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("one JSON doc");
+    let doc = without_nulls(doc);
+
+    // The YAML mapping, key by key in the order of the JSON fields.
+    let yaml = box_show_rendered(&alpha.host, "web", Some(BoxShowOutputFormat::Yaml)).await;
+    let quoted = |value: &serde_json_lenient::Value| match value {
+        serde_json_lenient::Value::String(text) => format!("\"{text}\""),
+        other => other.to_string(),
+    };
+    let mut expected = String::new();
+    for key in [
+        "schema",
+        "id",
+        "name",
+        "type",
+        "parent",
+        "project",
+        "state",
+        "reason",
+        "exit_code",
+        "signal",
+        "disk_bytes",
+        "identity",
+        "provider",
+        "host",
+    ] {
+        if let Some(value) = doc.get(key) {
+            expected.push_str(&format!("{key}: {}\n", quoted(value)));
+        }
+    }
+    expected.push_str("execs:\n");
+    for exec in doc["execs"].as_array().expect("execs") {
+        expected.push_str(&format!("- schema: {}\n", quoted(&exec["schema"])));
+        expected.push_str(&format!("  id: {}\n", quoted(&exec["id"])));
+        expected.push_str(&format!("  mode: {}\n", quoted(&exec["mode"])));
+        expected.push_str("  argv:\n");
+        for word in exec["argv"].as_array().expect("argv") {
+            expected.push_str(&format!("    - {}\n", quoted(word)));
+        }
+    }
+    assert_eq!(yaml, expected);
 }
 
 /// `min box stop`, `logs` or `wait` with `--exec`, parsed as the CLI parses
