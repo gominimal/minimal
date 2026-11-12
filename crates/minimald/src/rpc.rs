@@ -3857,6 +3857,8 @@ mod create_naming_tests {
     fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
         let mut request = create_session_req("unused", "/tmp");
         request.config.name = None;
+        // A `task` spec is created under the task verb (BOX-160).
+        request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
         let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
         spec.box_type = boxes::TASK_BOX_TYPE.to_string();
         spec.pty_enabled = false;

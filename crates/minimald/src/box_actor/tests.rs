@@ -15842,11 +15842,16 @@ fn of_container_on_a_pid_the_daemon_did_not_spawn_signals_nothing() {
     shell.wait().expect("reap the stand-in shell");
 }
 
-/// A session spec as a create sends it (BOX-068), with `pty_enabled` as
-/// given and every other setting at its default.
+/// A spec as a create sends it (BOX-068), with `pty_enabled` as given and
+/// every other setting at its default. A spec with no terminal is of the
+/// `task` type, as the `session` root allows only a terminal (BOX-160).
+/// Create it with [`create_task_with_spec`].
 fn resume_spec(pty_enabled: bool) -> serde_json_lenient::Value {
     let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
     spec.pty_enabled = pty_enabled;
+    if !pty_enabled {
+        spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+    }
     serde_json_lenient::to_value(&spec).expect("a spec serializes")
 }
 
@@ -15854,6 +15859,42 @@ fn resume_spec(pty_enabled: bool) -> serde_json_lenient::Value {
 /// carries `spec`, and `name: None` creates an unnamed session.
 async fn create_session_with_spec(
     client: &mut TestClient,
+    name: Option<&str>,
+    project: &str,
+    spec: Option<serde_json_lenient::Value>,
+) -> SessionId {
+    create_box_with_spec(
+        client,
+        minimald_rpc::CreatingVerb::Session,
+        name,
+        project,
+        spec,
+    )
+    .await
+}
+
+/// Creates an `Active` box through the whole create flow under the task
+/// verb, as a `task` spec needs (BOX-160). Its create carries `spec`.
+async fn create_task_with_spec(
+    client: &mut TestClient,
+    name: Option<&str>,
+    project: &str,
+    spec: Option<serde_json_lenient::Value>,
+) -> SessionId {
+    create_box_with_spec(
+        client,
+        minimald_rpc::CreatingVerb::Task,
+        name,
+        project,
+        spec,
+    )
+    .await
+}
+
+/// Creates an `Active` box through the whole create flow under `verb`.
+async fn create_box_with_spec(
+    client: &mut TestClient,
+    verb: minimald_rpc::CreatingVerb,
     name: Option<&str>,
     project: &str,
     spec: Option<serde_json_lenient::Value>,
@@ -15868,6 +15909,7 @@ async fn create_session_with_spec(
     if name.is_none() {
         req.config.name = None;
     }
+    req.config.creating_verb = verb;
     req.spec = spec;
     let id = client.call::<CreateSession>(&req).await.unwrap().id;
     unwrap_ready(
@@ -16389,7 +16431,7 @@ async fn resume_non_pty_box_refuses_keeps_state() {
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = create_session_with_spec(
+    let id = create_task_with_spec(
         &mut client,
         Some("no-pty"),
         "/uwu",
@@ -18002,12 +18044,17 @@ async fn timeout_record_write_failure_refuses_resume_and_stop_keeps_timeout() {
     assert_eq!(exited[0].data["reason"], "timeout");
 }
 
-/// A session spec as a create sends it (BOX-068) for a box that runs until
-/// it is stopped, with `pty_enabled` as given.
+/// A spec as a create sends it (BOX-068) for a box that runs until it is
+/// stopped, with `pty_enabled` as given. A spec with no terminal is of the
+/// `task` type, as the `session` root allows only a terminal (BOX-160).
+/// Create it with [`create_task_with_spec`].
 fn until_stopped_spec(pty_enabled: bool) -> serde_json_lenient::Value {
     let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
     spec.lifetime = mfile::spec::Lifetime::UntilStopped;
     spec.pty_enabled = pty_enabled;
+    if !pty_enabled {
+        spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+    }
     serde_json_lenient::to_value(&spec).expect("a spec serializes")
 }
 
@@ -18225,7 +18272,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     // The name: two running boxes answer to `pair`. A create and a launch
     // refuse a held name, so the first box takes it in its record after
     // both run.
-    let first = create_session_with_spec(
+    let first = create_task_with_spec(
         &mut client,
         Some("pair-first"),
         "/a/x",
@@ -18233,7 +18280,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     )
     .await;
     launch_host_for(&server, first).await;
-    let holder = create_session_with_spec(
+    let holder = create_task_with_spec(
         &mut client,
         Some("pair"),
         "/b/y",
@@ -18274,7 +18321,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
 
     // The spec: the box's own name does not trip the name check, and a
     // stored spec this daemon cannot start from is refused with exit 3.
-    let alone = create_session_with_spec(
+    let alone = create_task_with_spec(
         &mut client,
         Some("alone"),
         "/c/alone",
@@ -18333,7 +18380,7 @@ async fn restart_start_failure_leaves_box_stopped_with_its_stop_recorded() {
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = create_session_with_spec(
+    let id = create_task_with_spec(
         &mut client,
         Some("start-fails"),
         "/uwu",
