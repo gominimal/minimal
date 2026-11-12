@@ -13251,6 +13251,11 @@ async fn box_logs_piped_pty_transcript_has_no_control_codes() {
     let mut text = Vec::new();
     ControlStripper::default().strip(b"end\x1b]0;tit", &mut text);
     assert_eq!(text, b"end");
+    // A string with no end stops at the line feed, so the rest of the
+    // transcript still shows.
+    let mut text = Vec::new();
+    ControlStripper::default().strip(b"a\x1b]0;title\nnext line\n", &mut text);
+    assert_eq!(text, b"a\nnext line\n");
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
     let state = tempfile::tempdir().expect("a temp daemon state dir");
@@ -13311,6 +13316,11 @@ async fn box_logs_raw_keeps_control_codes() {
         panic!("expected `min box logs`");
     };
     assert!(!args.logs.raw, "raw is off by default");
+    // `--exec` writes one command's output as it is, so it refuses `--raw`.
+    assert!(
+        Cli::try_parse_from(["min", "box", "logs", "web", "--exec", "1", "--raw"]).is_err(),
+        "`min box logs --exec --raw` is refused"
+    );
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
     let state = tempfile::tempdir().expect("a temp daemon state dir");

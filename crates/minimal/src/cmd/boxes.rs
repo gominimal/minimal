@@ -95,7 +95,7 @@ pub(crate) async fn box_logs_on_hosts(
     let written = async {
         let mut client = box_host_client(&resolved.host).await?;
         if !args.raw && !stdout_is_terminal {
-            stripped = box_has_terminal(&mut client, verb, address, box_id).await?;
+            stripped = box_has_terminal(&mut client, verb, box_id).await;
         }
         let mut strip = stripped.then(ControlStripper::default);
         let request = minimald_rpc::ReadLogRequest {
@@ -161,27 +161,27 @@ async fn resolve_typed_box_on_hosts(
     }
 }
 
-/// Whether the stored spec of box `box_id` gives it a terminal. The detail
-/// of a failed read goes to the log.
+/// Whether the stored spec of box `box_id` gives it a terminal. Only the
+/// strip decision depends on this read, so a failed read gives `false`:
+/// the log is then written as the box wrote it. The detail goes to the log.
 async fn box_has_terminal(
     client: &mut client::Client,
     verb: &'static str,
-    address: &str,
     box_id: boxes::SessionId,
-) -> Result<bool, anyhow::Error> {
+) -> bool {
     use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
     match client
         .oneshot_rpc::<ShowBox>(ShowBoxRequest { id: box_id })
         .await
     {
-        Ok(Errorable::Ok(shown)) => Ok(shown.record.pty_enabled),
+        Ok(Errorable::Ok(shown)) => shown.record.pty_enabled,
         Ok(Errorable::Err { error }) => {
-            tracing::warn!(verb, box_id = %box_id, "read the box record: {error}");
-            Err(log_read_failed(address))
+            tracing::warn!(verb, box_id = %box_id, "read the box record, write the log raw: {error}");
+            false
         }
         Err(e) => {
-            tracing::warn!(verb, box_id = %box_id, "read the box record: {e:#}");
-            Err(log_read_failed(address))
+            tracing::warn!(verb, box_id = %box_id, "read the box record, write the log raw: {e:#}");
+            false
         }
     }
 }
@@ -190,7 +190,8 @@ async fn box_has_terminal(
 /// chunks: CSI sequences (`ESC [`), OSC strings (`ESC ]`, ended by BEL or
 /// `ESC \`), the DCS, SOS, PM and APC strings, the other escape sequences,
 /// and the C0 control codes except tab, line feed and carriage return. A
-/// sequence can be split across chunks: the state carries over. Bytes of
+/// sequence can be split across chunks: the state carries over. A line
+/// feed ends an OSC, DCS, SOS, PM or APC string that has no end. Bytes of
 /// 0x80 and up pass through, so UTF-8 text stays whole.
 #[derive(Debug, Default)]
 pub(crate) struct ControlStripper {
@@ -283,6 +284,12 @@ impl ControlStripper {
             ControlString => match byte {
                 Self::BEL => Ground,
                 Self::ESC => StringEscape,
+                // A string with no end must not hide the rest of the log, so
+                // a line feed ends it and is kept as text.
+                b'\n' => {
+                    text.push(byte);
+                    Ground
+                }
                 _ => ControlString,
             },
             StringEscape => match byte {

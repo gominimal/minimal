@@ -564,9 +564,9 @@ pub struct BoxLogsArgs {
     /// writes it, until the box is removed or the command is interrupted
     #[arg(short = 'f', long)]
     pub follow: bool,
-    /// Show a terminal box's output byte for byte, with its terminal
-    /// control codes. Without `--raw`, output that does not go to a
-    /// terminal has them removed
+    /// Show the output of a box with a terminal byte for byte, with its
+    /// terminal control codes. Without `--raw`, they are removed when the
+    /// output does not go to a terminal. `--exec` does not take `--raw`
     #[arg(long)]
     pub raw: bool,
 }
@@ -580,7 +580,11 @@ pub struct BoxLogsExecArgs {
     pub logs: BoxLogsArgs,
     /// Show what one command printed, by the exec id that `min box exec`
     /// printed for it. The command can be running or ended
-    #[arg(long = "exec", value_name = "EXEC_ID", conflicts_with = "follow")]
+    #[arg(
+        long = "exec",
+        value_name = "EXEC_ID",
+        conflicts_with_all = ["follow", "raw"]
+    )]
     pub exec: Option<String>,
 }
 
