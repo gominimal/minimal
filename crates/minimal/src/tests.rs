@@ -16173,6 +16173,78 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
     assert_eq!(format!("{error:#}"), format!("{expected:#}"));
 }
 
+/// The project file error that `min box spec` ends with.
+fn spec_project_error(error: &anyhow::Error) -> &mfile::Error {
+    &error
+        .downcast_ref::<crate::ProjectFileInvalid>()
+        .unwrap_or_else(|| panic!("not a project file error: {error:#}"))
+        .error
+}
+
+// BOX-171, BOX-172, BOX-173, BOX-175, BOX-181: `min box spec <entry>`
+// reads the box's loadout mode before any loadout, as `min box start`
+// does. A sealed entry refuses `--loadout` and reads no default loadout.
+// A loadout that sets `loadout_mode` and a contradicted constraint refuse
+// with exit 3.
+#[tokio::test]
+async fn box_spec_entry_gates_loadouts_as_start() {
+    let (_project, global) = spec_project(
+        "[sessions.locked]\nloadout_mode = 'sealed'\n\n\
+         [sessions.dev]\nloadout_mode = 'open'\n\n\
+         [box_types.ci]\nextends = 'session'\nconstraints = { loadout_mode = 'sealed' }\n\n\
+         [boxes.ci]\ntype = 'ci'\nloadout_mode = 'open'\n",
+    );
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(loadouts.join("default.toml"), "= not = toml =").unwrap();
+    std::fs::write(loadouts.join("dev.toml"), "packages = [\"helix\"]\n").unwrap();
+    std::fs::write(loadouts.join("moder.toml"), "loadout_mode = \"open\"\n").unwrap();
+
+    let error = box_spec_text(
+        &global,
+        &["min", "box", "spec", "locked", "--loadout", "dev"],
+    )
+    .await
+    .expect_err("a sealed entry refuses --loadout");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(invalid, mfile::Error::NamedLoadoutOnSealedBox { .. }),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    let toml = box_spec_text(&global, &["min", "box", "spec", "locked"])
+        .await
+        .expect("a sealed entry reads no default loadout");
+    assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
+
+    let error = box_spec_text(
+        &global,
+        &["min", "box", "spec", "dev", "--loadout", "moder"],
+    )
+    .await
+    .expect_err("a loadout that sets loadout_mode refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::LoadoutSetsLoadoutMode { loadout: Some(name) } if name == "moder"
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    let error = box_spec_text(&global, &["min", "box", "spec", "ci"])
+        .await
+        .expect_err("a contradicted constraint refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(invalid, mfile::Error::ConstraintViolated { .. }),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+}
+
 /// Creates a session box on the in-process daemon `server` from the
 /// project in `root`, named `name` when it is given, with its spec stamped
 /// on the request as a start stamps it. Gives the request and the box id.
