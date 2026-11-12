@@ -1105,6 +1105,13 @@ impl Context {
             self.repo_dir()?.to_path_buf()
         };
         let state_base_dir = match state_key {
+            // the mfile's load refuses such a key; checked again for a caller
+            // that hands one in another way
+            Some(name) if !name.is_empty() && !mfile::is_state_key(name) => {
+                return Err(Error::Other(anyhow!(
+                    "state key {name:?} is not one directory name; use a plain name such as \"dev\""
+                )));
+            }
             Some(name) if !name.is_empty() => mfile
                 .state_dir(name, self.daemon.config.state_base_dir())
                 .ok_or_else(|| {

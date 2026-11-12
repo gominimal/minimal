@@ -87,6 +87,13 @@ impl SetupForPackages {
                     let entry = entry.as_map().unwrap();
                     let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
                     let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
+                    // the prefix is joined onto the state dir: one name only
+                    if !mfile::is_state_key(&prefix) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("env_state_wiring prefix {prefix:?} is not one directory name"),
+                        ));
+                    }
 
                     state_dirs.insert(prefix.clone());
 
