@@ -13462,9 +13462,8 @@ async fn type_noun_verbs_alias_box_forms() {
     match err.downcast_ref::<BoxExecIdRefusal>() {
         Some(BoxExecIdRefusal::Unknown { target, .. }) => {
             assert_eq!(
-                target,
-                &web.to_string(),
-                "the exec stop read the session box"
+                target, &web_start,
+                "the refusal names the address the person typed"
             );
         }
         other => panic!("an unknown exec in the session box, not {other:?}: {err:#}"),
@@ -13473,6 +13472,85 @@ async fn type_noun_verbs_alias_box_forms() {
     cmd::typed_box_rm_on_hosts(hosts(), &rm(&decoy.to_string()), task, "rm")
         .await
         .expect("the decoy task box goes");
+
+    // With `--exec`, each noun prints the line of `min box stop --exec`,
+    // and the line names the box as the person typed it.
+    let native = hosts().into_iter().next().expect("the native host");
+    for (box_type, name, id) in [(session, "web", web), (task, "build", build)] {
+        let listed = server.list_running_exec(id, FIRST_EXEC_ID, &["sleep", "600"], false);
+        let exec_stop = BoxStopArgs {
+            target: name.to_owned(),
+            force: false,
+            exec: Some(FIRST_EXEC_ID.to_owned()),
+        };
+        let mut out = Vec::new();
+        let stop = cmd::typed_box_stop_on_hosts(hosts(), &mut out, &exec_stop, box_type, "stop");
+        let end = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            listed.end();
+        };
+        let (stopped, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(stop, end)
+        })
+        .await
+        .expect("the stop returns when the exec ends");
+        assert!(
+            stopped.expect("the exec stop succeeds").is_none(),
+            "an exec stop, not a box stop"
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "Exec {FIRST_EXEC_ID} in {name} ended before the stop, \
+                 so the stop changed nothing.\n"
+            )
+        );
+    }
+
+    // A stopped session box and a running task box hold the same name, and
+    // the task box runs an exec. A session stop with `--exec` does not stop
+    // the task box's exec.
+    let twin_session =
+        minimald::test_harness::create_configured_session(&mut daemon, "twin", project).await;
+    let mut out = Vec::new();
+    cmd::typed_box_stop_on_hosts(hosts(), &mut out, &stop("twin"), session, "stop")
+        .await
+        .expect("the session box stops")
+        .expect("a box stop");
+    let twin_task = create_configured_task(&mut daemon, "twin", project).await;
+    let _task_exec = server.list_running_exec(twin_task, FIRST_EXEC_ID, &["sleep", "600"], false);
+    let exec_stop = BoxStopArgs {
+        target: "twin".to_owned(),
+        force: false,
+        exec: Some(FIRST_EXEC_ID.to_owned()),
+    };
+    let mut out = Vec::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cmd::typed_box_stop_on_hosts(hosts(), &mut out, &exec_stop, session, "stop"),
+    )
+    .await
+    .expect("the session stop does not wait on the task box's exec");
+    assert!(
+        result.is_err(),
+        "the stopped session box runs no exec: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(out.is_empty());
+    let text = box_show_text(&native, &twin_task.to_string()).await;
+    assert_eq!(
+        live_exec_rows(&text),
+        [
+            "Live execs:".to_owned(),
+            format!("  {FIRST_EXEC_ID}  detached  sleep 600"),
+        ],
+        "the task box's exec runs on\n{text}"
+    );
+    for (box_type, id) in [(task, twin_task), (session, twin_session)] {
+        cmd::typed_box_rm_on_hosts(hosts(), &rm(&id.to_string()), box_type, "rm")
+            .await
+            .expect("the twin box goes");
+    }
 
     // Under its own noun, each box stops with the line of `min box stop`,
     // and then goes, as `min box rm` removes it.

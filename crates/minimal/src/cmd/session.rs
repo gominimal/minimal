@@ -989,14 +989,11 @@ pub(crate) async fn typed_box_stop_on_hosts(
     let box_id = resolved.box_id;
     let stopped = async {
         match args.exec.as_deref() {
-            // The exec stop reads only the host that keeps the box, and
-            // takes the box's full id. A full id matches only that box, so
-            // a name or id prefix of a box of another type is never read.
+            // The exec stop goes to the box this type resolved, with no
+            // second lookup, so a box of another type that holds the same
+            // name is never reached. The line names the typed address.
             Some(exec) => {
-                exec_id_arg(target, exec)?;
-                let host = vec![resolved.host.clone()];
-                let full_id = box_id.to_string();
-                box_stop_exec_on_hosts(host, out, &full_id, exec).await?;
+                box_stop_exec_in_resolved(&resolved, out, target, exec, verb).await?;
                 Ok(None)
             }
             None => {
