@@ -761,70 +761,73 @@ fn spawn_node_mirror(
         })
 }
 
-/// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
-/// the VMM child exits.
-///
-/// `root` (the process's root span, entered) and the `supervisor.start` span
-/// under it end once the VM is ready; the rest of the VM's life runs under a
-/// `supervisor.serve` root linked to them (`telemetry::SupervisorStart`).
+/// How long `minvmd run`'s first phase waits for a just-stopped supervisor to
+/// release the alive lock before bailing. The old supervisor writes its final
+/// `Stopped` state before `min stop` returns but releases the alive lock only
+/// at process exit, so a start issued immediately after `min stop` can lose
+/// the race and must briefly wait instead of failing.
 #[cfg(minvmd_libkrun)]
-fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
-    use std::io::Read as _;
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+const ALIVE_LOCK_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    use minimald_rpc::ProxyDownCause;
+/// Poll interval for that wait: each attempt re-takes the lifecycle lock and
+/// re-reads state, so a transition to Running/Starting is seen promptly.
+#[cfg(any(minvmd_libkrun, test))]
+const ALIVE_LOCK_RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
-    use crate::cmd::MARKER_SOCK_ENV;
-    use crate::image::resolve_boot_images;
+/// Acquire the alive lock for a start, waiting (bounded) when a stopped or
+/// stopping daemon still holds it, then reject a live minimald and commit the
+/// Stopped → Starting transition. On any other lifecycle the caller's bail
+/// messages are preserved verbatim.
+#[cfg(any(minvmd_libkrun, test))]
+fn acquire_alive_lock_for_start(
+    state_dir: &crate::state::StateDir,
+    lock_wait: std::time::Duration,
+) -> Result<crate::state::AliveLock> {
+    use anyhow::Context as _;
+
     use crate::lifecycle::{Action, Lifecycle, next_state};
-    use crate::net::answerer::DEFAULT_ANSWERER_PORT;
-    use crate::state::{StartingGuard, State, StateDir};
+    use crate::state::State;
 
-    // One span per supervisor phase, like minimald's per-connection `conn`
-    // span: every record the supervisor emits carries `vm`, so a detached
-    // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
-    // to every VM on the host) stay attributable once a second VM runs —
-    // grep instead of manual fields on each line. This one, `supervisor.start`,
-    // is the parent of the switch start and of `vm.boot` (and so of the guest's
-    // `guest.ready`), and ends with the process root at READY below.
-    let start_phase = crate::telemetry::SupervisorStart::enter(root);
-
-    // Fail-fast: resolve paths before touching lifecycle state.
-    // (UDS path lengths were already checked in `run_supervisor`.)
-    let (_kernel, _rootfs, _initramfs) =
-        resolve_boot_images().context("resolving boot image paths")?;
-
-    let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
-
-    // ── Phase 1: Stopped → Starting (under lock) ───────────────────────────
-    // The alive lock outlives the block: held for the whole supervisor life
-    // and inherited by the VMM child, so observers can tell a live daemon/VM
-    // from stale state.
-    let alive_lock;
-    {
+    let mut logged_wait = false;
+    let deadline = std::time::Instant::now() + lock_wait;
+    loop {
         let mut lock = state_dir
             .lifecycle_lock()
             .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
 
-        alive_lock = match state_dir
+        let acquired = state_dir
             .try_acquire_alive_lock()
-            .context("acquiring alive lock")?
-        {
+            .context("acquiring alive lock")?;
+
+        let alive_lock = match acquired {
             Some(l) => l,
-            None => match state.lifecycle {
-                Lifecycle::Running => {
-                    bail!("minvmd is already running (vmm_pid={:?})", state.vmm_pid)
+            None => {
+                let waits = matches!(state.lifecycle, Lifecycle::Stopped | Lifecycle::Stopping);
+                if !waits || std::time::Instant::now() >= deadline {
+                    match state.lifecycle {
+                        Lifecycle::Running => {
+                            bail!("minvmd is already running (vmm_pid={:?})", state.vmm_pid)
+                        }
+                        Lifecycle::Starting => bail!("minvmd is already starting"),
+                        Lifecycle::Stopping => {
+                            bail!("minvmd is stopping; wait for it to finish before restarting")
+                        }
+                        _ => bail!("another minvmd (a `boot` VM?) holds the alive lock"),
+                    }
                 }
-                Lifecycle::Starting => bail!("minvmd is already starting"),
-                Lifecycle::Stopping => {
-                    bail!("minvmd is stopping; wait for it to finish before restarting")
+                drop(_guard);
+                drop(lock);
+                if !logged_wait {
+                    logged_wait = true;
+                    tracing::info!(
+                        "a stopped daemon still holds the alive lock; waiting for its release"
+                    );
                 }
-                _ => bail!("another minvmd (a `boot` VM?) holds the alive lock"),
-            },
+                std::thread::sleep(ALIVE_LOCK_RELEASE_POLL);
+                continue;
+            }
         };
 
         // Both backends bind the same ssh.sock; don't steal a live native
@@ -859,7 +862,51 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 ..State::stopped()
             })
             .context("writing Starting state")?;
+
+        return Ok(alive_lock);
     }
+}
+
+/// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
+/// the VMM child exits.
+///
+/// `root` (the process's root span, entered) and the `supervisor.start` span
+/// under it end once the VM is ready; the rest of the VM's life runs under a
+/// `supervisor.serve` root linked to them (`telemetry::SupervisorStart`).
+#[cfg(minvmd_libkrun)]
+fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use minimald_rpc::ProxyDownCause;
+
+    use crate::cmd::MARKER_SOCK_ENV;
+    use crate::image::resolve_boot_images;
+    use crate::lifecycle::{Action, Lifecycle, next_state};
+    use crate::net::answerer::DEFAULT_ANSWERER_PORT;
+    use crate::state::{StartingGuard, State, StateDir};
+    // One span per supervisor phase, like minimald's per-connection `conn`
+    // span: every record the supervisor emits carries `vm`, so a detached
+    // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
+    // to every VM on the host) stay attributable once a second VM runs —
+    // grep instead of manual fields on each line. This one, `supervisor.start`,
+    // is the parent of the switch start and of `vm.boot` (and so of the guest's
+    // `guest.ready`), and ends with the process root at READY below.
+    let start_phase = crate::telemetry::SupervisorStart::enter(root);
+
+    // Fail-fast: resolve paths before touching lifecycle state.
+    // (UDS path lengths were already checked in `run_supervisor`.)
+    let (_kernel, _rootfs, _initramfs) =
+        resolve_boot_images().context("resolving boot image paths")?;
+
+    let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
+
+    // ── Phase 1: Stopped → Starting (under lock) ───────────────────────────
+    // The alive lock is held for the whole supervisor life and inherited by
+    // the VMM child, so observers can tell a live daemon/VM from stale state.
+    let alive_lock = acquire_alive_lock_for_start(&state_dir, ALIVE_LOCK_RELEASE_WAIT)?;
 
     // StartingGuard: resets lifecycle to Stopped on drop if we bail before
     // committing (R4.6). Holds no lock so concurrent readers observe the
@@ -5826,6 +5873,105 @@ mod tests {
                 "an open mirror allocates nothing"
             )),
             None
+        );
+    }
+
+    /// A stopping daemon releases the alive lock only at process exit, which
+    /// trails the `Stopped` state write that `min stop` already returned on,
+    /// so a start issued right after `min stop` races it. The first phase
+    /// must wait (bounded) for that release instead of bailing.
+    #[test]
+    fn start_waits_for_a_stopped_daemons_alive_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = crate::state::StateDir::new(tmp.path().to_path_buf()).unwrap();
+        sd.write_state(&crate::state::State::stopped()).unwrap();
+        let held = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+
+        // Hold the acquired lock while asserting, then let it drop with the
+        // test's scope.
+        let _alive =
+            super::acquire_alive_lock_for_start(&sd, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            sd.read_state().unwrap().lifecycle,
+            crate::lifecycle::Lifecycle::Starting
+        );
+        releaser.join().expect("releaser");
+    }
+
+    /// The wait is bounded: a Stopped daemon that never releases the lock
+    /// still bails with the alive-lock message.
+    #[test]
+    fn start_stops_waiting_for_an_alive_lock_that_never_frees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = crate::state::StateDir::new(tmp.path().to_path_buf()).unwrap();
+        sd.write_state(&crate::state::State::stopped()).unwrap();
+        let _held = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let err = super::acquire_alive_lock_for_start(&sd, std::time::Duration::from_millis(200))
+            .err()
+            .expect("a Stopped daemon that never frees the lock must refuse the start");
+        assert!(
+            err.to_string()
+                .contains("another minvmd (a `boot` VM?) holds the alive lock"),
+            "got: {err}"
+        );
+    }
+
+    /// A Stopping daemon that never releases the lock bails with the
+    /// stopping message once the wait expires.
+    #[test]
+    fn start_stops_waiting_for_a_stopping_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = crate::state::StateDir::new(tmp.path().to_path_buf()).unwrap();
+        sd.write_state(&crate::state::State {
+            lifecycle: crate::lifecycle::Lifecycle::Stopping,
+            vmm_pid: Some(999_999_999),
+            ..crate::state::State::stopped()
+        })
+        .unwrap();
+        let _held = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let err = super::acquire_alive_lock_for_start(&sd, std::time::Duration::from_millis(200))
+            .err()
+            .expect("a Stopping daemon that never frees the lock must refuse the start");
+        assert!(
+            err.to_string()
+                .contains("minvmd is stopping; wait for it to finish before restarting"),
+            "got: {err}"
+        );
+    }
+
+    /// A Running daemon holding the lock is not waited for: the start bails
+    /// immediately with the running message.
+    #[test]
+    fn start_does_not_wait_for_a_running_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = crate::state::StateDir::new(tmp.path().to_path_buf()).unwrap();
+        sd.write_state(&crate::state::State {
+            lifecycle: crate::lifecycle::Lifecycle::Running,
+            vmm_pid: Some(42),
+            started_at: Some(0),
+            ..crate::state::State::stopped()
+        })
+        .unwrap();
+        let _held = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let started = std::time::Instant::now();
+        let err = super::acquire_alive_lock_for_start(&sd, std::time::Duration::from_secs(5))
+            .err()
+            .expect("a Running daemon must refuse the start");
+        assert!(
+            err.to_string().contains("minvmd is already running"),
+            "got: {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "a Running daemon must not be waited for"
         );
     }
 }
