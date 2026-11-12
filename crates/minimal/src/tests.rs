@@ -9517,7 +9517,9 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
 /// Creates a running box named `name` from `project` on the harness
 /// daemon, through the whole create flow, with a stored spec whose
 /// `io.pty_enabled` is `pty`. `None` stores no spec, as the harness's own
-/// create does, and a session filed that way has a terminal.
+/// create does, and a session filed that way has a terminal. A box with no
+/// terminal is created under the task verb, as the daemon refuses a
+/// session with no terminal (BOX-160).
 async fn create_attach_box(
     daemon: &mut minimald::test_harness::TestClient,
     name: &str,
@@ -9525,14 +9527,12 @@ async fn create_attach_box(
     pty: Option<bool>,
 ) -> boxes::SessionId {
     let spec = pty.map(|pty| serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": pty}}));
-    create_spec_box(
-        daemon,
-        name,
-        project,
-        spec,
-        minimald_rpc::CreatingVerb::Session,
-    )
-    .await
+    let verb = if pty == Some(false) {
+        minimald_rpc::CreatingVerb::Task
+    } else {
+        minimald_rpc::CreatingVerb::Session
+    };
+    create_spec_box(daemon, name, project, spec, verb).await
 }
 
 /// Creates a running box named `name` from `project` on the harness
@@ -9632,6 +9632,25 @@ impl AttachHost {
     ) -> boxes::SessionId {
         let mut daemon = self.server.connect().await;
         create_spec_box(&mut daemon, name, self.project.path(), Some(spec), verb).await
+    }
+
+    /// Creates a running box of the type `verb` sets, then stores `spec`
+    /// in place of the spec it was created with. The daemon refuses a
+    /// session with no terminal and a task with one (BOX-160), so this is
+    /// how a test gets such a box, as a record stored before that check.
+    /// `state` is the daemon state dir [`exec_attach_host`] returns.
+    async fn create_stored(
+        &self,
+        state: &std::path::Path,
+        name: &str,
+        spec: serde_json_lenient::Value,
+        verb: minimald_rpc::CreatingVerb,
+    ) -> boxes::SessionId {
+        let allowed = resume_spec(verb == minimald_rpc::CreatingVerb::Session, None);
+        let id = self.create_with(name, allowed, verb).await;
+        let path = box_state_dir(state, id).join(boxes::store::SPEC_FILE);
+        std::fs::write(path, serde_json_lenient::to_vec(&spec).unwrap()).unwrap();
+        id
     }
 
     /// The project root the bare form reads for this host's project.
@@ -9946,6 +9965,19 @@ async fn exec_attach_host(host: &str) -> (AttachHost, std::path::PathBuf) {
     )
 }
 
+/// The directory of box `id` under the daemon state dir `state`.
+fn box_state_dir(state: &std::path::Path, id: boxes::SessionId) -> std::path::PathBuf {
+    std::fs::read_dir(state.join("sessions"))
+        .expect("the daemon's sessions dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("record.json"))
+                .is_ok_and(|record| record.contains(&id.to_string()))
+        })
+        .expect("the box's state dir")
+}
+
 /// Appends the exec event `kind` for `exec_id` to the events of box `id`
 /// under the daemon state dir `state`, with the fields the daemon writes.
 fn write_exec_event(
@@ -9957,15 +9989,7 @@ fn write_exec_event(
 ) {
     use boxes::events::exec_data;
 
-    let box_dir = std::fs::read_dir(state.join("sessions"))
-        .expect("the daemon's sessions dir")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|dir| {
-            std::fs::read_to_string(dir.join("record.json"))
-                .is_ok_and(|record| record.contains(&id.to_string()))
-        })
-        .expect("the box's state dir");
+    let box_dir = box_state_dir(state, id);
     let record: boxes::Record =
         serde_json_lenient::from_slice(&std::fs::read(box_dir.join("record.json")).unwrap())
             .expect("the box's record");
@@ -13889,7 +13913,7 @@ async fn resume_non_pty_box_exit2_hint_by_lifetime() {
         .create_with(
             "agent",
             resume_spec(false, Some("until_stopped")),
-            CreatingVerb::Session,
+            CreatingVerb::Task,
         )
         .await;
     let job = alpha
@@ -13932,10 +13956,10 @@ async fn resume_non_pty_box_exit2_hint_by_lifetime() {
 #[tokio::test]
 async fn session_attach_is_box_attach_filtered_to_sessions() {
     use minimald_rpc::CreatingVerb;
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
     let dev = alpha.create("dev", None).await;
     let build = alpha
-        .create_with("build", resume_spec(true, None), CreatingVerb::Task)
+        .create_stored(&state, "build", resume_spec(true, None), CreatingVerb::Task)
         .await;
     let hosts = [alpha.host.clone()];
 
@@ -13980,8 +14004,15 @@ async fn session_attach_is_box_attach_filtered_to_sessions() {
 /// hint by lifetime once it stopped.
 #[tokio::test]
 async fn session_attach_non_pty_reports_box_attach_refusal() {
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
-    alpha.create("worker", Some(false)).await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    alpha
+        .create_stored(
+            &state,
+            "worker",
+            resume_spec(false, None),
+            minimald_rpc::CreatingVerb::Session,
+        )
+        .await;
     let hosts = [alpha.host.clone()];
 
     let running = refused_by(AttachVerb::BoxAttach, &hosts, Some("worker"), None).await;
@@ -14020,9 +14051,9 @@ async fn session_attach_non_pty_reports_box_attach_refusal() {
 #[tokio::test]
 async fn session_attach_without_address_picks_project_else_sole() {
     use minimald_rpc::CreatingVerb;
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
     let build = alpha
-        .create_with("build", resume_spec(true, None), CreatingVerb::Task)
+        .create_stored(&state, "build", resume_spec(true, None), CreatingVerb::Task)
         .await;
     let dev = alpha.create("dev", Some(true)).await;
     let hosts = [alpha.host.clone()];
@@ -14050,11 +14081,11 @@ async fn session_attach_without_address_picks_project_else_sole() {
 #[tokio::test]
 async fn session_attach_without_address_ambiguous_exit2_lists() {
     use minimald_rpc::CreatingVerb;
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
     let web = alpha.create("web", Some(true)).await;
     let api = alpha.create("api", None).await;
     alpha
-        .create_with("build", resume_spec(true, None), CreatingVerb::Task)
+        .create_stored(&state, "build", resume_spec(true, None), CreatingVerb::Task)
         .await;
     let hosts = [alpha.host.clone()];
 
@@ -15755,12 +15786,19 @@ async fn box_wait_exec_returns_exec_code() {
 #[tokio::test]
 async fn session_attach_without_address_none_exit4_hints_start() {
     use minimald_rpc::CreatingVerb;
-    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
     // A task box with a terminal, and a session with none.
     alpha
-        .create_with("build", resume_spec(true, None), CreatingVerb::Task)
+        .create_stored(&state, "build", resume_spec(true, None), CreatingVerb::Task)
         .await;
-    alpha.create("worker", Some(false)).await;
+    alpha
+        .create_stored(
+            &state,
+            "worker",
+            resume_spec(false, None),
+            CreatingVerb::Session,
+        )
+        .await;
     let hosts = [alpha.host.clone()];
 
     let (message, code) = refused_by(
@@ -18228,7 +18266,7 @@ async fn start_attach_resume_end_to_end() {
         .create_with(
             "agent",
             resume_spec(false, Some("until_stopped")),
-            CreatingVerb::Session,
+            CreatingVerb::Task,
         )
         .await;
     alpha
