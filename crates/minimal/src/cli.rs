@@ -564,6 +564,11 @@ pub struct BoxLogsArgs {
     /// writes it, until the box is removed or the command is interrupted
     #[arg(short = 'f', long)]
     pub follow: bool,
+    /// Show a terminal box's output byte for byte, with its terminal
+    /// control codes. Without `--raw`, output that does not go to a
+    /// terminal has them removed
+    #[arg(long)]
+    pub raw: bool,
 }
 
 // BCLI-012, BCLI-056: `min box logs <box> [-f | --exec <id>]`. Only the box

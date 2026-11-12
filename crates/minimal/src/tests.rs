@@ -13063,6 +13063,7 @@ async fn type_noun_logs_follow() {
         let once = BoxLogsArgs {
             target: target.to_owned(),
             follow: false,
+            raw: false,
         };
         let mut out = Vec::new();
         box_logs_on_hosts(
@@ -13070,6 +13071,7 @@ async fn type_noun_logs_follow() {
             &once,
             box_type,
             verb,
+            false,
             &mut out,
         )
         .await
@@ -13087,12 +13089,14 @@ async fn type_noun_logs_follow() {
         let other = BoxLogsArgs {
             target: target.to_owned(),
             follow: false,
+            raw: false,
         };
         box_logs_on_hosts(
             local_hosts(&global).unwrap(),
             &other,
             Some(box_type),
             verb,
+            false,
             &mut out,
         )
         .await
@@ -13110,6 +13114,7 @@ async fn type_noun_logs_follow() {
                     args,
                     *box_type,
                     verb,
+                    false,
                     &mut out,
                 )
                 .await
@@ -13153,17 +13158,147 @@ async fn type_noun_logs_follow() {
     let gone = BoxLogsArgs {
         target: "web".to_owned(),
         follow: false,
+        raw: false,
     };
     box_logs_on_hosts(
         local_hosts(&global).unwrap(),
         &gone,
         None,
         "box logs",
+        false,
         &mut out,
     )
     .await
     .expect_err("the removed box has no output to read");
     assert!(out.is_empty());
+}
+
+/// What a terminal box writes: a bracketed-paste switch, a window title
+/// (OSC ended by BEL), colour (CSI), a DCS string ended by ST, a charset
+/// switch, a bare BEL, and UTF-8 text.
+const PTY_TRANSCRIPT: &[u8] = b"\x1b[?2004h\x1b]0;user@web: ~\x07\x1b[1;32mgreen\x1b[0m text\r\n\
+\x1bPq#0\x1b\\\x1b(Bdone\x07\r\n\xc3\xa9t\xc3\xa9\r\n";
+
+/// [`PTY_TRANSCRIPT`] with the control sequences removed.
+const PTY_TEXT: &str = "green text\r\ndone\r\n\u{e9}t\u{e9}\r\n";
+
+/// Reads the output of box `target` as the logs verb does, with `raw` and
+/// `stdout_is_terminal` as given.
+async fn read_box_logs(
+    global: &GlobalArgs,
+    target: &str,
+    raw: bool,
+    stdout_is_terminal: bool,
+) -> Vec<u8> {
+    let args = BoxLogsArgs {
+        target: target.to_owned(),
+        follow: false,
+        raw,
+    };
+    let mut out = Vec::new();
+    box_logs_on_hosts(
+        local_hosts(global).unwrap(),
+        &args,
+        None,
+        "box logs",
+        stdout_is_terminal,
+        &mut out,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("`min box logs {target}` reads the output: {e:#}"));
+    out
+}
+
+// BCLI-012 (T45): `min box logs <pty box> | cat` gets the transcript text
+// with no terminal control sequences. A box with no terminal gets its
+// bytes unchanged, and so does a stdout that is a terminal.
+#[tokio::test]
+async fn box_logs_piped_pty_transcript_has_no_control_codes() {
+    // The stripper keeps its state across chunks, so a sequence split
+    // between two output chunks is still removed whole.
+    for split in 0..=PTY_TRANSCRIPT.len() {
+        let mut strip = ControlStripper::default();
+        let mut text = Vec::new();
+        strip.strip(&PTY_TRANSCRIPT[..split], &mut text);
+        strip.strip(&PTY_TRANSCRIPT[split..], &mut text);
+        assert_eq!(String::from_utf8_lossy(&text), PTY_TEXT, "split at {split}");
+    }
+    // A sequence the stream ends inside writes nothing.
+    let mut text = Vec::new();
+    ControlStripper::default().strip(b"end\x1b]0;tit", &mut text);
+    assert_eq!(text, b"end");
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let web = create_attach_box(&mut daemon, "web", project.path(), Some(true)).await;
+    let plain = create_attach_box(&mut daemon, "plain", project.path(), Some(false)).await;
+    append_box_output(&box_store_dir(&state_path, web), PTY_TRANSCRIPT);
+    append_box_output(&box_store_dir(&state_path, plain), PTY_TRANSCRIPT);
+
+    let piped = read_box_logs(&global, "web", false, false).await;
+    assert_eq!(String::from_utf8_lossy(&piped), PTY_TEXT);
+    assert!(
+        !piped.iter().any(|b| *b == 0x1b || *b == 0x07),
+        "no ESC or BEL in {piped:?}"
+    );
+
+    // A terminal gets the raw stream.
+    let terminal = read_box_logs(&global, "web", false, true).await;
+    assert_eq!(terminal, PTY_TRANSCRIPT);
+
+    // A box with no terminal writes its bytes as they are.
+    let plain_piped = read_box_logs(&global, "plain", false, false).await;
+    assert_eq!(plain_piped, PTY_TRANSCRIPT);
+}
+
+// BCLI-012 (T45): `--raw` writes a terminal box's transcript unchanged,
+// with its control sequences, to a stdout that is not a terminal. Each
+// logs noun takes the flag.
+#[tokio::test]
+async fn box_logs_raw_keeps_control_codes() {
+    use clap::Parser as _;
+
+    for noun in ["session", "task", "box"] {
+        let cli = Cli::try_parse_from(["min", noun, "logs", "web", "--raw"])
+            .unwrap_or_else(|e| panic!("`min {noun} logs web --raw` parses: {e}"));
+        let raw = match cli.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Logs(args),
+            }))
+            | Some(Command::Task(TaskArgs {
+                command: TaskCommand::Logs(args),
+            })) => args.raw,
+            Some(Command::Box(BoxArgs {
+                command: BoxCommand::Logs(args),
+            })) => args.logs.raw,
+            _ => panic!("expected `min {noun} logs`"),
+        };
+        assert!(raw, "`min {noun} logs --raw` sets raw");
+    }
+    let cli = Cli::try_parse_from(["min", "box", "logs", "web"]).expect("parses");
+    let Some(Command::Box(BoxArgs {
+        command: BoxCommand::Logs(args),
+    })) = cli.command
+    else {
+        panic!("expected `min box logs`");
+    };
+    assert!(!args.logs.raw, "raw is off by default");
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let web = create_attach_box(&mut daemon, "web", project.path(), Some(true)).await;
+    append_box_output(&box_store_dir(&state_path, web), PTY_TRANSCRIPT);
+
+    let raw = read_box_logs(&global, "web", true, false).await;
+    assert_eq!(raw, PTY_TRANSCRIPT);
 }
 
 /// Drives the create flow of `create_configured_session` with the task
@@ -15755,6 +15890,7 @@ async fn task_run_logs_wait_list_end_to_end() {
         let follow_args = BoxLogsArgs {
             target: "check".to_owned(),
             follow: true,
+            raw: false,
         };
         let followed = SharedOut::default();
         let follow = {
@@ -15767,6 +15903,7 @@ async fn task_run_logs_wait_list_end_to_end() {
                     args,
                     Some(boxes::TASK_BOX_TYPE),
                     "task logs",
+                    false,
                     &mut out,
                 )
                 .await
