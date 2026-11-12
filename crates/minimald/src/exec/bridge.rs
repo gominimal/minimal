@@ -2156,6 +2156,28 @@ fn detached_notice(id: &ExecId) -> String {
     format!("\r\nDetached from exec {id}. It keeps running.\r\n")
 }
 
+/// Writes `bytes` to the client of the exec attach `id`, for at most
+/// [`EXIT_NOTICE_BOUND`]. A client that does not read, or a write that
+/// fails, skips the bytes: the caller goes on without them.
+async fn write_bounded<W>(out: &mut W, bytes: &[u8], id: &ExecId)
+where
+    W: AsyncWrite + Unpin,
+{
+    let write = async {
+        out.write_all(bytes).await?;
+        out.flush().await
+    };
+    match tokio::time::timeout(EXIT_NOTICE_BOUND, write).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(exec_id = %id, %error, "exec: a key notice to the attached client failed");
+        }
+        Err(_) => {
+            tracing::debug!(exec_id = %id, "exec: the attached client did not read a key notice");
+        }
+    }
+}
+
 /// Resumes a tty exec's terminal for one client: the transcript so far,
 /// then what the terminal writes, while what the client types goes to the
 /// terminal. Returns when the exec ends or the client goes away. The exec
@@ -2246,8 +2268,7 @@ where
                                 // The bell goes to the client, never to the
                                 // terminal, as on a box's own terminal.
                                 if matcher.keys().bell_on_leader {
-                                    out.write_all(b"\x07").await?;
-                                    out.flush().await?;
+                                    write_bounded(out, b"\x07", &entry.id).await;
                                 }
                             }
                             FeedOutcome::Action(KeyAction::Detach) => {
@@ -2263,8 +2284,9 @@ where
                         entry.send_input(&forward);
                     }
                     if detach {
-                        out.write_all(detached_notice(&entry.id).as_bytes()).await?;
-                        out.flush().await?;
+                        // The detach keys are how a person leaves a stalled
+                        // attach, so the notice never holds the detach.
+                        write_bounded(out, detached_notice(&entry.id).as_bytes(), &entry.id).await;
                         return Ok(AttachEnd::Detached);
                     }
                     // A chunk that leaves a chord prefix held (a lone `ESC`)
@@ -2717,5 +2739,36 @@ mod detach_tests {
             .unwrap()
             .unwrap();
         assert_eq!(status, Some(3), "the second attach ends with the exec");
+    }
+
+    /// BCLI-068: the detach keys end an exec attach whose client does not
+    /// read. The notice waits at most its bound, and the channel still ends
+    /// with status 0 while the exec runs on.
+    #[tokio::test(start_paused = true)]
+    async fn serve_exec_attach_detach_key_ends_channel_exec_runs_for_a_client_that_does_not_read() {
+        let session = crate::box_actor::WeakBoxHandle::answering(Vec::new())
+            .upgrade()
+            .expect("the stand-in actor lives");
+        session.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+        let dir = tempfile::tempdir().unwrap();
+        let (entry, _terminal_input) = live_tty_entry(&dir);
+        let keys = boxes::keys::SessionKeys::default();
+
+        let (tx, msgs) = msg_stream();
+        // One byte of room, and the client never reads it.
+        let (_client, mut server) = tokio::io::duplex(1);
+        let attach = crate::traced::spawn({
+            let entry = Arc::clone(&entry);
+            let session = session.clone();
+            async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
+        });
+        tx.send(typed(b"\x1dd")).unwrap();
+        let status = tokio::time::timeout(EXIT_NOTICE_BOUND * 4, attach)
+            .await
+            .expect("the detach ends the attach")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(0), "a detach ends the channel with status 0");
+        assert!(entry.exit.borrow().is_none(), "the exec keeps running");
     }
 }
