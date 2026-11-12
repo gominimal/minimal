@@ -13282,7 +13282,8 @@ async fn task_list_shows_exited_until_pruned() {
     // A listing of another project does not show the task.
     assert_eq!(
         list(Some("/another/project")).await,
-        format!("{}\n", crate::cmd::EMPTY_PROJECT_LIST)
+        "This project has no task boxes. Run `min task list --all` to list the task boxes \
+         of every project.\n"
     );
 
     // The exited task stays until a prune removes it.
@@ -13296,10 +13297,7 @@ async fn task_list_shows_exited_until_pruned() {
     )
     .await
     .expect("the prune");
-    assert_eq!(
-        list(None).await,
-        format!("{}\n", crate::cmd::EMPTY_HOST_LIST)
-    );
+    assert_eq!(list(None).await, "No task boxes on this machine.\n");
 }
 
 /// The typed listing of `min session list` and `min task list` over the
@@ -15896,7 +15894,7 @@ async fn task_run_logs_wait_list_end_to_end() {
             prune.unwrap_or_else(|e| panic!("the prune: {e:#}\n{ran}"));
             assert_eq!(
                 list(ran).await,
-                format!("{}\n", crate::cmd::EMPTY_HOST_LIST),
+                "No task boxes on this machine.\n",
                 "the prune removes the task\n{ran}"
             );
         };

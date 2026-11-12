@@ -906,9 +906,31 @@ pub(crate) async fn typed_box_list_on_hosts(
     let mut out = out;
     match output {
         Some(BoxListOutputFormat::Json) => render_box_list_json(&mut out, &listed)?,
+        None if listed.is_empty() => {
+            writeln!(
+                out,
+                "{}",
+                empty_typed_list(box_type, project_root.is_some())
+            )?;
+        }
         None => render_box_list(&mut out, &listed, project_root.is_some())?,
     }
     Ok(())
+}
+
+/// The line a typed listing prints when no box of `box_type` matches: for
+/// the current project when `scoped`, else for the local hosts. It names
+/// the type, so a project with boxes of another type does not read as
+/// empty.
+pub(crate) fn empty_typed_list(box_type: &str, scoped: bool) -> String {
+    if scoped {
+        format!(
+            "This project has no {box_type} boxes. \
+             Run `min {box_type} list --all` to list the {box_type} boxes of every project."
+        )
+    } else {
+        format!("No {box_type} boxes on this machine.")
+    }
 }
 
 /// Resolves the address `address` over `hosts` among the boxes of
