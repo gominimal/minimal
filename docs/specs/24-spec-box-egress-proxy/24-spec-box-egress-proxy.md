@@ -259,14 +259,14 @@ Steering and the interception CA
     verify: cargo nextest run -p bep root_recertified_under_same_key_and_subject
     <!-- Gatehouse §6.10: re-certification is not rotation; a running box keeps validating the names its root already permitted and reaches an added authority once re-created; the certificates below the root carry a key-identifier-only authority key identifier, so they chain to either issue of it -->
 
-- **BEP-014** WHILE the proxy is a release build, other than a Linux proxy that holds the key in Secret Service, THE SYSTEM SHALL hold the signing CA private key in the host's hardware key store as a non-exportable key and write no copy of it that another machine can load.
+- **BEP-014** WHILE the proxy is a release build THE SYSTEM SHALL hold the signing CA private key, unless a Linux proxy holds that key in Secret Service, in the host's hardware key store as a non-exportable key and write no copy of it that another machine can load.
   tier:     T0
   verify:   cargo nextest run -p bep signing_key_is_non_exportable_and_has_no_file
   <!-- the hardware key store is the Secure Enclave on macOS and TPM 2.0 on Linux (BEP-088); a TPM key's wrapped blob on disk is a file, but only the TPM that made it can load it, so it is not a copy another machine can load; a Linux host with no usable TPM holds software keys in Secret Service, the one exception (BEP-088, BEP-090); a macOS release build has no exception: it holds its keys in the Secure Enclave, and `bep::keys::custody` refuses an exportable key in a release build, so a release build never runs on login-keychain keys -->
 
   <!-- a debug build keeps an exportable key, and writes a warning for each role at each start: the macOS login keychain lets the process that made a key export it although `kSecAttrIsExtractable` is false (the probe on #2436), and the keychain that enforces it needs an entitlement that only a Developer ID signature carries, so a debug build would never start on a developer's Mac; decided 2026-10-31, this note is the record, and the architecture's key-custody rule stays as it is; `bep::keys::custody` is the one decision, at the keychain's generation, at `bep::keys::load` for a stored sealing key, and at the CA's key check for the root and signing keys -->
 
-- **BEP-059** WHILE the proxy is a release build, other than a Linux proxy that holds the keys in Secret Service, THE SYSTEM SHALL generate the proxy's sealing key and the root CA key non-exportable in the host's hardware key store, hold them there across proxy restarts, and write no copy of them that another machine can load.
+- **BEP-059** WHILE the proxy is a release build THE SYSTEM SHALL generate each of the proxy's sealing key and root CA key, unless a Linux proxy holds that key in Secret Service, non-exportable in the host's hardware key store, hold it there across proxy restarts, and write no copy of it that another machine can load.
   tier:     T0
   verify:   cargo nextest run -p bep sealing_and_root_keys_persist_non_exportable
   <!-- Gatehouse §6.10 un-enrolled lifecycle and the hardware-backed custody bullet -->
@@ -322,10 +322,14 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p bep an_unreachable_secret_service_refuses_start
     <!-- unwanted; distinct from a locked keyring, because unlocking does not help when no session bus or keyring daemon runs, as in a plain SSH session; the keys still exist, so the remedy is where the proxy starts, never `bep --replace-key` -->
-  - IF a proxy key is in a TPM and the TPM cannot load it THEN THE SYSTEM SHALL refuse to start, report that the TPM cannot load the key of that role, and name `bep --replace-key <role>` with that role.
+  - IF a proxy key is in a TPM and the TPM cannot be reached THEN THE SYSTEM SHALL refuse to start, report that the TPM cannot be reached, and not name `bep --replace-key`.
+    tier:   T0
+    verify: cargo nextest run -p bep an_unreachable_tpm_refuses_start_and_keeps_the_key
+    <!-- unwanted; a TPM that is disabled in firmware, not yet ready, or whose device the proxy's user cannot open, can come back with the key intact, so replacing it would throw away a key that still works; the proxy never generates the key again by itself and never falls back to Secret Service (BEP-089) -->
+  - IF a proxy key is in a TPM and the TPM refuses to load it THEN THE SYSTEM SHALL refuse to start, report that this TPM no longer holds the key of that role, and name `bep --replace-key <role>` with that role.
     tier:   T0
     verify: cargo nextest run -p bep a_tpm_key_the_tpm_cannot_load_refuses_start
-    <!-- unwanted; a TPM that is missing, cleared or replaced cannot load the blob, and the key is then lost, so replacement is the remedy, as BEP-060's refusal names it; the proxy never generates the key again by itself and never falls back to Secret Service (BEP-089); a `noDA` key is not refused by dictionary-attack lockout, so lockout is not this case -->
+    <!-- unwanted; a TPM that answers but cannot load the blob was cleared or is another TPM, and the key is then lost, so replacement is the remedy, as BEP-060's refusal names it; a `noDA` key is not refused by dictionary-attack lockout, so lockout is not this case -->
 
 - **BEP-090** WHILE the proxy holds a key in Secret Service THE SYSTEM SHALL report on `min auth status` that key's role and that it is a software key, which a program running as the operator's user can copy.
   tier:     T0
@@ -1180,8 +1184,8 @@ Secret Service (BEP-088).
 
 We did not choose a refusal to start without a TPM. The architecture asks for
 hardware custody only where the host offers it, and many developer machines
-and VMs have no TPM. The cost is that BEP-014 and BEP-059 do not hold on such a
-host, and BEP-090 reports it. The proxy chooses the store when it generates a
+and VMs have no TPM. The cost is that BEP-014 and BEP-059 do not hold for a key in
+Secret Service, and BEP-090 reports each such key. The proxy chooses the store when it generates a
 key, and never at a start (BEP-089). A key in another store is a replacement.
 
 A TPM key is a blob in a file that only that TPM can load. We did not choose
