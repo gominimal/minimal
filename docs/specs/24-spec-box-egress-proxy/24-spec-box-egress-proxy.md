@@ -259,14 +259,14 @@ Steering and the interception CA
     verify: cargo nextest run -p bep root_recertified_under_same_key_and_subject
     <!-- Gatehouse §6.10: re-certification is not rotation; a running box keeps validating the names its root already permitted and reaches an added authority once re-created; the certificates below the root carry a key-identifier-only authority key identifier, so they chain to either issue of it -->
 
-- **BEP-014** WHILE the proxy is a release build THE SYSTEM SHALL hold the signing CA private key, unless a Linux proxy holds that key in Secret Service, in the host's hardware key store as a non-exportable key and write no copy of it that another machine can load.
+- **BEP-014** WHILE the proxy is a release build and the signing CA key is not in Secret Service THE SYSTEM SHALL hold the signing CA private key in the host's hardware key store as a non-exportable key and write no copy of it that another machine can load.
   tier:     T0
   verify:   cargo nextest run -p bep signing_key_is_non_exportable_and_has_no_file
   <!-- the hardware key store is the Secure Enclave on macOS and TPM 2.0 on Linux (BEP-088); a TPM key's wrapped blob on disk is a file, but only the TPM that made it can load it, so it is not a copy another machine can load; a Linux host with no usable TPM holds software keys in Secret Service, the one exception (BEP-088, BEP-090); a macOS release build has no exception: it holds its keys in the Secure Enclave, and `bep::keys::custody` refuses an exportable key in a release build, so a release build never runs on login-keychain keys -->
 
   <!-- a debug build keeps an exportable key, and writes a warning for each role at each start: the macOS login keychain lets the process that made a key export it although `kSecAttrIsExtractable` is false (the probe on #2436), and the keychain that enforces it needs an entitlement that only a Developer ID signature carries, so a debug build would never start on a developer's Mac; decided 2026-10-31, this note is the record, and the architecture's key-custody rule stays as it is; `bep::keys::custody` is the one decision, at the keychain's generation, at `bep::keys::load` for a stored sealing key, and at the CA's key check for the root and signing keys -->
 
-- **BEP-059** WHILE the proxy is a release build THE SYSTEM SHALL generate each of the proxy's sealing key and root CA key, unless a Linux proxy holds that key in Secret Service, non-exportable in the host's hardware key store, hold it there across proxy restarts, and write no copy of it that another machine can load.
+- **BEP-059** WHILE the proxy is a release build THE SYSTEM SHALL generate in the host's hardware key store, as a non-exportable key, each of the sealing key and the root CA key that it does not generate in Secret Service, hold that key there across proxy restarts, and write no copy of it that another machine can load.
   tier:     T0
   verify:   cargo nextest run -p bep sealing_and_root_keys_persist_non_exportable
   <!-- Gatehouse §6.10 un-enrolled lifecycle and the hardware-backed custody bullet -->
@@ -333,7 +333,7 @@ Steering and the interception CA
   - IF the proxy holds a key for one role and its store holds no key for another role THEN THE SYSTEM SHALL refuse to start, report that the store no longer holds the key of that role, and name `bep --replace-key <role>` with that role.
     tier:   T0
     verify: cargo nextest run -p bep a_missing_role_key_refuses_start_and_names_replacement
-    <!-- unwanted; an unlocked, reachable keyring with no entry for a role, or a TPM key directory with no file for it, while another role's key is held, is a lost key and never a first start, so the proxy never generates it at start (BEP-060); only a host that holds no key for any role is a first start -->
+    <!-- unwanted; an unlocked, reachable keyring with no entry for a role, or a TPM key directory with no file for it, while another role's key is held, is a lost key and never a first start, so the proxy never generates it at start (BEP-060); only a host that holds no key for any role is a first start; a first start stopped between two generations leaves this state too, and its way forward is the named command: `bep --replace-key <role>` generates the missing role's key alone and keeps the key already made, and no box holds a value sealed to either, because the proxy publishes its identity (BEP-072) only after every key exists -->
 
 - **BEP-090** WHILE the proxy holds a key in Secret Service THE SYSTEM SHALL report on `min auth status` that key's role and that it is a software key, which a program running as the operator's user can copy.
   tier:     T0
