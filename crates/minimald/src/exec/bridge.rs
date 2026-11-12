@@ -2661,7 +2661,7 @@ mod detach_tests {
         // First attach: `ab`, then Ctrl-] d.
         let (tx, msgs) = msg_stream();
         let (mut client, mut server) = tokio::io::duplex(1 << 16);
-        let first = tokio::spawn({
+        let first = crate::traced::spawn({
             let entry = Arc::clone(&entry);
             let session = session.clone();
             async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
@@ -2694,7 +2694,7 @@ mod detach_tests {
         // Second attach: it takes input, and ends with the exec.
         let (tx, msgs) = msg_stream();
         let (_client, mut server) = tokio::io::duplex(1 << 16);
-        let second = tokio::spawn({
+        let second = crate::traced::spawn({
             let entry = Arc::clone(&entry);
             let session = session.clone();
             async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
