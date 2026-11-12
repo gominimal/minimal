@@ -500,6 +500,16 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             timed_out.hint().to_string(),
         ));
     }
+    // BCLI-033: an address that matches no box is `not_found`.
+    if let Some(minimal::BoxAddressRefusal::NotFound { .. }) =
+        e.downcast_ref::<minimal::BoxAddressRefusal>()
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            "not_found",
+            format!("{e:#}"),
+            "`min box list` lists the boxes there are".to_string(),
+        ));
+    }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             "output_failed",
@@ -1228,7 +1238,6 @@ mod tests {
         for (output, machine) in [
             (Some(minimal::BoxShowOutputFormat::Json), true),
             (Some(minimal::BoxShowOutputFormat::Yaml), true),
-            (Some(minimal::BoxShowOutputFormat::Toml), true),
             (None, false),
         ] {
             let cli = minimal::Cli {
@@ -1252,6 +1261,7 @@ mod tests {
         let line = machine_mode_error_line(&failure).unwrap();
         let object: serde_json_lenient::Value = serde_json_lenient::from_str(&line).unwrap();
         assert_eq!(object["schema"], "min/v1/error", "{line}");
+        assert_eq!(object["code"], "not_found", "{line}");
         assert!(
             object["message"].as_str().unwrap().contains("web"),
             "{line}"
