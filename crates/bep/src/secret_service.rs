@@ -1,0 +1,475 @@
+//! The Secret Service key store, for a Linux host with no usable TPM
+//! (BEP-088, BEP-089).
+//!
+//! [`SecretService`] generates each proxy key as a software P-256 key and
+//! holds its private half in Secret Service through `secret-tool`, as
+//! [`signin`](crate::signin) holds the sign-in. Each item has one attribute,
+//! `service`, whose value is the role's label in its slot (see
+//! [`Role::slot_label`]). Secret Service holds no key non-exportable and
+//! has no control per program, so a program running as the proxy's user can
+//! read these keys.
+//!
+//! A locked keyring and a Secret Service that this session cannot reach are
+//! [`KeyError::Locked`] and [`KeyError::Unreachable`]. Neither removes or
+//! replaces a key: the keys still exist, and the start refuses until the
+//! operator unlocks the keyring or starts the proxy from the desktop
+//! session.
+
+use std::ffi::OsString;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+
+use base64::Engine as _;
+use p256::{PublicKey, SecretKey};
+use zeroize::Zeroizing;
+
+use crate::keys::{HeldKey, KeyError, KeyStore, Role, Slot, missing_in};
+use crate::seal::ProxyPublicKey;
+
+/// The program that talks to Secret Service.
+pub const SECRET_TOOL: &str = "secret-tool";
+
+/// The one attribute of each item. Its value is the role's slot label.
+const ATTRIBUTE: &str = "service";
+
+/// The store name in the log lines.
+const STORE: &str = "secret-service";
+
+/// Parts of `secret-tool`'s error output that say the keyring is locked.
+const LOCKED: &[&str] = &["locked"];
+
+/// Parts of `secret-tool`'s error output that say this session has no
+/// Secret Service: no session bus, or no keyring daemon on it.
+const UNREACHABLE: &[&str] = &[
+    "d-bus",
+    "dbus",
+    "could not connect",
+    "org.freedesktop.secrets",
+    "serviceunknown",
+    "not provided by any",
+    "autolaunch",
+    "no such file or directory",
+    "connection refused",
+    "message bus",
+];
+
+/// The proxy's keys in Secret Service.
+#[derive(Debug, Clone)]
+pub struct SecretService {
+    program: PathBuf,
+    leading: Vec<OsString>,
+}
+
+impl Default for SecretService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SecretService {
+    /// The store that runs `secret-tool` from `PATH`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_program(SECRET_TOOL, Vec::<OsString>::new())
+    }
+
+    /// The store that runs `program` with `leading` before each
+    /// `secret-tool` argument list. A test gives it a fake `secret-tool`.
+    #[must_use]
+    pub fn with_program(
+        program: impl Into<PathBuf>,
+        leading: impl IntoIterator<Item = impl Into<OsString>>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            leading: leading.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    fn run(&self, role: Role, args: &[&str], stdin: Option<&[u8]>) -> Result<Output, KeyError> {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.leading)
+            .args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|err| KeyError::Store {
+            role,
+            detail: if err.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "`{SECRET_TOOL}` is not installed. Install it (the `libsecret-tools` package on Debian and Ubuntu, `libsecret` on Fedora and Arch)"
+                )
+            } else {
+                format!("`{SECRET_TOOL}` did not run: {err}")
+            },
+        })?;
+        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            pipe.write_all(input).map_err(|err| KeyError::Store {
+                role,
+                detail: format!("`{SECRET_TOOL}` did not read the key: {err}"),
+            })?;
+        }
+        child.wait_with_output().map_err(|err| KeyError::Store {
+            role,
+            detail: format!("`{SECRET_TOOL}` did not finish: {err}"),
+        })
+    }
+
+    /// The private half held for `role` in `slot`, or `None`.
+    fn lookup(&self, role: Role, slot: Slot) -> Result<Option<SecretKey>, KeyError> {
+        let label = role.slot_label(slot);
+        let out = self.run(role, &["lookup", ATTRIBUTE, &label], None)?;
+        let stdout = Zeroizing::new(out.stdout);
+        if !out.status.success() {
+            // `secret-tool lookup` exits 1 with no output when no item
+            // matches.
+            if out.stderr.iter().all(u8::is_ascii_whitespace) {
+                return Ok(None);
+            }
+            return Err(failure(role, &out.stderr));
+        }
+        let text = std::str::from_utf8(&stdout).map_err(|_| unreadable(role))?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let bytes = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(|_| unreadable(role))?,
+        );
+        SecretKey::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| unreadable(role))
+    }
+
+    /// Holds `secret` for `role` in `slot`, in place of any key there.
+    fn store(&self, role: Role, slot: Slot, secret: &SecretKey) -> Result<(), KeyError> {
+        let label = role.slot_label(slot);
+        let bytes = Zeroizing::new(secret.to_bytes().to_vec());
+        let encoded =
+            Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(bytes.as_slice()));
+        let label_arg = format!("--label={label}");
+        let out = self.run(
+            role,
+            &["store", &label_arg, ATTRIBUTE, &label],
+            Some(encoded.as_bytes()),
+        )?;
+        if !out.status.success() {
+            return Err(failure(role, &out.stderr));
+        }
+        Ok(())
+    }
+
+    /// Removes the item for `role` in `slot`. An empty slot is not an error.
+    fn clear(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
+        let label = role.slot_label(slot);
+        let out = self.run(role, &["clear", ATTRIBUTE, &label], None)?;
+        if !out.status.success() && !out.stderr.iter().all(u8::is_ascii_whitespace) {
+            return Err(failure(role, &out.stderr));
+        }
+        Ok(())
+    }
+}
+
+/// The error for a `secret-tool` run that failed with `stderr`.
+fn failure(role: Role, stderr: &[u8]) -> KeyError {
+    let detail = String::from_utf8_lossy(stderr).trim().to_owned();
+    let lower = detail.to_ascii_lowercase();
+    if LOCKED.iter().any(|part| lower.contains(part)) {
+        KeyError::Locked { role, detail }
+    } else if UNREACHABLE.iter().any(|part| lower.contains(part)) {
+        KeyError::Unreachable { role, detail }
+    } else {
+        KeyError::Store { role, detail }
+    }
+}
+
+fn unreadable(role: Role) -> KeyError {
+    KeyError::Store {
+        role,
+        detail: "Secret Service holds an item for this key that is not a P-256 private key".into(),
+    }
+}
+
+fn random_secret() -> Result<SecretKey, getrandom::Error> {
+    loop {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        getrandom::fill(bytes.as_mut())?;
+        if let Ok(secret) = SecretKey::from_slice(bytes.as_ref()) {
+            return Ok(secret);
+        }
+    }
+}
+
+/// A software key that Secret Service holds. The private half is in this
+/// process's memory while the proxy runs, and zeroed on drop.
+pub struct SecretServiceKey {
+    role: Role,
+    secret: SecretKey,
+}
+
+impl std::fmt::Debug for SecretServiceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretServiceKey")
+            .field("role", &self.role)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HeldKey for SecretServiceKey {
+    fn role(&self) -> Role {
+        self.role
+    }
+
+    fn public(&self) -> ProxyPublicKey {
+        ProxyPublicKey::from_sec1_bytes(&self.secret.public_key().to_sec1_bytes())
+            .expect("a P-256 public key")
+    }
+
+    /// `false`: the custody rule of [`custody`](crate::keys::custody) is
+    /// the keychain's export flag. A Secret Service key is a software key
+    /// by design (BEP-088), and the proxy reports it as such (BEP-090).
+    fn exportable(&self) -> bool {
+        false
+    }
+
+    fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        let peer =
+            PublicKey::from_sec1_bytes(&peer.to_sec1_bytes()).map_err(|_| KeyError::Store {
+                role: self.role,
+                detail: "the peer key is not a P-256 point".into(),
+            })?;
+        let shared = p256::ecdh::diffie_hellman(self.secret.to_nonzero_scalar(), peer.as_affine());
+        Ok(Zeroizing::new(shared.raw_secret_bytes().to_vec()))
+    }
+
+    /// The key was read from Secret Service when the store found it, so a
+    /// locked or unreachable keyring refused the start there.
+    fn probe(&self) -> Result<(), KeyError> {
+        Ok(())
+    }
+}
+
+impl crate::ca::CaKey for SecretServiceKey {
+    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyError> {
+        use p256::ecdsa::signature::Signer as _;
+        let signature: p256::ecdsa::Signature =
+            p256::ecdsa::SigningKey::from(&self.secret).sign(msg);
+        Ok(signature.to_der().as_bytes().to_vec())
+    }
+}
+
+impl KeyStore for SecretService {
+    type Key = SecretServiceKey;
+
+    fn find(&self, role: Role) -> Result<Option<SecretServiceKey>, KeyError> {
+        let Some(secret) = self.lookup(role, Slot::Held)? else {
+            return Ok(None);
+        };
+        let key = SecretServiceKey { role, secret };
+        tracing::info!(role = %role, fingerprint = %key.public().kid(), store = STORE, "loaded a proxy key");
+        Ok(Some(key))
+    }
+
+    fn generate_in(&self, role: Role, slot: Slot) -> Result<SecretServiceKey, KeyError> {
+        let secret = random_secret().map_err(|err| KeyError::Store {
+            role,
+            detail: format!("the random source failed: {err}"),
+        })?;
+        self.store(role, slot, &secret)?;
+        let key = SecretServiceKey { role, secret };
+        tracing::info!(role = %role, fingerprint = %key.public().kid(), store = STORE, "generated a proxy key");
+        Ok(key)
+    }
+
+    fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
+        self.clear(role, slot)
+    }
+
+    fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+        self.lookup(role, slot).map(|secret| secret.is_some())
+    }
+
+    fn kid_in(&self, role: Role, slot: Slot) -> Result<Option<String>, KeyError> {
+        Ok(self.lookup(role, slot)?.map(|secret| {
+            ProxyPublicKey::from_sec1_bytes(&secret.public_key().to_sec1_bytes())
+                .expect("a P-256 public key")
+                .kid()
+        }))
+    }
+
+    fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
+        let Some(secret) = self.lookup(role, from)? else {
+            return if from == Slot::Held {
+                Ok(())
+            } else {
+                Err(missing_in(role, from))
+            };
+        };
+        // Write the key in `to` first, so a failure leaves it in `from`.
+        self.store(role, to, &secret)?;
+        self.clear(role, from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::keys::{StartError, load};
+
+    /// A fake `secret-tool` that keeps each item in a file under `dir`. A
+    /// `locked` or `unreachable` file in `dir` makes every call fail as
+    /// the real tool does in that state.
+    fn fake(dir: &Path) -> SecretService {
+        let script = dir.join("secret-tool");
+        let body = format!(
+            r#"dir='{dir}'
+if [ -e "$dir/unreachable" ]; then
+  echo "secret-tool: Cannot autolaunch D-Bus without X11 \$DISPLAY" >&2; exit 1
+fi
+if [ -e "$dir/locked" ]; then
+  echo "secret-tool: Cannot get secret of a locked object" >&2; exit 1
+fi
+cmd=$1; shift
+[ "$cmd" = store ] && shift
+name=$2
+case "$cmd" in
+  store) cat > "$dir/item.$name" ;;
+  lookup) [ -f "$dir/item.$name" ] || exit 1; cat "$dir/item.$name" ;;
+  clear) rm -f "$dir/item.$name" ;;
+  *) echo "unknown command $cmd" >&2; exit 2 ;;
+esac
+"#,
+            dir = dir.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        // Run the script through `sh`, so no test executes a file another
+        // thread can still hold open for writing.
+        SecretService::with_program("/bin/sh", [script])
+    }
+
+    fn items(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                name.strip_prefix("item.").map(str::to_owned)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn kids(store: &SecretService) -> Vec<String> {
+        let keys = load(store, &[]).unwrap();
+        Role::ALL
+            .into_iter()
+            .map(|role| keys.get(role).public().kid())
+            .collect()
+    }
+
+    // BEP-088, BEP-089
+    #[test]
+    fn keys_are_generated_and_held_in_secret_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fake(dir.path());
+        let first = kids(&store);
+        assert_eq!(
+            items(dir.path()),
+            vec![
+                "dev.gominimal.bep.root",
+                "dev.gominimal.bep.sealing",
+                "dev.gominimal.bep.signing"
+            ]
+        );
+        assert_eq!(kids(&store), first, "a restart loads the held keys");
+    }
+
+    // BEP-060, BEP-089
+    #[test]
+    fn a_replacement_moves_the_new_key_into_the_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fake(dir.path());
+        let first = kids(&store);
+        crate::keys::replace(&store, Role::Signing).unwrap();
+        let second = kids(&store);
+        assert_eq!(first[..2], second[..2]);
+        assert_ne!(first[2], second[2]);
+        assert_eq!(items(dir.path()).len(), 3);
+    }
+
+    fn refuses_start_and_keeps_the_keys(state: &str, expected: &StartError, text: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fake(dir.path());
+        let first = kids(&store);
+        std::fs::write(dir.path().join(state), "").unwrap();
+        let err = load(&store, &[]).unwrap_err();
+        assert_eq!(&err, expected);
+        assert_eq!(err.to_string(), text);
+        assert!(!text.contains("--replace-key"));
+        std::fs::remove_file(dir.path().join(state)).unwrap();
+        assert_eq!(kids(&store), first, "the refused start kept every key");
+    }
+
+    // BEP-089
+    #[test]
+    fn a_locked_secret_service_refuses_start() {
+        refuses_start_and_keeps_the_keys(
+            "locked",
+            &StartError::Locked(Role::Sealing),
+            "The proxy did not start: the login keyring is locked, and it holds the proxy's sealing key. Unlock the login keyring, then start the proxy again.",
+        );
+    }
+
+    // BEP-089
+    #[test]
+    fn an_unreachable_secret_service_refuses_start() {
+        refuses_start_and_keeps_the_keys(
+            "unreachable",
+            &StartError::Unreachable(Role::Sealing),
+            "The proxy did not start: Secret Service cannot be reached from this session, and it holds the proxy's sealing key. Start the proxy from the desktop session that holds the login keyring.",
+        );
+    }
+
+    #[test]
+    fn secret_tool_errors_are_sorted_by_cause() {
+        let locked = failure(
+            Role::Root,
+            b"secret-tool: Cannot create an item in a locked collection\n",
+        );
+        assert!(matches!(
+            locked,
+            KeyError::Locked {
+                role: Role::Root,
+                ..
+            }
+        ));
+        let unreachable = failure(
+            Role::Root,
+            b"secret-tool: The name org.freedesktop.secrets was not provided by any .service files",
+        );
+        assert!(matches!(
+            unreachable,
+            KeyError::Unreachable {
+                role: Role::Root,
+                ..
+            }
+        ));
+        let other = failure(Role::Root, b"secret-tool: something else");
+        assert!(matches!(
+            other,
+            KeyError::Store {
+                role: Role::Root,
+                ..
+            }
+        ));
+    }
+}
