@@ -17171,6 +17171,30 @@ fn type_commands_refuse_invalid_project_types_with_exit_3() {
     assert_eq!(cmd::types::BoxTypesInvalid::EXIT_CODE, 3);
 }
 
+/// What `min type show <name>` resolves in `project`: the same load and
+/// resolution the command runs, so the `-o` tests follow the built-in
+/// defaults that ship, not a literal list.
+fn resolved_type_detail(project: &std::path::Path, name: &str) -> cmd::types::TypeDetail {
+    let types = cmd::types::load_types(project, false, "show the box type").unwrap();
+    cmd::types::type_detail(&types, &types.resolve(name).unwrap())
+}
+
+/// `values` as `min type show -o yaml` writes them under `field`.
+fn yaml_type_values(field: &str, values: &[cmd::types::TypeValue]) -> String {
+    let quote = |text: &str| serde_json_lenient::to_string(text).unwrap();
+    let mut block = format!("{field}:\n");
+    for value in values {
+        block.push_str(&format!(
+            "  - key: {}\n    value: {}\n    set_by: {}\n    source: {}\n",
+            quote(&value.key),
+            quote(&value.value),
+            quote(&value.set_by),
+            quote(value.source.as_str()),
+        ));
+    }
+    block
+}
+
 /// `min type list -o json` and `min type show -o json` write `min/v1/type`
 /// objects: an array of rows, and one detail.
 #[test]
@@ -17212,16 +17236,28 @@ fn type_output_json_writes_type_objects() {
         detail["chain"],
         serde_json_lenient::json!(["session", "base", "rust-dev"])
     );
+    let expected = resolved_type_detail(project.path(), "rust-dev");
     assert_eq!(
-        detail["defaults"][0],
-        serde_json_lenient::json!({
-            "key": "timeout",
-            "value": "\"30m\"",
-            "set_by": "base",
-            "source": "project",
-        })
+        detail["defaults"],
+        serde_json_lenient::to_value(&expected.defaults).unwrap()
     );
-    assert_eq!(detail["constraints"][0]["key"], "loadout_mode");
+    assert_eq!(
+        detail["constraints"],
+        serde_json_lenient::to_value(&expected.constraints).unwrap()
+    );
+    // The project's own value is among them, with the type that sets it.
+    assert!(
+        detail["defaults"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json_lenient::json!({
+                "key": "timeout",
+                "value": "\"30m\"",
+                "set_by": "base",
+                "source": "project",
+            })),
+        "{detail}"
+    );
 }
 
 /// `min type list -o yaml` and `min type show -o yaml` write `min/v1/type`
@@ -17249,16 +17285,35 @@ fn type_output_yaml_writes_type_mappings() {
     for block in [
         "schema: \"min/v1/type\"\nname: \"rust-dev\"\nsource: \"project\"\nextends: \"base\"\nroot: \"session\"\n",
         "chain:\n  - \"session\"\n  - \"base\"\n  - \"rust-dev\"\n",
-        "defaults:\n  - key: \"timeout\"\n    value: \"\\\"30m\\\"\"\n    set_by: \"base\"\n    source: \"project\"\n",
-        "constraints:\n  - key: \"loadout_mode\"\n",
     ] {
         assert!(show.contains(block), "missing {block:?}\n{show}");
     }
+    let expected = resolved_type_detail(project.path(), "rust-dev");
+    for block in [
+        yaml_type_values("defaults", &expected.defaults),
+        yaml_type_values("constraints", &expected.constraints),
+    ] {
+        assert!(show.contains(&block), "missing {block:?}\n{show}");
+    }
+    assert!(
+        show.contains("  - key: \"timeout\"\n    value: \"\\\"30m\\\"\"\n    set_by: \"base\"\n    source: \"project\"\n"),
+        "{show}"
+    );
 
-    // A built-in type has no values today: empty sequences, not blocks.
+    // A built-in type shows the values its own table sets, and no `extends`.
     let show = type_show(&globals, "session", Some(TypeOutputFormat::Yaml)).unwrap();
     assert!(show.contains("chain:\n  - \"session\"\n"), "{show}");
     assert!(!show.contains("extends"), "{show}");
+    let expected = resolved_type_detail(project.path(), "session");
+    for (field, values) in [
+        ("defaults", &expected.defaults),
+        ("constraints", &expected.constraints),
+    ] {
+        if !values.is_empty() {
+            let block = yaml_type_values(field, values);
+            assert!(show.contains(&block), "missing {block:?}\n{show}");
+        }
+    }
 
     // A type name with a control character is escaped in the YAML too.
     let hostile = tempfile::tempdir().unwrap();
@@ -17302,14 +17357,21 @@ fn type_output_toml_writes_type_tables() {
         .filter_map(toml::Value::as_str)
         .collect();
     assert_eq!(chain, ["session", "base", "rust-dev"]);
-    let first = detail["defaults"].as_array().unwrap()[0]
-        .as_table()
-        .unwrap();
-    assert_eq!(first["key"].as_str(), Some("timeout"));
-    assert_eq!(first["value"].as_str(), Some("\"30m\""));
-    assert_eq!(first["set_by"].as_str(), Some("base"));
+    let expected = resolved_type_detail(project.path(), "rust-dev");
     assert_eq!(
-        detail["constraints"].as_array().unwrap()[0]["key"].as_str(),
-        Some("loadout_mode")
+        detail["defaults"],
+        toml::Value::try_from(&expected.defaults).unwrap()
     );
+    assert_eq!(
+        detail["constraints"],
+        toml::Value::try_from(&expected.constraints).unwrap()
+    );
+    let timeout = detail["defaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["key"].as_str() == Some("timeout"))
+        .expect("the project's timeout");
+    assert_eq!(timeout["value"].as_str(), Some("\"30m\""));
+    assert_eq!(timeout["set_by"].as_str(), Some("base"));
 }
