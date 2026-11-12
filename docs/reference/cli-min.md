@@ -599,13 +599,41 @@ and for a session nobody is attached to.
 ### `box spec`
 
 ```
-min box spec [--network <none|host_ip|own_ip>] [PATH]
+min box spec [OPTIONS] <ENTRY>
+min box spec [-o <toml|json|yaml>] <BOX>
+min box spec [--network <none|host_ip|own_ip>]
 ```
 
-Shows how the box that the project at `PATH` declares reaches GitHub through
-the local Box Egress Proxy. `PATH` defaults to `--repo-dir`, or to the current
-directory. The rows are the proxy's root certificate fingerprint, each secret
-with its hosts, the steering mode, and the UDP 443 stance.
+With an argument, the command reads it as an entry of the project's
+`minimal.toml`. When the project has no entry of that name, it reads the
+argument as a box address: an id, the start of an id, or a name, as
+`min box list` prints them. It never reads the argument as a directory. To
+use another project, give `--repo-dir <DIR>` (short `-C`).
+
+`min box spec <ENTRY>` shows the spec that `min box start <ENTRY>` sends to
+the host, before any box exists. A comment or a `sources` field names the
+layer that set each value. A secret shows only as its reference, never as its
+value. The output also names the loadouts that `min box start` applies. When
+the entry declares a broker secret, the Box Egress Proxy rows follow.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--output <toml\|json\|yaml>` | `-o` | The format of the spec. The default is `toml` |
+| `--network`, `--ingress`, `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | | Overrides of the entry's `[network]` keys, as on [`session start`](#session-start) |
+| `--loadout <NAME>` | | Apply the named loadout, as on [`session start`](#session-start). Repeatable |
+
+A task entry refuses `--ingress` and `--loadout` with exit code 2, as
+`min box start` does.
+
+`min box spec <BOX>` shows the spec that the box was created with, as its
+host stores it. It takes `-o` and no override flag. An override flag with a
+box gives exit code 2.
+
+`min box spec` with no argument shows how the box of the project reaches
+GitHub through the local Box Egress Proxy. The rows are the proxy's root
+certificate fingerprint, each secret with its hosts, the steering mode, and
+the UDP 443 stance. This form takes `--network` and no other override flag.
+Another override flag gives exit code 2.
 
 | Flag | Short | Description |
 |------|-------|-------------|
