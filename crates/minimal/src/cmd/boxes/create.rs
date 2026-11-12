@@ -1495,11 +1495,18 @@ fn box_entry(
         .and_then(toml::Value::as_table)
         .map(|types| types.keys().cloned().collect())
         .unwrap_or_default();
-    let layers = mfile::expand::Layers::default().with_file_defaults(
+    let mut layers = mfile::expand::Layers::default().with_file_defaults(
         &defaults,
         entry.box_type.as_deref(),
         &project_types,
     );
+    // BOX-183, BOX-184: the merge compares resolved values, so each
+    // `inherit` name takes this process's value. A name it does not set
+    // stays out, and the merge falls back to the `default`.
+    layers.host_vars = mfile::expand::inherited_var_names(&entry, &layers)
+        .into_iter()
+        .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
+        .collect();
     let expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
     let spec = &expansion.spec;
