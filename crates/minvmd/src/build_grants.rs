@@ -173,12 +173,16 @@ impl BuildGrants {
         self.lock().tables.get(&session_id)?.get(spec_hash).cloned()
     }
 
-    /// Reserves the next grant's row and names it, or `None` at the cap. The
-    /// reservation counts toward the cap until [`Self::opened`] or
-    /// [`Self::unreserve`] ends it.
+    /// Reserves the next grant's row and names it, or `None` at the cap or
+    /// when the box's table has ended. The reservation counts toward the cap
+    /// until [`Self::opened`] or [`Self::unreserve`] ends it.
     pub(crate) fn next_row(&self, session_id: boxes::SessionId) -> Option<String> {
         let mut state = self.lock();
-        if state.open.len() + state.reserved.len() >= MAX_OPEN_GRANTS {
+        // The table is read under the reservation's own lock, so a table that
+        // ends after the caller's lookup leaves nothing to reserve.
+        if !state.tables.contains_key(&session_id)
+            || state.open.len() + state.reserved.len() >= MAX_OPEN_GRANTS
+        {
             return None;
         }
         state.opened += 1;
@@ -357,6 +361,7 @@ mod tests {
     fn a_grant_ends_at_its_deadline_or_earlier() {
         let grants = BuildGrants::default();
         let id = boxes::SessionId::mint();
+        grants.file(id, table("aa", false));
         let now = Instant::now();
         let deadline = grant_deadline(now, false);
         assert_eq!(deadline, now + FETCH_GRANT_DEADLINE);
@@ -381,6 +386,7 @@ mod tests {
     fn open_grants_stop_at_the_cap() {
         let grants = BuildGrants::default();
         let id = boxes::SessionId::mint();
+        grants.file(id, table("aa", false));
         let far = Instant::now() + BUILD_GRANT_DEADLINE;
         let rows: Vec<String> = (0..MAX_OPEN_GRANTS)
             .map(|_| grants.next_row(id).expect("room under the cap"))
@@ -405,6 +411,7 @@ mod tests {
         let grants = BuildGrants::default();
         let (id, other) = (boxes::SessionId::mint(), boxes::SessionId::mint());
         grants.file(id, table("aa", false));
+        grants.file(other, table("aa", false));
         let far = Instant::now() + BUILD_GRANT_DEADLINE;
         let open = grants.next_row(id).expect("room under the cap");
         assert!(grants.opened(withdrawal(&open), far));
@@ -417,6 +424,19 @@ mod tests {
         assert!(!grants.opened(withdrawal(&registering), far));
         assert!(grants.take(&open).is_none());
         assert_eq!(grants.take(&others), Some(withdrawal(&others)));
+    }
+
+    /// NET-165: a box whose table ended reserves no row, so a grant asked
+    /// for after its lookup cannot open once the table is gone.
+    #[test]
+    fn no_row_is_reserved_after_the_table_ends() {
+        let grants = BuildGrants::default();
+        let id = boxes::SessionId::mint();
+        assert!(grants.next_row(id).is_none(), "no table was filed");
+        grants.file(id, table("aa", false));
+        assert!(grants.lookup(id, "aa").is_some());
+        grants.drop_table(id);
+        assert!(grants.next_row(id).is_none(), "the table ended");
     }
 
     /// NET-165: a box's table survives the VM host daemon.
