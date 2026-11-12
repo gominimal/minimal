@@ -18,7 +18,8 @@
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use p256::{PublicKey, SecretKey};
@@ -36,22 +37,28 @@ const ATTRIBUTE: &str = "service";
 /// The store name in the log lines.
 const STORE: &str = "secret-service";
 
-/// Parts of `secret-tool`'s error output that say the keyring is locked.
-const LOCKED: &[&str] = &["locked"];
+/// How long one `secret-tool` call can run. A call on a locked keyring
+/// can wait on an unlock prompt. When nobody answers it, the start
+/// refuses as locked and does not wait forever.
+pub const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The exit code of a `secret-tool lookup` or `clear` that matched no item.
+const NO_MATCH: i32 = 1;
+
+/// Parts of `secret-tool`'s error output that say the keyring is locked:
+/// libsecret's "locked object" and "locked collection" errors.
+const LOCKED: &[&str] = &["locked object", "locked collection", "collection is locked"];
 
 /// Parts of `secret-tool`'s error output that say this session has no
-/// Secret Service: no session bus, or no keyring daemon on it.
+/// Secret Service: no session bus, or no keyring daemon on it. Each is a
+/// phrase from GDBus or the bus, not a bare word that other errors share.
 const UNREACHABLE: &[&str] = &[
-    "d-bus",
-    "dbus",
-    "could not connect",
-    "org.freedesktop.secrets",
-    "serviceunknown",
-    "not provided by any",
-    "autolaunch",
-    "no such file or directory",
-    "connection refused",
-    "message bus",
+    "could not connect:",
+    "cannot autolaunch d-bus",
+    "the name org.freedesktop.secrets was not provided",
+    "org.freedesktop.dbus.error.serviceunknown",
+    "org.freedesktop.dbus.error.noserver",
+    "failed to connect to the message bus",
 ];
 
 /// The proxy's keys in Secret Service.
@@ -59,6 +66,7 @@ const UNREACHABLE: &[&str] = &[
 pub struct SecretService {
     program: PathBuf,
     leading: Vec<OsString>,
+    timeout: Duration,
 }
 
 impl Default for SecretService {
@@ -84,7 +92,15 @@ impl SecretService {
         Self {
             program: program.into(),
             leading: leading.into_iter().map(Into::into).collect(),
+            timeout: TIMEOUT,
         }
+    }
+
+    /// The same store, with `timeout` for each `secret-tool` call.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     fn run(&self, role: Role, args: &[&str], stdin: Option<&[u8]>) -> Result<Output, KeyError> {
@@ -108,16 +124,20 @@ impl SecretService {
                 format!("`{SECRET_TOOL}` did not run: {err}")
             },
         })?;
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
         let written = match (stdin, child.stdin.take()) {
             // Dropping the pipe at the end of the arm closes it, so the
             // child sees the end of its input.
             (Some(input), Some(mut pipe)) => pipe.write_all(input),
             _ => Ok(()),
         };
-        let out = child.wait_with_output().map_err(|err| KeyError::Store {
-            role,
-            detail: format!("`{SECRET_TOOL}` did not finish: {err}"),
-        })?;
+        let status = self.wait(role, &mut child)?;
+        let out = Output {
+            status,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        };
         match written {
             // A `secret-tool` that fails before it reads its input (a locked
             // keyring, no session bus) closes the pipe. Its exit status and
@@ -131,18 +151,69 @@ impl SecretService {
         }
     }
 
+    /// Waits for `child` until the timeout. A call that outlives it is
+    /// killed and reads as a locked keyring: an unlock prompt that nobody
+    /// answered.
+    fn wait(&self, role: Role, child: &mut std::process::Child) -> Result<ExitStatus, KeyError> {
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let finished = child.try_wait().map_err(|err| KeyError::Store {
+                role,
+                detail: format!("`{SECRET_TOOL}` did not finish: {err}"),
+            })?;
+            if let Some(status) = finished {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!(role = %role, timeout_secs = self.timeout.as_secs_f64(), store = STORE, "secret-tool did not finish in time; read as a locked keyring");
+                return Err(KeyError::Locked {
+                    role,
+                    detail: format!(
+                        "`{SECRET_TOOL}` did not finish in {} s, so an unlock prompt is still waiting",
+                        self.timeout.as_secs()
+                    ),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Whether Secret Service lists an item for `label` that `lookup` did
+    /// not return. `search` without `--unlock` lists a locked item without
+    /// its secret, so a listed item here is a locked one.
+    fn listed(&self, role: Role, label: &str) -> Result<bool, KeyError> {
+        let out = self.run(role, &["search", ATTRIBUTE, label], None)?;
+        if out.status.success() {
+            return Ok(!out.stdout.iter().all(u8::is_ascii_whitespace));
+        }
+        if out.status.code() == Some(NO_MATCH) && blank(&out.stderr) {
+            return Ok(false);
+        }
+        Err(failure(role, &out))
+    }
+
     /// The private half held for `role` in `slot`, or `None`.
     fn lookup(&self, role: Role, slot: Slot) -> Result<Option<SecretKey>, KeyError> {
         let label = role.slot_label(slot);
-        let out = self.run(role, &["lookup", ATTRIBUTE, &label], None)?;
-        let stdout = Zeroizing::new(out.stdout);
+        let mut out = self.run(role, &["lookup", ATTRIBUTE, &label], None)?;
+        let stdout = Zeroizing::new(std::mem::take(&mut out.stdout));
         if !out.status.success() {
             // `secret-tool lookup` exits 1 with no output when no item
-            // matches.
-            if out.stderr.iter().all(u8::is_ascii_whitespace) {
+            // matches. A dismissed unlock prompt on a locked keyring gives
+            // the same result, so ask whether an item is there.
+            if out.status.code() == Some(NO_MATCH) && blank(&out.stderr) {
+                if self.listed(role, &label)? {
+                    return Err(KeyError::Locked {
+                        role,
+                        detail: "Secret Service lists the item but did not return its secret"
+                            .into(),
+                    });
+                }
                 return Ok(None);
             }
-            return Err(failure(role, &out.stderr));
+            return Err(failure(role, &out));
         }
         let text = std::str::from_utf8(&stdout).map_err(|_| unreadable(role))?;
         let text = text.trim();
@@ -172,7 +243,7 @@ impl SecretService {
             Some(encoded.as_bytes()),
         )?;
         if !out.status.success() {
-            return Err(failure(role, &out.stderr));
+            return Err(failure(role, &out));
         }
         Ok(())
     }
@@ -181,16 +252,43 @@ impl SecretService {
     fn clear(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
         let label = role.slot_label(slot);
         let out = self.run(role, &["clear", ATTRIBUTE, &label], None)?;
-        if !out.status.success() && !out.stderr.iter().all(u8::is_ascii_whitespace) {
-            return Err(failure(role, &out.stderr));
+        if out.status.success() || (out.status.code() == Some(NO_MATCH) && blank(&out.stderr)) {
+            return Ok(());
         }
-        Ok(())
+        Err(failure(role, &out))
     }
 }
 
-/// The error for a `secret-tool` run that failed with `stderr`.
-fn failure(role: Role, stderr: &[u8]) -> KeyError {
-    let detail = String::from_utf8_lossy(stderr).trim().to_owned();
+fn blank(bytes: &[u8]) -> bool {
+    bytes.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Reads all of `pipe` on its own thread, so a full pipe never blocks the
+/// child while the caller waits for it.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+/// The error for a `secret-tool` run that failed with `out`.
+fn failure(role: Role, out: &Output) -> KeyError {
+    let detail = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    if detail.is_empty() {
+        return KeyError::Store {
+            role,
+            detail: format!("`{SECRET_TOOL}` failed with no message ({})", out.status),
+        };
+    }
+    sort(role, detail)
+}
+
+/// Sorts a `secret-tool` error message by cause.
+fn sort(role: Role, detail: String) -> KeyError {
     let lower = detail.to_ascii_lowercase();
     if LOCKED.iter().any(|part| lower.contains(part)) {
         KeyError::Locked { role, detail }
@@ -338,7 +436,8 @@ mod tests {
 
     /// A fake `secret-tool` that keeps each item in a file under `dir`. A
     /// `locked` or `unreachable` file in `dir` makes every call fail as
-    /// the real tool does in that state.
+    /// the real tool does in that state. A `silent-locked` file makes
+    /// `lookup` exit 1 with no message, as after a dismissed unlock prompt.
     fn fake(dir: &Path) -> SecretService {
         let script = dir.join("secret-tool");
         let body = format!(
@@ -352,9 +451,11 @@ fi
 cmd=$1; shift
 [ "$cmd" = store ] && shift
 name=$2
+if [ -e "$dir/silent-locked" ] && [ "$cmd" = lookup ]; then exit 1; fi
 case "$cmd" in
   store) cat > "$dir/item.$name" ;;
   lookup) [ -f "$dir/item.$name" ] || exit 1; cat "$dir/item.$name" ;;
+  search) [ -f "$dir/item.$name" ] && printf '[/org/freedesktop/secrets/collection/login/1]\nlabel = %s\n' "$name"; exit 0 ;;
   clear) rm -f "$dir/item.$name" ;;
   *) echo "unknown command $cmd" >&2; exit 2 ;;
 esac
@@ -473,7 +574,7 @@ esac
             .unwrap();
         assert!(!out.status.success());
         assert!(matches!(
-            failure(Role::Root, &out.stderr),
+            failure(Role::Root, &out),
             KeyError::Locked {
                 role: Role::Root,
                 ..
@@ -483,9 +584,9 @@ esac
 
     #[test]
     fn secret_tool_errors_are_sorted_by_cause() {
-        let locked = failure(
+        let locked = sort(
             Role::Root,
-            b"secret-tool: Cannot create an item in a locked collection\n",
+            "secret-tool: Cannot create an item in a locked collection".into(),
         );
         assert!(matches!(
             locked,
@@ -494,9 +595,10 @@ esac
                 ..
             }
         ));
-        let unreachable = failure(
+        let unreachable = sort(
             Role::Root,
-            b"secret-tool: The name org.freedesktop.secrets was not provided by any .service files",
+            "secret-tool: The name org.freedesktop.secrets was not provided by any .service files"
+                .into(),
         );
         assert!(matches!(
             unreachable,
@@ -505,13 +607,78 @@ esac
                 ..
             }
         ));
-        let other = failure(Role::Root, b"secret-tool: something else");
+        for other in [
+            "secret-tool: something else",
+            "secret-tool: /home/u/.cache: No such file or directory",
+            "secret-tool: the dbus-broker log is unlocked",
+        ] {
+            assert!(
+                matches!(
+                    sort(Role::Root, other.into()),
+                    KeyError::Store {
+                        role: Role::Root,
+                        ..
+                    }
+                ),
+                "{other}"
+            );
+        }
+        let no_bus = sort(
+            Role::Root,
+            "secret-tool: Could not connect: No such file or directory".into(),
+        );
+        assert!(matches!(no_bus, KeyError::Unreachable { .. }));
+    }
+
+    // BEP-089
+    #[test]
+    fn a_silently_locked_lookup_refuses_start_and_keeps_the_keys() {
+        refuses_start_and_keeps_the_keys(
+            "silent-locked",
+            &StartError::Locked(Role::Sealing),
+            "The proxy did not start: the login keyring is locked, and it holds the proxy's sealing key. Unlock the login keyring, then start the proxy again.",
+        );
+    }
+
+    // BEP-089
+    #[test]
+    fn a_tool_that_does_not_finish_reads_as_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("secret-tool");
+        std::fs::write(&script, "exec sleep 30\n").unwrap();
+        let store = SecretService::with_program("/bin/sh", [script])
+            .with_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let err = store.lookup(Role::Root, Slot::Held).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(matches!(
-            other,
+            err,
+            KeyError::Locked {
+                role: Role::Root,
+                ..
+            }
+        ));
+    }
+
+    // BEP-089
+    #[test]
+    fn a_lookup_that_fails_with_no_message_is_not_an_empty_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("secret-tool");
+        std::fs::write(&script, "kill -KILL $$\n").unwrap();
+        let store = SecretService::with_program("/bin/sh", [script]);
+        let err = store.lookup(Role::Root, Slot::Held).unwrap_err();
+        assert!(matches!(
+            err,
             KeyError::Store {
                 role: Role::Root,
                 ..
             }
+        ));
+        std::fs::write(dir.path().join("secret-tool"), "exit 2\n").unwrap();
+        assert!(matches!(
+            store.lookup(Role::Root, Slot::Held),
+            Err(KeyError::Store { .. })
         ));
     }
 }
