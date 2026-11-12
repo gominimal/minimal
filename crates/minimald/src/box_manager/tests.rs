@@ -6847,6 +6847,15 @@ async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
             }),
             Some(("build", "build", "nesting.allowed", "true")),
         ),
+        // A spec with no `box.type` is checked as the creating verb's
+        // type, here `session`.
+        (
+            spec_of("rc-no-type", "session", &|spec| {
+                pty(false)(spec);
+                spec["box"].as_object_mut().unwrap().remove("type");
+            }),
+            Some(("session", "session", "io.pty_enabled", "false")),
+        ),
         // Inside the root's constraints: created.
         (spec_of("rc-task-ok", "task", &pty(false)), None),
         (spec_of("rc-session-ok", "session", &pty(true)), None),
@@ -6908,5 +6917,64 @@ async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
             line.contains("refusal="),
             "the create span records it: {line}"
         );
+    }
+
+    // A spec that names a type with no built-in root is refused: it has no
+    // constraints to check, so it never passes unchecked.
+    let unknown: [(serde_json_lenient::Value, &str, &str); 2] = [
+        (
+            spec_of("rc-custom-no-root", "ci", &pty(true)),
+            "box.type",
+            "ci",
+        ),
+        (
+            spec_of("rc-root-not-builtin", "ci", &|spec| {
+                spec["type"] = serde_json_lenient::json!({ "root": "nope" });
+            }),
+            "type.root",
+            "nope",
+        ),
+    ];
+    for (spec, key, value) in unknown {
+        let entry = spec["entry"].as_str().unwrap_or_default().to_owned();
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let err = mngr
+            .create_box_with_spec(unnamed_config(), Some(spec), None, None)
+            .await
+            .expect_err("a type with no built-in root is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{entry}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<UnknownRootRefusal>())
+            .unwrap_or_else(|| panic!("{entry}: the error is the root refusal: {err}"));
+        assert_eq!(refusal.exit_code(), 3, "{entry}");
+        assert_eq!(
+            (refusal.key, refusal.value.as_str()),
+            (key, value),
+            "{entry}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("`{key}`")) && text.contains(&format!("`{value}`")),
+            "{entry}: the refusal names the key and the value: {text}"
+        );
+        assert!(
+            text.contains("`session`") && !text.contains("BOX-"),
+            "{text}"
+        );
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{entry}: a refused create files no record"
+        );
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("names a type with no built-in root")
+                    && line.contains(&format!("key=\"{key}\" value={value} "))
+            })
+            .unwrap_or_else(|| panic!("{entry}: the daemon log names the refusal:\n{logged}"));
+        assert!(line.contains("exit_code=3"), "{line}");
     }
 }
