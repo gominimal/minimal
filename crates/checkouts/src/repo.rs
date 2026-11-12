@@ -3,7 +3,28 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tracing::trace;
 
-const GIT_SEC_ARGS: [&str; 3] = ["--no-optional-locks", "-c", "core.hooksPath=/dev/null"];
+/// Prepended to every git call on a repository a project named. The `ext`
+/// transport is turned off whatever the host's git config says.
+const GIT_SEC_ARGS: [&str; 5] = [
+    "--no-optional-locks",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "protocol.ext.allow=never",
+];
+
+/// Refuses a repository URL or ref that is empty or starts with `-`, which
+/// git would parse as an option rather than a value. No real URL or ref
+/// does.
+fn refuse_option_like(what: &'static str, value: &str) -> Result<(), Error> {
+    if value.is_empty() || value.starts_with('-') {
+        return Err(Error::OptionLike {
+            what,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
+}
 
 /// A git repository of some remote.
 pub struct Repo {
@@ -18,6 +39,7 @@ impl Repo {
     /// given path with be re-used if it is already initialized.
     pub fn new<S: Into<String>, P: Into<PathBuf>>(url: S, base: P) -> Result<Self, Error> {
         let url = url.into();
+        refuse_option_like("repository", &url)?;
         // Absolute, because every git call below pairs `current_dir(base)`
         // with `GIT_DIR=base`, and git resolves a relative `GIT_DIR` against
         // that new working directory.
@@ -62,7 +84,7 @@ impl Repo {
             .args(
                 GIT_SEC_ARGS
                     .into_iter()
-                    .chain(["clone", "--quiet", "--bare"])
+                    .chain(["clone", "--quiet", "--bare", "--"])
                     .chain([url.as_str(), base.to_str().ok_or(Error::InvalidPath)?])
                     .collect::<Vec<_>>(),
             )
@@ -125,6 +147,7 @@ impl Repo {
         worktree_path: &Path,
         git_ref: &GitRef,
     ) -> Result<String, Error> {
+        refuse_option_like("ref", git_ref.as_str())?;
         match git_ref {
             GitRef::Branch(b) => self.run_git_checkout(
                 worktree_path,
@@ -166,6 +189,7 @@ impl Repo {
     /// worktree would land on the clone-time tip and a branch created
     /// upstream since would not resolve at all.
     pub fn new_worktree(&mut self, path: PathBuf, git_ref: GitRef) -> Result<Checkout, Error> {
+        refuse_option_like("ref", git_ref.as_str())?;
         // Drop registrations whose directories are gone first, so a stale
         // entry cannot claim the path this add is about to use.
         self.run_git_bare(

@@ -913,6 +913,44 @@ mod tests {
     /// Helper: initialise a local git repo with one commit on `branch` and
     /// return (TempDir, commit-hash).  The TempDir must be kept alive for the
     /// duration of the test so the path stays valid.
+    /// A repository URL or a ref that starts with `-` is refused before git
+    /// runs, with what it was; a plain local repository still clones.
+    #[test]
+    fn an_option_like_repository_or_ref_is_refused_before_git_runs() {
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+        let err = handle
+            .checkout_of("--not-a-url", GitRef::Branch("main".into()))
+            .expect_err("a URL starting with `-` is refused");
+        assert!(
+            matches!(
+                err,
+                crate::Error::OptionLike {
+                    what: "repository",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let err = handle
+            .checkout_of("", GitRef::Branch("main".into()))
+            .expect_err("an empty URL is refused");
+        assert!(matches!(err, crate::Error::OptionLike { .. }), "{err}");
+
+        let (src, _) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let err = handle
+            .checkout_of(&remote, GitRef::Commit("--not-a-ref".into()))
+            .expect_err("a ref starting with `-` is refused");
+        assert!(
+            matches!(err, crate::Error::OptionLike { what: "ref", .. }),
+            "{err}"
+        );
+        handle
+            .checkout_of(&remote, GitRef::Branch("main".into()))
+            .expect("a plain local repository still clones");
+    }
+
     fn make_local_repo(branch: &str) -> (tempfile::TempDir, String) {
         use std::process::Command;
         let src = tempfile::tempdir().unwrap();

@@ -26,6 +26,13 @@ pub enum Error {
     #[error("invalid path")]
     InvalidPath,
 
+    /// A repository URL or ref that is empty or starts with `-`.
+    #[error(
+        "the {what} {value:?} starts with `-` or is empty, so git would read it as an option; \
+         no repository or ref does. Fix it in minimal.toml"
+    )]
+    OptionLike { what: &'static str, value: String },
+
     /// A generic error with a custom message.
     #[error("other: {0}")]
     Other(String),

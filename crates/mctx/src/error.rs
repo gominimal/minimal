@@ -203,6 +203,7 @@ impl From<checkouts::Error> for Error {
             } => Self::Other(anyhow::anyhow!(
                 "unexpected: git command '{command}' failed ({status}): {stderr}"
             )),
+            e @ checkouts::Error::OptionLike { .. } => Self::Other(anyhow::anyhow!("{e}")),
             checkouts::Error::InvalidPath => {
                 Self::Other(anyhow::anyhow!("vcs: invalid remote path"))
             }
