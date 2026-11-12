@@ -42,6 +42,13 @@ const STORE: &str = "secret-service";
 /// refuses as locked and does not wait forever.
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long `run` waits for the output pipes to close after `secret-tool`
+/// exits. A process that `secret-tool` started, such as a D-Bus daemon it
+/// autolaunched, can hold the pipes open after it. The output that
+/// `secret-tool` wrote is in the pipe when it exits, so a short wait reads
+/// all of it.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
+
 /// The exit code of a `secret-tool lookup` or `clear` that matched no item.
 const NO_MATCH: i32 = 1;
 
@@ -133,10 +140,11 @@ impl SecretService {
             _ => Ok(()),
         };
         let status = self.wait(role, &mut child)?;
+        let deadline = Instant::now() + DRAIN_GRACE;
         let out = Output {
             status,
-            stdout: stdout.join().unwrap_or_default(),
-            stderr: stderr.join().unwrap_or_default(),
+            stdout: stdout.collect(deadline),
+            stderr: stderr.collect(deadline),
         };
         match written {
             // A `secret-tool` that fails before it reads its input (a locked
@@ -263,16 +271,58 @@ fn blank(bytes: &[u8]) -> bool {
     bytes.iter().all(u8::is_ascii_whitespace)
 }
 
+/// The output of one pipe, which a thread of its own reads.
+struct Drain {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drain {
+    /// What the thread read by `deadline`, or by the end of the pipe if
+    /// that is first. A pipe that another process holds open past
+    /// `deadline` does not stop the caller: the thread reads on, detached,
+    /// until that process closes the pipe.
+    fn collect(self, deadline: Instant) -> Vec<u8> {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if self.done.recv_timeout(wait).is_err() {
+            tracing::warn!(
+                store = STORE,
+                "an output pipe of secret-tool stayed open after it exited; using the output read so far"
+            );
+        }
+        let mut buf = self
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *buf)
+    }
+}
+
 /// Reads all of `pipe` on its own thread, so a full pipe never blocks the
 /// child while the caller waits for it.
-fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drain {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, done) = std::sync::mpsc::channel();
+    let shared = std::sync::Arc::clone(&buf);
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
         if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend_from_slice(&chunk[..n]),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            zeroize::Zeroize::zeroize(&mut chunk);
         }
-        buf
-    })
+        let _ = tx.send(());
+    });
+    Drain { buf, done }
 }
 
 /// The error for a `secret-tool` run that failed with `out`.
@@ -576,6 +626,33 @@ esac
         assert!(matches!(
             failure(Role::Root, &out),
             KeyError::Locked {
+                role: Role::Root,
+                ..
+            }
+        ));
+    }
+
+    // BEP-089
+    #[test]
+    fn a_pipe_held_open_after_exit_does_not_stop_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("secret-tool");
+        // The background `sleep` keeps stdout and stderr open after the
+        // tool exits, as a D-Bus daemon that it autolaunched can.
+        std::fs::write(
+            &script,
+            "sleep 30 &\necho 'secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY' >&2; exit 1\n",
+        )
+        .unwrap();
+        let store = SecretService::with_program("/bin/sh", [script]);
+        let started = Instant::now();
+        let out = store
+            .run(Role::Root, &["lookup", ATTRIBUTE, "x"], None)
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(matches!(
+            failure(Role::Root, &out),
+            KeyError::Unreachable {
                 role: Role::Root,
                 ..
             }
