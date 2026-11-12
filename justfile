@@ -534,6 +534,12 @@ test-snap-update:
 test-ignored: _nextest
     cargo nextest run --workspace --locked --profile ci --run-ignored ignored-only --no-tests=fail
 
+# The Box Egress Proxy's TPM key-store proofs, against the TPM in BEP_TPM_TCTI
+# or a swtpm the script starts (needs swtpm and tpm2-tools). CI: ci-linux-native.
+[linux]
+test-tpm: _nextest
+    scripts/bep-tpm-integration.sh
+
 # COST: the first run compiles the workspace under emulation and can take an
 # hour+; later runs are incremental. HOME=/tmp: the container has no HOME.
 #
