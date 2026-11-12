@@ -18304,6 +18304,25 @@ async fn spec_type_init_end_to_end() {
     ] {
         assert!(shown.contains(line), "missing {line:?}\n{ran}");
     }
+    // Each default and constraint names the type that sets it and that
+    // type's source. `write_values` pads the setting column, so match the
+    // trimmed setting and the `from <type> (<source>)` suffix.
+    for (setting, source) in [
+        ("timeout = \"30m\"", "from rust-dev (project)"),
+        ("pty_enabled = true", "from session (builtin)"),
+    ] {
+        assert!(
+            shown.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with(setting)
+                    && line.ends_with(source)
+                    && line[setting.len()..line.len() - source.len()]
+                        .trim()
+                        .is_empty()
+            }),
+            "missing {setting:?} {source:?}\n{ran}"
+        );
+    }
 
     // `min box spec web` renders the expansion with the layer and the type
     // of each value, inside one span.
@@ -18314,7 +18333,8 @@ async fn spec_type_init_end_to_end() {
         ..daemon_global.clone()
     };
     std::fs::create_dir_all(project.path().join("config")).unwrap();
-    // Interim, with no tracking issue yet: architecture.md puts the Box Type
+    // Interim: <https://github.com/gominimal/minimal/issues/3340> tracks the
+    // type-defaults layer. architecture.md puts the Box Type
     // defaults layer in every expansion, but `expand_entry` in
     // cmd/box_spec.rs and the start path build `Layers::default()` with no
     // `type_defaults`. So `[box_types.rust-dev.defaults] timeout = "30m"`
@@ -18364,7 +18384,8 @@ async fn spec_type_init_end_to_end() {
     // A box created from an entry on the test daemon renders the spec
     // stored with its record.
     // The box comes from the session entry `default`: a start by name takes
-    // only that entry today, and an entry of a project type is refused.
+    // only that entry today (#3204), and an entry of a project type is
+    // refused (#3140).
     let start = parsed_start(&["min", "session", "start", "default", "--network", "own_ip"]);
     let entries = mfile::entry::read_entries(std::fs::read(&toml_path).unwrap().as_slice())
         .expect("the entries read");
