@@ -108,16 +108,27 @@ impl SecretService {
                 format!("`{SECRET_TOOL}` did not run: {err}")
             },
         })?;
-        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            pipe.write_all(input).map_err(|err| KeyError::Store {
-                role,
-                detail: format!("`{SECRET_TOOL}` did not read the key: {err}"),
-            })?;
-        }
-        child.wait_with_output().map_err(|err| KeyError::Store {
+        let written = match (stdin, child.stdin.take()) {
+            // Dropping the pipe at the end of the arm closes it, so the
+            // child sees the end of its input.
+            (Some(input), Some(mut pipe)) => pipe.write_all(input),
+            _ => Ok(()),
+        };
+        let out = child.wait_with_output().map_err(|err| KeyError::Store {
             role,
             detail: format!("`{SECRET_TOOL}` did not finish: {err}"),
-        })
+        })?;
+        match written {
+            // A `secret-tool` that fails before it reads its input (a locked
+            // keyring, no session bus) closes the pipe. Its exit status and
+            // error output say why, so the caller sorts them by cause.
+            Err(_) if !out.status.success() => Ok(out),
+            Err(err) => Err(KeyError::Store {
+                role,
+                detail: format!("`{SECRET_TOOL}` did not read the key: {err}"),
+            }),
+            Ok(()) => Ok(out),
+        }
     }
 
     /// The private half held for `role` in `slot`, or `None`.
@@ -437,6 +448,37 @@ esac
             &StartError::Unreachable(Role::Sealing),
             "The proxy did not start: Secret Service cannot be reached from this session, and it holds the proxy's sealing key. Start the proxy from the desktop session that holds the login keyring.",
         );
+    }
+
+    // BEP-089
+    #[test]
+    fn a_tool_that_fails_before_it_reads_the_key_is_sorted_by_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("secret-tool");
+        std::fs::write(
+            &script,
+            "echo 'secret-tool: Cannot create an item in a locked collection' >&2; exit 1\n",
+        )
+        .unwrap();
+        let store = SecretService::with_program("/bin/sh", [script]);
+        // More than a pipe buffer holds, so the write fails when the tool
+        // exits without reading it.
+        let input = vec![b'k'; 1 << 20];
+        let out = store
+            .run(
+                Role::Root,
+                &["store", "--label=x", ATTRIBUTE, "x"],
+                Some(&input),
+            )
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(matches!(
+            failure(Role::Root, &out.stderr),
+            KeyError::Locked {
+                role: Role::Root,
+                ..
+            }
+        ));
     }
 
     #[test]
