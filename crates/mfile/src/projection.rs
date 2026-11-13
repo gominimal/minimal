@@ -430,6 +430,150 @@ fn secret_grants(spec: &toml::Table) -> Json {
     )
 }
 
+/// Why a spec that the daemon received has no projection digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecDigestError {
+    /// The spec is not a table of TOML values: it is not an object, or it
+    /// holds a `null`.
+    NotATable(String),
+    /// The spec does not name its type's built-in root.
+    NoRoot,
+}
+
+impl std::fmt::Display for SpecDigestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpecDigestError::NotATable(why) => {
+                write!(f, "the spec is not a table of TOML values: {why}")
+            }
+            SpecDigestError::NoRoot => {
+                f.write_str("the spec does not name its type's built-in root")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpecDigestError {}
+
+/// The projection digest of a spec as it arrived, read from any serde
+/// form, such as the JSON of a create request (BOX-071). A `null` reads
+/// as an absent key, as an absent value is what a JSON writer leaves as
+/// `null`. The type is the spec's own, as [`TypeFacts::of_spec`] reads
+/// it, with `default_type` for a spec that names none.
+///
+/// # Errors
+///
+/// [`SpecDigestError`] when the spec is not a table of TOML values, or
+/// does not name its type's built-in root.
+pub fn spec_digest<'de, D: serde::Deserializer<'de>>(
+    spec: D,
+    default_type: &str,
+) -> Result<String, SpecDigestError> {
+    let loose = <Loose as serde::Deserialize>::deserialize(spec)
+        .map_err(|e| SpecDigestError::NotATable(e.to_string()))?;
+    let Some(toml::Value::Table(table)) = loose.into_toml() else {
+        return Err(SpecDigestError::NotATable("it is not an object".to_owned()));
+    };
+    let facts = TypeFacts::of_spec(&table, default_type).ok_or(SpecDigestError::NoRoot)?;
+    Ok(project(&table, &facts).digest())
+}
+
+/// A value of any self-describing serde form, `null` included.
+enum Loose {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    List(Vec<Loose>),
+    Map(Vec<(String, Loose)>),
+}
+
+impl Loose {
+    /// The TOML value, or `None` for a `null`. A `null` in a list or a
+    /// table is left out.
+    fn into_toml(self) -> Option<toml::Value> {
+        Some(match self {
+            Loose::Null => return None,
+            Loose::Bool(b) => toml::Value::Boolean(b),
+            Loose::Int(n) => toml::Value::Integer(n),
+            Loose::Float(f) => toml::Value::Float(f),
+            Loose::Str(s) => toml::Value::String(s),
+            Loose::List(items) => {
+                toml::Value::Array(items.into_iter().filter_map(Loose::into_toml).collect())
+            }
+            Loose::Map(pairs) => toml::Value::Table(
+                pairs
+                    .into_iter()
+                    .filter_map(|(k, v)| Some((k, v.into_toml()?)))
+                    .collect(),
+            ),
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Loose {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Loose;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a spec value")
+            }
+            fn visit_unit<E>(self) -> Result<Loose, E> {
+                Ok(Loose::Null)
+            }
+            fn visit_none<E>(self) -> Result<Loose, E> {
+                Ok(Loose::Null)
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Loose, D::Error> {
+                serde::Deserialize::deserialize(d)
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Loose, E> {
+                Ok(Loose::Bool(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Loose, E> {
+                Ok(Loose::Int(v))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Loose, E> {
+                i64::try_from(v)
+                    .map(Loose::Int)
+                    .map_err(|_| E::custom(format!("{v} is too large for a spec number")))
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<Loose, E> {
+                Ok(Loose::Float(v))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Loose, E> {
+                Ok(Loose::Str(v.to_owned()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Loose, E> {
+                Ok(Loose::Str(v))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Loose, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Loose::List(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Loose, A::Error> {
+                let mut pairs = Vec::new();
+                while let Some((k, v)) = map.next_entry::<String, Loose>()? {
+                    pairs.push((k, v));
+                }
+                Ok(Loose::Map(pairs))
+            }
+        }
+        deserializer.deserialize_any(Visit)
+    }
+}
+
 /// Builds the §6.3.2 projection of `spec`, a box of the type `facts`
 /// names (BOX-071).
 ///
