@@ -1584,7 +1584,8 @@ pub(crate) struct BoxEntryExpansion {
     pub(crate) wire: boxes::wire::request::WireBoxEntry,
     /// The expanded spec over every layer, the selected loadouts included.
     /// Each of its hooks names its declarer (BOX-179). Only the tests read
-    /// it until the daemon stores this spec.
+    /// it until the daemon stores this spec. Remove the `allow` below when
+    /// gominimal/minimal#3409 (T129) lands and the daemon stores it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) spec: toml::Table,
 }
