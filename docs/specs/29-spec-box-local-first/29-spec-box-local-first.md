@@ -578,7 +578,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal missing_export_named_and_others_copied
 
-- **BOX-191** IF the copy of a file fails, reading the listing of a directory in the box fails, creating a directory fails, a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at the destination that failed, leaving no partial file and no change to what is already there, keep the files a directory export already wrote, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports. An export that wrote only part of its files counts as skipped, so BOX-193 and BOX-194 apply and BOX-195 records it as not copied.
+- **BOX-191** IF the copy of a file fails, reading the listing of a directory in the box fails, creating a directory fails, a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at the file or directory whose write failed, leaving no partial file there and no change to what was already there, keep the files a directory export already wrote at its other destinations, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports. An export that wrote only part of its files counts as skipped, so BOX-193 and BOX-194 apply and BOX-195 records it as not copied.
   tier:     T0
   verify:   cargo nextest run -p minimal failed_export_file_leaves_its_destination_unchanged
 
@@ -592,7 +592,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal skipped_export_exit125_when_task_succeeded
 
-- **BOX-194** WHEN BOX-190, BOX-191, BOX-192 or BOX-196 skips an export of a box whose entrypoint did not exit 0, or that timed out, ran out of memory or was stopped, THE SYSTEM SHALL end the command that copied with the exit code it returns without exports, so that a timeout still exits 124 (BCLI-014).
+- **BOX-194** WHEN BOX-190, BOX-191, BOX-192 or BOX-196 skips an export of a box whose entrypoint did not exit 0, or that timed out, ran out of memory or was stopped, THE SYSTEM SHALL end the command that copied with the exit code it returns without exports, so that a timeout still exits 124 (BCLI-014). BOX-199 and BOX-201 copy no export and change no exit code.
   tier:     T0
   verify:   cargo nextest run -p minimal skipped_export_keeps_failed_task_exit_code
 
@@ -618,7 +618,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald export_claim_granted_once_for_each_end
 
-- **BOX-199** IF the project root of the command that waits differs from the project root in the box's record THEN THE SYSTEM SHALL copy no export of that box, and print on stderr one line that names the box and the project folder that created it and says that its exports were not copied here.
+- **BOX-199** IF the project root of the command that waits differs from the project root in the box's record THEN THE SYSTEM SHALL copy no export of that box, decide this before it asks for the claim of BOX-198 so that it never claims the end, and print on stderr one line that names the box and the project folder that created it and says that its exports were not copied here.
   <!-- unwanted; gominimal/arch#180 ruling 3: a box's exports are copied only in the project that created it -->
   tier:     T0
   verify:   cargo nextest run -p minimal exports_not_copied_from_another_project
