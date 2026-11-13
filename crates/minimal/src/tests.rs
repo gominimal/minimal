@@ -12863,11 +12863,36 @@ async fn events_parent_follow_stops_on_a_child_that_never_opens() {
         .await;
 }
 
-// Issue 3346: a short list outage keeps the follow, a listing that works
-// starts the count again, and CHILD_LIST_TRIES failures in a row end the
-// follow with the list error.
+// Issue 3346: a new child whose read opens on its last try joins the
+// follow, and its earlier failed opens do not end the follow.
 #[tokio::test(start_paused = true)]
-async fn events_parent_follow_survives_a_short_list_outage() {
+async fn events_parent_follow_adds_a_child_that_opens_on_its_last_try() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let slow = boxes::BoxId::mint();
+            host.list_box(slow, Some(parent));
+            let tries = usize::try_from(CHILD_OPEN_TRIES - 1).unwrap();
+            host.with(|state| {
+                let fails = std::iter::repeat_with(|| FakeOpen::Fails).take(tries);
+                state.opens.insert(slow, fails.collect());
+            });
+            let (task, out, _child) = fake_follow(&host, parent, child);
+
+            tokio::time::sleep(CHILD_POLL * (CHILD_OPEN_TRIES + 2)).await;
+            assert!(!task.is_finished(), "the failed opens ended the follow");
+            assert_eq!(host.opened(slow), CHILD_OPEN_TRIES);
+            assert_eq!(boxes_in(&out), [slow.to_string()]);
+            task.abort();
+        })
+        .await;
+}
+
+// Issue 3346: a listing that works after a short outage starts the count
+// of failed listings again, so a second short outage keeps the follow.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_resets_the_list_count_after_a_listing_works() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -12885,6 +12910,31 @@ async fn events_parent_follow_survives_a_short_list_outage() {
             assert!(
                 !task.is_finished(),
                 "a working listing starts the count again"
+            );
+            host.with(|state| state.list_fails = false);
+            tokio::time::sleep(CHILD_POLL * 3).await;
+            assert!(!task.is_finished(), "the follow ended after the outage");
+            task.abort();
+        })
+        .await;
+}
+
+// Issue 3346: CHILD_LIST_TRIES failed listings in a row end the follow
+// with the list error, and one fewer does not.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_stops_after_the_list_tries() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let (task, _out, _child) = fake_follow(&host, parent, child);
+
+            tokio::time::sleep(CHILD_POLL / 2).await;
+            host.with(|state| state.list_fails = true);
+            tokio::time::sleep(CHILD_POLL * (CHILD_LIST_TRIES - 1)).await;
+            assert!(
+                !task.is_finished(),
+                "the follow stopped before the last try"
             );
 
             tokio::time::sleep(CHILD_POLL).await;
