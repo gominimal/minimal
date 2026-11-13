@@ -197,11 +197,12 @@ pub trait FetchUrl: std::fmt::Debug + Clone {
 
     fn filename(&self) -> String;
 
-    /// Where the URL points, for a span or a log line: the scheme and host
-    /// and nothing of the path or query, which may carry a token.
-    fn origin(&self) -> String {
-        format!("{self:?}")
-    }
+    /// Where the URL points, for a span or a log line: the scheme, host and
+    /// port, and nothing of the user, path or query, which may carry a
+    /// token. Each implementation says this itself, with no default: a
+    /// generic default could only print the whole URL (its `Debug`), which is
+    /// what this method exists to keep out of a span.
+    fn origin(&self) -> String;
 }
 
 impl FetchUrl for ReqwestUrl {
@@ -211,7 +212,13 @@ impl FetchUrl for ReqwestUrl {
         UpstreamReqwestUrl::join(&self.0, input).map(ReqwestUrl)
     }
     fn origin(&self) -> String {
-        format!("{}://{}", self.0.scheme(), self.0.host_str().unwrap_or(""))
+        // `port` is `None` for the scheme's default port, so a cache on a
+        // port of its own is told apart from one on the same host's default.
+        let host = self.0.host_str().unwrap_or("");
+        match self.0.port() {
+            Some(port) => format!("{}://{host}:{port}", self.0.scheme()),
+            None => format!("{}://{host}", self.0.scheme()),
+        }
     }
     fn filename(&self) -> String {
         let path = self.0.path();
@@ -571,6 +578,22 @@ mod any_backend_tests {
             bucket: "projects/_/buckets/b".into(),
             object: object.into(),
         })
+    }
+
+    /// An origin names the scheme, host and a non-default port, and nothing
+    /// of the user, path or query, where a token may be (#3223).
+    #[test]
+    fn origin_keeps_scheme_host_and_port_and_drops_user_path_and_query() {
+        let url = "https://user:pw@cache.example.com/pkgs/a.tar?token=s3cr3t#frag";
+        assert_eq!(https(url).origin(), "https://cache.example.com");
+        let url = "http://cache.example.com:8443/pkgs/a.tar?token=s3cr3t";
+        assert_eq!(https(url).origin(), "http://cache.example.com:8443");
+        // The scheme's own port is the default, so it is not repeated.
+        assert_eq!(
+            https("https://cache.example.com:443/x").origin(),
+            "https://cache.example.com"
+        );
+        assert_eq!(gcs("pkgs/a.tar").origin(), "gs://projects/_/buckets/b");
     }
 
     #[test]

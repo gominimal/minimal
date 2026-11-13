@@ -7752,6 +7752,144 @@ fn launcher_starts_session_and_task_entrypoints_from_spec_without_logging_args()
     assert_eq!(LaunchEntrypoint::Shell.arg_count(), 0);
 }
 
+/// What [`LaunchSpans`] saw of one `box.launch` span: its status code, its
+/// status description, and whether it has closed.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LaunchSpanSeen {
+    code: Option<String>,
+    description: Option<String>,
+    closed: bool,
+}
+
+/// Records each `box.launch` span's status fields, each kept apart, and its
+/// close, in the order the spans are created.
+#[derive(Clone, Default)]
+struct LaunchSpans(std::sync::Arc<std::sync::Mutex<LaunchSpanLog>>);
+
+#[derive(Default)]
+struct LaunchSpanLog {
+    spans: Vec<LaunchSpanSeen>,
+    /// The index in `spans` of each `box.launch` span, by id.
+    by_id: std::collections::HashMap<u64, usize>,
+}
+
+impl LaunchSpans {
+    fn all(&self) -> Vec<LaunchSpanSeen> {
+        self.0.lock().unwrap().spans.clone()
+    }
+}
+
+#[derive(Default)]
+struct LaunchStatusFields {
+    code: Option<String>,
+    description: Option<String>,
+}
+
+impl tracing::field::Visit for LaunchStatusFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "otel.status_code" => self.code = Some(value.to_owned()),
+            "otel.status_description" => self.description = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S> tracing_subscriber::Layer<S> for LaunchSpans
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if attrs.metadata().name() == "box.launch" {
+            let mut log = self.0.lock().unwrap();
+            let at = log.spans.len();
+            log.spans.push(LaunchSpanSeen::default());
+            log.by_id.insert(id.into_u64(), at);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = LaunchStatusFields::default();
+        values.record(&mut fields);
+        let mut log = self.0.lock().unwrap();
+        if let Some(&at) = log.by_id.get(&id.into_u64()) {
+            let seen = &mut log.spans[at];
+            if fields.code.is_some() {
+                seen.code = fields.code;
+            }
+            if fields.description.is_some() {
+                seen.description = fields.description;
+            }
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut log = self.0.lock().unwrap();
+        if let Some(at) = log.by_id.remove(&id.into_u64()) {
+            log.spans[at].closed = true;
+        }
+    }
+}
+
+// gominimal/minimal#3223: a failed launch marks its `box.launch` span with
+// the ERROR code and says why in the status description; a launch that
+// succeeds sets neither. Either way the span has closed by the time the
+// launch's result is back, so its duration is the launch's alone and not the
+// binding setup and attach hooks the caller runs next.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_launch_marks_and_explains_its_span_and_the_span_closes_with_the_launch() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let spans = LaunchSpans::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+    let entrypoint = LaunchEntrypoint::Shell;
+
+    let ok = launch_in_span(
+        launch_span(boxes::SessionId::nil(), "dev", &entrypoint),
+        async { Ok::<_, io::Error>(7) },
+    )
+    .await;
+    assert_eq!(ok.unwrap(), 7);
+    assert_eq!(
+        spans.all(),
+        [LaunchSpanSeen {
+            code: None,
+            description: None,
+            closed: true,
+        }],
+        "a launch that succeeds sets no status and its span has closed"
+    );
+
+    let failed = launch_in_span(
+        launch_span(boxes::SessionId::nil(), "dev", &entrypoint),
+        async { Err::<(), _>(io::Error::other("no such file: /usr/bin/bash")) },
+    )
+    .await;
+    let err = failed.expect_err("the launch's error goes up unchanged");
+    assert_eq!(err.to_string(), "no such file: /usr/bin/bash");
+    assert_eq!(
+        spans.all()[1],
+        LaunchSpanSeen {
+            code: Some("ERROR".to_owned()),
+            description: Some("no such file: /usr/bin/bash".to_owned()),
+            closed: true,
+        },
+        "a failed launch's span carries the code and the reason, and has closed"
+    );
+}
+
 // T42, T43: one launcher reads the box's first process from its spec. A
 // session's spec starts its login shell. A task's spec starts its argv,
 // except on a launch minted only for hooks, which holds the shell.

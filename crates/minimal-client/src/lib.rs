@@ -2905,24 +2905,42 @@ mod rpc_status_tests {
         }
     }
 
-    /// Records each `client.rpc` span's `otel.status_code`, if it gets one,
-    /// in the order the spans are created.
+    /// Records each `client.rpc` span's `otel.status_code` and
+    /// `otel.status_description`, each kept apart, in the order the spans
+    /// are created.
     #[derive(Clone, Default)]
     struct Statuses(Arc<Mutex<StatusLog>>);
 
+    /// One span's status as recorded: its code and its description.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct Status {
+        code: Option<String>,
+        description: Option<String>,
+    }
+
+    impl Status {
+        /// The status of a failed span that says `why`.
+        fn error(why: &str) -> Self {
+            Status {
+                code: Some("ERROR".to_owned()),
+                description: Some(why.to_owned()),
+            }
+        }
+    }
+
     #[derive(Default)]
     struct StatusLog {
-        statuses: Vec<Option<String>>,
+        statuses: Vec<Status>,
         /// The index in `statuses` of each open `client.rpc` span, by id.
         by_id: std::collections::HashMap<u64, usize>,
     }
 
-    struct StatusField(Option<String>);
-
-    impl tracing::field::Visit for StatusField {
+    impl tracing::field::Visit for Status {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "otel.status_code" {
-                self.0 = Some(value.to_owned());
+            match field.name() {
+                "otel.status_code" => self.code = Some(value.to_owned()),
+                "otel.status_description" => self.description = Some(value.to_owned()),
+                _ => {}
             }
         }
 
@@ -2939,7 +2957,7 @@ mod rpc_status_tests {
             if attrs.metadata().name() == "client.rpc" {
                 let mut log = self.0.lock().unwrap();
                 let at = log.statuses.len();
-                log.statuses.push(None);
+                log.statuses.push(Status::default());
                 log.by_id.insert(id.into_u64(), at);
             }
         }
@@ -2950,19 +2968,27 @@ mod rpc_status_tests {
             values: &tracing::span::Record<'_>,
             _: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            let mut field = StatusField(None);
-            values.record(&mut field);
+            let mut recorded = Status::default();
+            values.record(&mut recorded);
             let mut log = self.0.lock().unwrap();
-            if let (Some(status), Some(&at)) = (field.0, log.by_id.get(&id.into_u64())) {
-                log.statuses[at] = Some(status);
+            if let Some(&at) = log.by_id.get(&id.into_u64()) {
+                let status = &mut log.statuses[at];
+                if recorded.code.is_some() {
+                    status.code = recorded.code;
+                }
+                if recorded.description.is_some() {
+                    status.description = recorded.description;
+                }
             }
         }
     }
 
     /// A `client.rpc` span carries the ERROR status when the daemon refuses
     /// the call (`Errorable::Err` or a `SubmitVerdict` fault), when the
-    /// reply does not decode, and when the call times out; a successful
-    /// reply leaves it unset.
+    /// reply does not decode, and when the call times out, and its status
+    /// description says which (gominimal/minimal#3223): a refusal says the
+    /// daemon refused, a failure carries the error the caller gets. A
+    /// successful reply sets neither.
     #[tokio::test(flavor = "current_thread")]
     async fn a_refused_failed_or_timed_out_rpc_marks_its_span() {
         use boxes::wire::{errors::WireError, request::BoxStep};
@@ -3053,7 +3079,7 @@ mod rpc_status_tests {
         let undecodable = client
             .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
             .await;
-        assert!(undecodable.is_err());
+        let undecodable = format!("{:#}", undecodable.expect_err("the reply does not decode"));
 
         *reply.lock().unwrap() = Reply::Hang;
         let timed_out = client
@@ -3062,13 +3088,22 @@ mod rpc_status_tests {
                 std::time::Duration::from_millis(200),
             )
             .await;
-        let err = timed_out.expect_err("a call nobody answers times out");
-        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        let timed_out = format!(
+            "{:#}",
+            timed_out.expect_err("a call nobody answers times out")
+        );
+        assert!(timed_out.contains("timed out"), "{timed_out}");
 
-        let error = Some("ERROR".to_owned());
+        let refused = Status::error("the daemon refused the request");
         assert_eq!(
             statuses.0.lock().unwrap().statuses,
-            [None, error.clone(), error.clone(), error.clone(), error]
+            [
+                Status::default(),
+                refused.clone(),
+                refused,
+                Status::error(&undecodable),
+                Status::error(&timed_out),
+            ]
         );
         drop(client);
         server.abort();

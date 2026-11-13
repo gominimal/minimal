@@ -986,6 +986,9 @@ mod tests {
         fn filename(&self) -> String {
             self.0.rsplit('/').next().unwrap_or(&self.0).to_string()
         }
+        fn origin(&self) -> String {
+            "mock://cache".to_string()
+        }
     }
 
     #[derive(Debug)]

@@ -687,6 +687,25 @@ pub(crate) fn launch_span(
     span
 }
 
+/// Runs a launch inside its `box.launch` span (from [`launch_span`]) and
+/// closes the span when the launch completes. A launch that failed marks the
+/// span and says why in its status (gominimal/minimal#3223) before the error
+/// goes up. The span is taken by value, so no handle outlives the launch: the
+/// span's duration is the launch's, not the binding setup and attach hooks
+/// that follow it.
+pub(crate) async fn launch_in_span<T, E: std::fmt::Display>(
+    span: tracing::Span,
+    launch: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let launched = tracing::Instrument::instrument(launch, span.clone()).await;
+    if let Err(e) = &launched {
+        span.record("otel.status_code", "ERROR");
+        span.record("otel.status_description", format!("{e:#}").as_str());
+    }
+    drop(span);
+    launched
+}
+
 /// Places the grants' sealed values in a launch's connection layer
 /// (BEP-007), before the launcher builds the shell from `attach_env`, so the
 /// values exist before the shell's entrypoint runs. Returns the placed
@@ -1289,8 +1308,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // One span per launch, naming the entrypoint the launcher read from
         // the box's spec, so the daemon log says what each launch started.
         let entrypoint = launcher.entrypoint()?;
-        let launch_span = launch_span(session_id, &session_name, &entrypoint);
-        let launched = tracing::Instrument::instrument(
+        // The span closes when the launch completes, marked and explained
+        // if it failed.
+        let launched = launch_in_span(
+            launch_span(session_id, &session_name, &entrypoint),
             launcher.launch(
                 crate::guest::is_microvm_daemon(),
                 session_id,
@@ -1299,15 +1320,8 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 paths,
                 sz,
             ),
-            launch_span.clone(),
         )
         .await;
-        // A launch that failed marks its span and says why in the status
-        // (gominimal/minimal#3223), before the error goes up.
-        if let Err(e) = &launched {
-            launch_span.record("otel.status_code", "ERROR");
-            launch_span.record("otel.status_description", format!("{e:#}").as_str());
-        }
         let Launched {
             master,
             process,
