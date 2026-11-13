@@ -1358,7 +1358,12 @@ impl BoxActor {
                 _ => scaffold(),
             }?;
         }
-        let ctx = mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())?;
+        let mut ctx =
+            mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())?;
+        // inbox#1245: the box controls everything under its workspace, so an
+        // edit of its minimal.toml (`min add` in the box) must not follow a
+        // link there to a file outside the workspace.
+        ctx.confine_mfile_edits_to(wsp.as_utf8_path().into());
         // NET-155: an own-address box has no classifier leaf. Every package
         // build its context starts, the activation launch's among them,
         // attaches to a network of the box's own, under the box's egress
