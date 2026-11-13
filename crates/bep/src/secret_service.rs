@@ -325,10 +325,12 @@ fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drain {
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) => break,
-                    Ok(n) => shared
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .extend_from_slice(&chunk[..n]),
+                    Ok(n) => append(
+                        &mut shared
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        &chunk[..n],
+                    ),
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
@@ -338,6 +340,20 @@ fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drain {
         let _ = tx.send(());
     });
     Drain { buf, done }
+}
+
+/// Appends `bytes` to `buf`. When `buf` must grow, the bytes move to a
+/// new allocation and the old one is zeroed before it is freed, so no
+/// copy of a key read from `secret-tool` stays in freed memory.
+fn append(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let needed = buf.len() + bytes.len();
+    if needed > buf.capacity() {
+        let mut grown = Vec::with_capacity(needed.max(buf.capacity() * 2));
+        grown.extend_from_slice(buf);
+        zeroize::Zeroize::zeroize(buf);
+        *buf = grown;
+    }
+    buf.extend_from_slice(bytes);
 }
 
 /// The error for a `secret-tool` run that failed with `out`.
@@ -498,6 +514,16 @@ mod tests {
 
     use super::*;
     use crate::keys::{StartError, load};
+
+    #[test]
+    fn append_keeps_every_byte_across_growth() {
+        let mut buf = Vec::new();
+        for chunk in [b"abc".as_slice(), b"defgh", &[b'x'; 5000]] {
+            append(&mut buf, chunk);
+        }
+        assert_eq!(&buf[..8], b"abcdefgh");
+        assert_eq!(buf.len(), 8 + 5000);
+    }
 
     /// A fake `secret-tool` that keeps each item in a file under `dir`. A
     /// `locked` or `unreachable` file in `dir` makes every call fail as
