@@ -5115,6 +5115,13 @@ int main(int argc, char **argv) {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_with_cancel_starts_in_the_given_dir() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping run_with_cancel_starts_in_the_given_dir: this host denies the \
+                 unprivileged user namespace every sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
         let Some(base_dir) = sandbox_base_dir() else {
             eprintln!("no directory on this host can hold a sandbox — skipping");
             return;

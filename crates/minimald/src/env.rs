@@ -6301,6 +6301,15 @@ exit $rc
     /// line for a task that fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_task_relays_exit_through_both_paths() {
+        // A host that denies the unprivileged user namespace (stock Ubuntu
+        // 24.04+ runners) cannot start the sandbox a task runs in.
+        if let Some(reason) = sandbox::user_namespaces_restriction() {
+            eprintln!(
+                "skipping run_task_relays_exit_through_both_paths: this host denies the \
+                 unprivileged user namespace every sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
         let Some(base) = sandbox_base_dir() else {
             eprintln!("no directory on this host can hold a sandbox — skipping");
             return;
