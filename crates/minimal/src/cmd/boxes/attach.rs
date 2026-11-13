@@ -208,8 +208,8 @@ async fn box_via_ssh_with(
 ) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow. The interactive path resolves the
-    // session-key config from `config_dir` and forwards it per channel; the
-    // exec path has no detach and passes `None`.
+    // session-key config from `config_dir` and forwards it per channel. The
+    // `wire` path sends no session keys.
     let session_keys = if wire.is_none() {
         Some(minimal_client::attach::resolve_session_keys(config_dir)?)
     } else {
