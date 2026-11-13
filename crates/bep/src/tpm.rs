@@ -340,32 +340,47 @@ const TOOL_DEADLINE: Duration = Duration::from_secs(120);
 /// How often the store looks whether a running command finished.
 const TOOL_POLL: Duration = Duration::from_millis(5);
 
-/// Removes the `.work-<pid>-<n>` directories in `dir` whose process is
-/// gone. A proxy that was killed leaves its work directories behind, with
-/// copies of key blobs and saved contexts in them.
+/// Removes the `.work-<pid>-<n>` directories and the `<file>.tmp-<pid>`
+/// files in `dir` whose process is gone. A proxy that was killed leaves its
+/// work directories behind, with copies of key blobs and saved contexts in
+/// them. A proxy killed inside `write_private` leaves a temporary file,
+/// with an authorization value in it.
 fn sweep_work_dirs(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(".work-"))
-            .and_then(|rest| rest.split_once('-'))
-            .and_then(|(pid, _)| pid.parse::<u32>().ok())
-        else {
+        let Some(name) = name.to_str() else {
             continue;
+        };
+        let work_pid = name
+            .strip_prefix(".work-")
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok());
+        let tmp_pid = name
+            .rsplit_once(".tmp-")
+            .filter(|(stem, _)| !stem.is_empty())
+            .and_then(|(_, pid)| pid.parse::<u32>().ok());
+        let (pid, is_dir) = match (work_pid, tmp_pid) {
+            (Some(pid), _) => (pid, true),
+            (None, Some(pid)) => (pid, false),
+            (None, None) => continue,
         };
         if pid == std::process::id() || Path::new("/proc").join(pid.to_string()).exists() {
             continue;
         }
-        match fs::remove_dir_all(entry.path()) {
+        let removed = if is_dir {
+            fs::remove_dir_all(entry.path())
+        } else {
+            fs::remove_file(entry.path())
+        };
+        match removed {
             Ok(()) => {
-                tracing::debug!(path = %entry.path().display(), "removed a stale TPM work directory")
+                tracing::debug!(path = %entry.path().display(), "removed a stale TPM work file")
             }
             Err(err) => {
-                tracing::warn!(path = %entry.path().display(), %err, "could not remove a stale TPM work directory")
+                tracing::warn!(path = %entry.path().display(), %err, "could not remove a stale TPM work file")
             }
         }
     }
@@ -1171,6 +1186,27 @@ mod tests {
         assert!(!stale.exists());
         assert!(live.exists());
         assert!(work.0.exists());
+    }
+
+    // A temporary file that a proxy killed inside `write_private` left
+    // behind holds an authorization value. It goes away with the stale
+    // work directories. A live process keeps its own.
+    #[test]
+    fn a_stale_temporary_auth_file_is_swept_when_the_store_opens_a_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TpmStore::new(dir.path().to_path_buf(), DEVICE_TCTI);
+        let stale = dir.path().join("sealing.auth.tmp-4294967294");
+        let live = dir
+            .path()
+            .join(format!("sealing.auth.tmp-{}", std::process::id()));
+        let other = dir.path().join("sealing.auth");
+        for path in [&stale, &live, &other] {
+            fs::write(path, b"auth").expect("write");
+        }
+        let _work = store.work_dir().expect("work dir");
+        assert!(!stale.exists());
+        assert!(live.exists());
+        assert!(other.exists());
     }
 
     // A proxy that dies between the two renames of a move leaves the key
