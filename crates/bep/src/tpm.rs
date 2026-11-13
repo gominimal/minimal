@@ -519,6 +519,9 @@ impl ToolError {
 pub struct TpmStore {
     dir: PathBuf,
     tcti: String,
+    /// The directory of the `tpm2-tools` commands, or `None` to find them
+    /// on `PATH`. Only a test sets it.
+    tools: Option<PathBuf>,
 }
 
 static WORK_DIRS: AtomicU64 = AtomicU64::new(0);
@@ -606,6 +609,7 @@ impl TpmStore {
         Self {
             dir,
             tcti: tcti.into(),
+            tools: None,
         }
     }
 
@@ -687,7 +691,11 @@ impl TpmStore {
         stdin: Option<&[u8]>,
         deadline: Duration,
     ) -> Result<(), ToolError> {
-        let mut child = Command::new(tool)
+        let program = match &self.tools {
+            Some(dir) => dir.join(tool),
+            None => PathBuf::from(tool),
+        };
+        let mut child = Command::new(program)
             .args(args)
             .env("TPM2TOOLS_TCTI", &self.tcti)
             .stdin(if stdin.is_some() {
@@ -911,9 +919,15 @@ impl TpmStore {
         self.open(role, &bytes, auth).map_err(|err| {
             let _ = fs::remove_file(&key_path);
             let _ = fs::remove_file(&auth_path);
+            // The files are gone, so the key is neither kept nor lost: a
+            // failed generation is a store error, as `KeyStore::generate_in`
+            // promises. The start sorting applies only to a stored key.
             match err {
+                KeyError::Store { .. } => err,
                 KeyError::Refused { detail, .. } => store_err(detail),
-                other => other,
+                KeyError::TpmKept { case, .. } => store_err(case.to_string()),
+                KeyError::TpmLost { case, .. } => store_err(case.to_string()),
+                other => store_err(other.to_string()),
             }
         })
     }
@@ -1724,6 +1738,62 @@ mod tests {
                 },
             }
         );
+    }
+
+    /// Writes an executable shell script `name` in `dir`.
+    fn fake_tool(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake tool");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake tool");
+    }
+
+    // BEP-089: the kept and lost sorting is for a stored key at start. A new
+    // key that the TPM does not load is a failed generation, a store error,
+    // and its files are gone.
+    #[test]
+    fn a_tpm_key_the_tpm_cannot_load_refuses_start_but_a_new_one_is_a_store_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tools = dir.path().join("tools");
+        fs::create_dir(&tools).expect("tools dir");
+        let role = Role::Sealing;
+        let public = tools.join("new.pub");
+        let private = tools.join("new.priv");
+        fs::write(
+            &public,
+            public_area(key_template(role).attributes, &some_public()),
+        )
+        .expect("write public");
+        fs::write(&private, [0, 3, 1, 2, 3]).expect("write private");
+        fake_tool(&tools, "tpm2_createprimary", "exit 0");
+        fake_tool(
+            &tools,
+            "tpm2_create",
+            &format!(
+                "cat >/dev/null\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -u) cp '{}' \"$2\"; shift ;;\n    -r) cp '{}' \"$2\"; shift ;;\n  esac\n  shift\ndone",
+                public.display(),
+                private.display()
+            ),
+        );
+        // TPM_RC_INTEGRITY: at start, this response loses a stored key.
+        fake_tool(
+            &tools,
+            "tpm2_load",
+            "echo 'ERROR: Esys_Load(0x1DF) - tpm:parameter(1):integrity check failed ErrorCode (0x000001df)' >&2\nexit 1",
+        );
+        let mut store = TpmStore::new(dir.path().join("keys"), DEVICE_TCTI);
+        store.tools = Some(tools);
+
+        let err = match store.generate_in(role, Slot::Held) {
+            Err(err) => err,
+            Ok(_) => panic!("expected the generation to fail"),
+        };
+        let KeyError::Store { role: got, detail } = &err else {
+            panic!("expected a store error, got {err:?}");
+        };
+        assert_eq!(*got, role);
+        assert!(detail.contains("0x000001df"), "{detail}");
+        assert!(!store.key_path(role, Slot::Held).exists());
+        assert!(!store.auth_path(role, Slot::Held).exists());
     }
 
     // BEP-089: a missing key file, a missing authorization file, and a key
