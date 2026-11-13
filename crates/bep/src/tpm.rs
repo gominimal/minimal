@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
-use crate::keys::{HeldKey, KeyError, KeyStore, Role, Slot};
+use crate::keys::{HeldKey, KeyError, KeyStore, Role, Slot, TpmKept, TpmLost};
 use crate::seal::ProxyPublicKey;
 
 /// The TCTI the store uses on a host: the kernel's resource manager, which
@@ -172,6 +172,72 @@ fn is_auth_failure(code: &str) -> bool {
     // number is in bits 0 to 5. Bit 6 and bits 8 to 11 name the parameter
     // or the session.
     rc >> 16 == 0 && matches!(rc & 0xbf, 0xa2 | 0x8e)
+}
+
+/// Whether a TPM response code says that no TPM can load the key file:
+/// `TPM_RC_INTEGRITY` or `TPM_RC_HIERARCHY`, for any handle or parameter.
+/// The key file then belongs to a TPM that was cleared, or to another TPM
+/// (BEP-089).
+fn is_lost_key(code: &str) -> bool {
+    let Some(rc) = code
+        .strip_prefix("0x")
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+    else {
+        return false;
+    };
+    // As in `is_auth_failure`: layer 0, format one, error number 0x1f or 0x05.
+    rc >> 16 == 0 && matches!(rc & 0xbf, 0x9f | 0x85)
+}
+
+/// Sorts a failed load of a key at start (BEP-089). Only an integrity or a
+/// hierarchy error loses the key. Every other failure keeps it: a TPM that
+/// cannot be reached, that is not ready, or that answers with a temporary
+/// response such as `TPM_RC_OBJECT_MEMORY` or `TPM_RC_RETRY` can load the
+/// key later, and a replacement would throw away a key that still works.
+fn load_error(role: Role, err: ToolError) -> KeyError {
+    match err {
+        ToolError::Tpm(detail) => {
+            let code = detail.rsplit(' ').next().unwrap_or_default();
+            let response = format!("TPM response code {code}");
+            if is_lost_key(code) {
+                KeyError::TpmLost {
+                    role,
+                    case: TpmLost::NotThisTpm { response },
+                }
+            } else {
+                KeyError::TpmKept {
+                    role,
+                    case: TpmKept::Unavailable { response },
+                }
+            }
+        }
+        ToolError::Other(response) => KeyError::TpmKept {
+            role,
+            case: TpmKept::Unavailable { response },
+        },
+    }
+}
+
+/// Sorts a failed read of a key file or an authorization file at start
+/// (BEP-089). A missing file loses the key, and a file the proxy's user
+/// cannot read keeps it.
+fn read_error(role: Role, path: &Path, err: &io::Error, missing: TpmLost) -> KeyError {
+    match err.kind() {
+        io::ErrorKind::NotFound => KeyError::TpmLost {
+            role,
+            case: missing,
+        },
+        io::ErrorKind::PermissionDenied => KeyError::TpmKept {
+            role,
+            case: TpmKept::Unreadable {
+                path: path.to_path_buf(),
+            },
+        },
+        _ => KeyError::Store {
+            role,
+            detail: format!("did not read {}: {err}", path.display()),
+        },
+    }
 }
 
 /// The directory, in memory, for the files that hold an ECDH shared secret:
@@ -734,14 +800,31 @@ impl TpmStore {
     }
 
     fn read_key(&self, role: Role, slot: Slot) -> Result<Option<Vec<u8>>, KeyError> {
-        match fs::read(self.key_path(role, slot)) {
+        let path = self.key_path(role, slot);
+        match fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(KeyError::Store {
+            Err(err) => Err(read_error(
                 role,
-                detail: format!("did not read the TPM key file: {err}"),
-            }),
+                &path,
+                &err,
+                TpmLost::MissingKeyFile { path: path.clone() },
+            )),
         }
+    }
+
+    /// Whether the held key's file is missing beside its authorization
+    /// file, with no key file in a side slot that a move can bring back.
+    fn lost_key_file(&self, role: Role) -> Result<bool, KeyError> {
+        let exists = |path: PathBuf| {
+            path.try_exists().map_err(|err| KeyError::Store {
+                role,
+                detail: format!("did not check for {}: {err}", path.display()),
+            })
+        };
+        Ok(exists(self.auth_path(role, Slot::Held))?
+            && !exists(self.key_path(role, Slot::New))?
+            && !exists(self.key_path(role, Slot::Old))?)
     }
 
     fn open(&self, role: Role, bytes: &[u8], auth: Zeroizing<Vec<u8>>) -> Result<TpmKey, KeyError> {
@@ -898,12 +981,19 @@ impl TpmKey {
         self.work.0.join("key.ctx")
     }
 
+    /// Loads the key at start. A key that does not load is kept or lost
+    /// (BEP-089).
     fn load(&self) -> Result<(), KeyError> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.reload(&mut state)
+        state.0 = false;
+        self.store
+            .load_into(&self.blob, &self.work.0, &self.context())
+            .map_err(|err| load_error(self.role, err))?;
+        state.0 = true;
+        Ok(())
     }
 
     fn reload(&self, state: &mut Loaded) -> Result<(), KeyError> {
@@ -1076,14 +1166,30 @@ impl KeyStore for TpmStore {
     fn find(&self, role: Role) -> Result<Option<TpmKey>, KeyError> {
         self.recover_auth(role, Slot::Held)?;
         let Some(bytes) = self.read_key(role, Slot::Held)? else {
+            // BEP-089: an authorization file alone is a key whose key file
+            // is gone. A move that stopped part way leaves the key file in
+            // a side slot, and the start moves it back.
+            if self.lost_key_file(role)? {
+                return Err(KeyError::TpmLost {
+                    role,
+                    case: TpmLost::MissingKeyFile {
+                        path: self.key_path(role, Slot::Held),
+                    },
+                });
+            }
             return Ok(None);
         };
-        let auth = fs::read(self.auth_path(role, Slot::Held))
-            .map(Zeroizing::new)
-            .map_err(|err| KeyError::Refused {
+        let auth_path = self.auth_path(role, Slot::Held);
+        let auth = fs::read(&auth_path).map(Zeroizing::new).map_err(|err| {
+            read_error(
                 role,
-                detail: format!("did not read the TPM key's authorization file: {err}"),
-            })?;
+                &auth_path,
+                &err,
+                TpmLost::MissingAuthFile {
+                    path: auth_path.clone(),
+                },
+            )
+        })?;
         let key = self.open(role, &bytes, auth)?;
         tracing::info!(
             role = %role,
@@ -1527,5 +1633,199 @@ mod tests {
         let raw = [7u8; 64];
         let der = der_signature(&raw).expect("der");
         assert_eq!(der_signature(&der).expect("der"), der);
+    }
+
+    /// A key file and an authorization file for `role` in the held slot,
+    /// as `tpm2_create` and the store write them.
+    fn write_key_files(store: &TpmStore, role: Role) {
+        let mut file = public_area(key_template(role).attributes, &some_public());
+        file.extend_from_slice(&[0, 3, 1, 2, 3]);
+        fs::write(store.key_path(role, Slot::Held), file).expect("write key file");
+        fs::write(store.auth_path(role, Slot::Held), [7u8; AUTH_LEN]).expect("write auth file");
+    }
+
+    fn start_error(store: &TpmStore) -> crate::keys::StartError {
+        match crate::keys::load(store, &[]) {
+            Err(err) => err,
+            Ok(_) => panic!("expected the start to be refused"),
+        }
+    }
+
+    // BEP-089: a TPM that cannot be reached, or that answers that it cannot
+    // load an object now, keeps the key and names no replacement.
+    #[test]
+    fn an_unreachable_tpm_refuses_start_and_keeps_the_key() {
+        use crate::keys::StartError;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No TPM answers at this path. Whether or not `tpm2-tools` is
+        // installed, the load fails before a TPM answers.
+        let store = TpmStore::new(dir.path().to_path_buf(), "device:/nonexistent/tpmrm0");
+        write_key_files(&store, Role::Sealing);
+        let err = start_error(&store);
+        let StartError::TpmKept {
+            role: Role::Sealing,
+            case: TpmKept::Unavailable { response },
+        } = &err
+        else {
+            panic!("expected a kept key, got {err:?}");
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The proxy did not start: the TPM cannot load the proxy's sealing key now ({response}). The key is kept; start the proxy again when the TPM is available."
+            )
+        );
+        assert!(!err.to_string().contains("--replace-key"));
+        assert!(store.key_path(Role::Sealing, Slot::Held).exists());
+        assert!(store.auth_path(Role::Sealing, Slot::Held).exists());
+
+        // A temporary response keeps the key too, as does any response
+        // that does not say the key is lost.
+        for code in ["0x00000902", "0x00000922", "0x00000100", "0x000009a2"] {
+            let err = load_error(
+                Role::Root,
+                ToolError::Tpm(format!("tpm2_load failed with TPM response code {code}")),
+            );
+            assert_eq!(
+                err,
+                KeyError::TpmKept {
+                    role: Role::Root,
+                    case: TpmKept::Unavailable {
+                        response: format!("TPM response code {code}"),
+                    },
+                }
+            );
+            assert_eq!(
+                StartError::from_store(err).to_string(),
+                format!(
+                    "The proxy did not start: the TPM cannot load the proxy's root key now (TPM response code {code}). The key is kept; start the proxy again when the TPM is available."
+                )
+            );
+        }
+    }
+
+    // BEP-089: a missing key file, a missing authorization file, and a key
+    // file that the TPM refuses as not its own are lost keys. Each refusal
+    // names the replacement for its role.
+    #[test]
+    fn a_tpm_key_the_tpm_cannot_load_refuses_start() {
+        use crate::keys::StartError;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TpmStore::new(dir.path().to_path_buf(), "device:/nonexistent/tpmrm0");
+
+        write_key_files(&store, Role::Root);
+        let auth = store.auth_path(Role::Root, Slot::Held);
+        fs::remove_file(&auth).expect("rm auth");
+        let err = start_error(&store);
+        assert_eq!(
+            err,
+            StartError::TpmLost {
+                role: Role::Root,
+                case: TpmLost::MissingAuthFile { path: auth.clone() },
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The proxy did not start: the authorization file of the proxy's root key is missing: {}. Run `bep --replace-key root` to make a new one. Boxes created before then must be re-created.",
+                auth.display()
+            )
+        );
+
+        write_key_files(&store, Role::Root);
+        let key = store.key_path(Role::Root, Slot::Held);
+        fs::remove_file(&key).expect("rm key");
+        let err = start_error(&store);
+        assert_eq!(
+            err,
+            StartError::TpmLost {
+                role: Role::Root,
+                case: TpmLost::MissingKeyFile { path: key.clone() },
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The proxy did not start: the key file of the proxy's root key is missing: {}. Run `bep --replace-key root` to make a new one. Boxes created before then must be re-created.",
+                key.display()
+            )
+        );
+        // The refusal removes nothing.
+        assert!(auth.exists());
+
+        // TPM_RC_INTEGRITY and TPM_RC_HIERARCHY, for any parameter or
+        // handle, say the key file is not this TPM's.
+        for code in ["0x0000009f", "0x000001df", "0x00000085", "0x000002c5"] {
+            let err = load_error(
+                Role::Signing,
+                ToolError::Tpm(format!("tpm2_load failed with TPM response code {code}")),
+            );
+            assert_eq!(
+                err,
+                KeyError::TpmLost {
+                    role: Role::Signing,
+                    case: TpmLost::NotThisTpm {
+                        response: format!("TPM response code {code}"),
+                    },
+                }
+            );
+            assert_eq!(
+                StartError::from_store(err).to_string(),
+                "The proxy did not start: this TPM no longer holds the proxy's signing key. Run `bep --replace-key signing` to make a new one. Boxes created before then must be re-created."
+            );
+        }
+    }
+
+    // BEP-089: a key file or an authorization file that the proxy's user
+    // cannot read is intact, so the start keeps the key and names no
+    // replacement.
+    #[test]
+    fn an_unreadable_tpm_key_file_refuses_start_and_keeps_the_key() {
+        use crate::keys::StartError;
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let path = PathBuf::from("/home/u/.minimal/bep/tpm/sealing.auth");
+        let err = read_error(
+            Role::Sealing,
+            &path,
+            &denied,
+            TpmLost::MissingAuthFile { path: path.clone() },
+        );
+        assert_eq!(
+            StartError::from_store(err).to_string(),
+            "The proxy did not start: this user cannot read /home/u/.minimal/bep/tpm/sealing.auth, which holds the proxy's sealing key. The key is kept."
+        );
+
+        // Through a start, for each of the two files. Mode bits do not stop
+        // root, so this half runs only for another user.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TpmStore::new(dir.path().to_path_buf(), "device:/nonexistent/tpmrm0");
+        write_key_files(&store, Role::Sealing);
+        for path in [
+            store.key_path(Role::Sealing, Slot::Held),
+            store.auth_path(Role::Sealing, Slot::Held),
+        ] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod");
+            if fs::read(&path).is_ok() {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+                continue;
+            }
+            let err = start_error(&store);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+            assert_eq!(
+                err,
+                StartError::TpmKept {
+                    role: Role::Sealing,
+                    case: TpmKept::Unreadable { path: path.clone() },
+                }
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "The proxy did not start: this user cannot read {}, which holds the proxy's sealing key. The key is kept.",
+                    path.display()
+                )
+            );
+            assert!(path.exists());
+        }
     }
 }
