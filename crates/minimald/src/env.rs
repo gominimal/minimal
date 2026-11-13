@@ -3604,24 +3604,56 @@ fn relayed_exit_code(result: &Result<(), Error>) -> Option<u8> {
 /// runs here.
 ///
 /// `Env::run` gives a task no stdin either, so a run whose helper forwards
-/// its stdin runs here too (T123). With `stdin`, the first invocation gets
-/// a stdin pipe, the channel sends the helper `stdin:`, and the copy of the
-/// forwarded stdin to the pipe goes into `stdin`. Only the first invocation
-/// of a multi-invocation task gets the forwarded stdin. The later
-/// invocations get none. https://github.com/gominimal/minimal/issues/3094
-/// tracks this gap.
+/// its stdin runs here too (T123). With `stdin`, the channel sends the
+/// helper `stdin:`, and the copy of the forwarded stdin to one pipe goes
+/// into `stdin`. Each invocation reads that pipe in turn, so an invocation
+/// reads the input that the invocations before it left unread (#3094).
 async fn run_invocations_in(
     env: &mut mctx::Env<'_>,
     invocations: Vec<sandbox::config::Invocation>,
     dir: Option<&str>,
     stream: &UnixStream,
     err_tag: &'static str,
-    mut stdin: Option<&mut Option<crate::exec::ForwardedStdin>>,
+    stdin: Option<&mut Option<crate::exec::ForwardedStdin>>,
 ) -> Result<(), Error> {
     let io = |what: &'static str| move |e: std::io::Error| Error::IO(what, Default::default(), e);
     let shared = Arc::new(Mutex::new(
         stream.try_clone().map_err(io("creating writers"))?,
     ));
+    let Some(slot) = stdin else {
+        return run_each_invocation(env, invocations, dir, &shared, err_tag, None).await;
+    };
+    let (forwarded, task_stdin) =
+        crate::exec::ForwardedStdin::start_pipe(stream).map_err(|e| forwarded_stdin_error(&e))?;
+    let forwarded = slot.insert(forwarded);
+    {
+        // The helper sends its stdin only after this line, so the request
+        // line the listener read is all it read.
+        let mut stream = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = writeln!(stream, "stdin:");
+    }
+    let result =
+        run_each_invocation(env, invocations, dir, &shared, err_tag, Some(&task_stdin)).await;
+    // The last invocation ended, so a read of the forwarded stdin that fails
+    // now does not fail the run. With the read end closed, the copy drops
+    // the rest of the input.
+    forwarded.task_ended();
+    drop(task_stdin);
+    result
+}
+
+/// The loop of [`run_invocations_in`]. Each invocation gets a copy of
+/// `task_stdin` as its stdin, if there is one.
+async fn run_each_invocation(
+    env: &mut mctx::Env<'_>,
+    invocations: Vec<sandbox::config::Invocation>,
+    dir: Option<&str>,
+    shared: &Arc<Mutex<UnixStream>>,
+    err_tag: &'static str,
+    task_stdin: Option<&std::io::PipeReader>,
+) -> Result<(), Error> {
     for (idx, invocation) in invocations.iter().enumerate() {
         // One plan, container and attach per invocation: hakoniwa unshares
         // per spawn, so each one needs its own network.
@@ -3631,9 +3663,9 @@ async fn run_invocations_in(
         if let Some(dir) = dir {
             cmd.current_dir(dir);
         }
-        let mut stdin = stdin.as_deref_mut().filter(|_| idx == 0);
-        if stdin.is_some() {
-            cmd.stdin(hakoniwa::Stdio::piped());
+        if let Some(reader) = task_stdin {
+            let reader = reader.try_clone().map_err(|e| forwarded_stdin_error(&e))?;
+            cmd.stdin(hakoniwa::Stdio::from(reader));
         }
         cmd.stdout(hakoniwa::Stdio::MakePipe);
         cmd.stderr(hakoniwa::Stdio::MakePipe);
@@ -3647,34 +3679,6 @@ async fn run_invocations_in(
                 return Err(e.into());
             }
         };
-        if let Some(slot) = stdin.as_deref_mut() {
-            let started = match child.stdin.take() {
-                Some(pipe) => crate::exec::ForwardedStdin::start(
-                    stream,
-                    std::fs::File::from(std::os::fd::OwnedFd::from(pipe)),
-                ),
-                None => Err(std::io::Error::other("the task has no stdin pipe")),
-            };
-            match started {
-                Ok(forwarded) => {
-                    *slot = Some(forwarded);
-                    // The helper sends its stdin only after this line, so
-                    // the request line the listener read is all it read.
-                    let mut stream = shared
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let _ = writeln!(stream, "stdin:");
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(guard) = guard {
-                        guard.teardown().await;
-                    }
-                    return Err(forwarded_stdin_error(&e));
-                }
-            }
-        }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let (out, err) = (shared.clone(), shared.clone());
@@ -3686,11 +3690,6 @@ async fn run_invocations_in(
             child.wait()
         })
         .await;
-        // The task ended, so a read of the forwarded stdin that fails now
-        // does not fail the run.
-        if let Some(Some(forwarded)) = stdin.as_deref() {
-            forwarded.task_ended();
-        }
         if let Some(guard) = guard {
             guard.teardown().await;
         }
@@ -5295,37 +5294,50 @@ exit $rc
     /// [`crate::exec::ForwardedStdin`], its stdout as `msg:` lines and its
     /// stderr as `err:` lines, then its exit code and the close.
     fn serve_task(script: &'static str) -> impl FnOnce(UnixStream, String) + Send + 'static {
+        serve_invocations(vec![script])
+    }
+
+    /// [`serve_task`] for a task with one invocation per script. As in
+    /// `run_invocations_in`, the invocations read one forwarded stdin pipe
+    /// in turn, and the run stops at the first one that fails.
+    fn serve_invocations(
+        scripts: Vec<&'static str>,
+    ) -> impl FnOnce(UnixStream, String) + Send + 'static {
         move |stream, line| {
             assert!(run_request_data(&line).stdin, "{line:?}");
-            let mut task = std::process::Command::new("/bin/sh")
-                .args(["-c", script])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut forwarded =
-                crate::exec::ForwardedStdin::start(&stream, task.stdin.take().unwrap()).unwrap();
+            let (mut forwarded, task_stdin) =
+                crate::exec::ForwardedStdin::start_pipe(&stream).unwrap();
             let shared = Arc::new(Mutex::new(stream.try_clone().unwrap()));
             writeln!(shared.lock().unwrap(), "stdin:").unwrap();
-            let (stdout, stderr) = (task.stdout.take().unwrap(), task.stderr.take().unwrap());
-            let (out, err) = (shared.clone(), shared.clone());
-            let out = std::thread::spawn(move || forward_lines(stdout, &out, "msg"));
-            let err = std::thread::spawn(move || forward_lines(stderr, &err, "err"));
-            out.join().unwrap();
-            err.join().unwrap();
-            let status = task.wait().unwrap();
+            let mut result = Ok(true);
+            for (idx, script) in scripts.iter().enumerate() {
+                let mut task = std::process::Command::new("/bin/sh")
+                    .args(["-c", script])
+                    .stdin(task_stdin.try_clone().unwrap())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let (stdout, stderr) = (task.stdout.take().unwrap(), task.stderr.take().unwrap());
+                let (out, err) = (shared.clone(), shared.clone());
+                let out = std::thread::spawn(move || forward_lines(stdout, &out, "msg"));
+                let err = std::thread::spawn(move || forward_lines(stderr, &err, "err"));
+                out.join().unwrap();
+                err.join().unwrap();
+                let status = task.wait().unwrap();
+                if status.code() != Some(0) {
+                    result = Err(Error::Execution {
+                        idx,
+                        code: status.code().unwrap_or(1),
+                        reason: String::new(),
+                        stderr: String::new(),
+                        stdout: String::new(),
+                    });
+                    break;
+                }
+            }
             forwarded.task_ended();
-            let result = match status.code() {
-                Some(0) => Ok(true),
-                code => Err(Error::Execution {
-                    idx: 0,
-                    code: code.unwrap_or(1),
-                    reason: String::new(),
-                    stderr: String::new(),
-                    stdout: String::new(),
-                }),
-            };
+            drop(task_stdin);
             let mut stream = stream;
             BoxChannel::end_task_run(
                 &mut stream,
@@ -5337,6 +5349,43 @@ exit $rc
             );
             forwarded.finish(std::time::Duration::from_secs(10));
         }
+    }
+
+    // #3094, T123: a task with two invocations, where the first reads one
+    // line and the second runs `cat`. The run prints all of its piped
+    // input, and the second invocation gets the lines the first left.
+    #[test]
+    fn task_run_shares_forwarded_stdin_across_invocations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let Some((stdout, stderr, code)) = run_min_against_channel(
+            rootfs,
+            &["task", "run", "query"],
+            b"one\ntwo\nthree\n".to_vec(),
+            serve_invocations(vec!["read first; echo \"first:$first\"", "cat"]),
+        ) else {
+            return;
+        };
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        assert_eq!(stdout, "first:one\ntwo\nthree\n");
+        assert!(stderr.is_empty(), "{stderr}");
+
+        // A second invocation that reads nothing, then a third that reads
+        // the rest: input that no invocation reads is not lost to the next.
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let Some((stdout, stderr, code)) = run_min_against_channel(
+            rootfs,
+            &["task", "run", "query"],
+            b"a\nb\n".to_vec(),
+            serve_invocations(vec!["read x; echo \"1:$x\"", "echo 2:none", "cat; exit 5"]),
+        ) else {
+            return;
+        };
+        assert_eq!(code, 5, "{stdout} {stderr}");
+        assert_eq!(stdout, "1:a\n2:none\nb\n");
     }
 
     // T123, BOX-038: `cat q.sql | min task run query > out.csv` in a task

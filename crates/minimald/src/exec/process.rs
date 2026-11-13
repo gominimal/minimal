@@ -1126,6 +1126,11 @@ async fn relay_entrypoint_stream(
 /// or ends first, the thread reads on and drops the rest until the helper
 /// closes its side. So the helper's writes never fail, and the run's last
 /// lines (its `exit:` line among them) reach it.
+///
+/// With [`Self::start_pipe`], the copy feeds a pipe that each invocation of
+/// a multi-invocation task reads in turn. The next invocation reads the
+/// input that the one before it left unread. Call [`Self::task_ended`] only
+/// after the last invocation ends.
 pub(crate) struct ForwardedStdin {
     connection: std::os::unix::net::UnixStream,
     done: std::sync::mpsc::Receiver<io::Result<()>>,
@@ -1157,7 +1162,19 @@ impl ForwardedStdin {
         })
     }
 
-    /// Records that the task ended. A read of the connection that fails
+    /// Starts the copy of `connection` to a new pipe, and returns the
+    /// pipe's read end. Give each invocation of the task a `try_clone` of
+    /// it as its stdin, one after the other. Drop it after the last
+    /// invocation ends: the copy then drops the rest of the input.
+    pub(crate) fn start_pipe(
+        connection: &std::os::unix::net::UnixStream,
+    ) -> io::Result<(Self, std::io::PipeReader)> {
+        let (reader, writer) = std::io::pipe()?;
+        Ok((Self::start(connection, writer)?, reader))
+    }
+
+    /// Records that the task ended. For a task with more than one
+    /// invocation, that is after its last invocation ends. A read of the connection that fails
     /// after this is not an error: the task no longer reads its stdin.
     pub(crate) fn task_ended(&self) {
         self.task_ended
