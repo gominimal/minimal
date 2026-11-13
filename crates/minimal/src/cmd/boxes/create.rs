@@ -1332,17 +1332,19 @@ pub(crate) fn task_project_egress(
     }
 }
 
-/// Whether any `network` key appears in `[defaults]`, in a
-/// `[defaults.<type>]` table, in a `[box_types.<name>.defaults]` table, or
-/// in an entry of the file.
+/// Whether a `network` key appears in a layer that a session start can
+/// read: `[defaults]`, `[defaults.session]`, a session entry, or a project
+/// Box Type's entry or `[box_types.<name>.defaults]`, whose root the client
+/// cannot resolve (#3140). A key in a task entry or in `[defaults.task]`
+/// never reaches a session, so it never refuses a session start.
 fn declares_network(file: &toml::Table, entries: &[mfile::entry::BoxEntry]) -> bool {
     let defaults = file.get("defaults").and_then(toml::Value::as_table);
     let in_defaults = defaults.is_some_and(|defaults| {
         defaults.contains_key("network")
             || defaults
-                .values()
-                .filter_map(toml::Value::as_table)
-                .any(|table| table.contains_key("network"))
+                .get(boxes::SESSION_BOX_TYPE)
+                .and_then(toml::Value::as_table)
+                .is_some_and(|table| table.contains_key("network"))
     });
     let in_type_defaults = file
         .get("box_types")
@@ -1354,10 +1356,17 @@ fn declares_network(file: &toml::Table, entries: &[mfile::entry::BoxEntry]) -> b
                 .filter_map(|box_type| box_type.get("defaults").and_then(toml::Value::as_table))
                 .any(|defaults| defaults.contains_key("network"))
         });
+    // A built-in type other than `session` is never a session's entry.
+    let can_be_session = |entry: &mfile::entry::BoxEntry| match entry.box_type.as_deref() {
+        Some(t) if t == boxes::SESSION_BOX_TYPE => true,
+        Some(t) => !mfile::expand::BUILTIN_BOX_TYPES.contains(&t),
+        None => true,
+    };
     in_defaults
         || in_type_defaults
         || entries
             .iter()
+            .filter(|entry| can_be_session(entry))
             .any(|entry| entry.body.contains_key("network"))
 }
 
@@ -1683,6 +1692,34 @@ fn network_key_invalid(
             problem: mfile::SpecKeyProblem::WrongShape { expected, found },
         },
     }
+}
+
+/// A session start's effective egress: the project's egress with the
+/// egress flags applied, as [`effective_egress`] says. A `none` box with
+/// egress is refused here, before the create request, and the refusal names
+/// the minimal.toml table the egress came from (NET-065), as `min task run`
+/// does.
+///
+/// # Errors
+///
+/// The refusal, when `network` is `none` and the box has egress.
+fn session_effective_egress(
+    project: ProjectEgress,
+    flags: Option<boxes::EgressPolicy>,
+    network: boxes::NetworkMode,
+    args: &crate::EgressArgs,
+) -> anyhow::Result<EffectiveEgress> {
+    let file_layer = project.layer.filter(|_| project.policy.is_some());
+    let egress = effective_egress(project.policy, flags, args.deny_all_egress);
+    // A session's own_ip box is available on every host kind.
+    crate::task::refuse_egress_on_none(
+        network,
+        egress.policy.is_some(),
+        args,
+        file_layer.as_deref(),
+        true,
+    )?;
+    Ok(egress)
 }
 
 /// The box's effective egress (arch#166): the project's declaration with
@@ -3276,8 +3313,12 @@ pub(crate) async fn activate_box(
                     tracing::warn!(hint = %hint, "the project's network keys use a legacy spelling");
                 }
             }
-            let egress =
-                effective_egress(project_egress.policy, egress, args.egress.deny_all_egress);
+            let egress = session_effective_egress(
+                project_egress,
+                egress,
+                args.network.into(),
+                &args.egress,
+            )?;
             tracing::debug!(
                 egress = ?egress.policy,
                 sources = ?egress.sources,
@@ -6352,6 +6393,120 @@ mod tests {
                 .starts_with("Cannot create the box: it declares the GitHub grant GH_TOKEN, and "),
             "{refused}"
         );
+    }
+
+    /// A `network` key in a task entry never reaches a session, so two
+    /// session entries with no default still start when only a task
+    /// declares `network`. The same key in a session layer still refuses.
+    #[test]
+    fn network_key_only_in_task_does_not_refuse_session_pick() {
+        let sessions = "[sessions.a]\npackages = [\"git\"]\n\n\
+                        [sessions.b]\npackages = [\"git\"]\n\n\
+                        [tasks.build]\nexec = 'true'\n\n";
+        let only_task =
+            format!("{sessions}[tasks.build.network.egress]\nallow_dns_hosts = [\"github.com\"]\n");
+        let project = project_egress_from(only_task.as_bytes(), None)
+            .expect("a network key only in a task does not refuse the session start");
+        assert_eq!(project, ProjectEgress::default());
+        let task_defaults = format!(
+            "{sessions}[defaults.task.network.egress]\nallow_dns_hosts = [\"github.com\"]\n"
+        );
+        assert_eq!(
+            project_egress_from(task_defaults.as_bytes(), None)
+                .expect("[defaults.task] does not refuse the session start"),
+            ProjectEgress::default()
+        );
+        for layer in [
+            "[defaults.network.egress]",
+            "[defaults.session.network.egress]",
+            "[sessions.a.network.egress]",
+        ] {
+            let body = format!("{sessions}{layer}\nallow_dns_hosts = [\"github.com\"]\n");
+            let error = project_egress_from(body.as_bytes(), None)
+                .expect_err("a session layer's network key needs a picked entry");
+            assert!(
+                error.downcast_ref::<SessionEntryUndecided>().is_some(),
+                "{layer}: {error}"
+            );
+        }
+    }
+
+    /// NET-065: a session start with project egress and `--network none`
+    /// refuses before the create request, and names the minimal.toml table
+    /// the egress came from.
+    #[test]
+    fn session_network_none_refusal_names_minimal_toml() {
+        let daemon = "egress rules need network mode own_ip or host_ip (this box is none): a \
+                      none box has no network to apply them to.";
+        let none = boxes::NetworkMode::NoNet;
+        for (body, layer) in [
+            (
+                "[defaults.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
+                "[defaults]",
+            ),
+            (
+                "[defaults.session.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
+                "[defaults.session]",
+            ),
+            (
+                "[sessions.default]\npackages = [\"git\"]\n\n\
+                 [sessions.default.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
+                "[sessions.default]",
+            ),
+        ] {
+            let project = project_egress_from(body.as_bytes(), None).expect("the file loads");
+            let refusal =
+                session_effective_egress(project, None, none, &crate::EgressArgs::default())
+                    .expect_err("--network none refuses the project's egress")
+                    .to_string();
+            assert_eq!(
+                refusal,
+                format!(
+                    "{daemon} The box's egress rules come from {layer} in minimal.toml. Run it \
+                     with --network host_ip or --network own_ip."
+                )
+            );
+        }
+        // A flag alone names the flag and offers to drop it.
+        let flags = crate::EgressArgs {
+            deny_all_egress: true,
+            ..crate::EgressArgs::default()
+        };
+        let refusal = session_effective_egress(
+            ProjectEgress::default(),
+            flag_egress(&flags).expect("the flags parse"),
+            none,
+            &flags,
+        )
+        .expect_err("--network none refuses --deny-all-egress")
+        .to_string();
+        assert_eq!(
+            refusal,
+            format!(
+                "{daemon} The box's egress rules come from --deny-all-egress. Run it with \
+                 --network host_ip or --network own_ip, or without --deny-all-egress."
+            )
+        );
+        // With no egress, or on another mode, the start goes on.
+        session_effective_egress(
+            ProjectEgress::default(),
+            None,
+            none,
+            &crate::EgressArgs::default(),
+        )
+        .expect("a none box with no egress starts");
+        let project = project_egress_from(
+            b"[defaults.network.egress]\nallow_dns_hosts = [\"github.com\"]\n",
+            None,
+        )
+        .expect("the file loads");
+        session_effective_egress(
+            project,
+            None,
+            boxes::NetworkMode::HostNet,
+            &crate::EgressArgs::default(),
+        )
+        .expect("a host_ip box keeps its egress");
     }
 
     /// NET-060: the egress keys a project's `minimal.toml` declares become
