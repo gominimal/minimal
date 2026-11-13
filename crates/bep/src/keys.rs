@@ -127,6 +127,26 @@ pub enum KeyError {
         /// What the store said.
         detail: String,
     },
+    /// Secret Service holds the key in a keyring that is locked. The key
+    /// still exists (BEP-089).
+    #[error("the login keyring is locked, and it holds the proxy's {role} key: {detail}")]
+    Locked {
+        /// The role of the key.
+        role: Role,
+        /// What the store said.
+        detail: String,
+    },
+    /// Secret Service, which holds the key, cannot be reached from this
+    /// session. The key still exists (BEP-089).
+    #[error(
+        "Secret Service cannot be reached from this session, and it holds the proxy's {role} key: {detail}"
+    )]
+    Unreachable {
+        /// The role of the key.
+        role: Role,
+        /// What the store said.
+        detail: String,
+    },
     /// The store made a key, the keychain made it exportable, and the
     /// build refused it. `removed` says whether the store then removed it.
     #[error(
@@ -376,6 +396,29 @@ pub enum StartError {
     Exportable(Role),
     /// The store did not generate a missing key.
     Store(KeyError),
+    /// Secret Service holds the role's key in a locked keyring (BEP-089).
+    Locked(Role),
+    /// Secret Service, which holds the role's key, cannot be reached from
+    /// this session (BEP-089).
+    Unreachable(Role),
+}
+
+impl StartError {
+    /// The start refusal for a store error. A locked or unreachable Secret
+    /// Service keeps its keys, so its refusal names no replacement.
+    fn from_store(err: KeyError) -> Self {
+        match err {
+            KeyError::Locked { role, detail } => {
+                tracing::error!(role = %role, detail = %detail, "the login keyring that holds a proxy key is locked");
+                Self::Locked(role)
+            }
+            KeyError::Unreachable { role, detail } => {
+                tracing::error!(role = %role, detail = %detail, "Secret Service, which holds a proxy key, cannot be reached");
+                Self::Unreachable(role)
+            }
+            err => Self::Store(err),
+        }
+    }
 }
 
 impl fmt::Display for StartError {
@@ -401,6 +444,15 @@ impl fmt::Display for StartError {
                 "The proxy did not start: the keychain holds the proxy's {role} key as exportable, and a release build does not use an exportable key. Run `bep --replace-key {role}` to make a new one. Boxes created before then must be re-created."
             ),
             Self::Store(err) => write!(f, "The proxy did not start: {err}."),
+            // BEP-089: the wording is fixed by the task's diagnostics line.
+            Self::Locked(role) => write!(
+                f,
+                "The proxy did not start: the login keyring is locked, and it holds the proxy's {role} key. Unlock the login keyring, then start the proxy again."
+            ),
+            Self::Unreachable(role) => write!(
+                f,
+                "The proxy did not start: Secret Service cannot be reached from this session, and it holds the proxy's {role} key. Start the proxy from the desktop session that holds the login keyring."
+            ),
         }
     }
 }
@@ -459,7 +511,7 @@ pub fn load_with<S: KeyStore>(
                 // compared stays aside, and the role is a lost key.
                 Ok(false) | Err(Interrupted::Unread) => Ok(None),
                 Err(Interrupted::Check(err) | Interrupted::Move(err)) => {
-                    return Err(StartError::Store(err));
+                    return Err(StartError::from_store(err));
                 }
             },
             held => held,
@@ -482,8 +534,13 @@ pub fn load_with<S: KeyStore>(
                 }
                 // A locked store is not a refused key, and the replacement
                 // advice would delete a healthy key.
-                Err(err @ (KeyError::Store { .. } | KeyError::Exportable { .. })) => {
-                    return Err(StartError::Store(err));
+                Err(
+                    err @ (KeyError::Store { .. }
+                    | KeyError::Exportable { .. }
+                    | KeyError::Locked { .. }
+                    | KeyError::Unreachable { .. }),
+                ) => {
+                    return Err(StartError::from_store(err));
                 }
             },
             Ok(None) if published_roles.contains(&role) => {
@@ -495,8 +552,13 @@ pub fn load_with<S: KeyStore>(
                 tracing::error!(role = %role, error = %err, "the key store refused a proxy key");
                 refused.push(role);
             }
-            Err(err @ (KeyError::Store { .. } | KeyError::Exportable { .. })) => {
-                return Err(StartError::Store(err));
+            Err(
+                err @ (KeyError::Store { .. }
+                | KeyError::Exportable { .. }
+                | KeyError::Locked { .. }
+                | KeyError::Unreachable { .. }),
+            ) => {
+                return Err(StartError::from_store(err));
             }
         }
     }
@@ -532,7 +594,7 @@ pub fn load_with<S: KeyStore>(
                 }
                 Err(err) => {
                     roll_back(store, &generated);
-                    return Err(StartError::Store(err));
+                    return Err(StartError::from_store(err));
                 }
             },
         };
@@ -908,8 +970,8 @@ enum Interrupted {
 
 /// The error for a move out of an empty slot. Only the move of the old key
 /// aside finds an empty slot and succeeds: a role can have no key yet.
-#[cfg(any(test, target_os = "macos"))]
-fn missing_in(role: Role, slot: Slot) -> KeyError {
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+pub(crate) fn missing_in(role: Role, slot: Slot) -> KeyError {
     let detail = match slot {
         Slot::New => "the store holds no new key to move in",
         Slot::Old => "the store holds no old key to move back",
