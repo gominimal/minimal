@@ -803,33 +803,6 @@ impl TpmKey {
     fn io_error(err: &io::Error) -> ToolError {
         ToolError::Other(format!("did not use the TPM work directory: {err}"))
     }
-
-    /// Asks the TPM to duplicate the key, with its authorization value, to
-    /// no new parent and with no outer wrapper. The TPM refuses this for a
-    /// key with `fixedTPM` and `fixedParent`, and the error carries its
-    /// response code. The proxy never calls it. It exists so a proof can
-    /// show the refusal.
-    ///
-    /// # Errors
-    ///
-    /// [`KeyError::Refused`] with the TPM's response code when the TPM
-    /// refuses the duplication, or [`KeyError::Store`] when the command did
-    /// not run.
-    pub fn duplicate(&self) -> Result<(), KeyError> {
-        let private = self.work.0.join("dup.priv");
-        let seed = self.work.0.join("dup.seed");
-        self.with_context(|ctx| {
-            let private = RemoveOnDrop(&private);
-            let seed = RemoveOnDrop(&seed);
-            let args: Vec<OsString> = args(&["-c"], &[ctx])
-                .into_iter()
-                .chain(["-p", "file:-", "-C", "null", "-G", "null"].map(OsString::from))
-                .chain(args(&["-r"], &[private.0]))
-                .chain(args(&["-s"], &[seed.0]))
-                .collect();
-            self.store.run("tpm2_duplicate", &args, Some(&self.auth))
-        })
-    }
 }
 
 impl HeldKey for TpmKey {
