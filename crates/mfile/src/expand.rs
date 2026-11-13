@@ -211,6 +211,83 @@ pub struct Layers {
     /// BOX-184), so the client fills this from its environment, for the
     /// names [`inherited_var_names`] gives.
     pub host_vars: BTreeMap<String, String>,
+    /// The client's `[secret-store-rules]`, by item identifier. Expansion
+    /// writes a rule's `upstream` and `inject` into each `source =
+    /// "store"` reference to its item (BOX-071). The client fills this
+    /// from its own configuration, never from the project file.
+    pub store_rules: BTreeMap<String, StoreRule>,
+}
+
+/// One rule of the client's `[secret-store-rules]`, as expansion writes
+/// it into a store reference.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StoreRule {
+    /// The upstream authorities the item's value is sent to, each `host`
+    /// or `host:port`. Written as the reference's `upstream.hosts`.
+    pub upstream: Vec<String>,
+    /// How the value is injected: the rule's `header`, `prefix` and
+    /// `basic_auth`, as the rule sets them. Written as the reference's
+    /// `inject`.
+    pub inject: toml::Table,
+}
+
+/// Writes each store reference's authorities into the spec (BOX-071). A
+/// `[secrets]` entry with `source = "store"` takes the `upstream` and
+/// `inject` of the rule for its `id`. Any `upstream` or `inject` that a
+/// layer wrote into the reference is dropped first, so only the client's
+/// rules set them. A reference with no rule for its item keeps neither.
+fn write_store_authorities(spec: &mut toml::Table, rules: &BTreeMap<String, StoreRule>) {
+    let Some(secrets) = spec.get_mut("secrets").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+    for grant in secrets.iter_mut().filter_map(|(_, v)| v.as_table_mut()) {
+        if grant.get("source").and_then(toml::Value::as_str) != Some("store") {
+            continue;
+        }
+        grant.remove("upstream");
+        grant.remove("inject");
+        let rule = grant
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .and_then(|id| rules.get(id.trim()));
+        let Some(rule) = rule else {
+            continue;
+        };
+        let hosts = rule
+            .upstream
+            .iter()
+            .cloned()
+            .map(toml::Value::String)
+            .collect();
+        grant.insert(
+            "upstream".to_owned(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "hosts".to_owned(),
+                toml::Value::Array(hosts),
+            )])),
+        );
+        grant.insert("inject".to_owned(), toml::Value::Table(rule.inject.clone()));
+    }
+}
+
+/// The built-in root of the entry's type: the first type of its chain,
+/// else the entry's own type when it is a built-in, else the root that
+/// its table implies.
+fn entry_root(entry: &BoxEntry, layers: &Layers) -> &'static str {
+    layers
+        .type_defaults
+        .first()
+        .and_then(|(name, _)| crate::box_types::builtin(name))
+        .or_else(|| {
+            entry
+                .box_type
+                .as_deref()
+                .and_then(crate::box_types::builtin)
+        })
+        .unwrap_or(match entry.table {
+            EntryTable::Tasks => "task",
+            _ => "session",
+        })
 }
 
 impl Layers {
@@ -271,6 +348,17 @@ impl Expansion {
     pub fn spec_bytes(&self) -> Result<String, toml::ser::Error> {
         toml::to_string(&canonical_table(&self.spec))
     }
+
+    /// The Gatehouse §6.3.2 projection of the spec, for a box of the type
+    /// `box_type` (BOX-071). Its [`digest`](crate::projection::Projection::digest)
+    /// is the one the client sends with the spec.
+    #[must_use]
+    pub fn projection(&self, box_type: &ResolvedType) -> crate::projection::Projection {
+        crate::projection::project(
+            &self.spec,
+            &crate::projection::TypeFacts::of_resolved(box_type),
+        )
+    }
 }
 
 /// Expands `entry` over `layers` in the order of [`Layer::ORDER`], then
@@ -311,6 +399,19 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
+    // BOX-071: the store references carry the client's authorities, and
+    // the omitted values the digest binds are filled, before the spec is
+    // checked or projected.
+    write_store_authorities(&mut expansion.spec, &layers.store_rules);
+    let root = entry_root(entry, layers);
+    let had_network = expansion.spec.contains_key("network");
+    crate::projection::fill_effective(&mut expansion.spec, root);
+    if !had_network {
+        expansion.report.values.insert(
+            "network".to_owned(),
+            ValueOrigin::Value(Origin::type_defaults(root)),
+        );
+    }
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
@@ -936,8 +1037,8 @@ pub(crate) const fn value_words(value: &toml::Value) -> &'static str {
 /// <https://github.com/gominimal/minimal/issues/3096> lands: BOX-076
 /// replaces it with the full Box Spec schema. Two more residuals of this
 /// fold are filed:
-/// - <https://github.com/gominimal/minimal/issues/3097>: `expand` takes the
-///   client `[secret-store-rules]` input of BOX-065.
+/// - <https://github.com/gominimal/minimal/issues/3097>: the client passes
+///   its `[secret-store-rules]` as [`Layers::store_rules`] (BOX-065).
 /// - <https://github.com/gominimal/minimal/issues/3098>: [`Expansion`]
 ///   marks an implicit `default` entry (BOX-161 with BOX-165).
 const SPEC_KEYS: &[(&str, Shape)] = &[
@@ -1509,6 +1610,10 @@ mod tests {
 
                 [network]
                 mode = "own_ip"
+                quic443 = "auto"
+
+                [network.bep]
+                steering = "dns"
 
                 [network.egress]
                 allow_dns_hosts = ["b.example", "a.example"]
@@ -1892,7 +1997,9 @@ mod tests {
         let none = implicit_default_entry(&[], test_root).expect("an implicit entry");
         assert_eq!(none, entry);
         let e = expand(&none, &Layers::default()).expect("expands");
-        assert!(e.spec.is_empty(), "{:?}", e.spec);
+        // BOX-071: expansion fills only the values the digest binds.
+        let filled = table("[network]\nquic443 = \"auto\"\n[network.bep]\nsteering = \"dns\"\n");
+        assert_eq!(e.spec, filled, "{:?}", e.spec);
         assert!(e.report.implicit);
 
         // A session entry, direct or through a type rooted at `session`,
@@ -2457,7 +2564,9 @@ mod tests {
         }
         let (bare, _) = expand_checked(file, "bare", "", "");
         assert!(bare.spec.get("packages").is_none());
-        assert!(bare.spec.get("network").is_none());
+        let bare_network = bare.spec["network"].as_table().expect("network");
+        assert!(bare_network.get("ingress").is_none());
+        assert!(bare_network.get("egress").is_none());
         let (dev, _) = expand_checked(file, "dev", "", "");
         assert_eq!(strings(dev.spec.get("packages")), ["git"]);
         let network = dev.spec["network"].as_table().expect("network");
@@ -3003,5 +3112,280 @@ mod tests {
         let e = expand_in(file, "dev", vars_layers("", &[("H", "host")])).expect("one variable");
         assert_eq!(e.spec["vars"]["A"].as_str(), Some("1"));
         assert!(lenient(&e.spec).is_empty(), "{:?}", e.spec);
+    }
+
+    /// Expands the entry `name` of `file` over its type chain, with the
+    /// client's `store_rules` and the command-line `overrides`, and gives
+    /// the expansion and its projection digest.
+    fn expand_projected(
+        file: &str,
+        name: &str,
+        overrides: &str,
+        store_rules: BTreeMap<String, StoreRule>,
+    ) -> (Expansion, String) {
+        let doc = table(file);
+        let types = BoxTypes::from_file(&doc).expect("the types resolve");
+        let entries = read_entries(file.as_bytes()).expect("entries read");
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let resolved = expandable_type(entry, &types).expect("expandable");
+        let project_types = types.project().keys().cloned().collect();
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let layers = Layers {
+            type_defaults: resolved.defaults.clone(),
+            overrides: table(overrides),
+            store_rules,
+            ..Layers::default()
+        }
+        .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+        let expansion = expand(entry, &layers).expect("expands");
+        let digest = expansion.projection(&resolved).digest();
+        (expansion, digest)
+    }
+
+    fn npm_rule(hosts: &[&str]) -> BTreeMap<String, StoreRule> {
+        BTreeMap::from([(
+            "npm-token".to_owned(),
+            StoreRule {
+                upstream: hosts.iter().map(|h| (*h).to_owned()).collect(),
+                inject: table("header = \"Authorization\"\nprefix = \"Bearer \"\n"),
+            },
+        )])
+    }
+
+    const STORE_FILE: &str = r#"
+        [sessions.dev.secrets.NPM]
+        source = "store"
+        store = "keychain"
+        id = "npm-token"
+        upstream = { hosts = ["project.example"] }
+
+        [sessions.dev.secrets.OTHER]
+        source = "store"
+        store = "keychain"
+        id = "no-rule"
+        inject = { header = "X-Project" }
+
+        [sessions.dev.secret-store-rules.npm-token]
+        upstream = ["project.example"]
+    "#;
+
+    // BOX-071: expansion writes each store reference's `upstream` and
+    // `inject` from the client's `[secret-store-rules]`, never from the
+    // project file, so the projection's `secret_grants` carry them.
+    #[test]
+    fn store_reference_upstream_and_inject_written_into_spec() {
+        let (e, digest) =
+            expand_projected(STORE_FILE, "dev", "", npm_rule(&["registry.npmjs.org"]));
+        let npm = e.spec["secrets"]["NPM"].as_table().expect("the reference");
+        assert_eq!(
+            npm["upstream"],
+            toml::Value::Table(table("hosts = [\"registry.npmjs.org\"]")),
+            "the client's rule, not the project's value"
+        );
+        assert_eq!(
+            npm["inject"],
+            toml::Value::Table(table("header = \"Authorization\"\nprefix = \"Bearer \"\n"))
+        );
+        assert_eq!(npm["id"].as_str(), Some("npm-token"));
+        let other = e.spec["secrets"]["OTHER"]
+            .as_table()
+            .expect("the reference");
+        assert!(other.get("upstream").is_none(), "{other:?}");
+        assert!(
+            other.get("inject").is_none(),
+            "the project never sets it: {other:?}"
+        );
+        assert!(e.spec.get("secret-store-rules").is_none());
+
+        // The digest binds where the secret is sent.
+        let (_, moved) = expand_projected(STORE_FILE, "dev", "", npm_rule(&["evil.example"]));
+        assert_ne!(digest, moved);
+        let (_, again) = expand_projected(STORE_FILE, "dev", "", npm_rule(&["registry.npmjs.org"]));
+        assert_eq!(digest, again);
+    }
+
+    const GRANTS_FILE: &str = r#"
+        [box_types.release]
+        extends = "task"
+        defaults = { github_token_mode = "installation" }
+
+        [sessions.dev.secrets.GH]
+        source = "broker"
+        scopes = ["github:repo:read"]
+
+        [sessions.dev.secrets.API]
+        source = "client_env"
+
+        [tasks.lint.secrets.GH]
+        source = "broker"
+        scopes = ["github:repo:read"]
+
+        [boxes.ship]
+        type = "release"
+        [boxes.ship.secrets.GH]
+        source = "broker"
+        scopes = ["github:repo:write"]
+
+        [sessions.set]
+        [sessions.set.network]
+        quic443 = "block"
+        [sessions.set.network.bep]
+        steering = "proxy_env"
+        [sessions.set.secrets.GH]
+        source = "broker"
+        scopes = ["github:repo:read"]
+        mode = "installation"
+    "#;
+
+    // BOX-071: expansion fills each `github:*` grant's omitted `mode` from
+    // the type's `github_token_mode`, an omitted `network.quic443` with
+    // `auto` and an omitted `bep.steering` with `dns`, so the digest binds
+    // the effective values. A value the spec sets is kept.
+    #[test]
+    fn expansion_fills_token_mode_quic443_steering_before_digest() {
+        let mode = |e: &Expansion, name: &str| {
+            e.spec["secrets"][name]
+                .get("mode")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
+        let (dev, dev_digest) = expand_projected(GRANTS_FILE, "dev", "", BTreeMap::new());
+        assert_eq!(mode(&dev, "GH").as_deref(), Some("user"));
+        assert_eq!(mode(&dev, "API"), None, "not a GitHub grant");
+        assert_eq!(dev.spec["network"]["quic443"].as_str(), Some("auto"));
+        assert_eq!(dev.spec["network"]["bep"]["steering"].as_str(), Some("dns"));
+        let (lint, _) = expand_projected(GRANTS_FILE, "lint", "", BTreeMap::new());
+        assert_eq!(mode(&lint, "GH").as_deref(), Some("user"));
+        let (ship, _) = expand_projected(GRANTS_FILE, "ship", "", BTreeMap::new());
+        assert_eq!(mode(&ship, "GH").as_deref(), Some("installation"));
+        let (set, _) = expand_projected(GRANTS_FILE, "set", "", BTreeMap::new());
+        assert_eq!(mode(&set, "GH").as_deref(), Some("installation"));
+        assert_eq!(set.spec["network"]["quic443"].as_str(), Some("block"));
+        assert_eq!(
+            set.spec["network"]["bep"]["steering"].as_str(),
+            Some("proxy_env")
+        );
+
+        // Writing the filled values out projects the same digest, and
+        // another value projects another one.
+        let explicit = GRANTS_FILE.replace(
+            "[sessions.dev.secrets.API]",
+            "[sessions.dev.network]\nquic443 = \"auto\"\nbep = { steering = \"dns\" }\n\
+             [sessions.dev.secrets.API]",
+        );
+        let explicit = explicit.replacen(
+            "scopes = [\"github:repo:read\"]\n",
+            "scopes = [\"github:repo:read\"]\nmode = \"user\"\n",
+            1,
+        );
+        let (_, explicit_digest) = expand_projected(&explicit, "dev", "", BTreeMap::new());
+        assert_eq!(dev_digest, explicit_digest);
+        let (_, other) = expand_projected(
+            GRANTS_FILE,
+            "dev",
+            "network = { quic443 = \"allow\" }",
+            BTreeMap::new(),
+        );
+        assert_ne!(dev_digest, other);
+    }
+
+    /// The host facts a client can create a box under.
+    #[derive(Debug, Clone, Copy)]
+    enum HostFacts {
+        Unenrolled,
+        Enrolled,
+    }
+
+    /// The layers a client builds for the entry `dev` of `file`. Every
+    /// input of expansion is named here, with no `..Layers::default()`, so
+    /// an input that varies with `facts` cannot be added unseen: none
+    /// does (BOX-142).
+    fn client_layers(
+        facts: HostFacts,
+        file: &str,
+        overrides: &str,
+        store_rules: &BTreeMap<String, StoreRule>,
+    ) -> Layers {
+        let _ = facts;
+        let doc = table(file);
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        Layers {
+            upstream: doc
+                .get("upstream")
+                .and_then(toml::Value::as_table)
+                .cloned()
+                .unwrap_or_default(),
+            type_defaults: vec![(
+                "session".to_owned(),
+                crate::box_types::builtin_defaults("session"),
+            )],
+            defaults: toml::Table::new(),
+            defaults_type: toml::Table::new(),
+            loadouts: toml::Table::new(),
+            overrides: table(overrides),
+            host_vars: BTreeMap::new(),
+            store_rules: store_rules.clone(),
+        }
+        .with_file_defaults(&defaults, Some("session"), &BTreeSet::new())
+    }
+
+    proptest! {
+        // BOX-142 (property): one minimal.toml, one set of overrides and
+        // one set of client store rules expand to the same spec bytes and
+        // projection digest whether the host is enrolled or not.
+        #[test]
+        fn enrolled_and_unenrolled_expansion_identical(
+            packages in proptest::collection::vec("[a-z]{1,6}", 0..4),
+            quic in proptest::option::of(prop_oneof!["auto", "block", "allow"]),
+            mode in proptest::option::of(prop_oneof!["none", "host_ip", "own_ip"]),
+            hosts in proptest::collection::vec("[a-z]{1,6}\\.example", 0..3),
+            pinned in any::<bool>(),
+        ) {
+            let quoted: Vec<String> = packages.iter().map(|p| format!("\"{p}\"")).collect();
+            let mut file = String::new();
+            if pinned {
+                file.push_str("[upstream]\nrepo_url = \"https://r.example\"\ncommit = \"abc\"\n");
+            }
+            file.push_str(&format!(
+                "[sessions.dev]\ntype = \"session\"\npackages = [{}]\n\
+                 [sessions.dev.secrets.NPM]\nsource = \"store\"\nstore = \"keychain\"\n\
+                 id = \"npm-token\"\n\
+                 [sessions.dev.secrets.GH]\nsource = \"broker\"\nscopes = [\"github:repo\"]\n",
+                quoted.join(", ")
+            ));
+            let mut overrides = String::new();
+            if mode.is_some() || quic.is_some() {
+                overrides.push_str("[network]\n");
+            }
+            if let Some(mode) = &mode {
+                overrides.push_str(&format!("mode = \"{mode}\"\n"));
+            }
+            if let Some(quic) = &quic {
+                overrides.push_str(&format!("quic443 = \"{quic}\"\n"));
+            }
+            let host_refs: Vec<&str> = hosts.iter().map(String::as_str).collect();
+            let rules = npm_rule(&host_refs);
+            let entries = read_entries(file.as_bytes()).expect("entries read");
+            let entry = entries.iter().find(|e| e.name == "dev").expect("dev");
+            let resolved = expandable_type(entry, &BoxTypes::from_file(&table(&file)).unwrap())
+                .expect("a session expands");
+            let run = |facts| {
+                let layers = client_layers(facts, &file, &overrides, &rules);
+                let e = expand(entry, &layers).expect("expands");
+                (e.spec_bytes().expect("writes"), e.projection(&resolved).digest())
+            };
+            prop_assert_eq!(run(HostFacts::Unenrolled), run(HostFacts::Enrolled));
+        }
     }
 }
