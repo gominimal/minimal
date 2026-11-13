@@ -436,15 +436,26 @@ impl TpmStore {
                     format!("{tool} did not start: {err}")
                 })
             })?;
+        // A tool that fails before it reads its input closes the pipe. Its
+        // exit status and its stderr then carry the real reason, so a broken
+        // pipe falls through to the wait. The wait also reaps the child.
+        let mut write_error = None;
         if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            pipe.write_all(input)
-                .map_err(|err| ToolError::Other(format!("{tool} did not read its input: {err}")))?;
+            write_error = pipe
+                .write_all(input)
+                .err()
+                .filter(|err| err.kind() != io::ErrorKind::BrokenPipe);
         }
         let output = child
             .wait_with_output()
             .map_err(|err| ToolError::Other(format!("{tool} did not finish: {err}")))?;
         if output.status.success() {
-            return Ok(());
+            return match write_error {
+                Some(err) => Err(ToolError::Other(format!(
+                    "{tool} did not read its input: {err}"
+                ))),
+                None => Ok(()),
+            };
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(match response_code(&stderr) {
@@ -949,6 +960,20 @@ mod tests {
             .mode();
         assert_eq!(dir_mode & 0o777, 0o700);
         assert_eq!(fs::read(&path).expect("read"), *a);
+    }
+
+    // A tool that exits before it reads its input still reports the TPM's
+    // response code from its stderr.
+    #[test]
+    fn a_tool_that_exits_before_its_input_reports_its_response_code() {
+        let store = TpmStore::new(PathBuf::from("/nonexistent"), DEVICE_TCTI);
+        let script = "echo 'ErrorCode (0x000009a2)' >&2; exit 1";
+        let input = vec![0u8; 4 << 20];
+        match store.run_once("sh", &args(&["-c", script], &[]), Some(&input)) {
+            Err(ToolError::Tpm(detail)) => assert!(detail.ends_with("0x000009a2"), "{detail}"),
+            Err(ToolError::Other(detail)) => panic!("lost the response code: {detail}"),
+            Ok(()) => panic!("expected a failure"),
+        }
     }
 
     #[test]
