@@ -188,6 +188,19 @@ pub const HOST_IP_IDS_FILE: &str = "box-host-ip-ids.json";
 /// version is set aside and reloads no id, like one that does not parse.
 const HOST_IP_IDS_FILE_VERSION: u32 = 1;
 
+/// The file the registry persists each held `host_ip` box's declared egress
+/// policy and credentialed lane to ([`BoxRegistry::admit_host_ip_box`]),
+/// beside [`HOST_IP_IDS_FILE`]. It holds every box whose rules are held,
+/// resident or set aside. A restart reloads them as set-aside rules, so a
+/// box the guest reports running gets its egress back from the next
+/// reconcile, with no client admit. A file of its own, for the same reason
+/// as [`HELD_NAMES_FILE`].
+pub const HOST_IP_RULES_FILE: &str = "box-host-ip-rules.json";
+
+/// The persisted `host_ip` rules' format version. A file of any other
+/// version is set aside and reloads no rules, like one that does not parse.
+const HOST_IP_RULES_FILE_VERSION: u32 = 1;
+
 /// How long a hold reloaded from [`HELD_NAMES_FILE`] stands unconfirmed
 /// before it is dropped ([`BoxRegistry::expire_unconfirmed_holds`]). Only
 /// a host client re-makes a hold, over the host's control socket: the
@@ -1186,6 +1199,27 @@ struct HostIpIdsFile {
     credentialed: Vec<boxes::BoxId>,
 }
 
+/// The persisted `host_ip` rules ([`HOST_IP_RULES_FILE`]): its format
+/// version, then one entry per box whose rules are held.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostIpRulesFile {
+    version: u32,
+    boxes: Vec<HostIpRulesEntry>,
+}
+
+/// One held `host_ip` box in [`HOST_IP_RULES_FILE`]: its session, the
+/// policy its client declared, and whether it declares a credentialed
+/// upstream. The policy is the declared one, not the effective one, so a
+/// reload fills it under this run's egress default, as an admit does.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostIpRulesEntry {
+    session: boxes::SessionId,
+    declared: Option<EgressPolicy>,
+    credentialed_upstream: bool,
+}
+
 /// Writes `file` to `path` the one way any of the registry's persisted
 /// files — the box registry ([`REGISTRY_FILE`]), its held names
 /// ([`HELD_NAMES_FILE`]) and its `host_ip` ids ([`HOST_IP_IDS_FILE`]) — is
@@ -1458,6 +1492,50 @@ fn read_host_ip_ids_file(path: &std::path::Path) -> HostIpIds {
         ),
     }
     HostIpIds::default()
+}
+
+/// Reads the `host_ip` rules persisted at `path`: none when there is no
+/// file yet. A file that cannot be read, does not parse, or is of another
+/// version than [`HOST_IP_RULES_FILE_VERSION`] reloads no rules and is
+/// renamed aside under the same `.unusable-<unix seconds>` suffix, said as
+/// an error line. Losing them costs only the egress of a box the guest
+/// still runs, until a client admits it again: the fail-closed reading.
+fn read_host_ip_rules_file(path: &std::path::Path) -> Vec<HostIpRulesEntry> {
+    let why = match std::fs::read(path) {
+        Ok(bytes) => match serde_json_lenient::from_slice::<HostIpRulesFile>(&bytes) {
+            Ok(file) if file.version == HOST_IP_RULES_FILE_VERSION => return file.boxes,
+            Ok(file) => format!(
+                "version {}, this build reads {HOST_IP_RULES_FILE_VERSION}",
+                file.version
+            ),
+            Err(error) => error.to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => error.to_string(),
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unusable-{stamp}"));
+    let aside = std::path::PathBuf::from(aside);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::error!(
+            path = %path.display(),
+            aside = %aside.display(),
+            why,
+            "the persisted host_ip box rules are unusable; they are set aside and no rules \
+             are reloaded"
+        ),
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            why,
+            %error,
+            "the persisted host_ip box rules are unusable and could not be set aside; \
+             no rules are reloaded and the next change writes over them"
+        ),
+    }
+    Vec::new()
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -3919,6 +3997,30 @@ impl BoxRegistry {
             );
             *self.host_ip_id_set() = reloaded;
         }
+        {
+            // A host_ip box's rules come back set aside: they admit nothing
+            // until a reconcile finds the guest runs the box again
+            // ([`Self::reconcile_host_ip_boxes`]), and a reconcile that finds
+            // the guest no longer lists it forgets them.
+            let reloaded = read_host_ip_rules_file(&path.with_file_name(HOST_IP_RULES_FILE));
+            let mut resident = self
+                .host_ip_boxes
+                .write()
+                .expect("the resident host_ip boxes' lock is never held across a panic");
+            for entry in reloaded {
+                let rules = self.host_ip_box_rules(
+                    entry.session,
+                    entry.declared,
+                    entry.credentialed_upstream,
+                );
+                resident.dormant.insert(entry.session, Arc::new(rules));
+            }
+            tracing::info!(
+                set_aside = resident.dormant.len(),
+                "reloaded the persisted host_ip box rules; each rejoins the union when the VM \
+                 runs its box"
+            );
+        }
         self.persisted_at = Some(Arc::new(path));
         let mut held_loopbacks = std::collections::BTreeMap::new();
         // The file is in name order, not registration order. A standing
@@ -4171,6 +4273,48 @@ impl BoxRegistry {
                 path = %path.display(),
                 %error,
                 "could not persist the host_ip box ids; they will not survive this process"
+            );
+        }
+    }
+
+    /// Writes every held `host_ip` box's declared policy and lane, resident
+    /// or set aside, to [`HOST_IP_RULES_FILE`]. Call it with no lock on the
+    /// resident set held.
+    fn persist_host_ip_rules(&self) {
+        let Some(path) = &self.persisted_at else {
+            return;
+        };
+        let path = path.with_file_name(HOST_IP_RULES_FILE);
+        let _turn = self
+            .persist_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file = {
+            let resident = self
+                .host_ip_boxes
+                .read()
+                .expect("the resident host_ip boxes' lock is never held across a panic");
+            let mut held: BTreeMap<boxes::SessionId, &HostIpBoxRules> = BTreeMap::new();
+            for (session, rules) in resident.dormant.iter().chain(resident.boxes.iter()) {
+                held.insert(*session, rules);
+            }
+            HostIpRulesFile {
+                version: HOST_IP_RULES_FILE_VERSION,
+                boxes: held
+                    .into_iter()
+                    .map(|(session, rules)| HostIpRulesEntry {
+                        session,
+                        declared: rules.declared.clone(),
+                        credentialed_upstream: rules.credentialed_upstream,
+                    })
+                    .collect(),
+            }
+        };
+        if let Err(error) = write_registry_file(&path, &file) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not persist the host_ip box rules; they will not survive this process"
             );
         }
     }
@@ -6718,10 +6862,15 @@ impl BoxRegistry {
     /// (BOX-154), or a box an attach left `stopped` or `exited` through
     /// Keep. Until that reconcile runs, the union can include a box that is
     /// not live. A box the VM runs again (BOX-025) rejoins the union with
-    /// the rules the reconcile set aside. After a VM host daemon restart
-    /// nothing is set aside, so a resumed `host_ip` box gets no egress
-    /// until a client admits it again.
-    /// <https://github.com/gominimal/minimal/issues/3015> owns that case.
+    /// the rules the reconcile set aside.
+    ///
+    /// Each held box's declared policy and lane persist to
+    /// [`HOST_IP_RULES_FILE`] beside [`HOST_IP_IDS_FILE`]
+    /// ([`Self::persisting_to`]). A VM host daemon restart reloads them as
+    /// set-aside rules, so a resumed `host_ip` box the guest reports
+    /// running rejoins the union at the next reconcile, with no client
+    /// admit. Rules a client retired are not persisted, and a box the guest
+    /// no longer lists is forgotten.
     pub fn admit_host_ip_box(
         &self,
         session_id: boxes::SessionId,
@@ -6741,30 +6890,7 @@ impl BoxRegistry {
         declared: Option<&EgressPolicy>,
         credentialed_upstream: bool,
     ) -> bool {
-        let policy = match boxes::effective_egress(
-            declared,
-            boxes::NetworkMode::HostNet,
-            self.egress_default_phase,
-            self.egress_deny_all_opt_out,
-        ) {
-            boxes::EffectiveEgress::Declared(policy) => Some(policy),
-            boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
-            boxes::EffectiveEgress::AllowAll => None,
-        };
-        let node = self.subnet.daemon_ip().octets();
-        let resolver = self.subnet.dns_server().octets();
-        let rules = HostIpBoxRules {
-            session_id,
-            credentialed_upstream,
-            egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
-            dns_hosts: policy
-                .as_ref()
-                .and_then(|policy| policy.allow_dns_hosts.clone())
-                .unwrap_or_default(),
-            allow_subnets: policy
-                .as_ref()
-                .and_then(|policy| policy.allow_subnets.clone()),
-        };
+        let rules = self.host_ip_box_rules(session_id, declared.cloned(), credentialed_upstream);
         let mut resident = self
             .host_ip_boxes
             .write()
@@ -6817,6 +6943,7 @@ impl BoxRegistry {
         if credentialed_changed {
             self.persist_host_ip_ids();
         }
+        self.persist_host_ip_rules();
         // The first box since the last one ended binds the ports the guest
         // still holds as listening (NET-138).
         if !was_published {
@@ -6842,6 +6969,43 @@ impl BoxRegistry {
              address are decided by the resident boxes' rules"
         );
         true
+    }
+
+    /// A `host_ip` box's rules from its client's declared policy, filled
+    /// under this registry's egress default the way the guest daemon fills
+    /// it, and compiled with the node's own address as its lease
+    /// ([`Self::admit_host_ip_box`], and a reload in [`Self::persisting_to`]).
+    fn host_ip_box_rules(
+        &self,
+        session_id: boxes::SessionId,
+        declared: Option<EgressPolicy>,
+        credentialed_upstream: bool,
+    ) -> HostIpBoxRules {
+        let policy = match boxes::effective_egress(
+            declared.as_ref(),
+            boxes::NetworkMode::HostNet,
+            self.egress_default_phase,
+            self.egress_deny_all_opt_out,
+        ) {
+            boxes::EffectiveEgress::Declared(policy) => Some(policy),
+            boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
+            boxes::EffectiveEgress::AllowAll => None,
+        };
+        let node = self.subnet.daemon_ip().octets();
+        let resolver = self.subnet.dns_server().octets();
+        HostIpBoxRules {
+            session_id,
+            credentialed_upstream,
+            egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
+            dns_hosts: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_dns_hosts.clone())
+                .unwrap_or_default(),
+            allow_subnets: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_subnets.clone()),
+            declared,
+        }
     }
 
     /// Drops the egress [`Self::admit_host_ip_box`] holds for a session:
@@ -6884,6 +7048,9 @@ impl BoxRegistry {
                 .set_published(resident.boxes.keys().copied().collect());
         }
         drop(resident);
+        if removed || dormant_rules.is_some() {
+            self.persist_host_ip_rules();
+        }
         // The box ended, so its registration name no longer answers a mint
         // ask: a later box under the name is a new creation. The id stays
         // for the collision check (BEP-082).
@@ -7110,10 +7277,16 @@ impl BoxRegistry {
                 spawn_revocation(path.clone(), id, BoxEnd::HostIpGuestDestroy);
             }
         }
+        // A box the guest destroyed leaves the persisted rules. A box set
+        // aside or admitted again keeps its entry.
+        let rules_changed = !ended.is_empty();
         if outcome.is_empty() {
             drop(resident);
             if ids_changed {
                 self.persist_host_ip_ids();
+            }
+            if rules_changed {
+                self.persist_host_ip_rules();
             }
             return outcome;
         }
@@ -7127,6 +7300,9 @@ impl BoxRegistry {
         drop(resident);
         if ids_changed {
             self.persist_host_ip_ids();
+        }
+        if rules_changed {
+            self.persist_host_ip_rules();
         }
         for session in &outcome.dropped {
             tracing::info!(
@@ -8183,6 +8359,9 @@ pub struct HostIpBoxRules {
     egress: EgressRules,
     dns_hosts: Vec<String>,
     allow_subnets: Option<Vec<String>>,
+    /// The policy the box's client declared, before the egress default
+    /// filled it: what [`HOST_IP_RULES_FILE`] persists.
+    declared: Option<EgressPolicy>,
 }
 
 impl HostIpBoxRules {
@@ -14806,6 +14985,106 @@ mod tests {
             file.credentialed.is_empty(),
             "the destroyed box's id leaves the credentialed set"
         );
+    }
+
+    // NET-085: a host_ip box's declared policy and lane persist beside the
+    // id file. After a VM host daemon restart they come back set aside, and
+    // the first reconcile that finds the guest runs the box puts its rules
+    // back in the union with no client admit. A box the guest does not list
+    // is forgotten, and a box a client retired does not come back.
+    #[test]
+    fn host_ip_box_rules_survive_a_restart_and_rejoin_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = persisted_registry(&dir);
+        let policy = EgressPolicy {
+            allow_protocols: Some(vec![IpProto::Tcp]),
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: Some(vec!["example.com".to_string()]),
+            deny_subnets: None,
+        };
+        let resumed = boxes::SessionId::from_bytes(
+            before
+                .register_host_ip_box_as("resumed", [0x7a; 16])
+                .expect("no record holds the id"),
+        );
+        let destroyed = boxes::SessionId::from_bytes(
+            before
+                .register_host_ip_box_as("destroyed", [0x7b; 16])
+                .expect("no record holds the id"),
+        );
+        let retired = boxes::SessionId::from_bytes(
+            before
+                .register_host_ip_box_as("retired", [0x7c; 16])
+                .expect("no record holds the id"),
+        );
+        assert!(before.admit_host_ip_box_with_lane(resumed, Some(&policy), true));
+        assert!(before.admit_host_ip_box(destroyed, None));
+        assert!(before.admit_host_ip_box(retired, None));
+        assert!(before.retire_host_ip_box(retired, HostIpBoxEnd::Stopped));
+        let held = before.table().host_ip_boxes();
+        let expected = held
+            .iter()
+            .find(|rules| rules.session_id() == resumed)
+            .expect("the resumed box is resident")
+            .clone();
+        drop(held);
+        drop(before);
+
+        let after = persisted_registry(&dir);
+        assert!(
+            after.table().host_ip_boxes().is_empty(),
+            "a reloaded box admits nothing until the VM runs it"
+        );
+        assert!(after.holds_host_ip_boxes(), "the reloaded rules are held");
+        let mark = after.host_ip_admit_mark();
+        let guest = BTreeMap::from([
+            (resumed, boxes::BoxState::Active),
+            (retired, boxes::BoxState::Active),
+        ]);
+        let outcome = after.reconcile_host_ip_boxes(&guest, mark, HostIpReconcileTrigger::Timer);
+        assert_eq!(
+            outcome.admitted,
+            vec![resumed],
+            "the resumed box rejoins the union, and the retired box does not"
+        );
+        assert_eq!(
+            after.host_ip_admit_mark(),
+            mark,
+            "no client admitted the box again"
+        );
+        let union = after.table().host_ip_boxes();
+        assert_eq!(union.len(), 1);
+        assert_eq!(
+            *union[0], *expected,
+            "the reloaded rules equal the admitted ones, lane included"
+        );
+        assert!(union[0].declares_credentialed_upstream());
+
+        let file: HostIpRulesFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(HOST_IP_RULES_FILE)).expect("the rules file reads"),
+        )
+        .expect("the rules file parses");
+        let sessions: Vec<_> = file.boxes.iter().map(|entry| entry.session).collect();
+        assert_eq!(
+            sessions,
+            vec![resumed],
+            "the box the guest no longer lists is forgotten"
+        );
+        assert_eq!(file.boxes[0].declared.as_ref(), Some(&policy));
+
+        let path = dir.path().join(HOST_IP_RULES_FILE);
+        std::fs::write(&path, b"not json").unwrap();
+        let unusable = persisted_registry(&dir);
+        let outcome = unusable.reconcile_host_ip_boxes(
+            &BTreeMap::from([(resumed, boxes::BoxState::Active)]),
+            unusable.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert!(
+            outcome.admitted.is_empty(),
+            "an unusable rules file reloads no rules"
+        );
+        assert!(!path.exists(), "the unusable file is moved");
     }
 
     // BEP-082: the ids a registry minted persist, so the registry of the
