@@ -4494,8 +4494,11 @@ impl BoxManager {
             .attrs
             .remove(minimald_rpc::DAEMON_PROJECTION_DIGEST_ATTR);
         let digests = projection_digests(&config, spec.as_ref(), verb_type);
-        // A client value that is not a digest in form is not stored.
-        if !matches!(digests.client, ClientDigest::Digest(_)) {
+        // A client value that is not a digest in form is not stored. A
+        // client digest is stored only beside a daemon digest: with no
+        // spec, or a spec the daemon cannot project, the record has
+        // nothing to compare it with. The log still names it.
+        if !matches!(digests.client, ClientDigest::Digest(_)) || digests.daemon.is_none() {
             config
                 .attrs
                 .remove(minimald_rpc::CLIENT_PROJECTION_DIGEST_ATTR);

@@ -7364,6 +7364,21 @@ async fn projection_digests_stored_side_by_side() {
     let (_, record) = create(unnamed_config()).await;
     assert_eq!(digests_of(record), (None, Some(expected.clone())));
 
+    // A create with no spec has no daemon digest, so the client's is not
+    // stored alone.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    let id = mngr
+        .create_box_with_spec(as_task(config), None, None, None)
+        .await
+        .expect("the box is created");
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is filed");
+    assert_eq!(digests_of(record), (None, None));
+
     // The daemon log names both digests.
     let logged = log.contents();
     // A malformed client value logs as `malformed`, never as `none` and
