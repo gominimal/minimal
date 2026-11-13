@@ -12,6 +12,10 @@
 # what this script reads it acts on as root. What it needs comes from the
 # package's own scripts directory and from /Library, which are root's.
 set -eu
+# Only the base system's tools, wherever this was started from: sudo keeps
+# the caller's PATH, and a directory a user owns may be first on it.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 
 # Set by build-pkg.sh when it packs this script. As written here they are
 # the released values, so the script unchanged requires minimal's Developer
