@@ -564,6 +564,12 @@ pub struct BoxLogsArgs {
     /// writes it, until the box is removed or the command is interrupted
     #[arg(short = 'f', long)]
     pub follow: bool,
+    /// Write the box's own output byte for byte, with its terminal control
+    /// codes. Without `--raw`, the codes are removed from the output of a
+    /// box with a terminal when stdout is not a terminal. `--exec` output is
+    /// always written unchanged, so `--exec` does not take `--raw`
+    #[arg(long)]
+    pub raw: bool,
 }
 
 // BCLI-012, BCLI-056: `min box logs <box> [-f | --exec <id>]`. Only the box
@@ -575,7 +581,11 @@ pub struct BoxLogsExecArgs {
     pub logs: BoxLogsArgs,
     /// Show what one command printed, by the exec id that `min box exec`
     /// printed for it. The command can be running or ended
-    #[arg(long = "exec", value_name = "EXEC_ID", conflicts_with = "follow")]
+    #[arg(
+        long = "exec",
+        value_name = "EXEC_ID",
+        conflicts_with_all = ["follow", "raw"]
+    )]
     pub exec: Option<String>,
 }
 

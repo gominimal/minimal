@@ -203,6 +203,18 @@ pub struct Layers {
     pub defaults_type: toml::Table,
     /// The selected loadouts' layer.
     pub loadouts: toml::Table,
+    /// The constraints of each type in the entry's type chain, the built-in
+    /// root first and the entry's own type last, each with its type name.
+    /// The order of [`crate::box_types::ResolvedType::constraints`].
+    /// [`loadout_gate`] reads their `loadout_mode` (BOX-181).
+    pub type_constraints: Vec<(String, toml::Table)>,
+    /// The loadouts a `--loadout` flag names, in flag order. Empty when the
+    /// client config's `default_loadouts` select the loadouts. A sealed box
+    /// refuses a named loadout (BOX-173).
+    pub named_loadouts: Vec<String>,
+    /// The name of each selected loadout whose file sets `loadout_mode`, in
+    /// selection order. An open box refuses the first (BOX-172).
+    pub loadouts_setting_mode: Vec<String>,
     /// The command-line overrides.
     pub overrides: toml::Table,
     /// The host's value for each variable that a layer sets to
@@ -348,32 +360,37 @@ impl Expansion {
 ///
 /// [`Error::InvalidSpecKey`] for the first key, in key order, that is not
 /// a box setting or has a value of the wrong shape. It names the layer
-/// that set the bad value. The same error, before any loadout applies,
-/// when `loadout_mode` is a string other than `sealed` or `open`.
+/// that set the bad value. Before any loadout applies, the errors of
+/// [`loadout_gate`]. On an open box, [`Error::LoadoutSetsLoadoutMode`]
+/// for a selected loadout that sets `loadout_mode`.
 pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
-    // The `[upstream]` table is the registry pin, so it sets the one spec
-    // key `upstream` and nothing else. An empty table sets nothing.
-    let mut upstream = toml::Table::new();
-    if !layers.upstream.is_empty() {
-        upstream.insert(
-            "upstream".to_owned(),
-            toml::Value::Table(layers.upstream.clone()),
-        );
-    }
-    let mut ordered: Vec<(Origin, &toml::Table)> = vec![(Origin::of(Layer::Upstream), &upstream)];
-    for (box_type, table) in &layers.type_defaults {
-        ordered.push((Origin::type_defaults(box_type), table));
-    }
-    ordered.push((Origin::of(Layer::Defaults), &layers.defaults));
-    ordered.push((Origin::of(Layer::DefaultsType), &layers.defaults_type));
-    ordered.push((Origin::of(Layer::Entry), &entry.body));
+    let upstream = upstream_layer(layers);
+    let mut ordered = layers_to_entry(entry, layers, &upstream);
     // BOX-166, BOX-167, BOX-170: the layers up to and including the entry
     // set `loadout_mode`, and the mode alone decides whether the selected
     // loadouts apply. A loadout cannot open the gate that admits it.
     let sealed = toml::Table::new();
-    let loadouts = match loadout_mode(entry, &ordered)? {
-        Some(LoadoutMode::Open) => &layers.loadouts,
-        Some(LoadoutMode::Sealed) | None => &sealed,
+    let loadouts = match gate(entry, layers, &ordered)? {
+        LoadoutMode::Open => {
+            // BOX-172: a loadout cannot set the mode. The gate read it
+            // before this layer, so the loadout's value would do nothing.
+            let in_table = layers.loadouts.contains_key("loadout_mode")
+                || layers
+                    .loadouts
+                    .get("box")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|b| b.contains_key("loadout_mode"));
+            if let Some(name) = layers.loadouts_setting_mode.first() {
+                return Err(Error::LoadoutSetsLoadoutMode {
+                    loadout: Some(name.clone()),
+                });
+            }
+            if in_table {
+                return Err(Error::LoadoutSetsLoadoutMode { loadout: None });
+            }
+            &layers.loadouts
+        }
+        LoadoutMode::Sealed => &sealed,
     };
     ordered.push((Origin::of(Layer::Loadouts), loadouts));
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
@@ -388,6 +405,124 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
+}
+
+/// The one spec key `upstream` that the `[upstream]` table sets. It is the
+/// registry pin, so it sets nothing else. An empty table sets nothing.
+fn upstream_layer(layers: &Layers) -> toml::Table {
+    let mut upstream = toml::Table::new();
+    if !layers.upstream.is_empty() {
+        upstream.insert(
+            "upstream".to_owned(),
+            toml::Value::Table(layers.upstream.clone()),
+        );
+    }
+    upstream
+}
+
+/// The layers of [`Layer::ORDER`] up to and including the entry.
+fn layers_to_entry<'a>(
+    entry: &'a BoxEntry,
+    layers: &'a Layers,
+    upstream: &'a toml::Table,
+) -> Vec<(Origin, &'a toml::Table)> {
+    let mut ordered: Vec<(Origin, &toml::Table)> = vec![(Origin::of(Layer::Upstream), upstream)];
+    for (box_type, table) in &layers.type_defaults {
+        ordered.push((Origin::type_defaults(box_type), table));
+    }
+    ordered.push((Origin::of(Layer::Defaults), &layers.defaults));
+    ordered.push((Origin::of(Layer::DefaultsType), &layers.defaults_type));
+    ordered.push((Origin::of(Layer::Entry), &entry.body));
+    ordered
+}
+
+/// The loadout gate of `entry`: whether the box takes its selected
+/// loadouts. It reads only the layers up to and including the entry, the
+/// type chain's constraints and [`Layers::named_loadouts`], so a client
+/// can call it before it reads any loadout file (BOX-175, BOX-181). An
+/// entry whose layers set no `loadout_mode` is sealed.
+///
+/// # Errors
+///
+/// In this order, each with exit 3:
+///
+/// - [`Error::InvalidSpecKey`] for a `loadout_mode` other than `sealed` or
+///   `open` (BOX-174).
+/// - [`Error::ConstraintViolated`] when a type of the chain constrains
+///   `loadout_mode` to another value (BOX-181).
+/// - [`Error::NamedLoadoutOnSealedBox`] when the box is sealed and a
+///   `--loadout` flag names a loadout (BOX-173).
+pub fn loadout_gate(entry: &BoxEntry, layers: &Layers) -> Result<LoadoutMode, Error> {
+    let upstream = upstream_layer(layers);
+    let ordered = layers_to_entry(entry, layers, &upstream);
+    gate(entry, layers, &ordered)
+}
+
+/// [`loadout_gate`] over `ordered`, the layers up to and including the
+/// entry.
+fn gate(
+    entry: &BoxEntry,
+    layers: &Layers,
+    ordered: &[(Origin, &toml::Table)],
+) -> Result<LoadoutMode, Error> {
+    let set = loadout_mode(entry, ordered)?;
+    let held = holding_constraint(layers);
+    if let (Some(set), Some((box_type, admitted))) = (&set, &held)
+        && let Some(found) = &set.found
+        && !admitted.iter().any(|a| a == found)
+    {
+        return Err(Error::ConstraintViolated {
+            key: set.key.to_owned(),
+            layer: set.layer.clone(),
+            found: found.clone(),
+            box_type: box_type.clone(),
+            admitted: admitted.clone(),
+        });
+    }
+    let mode = set.as_ref().map_or(LoadoutMode::Sealed, |s| s.mode);
+    if mode == LoadoutMode::Sealed && !layers.named_loadouts.is_empty() {
+        return Err(Error::NamedLoadoutOnSealedBox {
+            loadouts: layers.named_loadouts.clone(),
+            layer: set.as_ref().map(|s| s.layer.clone()),
+            entry: EntryHeader(entry.table.key(), &entry.name).to_string(),
+            // A constraint holds the box sealed only when it does not
+            // admit `open`. One that admits `open` leaves the remedy open.
+            held_by: held
+                .filter(|(_, admitted)| !admitted.iter().any(|a| a == "open"))
+                .map(|(box_type, _)| box_type),
+        });
+    }
+    // The client's record of the decision. `minimald` does not log the
+    // box's loadout mode.
+    tracing::debug!(entry = %entry.name, loadout_mode = ?mode, "loadout gate");
+    Ok(mode)
+}
+
+/// The most specific type of the chain whose constraints hold
+/// `loadout_mode`, as a message names it, with the values the constraint
+/// admits. A constraint is one value or a list of values.
+fn holding_constraint(layers: &Layers) -> Option<(String, Vec<String>)> {
+    layers.type_constraints.iter().rev().find_map(|(name, c)| {
+        let value = c.get("loadout_mode").or_else(|| {
+            c.get("box")
+                .and_then(toml::Value::as_table)
+                .and_then(|b| b.get("loadout_mode"))
+        })?;
+        let admitted: Vec<String> = match value {
+            toml::Value::String(s) => vec![s.clone()],
+            toml::Value::Array(items) => items
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_owned))
+                .collect(),
+            _ => return None,
+        };
+        let words = if BUILTIN_BOX_TYPES.contains(&name.as_str()) {
+            format!("the built-in `{name}` box type")
+        } else {
+            format!("`[box_types.{name}]`")
+        };
+        Some((words, admitted))
+    })
 }
 
 /// Checks a finished expansion of `entry` against the constraints of its
@@ -478,6 +613,17 @@ impl LoadoutMode {
     }
 }
 
+/// The `loadout_mode` that the layers up to and including the entry set:
+/// the mode, the key that set it, the layer as a message names it, and the
+/// string the layer wrote.
+struct SetMode {
+    mode: LoadoutMode,
+    key: &'static str,
+    layer: String,
+    /// `None` for a value that is not a string.
+    found: Option<String>,
+}
+
 /// The `loadout_mode` that `ordered`, the layers up to and including the
 /// entry, set. It is the flat key or the `[box]` section's key, whichever
 /// a later layer set. `None` when no layer sets it, and the gate treats
@@ -494,7 +640,7 @@ impl LoadoutMode {
 fn loadout_mode(
     entry: &BoxEntry,
     ordered: &[(Origin, &toml::Table)],
-) -> Result<Option<LoadoutMode>, Error> {
+) -> Result<Option<SetMode>, Error> {
     let before = fold(ordered);
     let rank = |key: &str| -> Option<(usize, &Origin)> {
         let origin = before.report.values.get(key)?.first()?;
@@ -517,14 +663,25 @@ fn loadout_mode(
         (None, Some((v, (_, o)))) => ("box.loadout_mode", v, o),
         (None, None) => return Ok(None),
     };
+    let layer = layer_words(entry, Some(origin));
     let Some(found) = value.as_str() else {
-        return Ok(Some(LoadoutMode::Sealed));
+        return Ok(Some(SetMode {
+            mode: LoadoutMode::Sealed,
+            key,
+            layer,
+            found: None,
+        }));
     };
     match LoadoutMode::parse(found) {
-        Some(mode) => Ok(Some(mode)),
+        Some(mode) => Ok(Some(SetMode {
+            mode,
+            key,
+            layer,
+            found: Some(found.to_owned()),
+        })),
         None => Err(Error::InvalidSpecKey {
             key: key.to_owned(),
-            layer: layer_words(entry, Some(origin)),
+            layer,
             problem: SpecKeyProblem::UnknownValue {
                 found: found.to_owned(),
                 accepted: LoadoutMode::ACCEPTED,
@@ -2058,11 +2215,40 @@ mod tests {
             .unwrap_or_default();
         let layers = Layers {
             type_defaults: resolved.defaults,
+            type_constraints: resolved.constraints,
             loadouts,
             ..Layers::default()
         }
         .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
         Ok(expand(entry, &layers))
+    }
+
+    /// The entry `name` of `file` and its layers, as [`expand_typed_with`]
+    /// builds them, with the type chain's constraints. `with` then sets
+    /// the loadout fields a test needs.
+    fn typed_layers(file: &str, name: &str, with: impl FnOnce(&mut Layers)) -> (BoxEntry, Layers) {
+        let doc = table(file);
+        let types = BoxTypes::from_file(&doc).expect("the types resolve");
+        let entry = read_entries(file.as_bytes())
+            .expect("entries read")
+            .into_iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let resolved = expandable_type(&entry, &types).expect("the type resolves");
+        let project_types = types.project().keys().cloned().collect();
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let mut layers = Layers {
+            type_defaults: resolved.defaults,
+            type_constraints: resolved.constraints,
+            ..Layers::default()
+        }
+        .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+        with(&mut layers);
+        (entry, layers)
     }
 
     const TYPED_FILE: &str = r#"
@@ -2803,6 +2989,219 @@ mod tests {
             assert_eq!(err.exit_code(), Some(3), "{name}");
             assert_eq!(err.to_string(), msg, "{name}");
         }
+    }
+
+    // BOX-172: a loadout that an open box applies cannot set
+    // `loadout_mode`. The expansion fails with exit 3, names the loadout
+    // and the key, and tells the person to remove the key.
+    #[test]
+    fn loadout_setting_loadout_mode_refused_exit3() {
+        let file = "[sessions.dev]\n\n[tasks.lint]\n";
+        let mut setting = whole_loadout();
+        setting.insert("loadout_mode".to_owned(), "sealed".into());
+        let (entry, layers) = typed_layers(file, "dev", |l| {
+            l.loadouts = setting.clone();
+            l.loadouts_setting_mode = vec!["mine".to_owned()];
+        });
+        assert!(matches!(
+            loadout_gate(&entry, &layers),
+            Ok(LoadoutMode::Open)
+        ));
+        let err = expand(&entry, &layers).expect_err("a loadout cannot set the mode");
+        assert!(
+            matches!(&err, Error::LoadoutSetsLoadoutMode { loadout: Some(l) } if l == "mine"),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(
+            err.to_string(),
+            "loadout `mine` sets `loadout_mode`, but a loadout cannot set \
+             `loadout_mode`. Remove `loadout_mode` from loadout `mine`."
+        );
+
+        // The `[box]` spelling in a loadouts layer that names no loadout.
+        let mut nested = whole_loadout();
+        nested.insert(
+            "box".to_owned(),
+            toml::Value::Table(table("loadout_mode = \"open\"")),
+        );
+        let (entry, layers) = typed_layers(file, "dev", |l| l.loadouts = nested);
+        let err = expand(&entry, &layers).expect_err("a loadout cannot set the mode");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(
+            err.to_string(),
+            "a selected loadout sets `loadout_mode`, but a loadout cannot set \
+             `loadout_mode`. Remove `loadout_mode` from that loadout."
+        );
+
+        // A sealed box reads no loadout, so the check does not run.
+        let (entry, layers) = typed_layers(file, "lint", |l| {
+            l.loadouts = setting;
+            l.loadouts_setting_mode = vec!["mine".to_owned()];
+        });
+        let e = expand(&entry, &layers).expect("a sealed box takes no loadout");
+        assert_no_loadout(&e, "lint");
+    }
+
+    // BOX-173: a loadout that a flag names, for a sealed box, fails the
+    // expansion with exit 3. The error names the loadout, the sealed mode
+    // and the layer that set it, and the remedies: run without
+    // `--loadout`, and open the entry unless a type constraint holds the
+    // mode, in which case it names that type.
+    #[test]
+    fn named_loadout_on_sealed_box_refused_exit3() {
+        let file = r#"
+            [box_types.ci]
+            extends = "task"
+            constraints = { loadout_mode = "sealed" }
+
+            [sessions.locked]
+            loadout_mode = "sealed"
+
+            [sessions.dev]
+
+            [tasks.lint]
+
+            [boxes.ci]
+            type = "ci"
+
+            [box_types.either]
+            extends = "task"
+            constraints = { loadout_mode = ["sealed", "open"] }
+
+            [boxes.either]
+            type = "either"
+        "#;
+        let cases: [(&str, &[&str], &str); 4] = [
+            (
+                "lint",
+                &["dev"],
+                "`--loadout` names loadout `dev`, but this box takes no loadout. \
+                 The built-in `task` box type sets `loadout_mode` to `sealed`. \
+                 Run the command without `--loadout`, or set \
+                 `loadout_mode = \"open\"` in `[tasks.lint]`.",
+            ),
+            (
+                "locked",
+                &["dev", "rust"],
+                "`--loadout` names loadouts `dev`, `rust`, but this box takes no \
+                 loadout. `[sessions.locked]` in minimal.toml sets `loadout_mode` \
+                 to `sealed`. Run the command without `--loadout`, or set \
+                 `loadout_mode = \"open\"` in `[sessions.locked]`.",
+            ),
+            (
+                "ci",
+                &["dev"],
+                "`--loadout` names loadout `dev`, but this box takes no loadout. \
+                 The built-in `task` box type sets `loadout_mode` to `sealed`. \
+                 Run the command without `--loadout`. `[box_types.ci]` constrains \
+                 `loadout_mode` to `sealed`, so `[boxes.ci]` cannot set it to \
+                 `open`.",
+            ),
+            // A constraint that admits `open` does not hold the box sealed,
+            // so the message keeps the remedy.
+            (
+                "either",
+                &["dev"],
+                "`--loadout` names loadout `dev`, but this box takes no loadout. \
+                 The built-in `task` box type sets `loadout_mode` to `sealed`. \
+                 Run the command without `--loadout`, or set \
+                 `loadout_mode = \"open\"` in `[boxes.either]`.",
+            ),
+        ];
+        for (name, named, msg) in cases {
+            let (entry, layers) = typed_layers(file, name, |l| {
+                l.loadouts = whole_loadout();
+                l.named_loadouts = named.iter().map(|n| (*n).to_owned()).collect();
+            });
+            // The creation and `min box spec <entry>` both expand, and the
+            // client's gate refuses the same way before it reads a loadout.
+            let gate = loadout_gate(&entry, &layers).expect_err("a sealed box refuses");
+            let err = expand(&entry, &layers).expect_err("a sealed box refuses");
+            assert_eq!(gate.to_string(), err.to_string(), "{name}");
+            assert!(
+                matches!(err, Error::NamedLoadoutOnSealedBox { .. }),
+                "{name}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{name}");
+            assert_eq!(err.to_string(), msg, "{name}");
+        }
+
+        // An open box takes the loadout a flag names.
+        let (entry, layers) = typed_layers(file, "dev", |l| {
+            l.loadouts = whole_loadout();
+            l.named_loadouts = vec!["dev".to_owned()];
+        });
+        let e = expand(&entry, &layers).expect("an open box takes a named loadout");
+        assert_whole_loadout(&e, "dev");
+    }
+
+    // BOX-181: a type constraint that holds `loadout_mode` at another value
+    // than the layers set fails with exit 3, as BOX-061 does, before the
+    // selected-loadouts layer. The loadout layer here would fail BOX-172
+    // and the flag BOX-173, so the constraint's error proves the order.
+    #[test]
+    fn constrained_loadout_mode_refused_before_loadouts() {
+        let file = r#"
+            [box_types.ci]
+            extends = "task"
+            constraints = { loadout_mode = "sealed" }
+
+            [box_types.dev]
+            extends = "session"
+            constraints = { loadout_mode = ["open"] }
+
+            [boxes.ci]
+            type = "ci"
+            loadout_mode = "open"
+
+            [boxes.dev]
+            type = "dev"
+            box = { loadout_mode = "sealed" }
+
+            [boxes.ok]
+            type = "ci"
+        "#;
+        let cases = [
+            (
+                "ci",
+                "`[boxes.ci]` in minimal.toml sets `loadout_mode` to \"open\", but \
+                 `[box_types.ci]` constrains `loadout_mode` to `sealed`. Fix the value.",
+            ),
+            (
+                "dev",
+                "`[boxes.dev]` in minimal.toml sets `box.loadout_mode` to \"sealed\", \
+                 but `[box_types.dev]` constrains `box.loadout_mode` to `open`. \
+                 Fix the value.",
+            ),
+        ];
+        for (name, msg) in cases {
+            let (entry, layers) = typed_layers(file, name, |l| {
+                let mut setting = whole_loadout();
+                setting.insert("loadout_mode".to_owned(), "open".into());
+                l.loadouts = setting;
+                l.loadouts_setting_mode = vec!["mine".to_owned()];
+                l.named_loadouts = vec!["mine".to_owned()];
+            });
+            let gate = loadout_gate(&entry, &layers).expect_err("the constraint refuses");
+            let err = expand(&entry, &layers).expect_err("the constraint refuses");
+            assert_eq!(gate.to_string(), err.to_string(), "{name}");
+            assert!(
+                matches!(err, Error::ConstraintViolated { .. }),
+                "{name}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{name}");
+            assert_eq!(err.to_string(), msg, "{name}");
+        }
+
+        // A value the constraint admits expands.
+        let (entry, layers) = typed_layers(file, "ok", |l| l.loadouts = whole_loadout());
+        assert!(matches!(
+            loadout_gate(&entry, &layers),
+            Ok(LoadoutMode::Sealed)
+        ));
+        let e = expand(&entry, &layers).expect("the constraint admits sealed");
+        assert_no_loadout(&e, "ok");
     }
 
     /// Layers whose selected loadouts' layer is `loadouts` and whose host

@@ -54,6 +54,41 @@ pub enum Error {
     /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
     /// the task name. Exits 3.
     InteractiveTask(String),
+    /// A selected loadout sets `loadout_mode`, which only the layers up to
+    /// and including the entry can set (BOX-172). Carries the loadout's
+    /// name, when the caller knows it. Exits 3.
+    LoadoutSetsLoadoutMode {
+        loadout: Option<String>,
+    },
+    /// A `--loadout` flag names a loadout for a box whose `loadout_mode` is
+    /// `sealed` (BOX-173). Carries the named loadouts, the layer that set
+    /// the mode (`None` when no layer sets it), the entry's table header,
+    /// and the type whose constraint holds the mode, if one does. Exits 3.
+    NamedLoadoutOnSealedBox {
+        loadouts: Vec<String>,
+        layer: Option<String>,
+        entry: String,
+        held_by: Option<String>,
+    },
+    /// A Box Type constraint holds a key at a value other than the one the
+    /// layers set (BOX-061, BOX-181). Carries the key, the layer that set
+    /// the value, the value, the type as the message names it, and the
+    /// values the constraint admits. Exits 3.
+    ///
+    /// This check duplicates `check_constraints` and
+    /// `BoxTypeError::ConstraintBroken`. When #3292 merges, the two become
+    /// one check and this variant goes:
+    /// <https://github.com/gominimal/minimal/issues/3304>.
+    ConstraintViolated {
+        key: String,
+        layer: String,
+        found: String,
+        box_type: String,
+        admitted: Vec<String>,
+    },
+    /// The entry's Box Type does not resolve, or the entry cannot use it.
+    /// Exits 3.
+    BoxType(Box<crate::box_types::BoxTypeError>),
     /// A selected loadout sets a variable to a resolved value other than
     /// the one the layers up to and including the entry, or another
     /// selected loadout, give it (BOX-183). Carries the variable and the
@@ -131,6 +166,15 @@ impl fmt::Display for EntryHeader<'_> {
     }
 }
 
+/// `words` with its first letter in upper case, to open a sentence.
+fn sentence_start(words: &str) -> String {
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 impl Error {
     /// The exit code a command ends with on this error, when the
     /// architecture's exit-code table fixes one. An invalid entry name is a
@@ -142,6 +186,10 @@ impl Error {
             | Error::InvalidSpecKey { .. }
             | Error::LegacyTable { .. }
             | Error::InteractiveTask(_)
+            | Error::LoadoutSetsLoadoutMode { .. }
+            | Error::NamedLoadoutOnSealedBox { .. }
+            | Error::ConstraintViolated { .. }
+            | Error::BoxType(_)
             | Error::LoadoutVarConflict { .. }
             | Error::DuplicateVar { .. } => Some(3),
             _ => None,
@@ -295,6 +343,73 @@ impl fmt::Display for Error {
                 EntryHeader("tasks", name),
                 EntryHeader("sessions", name)
             ),
+            Error::LoadoutSetsLoadoutMode { loadout } => {
+                let (which, that) = match loadout {
+                    Some(name) => (format!("loadout `{name}`"), format!("loadout `{name}`")),
+                    None => ("a selected loadout".to_owned(), "that loadout".to_owned()),
+                };
+                write!(
+                    f,
+                    "{which} sets `loadout_mode`, but a loadout cannot set \
+                     `loadout_mode`. Remove `loadout_mode` from {that}."
+                )
+            }
+            Error::NamedLoadoutOnSealedBox {
+                loadouts,
+                layer,
+                entry,
+                held_by,
+            } => {
+                let names: Vec<String> = loadouts.iter().map(|l| format!("`{l}`")).collect();
+                let noun = if names.len() == 1 {
+                    "loadout"
+                } else {
+                    "loadouts"
+                };
+                write!(
+                    f,
+                    "`--loadout` names {noun} {}, but this box takes no loadout. ",
+                    names.join(", ")
+                )?;
+                match layer {
+                    Some(layer) => write!(
+                        f,
+                        "{} sets `loadout_mode` to `sealed`. ",
+                        sentence_start(layer)
+                    )?,
+                    None => write!(
+                        f,
+                        "No layer of minimal.toml sets `loadout_mode`, and a box \
+                         without it is sealed. "
+                    )?,
+                }
+                write!(f, "Run the command without `--loadout`")?;
+                match held_by {
+                    None => write!(f, ", or set `loadout_mode = \"open\"` in `{entry}`."),
+                    Some(box_type) => write!(
+                        f,
+                        ". {box_type} constrains `loadout_mode` to `sealed`, so \
+                         `{entry}` cannot set it to `open`."
+                    ),
+                }
+            }
+            // The type error's own message is the whole message.
+            Error::BoxType(error) => write!(f, "{error}"),
+            Error::ConstraintViolated {
+                key,
+                layer,
+                found,
+                box_type,
+                admitted,
+            } => {
+                let admitted: Vec<String> = admitted.iter().map(|a| format!("`{a}`")).collect();
+                write!(
+                    f,
+                    "{layer} sets `{key}` to {found:?}, but {box_type} \
+                     constrains `{key}` to {}. Fix the value.",
+                    admitted.join(" or ")
+                )
+            }
             Error::LoadoutVarConflict {
                 name,
                 first,
@@ -335,6 +450,12 @@ impl std::error::Error for Error {
             Error::InvalidSpecKey { .. } => None,
             Error::LegacyTable { .. } => None,
             Error::InteractiveTask(_) => None,
+            Error::LoadoutSetsLoadoutMode { .. } => None,
+            Error::NamedLoadoutOnSealedBox { .. } => None,
+            Error::ConstraintViolated { .. } => None,
+            // `Display` prints the type error, so a chain printer prints it
+            // once.
+            Error::BoxType(_) => None,
             Error::LoadoutVarConflict { .. } => None,
             Error::DuplicateVar { .. } => None,
         }
