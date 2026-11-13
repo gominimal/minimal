@@ -547,6 +547,11 @@ impl BoxDir {
     /// sparse file counts what it holds. A link is not followed. A file
     /// with a hard link outside the directory counts nothing, since the
     /// reap does not free it, and a file linked twice inside counts once.
+    /// The figure counts only what is on the directory's own device: a
+    /// mount under the directory, and the mount point itself, count
+    /// nothing, since a reap does not free what another device holds. A
+    /// bind mount from the directory's own device shares its device
+    /// number, so it is not told apart and its files count.
     ///
     /// # Errors
     ///
@@ -564,8 +569,17 @@ fn allocated_bytes_under(root: &std::path::Path) -> Result<u64, std::io::Error> 
     let mut linked: std::collections::HashMap<(u64, u64), (u64, u64, u64)> =
         std::collections::HashMap::new();
     let mut total = 0u64;
-    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+    let device = std::fs::symlink_metadata(root).map(|meta| file_id(&meta).0)?;
+    // The walk does not descend into a mount from another device, but it
+    // still yields the mount point, whose metadata is the mounted root's.
+    let walk = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .same_file_system(true);
+    for entry in walk {
         let meta = entry?.metadata()?;
+        if file_id(&meta).0 != device {
+            continue;
+        }
         let (bytes, links) = allocated(&meta);
         if links <= 1 || meta.is_dir() {
             total = total.saturating_add(bytes);
@@ -2455,6 +2469,135 @@ mod tests {
 
         loader.delete(&key).unwrap();
         assert_eq!(dir.disk_bytes().unwrap_err().kind(), ErrorKind::NotFound);
+    }
+
+    /// The environment variable that tells a run of
+    /// `box_dir_disk_stays_on_its_own_device` it is the copy inside the
+    /// mount namespace.
+    #[cfg(target_os = "linux")]
+    const DISK_MOUNT_CHILD: &str = "BOXES_TEST_DISK_MOUNT_CHILD";
+
+    /// A box directory's disk figure counts only what is on the box
+    /// directory's own device: a bind mount of another device under the
+    /// box's tree adds nothing, since a reap does not free it. The mounts
+    /// need a mount namespace, so the test runs itself again under
+    /// `unshare`, and skips with the reason where `unshare` cannot run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn box_dir_disk_stays_on_its_own_device() {
+        if std::env::var_os(DISK_MOUNT_CHILD).is_some() {
+            disk_stays_on_its_own_device_in_namespace();
+            return;
+        }
+        // The probe mounts a tmpfs, as the run in the namespace does. A
+        // host can allow the namespace and still refuse the mount.
+        let scratch = TempDir::new().unwrap();
+        let probe = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--"])
+            .args(["mount", "-t", "tmpfs", "none"])
+            .arg(scratch.path())
+            .output();
+        match probe {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "skipped: this host cannot mount in a mount namespace: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("skipped: unshare cannot run here: {e}");
+                return;
+            }
+        }
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, rest)| rest);
+        let name = format!("{module}::box_dir_disk_stays_on_its_own_device");
+        let out = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(DISK_MOUNT_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "the run in the mount namespace failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the test did not run:\n{stdout}"
+        );
+    }
+
+    /// The body of `box_dir_disk_stays_on_its_own_device`, as root in its
+    /// own mount namespace.
+    #[cfg(target_os = "linux")]
+    fn disk_stays_on_its_own_device_in_namespace() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let run = |args: &[&std::ffi::OsStr]| {
+            let out = std::process::Command::new(args[0])
+                .args(&args[1..])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let dir = object.dir();
+        let tree = object.workspace_path();
+        let tree = tree.as_utf8_path().as_std_path();
+        let mount_point = tree.join("mnt");
+        std::fs::create_dir_all(&mount_point).unwrap();
+        std::fs::write(tree.join("own.bin"), vec![7u8; 64 * 1024]).unwrap();
+
+        // A tmpfs outside the box is another device, with a file in it.
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        run(&[
+            "mount".as_ref(),
+            "-t".as_ref(),
+            "tmpfs".as_ref(),
+            "none".as_ref(),
+            other.as_ref(),
+        ]);
+        std::fs::write(other.join("big.bin"), vec![7u8; 4 * 1024 * 1024]).unwrap();
+        let other_device = std::fs::metadata(&other).unwrap().dev();
+        assert_ne!(other_device, std::fs::metadata(tree).unwrap().dev());
+
+        let without = dir.disk_bytes().unwrap();
+        let point_bytes = std::fs::metadata(&mount_point).unwrap().blocks() * 512;
+        run(&[
+            "mount".as_ref(),
+            "--bind".as_ref(),
+            other.as_ref(),
+            mount_point.as_ref(),
+        ]);
+        assert_eq!(
+            std::fs::metadata(&mount_point).unwrap().dev(),
+            other_device,
+            "the bind mount is in place"
+        );
+        let with = dir.disk_bytes().unwrap();
+        run(&["umount".as_ref(), mount_point.as_ref()]);
+        run(&["umount".as_ref(), other.as_ref()]);
+
+        // The mount point hides the directory under it, so it counts
+        // nothing. That directory holds no blocks on a tmpfs.
+        assert_eq!(with, without - point_bytes, "the mount adds nothing");
+        assert_eq!(dir.disk_bytes().unwrap(), without, "the figure is back");
     }
 
     /// BOX-164: a read of a box's log does not follow a link planted where
