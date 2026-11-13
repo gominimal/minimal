@@ -690,9 +690,9 @@ fn fold(ordered: &[(Origin, &toml::Table)]) -> Expansion {
 /// `words` with its first letter in capitals, for the start of a sentence.
 fn sentence_start(words: &str) -> String {
     let mut chars = words.chars();
-    chars.next().map_or_else(String::new, |c| {
-        c.to_uppercase().chain(chars).collect()
-    })
+    chars
+        .next()
+        .map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
 /// `hooks`, a layer's `lifecycle_hooks`, with a `declared_by` table
@@ -3615,7 +3615,9 @@ mod tests {
         let layers = Layers {
             selected_loadouts: vec![(
                 "rust".to_owned(),
-                table("lifecycle_hooks = [{ on_activate = { type = \"inline\", value = \"echo rust\" } }]"),
+                table(
+                    "lifecycle_hooks = [{ on_activate = { type = \"inline\", value = \"echo rust\" } }]",
+                ),
             )],
             ..Layers::default()
         };
