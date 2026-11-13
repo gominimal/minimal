@@ -13763,12 +13763,31 @@ async fn task_list_in_a_session_only_project_says_no_task_boxes() {
     );
     assert!(!tasks.contains(EMPTY_PROJECT_LIST), "{tasks}");
 
-    // `min box list` keeps its own empty line for a project with no box.
+    // `min box list` for the same project lists the session box, so it
+    // does not print its own empty line either.
+    let root = paths::HostAbsPath::try_new(project).unwrap();
+    let mut listed = Vec::new();
+    for host in local_hosts(&global).unwrap() {
+        let records = cmd::read_host_boxes(&host).await.unwrap().unwrap();
+        listed.extend(
+            records
+                .into_iter()
+                .filter(|record| record.project_root.as_ref() == Some(&root))
+                .map(|record| cmd::ListedBox {
+                    provider: host.provider.to_string(),
+                    host: host.host.clone(),
+                    record,
+                }),
+        );
+    }
     let mut box_list = Vec::new();
-    cmd::render_box_list(&mut box_list, &[], true).unwrap();
+    cmd::render_box_list(&mut box_list, &listed, true).unwrap();
     let box_list = String::from_utf8(box_list).unwrap();
-    assert_eq!(box_list, format!("{EMPTY_PROJECT_LIST}\n"));
-    assert_ne!(box_list, tasks);
+    let rows: Vec<&str> = box_list.lines().collect();
+    assert_eq!(rows.len(), 2, "a header and the session box:\n{box_list}");
+    assert!(rows[1].contains("  web  "), "{box_list}");
+    assert!(rows[1].contains("  session  "), "{box_list}");
+    assert!(!box_list.contains(EMPTY_PROJECT_LIST), "{box_list}");
 }
 
 /// The typed listing of `min session list` and `min task list` over the
