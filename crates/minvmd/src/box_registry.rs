@@ -4311,10 +4311,23 @@ impl BoxRegistry {
             }
         };
         if let Err(error) = write_registry_file(&path, &file) {
-            tracing::warn!(
+            // Fail closed: an earlier file can still list a box a client
+            // retired since, and a restart must not reload it. With no file,
+            // the next start reloads no rules.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => {}
+                Err(remove) => tracing::error!(
+                    path = %path.display(),
+                    error = %remove,
+                    "could not remove the stale host_ip box rules file"
+                ),
+            }
+            tracing::error!(
                 path = %path.display(),
                 %error,
-                "could not persist the host_ip box rules; they will not survive this process"
+                "could not persist the host_ip box rules; the rules file is removed and the \
+                 next start reloads no rules"
             );
         }
     }
@@ -15085,6 +15098,42 @@ mod tests {
             "an unusable rules file reloads no rules"
         );
         assert!(!path.exists(), "the unusable file is moved");
+    }
+
+    // NET-085: a failed write of the rules fails closed. The earlier file
+    // still lists a box a client retired since, so it is removed, and a
+    // restart does not bring the retired box back.
+    #[test]
+    fn host_ip_box_rules_write_failure_on_retire_reloads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = persisted_registry(&dir);
+        let retired = boxes::SessionId::from_bytes(
+            before
+                .register_host_ip_box_as("retired", [0x7d; 16])
+                .expect("no record holds the id"),
+        );
+        assert!(before.admit_host_ip_box(retired, None));
+        let path = dir.path().join(HOST_IP_RULES_FILE);
+        assert!(path.exists(), "the admit persists the rules");
+        // A directory where the write puts its temporary file makes the
+        // write fail.
+        let blocker = path.with_extension("json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(before.retire_host_ip_box(retired, HostIpBoxEnd::Stopped));
+        assert!(!path.exists(), "a failed write removes the stale file");
+        drop(before);
+        std::fs::remove_dir(&blocker).unwrap();
+
+        let after = persisted_registry(&dir);
+        let outcome = after.reconcile_host_ip_boxes(
+            &BTreeMap::from([(retired, boxes::BoxState::Active)]),
+            after.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert!(
+            outcome.admitted.is_empty(),
+            "a retired box does not come back after a failed write"
+        );
     }
 
     // BEP-082: the ids a registry minted persist, so the registry of the
