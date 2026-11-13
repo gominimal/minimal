@@ -2487,56 +2487,17 @@ impl BoxChannel {
                 return Ok(false);
             }
 
-            // One run path for every task: an `inherit_cwd` task, a task
-            // whose helper forwards its stdin, and a default task differ
-            // only in the run options.
-            tracing::debug!(
-                task = %task_name,
-                start_dir = start_dir.as_deref().unwrap_or("<the box's working directory>"),
-                stdin_forwarded = forward_stdin,
-                "in-box task run uses the sandbox run path",
-            );
-            let started: StartedStdin = Arc::new(Mutex::new(None));
-            let options = sandbox::RunOptions {
-                current_dir: start_dir.clone(),
-                stdin: if forward_stdin {
-                    Some(forwarded_stdin_slot(stream, started.clone())?)
-                } else {
-                    None
-                },
-                ..sandbox::RunOptions::default()
-            };
-            let (mut stdout_writer, mut stderr_writer) =
-                StreamWriter::pair_tagged(stream, note_tag)
-                    .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
-            let ran = env
-                .run_with_options(
-                    invocations,
-                    Some(&mut stdout_writer),
-                    Some(&mut stderr_writer),
-                    options,
-                )
-                .await;
-            // A last line without a newline still reaches the helper. No
-            // await here: `mctx::Error` is not `Send`, and `ran` holds one.
-            stdout_writer.finish_line();
-            stderr_writer.finish_line();
-            let started = started
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            match started {
-                Some(Ok(stdin)) => {
-                    // The task ended, so a read of the forwarded stdin that
-                    // fails now does not fail the run.
-                    stdin.task_ended();
-                    forwarded = Some(stdin);
-                }
-                Some(Err(e)) => return Err(forwarded_stdin_error(&e)),
-                None => {}
-            }
-            ran?;
-            Ok(true)
+            run_invocations_relayed(
+                &mut env,
+                stream,
+                note_tag,
+                task_name,
+                invocations,
+                start_dir.clone(),
+                forward_stdin,
+                &mut forwarded,
+            )
+            .await
         }
         .await;
 
@@ -3625,6 +3586,97 @@ fn relayed_exit_code(result: &Result<(), Error>) -> Option<u8> {
         }
         Err(_) => None,
     }
+}
+
+/// Runs a task's invocations. [`mctx::Env`] runs them in the box's sandbox.
+/// A test gives a runner of its own, so the relay around a run is checked on
+/// a host that cannot start a sandbox.
+trait InvocationRunner {
+    fn run_invocations(
+        &mut self,
+        invocations: Vec<sandbox::config::Invocation>,
+        stdout: &mut StreamWriter,
+        stderr: &mut StreamWriter,
+        options: sandbox::RunOptions,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+}
+
+impl InvocationRunner for mctx::Env<'_> {
+    async fn run_invocations(
+        &mut self,
+        invocations: Vec<sandbox::config::Invocation>,
+        stdout: &mut StreamWriter,
+        stderr: &mut StreamWriter,
+        options: sandbox::RunOptions,
+    ) -> Result<(), Error> {
+        self.run_with_options(invocations, Some(stdout), Some(stderr), options)
+            .await
+    }
+}
+
+/// Runs a task's invocations through the one run path, with its output
+/// relayed to `stream` as `msg:` and `<note_tag>:` lines. `start_dir` and
+/// `forward_stdin` set the run options. A forwarded stdin that started is
+/// left in `forwarded`. `Ok(true)` is a run that passed. The caller sends
+/// the exit line with [`BoxChannel::end_task_run`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site in run_task, which hands over each fact of the run"
+)]
+async fn run_invocations_relayed<R: InvocationRunner>(
+    runner: &mut R,
+    stream: &mut UnixStream,
+    note_tag: &'static str,
+    task_name: &str,
+    invocations: Vec<sandbox::config::Invocation>,
+    start_dir: Option<String>,
+    forward_stdin: bool,
+    forwarded: &mut Option<crate::exec::ForwardedStdin>,
+) -> Result<bool, Error> {
+    // One run path for every task: an `inherit_cwd` task, a task
+    // whose helper forwards its stdin, and a default task differ
+    // only in the run options.
+    tracing::debug!(
+        task = %task_name,
+        start_dir = start_dir.as_deref().unwrap_or("<the box's working directory>"),
+        stdin_forwarded = forward_stdin,
+        "in-box task run uses the sandbox run path",
+    );
+    let started: StartedStdin = Arc::new(Mutex::new(None));
+    let options = sandbox::RunOptions {
+        current_dir: start_dir,
+        stdin: if forward_stdin {
+            Some(forwarded_stdin_slot(stream, started.clone())?)
+        } else {
+            None
+        },
+        ..sandbox::RunOptions::default()
+    };
+    let (mut stdout_writer, mut stderr_writer) = StreamWriter::pair_tagged(stream, note_tag)
+        .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
+    let ran = runner
+        .run_invocations(invocations, &mut stdout_writer, &mut stderr_writer, options)
+        .await;
+    // A last line without a newline still reaches the helper. No
+    // await here: `mctx::Error` is not `Send`, and `ran` holds one.
+    stdout_writer.finish_line();
+    stderr_writer.finish_line();
+    let started = started
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    match started {
+        Some(Ok(stdin)) => {
+            // The task ended, so a read of the forwarded stdin that
+            // fails now does not fail the run.
+            stdin.task_ended();
+            *forwarded = Some(stdin);
+        }
+        Some(Err(e)) => return Err(forwarded_stdin_error(&e)),
+        None => {}
+    }
+    ran?;
+    Ok(true)
 }
 
 /// Where the stdin slot of a run leaves the forwarded stdin it started, or
@@ -6468,6 +6520,156 @@ exit $rc
         let mut raw = String::new();
         std::io::Read::read_to_string(&mut theirs, &mut raw).unwrap();
         assert_eq!(raw, "stdin:\nmsg:from the helper\nexit:0\n");
+    }
+
+    /// A runner that starts no sandbox. It prints the directory the run
+    /// options give, or the box's working directory, and then the stdin it
+    /// gets and a last line without a newline. It ends with `code`.
+    struct FakeRunner {
+        code: i32,
+        seen: Vec<(Option<String>, bool)>,
+    }
+
+    impl InvocationRunner for FakeRunner {
+        async fn run_invocations(
+            &mut self,
+            invocations: Vec<sandbox::config::Invocation>,
+            stdout: &mut StreamWriter,
+            _stderr: &mut StreamWriter,
+            options: sandbox::RunOptions,
+        ) -> Result<(), Error> {
+            use std::io::Read as _;
+            use tokio::io::AsyncWriteExt as _;
+
+            assert_eq!(invocations.len(), 1, "the run gets the task's invocations");
+            self.seen
+                .push((options.current_dir.clone(), options.stdin.is_some()));
+            // The sandbox hands the stdin pipe to its slot before it reads
+            // any output, so the fake does the same.
+            let stdin = options.stdin.map(|slot| {
+                let (reader, writer) = std::io::pipe().unwrap();
+                slot(std::fs::File::from(std::os::fd::OwnedFd::from(writer)))
+                    .expect("the slot takes the pipe");
+                reader
+            });
+            let dir = options
+                .current_dir
+                .unwrap_or_else(|| format!("/{}", sandbox::SESSION_DEFAULT_WD));
+            stdout
+                .write_all(format!("{dir}\n").as_bytes())
+                .await
+                .unwrap();
+            if let Some(mut reader) = stdin {
+                let got = spawn_blocking(move || {
+                    let mut got = Vec::new();
+                    reader.read_to_end(&mut got).map(|_| got)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                stdout.write_all(&got).await.unwrap();
+            }
+            stdout.write_all(b"no-newline").await.unwrap();
+            if self.code == 0 {
+                return Ok(());
+            }
+            Err(Error::Execution {
+                idx: 0,
+                code: self.code,
+                reason: "the fake task failed".to_string(),
+                stderr: String::new(),
+                stdout: String::new(),
+            })
+        }
+    }
+
+    /// Runs one task through the relay that `BoxChannel::run_task` uses, with
+    /// `runner` in place of the sandbox, and returns what the helper reads.
+    async fn relay_with(
+        runner: &mut FakeRunner,
+        start_dir: Option<String>,
+        helper_stdin: Option<&[u8]>,
+    ) -> String {
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        if let Some(bytes) = helper_stdin {
+            theirs.write_all(bytes).unwrap();
+            theirs.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        let invocation = sandbox::config::Invocation {
+            executable: "/bbin/pwd".to_string(),
+            args: Vec::new(),
+            envs: Default::default(),
+        };
+        let mut forwarded = None;
+        let result = run_invocations_relayed(
+            runner,
+            &mut ours,
+            "err",
+            "fake",
+            vec![invocation],
+            start_dir,
+            helper_stdin.is_some(),
+            &mut forwarded,
+        )
+        .await;
+        BoxChannel::end_task_run(&mut ours, true, "err", "fake", result, forwarded.as_mut());
+        if let Some(forwarded) = forwarded {
+            forwarded.finish(FORWARDED_STDIN_CLOSE_WAIT);
+        }
+        drop(ours);
+        let mut raw = String::new();
+        std::io::Read::read_to_string(&mut theirs, &mut raw).unwrap();
+        raw
+    }
+
+    /// D2983: an `inherit_cwd` task and a default task go through the same
+    /// relay, and only the run options differ. Both send the task's output
+    /// and then the same exit line. A fake runner stands in for the
+    /// sandbox, so this test needs no user namespace and never skips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_task_relays_exit_through_both_paths_with_a_fake_runner() {
+        let working = tempfile::tempdir().unwrap();
+        std::fs::create_dir(working.path().join("sub")).unwrap();
+        let inherit = start_dir_in_box(true, Some("/workbench/sub"), working.path()).unwrap();
+        let default = start_dir_in_box(false, Some("/workbench/sub"), working.path()).unwrap();
+        assert_eq!(inherit.as_deref(), Some("/workbench/sub"));
+        assert_eq!(default, None);
+
+        for (code, exit) in [(0, "exit:0"), (3, "exit:3")] {
+            let mut runner = FakeRunner {
+                code,
+                seen: Vec::new(),
+            };
+            let cwd = relay_with(&mut runner, inherit.clone(), None).await;
+            let plain = relay_with(&mut runner, default.clone(), None).await;
+            assert_eq!(
+                cwd,
+                format!("msg:/workbench/sub\nmsg:no-newline\n{exit}\n"),
+                "an inherit_cwd task relays its own exit"
+            );
+            assert_eq!(
+                plain,
+                format!("msg:/workbench\nmsg:no-newline\n{exit}\n"),
+                "a default task relays the same exit line"
+            );
+            assert_eq!(
+                runner.seen,
+                [(Some("/workbench/sub".to_string()), false), (None, false)],
+                "the run options carry the start directory and no stdin"
+            );
+        }
+
+        // A forwarded stdin reaches an inherit_cwd task on the same path.
+        let mut runner = FakeRunner {
+            code: 0,
+            seen: Vec::new(),
+        };
+        let raw = relay_with(&mut runner, inherit.clone(), Some(b"from the helper\n")).await;
+        assert_eq!(
+            raw,
+            "stdin:\nmsg:/workbench/sub\nmsg:from the helper\nmsg:no-newline\nexit:0\n"
+        );
+        assert_eq!(runner.seen, [(Some("/workbench/sub".to_string()), true)]);
     }
 
     /// D2983: the text after the last newline reaches the helper as a line
