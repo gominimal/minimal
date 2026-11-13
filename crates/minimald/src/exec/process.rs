@@ -1157,6 +1157,18 @@ impl ForwardedStdin {
         })
     }
 
+    /// Starts the copy of `connection` to a new pipe, and returns the
+    /// pipe's read end with it. Each invocation of a task reads that one
+    /// pipe in turn, so an invocation gets the input that the one before it
+    /// left unread. Drop the read end after the last invocation ends: the
+    /// copy then drops the rest of `connection`.
+    pub(crate) fn start_shared(
+        connection: &std::os::unix::net::UnixStream,
+    ) -> io::Result<(Self, SharedStdin)> {
+        let (reader, writer) = io::pipe()?;
+        Ok((Self::start(connection, writer)?, SharedStdin(reader)))
+    }
+
     /// Records that the task ended. A read of the connection that fails
     /// after this is not an error: the task no longer reads its stdin.
     pub(crate) fn task_ended(&self) {
@@ -1204,6 +1216,18 @@ impl ForwardedStdin {
             let _ = self.connection.shutdown(std::net::Shutdown::Read);
             let _ = self.done.recv();
         }
+    }
+}
+
+/// The read end of the pipe that a [`ForwardedStdin`] from
+/// [`ForwardedStdin::start_shared`] feeds. The invocations of one task read
+/// it in turn.
+pub(crate) struct SharedStdin(io::PipeReader);
+
+impl SharedStdin {
+    /// A new descriptor of the read end, for one invocation's stdin.
+    pub(crate) fn for_invocation(&self) -> io::Result<std::os::fd::OwnedFd> {
+        Ok(self.0.try_clone()?.into())
     }
 }
 
