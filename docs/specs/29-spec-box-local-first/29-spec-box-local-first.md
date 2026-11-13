@@ -563,10 +563,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal directory_export_copies_its_tree_and_deletes_nothing
 
-- **BOX-188** WHEN BOX-185 copies a file to a path under the project root where a file already exists THE SYSTEM SHALL write the new file beside it under a temporary name and then rename it over the old one, so that the destination holds either the old file or the whole new one, even when two commands export the same path at once.
+- **BOX-188** WHEN BOX-185 copies a file to a path under the project root THE SYSTEM SHALL write it beside that path under a temporary name and then rename it into place, whether or not a file is already there, so that the destination holds either the whole earlier file, no file, or the whole new one, even when two commands export the same path at once.
   <!-- event-driven; decided 2026-11-13: a task's declared output is its latest result, as `min box cp` replaces a file today -->
   tier:     T0
-  verify:   cargo nextest run -p minimal export_replaces_existing_file_atomically
+  verify:   cargo nextest run -p minimal export_writes_each_file_atomically
 
 - **BOX-189** IF a `[[file_exports]]` path is absolute, contains a `..` component, or names the project root itself (an empty path, `.` or `./`) THEN THE SYSTEM SHALL fail the expansion with exit 3 before any box is created, so that the creating command and `min box spec <entry>` both refuse it. The error SHALL quote the path, say that it points outside the folder that holds `minimal.toml` or names that folder itself, and ask for the path of a file or folder inside it.
   <!-- unwanted; decided 2026-11-13: a destination outside the minimal.toml subtree is a spec error, caught before a run is spent, as BCLI-078 refuses at expansion; the architecture limits exports to that subtree (TB1, AT11) -->
@@ -623,13 +623,13 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal exports_not_copied_from_another_project
 
-- **BOX-200** IF the client's report of an export to the daemon fails THEN THE SYSTEM SHALL print on stderr one line that names the export's path and says that the box's record has no entry for it, and leave the command's exit code as BOX-193 and BOX-194 set it. The claim BOX-198 recorded stays, so no later command copies those exports again.
+- **BOX-200** IF the client's report of an export to the daemon fails THEN THE SYSTEM SHALL print on stderr one line that names the export's path and says that the client could not confirm that the box's record holds an entry for it, and leave the command's exit code as BOX-193 and BOX-194 set it. The claim BOX-198 recorded stays, so no later command copies those exports again.
   <!-- unwanted; decided 2026-11-13: the copied files are what a caller needs, and the record is the audit trail; a lost report does not change the result -->
   tier:     T0
   verify:   cargo nextest run -p minimal lost_export_report_named_exit_unchanged
 
 
-- **BOX-201** IF the daemon refuses a command's claim because another command already claimed that end THEN THE SYSTEM SHALL copy no export of that end, print on stderr one line that names the box and says its exports for that end were already copied, and leave the command's exit code as it is without exports.
+- **BOX-201** IF the daemon refuses a command's claim because another command already claimed that end THEN THE SYSTEM SHALL copy no export of that end, print on stderr one line that names the box and says that another command claimed its exports for that end, and leave the command's exit code as it is without exports.
   <!-- unwanted; decided 2026-11-13: the claim of BOX-198 makes "once for each end" hold; a refused claim is not a failure of the command -->
   tier:     T0
   verify:   cargo nextest run -p minimal refused_export_claim_copies_nothing
