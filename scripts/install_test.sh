@@ -3087,6 +3087,42 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
         want_err "the note names no daemon or host it cannot prove" grep -q "min host stop" "$OUT"
         want_err "a standing process is not reported as an unexplained write failure" \
             grep -q "The write failed (" "$OUT"
+
+        # A refusal on one verdict subtree takes nothing from its sibling: the cohort above both
+        # has the controller, so the allow subtree is still tried after the deny subtree refuses,
+        # and each is reported. A refusal on the cohort itself still stops the walk, both
+        # subtrees below it unwritten.
+        HC_HELPER="$root/hclib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        : >"$tree/boxes/allow/cgroup.subtree_control"
+        chmod 0444 "$tree/boxes/deny/cgroup.subtree_control"
+        run_hc install-deny-refuses "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        chmod 0644 "$tree/boxes/deny/cgroup.subtree_control"
+        check 0 "$rc" "install exits 0 when the deny subtree refuses the controller"
+        want_ok "the deny subtree's refusal is reported with the path that refused" \
+            grep -q "could not enable it on $tree/boxes/deny/cgroup.subtree_control\. The write failed (" "$OUT"
+        want_ok "the allow subtree is still enabled after its sibling refuses" \
+            grep -q "^+memory$" "$tree/boxes/allow/cgroup.subtree_control"
+        want_ok "and reported as enabled on its own" \
+            grep -q "enabled the memory controller on $tree/boxes/allow too\." "$OUT"
+        want_err "a partial install claims no boxes read memory.max across the tree" \
+            grep -q "Boxes can read their own memory.max" "$OUT"
+
+        : >"$tree/boxes/deny/cgroup.subtree_control"
+        : >"$tree/boxes/allow/cgroup.subtree_control"
+        chmod 0444 "$tree/boxes/cgroup.subtree_control"
+        run_hc install-cohort-refuses "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        chmod 0644 "$tree/boxes/cgroup.subtree_control"
+        unset HC_HELPER HC_SUDOERS
+        check 0 "$rc" "install exits 0 when the cohort refuses the controller"
+        want_ok "the cohort's refusal is reported with the path that refused" \
+            grep -q "could not enable it on $tree/boxes/cgroup.subtree_control\. The write failed (" "$OUT"
+        # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+        want_ok "neither subtree is tried below a cohort that refused" \
+            sh -c '! grep -q "+memory" "$1" && ! grep -q "+memory" "$2"' _ \
+            "$tree/boxes/deny/cgroup.subtree_control" "$tree/boxes/allow/cgroup.subtree_control"
     fi
 
     # --user takes an account name too, resolved to the same uid and group;

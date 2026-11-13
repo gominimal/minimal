@@ -1812,18 +1812,24 @@ done
 parent=$(dirname "$tree_root")
 if grep -qw memory "$parent/cgroup.subtree_control" 2>/dev/null; then
     if err=$(printf '+memory\n' 2>&1 >"$tree_root/cgroup.subtree_control"); then
-        # top down: a cgroup gets the controller only once the one above it has enabled it, so the
-        # first refusal leaves every cgroup below it without one, and the walk stops there
+        # top down: a cgroup gets the controller only once the one above it has enabled it, so
+        # a refusal on the cohort leaves both subtrees without one, and the walk stops there; a
+        # refusal on one subtree takes nothing from its sibling, which is still tried and
+        # reported on its own
         enabled="the slice, $tree_root"
+        refused=
         for cgroup in "/$BOXES_DIR" "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"; do
             if ! err=$(printf '+memory\n' 2>&1 >"$tree_root$cgroup/cgroup.subtree_control"); then
                 note "enabled the memory controller on $enabled, and could not enable it on $tree_root$cgroup/cgroup.subtree_control. The write failed (${err:-no error text}). Boxes under $tree_root$cgroup read no memory.max."
-                enabled=
-                break
+                refused=1
+                [ "$cgroup" != "/$BOXES_DIR" ] || break
+                continue
             fi
+            [ -z "$refused" ] ||
+                note "enabled the memory controller on $tree_root$cgroup too. Boxes under $tree_root$cgroup can read their own memory.max."
             enabled="$enabled, $tree_root$cgroup"
         done
-        [ -z "$enabled" ] ||
+        [ -n "$refused" ] ||
             note "enabled the memory controller on $enabled. Boxes can read their own memory.max."
     else
         # the one cause this step can prove is a process standing in the slice itself (cgroup v2 refuses
