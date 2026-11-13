@@ -17086,6 +17086,104 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
     assert_eq!(format!("{error:#}"), format!("{expected:#}"));
 }
 
+/// The project file error that `min box spec` ends with.
+fn spec_project_error(error: &anyhow::Error) -> &mfile::Error {
+    &error
+        .downcast_ref::<crate::ProjectFileInvalid>()
+        .unwrap_or_else(|| panic!("not a project file error: {error:#}"))
+        .error
+}
+
+// BOX-171, BOX-172, BOX-173, BOX-175, BOX-181: `min box spec <entry>`
+// reads the box's loadout mode before any loadout, as `min box start`
+// does. A sealed entry refuses `--loadout` and reads no default loadout.
+// A loadout that sets `loadout_mode` and a contradicted constraint refuse
+// with exit 3.
+#[tokio::test]
+async fn box_spec_entry_gates_loadouts_as_start() {
+    let (_project, global) = spec_project(
+        "[sessions.locked]\nloadout_mode = 'sealed'\n\n\
+         [sessions.dev]\nloadout_mode = 'open'\n\n\
+         [box_types.ci]\nextends = 'session'\nconstraints = { loadout_mode = 'sealed' }\n\n\
+         [boxes.ci]\ntype = 'ci'\nloadout_mode = 'open'\n\n\
+         [tasks.lint]\necho = 'x'\n",
+    );
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(loadouts.join("default.toml"), "= not = toml =").unwrap();
+    std::fs::write(loadouts.join("dev.toml"), "packages = [\"helix\"]\n").unwrap();
+    std::fs::write(loadouts.join("moder.toml"), "loadout_mode = \"open\"\n").unwrap();
+
+    let error = box_spec_text(
+        &global,
+        &["min", "box", "spec", "locked", "--loadout", "dev"],
+    )
+    .await
+    .expect_err("a sealed entry refuses --loadout");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(invalid, mfile::Error::NamedLoadoutOnSealedBox { .. }),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    let toml = box_spec_text(&global, &["min", "box", "spec", "locked"])
+        .await
+        .expect("a sealed entry reads no default loadout");
+    assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
+
+    // A sealed task entry reads no default loadout, as `min task run` does.
+    let toml = box_spec_text(&global, &["min", "box", "spec", "lint"])
+        .await
+        .expect("a sealed task entry reads no default loadout");
+    assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
+
+    let error = box_spec_text(
+        &global,
+        &["min", "box", "spec", "dev", "--loadout", "moder"],
+    )
+    .await
+    .expect_err("a loadout that sets loadout_mode refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::LoadoutSetsLoadoutMode { loadout: Some(name) } if name == "moder"
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    let error = box_spec_text(&global, &["min", "box", "spec", "ci"])
+        .await
+        .expect_err("a contradicted constraint refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(invalid, mfile::Error::ConstraintViolated { .. }),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    // BOX-172: an open task entry takes its default loadouts, as
+    // `min task run` does, so one that sets `loadout_mode` refuses.
+    let (_project, global) = spec_project("[tasks.opened]\necho = 'x'\nloadout_mode = 'open'\n");
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(loadouts.join("default.toml"), "loadout_mode = \"open\"\n").unwrap();
+    let error = box_spec_text(&global, &["min", "box", "spec", "opened"])
+        .await
+        .expect_err("an open task entry refuses a loadout that sets loadout_mode");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::LoadoutSetsLoadoutMode { loadout: Some(name) } if name == "default"
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+}
+
 /// Creates a session box on the in-process daemon `server` from the
 /// project in `root`, named `name` when it is given, with its spec stamped
 /// on the request as a start stamps it. Gives the request and the box id.
@@ -17678,6 +17776,196 @@ async fn retained_box_management_end_to_end() {
             "a `{verb}` event in the span\n{log}\n{ran}"
         );
     }
+}
+
+/// A project with `minimal_toml` and a client config directory whose
+/// `loadouts` directory holds each `(file, text)` of `loadouts`, with
+/// `config_toml` as the client config. Returns both directories and the
+/// global flags that point at them.
+fn loadout_project(
+    minimal_toml: &str,
+    config_toml: &str,
+    loadouts: &[(&str, &str)],
+) -> (tempfile::TempDir, tempfile::TempDir, GlobalArgs) {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), minimal_toml).unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let dir = config.path().join("minimal");
+    std::fs::create_dir_all(dir.join("loadouts")).unwrap();
+    std::fs::write(dir.join("config.toml"), config_toml).unwrap();
+    for (file, text) in loadouts {
+        std::fs::write(dir.join("loadouts").join(file), text).unwrap();
+    }
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        config_dir: Some(config.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+    (project, config, global)
+}
+
+fn utf8(dir: &tempfile::TempDir) -> camino::Utf8PathBuf {
+    camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap()
+}
+
+// BOX-171: `min task run` of a sealed task skips the config's default
+// loadouts and prints nothing about them. The same task set to `open`
+// takes the default loadout and prints the line that names it.
+#[test]
+fn sealed_task_run_prints_nothing_about_loadouts() {
+    let (project, _config, global) = loadout_project(
+        "[tasks.lint]\necho = 'x'\n\n[tasks.opened]\necho = 'x'\nloadout_mode = 'open'\n",
+        "",
+        &[("default.toml", "packages = [\"zellij\"]\n")],
+    );
+    let root = utf8(&project);
+    for task in ["lint", "undeclared"] {
+        let inputs = task::task_activation_inputs(
+            &global,
+            &root,
+            task,
+            false,
+            false,
+            boxes::core::policy::UserPolicy::default(),
+        )
+        .unwrap_or_else(|e| panic!("{task}: {e:#}"));
+        assert!(
+            inputs.loadout_names.is_empty(),
+            "{task}: {:?}",
+            inputs.loadout_names
+        );
+        assert_eq!(inputs.loadouts_line(), None, "{task}");
+    }
+
+    let inputs = task::task_activation_inputs(
+        &global,
+        &root,
+        "opened",
+        false,
+        false,
+        boxes::core::policy::UserPolicy::default(),
+    )
+    .expect("an open task takes its default loadouts");
+    assert_eq!(
+        inputs.loadouts_line().as_deref(),
+        Some("Applying loadouts: default")
+    );
+}
+
+// BOX-175: a sealed box reads no loadout that `default_loadouts` names,
+// and not the `default` loadout either, so a broken or missing one does
+// not fail it. An open box reads them, and fails on the broken one.
+#[test]
+fn sealed_box_ignores_broken_default_loadout() {
+    let minimal_toml = "[tasks.lint]\necho = 'x'\n\n\
+                        [sessions.locked]\nloadout_mode = 'sealed'\n\n\
+                        [sessions.dev]\n";
+    let configs: [(&str, &[(&str, &str)]); 2] = [
+        // The `default` loadout applies, and its file does not parse.
+        ("", &[("default.toml", "= not = toml =")]),
+        // `default_loadouts` names a missing loadout and a broken one.
+        (
+            "[loadouts]\ndefault_loadouts = ['missing', 'broken']\n",
+            &[("broken.toml", "packages = 3\n")],
+        ),
+    ];
+    for (config_toml, files) in configs {
+        let (project, _config, global) = loadout_project(minimal_toml, config_toml, files);
+        let root = utf8(&project);
+        task::task_activation_inputs(
+            &global,
+            &root,
+            "lint",
+            false,
+            false,
+            boxes::core::policy::UserPolicy::default(),
+        )
+        .unwrap_or_else(|e| panic!("{config_toml:?}: a sealed task fails: {e:#}"));
+
+        let session = |entry: &str| -> anyhow::Result<loadouts::ActivationInputs> {
+            let mode = session_loadout_mode(&root, Some(entry), &[])?;
+            loadouts::prepare_activation_inputs(
+                &global,
+                &root,
+                loadouts::gate_selection(loadouts::LoadoutSelection::Defaults, mode),
+                loadouts::HookPrep::Disabled,
+                Some(boxes::core::policy::UserPolicy::default()),
+            )
+        };
+        let sealed = session("locked")
+            .unwrap_or_else(|e| panic!("{config_toml:?}: a sealed session fails: {e:#}"));
+        assert_eq!(sealed.loadouts_line(), None, "{config_toml:?}");
+        assert!(
+            session("dev").is_err(),
+            "{config_toml:?}: an open session reads the broken default"
+        );
+    }
+}
+
+// BOX-181: an entry of the built-in `build` type does not resolve as a
+// start, so the gate reads the built-in constraints of `build`. They hold
+// `loadout_mode` at `sealed`, so an entry that sets `open` fails with
+// exit 3 before any loadout is read: the broken default does not fail it.
+#[test]
+fn builtin_build_entry_setting_open_refused_exit3() {
+    let (project, _config, _global) = loadout_project(
+        "[boxes.b]\ntype = 'build'\nloadout_mode = 'open'\n",
+        "",
+        &[("default.toml", "= not = toml =")],
+    );
+    let error = session_loadout_mode(&utf8(&project), Some("b"), &[])
+        .expect_err("a build entry that sets open refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::ConstraintViolated { key, box_type, .. }
+                if key == "loadout_mode" && box_type.contains("`build`")
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+}
+
+// BOX-175: a start whose session entry the pick cannot decide refuses with
+// exit 2 when it reads the loadout mode, before any loadout is read. It does
+// not fall back to the bare session entry, which is open.
+#[test]
+fn undecided_session_pick_refuses_before_loadouts() {
+    let (project, _config, _global) = loadout_project(
+        "[sessions.one]\n\n[sessions.two]\n",
+        "",
+        &[("default.toml", "= not = toml =")],
+    );
+    let error = session_loadout_mode(&utf8(&project), None, &[])
+        .expect_err("an undecided pick refuses the start");
+    assert!(
+        error
+            .downcast_ref::<crate::SessionEntryUndecided>()
+            .is_some(),
+        "{error:#}"
+    );
+}
+
+// BOX-181: an entry whose type name is not built in and does not resolve
+// refuses with exit 3. The gate does not decide the mode without the type
+// chain's constraints.
+#[test]
+fn unresolved_project_type_refuses_loadout_gate_exit3() {
+    let (project, _config, _global) =
+        loadout_project("[boxes.odd]\ntype = 'nosuchtype'\n", "", &[]);
+    let error = session_loadout_mode(&utf8(&project), Some("odd"), &[])
+        .expect_err("an unresolved type refuses the gate");
+    let invalid = error
+        .downcast_ref::<crate::ProjectFileInvalid>()
+        .unwrap_or_else(|| panic!("not a project file error: {error:#}"));
+    assert!(
+        matches!(invalid.error, mfile::Error::BoxType(_)),
+        "{:?}",
+        invalid.error
+    );
+    assert_eq!(invalid.error.exit_code(), Some(3));
 }
 
 /// A project whose `minimal.toml` declares two box types: `base` extends

@@ -1481,30 +1481,19 @@ pub(crate) async fn run_entry(
     let upload_root = crate::resolve_upload_root(&utf8_path)?;
     crate::stamp_project_root(&mut request, &upload_root)?;
 
-    // Loadouts and user policy: the same defaults as an activate with no
-    // loadout flags — the config's `default_loadouts` apply, unless
-    // `--no-loadouts` selects none (BCLI-075). Resolved before
-    // the daemon connection so a broken loadout fails loudly client-side, and
-    // through the same shared helper an activate uses so the staged hook
-    // scripts and the finalize budget match. The helper gets the resolved
-    // project root, not the directory `min task run` was invoked from, so a
-    // task started in a subdirectory still finds the project's config.
-    //
-    // `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
-    // reach the daemon inside the uploaded mfile, and this command never
-    // refused a project whose hook script the staging check rejects.
-    let selection = crate::loadouts::LoadoutSelection::from_flags(&[], args.other.no_loadouts);
-    let hook_prep = if args.other.no_hooks {
-        crate::loadouts::HookPrep::Disabled
-    } else {
-        crate::loadouts::HookPrep::StageOnly
-    };
-    let inputs = crate::loadouts::prepare_activation_inputs(
+    // Loadouts and user policy, resolved before the daemon connection so a
+    // broken loadout fails loudly client-side, and through the same shared
+    // helper an activate uses so the staged hook scripts and the finalize
+    // budget match. The helper gets the resolved project root, not the
+    // directory `min task run` was invoked from, so a task started in a
+    // subdirectory still finds the project's config.
+    let inputs = task_activation_inputs(
         global,
         &upload_root,
-        selection,
-        hook_prep,
-        Some(amended_policy),
+        &args.entry,
+        args.other.no_loadouts,
+        args.other.no_hooks,
+        amended_policy,
     )?;
     inputs.announce_loadouts();
 
@@ -2051,6 +2040,40 @@ pub(crate) async fn release_task_name_hold(
     name: &str,
 ) {
     crate::release_held_box_name(control_sock, id, Some(name), None).await;
+}
+
+/// The loadouts and user policy of the box `min task run` creates for task
+/// `entry` in the project at `project`. The config's `default_loadouts`
+/// apply, unless `--no-loadouts` (`no_loadouts`) selects none (BCLI-075).
+/// `--no-hooks` (`no_hooks`) disables every hook.
+///
+/// BOX-175: the task's loadout mode is read first, before any loadout
+/// file. A sealed task, the task type's default, selects none. So a broken
+/// default loadout cannot fail it, and nothing prints about the skipped
+/// defaults (BOX-171).
+///
+/// `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
+/// reach the daemon inside the uploaded mfile, and this command never
+/// refused a project whose hook script the staging check rejects.
+pub(crate) fn task_activation_inputs(
+    global: &crate::GlobalArgs,
+    project: &camino::Utf8Path,
+    entry: &str,
+    no_loadouts: bool,
+    no_hooks: bool,
+    policy: boxes::core::policy::UserPolicy,
+) -> anyhow::Result<crate::loadouts::ActivationInputs> {
+    let mode = crate::task_loadout_mode(project, entry)?;
+    let selection = crate::loadouts::gate_selection(
+        crate::loadouts::LoadoutSelection::from_flags(&[], no_loadouts),
+        mode,
+    );
+    let hook_prep = if no_hooks {
+        crate::loadouts::HookPrep::Disabled
+    } else {
+        crate::loadouts::HookPrep::StageOnly
+    };
+    crate::loadouts::prepare_activation_inputs(global, project, selection, hook_prep, Some(policy))
 }
 
 #[cfg(test)]
