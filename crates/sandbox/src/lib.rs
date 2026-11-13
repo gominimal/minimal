@@ -6169,14 +6169,13 @@ ff02::2\tip6-allrouters
             read_only: false,
             is_file: true,
             create_if_missing: true,
-            ..Default::default()
         };
         let config = Config::new("test-create-beneath")
             .with_dns(false)
             .with_session_dirs_mapped(home.clone(), working, vec![mapping]);
-        let err = Sandbox::new(base, config, ())
-            .err()
-            .expect("a link out of the home refuses the sandbox");
+        let Err(err) = Sandbox::new(base, config, ()) else {
+            panic!("a link out of the home refuses the sandbox");
+        };
         let text = err.to_string();
         assert!(text.contains("session's home or workbench"), "{text}");
         assert!(
