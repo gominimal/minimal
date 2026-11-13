@@ -112,6 +112,14 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   <!-- event-driven; how much of the output the capture keeps is BOX-155's; the architecture rules the bound (gominimal/arch#159, owner ruling 2026-11-06): a drop-oldest cap per log, a daemon default of 8 MiB that the operator can configure, with a drop mark where older output went -->
   tier:     T0
   verify:   cargo nextest run -p minimal type_noun_logs_follow
+  - WHERE the box's spec sets `pty_enabled`, stdout is not a terminal, and `--raw` is not given, THE SYSTEM SHALL remove terminal control sequences from the output that `min box logs`, `min session logs` and `min task logs` write.
+    <!-- state-driven; the architecture's `min box logs` line (L473), and design principle 3 -->
+    tier:   T0
+    verify: cargo nextest run -p minimal box_logs_piped_pty_transcript_has_no_control_codes
+  - WHERE `--raw` is given, or stdout is a terminal, or the spec does not set `pty_enabled`, THE SYSTEM SHALL write the captured bytes unchanged.
+    <!-- state-driven; the architecture's `min box logs` line (L473), and design principle 3 -->
+    tier:   T0
+    verify: cargo nextest run -p minimal box_logs_raw_keeps_control_codes
 
 - **BCLI-013** WHEN `min box wait <box>` runs THE SYSTEM SHALL return the `exit_code` BOX-011 stores for the box. For a box that already ended, it SHALL read the stored `exited` event. For a `stopped` record with no `exit_code`, it SHALL return 128 plus the `signal` BOX-011 and BOX-013 store for it.
   tier:     T0
