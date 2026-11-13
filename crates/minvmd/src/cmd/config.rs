@@ -8,7 +8,11 @@
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::cmd::{DEFAULT_VM_RAM_MIB, DEFAULT_VM_VCPUS, env_ram_mib, env_vcpus};
+use switch::bep_host::DEFAULT_PER_SOURCE_CAP;
+
+use crate::cmd::{
+    DEFAULT_VM_RAM_MIB, DEFAULT_VM_VCPUS, env_bep_per_box_cap, env_ram_mib, env_vcpus,
+};
 use crate::config::ResourceConfig;
 use crate::state::host_dir;
 
@@ -102,12 +106,27 @@ fn validate_resources(
     Ok(warnings)
 }
 
+/// Validate a requested per-box cap on Box Egress Proxy connections: a box
+/// with a cap of zero can open no connection to the proxy, so zero is
+/// refused.
+fn validate_bep_per_box_cap(cap: Option<u32>) -> Result<()> {
+    if cap == Some(0) {
+        bail!("--bep-per-box-cap must be at least 1");
+    }
+    Ok(())
+}
+
 /// Run `minvmd config set`: validate, merge into the persisted config, and save.
-pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
-    if vcpus.is_none() && ram_mib.is_none() {
-        bail!("nothing to set: pass --vcpus and/or --ram-mib");
+pub fn run_set(
+    vcpus: Option<u8>,
+    ram_mib: Option<u32>,
+    bep_per_box_cap: Option<u32>,
+) -> Result<()> {
+    if vcpus.is_none() && ram_mib.is_none() && bep_per_box_cap.is_none() {
+        bail!("nothing to set: pass --vcpus, --ram-mib or --bep-per-box-cap");
     }
 
+    validate_bep_per_box_cap(bep_per_box_cap)?;
     let warnings = validate_resources(vcpus, ram_mib, HostCapacity::probe())?;
 
     let dir = host_dir();
@@ -128,15 +147,19 @@ pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
     if let Some(m) = ram_mib {
         cfg.ram_mib = Some(m);
     }
+    if let Some(cap) = bep_per_box_cap {
+        cfg.bep_per_box_cap = Some(cap);
+    }
     cfg.write(&dir).context("persisting resource config")?;
 
     for w in &warnings {
         eprintln!("warning: {w}");
     }
     println!(
-        "saved: vcpus={}, ram_mib={} (takes effect on next boot)",
+        "saved: vcpus={}, ram_mib={}, bep_per_box_cap={} (takes effect on next boot)",
         describe(cfg.vcpus, DEFAULT_VM_VCPUS),
         describe(cfg.ram_mib, DEFAULT_VM_RAM_MIB),
+        describe(cfg.bep_per_box_cap, DEFAULT_PER_SOURCE_CAP),
     );
     Ok(())
 }
@@ -149,6 +172,9 @@ pub fn run_show(json: bool) -> Result<()> {
     let ram_mib = crate::cmd::effective_ram_mib();
     let vcpus_source = source(env_vcpus().is_some(), cfg.vcpus.is_some());
     let ram_source = source(env_ram_mib().is_some(), cfg.ram_mib.is_some());
+    let (bep_cap, bep_cap_source) =
+        crate::cmd::resolve_bep_per_box_cap(env_bep_per_box_cap(), cfg.bep_per_box_cap);
+    let bep_cap_source = bep_cap_source.label();
 
     if json {
         let out = serde_json_lenient::json!({
@@ -156,11 +182,14 @@ pub fn run_show(json: bool) -> Result<()> {
             "ram_mib": ram_mib,
             "vcpus_source": vcpus_source,
             "ram_mib_source": ram_source,
+            "bep_per_box_cap": bep_cap,
+            "bep_per_box_cap_source": bep_cap_source,
         });
         println!("{out}");
     } else {
-        println!("vcpus   = {vcpus} ({vcpus_source})");
-        println!("ram_mib = {ram_mib} ({ram_source})");
+        println!("vcpus           = {vcpus} ({vcpus_source})");
+        println!("ram_mib         = {ram_mib} ({ram_source})");
+        println!("bep_per_box_cap = {bep_cap} ({bep_cap_source})");
     }
     Ok(())
 }
@@ -248,6 +277,15 @@ mod tests {
             warns.iter().any(|w| w.contains("MMIO hole")),
             "expected an MMIO-hole warning: {warns:?}"
         );
+    }
+
+    #[test]
+    fn zero_bep_per_box_cap_is_rejected() {
+        let err = validate_bep_per_box_cap(Some(0)).unwrap_err();
+        assert_eq!(err.to_string(), "--bep-per-box-cap must be at least 1");
+        validate_bep_per_box_cap(Some(1)).expect("one is a valid cap");
+        validate_bep_per_box_cap(Some(128)).expect("128 is a valid cap");
+        validate_bep_per_box_cap(None).expect("unset is valid");
     }
 
     #[test]

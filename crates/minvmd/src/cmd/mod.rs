@@ -245,6 +245,68 @@ pub fn effective_resources() -> (u8, u32) {
     )
 }
 
+/// Environment variable overriding the per-box cap on Box Egress Proxy
+/// connections (see [`effective_bep_per_box_cap`]).
+pub const BEP_PER_BOX_CAP_ENV: &str = "MINVMD_BEP_PER_BOX_CAP";
+
+/// The `MINVMD_BEP_PER_BOX_CAP` override as a positive value, if set and valid.
+pub(crate) fn env_bep_per_box_cap() -> Option<u32> {
+    positive_env(BEP_PER_BOX_CAP_ENV)
+}
+
+/// Where the effective per-box cap came from, in the precedence order
+/// [`resolve_bep_per_box_cap`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapSource {
+    /// The [`BEP_PER_BOX_CAP_ENV`] override.
+    Env,
+    /// `bep_per_box_cap` in `config.toml`, written by `minvmd config set`.
+    Config,
+    /// [`switch::bep_host::DEFAULT_PER_SOURCE_CAP`].
+    Default,
+}
+
+impl CapSource {
+    /// The label `minvmd config show` prints beside the value.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Config => "config",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Resolve the per-box cap from its layers: the env override, then the
+/// persisted config, then the switch's recorded default. A zero in either
+/// layer counts as unset, because a box with no share can open nothing.
+/// Pure, so the precedence is testable without the process environment.
+#[must_use]
+pub fn resolve_bep_per_box_cap(env: Option<u32>, persisted: Option<u32>) -> (usize, CapSource) {
+    let positive = |v: Option<u32>| v.filter(|v| *v > 0).map(|v| v as usize);
+    if let Some(cap) = positive(env) {
+        (cap, CapSource::Env)
+    } else if let Some(cap) = positive(persisted) {
+        (cap, CapSource::Config)
+    } else {
+        (switch::bep_host::DEFAULT_PER_SOURCE_CAP, CapSource::Default)
+    }
+}
+
+/// The effective per-box cap on Box Egress Proxy connections — each
+/// registered box's share of the proxy listener pool (spec NET-132) —
+/// with the layer it came from, resolved as
+/// `env override ?? persisted config ?? default`. Read once at boot, so a
+/// `minvmd config set --bep-per-box-cap` takes effect on the next boot.
+#[must_use]
+pub fn effective_bep_per_box_cap() -> (usize, CapSource) {
+    resolve_bep_per_box_cap(
+        env_bep_per_box_cap(),
+        persisted_resource_config().bep_per_box_cap,
+    )
+}
+
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
 ///
 /// On Linux, libkrun drives KVM, which needs a readable `/dev/kvm`. Probe it
@@ -744,5 +806,54 @@ mod beacon_tests {
             contents.contains(&latest),
             "known_hosts must hold the latest host key, got: {contents:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod bep_cap_tests {
+    use super::{CapSource, resolve_bep_per_box_cap};
+    use switch::bep_host::DEFAULT_PER_SOURCE_CAP;
+
+    #[test]
+    fn effective_bep_per_box_cap_prefers_env_then_config_then_default() {
+        assert_eq!(
+            resolve_bep_per_box_cap(Some(32), Some(128)),
+            (32, CapSource::Env)
+        );
+        assert_eq!(
+            resolve_bep_per_box_cap(None, Some(128)),
+            (128, CapSource::Config)
+        );
+        assert_eq!(
+            resolve_bep_per_box_cap(None, None),
+            (DEFAULT_PER_SOURCE_CAP, CapSource::Default)
+        );
+    }
+
+    #[test]
+    fn effective_bep_per_box_cap_treats_zero_as_unset() {
+        assert_eq!(
+            resolve_bep_per_box_cap(Some(0), Some(96)),
+            (96, CapSource::Config)
+        );
+        assert_eq!(
+            resolve_bep_per_box_cap(None, Some(0)),
+            (DEFAULT_PER_SOURCE_CAP, CapSource::Default)
+        );
+    }
+
+    #[test]
+    fn effective_bep_per_box_cap_default_admits_one_pulumi_preview() {
+        // Sixty parallel CONNECTs from one box must all get a share.
+        let (cap, source) = resolve_bep_per_box_cap(None, None);
+        assert_eq!(source, CapSource::Default);
+        assert!(cap >= 60, "the default cap {cap} resets a Pulumi preview");
+    }
+
+    #[test]
+    fn effective_bep_per_box_cap_source_labels() {
+        assert_eq!(CapSource::Env.label(), "env");
+        assert_eq!(CapSource::Config.label(), "config");
+        assert_eq!(CapSource::Default.label(), "default");
     }
 }

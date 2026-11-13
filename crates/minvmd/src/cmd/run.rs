@@ -1267,10 +1267,16 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             }
             // The wire the peer carries: the acceptor's socket, this boot's
             // token, and the per-source cap that is each registered box's
-            // share of the pool. The default cap is the recorded working
-            // value (spec NET-132), named here so the two cannot drift.
-            let wire = switch::bep_host::BepWire::new(proxy_sock, token)
-                .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
+            // share of the pool. The cap resolves from the env override,
+            // then `config.toml`, then the recorded default (spec NET-132).
+            let (per_box_cap, per_box_cap_source) = crate::cmd::effective_bep_per_box_cap();
+            tracing::info!(
+                per_box_cap,
+                source = per_box_cap_source.label(),
+                "Box Egress Proxy per-box connection cap"
+            );
+            let wire =
+                switch::bep_host::BepWire::new(proxy_sock, token).with_per_source_cap(per_box_cap);
             // The stand-in binds before it returns, so it listens for the
             // boot's life. The proxy listens only once its watcher sees its
             // socket, and stops with its exit.
