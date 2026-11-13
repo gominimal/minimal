@@ -516,6 +516,11 @@ mod tests {
     #[test]
     fn one_line_per_attachment_issued_and_withdrawn() {
         let (log, _guard) = capture_log();
+        // Another test thread can register these callsites while no
+        // subscriber is set on it. That race can cache "never" for a
+        // callsite before this thread's subscriber is counted. Rebuild the
+        // cache before each logged call so this thread's subscriber counts.
+        tracing::callsite::rebuild_interest_cache();
         let attachments = Attachments::new();
         let web = attachments.issue(
             "web",
@@ -549,6 +554,7 @@ mod tests {
             "an issue is not an end, got: {logged}"
         );
 
+        tracing::callsite::rebuild_interest_cache();
         attachments.withdraw(Ipv4Addr::new(100, 64, 0, 9), Instant::now());
         let withdrawn = "withdrew a box egress proxy attachment";
         let logged = log.contents();
