@@ -2019,6 +2019,26 @@ impl std::fmt::Debug for RunOptions {
     }
 }
 
+/// Sets the [`RunOptions`] on the command of one invocation. The command
+/// starts in `current_dir` when it is set. The command gets a stdin pipe when
+/// `stdin` still holds a slot, and the slot moves out to the caller. So only
+/// the first invocation of a run gets the slot, and the later ones get none.
+#[cfg(target_os = "linux")]
+fn apply_run_options(
+    cmd: &mut hakoniwa::Command,
+    current_dir: Option<&str>,
+    stdin: &mut Option<StdinSlot>,
+) -> Option<StdinSlot> {
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    let slot = stdin.take();
+    if slot.is_some() {
+        cmd.stdin(hakoniwa::Stdio::piped());
+    }
+    slot
+}
+
 // Sandbox usage
 #[cfg(target_os = "linux")]
 impl<C: Channel> Sandbox<C> {
@@ -2602,13 +2622,7 @@ impl<C: Channel> Sandbox<C> {
             let container = self.new_container(planned.plan())?;
 
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
-            if let Some(dir) = current_dir.as_deref() {
-                cmd.current_dir(dir);
-            }
-            let stdin_slot = stdin.take();
-            if stdin_slot.is_some() {
-                cmd.stdin(hakoniwa::Stdio::piped());
-            }
+            let stdin_slot = apply_run_options(&mut cmd, current_dir.as_deref(), &mut stdin);
             cmd.stderr(hakoniwa::Stdio::MakePipe);
             cmd.stdout(hakoniwa::Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
@@ -5106,6 +5120,58 @@ int main(int argc, char **argv) {
                         .intersects(FsFlags::ST_NODEV | FsFlags::ST_NOEXEC)
                 })
         })
+    }
+
+    /// The options of `run_with_cancel` reach the command that each
+    /// invocation builds. Every command starts in the run's working
+    /// directory. Only the first command takes the stdin slot, and it is the
+    /// slot the caller gave. This test builds commands and spawns nothing, so
+    /// it needs no user namespace and runs on every Linux host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_with_cancel_starts_in_the_given_dir_on_each_built_command() {
+        let container = hakoniwa::Container::new();
+        let given = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let slot_saw = given.clone();
+        let mut stdin: Option<StdinSlot> = Some(Box::new(move |mut pipe: fs::File| {
+            pipe.write_all(b"from the slot\n")?;
+            slot_saw.lock().unwrap().extend_from_slice(b"called");
+            Ok(())
+        }));
+
+        let mut first = container.command("/usr/bin/probe");
+        let first_slot = apply_run_options(&mut first, Some("/start/here"), &mut stdin);
+        let mut second = container.command("/usr/bin/probe");
+        let second_slot = apply_run_options(&mut second, Some("/start/here"), &mut stdin);
+
+        assert_eq!(first.get_current_dir(), Some(Path::new("/start/here")));
+        assert_eq!(second.get_current_dir(), Some(Path::new("/start/here")));
+        assert!(
+            second_slot.is_none(),
+            "a later invocation gets no stdin slot"
+        );
+        assert!(
+            stdin.is_none(),
+            "the run keeps no slot after the first command"
+        );
+
+        let pipe = tempfile::tempfile().unwrap();
+        first_slot.expect("the first invocation gets the slot")(pipe)
+            .expect("the slot takes the pipe");
+        assert_eq!(
+            &*given.lock().unwrap(),
+            b"called",
+            "it is the caller's slot"
+        );
+
+        let mut plain = container.command("/usr/bin/probe");
+        let mut none: Option<StdinSlot> = None;
+        assert!(apply_run_options(&mut plain, None, &mut none).is_none());
+        assert_eq!(
+            plain.get_current_dir(),
+            None,
+            "no dir keeps the sandbox's own"
+        );
     }
 
     /// `run_with_cancel` starts every invocation in the run's working
