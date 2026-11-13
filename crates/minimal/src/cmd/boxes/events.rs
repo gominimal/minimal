@@ -184,6 +184,15 @@ pub(crate) async fn box_events_on_hosts(
             )?;
             return Ok(());
         }
+        if children.is_empty() {
+            // Without this line, a follow with nothing to print reads as a hang.
+            writeln!(
+                err,
+                "Box {} has no child boxes on host {} yet. \
+                 The events of each new child box print here. Press Ctrl-C to stop.",
+                resolved.box_id, resolved.host.host
+            )?;
+        }
         children
     } else {
         vec![(resolved.box_id, address.to_owned())]
@@ -195,13 +204,13 @@ pub(crate) async fn box_events_on_hosts(
         reads.push((label.clone(), lines));
     }
     let written = if args.follow {
-        let watch = args.parent.as_ref().map(|_| ChildWatch {
-            client,
-            parent: resolved.box_id,
-            address: address.to_owned(),
-            seen: ids.iter().map(|(id, _)| *id).collect(),
-            failed: std::collections::HashMap::new(),
-            list_failures: 0,
+        let watch = args.parent.as_ref().map(|_| {
+            ChildWatch::new(
+                HostChildren(client),
+                resolved.box_id,
+                address.to_owned(),
+                ids.iter().map(|(id, _)| *id),
+            )
         });
         follow_events(reads, watch, mode, out).await
     } else {
@@ -260,42 +269,126 @@ async fn open_events_read(
     })
 }
 
+/// The lines of one read of a box's events, one update in each.
+pub(crate) trait EventLines: Send + 'static {
+    /// The next line, or `None` once the daemon ended the read.
+    fn next_line(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<String>, anyhow::Error>> + Send;
+}
+
+impl EventLines for client::SubsystemLines {
+    async fn next_line(&mut self) -> Result<Option<String>, anyhow::Error> {
+        client::SubsystemLines::next_line(self).await
+    }
+}
+
+/// Where `--parent --follow` lists the boxes and opens the read of a new
+/// child: the parent's host, or a stand-in in the tests.
+pub(crate) trait ChildSource: Send + 'static {
+    /// The lines of one read that [`ChildSource::open`] gives.
+    type Lines: EventLines;
+
+    /// Every box on the host.
+    fn list(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Vec<minimald_rpc::BoxListingEntry>, anyhow::Error>>
+    + Send;
+
+    /// Opens the followed read of the events of box `id`, which errors
+    /// call `label`.
+    fn open(
+        &mut self,
+        id: boxes::BoxId,
+        label: &str,
+    ) -> impl std::future::Future<Output = Result<Self::Lines, anyhow::Error>> + Send;
+}
+
+/// The host of the parent, through its client.
+pub(crate) struct HostChildren(client::Client);
+
+impl ChildSource for HostChildren {
+    type Lines = client::SubsystemLines;
+
+    async fn list(&mut self) -> Result<Vec<minimald_rpc::BoxListingEntry>, anyhow::Error> {
+        list_box_records(&mut self.0, None).await
+    }
+
+    async fn open(
+        &mut self,
+        id: boxes::BoxId,
+        label: &str,
+    ) -> Result<client::SubsystemLines, anyhow::Error> {
+        open_events_read(&mut self.0, id, label, true).await
+    }
+}
+
 /// How often `--parent --follow` lists the parent's children again to
 /// find a child that is new since the follow started.
-const CHILD_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const CHILD_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How many listings in a row can show a new child whose read does not
-/// open before `--parent --follow` stops with the open error.
-const CHILD_OPEN_TRIES: u32 = 5;
+/// How long one listing, or one open of a new child's read, can take
+/// before `--parent --follow` counts it as failed. The streams already in
+/// the follow keep their output meanwhile.
+pub(crate) const CHILD_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many times in a row the read of a new child can fail to open, or
+/// be refused before its first event, while the listings still show the
+/// child. The next failure stops `--parent --follow` with the error.
+pub(crate) const CHILD_OPEN_TRIES: u32 = 5;
 
 /// How many listings in a row can fail before `--parent --follow` stops
 /// with the list error. A shorter outage keeps the follow and its streams.
-const CHILD_LIST_TRIES: u32 = 5;
+pub(crate) const CHILD_LIST_TRIES: u32 = 5;
 
 /// The state `--parent --follow` keeps to add the stream of each new child
 /// of `parent` to the follow.
-struct ChildWatch {
-    client: client::Client,
+pub(crate) struct ChildWatch<S> {
+    source: S,
     parent: boxes::BoxId,
     /// The parent as the person named it.
     address: String,
-    /// The children whose read is already in the follow.
+    /// The children whose read is in the follow, or is open and waits for
+    /// its first update. Only children the last listing showed stay here.
     seen: std::collections::HashSet<boxes::BoxId>,
-    /// For each new child whose read did not open, the number of listings
-    /// in a row that showed it.
+    /// For each new child whose read did not open, the number of times in
+    /// a row that it failed.
     failed: std::collections::HashMap<boxes::BoxId, u32>,
     /// The number of listings in a row that failed.
     list_failures: u32,
 }
 
-impl ChildWatch {
+impl<S: ChildSource> ChildWatch<S> {
+    /// A watch of the children of `parent`, which the person named
+    /// `address`. The children in `followed` are already in the follow.
+    pub(crate) fn new(
+        source: S,
+        parent: boxes::BoxId,
+        address: String,
+        followed: impl IntoIterator<Item = boxes::BoxId>,
+    ) -> Self {
+        Self {
+            source,
+            parent,
+            address,
+            seen: followed.into_iter().collect(),
+            failed: std::collections::HashMap::new(),
+            list_failures: 0,
+        }
+    }
+
     /// Lists the boxes again and opens a read for each child of the parent
-    /// that is not in the follow yet. `None` once the parent is removed:
-    /// no new child can come then.
+    /// that is not in the follow yet. Each read comes with the child's id
+    /// and name. `None` once the parent is removed: no new child can come
+    /// then. A child that the last listing before that showed, and that is
+    /// not in the follow yet, is never added.
     async fn new_children(
         &mut self,
-    ) -> Result<Option<Vec<(String, client::SubsystemLines)>>, anyhow::Error> {
-        let listing = match list_box_records(&mut self.client, None).await {
+    ) -> Result<Option<Vec<(boxes::BoxId, String, S::Lines)>>, anyhow::Error> {
+        let listed = tokio::time::timeout(CHILD_CALL_TIMEOUT, self.source.list())
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the listing timed out")));
+        let listing = match listed {
             Ok(listing) => {
                 self.list_failures = 0;
                 listing
@@ -323,36 +416,70 @@ impl ChildWatch {
             tracing::info!(verb = "box events", box_id = %self.parent, "the parent is removed");
             return Ok(None);
         }
+        // A child gone from the listing is never listed again, and a count
+        // starts again for a child that comes back.
+        let listed = |id: &boxes::BoxId| listing.iter().any(|entry| entry.box_id == *id);
+        self.seen.retain(listed);
+        self.failed.retain(|id, _| listed(id));
         let mut reads = Vec::new();
         for (id, label) in child_labels(&listing, self.parent) {
             if self.seen.contains(&id) {
                 continue;
             }
-            // A child removed between the listing and the open is gone
-            // from the next listing, so a failed open is tried again then.
-            // A child that the listings keep showing but whose read never
-            // opens ends the follow with the open error, not a silent gap.
-            match open_events_read(&mut self.client, id, &label, true).await {
+            let opened = tokio::time::timeout(CHILD_CALL_TIMEOUT, self.source.open(id, &label))
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::warn!(verb = "box events", box_id = %id, "the open of the events read timed out");
+                    Err(anyhow::anyhow!(
+                        "Could not read the events of box {label}. \
+                         Run `min box show {label}` to check that the box still exists."
+                    ))
+                });
+            match opened {
                 Ok(lines) => {
                     tracing::info!(verb = "box events", box_id = %id, parent = %self.parent, "follow a new child");
-                    self.failed.remove(&id);
                     self.seen.insert(id);
-                    reads.push((label, lines));
+                    reads.push((id, label, lines));
                 }
-                Err(e) => {
-                    let tries = self.failed.entry(id).or_insert(0);
-                    *tries += 1;
-                    tracing::debug!(verb = "box events", box_id = %id, tries = *tries, "{e:#}");
-                    if *tries >= CHILD_OPEN_TRIES {
-                        return Err(e);
-                    }
-                }
+                Err(e) => self.not_opened(id, e)?,
             }
         }
-        // A child gone from the listing starts its count again if it comes back.
-        self.failed
-            .retain(|id, _| listing.iter().any(|entry| entry.box_id == *id));
         Ok(Some(reads))
+    }
+
+    /// Takes the first update of the read of the new child `id`. A refusal
+    /// before the first event, such as for a child removed after the
+    /// listing, means the read did not open: the next listing that shows
+    /// the child opens it again.
+    fn first_update(
+        &mut self,
+        id: boxes::BoxId,
+        first: Result<(), anyhow::Error>,
+    ) -> Result<(), anyhow::Error> {
+        match first {
+            Ok(()) => {
+                self.failed.remove(&id);
+                Ok(())
+            }
+            Err(e) => {
+                self.seen.remove(&id);
+                self.not_opened(id, e)
+            }
+        }
+    }
+
+    /// Counts one more failure in a row of the read of `id`, and returns
+    /// `e` once the read failed [`CHILD_OPEN_TRIES`] times. A child that the
+    /// listings keep showing but whose read never opens ends the follow
+    /// with the error, not a silent gap.
+    fn not_opened(&mut self, id: boxes::BoxId, e: anyhow::Error) -> Result<(), anyhow::Error> {
+        let tries = self.failed.entry(id).or_insert(0);
+        *tries += 1;
+        tracing::debug!(verb = "box events", box_id = %id, tries = *tries, "{e:#}");
+        if *tries >= CHILD_OPEN_TRIES {
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -369,9 +496,9 @@ pub(crate) fn merge_events(
 /// The next update of the read of the box `label` names, or `None` once it
 /// ended. A `Failed` update and a stream that ends early are errors, which
 /// name the box by `label`. The detail goes to the log.
-async fn next_event(
+async fn next_event<L: EventLines>(
     label: &str,
-    lines: &mut client::SubsystemLines,
+    lines: &mut L,
 ) -> Result<Option<boxes::events::BoxEvent>, anyhow::Error> {
     let line = match lines.next_line().await {
         Ok(Some(line)) => line,
@@ -453,68 +580,103 @@ async fn replay_events(
 /// box kept, then each new one, until every followed box is removed or the
 /// command is interrupted. With a `watch`, the stream of each new child of
 /// the parent joins the follow, and the follow lasts until the parent is
-/// removed as well.
-async fn follow_events(
-    reads: Vec<(String, client::SubsystemLines)>,
-    mut watch: Option<ChildWatch>,
+/// removed as well. The watch runs in its own task, so a slow listing or
+/// open never holds back the output of the streams already in the follow.
+pub(crate) async fn follow_events<S: ChildSource>(
+    reads: Vec<(String, S::Lines)>,
+    watch: Option<ChildWatch<S>>,
     mode: OutputMode,
     out: &mut dyn std::io::Write,
 ) -> Result<(), anyhow::Error> {
-    type Next = Result<Option<boxes::events::BoxEvent>, anyhow::Error>;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Next>(64);
-    let mut readers = tokio::task::JoinSet::new();
-    let spawn = |readers: &mut tokio::task::JoinSet<()>,
-                 tx: &tokio::sync::mpsc::Sender<Next>,
-                 label: String,
-                 mut lines: client::SubsystemLines| {
-        let tx = tx.clone();
-        readers.spawn(async move {
-            loop {
-                let next = next_event(&label, &mut lines).await;
-                let end = !matches!(next, Ok(Some(_)));
-                if tx.send(next).await.is_err() || end {
-                    return;
-                }
-            }
-        });
-    };
+    // Every task ends when this set drops, on each return below.
+    let mut tasks = tokio::task::JoinSet::new();
     for (label, lines) in reads {
-        spawn(&mut readers, &tx, label, lines);
+        tasks.spawn(read_stream(label, lines, tx.clone(), None));
     }
-    // The sender stays only while a watch can add a reader, so the
-    // channel closes once every reader ended and no new one can come.
-    let mut tx = watch.is_some().then_some(tx);
-    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + CHILD_POLL, CHILD_POLL);
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            next = rx.recv() => {
-                let Some(next) = next else { break };
-                if let Some(event) = next? {
-                    write_object(out, mode, &EventRow(event))?;
-                    out.flush()?;
-                }
-            }
-            _ = poll.tick(), if watch.is_some() => {
-                let found = match watch.as_mut() {
-                    Some(watch) => watch.new_children().await?,
-                    None => None,
-                };
-                match (found, tx.as_ref()) {
-                    (Some(new), Some(sender)) => {
-                        for (label, lines) in new {
-                            spawn(&mut readers, sender, label, lines);
-                        }
-                    }
-                    _ => {
-                        watch = None;
-                        tx = None;
-                    }
-                }
-            }
+    if let Some(watch) = watch {
+        tasks.spawn(watch_children(watch, tx.clone()));
+    }
+    // The channel closes once every reader ended and the watch, which can
+    // add a reader, ended too.
+    drop(tx);
+    while let Some(next) = rx.recv().await {
+        if let Some(event) = next? {
+            write_object(out, mode, &EventRow(event))?;
+            out.flush()?;
         }
     }
     Ok(())
+}
+
+/// One update of a followed stream, as the output loop takes it.
+type Next = Result<Option<boxes::events::BoxEvent>, anyhow::Error>;
+
+/// Where the reader of a new child says how its first update went.
+type FirstUpdate = tokio::sync::mpsc::UnboundedSender<(boxes::BoxId, Result<(), anyhow::Error>)>;
+
+/// Sends each update of the read of the box `label` names to `tx`, until
+/// the read ends. With `first`, the read is of a new child: an error before
+/// its first event goes to the watch on `first`, not to the output.
+async fn read_stream<L: EventLines>(
+    label: String,
+    mut lines: L,
+    tx: tokio::sync::mpsc::Sender<Next>,
+    mut first: Option<(boxes::BoxId, FirstUpdate)>,
+) {
+    loop {
+        let next = next_event(&label, &mut lines).await;
+        if let Some((id, watch)) = first.take() {
+            if let Err(e) = next {
+                let _ = watch.send((id, Err(e)));
+                return;
+            }
+            let _ = watch.send((id, Ok(())));
+        }
+        let end = !matches!(next, Ok(Some(_)));
+        if tx.send(next).await.is_err() || end {
+            return;
+        }
+    }
+}
+
+/// Lists the children of the watched parent each [`CHILD_POLL`], and adds a
+/// reader for each new one, until the parent is removed. Then it waits for
+/// the readers it added. An error that ends the follow goes to `tx`.
+async fn watch_children<S: ChildSource>(
+    mut watch: ChildWatch<S>,
+    tx: tokio::sync::mpsc::Sender<Next>,
+) {
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut readers = tokio::task::JoinSet::new();
+    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + CHILD_POLL, CHILD_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        poll.tick().await;
+        // A reader that ended leaves the set, so a parent whose children
+        // come and go keeps only the readers that still run.
+        while readers.try_join_next().is_some() {}
+        while let Ok((id, first)) = first_rx.try_recv() {
+            if let Err(e) = watch.first_update(id, first) {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+        match watch.new_children().await {
+            Ok(Some(new)) => {
+                for (id, label, lines) in new {
+                    let first = Some((id, first_tx.clone()));
+                    readers.spawn(read_stream(label, lines, tx.clone(), first));
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+    while readers.join_next().await.is_some() {}
 }
 
 /// `min box cp`.
