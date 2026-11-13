@@ -580,6 +580,14 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-068** WHILE a box's egress is a hostname-only allowlist naming every host that `git clone`, `npm install`, `pip install`, and a container pull contact THE SYSTEM SHALL complete those operations.
   tier:     T0
   verify:   cargo nextest run -p minvmd hostname_allowlist_toolchain_completes
+  verify:   cargo test -p minimald hostname_allowlist_box_loopback_connect_is_admitted
+  <!-- The guest table does not refuse a box's own loopback traffic, such as
+       git's connect to 127.0.0.1. An own-IP box has a network namespace of
+       its own and no classifier leaf, and a hostname allowlist is not
+       deny-all. Every refusing rule of the guest table needs a socket of the
+       boxes subtree. The one refusal on lo that a guest boot log carries is
+       the effect probe's, from its deny leaf at boot, so the verify reads the
+       log only from the first tool on and fails on a refusal on lo there. -->
   <!-- S8b/AC3; prose 44; state-driven; the story's list also names apt, which the composed base (the gominimal/pkgs base, no Debian userland) does not ship, so no box can run it; the container pull keeps the rotating-CDN shape apt stood for, and git, npm and pip cover the pinned-name shape; the five-tool list came from the egress-gateway spike as an illustration, not as a requirement in itself. The
        allowlist the verify uses names both CDNs Docker Hub's blob redirect lands
        on (cloudflare and cloudfront): every host the pull may contact is a host
