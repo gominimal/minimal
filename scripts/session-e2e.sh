@@ -8144,11 +8144,19 @@ relay_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name e2e-relay ${E2E_
 relay_sid="$(printf '%s\n' "$relay_sid" | tail -n1 | tr -d '\r')"
 
 # 1. Resize, then the detach chord. The typed line echoes as
-# `RELAY_SIZE[%s]`; only the shell's output carries the size itself.
+# `RELAY_SIZE[%s]`; only the shell's output carries the size itself. The
+# resize travels client -> ssh -> daemon -> the session's pty, so the
+# session's shell polls `stty size` (up to 10 s) for the new size before it
+# prints, and each poll prints a dot: the dots keep the pty busy, so the
+# helper's quiet-stream detach does not fire while the shell waits. The
+# ready marker is built with printf, so the pty's echo of the typed text
+# never contains it; the E2E_PTY_READY docstring in e2e-attach-pty.py has
+# the rest. What is asserted: the size the session reports is the resized
+# one.
 # shellcheck disable=SC2016 # `$(stty size)` must run in the SESSION's shell.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-relay_out="$(E2E_PTY_COMMANDS='echo RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
-  E2E_PTY_AFTER='printf "RELAY_SIZE[%s]\n" "$(stty size)"' E2E_PTY_DETACH=1 \
+relay_out="$(E2E_PTY_COMMANDS='printf "RELAY_%s\n" READY' E2E_PTY_READY='RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
+  E2E_PTY_AFTER='for _ in $(seq 1 40); do s=$(stty size); [ "$s" = "41 117" ] && break; printf .; sleep 0.25; done; printf "\nRELAY_SIZE[%s]\n" "$s"' E2E_PTY_DETACH=1 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-resize.err")" || {
   echo "::error::the resize-and-detach attach through the relay failed"
