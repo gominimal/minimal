@@ -578,7 +578,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal missing_export_named_and_others_copied
 
-- **BOX-191** IF the copy of a file fails, creating a directory fails, a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at the destination that failed, leaving no partial file and no change to what is already there, keep the files a directory export already wrote, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports.
+- **BOX-191** IF the copy of a file fails, reading the listing of a directory in the box fails, creating a directory fails, a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at the destination that failed, leaving no partial file and no change to what is already there, keep the files a directory export already wrote, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports.
   tier:     T0
   verify:   cargo nextest run -p minimal failed_export_file_leaves_its_destination_unchanged
 
