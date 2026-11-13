@@ -1,5 +1,22 @@
 use super::*;
 
+/// Writes `content`, a box's default `minimal.toml`, to `toml_path` in the
+/// box's workspace `wsp` if no file is there yet. Under the lock `min
+/// init`/`add`/`update` take, and only if the file is still missing there,
+/// so a concurrent writer's file is never clobbered by the default. The
+/// write stays inside the workspace ([`mfile::File::edit_exclusively_within`]):
+/// the box controls it, so a link there that leads out of it is refused.
+pub(super) fn write_default_mfile(
+    wsp: &std::path::Path,
+    toml_path: &std::path::Path,
+    content: String,
+) -> Result<(), String> {
+    mfile::File::edit_exclusively_within::<mfile::Error>(wsp, toml_path, |existing| {
+        Ok(existing.is_none().then_some(content))
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// The daemon log's one line for an activation refused on a declared host
 /// port that something else holds (NET-144): the session, the port, the
 /// address and the holder (`box:<name>` or `host`).
@@ -1286,13 +1303,7 @@ impl BoxActor {
             Ok(_) => Ok(()), // it exists
             Err(mfile::Error::NotFound) => {
                 let (toml_path, content) = self.default_mfile_plan(wsp)?;
-                // Under the lock `min init`/`add`/`update` take, and only if
-                // the file is still missing there, so a concurrent writer's
-                // file is never clobbered by the default.
-                mfile::File::edit_exclusively::<mfile::Error>(&toml_path, |existing| {
-                    Ok(existing.is_none().then_some(content))
-                })
-                .map_err(|e| e.to_string())
+                write_default_mfile(wsp.as_utf8_path().as_std_path(), &toml_path, content)
             }
             Err(e) => Err(e.to_string()),
         }
