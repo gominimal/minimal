@@ -35,6 +35,8 @@ pub mod redeem;
 pub mod redeemer;
 pub mod revoke;
 pub mod seal;
+#[cfg(target_os = "linux")]
+pub mod secret_service;
 pub mod signin;
 pub mod store;
 pub mod supervisor;
