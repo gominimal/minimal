@@ -15,6 +15,23 @@ export PATH
 for job in dev.gominimal.zone dev.minimal.local-range; do
     launchctl bootout "system/$job" 2>/dev/null || true
 done
+# Packages before this layout kept the service's bundle and the uninstaller
+# under /usr/local. Installer does not remove what a newer package no longer
+# carries, so the two would stay for good, in no receipt. They go here, and
+# only when the earlier receipt lists them: never a path that is a link, and
+# nothing a user put there under the same name on a Mac the package never
+# wrote to.
+earlier="$(pkgutil --files dev.minimal.min 2>/dev/null || true)"
+if printf '%s\n' "$earlier" | grep -qx 'usr/local/bin/Minimal.app'; then
+    if [ -d /usr/local/bin/Minimal.app ] && [ ! -L /usr/local/bin/Minimal.app ]; then
+        rm -rf /usr/local/bin/Minimal.app
+    fi
+fi
+if printf '%s\n' "$earlier" | grep -qx 'usr/local/share/minimal/uninstall.sh'; then
+    if [ -f /usr/local/share/minimal/uninstall.sh ] && [ ! -L /usr/local/share/minimal/uninstall.sh ]; then
+        rm -f /usr/local/share/minimal/uninstall.sh
+    fi
+fi
 bundle=/Library/PrivilegedHelperTools/Minimal.app
 # An install that stopped between this script and its postinstall left the
 # earlier program aside: it is the current one again.
