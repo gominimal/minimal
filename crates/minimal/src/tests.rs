@@ -13325,6 +13325,54 @@ async fn task_list_shows_exited_until_pruned() {
     assert_eq!(list(None).await, "No task boxes on this machine.\n");
 }
 
+// D3203: in a project that holds only a session box, a scoped
+// `min task list` names the task type in its empty line. It does not print
+// the `min box list` empty line, which says the project has no boxes at all.
+#[tokio::test]
+async fn task_list_in_a_session_only_project_says_no_task_boxes() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+
+    let list = async |box_type: &str| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        typed_list_on_hosts(
+            box_type,
+            local_hosts(&global).unwrap(),
+            Some(paths::HostAbsPath::try_new(project).unwrap()),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .expect("the typed list");
+        assert_eq!(String::from_utf8_lossy(&err), "", "nothing on stderr");
+        String::from_utf8(out).unwrap()
+    };
+
+    // The session box is in the project, so the project is not empty.
+    let sessions = list(boxes::SESSION_BOX_TYPE).await;
+    assert!(sessions.contains("  web  "), "{sessions}");
+
+    let tasks = list(boxes::TASK_BOX_TYPE).await;
+    assert_eq!(
+        tasks,
+        "This project has no task boxes. Run `min task list --all` to list the task boxes \
+         of every project.\n"
+    );
+    assert!(!tasks.contains(EMPTY_PROJECT_LIST), "{tasks}");
+
+    // `min box list` keeps its own empty line for a project with no box.
+    let mut box_list = Vec::new();
+    cmd::render_box_list(&mut box_list, &[], true).unwrap();
+    let box_list = String::from_utf8(box_list).unwrap();
+    assert_eq!(box_list, format!("{EMPTY_PROJECT_LIST}\n"));
+    assert_ne!(box_list, tasks);
+}
+
 /// The typed listing of `min session list` and `min task list` over the
 /// local `hosts`, as the commands run it, with the table rendering.
 async fn typed_list_on_hosts(
