@@ -5,8 +5,9 @@
 use crate::Error;
 use common::{SpecOrigin, Target};
 
-use nickel_lang_core::cache::TermCacheError;
+use nickel_lang_core::cache::{TermCacheError, normalize_abs_path, normalize_path};
 use nickel_lang_core::eval::value::{NickelValue, RecordData};
+use nickel_lang_core::files::Files;
 use nickel_lang_core::identifier::{Ident, LocIdent};
 use nickel_lang_core::program::BuilderError;
 use nickel_lang_core::term::Term;
@@ -16,9 +17,12 @@ use nickel_lang_core::{
     eval::cache::CacheImpl,
     program::{Program, ProgramBuilder},
 };
-use std::collections::{BTreeSet, HashMap};
+use regex::Regex;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::hash::Hash;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 
 /// Configuration for loading a layer (of Nickel files).
 ///
@@ -33,6 +37,12 @@ pub struct LoadOptions {
     pub target: Target,
     /// The parameters being passed to the layer during evaluation.
     pub params: Option<HashMap<String, args::DiskArg>>,
+    /// When set, the canonical root of the layer: every file the program
+    /// loads must lie under it or under the minimal library, or loading fails
+    /// with [Error::ImportOutside]. Loading a layer from its directory sets
+    /// it to that directory. It does not take part in
+    /// [LoadOptions::input_hash].
+    pub confine_to: Option<PathBuf>,
 }
 
 impl LoadOptions {
@@ -43,6 +53,7 @@ impl LoadOptions {
                 .join("minimal-ncl"),
             target: Target::default(),
             params: None,
+            confine_to: None,
         }
     }
 
@@ -183,6 +194,156 @@ pub fn build_decls_in_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, std::i
     Ok(out)
 }
 
+/// Matches an `import "…"` expression in Nickel source; group 1 is the
+/// string's body, escapes still in place.
+static IMPORT_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\bimport\s*"((?:[^"\\]|\\.)*)""#).expect("the import pattern is valid")
+});
+
+/// Undoes the Nickel string escapes a path can plausibly hold (`\"`, `\\`,
+/// `\%`). Any other escape is kept as written; the check after loading
+/// covers a path this gets wrong.
+fn unescape_import(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(e @ ('"' | '\\' | '%')) => out.push(e),
+            Some(e) => {
+                out.push('\\');
+                out.push(e);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Refuses, before Nickel reads anything, an import that reaches outside the
+/// layer.
+///
+/// `entries` are the files the generated toplevel imports; `root` is the
+/// canonical layer directory; `lib_path` is the minimal library directory as
+/// Nickel is given it. Each entry, and every `.ncl` file inside the layer
+/// that they import (transitively), is read and each `import "…"` in it is
+/// resolved the way Nickel resolves it: against the importing file's
+/// directory first, then the minimal library. An absolute import is refused
+/// outright. A relative one, `..` included, must land (symlinks resolved)
+/// under `root` or under the minimal library. An import that resolves to no
+/// file is left for Nickel to report.
+///
+/// Packages import their siblings as `../<name>/build.ncl`, so `..` itself
+/// is not refused: where the path lands is what counts.
+///
+/// The scan is lexical and can miss an import (see [Loader::new], whose check
+/// after loading backs it up), and it can over-match: an `import "…"` inside
+/// a comment or a string is checked too.
+fn confine_imports(entries: &[PathBuf], root: &Path, lib_path: &Path) -> Result<(), Error> {
+    let lib = lib_path.canonicalize().ok();
+    let outside = |file: &Path, import: &str| Error::ImportOutside {
+        file: Some(file.to_path_buf()),
+        import: import.to_string(),
+        root: root.to_path_buf(),
+    };
+
+    // Files still to scan, each by the normalized path Nickel names it by:
+    // Nickel resolves a relative import against that path's directory, not
+    // against the symlink-resolved one.
+    let mut todo: Vec<PathBuf> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let named = normalize_path(entry.as_path())?;
+        match named.canonicalize() {
+            Ok(canon) if canon.starts_with(root) => todo.push(named),
+            Ok(_) => return Err(outside(root, &entry.to_string_lossy())),
+            // A missing entry is Nickel's to report.
+            Err(_) => {}
+        }
+    }
+
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    while let Some(named) = todo.pop() {
+        let Ok(canon) = named.canonicalize() else {
+            continue;
+        };
+        if !visited.insert(canon.clone()) {
+            continue;
+        }
+        // The file is inside the layer; if it cannot be read as text, Nickel
+        // reports that itself.
+        let Ok(text) = std::fs::read_to_string(&canon) else {
+            continue;
+        };
+        let dir = named.parent().map(Path::to_path_buf).unwrap_or_default();
+
+        for cap in IMPORT_PATH.captures_iter(&text) {
+            let Some(raw) = cap.get(1) else {
+                continue;
+            };
+            let import = unescape_import(raw.as_str());
+            let rel = Path::new(&import);
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+            {
+                return Err(outside(&named, &import));
+            }
+
+            // Nickel takes the first candidate it can read.
+            let mut candidates = vec![normalize_abs_path(&dir.join(rel))];
+            if let Ok(in_lib) = normalize_path(lib_path.join(rel)) {
+                candidates.push(in_lib);
+            }
+            let found = candidates.into_iter().find_map(|c| {
+                let canon = c.canonicalize().ok()?;
+                std::fs::metadata(&canon)
+                    .ok()?
+                    .is_file()
+                    .then_some((c, canon))
+            });
+            let Some((import_named, import_canon)) = found else {
+                continue;
+            };
+
+            if import_canon.starts_with(root) {
+                if import_named.extension().is_some_and(|e| e == "ncl") {
+                    todo.push(import_named);
+                }
+            } else if !lib.as_deref().is_some_and(|l| import_canon.starts_with(l)) {
+                return Err(outside(&named, &import));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns the first file in `files` read from disk outside `root` and the
+/// minimal library (`lib`, canonical), if any.
+///
+/// Nickel names every file it reads from disk by its absolute normalized
+/// path. Its in-memory sources (the generated `toplevel`, the Nickel
+/// standard library modules, its own `<generated …>` snippets) have names
+/// that are not absolute paths, and are skipped.
+fn first_file_outside(files: &Files, root: &Path, lib: Option<&Path>) -> Option<PathBuf> {
+    let stdlib: HashSet<&OsStr> = files.stdlib_modules().map(|id| files.name(id)).collect();
+    for name in files.filenames() {
+        let path = Path::new(name);
+        if stdlib.contains(name) || name == "toplevel" || !path.is_absolute() {
+            continue;
+        }
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if resolved.starts_with(root) || lib.is_some_and(|l| resolved.starts_with(l)) {
+            continue;
+        }
+        return Some(path.to_path_buf());
+    }
+    None
+}
+
 /// Evaluates a single layer of nickel files which describe minimal build specifications.
 pub(crate) struct Loader {
     p: Program<CacheImpl>,
@@ -241,12 +402,37 @@ impl Loader {
                 BuilderError::Io { path: _, error } => Error::IO(error),
             })?;
 
-        program
-            .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
-            .map_err(|e| Error::Nickel(Box::new((program.files(), e))))?;
-        program
-            .compile()
-            .map_err(|e| Error::Nickel(Box::new((program.files(), e))))?;
+        // Nickel reads every import while typechecking. The confinement check
+        // below runs after that read, so on its own it cannot keep a foreign
+        // file's bytes out of a parse diagnostic: the scan before loading
+        // ([confine_imports], run by [Loader::new_with_all_pkgs]) does that.
+        // This check is the backstop for what the scan cannot see, such as an
+        // escaped quote or a string form its pattern does not match. It runs
+        // on the failure paths too, so a foreign file that fails to parse is
+        // reported as outside the layer rather than quoted.
+        let lib = opts.minimal_lib_path.canonicalize().ok();
+        let confine = |program: &Program<CacheImpl>| -> Result<(), Error> {
+            let Some(root) = opts.confine_to.as_deref() else {
+                return Ok(());
+            };
+            match first_file_outside(&program.files(), root, lib.as_deref()) {
+                Some(path) => Err(Error::ImportOutside {
+                    file: None,
+                    import: path.to_string_lossy().into_owned(),
+                    root: root.to_path_buf(),
+                }),
+                None => Ok(()),
+            }
+        };
+        if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
+            confine(&program)?;
+            return Err(Error::Nickel(Box::new((program.files(), e))));
+        }
+        if let Err(e) = program.compile() {
+            confine(&program)?;
+            return Err(Error::Nickel(Box::new((program.files(), e))));
+        }
+        confine(&program)?;
 
         let mut out = Self {
             p: program,
@@ -265,6 +451,8 @@ impl Loader {
         args: Option<&args::ArgsSet>,
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
+        // Every file the generated toplevel imports; see [confine_imports].
+        let mut entries: Vec<PathBuf> = Vec::new();
         let mut src = String::with_capacity(2048);
         src.push_str("let {layer, ..} = import \"minimal.ncl\" in\n");
         src.push_str("layer {\n");
@@ -273,6 +461,7 @@ impl Loader {
             src.push_str("\t\timport \"");
             src.push_str(pb.to_str().unwrap());
             src.push_str("\",\n");
+            entries.push(pb);
         }
         src.push_str("\t],\n");
 
@@ -290,6 +479,7 @@ impl Loader {
                         src.push_str("  import \"");
                         src.push_str(e.path().to_str().unwrap());
                         src.push_str("/profile.ncl\",\n");
+                        entries.push(e.path().join("profile.ncl"));
                     }
                 }
                 src.push_str("\t],\n");
@@ -309,6 +499,7 @@ impl Loader {
                         src.push_str("  import \"");
                         src.push_str(e.path().to_str().unwrap());
                         src.push_str("/stack.ncl\",\n");
+                        entries.push(e.path().join("stack.ncl"));
                     }
                 }
             }
@@ -329,6 +520,7 @@ impl Loader {
                         src.push_str("  import \"");
                         src.push_str(e.path().to_str().unwrap());
                         src.push_str("/spec.ncl\",\n");
+                        entries.push(e.path().join("spec.ncl"));
                     }
                 }
             }
@@ -337,7 +529,26 @@ impl Loader {
 
         src.push('}');
 
-        Self::new(src, args, opts)
+        // The layer's own files may import each other and the minimal
+        // library, and nothing else. A layer directory that does not exist
+        // has no files to confine; its normalized path stands in as the root.
+        let root = match layer_dir.as_ref().canonicalize() {
+            Ok(root) => root,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                normalize_path(layer_dir.as_ref())?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        confine_imports(&entries, &root, &opts.minimal_lib_path)?;
+
+        let confined = LoadOptions {
+            minimal_lib_path: opts.minimal_lib_path.clone(),
+            from: opts.from.clone(),
+            target: opts.target.clone(),
+            params: opts.params.clone(),
+            confine_to: Some(root),
+        };
+        Self::new(src, args, &confined)
     }
 
     /// Walks the AST to find unique build-spec declarations, annotating them with a unique ID.
@@ -599,6 +810,222 @@ mod tests {
         }
 
         sr.unwrap();
+    }
+
+    const SECRET: &str = "secret-marker-xyz";
+
+    /// A layer at `<dir>/layer` (with an empty `profiles`, which the layer
+    /// contract requires) whose package `p` has `build.ncl` = `build`.
+    /// Returns the layer directory.
+    fn layer_with_package(dir: &Path, build: &str) -> PathBuf {
+        let layer = dir.join("layer");
+        let pkg = layer.join("packages").join("p");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(layer.join("profiles")).unwrap();
+        std::fs::write(pkg.join("build.ncl"), build).unwrap();
+        layer
+    }
+
+    /// The import an [Error::ImportOutside] names, and everything the error
+    /// prints (its `Display` and its rendered report).
+    fn import_refusal(res: Result<Loader, Error>) -> (Option<PathBuf>, String, String) {
+        let err = match res {
+            Ok(_) => panic!("expected the import to be refused"),
+            Err(err) => err,
+        };
+        let (file, import) = match &err {
+            Error::ImportOutside { file, import, .. } => (file.clone(), import.clone()),
+            other => {
+                other.report_to_stderr();
+                panic!("expected Error::ImportOutside, got {other:?}");
+            }
+        };
+        let mut buf = codespan_reporting::term::termcolor::Buffer::no_color();
+        err.report_to(&mut buf);
+        let text = format!("{err}\n{}", String::from_utf8_lossy(buf.as_slice()));
+        (file, import, text)
+    }
+
+    fn load_ok(res: Result<Loader, Error>) -> Loader {
+        res.unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed: {e}");
+        })
+    }
+
+    #[test]
+    fn package_importing_an_absolute_host_path_is_refused_before_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, SECRET).unwrap();
+        let layer = layer_with_package(
+            dir.path(),
+            &format!(
+                "let {{BuildSpec, ..}} = import \"minimal.ncl\" in\n\
+                 let leak = import \"{}\" in\n\
+                 {{ name = \"p\" }} | BuildSpec\n",
+                secret.to_str().unwrap()
+            ),
+        );
+
+        let (file, import, text) = import_refusal(Loader::new_with_all_pkgs(
+            &layer,
+            None,
+            &LoadOptions::for_test(),
+        ));
+        assert!(
+            file.is_some_and(|f| f.ends_with("packages/p/build.ncl")),
+            "{text}"
+        );
+        assert_eq!(import, secret.to_str().unwrap());
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    #[test]
+    fn package_importing_up_out_of_the_layer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("outside.ncl"), SECRET).unwrap();
+        // packages/p -> packages -> layer -> the directory holding the layer.
+        let layer = layer_with_package(
+            dir.path(),
+            "let {BuildSpec, ..} = import \"minimal.ncl\" in\n\
+             let leak = import \"../../../outside.ncl\" in\n\
+             { name = \"p\" } | BuildSpec\n",
+        );
+
+        let (_file, import, text) = import_refusal(Loader::new_with_all_pkgs(
+            &layer,
+            None,
+            &LoadOptions::for_test(),
+        ));
+        assert_eq!(import, "../../../outside.ncl");
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_importing_through_a_symlink_out_of_the_layer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("helper.ncl"), SECRET).unwrap();
+        let layer = layer_with_package(
+            dir.path(),
+            "let {BuildSpec, ..} = import \"minimal.ncl\" in\n\
+             let leak = import \"./lib/helper.ncl\" in\n\
+             { name = \"p\" } | BuildSpec\n",
+        );
+        std::os::unix::fs::symlink(&elsewhere, layer.join("packages/p/lib")).unwrap();
+
+        let (_file, import, text) = import_refusal(Loader::new_with_all_pkgs(
+            &layer,
+            None,
+            &LoadOptions::for_test(),
+        ));
+        assert_eq!(import, "./lib/helper.ncl");
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    /// A helper inside the package, a sibling package reached with `..`, and
+    /// the minimal library all stay importable.
+    #[test]
+    fn package_imports_inside_the_layer_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer = layer_with_package(
+            dir.path(),
+            "let {BuildSpec, ..} = import \"minimal.ncl\" in\n\
+             let helper = import \"./lib/helper.ncl\" in\n\
+             let q = import \"../q/build.ncl\" in\n\
+             { name = helper.name, build_deps = [q] } | BuildSpec\n",
+        );
+        let lib = layer.join("packages/p/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("helper.ncl"), "{ name = \"p\" }\n").unwrap();
+        let q = layer.join("packages/q");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(
+            q.join("build.ncl"),
+            "let {BuildSpec, ..} = import \"minimal.ncl\" in\n{ name = \"q\" } | BuildSpec\n",
+        )
+        .unwrap();
+
+        let loader = load_ok(Loader::new_with_all_pkgs(
+            &layer,
+            None,
+            &LoadOptions::for_test(),
+        ));
+        load_ok_finish(loader);
+    }
+
+    fn load_ok_finish(loader: Loader) {
+        if let Err(e) = loader.finish() {
+            e.report_to_stderr();
+            panic!("finish failed: {e}");
+        }
+    }
+
+    /// The check after loading, on its own: an inline source (which the scan
+    /// before loading never sees) importing a file outside `confine_to`.
+    #[test]
+    fn confine_to_refuses_a_file_loaded_from_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata/local_input.ncl");
+        let opts = LoadOptions {
+            confine_to: Some(dir.path().canonicalize().unwrap()),
+            ..LoadOptions::for_test()
+        };
+
+        let (file, import, text) = import_refusal(Loader::new(
+            format!("import \"{}\"", outside.to_str().unwrap()),
+            None,
+            &opts,
+        ));
+        assert!(file.is_none(), "{text}");
+        assert!(import.ends_with("testdata/local_input.ncl"), "{text}");
+    }
+
+    /// When the foreign file fails to parse, the check after loading still
+    /// reports it as outside the layer, not as a parse error quoting it.
+    #[test]
+    fn confine_to_reports_an_unparsable_foreign_file_without_quoting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("layer");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = dir.path().join("secret.ncl");
+        std::fs::write(&secret, format!("{SECRET} ) {{ not nickel")).unwrap();
+        let opts = LoadOptions {
+            confine_to: Some(root.canonicalize().unwrap()),
+            ..LoadOptions::for_test()
+        };
+
+        let (_file, _import, text) = import_refusal(Loader::new(
+            format!("import \"{}\"", secret.to_str().unwrap()),
+            None,
+            &opts,
+        ));
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    /// Without `confine_to` (inline test sources), nothing is confined.
+    #[test]
+    fn no_confine_to_leaves_absolute_imports_alone() {
+        let path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata/local_input.ncl");
+        load_ok(Loader::new(
+            format!("import \"{}\"", path.to_str().unwrap()),
+            None,
+            &LoadOptions::for_test(),
+        ));
+    }
+
+    #[test]
+    fn unescape_import_undoes_path_escapes_only() {
+        assert_eq!(unescape_import(r#"a\"b"#), "a\"b");
+        assert_eq!(unescape_import(r"a\\b"), r"a\b");
+        assert_eq!(unescape_import(r"a\%b"), "a%b");
+        assert_eq!(unescape_import(r"a\nb"), r"a\nb");
+        assert_eq!(unescape_import("plain/path.ncl"), "plain/path.ncl");
     }
 
     #[test]

@@ -23,7 +23,7 @@ mod load;
 pub use load::{LoadOptions, build_decls_in_dir};
 
 mod error;
-pub use error::Error;
+pub use error::{Error, LocalInputWhy};
 
 pub mod attrs;
 pub use attrs::AttrValue;
