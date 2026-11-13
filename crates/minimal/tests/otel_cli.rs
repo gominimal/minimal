@@ -857,12 +857,22 @@ async fn exec_run_attach_and_task_run_share_the_commands_trace() {
         assert!(r.cmd.is_none(), "{}: spooled with telemetry off", r.verb);
     }
     assert!(off_col.requests.lock().unwrap().is_empty(), "nothing sent");
+    // The opt-out mark is a field the daemon records on its request span,
+    // which can land after the answer reaches the CLI, so wait (bounded)
+    // for every verb's mark before counting them (#3398).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let marked = loop {
+        let marked = log.find("exec", "telemetry", "opt-out").len()
+            + log.find("attach", "telemetry", "opt-out").len();
+        if marked - marked_before >= 4 || std::time::Instant::now() >= deadline {
+            break marked;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     assert!(
         in_trace(&log, INHERITED).is_empty(),
         "no daemon span joined the inherited trace"
     );
-    let marked = log.find("exec", "telemetry", "opt-out").len()
-        + log.find("attach", "telemetry", "opt-out").len();
     assert_eq!(
         marked - marked_before,
         4,
