@@ -1,0 +1,4438 @@
+{
+  "crates": {
+    "args": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 13,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 11,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 2,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 2
+        },
+        "strict_total": 28,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 41,
+          "pct": 63.08,
+          "total": 65
+        },
+        "lines": {
+          "covered": 534,
+          "pct": 79.11,
+          "total": 675
+        },
+        "regions": {
+          "covered": 887,
+          "pct": 77.94,
+          "total": 1138
+        }
+      },
+      "crap": {
+        "functions": 27,
+        "max": 42.0,
+        "over_threshold": 1
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 230,
+          "ce": 0,
+          "cohesion": 2.125,
+          "distance": 0.7071067811865475,
+          "instability": 0.0
+        },
+        "rustqual": {
+          "complexity_findings": 1,
+          "cycles": 0,
+          "dead_code": 3,
+          "dimension_scores": [
+            1.0,
+            0.9,
+            0.875,
+            0.975,
+            1.0,
+            0.925,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 1.0,
+          "iosp_violations": 0,
+          "max_instability": 0.0,
+          "score": 0.6762499999999999,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 54,
+        "code": 1006,
+        "comments": 16,
+        "files": 1,
+        "test_code": 0
+      }
+    },
+    "async-dialog": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 2,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 2,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 62,
+          "pct": 100.0,
+          "total": 62
+        },
+        "lines": {
+          "covered": 325,
+          "pct": 97.6,
+          "total": 333
+        },
+        "regions": {
+          "covered": 568,
+          "pct": 96.76,
+          "total": 587
+        }
+      },
+      "crap": {
+        "functions": 20,
+        "max": 15.0,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 2,
+          "ce": 1,
+          "cohesion": 2.1666666666666665,
+          "distance": 0.4714045207910317,
+          "instability": 0.3333333333333333
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 5,
+          "dimension_scores": [
+            0.96,
+            0.8571428571428572,
+            0.6904761904761905,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 0.96,
+          "iosp_violations": 1,
+          "max_instability": 1.0,
+          "score": 0.4767333333333329,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 70,
+        "code": 410,
+        "comments": 26,
+        "files": 4,
+        "test_code": 0
+      }
+    },
+    "bep": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 1,
+          "too_many_arguments": 0,
+          "too_many_lines": 9
+        },
+        "complexity_total": 10,
+        "strict": {
+          "clippy::allow_attributes": 12,
+          "clippy::allow_attributes_without_reason": 12,
+          "clippy::assertions_on_result_states": 33,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 51,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 30,
+          "clippy::map_err_ignore": 35,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 4,
+          "clippy::string_slice": 9,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 3,
+          "clippy::unused_result_ok": 2,
+          "clippy::unwrap_in_result": 25,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 216,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 1766,
+          "pct": 87.99,
+          "total": 2007
+        },
+        "lines": {
+          "covered": 17505,
+          "pct": 91.38,
+          "total": 19156
+        },
+        "regions": {
+          "covered": 30839,
+          "pct": 91.91,
+          "total": 33552
+        }
+      },
+      "crap": {
+        "functions": 683,
+        "max": 506.0,
+        "over_threshold": 13
+      },
+      "deps": {
+        "internal": [
+          "client-config",
+          "paths"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.08823529411764706,
+          "ca": 85,
+          "ce": 13,
+          "cohesion": 4.671568627450981,
+          "distance": 0.5509151272389788,
+          "instability": 0.1326530612244898
+        },
+        "rustqual": {
+          "complexity_findings": 22,
+          "cycles": 4,
+          "dead_code": 40,
+          "dimension_scores": [
+            0.8878248974008208,
+            0.836591086786552,
+            0.854573885848319,
+            0.980453479280688,
+            0.9843627834245504,
+            0.9906176700547302,
+            1.0
+          ],
+          "duplicates": 2,
+          "iosp_score": 0.8878248974008208,
+          "iosp_violations": 82,
+          "max_instability": 1.0,
+          "score": 0.4479696539597341,
+          "sdp_violations": 3
+        }
+      },
+      "layer": "session",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "bep::control",
+            "bep::redeemer"
+          ],
+          [
+            "bep::forward",
+            "bep::proxy"
+          ],
+          [
+            "bep::handle",
+            "bep::redeem"
+          ],
+          [
+            "bep::keys",
+            "bep::seal"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 2071,
+        "code": 25900,
+        "comments": 1383,
+        "files": 23,
+        "test_code": 0
+      }
+    },
+    "boxes": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 1,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 1,
+        "strict": {
+          "clippy::allow_attributes": 4,
+          "clippy::allow_attributes_without_reason": 3,
+          "clippy::assertions_on_result_states": 41,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 36,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 3,
+          "clippy::map_err_ignore": 2,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 4,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 10,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 1,
+          "clippy::unreachable": 1,
+          "clippy::unused_result_ok": 1,
+          "clippy::unwrap_in_result": 9,
+          "clippy::unwrap_used": 10
+        },
+        "strict_total": 125,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 1654,
+          "pct": 95.39,
+          "total": 1734
+        },
+        "lines": {
+          "covered": 14860,
+          "pct": 95.22,
+          "total": 15606
+        },
+        "regions": {
+          "covered": 24351,
+          "pct": 95.13,
+          "total": 25597
+        }
+      },
+      "crap": {
+        "functions": 777,
+        "max": 132.0,
+        "over_threshold": 5
+      },
+      "deps": {
+        "internal": [
+          "client-config",
+          "common",
+          "paths"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0319634703196347,
+          "ca": 1188,
+          "ce": 17,
+          "cohesion": 4.607305936073059,
+          "distance": 0.674529414257784,
+          "instability": 0.014107883817427386
+        },
+        "rustqual": {
+          "complexity_findings": 16,
+          "cycles": 1,
+          "dead_code": 114,
+          "dimension_scores": [
+            0.9809750297265161,
+            0.9061032863849765,
+            0.8276324614352784,
+            0.9798792756539235,
+            0.9953051643192489,
+            0.971830985915493,
+            1.0
+          ],
+          "duplicates": 9,
+          "iosp_score": 0.9809750297265161,
+          "iosp_violations": 16,
+          "max_instability": 1.0,
+          "score": 0.6475090575159236,
+          "sdp_violations": 1
+        }
+      },
+      "layer": "session",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "boxes::core::compose",
+            "boxes::core::compose::conflict",
+            "boxes::core::enumerate",
+            "boxes::core::expansion",
+            "boxes::core::hooks",
+            "boxes::core::lifecyclehook",
+            "boxes::core::policy",
+            "boxes::core::primitives",
+            "boxes::core::source",
+            "boxes::wire::errors",
+            "boxes::wire::policy",
+            "boxes::wire::primitives",
+            "boxes::wire::request"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 2605,
+        "code": 26531,
+        "comments": 1976,
+        "files": 38,
+        "test_code": 1673
+      }
+    },
+    "check": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 1
+        },
+        "complexity_total": 1,
+        "strict": {
+          "clippy::allow_attributes": 1,
+          "clippy::allow_attributes_without_reason": 2,
+          "clippy::assertions_on_result_states": 1,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 5,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 1,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 2,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 4,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 2,
+          "clippy::unused_result_ok": 6,
+          "clippy::unwrap_in_result": 1,
+          "clippy::unwrap_used": 36
+        },
+        "strict_total": 61,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 128,
+          "pct": 49.61,
+          "total": 258
+        },
+        "lines": {
+          "covered": 1385,
+          "pct": 48.78,
+          "total": 2839
+        },
+        "regions": {
+          "covered": 2216,
+          "pct": 52.89,
+          "total": 4190
+        }
+      },
+      "crap": {
+        "functions": 59,
+        "max": 342.0,
+        "over_threshold": 16
+      },
+      "deps": {
+        "internal": [
+          "common",
+          "decode",
+          "graph",
+          "lcache",
+          "mlog",
+          "op",
+          "ot"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.07407407407407407,
+          "ca": 23,
+          "ce": 27,
+          "cohesion": 5.111111111111111,
+          "distance": 0.2728908392579194,
+          "instability": 0.54
+        },
+        "rustqual": {
+          "complexity_findings": 10,
+          "cycles": 0,
+          "dead_code": 2,
+          "dimension_scores": [
+            1.0,
+            0.4653465346534653,
+            0.26732673267326734,
+            0.9702970297029703,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duplicates": 8,
+          "iosp_score": 1.0,
+          "iosp_violations": 0,
+          "max_instability": 0.0,
+          "score": 0.0,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 343,
+        "code": 3451,
+        "comments": 117,
+        "files": 5,
+        "test_code": 0
+      }
+    },
+    "checkouts": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 2,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 3,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 3,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 1,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 5,
+          "clippy::unwrap_used": 13
+        },
+        "strict_total": 27,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 78,
+          "pct": 78.0,
+          "total": 100
+        },
+        "lines": {
+          "covered": 928,
+          "pct": 78.84,
+          "total": 1177
+        },
+        "regions": {
+          "covered": 1729,
+          "pct": 81.17,
+          "total": 2130
+        }
+      },
+      "crap": {
+        "functions": 38,
+        "max": 42.0,
+        "over_threshold": 1
+      },
+      "deps": {
+        "internal": [
+          "common",
+          "mfile"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 8,
+          "ce": 5,
+          "cohesion": 3.0,
+          "distance": 0.43514263457633695,
+          "instability": 0.38461538461538464
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 6,
+          "dimension_scores": [
+            1.0,
+            0.7808219178082192,
+            0.9178082191780822,
+            0.9726027397260274,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 1.0,
+          "iosp_violations": 0,
+          "max_instability": 0.0,
+          "score": 0.6145205479452053,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 167,
+        "code": 1422,
+        "comments": 127,
+        "files": 3,
+        "test_code": 0
+      }
+    },
+    "client-config": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 2,
+          "clippy::allow_attributes_without_reason": 2,
+          "clippy::assertions_on_result_states": 9,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 15,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 28,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 180,
+          "pct": 96.77,
+          "total": 186
+        },
+        "lines": {
+          "covered": 1604,
+          "pct": 97.39,
+          "total": 1647
+        },
+        "regions": {
+          "covered": 2800,
+          "pct": 96.92,
+          "total": 2889
+        }
+      },
+      "crap": {
+        "functions": 68,
+        "max": 20.0,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 47,
+          "ce": 0,
+          "cohesion": 2.323529411764706,
+          "distance": 0.7071067811865475,
+          "instability": 0.0
+        },
+        "rustqual": {
+          "complexity_findings": 2,
+          "cycles": 0,
+          "dead_code": 13,
+          "dimension_scores": [
+            0.9907407407407407,
+            0.8666666666666667,
+            0.8933333333333333,
+            0.98,
+            1.0,
+            0.9933333333333333,
+            1.0
+          ],
+          "duplicates": 1,
+          "iosp_score": 0.9907407407407407,
+          "iosp_violations": 1,
+          "max_instability": 1.0,
+          "score": 0.6908074074074063,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 205,
+        "code": 2369,
+        "comments": 105,
+        "files": 5,
+        "test_code": 0
+      }
+    },
+    "common": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 2
+        },
+        "complexity_total": 2,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 1,
+          "clippy::assertions_on_result_states": 9,
+          "clippy::cast_sign_loss": 4,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 3,
+          "clippy::large_futures": 1,
+          "clippy::let_underscore_must_use": 2,
+          "clippy::map_err_ignore": 3,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 2,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 11,
+          "clippy::string_slice": 3,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 1,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 2,
+          "clippy::unused_result_ok": 1,
+          "clippy::unwrap_in_result": 50,
+          "clippy::unwrap_used": 12
+        },
+        "strict_total": 105,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 387,
+          "pct": 78.82,
+          "total": 491
+        },
+        "lines": {
+          "covered": 3367,
+          "pct": 83.4,
+          "total": 4037
+        },
+        "regions": {
+          "covered": 5683,
+          "pct": 83.71,
+          "total": 6789
+        }
+      },
+      "crap": {
+        "functions": 194,
+        "max": 65.35,
+        "over_threshold": 5
+      },
+      "deps": {
+        "internal": [
+          "args",
+          "ot"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.07547169811320754,
+          "ca": 125,
+          "ce": 3,
+          "cohesion": 2.0,
+          "distance": 0.6371674164789748,
+          "instability": 0.0234375
+        },
+        "rustqual": {
+          "complexity_findings": 4,
+          "cycles": 0,
+          "dead_code": 38,
+          "dimension_scores": [
+            0.934640522875817,
+            0.7403846153846154,
+            0.7243589743589743,
+            0.9903846153846154,
+            0.9871794871794872,
+            0.9807692307692307,
+            1.0
+          ],
+          "duplicates": 3,
+          "iosp_score": 0.934640522875817,
+          "iosp_violations": 10,
+          "max_instability": 1.0,
+          "score": 0.2877438411261941,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "shared",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 671,
+        "code": 5549,
+        "comments": 324,
+        "files": 19,
+        "test_code": 274
+      }
+    },
+    "decode": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 6
+        },
+        "complexity_total": 6,
+        "strict": {
+          "clippy::allow_attributes": 1,
+          "clippy::allow_attributes_without_reason": 2,
+          "clippy::assertions_on_result_states": 4,
+          "clippy::cast_sign_loss": 1,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 3,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 4,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 3,
+          "clippy::panic_in_result_fn": 2,
+          "clippy::string_slice": 3,
+          "clippy::todo": 1,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 3,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 2,
+          "clippy::unwrap_used": 43
+        },
+        "strict_total": 72,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 253,
+          "pct": 73.12,
+          "total": 346
+        },
+        "lines": {
+          "covered": 3859,
+          "pct": 82.9,
+          "total": 4655
+        },
+        "regions": {
+          "covered": 5243,
+          "pct": 83.16,
+          "total": 6305
+        }
+      },
+      "crap": {
+        "functions": 84,
+        "max": 74.67,
+        "over_threshold": 3
+      },
+      "deps": {
+        "internal": [
+          "args",
+          "common",
+          "mfile",
+          "stdlib"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.04,
+          "ca": 38,
+          "ce": 20,
+          "cohesion": 3.6,
+          "distance": 0.4349925853920002,
+          "instability": 0.3448275862068966
+        },
+        "rustqual": {
+          "complexity_findings": 11,
+          "cycles": 0,
+          "dead_code": 15,
+          "dimension_scores": [
+            0.9596774193548387,
+            0.603448275862069,
+            0.16666666666666663,
+            0.9252873563218391,
+            1.0,
+            0.9885057471264368,
+            1.0
+          ],
+          "duplicates": 9,
+          "iosp_score": 0.9596774193548387,
+          "iosp_violations": 5,
+          "max_instability": 1.0,
+          "score": 0.0,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 479,
+        "code": 6114,
+        "comments": 136,
+        "files": 8,
+        "test_code": 0
+      }
+    },
+    "diagnostics": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 1,
+          "clippy::allow_attributes_without_reason": 1,
+          "clippy::assertions_on_result_states": 1,
+          "clippy::cast_sign_loss": 2,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 5,
+          "clippy::large_futures": 31,
+          "clippy::let_underscore_must_use": 26,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 1,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 30,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 1,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 1,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 100,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 440,
+          "pct": 94.02,
+          "total": 468
+        },
+        "lines": {
+          "covered": 3063,
+          "pct": 93.44,
+          "total": 3278
+        },
+        "regions": {
+          "covered": 4993,
+          "pct": 91.97,
+          "total": 5429
+        }
+      },
+      "crap": {
+        "functions": 130,
+        "max": 83.84,
+        "over_threshold": 1
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.08333333333333333,
+          "ca": 44,
+          "ce": 2,
+          "cohesion": 3.5416666666666665,
+          "distance": 0.6174374429926013,
+          "instability": 0.043478260869565216
+        },
+        "rustqual": {
+          "complexity_findings": 2,
+          "cycles": 0,
+          "dead_code": 25,
+          "dimension_scores": [
+            0.9451219512195121,
+            0.851063829787234,
+            0.825531914893617,
+            0.9872340425531915,
+            1.0,
+            0.9574468085106383,
+            1.0
+          ],
+          "duplicates": 3,
+          "iosp_score": 0.9451219512195121,
+          "iosp_violations": 9,
+          "max_instability": 1.0,
+          "score": 0.5231899325376227,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 383,
+        "code": 4287,
+        "comments": 239,
+        "files": 15,
+        "test_code": 0
+      }
+    },
+    "graph": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 6
+        },
+        "complexity_total": 6,
+        "strict": {
+          "clippy::allow_attributes": 3,
+          "clippy::allow_attributes_without_reason": 7,
+          "clippy::assertions_on_result_states": 4,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 17,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 3,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 1,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 2,
+          "clippy::unused_result_ok": 2,
+          "clippy::unwrap_in_result": 6,
+          "clippy::unwrap_used": 50
+        },
+        "strict_total": 95,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 345,
+          "pct": 82.14,
+          "total": 420
+        },
+        "lines": {
+          "covered": 4969,
+          "pct": 88.26,
+          "total": 5630
+        },
+        "regions": {
+          "covered": 6723,
+          "pct": 86.98,
+          "total": 7729
+        }
+      },
+      "crap": {
+        "functions": 164,
+        "max": 110.0,
+        "over_threshold": 8
+      },
+      "deps": {
+        "internal": [
+          "args",
+          "checkouts",
+          "common",
+          "decode",
+          "mfile"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.07272727272727272,
+          "ca": 113,
+          "ce": 37,
+          "cohesion": 3.963636363636364,
+          "distance": 0.4812611607712078,
+          "instability": 0.24666666666666667
+        },
+        "rustqual": {
+          "complexity_findings": 7,
+          "cycles": 0,
+          "dead_code": 18,
+          "dimension_scores": [
+            0.9252873563218391,
+            0.6098484848484849,
+            0.5113636363636364,
+            0.9659090909090909,
+            0.9696969696969697,
+            0.9962121212121212,
+            1.0
+          ],
+          "duplicates": 9,
+          "iosp_score": 0.9252873563218391,
+          "iosp_violations": 13,
+          "max_instability": 1.0,
+          "score": 0.0,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "graph::builds",
+            "graph::graph",
+            "graph::loader",
+            "graph::spec_hasher"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 793,
+        "code": 7188,
+        "comments": 337,
+        "files": 10,
+        "test_code": 0
+      }
+    },
+    "lcache": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 3,
+          "clippy::allow_attributes_without_reason": 3,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 3,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 5,
+          "clippy::todo": 4,
+          "clippy::undocumented_unsafe_blocks": 1,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 2,
+          "clippy::unwrap_in_result": 4,
+          "clippy::unwrap_used": 9
+        },
+        "strict_total": 34,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 82,
+          "pct": 80.39,
+          "total": 102
+        },
+        "lines": {
+          "covered": 663,
+          "pct": 85.55,
+          "total": 775
+        },
+        "regions": {
+          "covered": 1238,
+          "pct": 85.38,
+          "total": 1450
+        }
+      },
+      "crap": {
+        "functions": 69,
+        "max": 30.0,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [
+          "common",
+          "graph"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.1875,
+          "ca": 34,
+          "ce": 10,
+          "cohesion": 2.875,
+          "distance": 0.4138181730807636,
+          "instability": 0.22727272727272727
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 13,
+          "dimension_scores": [
+            0.88,
+            0.8823529411764706,
+            0.6470588235294117,
+            0.9176470588235294,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duplicates": 1,
+          "iosp_score": 0.88,
+          "iosp_violations": 6,
+          "max_instability": 1.0,
+          "score": 0.24202352941176375,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 205,
+        "code": 1042,
+        "comments": 25,
+        "files": 4,
+        "test_code": 0
+      }
+    },
+    "mctx": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 2
+        },
+        "complexity_total": 2,
+        "strict": {
+          "clippy::allow_attributes": 2,
+          "clippy::allow_attributes_without_reason": 2,
+          "clippy::assertions_on_result_states": 4,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 5,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 1,
+          "clippy::map_err_ignore": 2,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 7,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 39,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 31
+        },
+        "strict_total": 93,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 269,
+          "pct": 61.0,
+          "total": 441
+        },
+        "lines": {
+          "covered": 2485,
+          "pct": 63.83,
+          "total": 3893
+        },
+        "regions": {
+          "covered": 3984,
+          "pct": 64.63,
+          "total": 6164
+        }
+      },
+      "crap": {
+        "functions": 179,
+        "max": 702.0,
+        "over_threshold": 13
+      },
+      "deps": {
+        "internal": [
+          "args",
+          "check",
+          "checkouts",
+          "common",
+          "graph",
+          "lcache",
+          "mfile",
+          "op",
+          "orchestrator",
+          "ot",
+          "paths",
+          "rcache",
+          "sandbox",
+          "stdlib"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.041666666666666664,
+          "ca": 127,
+          "ce": 99,
+          "cohesion": 2.75,
+          "distance": 0.36789368298459385,
+          "instability": 0.43805309734513276
+        },
+        "rustqual": {
+          "complexity_findings": 6,
+          "cycles": 0,
+          "dead_code": 32,
+          "dimension_scores": [
+            0.8958333333333334,
+            0.8314176245210728,
+            0.7586206896551724,
+            0.9770114942528736,
+            1.0,
+            0.9770114942528736,
+            1.0
+          ],
+          "duplicates": 1,
+          "iosp_score": 0.8958333333333334,
+          "iosp_violations": 15,
+          "max_instability": 1.0,
+          "score": 0.3624568965517242,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "facade",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 434,
+        "code": 4829,
+        "comments": 220,
+        "files": 6,
+        "test_code": 0
+      }
+    },
+    "mfile": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 1,
+          "too_many_arguments": 0,
+          "too_many_lines": 8
+        },
+        "complexity_total": 9,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 7,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 13,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 1,
+          "clippy::map_err_ignore": 2,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 3,
+          "clippy::string_slice": 7,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 4,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 7,
+          "clippy::unwrap_used": 5
+        },
+        "strict_total": 49,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 601,
+          "pct": 91.48,
+          "total": 657
+        },
+        "lines": {
+          "covered": 7224,
+          "pct": 95.38,
+          "total": 7574
+        },
+        "regions": {
+          "covered": 11182,
+          "pct": 95.25,
+          "total": 11740
+        }
+      },
+      "crap": {
+        "functions": 185,
+        "max": 210.51,
+        "over_threshold": 3
+      },
+      "deps": {
+        "internal": [
+          "args",
+          "boxes",
+          "common",
+          "paths",
+          "version"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 183,
+          "ce": 41,
+          "cohesion": 3.295774647887324,
+          "distance": 0.5776809864157955,
+          "instability": 0.18303571428571427
+        },
+        "rustqual": {
+          "complexity_findings": 11,
+          "cycles": 0,
+          "dead_code": 42,
+          "dimension_scores": [
+            0.8551401869158879,
+            0.8714652956298201,
+            0.8483290488431876,
+            0.9691516709511568,
+            0.9922879177377892,
+            0.9922879177377892,
+            1.0
+          ],
+          "duplicates": 5,
+          "iosp_score": 0.8551401869158879,
+          "iosp_violations": 31,
+          "max_instability": 1.0,
+          "score": 0.4278156307810599,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "mfile::error",
+            "mfile::legacy"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 762,
+        "code": 10219,
+        "comments": 499,
+        "files": 12,
+        "test_code": 0
+      }
+    },
+    "minimal": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 16,
+          "too_many_arguments": 0,
+          "too_many_lines": 96
+        },
+        "complexity_total": 112,
+        "strict": {
+          "clippy::allow_attributes": 6,
+          "clippy::allow_attributes_without_reason": 6,
+          "clippy::assertions_on_result_states": 36,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 47,
+          "clippy::large_futures": 77,
+          "clippy::let_underscore_must_use": 82,
+          "clippy::map_err_ignore": 28,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 13,
+          "clippy::panic_in_result_fn": 10,
+          "clippy::string_slice": 35,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 8,
+          "clippy::unused_result_ok": 5,
+          "clippy::unwrap_in_result": 16,
+          "clippy::unwrap_used": 66
+        },
+        "strict_total": 435,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 3976,
+          "pct": 84.74,
+          "total": 4692
+        },
+        "lines": {
+          "covered": 44296,
+          "pct": 86.93,
+          "total": 50956
+        },
+        "regions": {
+          "covered": 65457,
+          "pct": 85.34,
+          "total": 76703
+        }
+      },
+      "crap": {
+        "functions": 1791,
+        "max": 5282.62,
+        "over_threshold": 78
+      },
+      "deps": {
+        "internal": [
+          "bep",
+          "boxes",
+          "common",
+          "diagnostics",
+          "mctx",
+          "mfile",
+          "minimal-client",
+          "minimald-rpc",
+          "minvmd",
+          "mlog",
+          "op",
+          "ot",
+          "paths",
+          "switch",
+          "version"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.01990049751243781,
+          "ca": 0,
+          "ce": 510,
+          "cohesion": 4.788557213930348,
+          "distance": 0.014071776740030732,
+          "instability": 1.0
+        },
+        "rustqual": {
+          "complexity_findings": 58,
+          "cycles": 0,
+          "dead_code": 26,
+          "dimension_scores": [
+            0.9836343115124153,
+            0.8202131316603644,
+            0.8370574080440014,
+            0.9711240976280509,
+            0.9779993124785149,
+            0.9972499140598143,
+            1.0
+          ],
+          "duplicates": 10,
+          "iosp_score": 0.9836343115124153,
+          "iosp_violations": 29,
+          "max_instability": 1.0,
+          "score": 0.5478184966558984,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "product",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "minimal::cli",
+            "minimal::completion",
+            "minimal::diag"
+          ],
+          [
+            "minimal::cmd",
+            "minimal::cmd::admin",
+            "minimal::cmd::box_spec",
+            "minimal::cmd::box_verbs",
+            "minimal::cmd::box_verbs::address",
+            "minimal::cmd::box_verbs::attach",
+            "minimal::cmd::box_verbs::create",
+            "minimal::cmd::box_verbs::events",
+            "minimal::cmd::box_verbs::exec",
+            "minimal::cmd::box_verbs::lifecycle",
+            "minimal::cmd::box_verbs::list",
+            "minimal::cmd::box_verbs::policy",
+            "minimal::cmd::box_verbs::show",
+            "minimal::cmd::box_verbs::vm_host",
+            "minimal::cmd::box_verbs::wait",
+            "minimal::cmd::finalize_install",
+            "minimal::cmd::finalize_install::linux",
+            "minimal::cmd::list",
+            "minimal::cmd::net",
+            "minimal::cmd::project",
+            "minimal::cmd::session",
+            "minimal::dash",
+            "minimal::dash::app",
+            "minimal::dash::rpc",
+            "minimal::dirs"
+          ],
+          [
+            "minimal::update_check",
+            "minimal::update_check::request"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 5770,
+        "code": 87574,
+        "comments": 7919,
+        "files": 74,
+        "test_code": 6798
+      }
+    },
+    "minimal-client": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 1,
+          "too_many_arguments": 0,
+          "too_many_lines": 4
+        },
+        "complexity_total": 5,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 3,
+          "clippy::cast_sign_loss": 3,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 8,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 12,
+          "clippy::map_err_ignore": 4,
+          "clippy::mem_forget": 3,
+          "clippy::multiple_unsafe_ops_per_block": 3,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 3,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 3,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 2,
+          "clippy::unwrap_in_result": 5,
+          "clippy::unwrap_used": 1
+        },
+        "strict_total": 50,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 673,
+          "pct": 89.38,
+          "total": 753
+        },
+        "lines": {
+          "covered": 5947,
+          "pct": 90.31,
+          "total": 6585
+        },
+        "regions": {
+          "covered": 8911,
+          "pct": 89.85,
+          "total": 9918
+        }
+      },
+      "crap": {
+        "functions": 203,
+        "max": 92.11,
+        "over_threshold": 5
+      },
+      "deps": {
+        "internal": [
+          "boxes",
+          "minimald-rpc",
+          "ot",
+          "paths",
+          "version"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.05555555555555555,
+          "ca": 157,
+          "ce": 72,
+          "cohesion": 2.2777777777777777,
+          "distance": 0.4455012883894866,
+          "instability": 0.314410480349345
+        },
+        "rustqual": {
+          "complexity_findings": 5,
+          "cycles": 0,
+          "dead_code": 58,
+          "dimension_scores": [
+            0.9504132231404959,
+            0.8639798488664987,
+            0.8261964735516373,
+            0.982367758186398,
+            0.9949622166246851,
+            0.9596977329974811,
+            1.0
+          ],
+          "duplicates": 2,
+          "iosp_score": 0.9504132231404959,
+          "iosp_violations": 12,
+          "max_instability": 1.0,
+          "score": 0.5404877490267915,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "session",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 647,
+        "code": 8141,
+        "comments": 602,
+        "files": 7,
+        "test_code": 0
+      }
+    },
+    "minimald": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 31,
+          "too_many_arguments": 0,
+          "too_many_lines": 152
+        },
+        "complexity_total": 183,
+        "strict": {
+          "clippy::allow_attributes": 42,
+          "clippy::allow_attributes_without_reason": 39,
+          "clippy::assertions_on_result_states": 12,
+          "clippy::cast_sign_loss": 9,
+          "clippy::get_unwrap": 1,
+          "clippy::indexing_slicing": 71,
+          "clippy::large_futures": 15,
+          "clippy::let_underscore_must_use": 529,
+          "clippy::map_err_ignore": 33,
+          "clippy::mem_forget": 2,
+          "clippy::multiple_unsafe_ops_per_block": 25,
+          "clippy::panic": 23,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 17,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 30,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 1,
+          "clippy::unreachable": 18,
+          "clippy::unused_result_ok": 1,
+          "clippy::unwrap_in_result": 30,
+          "clippy::unwrap_used": 70
+        },
+        "strict_total": 968,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 6443,
+          "pct": 88.13,
+          "total": 7311
+        },
+        "lines": {
+          "covered": 64935,
+          "pct": 87.95,
+          "total": 73835
+        },
+        "regions": {
+          "covered": 100835,
+          "pct": 87.83,
+          "total": 114806
+        }
+      },
+      "crap": {
+        "functions": 3322,
+        "max": 994.16,
+        "over_threshold": 125
+      },
+      "deps": {
+        "internal": [
+          "args",
+          "async-dialog",
+          "bep",
+          "boxes",
+          "check",
+          "client-config",
+          "common",
+          "diagnostics",
+          "graph",
+          "mctx",
+          "mfile",
+          "minimald-rpc",
+          "mlog",
+          "op",
+          "orchestrator",
+          "ot",
+          "paths",
+          "sandbox",
+          "stdlib",
+          "switch",
+          "version"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.028112449799196786,
+          "ca": 52,
+          "ce": 547,
+          "cohesion": 5.600401606425703,
+          "distance": 0.04150639197382666,
+          "instability": 0.9131886477462438
+        },
+        "rustqual": {
+          "complexity_findings": 72,
+          "cycles": 1,
+          "dead_code": 54,
+          "dimension_scores": [
+            0.9713237745915305,
+            0.7285467874083656,
+            0.5474342388960759,
+            0.9730487278999569,
+            0.9946097455799914,
+            0.9646399310047434,
+            1.0
+          ],
+          "duplicates": 20,
+          "iosp_score": 0.9713237745915305,
+          "iosp_violations": 86,
+          "max_instability": 1.0,
+          "score": 0.13986621097358687,
+          "sdp_violations": 10
+        }
+      },
+      "layer": "product",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "minimald::box_actor",
+            "minimald::box_actor::attach",
+            "minimald::box_actor::handle",
+            "minimald::box_actor::helpers",
+            "minimald::box_actor::host",
+            "minimald::box_actor::kind",
+            "minimald::box_actor::launch_spec_seam",
+            "minimald::box_actor::launcher",
+            "minimald::box_actor::mint_attach_seam",
+            "minimald::box_actor::naming",
+            "minimald::box_actor::ports",
+            "minimald::box_actor::setup",
+            "minimald::box_manager",
+            "minimald::box_manager::handle",
+            "minimald::box_ops",
+            "minimald::box_runtime",
+            "minimald::box_runtime::backend",
+            "minimald::box_runtime::binding",
+            "minimald::box_runtime::enforcement",
+            "minimald::box_runtime::handle",
+            "minimald::box_runtime::hooks",
+            "minimald::box_runtime::launcher",
+            "minimald::box_runtime::mock",
+            "minimald::box_runtime::pipes",
+            "minimald::box_runtime::pty",
+            "minimald::env",
+            "minimald::store"
+          ],
+          [
+            "minimald::connection",
+            "minimald::exec",
+            "minimald::exec::bridge",
+            "minimald::exec::git",
+            "minimald::exec::process",
+            "minimald::exec::process::stop_at_start",
+            "minimald::exec::run",
+            "minimald::exec::testing",
+            "minimald::maintenance",
+            "minimald::net::answerer",
+            "minimald::rpc",
+            "minimald::server",
+            "minimald::sftp"
+          ],
+          [
+            "minimald::net::dns",
+            "minimald::net::dns_gate",
+            "minimald::net::listeners",
+            "minimald::net::policy",
+            "minimald::net::switch"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 10137,
+        "code": 140117,
+        "comments": 15169,
+        "files": 79,
+        "test_code": 5204
+      }
+    },
+    "minimald-rpc": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 1
+        },
+        "complexity_total": 1,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 2,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 1,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 6,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 9,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 128,
+          "pct": 94.81,
+          "total": 135
+        },
+        "lines": {
+          "covered": 1206,
+          "pct": 93.85,
+          "total": 1285
+        },
+        "regions": {
+          "covered": 1861,
+          "pct": 94.76,
+          "total": 1964
+        }
+      },
+      "crap": {
+        "functions": 73,
+        "max": 27.49,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [
+          "boxes",
+          "paths"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0064516129032258064,
+          "ca": 828,
+          "ce": 23,
+          "cohesion": 1.1741935483870967,
+          "distance": 0.683433807866963,
+          "instability": 0.02702702702702703
+        },
+        "rustqual": {
+          "complexity_findings": 1,
+          "cycles": 0,
+          "dead_code": 35,
+          "dimension_scores": [
+            0.9240506329113924,
+            0.8170731707317074,
+            0.15243902439024393,
+            0.9817073170731707,
+            1.0,
+            0.9390243902439024,
+            1.0
+          ],
+          "duplicates": 2,
+          "iosp_score": 0.9240506329113924,
+          "iosp_violations": 6,
+          "max_instability": 0.0,
+          "score": 0.0,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "session",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 495,
+        "code": 4815,
+        "comments": 251,
+        "files": 5,
+        "test_code": 0
+      }
+    },
+    "minvmd": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 9,
+          "too_many_arguments": 0,
+          "too_many_lines": 64
+        },
+        "complexity_total": 73,
+        "strict": {
+          "clippy::allow_attributes": 107,
+          "clippy::allow_attributes_without_reason": 107,
+          "clippy::assertions_on_result_states": 14,
+          "clippy::cast_sign_loss": 3,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 29,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 90,
+          "clippy::map_err_ignore": 8,
+          "clippy::mem_forget": 2,
+          "clippy::multiple_unsafe_ops_per_block": 9,
+          "clippy::panic": 3,
+          "clippy::panic_in_result_fn": 1,
+          "clippy::string_slice": 10,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 22,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 3,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 19,
+          "clippy::unwrap_used": 1
+        },
+        "strict_total": 428,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 3442,
+          "pct": 92.35,
+          "total": 3727
+        },
+        "lines": {
+          "covered": 42252,
+          "pct": 93.39,
+          "total": 45242
+        },
+        "regions": {
+          "covered": 68021,
+          "pct": 93.58,
+          "total": 72686
+        }
+      },
+      "crap": {
+        "functions": 1246,
+        "max": 182.0,
+        "over_threshold": 21
+      },
+      "deps": {
+        "internal": [
+          "bep",
+          "boxes",
+          "client-config",
+          "minimald-rpc",
+          "mlog",
+          "paths",
+          "switch",
+          "version"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.01195219123505976,
+          "ca": 37,
+          "ce": 173,
+          "cohesion": 3.8207171314741037,
+          "distance": 0.11613400502242352,
+          "instability": 0.8238095238095238
+        },
+        "rustqual": {
+          "complexity_findings": 40,
+          "cycles": 0,
+          "dead_code": 44,
+          "dimension_scores": [
+            0.937034529451591,
+            0.6938053097345133,
+            0.7619469026548673,
+            0.9654867256637168,
+            1.0,
+            0.9929203539823008,
+            1.0
+          ],
+          "duplicates": 7,
+          "iosp_score": 0.937034529451591,
+          "iosp_violations": 93,
+          "max_instability": 1.0,
+          "score": 0.2521570691607592,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "product",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "minvmd::box_registry",
+            "minvmd::net::dns_pins",
+            "minvmd::net::drop_limiter",
+            "minvmd::net::egress_gate"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 4253,
+        "code": 71382,
+        "comments": 5671,
+        "files": 60,
+        "test_code": 6600
+      }
+    },
+    "minzoned": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 0,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 6,
+          "pct": 75.0,
+          "total": 8
+        },
+        "lines": {
+          "covered": 40,
+          "pct": 72.73,
+          "total": 55
+        },
+        "regions": {
+          "covered": 79,
+          "pct": 75.24,
+          "total": 105
+        }
+      },
+      "crap": {
+        "functions": 3,
+        "max": 42.0,
+        "over_threshold": 1
+      },
+      "deps": {
+        "internal": [
+          "minvmd",
+          "switch",
+          "version"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 0,
+          "ce": 3,
+          "cohesion": 2.0,
+          "distance": 0.0,
+          "instability": 1.0
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 0,
+          "dimension_scores": [
+            0.6666666666666666,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.75,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 0.6666666666666666,
+          "iosp_violations": 1,
+          "max_instability": 0.0,
+          "score": 0.3116666666666671,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "product",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 13,
+        "code": 130,
+        "comments": 6,
+        "files": 1,
+        "test_code": 0
+      }
+    },
+    "mip": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 3
+        },
+        "complexity_total": 3,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 2,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 1,
+          "clippy::large_futures": 3,
+          "clippy::let_underscore_must_use": 4,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 5,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 1,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 4,
+          "clippy::unused_result_ok": 2,
+          "clippy::unwrap_in_result": 35,
+          "clippy::unwrap_used": 92
+        },
+        "strict_total": 149,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 36,
+          "pct": 23.23,
+          "total": 155
+        },
+        "lines": {
+          "covered": 346,
+          "pct": 19.38,
+          "total": 1785
+        },
+        "regions": {
+          "covered": 556,
+          "pct": 18.87,
+          "total": 2946
+        }
+      },
+      "crap": {
+        "functions": 51,
+        "max": 870.0,
+        "over_threshold": 25
+      },
+      "deps": {
+        "internal": [
+          "args",
+          "check",
+          "checkouts",
+          "common",
+          "decode",
+          "graph",
+          "lcache",
+          "mctx",
+          "mfile",
+          "op",
+          "orchestrator",
+          "ot",
+          "paths",
+          "rcache",
+          "remote-client",
+          "sandbox",
+          "version"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 0,
+          "ce": 75,
+          "cohesion": 2.710526315789474,
+          "distance": 0.0,
+          "instability": 1.0
+        },
+        "rustqual": {
+          "complexity_findings": 5,
+          "cycles": 0,
+          "dead_code": 1,
+          "dimension_scores": [
+            0.864406779661017,
+            0.4444444444444444,
+            0.9722222222222222,
+            0.9583333333333334,
+            1.0,
+            0.45833333333333337,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 0.864406779661017,
+          "iosp_violations": 8,
+          "max_instability": 1.0,
+          "score": 0.0,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "product",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 307,
+        "code": 2586,
+        "comments": 74,
+        "files": 17,
+        "test_code": 85
+      }
+    },
+    "mlog": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 1,
+          "too_many_arguments": 0,
+          "too_many_lines": 3
+        },
+        "complexity_total": 4,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 1,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 1,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 441,
+          "pct": 90.55,
+          "total": 487
+        },
+        "lines": {
+          "covered": 3968,
+          "pct": 93.63,
+          "total": 4238
+        },
+        "regions": {
+          "covered": 6560,
+          "pct": 93.09,
+          "total": 7047
+        }
+      },
+      "crap": {
+        "functions": 165,
+        "max": 35.64,
+        "over_threshold": 1
+      },
+      "deps": {
+        "internal": [
+          "paths",
+          "version"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 43,
+          "ce": 3,
+          "cohesion": 2.7941176470588234,
+          "distance": 0.6609911215439466,
+          "instability": 0.06521739130434782
+        },
+        "rustqual": {
+          "complexity_findings": 4,
+          "cycles": 0,
+          "dead_code": 31,
+          "dimension_scores": [
+            0.9337349397590361,
+            0.7961538461538462,
+            0.8576923076923078,
+            0.9884615384615385,
+            0.9923076923076923,
+            0.9807692307692307,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 0.9337349397590361,
+          "iosp_violations": 11,
+          "max_instability": 0.0,
+          "score": 0.47875949953660835,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "shared",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 366,
+        "code": 6966,
+        "comments": 212,
+        "files": 7,
+        "test_code": 1199
+      }
+    },
+    "op": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 4
+        },
+        "complexity_total": 4,
+        "strict": {
+          "clippy::allow_attributes": 1,
+          "clippy::allow_attributes_without_reason": 2,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 9,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 11,
+          "clippy::map_err_ignore": 1,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 2,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 6,
+          "clippy::todo": 2,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 7,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 32
+        },
+        "strict_total": 73,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 218,
+          "pct": 66.67,
+          "total": 327
+        },
+        "lines": {
+          "covered": 2711,
+          "pct": 76.76,
+          "total": 3532
+        },
+        "regions": {
+          "covered": 4225,
+          "pct": 77.28,
+          "total": 5467
+        }
+      },
+      "crap": {
+        "functions": 84,
+        "max": 812.0,
+        "over_threshold": 9
+      },
+      "deps": {
+        "internal": [
+          "common",
+          "decode",
+          "graph",
+          "lcache",
+          "mfile",
+          "ot",
+          "rcache",
+          "sandbox"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.1,
+          "ca": 58,
+          "ce": 66,
+          "cohesion": 2.775,
+          "distance": 0.26003281630731107,
+          "instability": 0.532258064516129
+        },
+        "rustqual": {
+          "complexity_findings": 2,
+          "cycles": 0,
+          "dead_code": 7,
+          "dimension_scores": [
+            0.956989247311828,
+            0.8192090395480226,
+            0.5875706214689266,
+            0.9378531073446328,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duplicates": 4,
+          "iosp_score": 0.956989247311828,
+          "iosp_violations": 4,
+          "max_instability": 1.0,
+          "score": 0.2523510114816836,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "op::project",
+            "op::project::init",
+            "op::project::update"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 507,
+        "code": 4806,
+        "comments": 168,
+        "files": 16,
+        "test_code": 0
+      }
+    },
+    "orchestrator": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 1,
+          "too_many_arguments": 0,
+          "too_many_lines": 4
+        },
+        "complexity_total": 5,
+        "strict": {
+          "clippy::allow_attributes": 2,
+          "clippy::allow_attributes_without_reason": 3,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 1,
+          "clippy::get_unwrap": 1,
+          "clippy::indexing_slicing": 2,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 2,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 3,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 5,
+          "clippy::unused_result_ok": 3,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 23
+        },
+        "strict_total": 45,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 72,
+          "pct": 58.54,
+          "total": 123
+        },
+        "lines": {
+          "covered": 761,
+          "pct": 59.69,
+          "total": 1275
+        },
+        "regions": {
+          "covered": 938,
+          "pct": 57.02,
+          "total": 1645
+        }
+      },
+      "crap": {
+        "functions": 57,
+        "max": 110.0,
+        "over_threshold": 5
+      },
+      "deps": {
+        "internal": [
+          "common",
+          "decode",
+          "graph",
+          "lcache",
+          "op",
+          "ot",
+          "rcache",
+          "sandbox"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.08333333333333333,
+          "ca": 15,
+          "ce": 31,
+          "cohesion": 3.7916666666666665,
+          "distance": 0.17165273311412563,
+          "instability": 0.6739130434782609
+        },
+        "rustqual": {
+          "complexity_findings": 2,
+          "cycles": 0,
+          "dead_code": 4,
+          "dimension_scores": [
+            0.8484848484848485,
+            0.6666666666666667,
+            0.7727272727272727,
+            0.9090909090909091,
+            1.0,
+            0.9545454545454546,
+            1.0
+          ],
+          "duplicates": 3,
+          "iosp_score": 0.8484848484848485,
+          "iosp_violations": 5,
+          "max_instability": 1.0,
+          "score": 0.0,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": false,
+        "cycles": [
+          [
+            "orchestrator::state",
+            "orchestrator::traits"
+          ]
+        ],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 154,
+        "code": 1733,
+        "comments": 52,
+        "files": 7,
+        "test_code": 0
+      }
+    },
+    "ot": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 1,
+          "clippy::allow_attributes_without_reason": 1,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 3,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 1,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 1,
+          "clippy::unwrap_used": 13
+        },
+        "strict_total": 20,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 107,
+          "pct": 81.68,
+          "total": 131
+        },
+        "lines": {
+          "covered": 769,
+          "pct": 90.79,
+          "total": 847
+        },
+        "regions": {
+          "covered": 1266,
+          "pct": 90.43,
+          "total": 1400
+        }
+      },
+      "crap": {
+        "functions": 65,
+        "max": 16.39,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 56,
+          "ce": 1,
+          "cohesion": 2.375,
+          "distance": 0.6947013990604677,
+          "instability": 0.017543859649122806
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 8,
+          "dimension_scores": [
+            1.0,
+            0.846938775510204,
+            0.9081632653061225,
+            0.9795918367346939,
+            1.0,
+            0.9897959183673469,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 1.0,
+          "iosp_violations": 0,
+          "max_instability": 0.0,
+          "score": 0.6907142857142855,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 138,
+        "code": 1037,
+        "comments": 89,
+        "files": 2,
+        "test_code": 0
+      }
+    },
+    "paths": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 1,
+          "clippy::allow_attributes_without_reason": 1,
+          "clippy::assertions_on_result_states": 3,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 3,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 7,
+          "clippy::map_err_ignore": 2,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 6,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 23,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 167,
+          "pct": 85.2,
+          "total": 196
+        },
+        "lines": {
+          "covered": 1001,
+          "pct": 88.43,
+          "total": 1132
+        },
+        "regions": {
+          "covered": 1745,
+          "pct": 89.67,
+          "total": 1946
+        }
+      },
+      "crap": {
+        "functions": 112,
+        "max": 12.0,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.15384615384615385,
+          "ca": 346,
+          "ce": 2,
+          "cohesion": 2.6153846153846154,
+          "distance": 0.5942572904666785,
+          "instability": 0.005747126436781609
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 18,
+          "dimension_scores": [
+            0.9777777777777777,
+            0.9712643678160919,
+            0.8103448275862069,
+            0.9885057471264368,
+            1.0,
+            0.9655172413793104,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 0.9777777777777777,
+          "iosp_violations": 2,
+          "max_instability": 0.0,
+          "score": 0.7183639846743288,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 240,
+        "code": 1541,
+        "comments": 77,
+        "files": 1,
+        "test_code": 0
+      }
+    },
+    "rcache": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 2,
+          "clippy::allow_attributes_without_reason": 2,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 2,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 1,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 7,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 1,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 5
+        },
+        "strict_total": 20,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 211,
+          "pct": 90.95,
+          "total": 232
+        },
+        "lines": {
+          "covered": 1718,
+          "pct": 93.32,
+          "total": 1841
+        },
+        "regions": {
+          "covered": 2594,
+          "pct": 93.41,
+          "total": 2777
+        }
+      },
+      "crap": {
+        "functions": 50,
+        "max": 20.86,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [
+          "common",
+          "graph",
+          "lcache",
+          "mfile",
+          "ot"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 8,
+          "ce": 27,
+          "cohesion": 2.111111111111111,
+          "distance": 0.1616244071283537,
+          "instability": 0.7714285714285715
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 12,
+          "dimension_scores": [
+            0.922077922077922,
+            0.7398373983739837,
+            0.5284552845528455,
+            0.967479674796748,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duplicates": 6,
+          "iosp_score": 0.922077922077922,
+          "iosp_violations": 6,
+          "max_instability": 1.0,
+          "score": 0.08211382113821053,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 251,
+        "code": 2372,
+        "comments": 191,
+        "files": 4,
+        "test_code": 0
+      }
+    },
+    "remote-client": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 3
+        },
+        "complexity_total": 3,
+        "strict": {
+          "clippy::allow_attributes": 1,
+          "clippy::allow_attributes_without_reason": 1,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 7,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 16,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 1,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 1
+        },
+        "strict_total": 27,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 43,
+          "pct": 48.86,
+          "total": 88
+        },
+        "lines": {
+          "covered": 352,
+          "pct": 62.52,
+          "total": 563
+        },
+        "regions": {
+          "covered": 541,
+          "pct": 69.01,
+          "total": 784
+        }
+      },
+      "crap": {
+        "functions": 8,
+        "max": 380.0,
+        "over_threshold": 1
+      },
+      "deps": {
+        "internal": [
+          "check",
+          "common",
+          "graph",
+          "orchestrator",
+          "remote-proto"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 2,
+          "ce": 10,
+          "cohesion": 1.1111111111111112,
+          "distance": 0.11785113019775789,
+          "instability": 0.8333333333333334
+        },
+        "rustqual": {
+          "complexity_findings": 1,
+          "cycles": 0,
+          "dead_code": 2,
+          "dimension_scores": [
+            1.0,
+            0.5454545454545454,
+            0.48484848484848486,
+            0.9696969696969697,
+            1.0,
+            0.9696969696969697,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 1.0,
+          "iosp_violations": 0,
+          "max_instability": 0.0,
+          "score": 0.0,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 105,
+        "code": 973,
+        "comments": 24,
+        "files": 1,
+        "test_code": 0
+      }
+    },
+    "remote-proto": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 1,
+          "clippy::allow_attributes_without_reason": 1,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 1,
+          "clippy::unwrap_used": 1
+        },
+        "strict_total": 4,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 0,
+          "pct": 0.0,
+          "total": 0
+        },
+        "lines": {
+          "covered": 0,
+          "pct": 0.0,
+          "total": 0
+        },
+        "regions": {
+          "covered": 0,
+          "pct": 0.0,
+          "total": 0
+        }
+      },
+      "crap": {
+        "functions": 0,
+        "max": 0.0,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 0,
+          "ce": 0,
+          "cohesion": 0.0,
+          "distance": 0.7071067811865475,
+          "instability": 0.0
+        },
+        "rustqual": null
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 6,
+        "code": 34,
+        "comments": 4,
+        "files": 2,
+        "test_code": 30
+      }
+    },
+    "sandbox": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 2,
+          "too_many_arguments": 0,
+          "too_many_lines": 12
+        },
+        "complexity_total": 14,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 1,
+          "clippy::cast_sign_loss": 15,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 15,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 15,
+          "clippy::map_err_ignore": 2,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 4,
+          "clippy::panic": 1,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 8,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 4,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 1,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 2,
+          "clippy::unwrap_in_result": 2,
+          "clippy::unwrap_used": 6
+        },
+        "strict_total": 76,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 316,
+          "pct": 56.94,
+          "total": 555
+        },
+        "lines": {
+          "covered": 2871,
+          "pct": 54.91,
+          "total": 5229
+        },
+        "regions": {
+          "covered": 4202,
+          "pct": 54.63,
+          "total": 7692
+        }
+      },
+      "crap": {
+        "functions": 192,
+        "max": 2041.17,
+        "over_threshold": 12
+      },
+      "deps": {
+        "internal": [
+          "common"
+        ],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.07692307692307693,
+          "ca": 119,
+          "ce": 11,
+          "cohesion": 3.5128205128205128,
+          "distance": 0.5928818396102591,
+          "instability": 0.08461538461538462
+        },
+        "rustqual": {
+          "complexity_findings": 10,
+          "cycles": 0,
+          "dead_code": 44,
+          "dimension_scores": [
+            0.9753086419753086,
+            0.7152103559870551,
+            0.7993527508090614,
+            0.9838187702265372,
+            1.0,
+            0.9870550161812298,
+            1.0
+          ],
+          "duplicates": 1,
+          "iosp_score": 0.9753086419753086,
+          "iosp_violations": 4,
+          "max_instability": 1.0,
+          "score": 0.3911015222342077,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "build",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 603,
+        "code": 7565,
+        "comments": 1003,
+        "files": 7,
+        "test_code": 450
+      }
+    },
+    "stdlib": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 2,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 15
+        },
+        "strict_total": 17,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 25,
+          "pct": 100.0,
+          "total": 25
+        },
+        "lines": {
+          "covered": 134,
+          "pct": 93.06,
+          "total": 144
+        },
+        "regions": {
+          "covered": 274,
+          "pct": 86.98,
+          "total": 315
+        }
+      },
+      "crap": {
+        "functions": 6,
+        "max": 19.33,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 4,
+          "ce": 0,
+          "cohesion": 0.0,
+          "distance": 0.7071067811865475,
+          "instability": 0.0
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 2,
+          "dimension_scores": [
+            1.0,
+            1.0,
+            0.8181818181818181,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 1.0,
+          "iosp_violations": 0,
+          "max_instability": 0.0,
+          "score": 0.8345454545454535,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 51,
+        "code": 236,
+        "comments": 5,
+        "files": 2,
+        "test_code": 75
+      }
+    },
+    "switch": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 1
+        },
+        "complexity_total": 1,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 1,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 58,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 11,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 0,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 2,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 0
+        },
+        "strict_total": 72,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 363,
+          "pct": 95.53,
+          "total": 380
+        },
+        "lines": {
+          "covered": 4086,
+          "pct": 96.25,
+          "total": 4245
+        },
+        "regions": {
+          "covered": 7600,
+          "pct": 96.32,
+          "total": 7890
+        }
+      },
+      "crap": {
+        "functions": 168,
+        "max": 32.25,
+        "over_threshold": 1
+      },
+      "deps": {
+        "internal": [],
+        "unused": [
+          "switch"
+        ]
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.02564102564102564,
+          "ca": 197,
+          "ce": 1,
+          "cohesion": 2.282051282051282,
+          "distance": 0.685404591709571,
+          "instability": 0.005050505050505051
+        },
+        "rustqual": {
+          "complexity_findings": 7,
+          "cycles": 0,
+          "dead_code": 26,
+          "dimension_scores": [
+            0.9933333333333333,
+            0.7455830388692579,
+            0.6996466431095406,
+            0.9611307420494699,
+            1.0,
+            0.9823321554770318,
+            1.0
+          ],
+          "duplicates": 3,
+          "iosp_score": 0.9933333333333333,
+          "iosp_violations": 1,
+          "max_instability": 1.0,
+          "score": 0.3345036513545341,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 522,
+        "code": 5389,
+        "comments": 588,
+        "files": 4,
+        "test_code": 0
+      }
+    },
+    "version": {
+      "clippy": {
+        "complexity": {
+          "cognitive_complexity": 0,
+          "too_many_arguments": 0,
+          "too_many_lines": 0
+        },
+        "complexity_total": 0,
+        "strict": {
+          "clippy::allow_attributes": 0,
+          "clippy::allow_attributes_without_reason": 0,
+          "clippy::assertions_on_result_states": 0,
+          "clippy::cast_sign_loss": 0,
+          "clippy::get_unwrap": 0,
+          "clippy::indexing_slicing": 0,
+          "clippy::large_futures": 0,
+          "clippy::let_underscore_must_use": 0,
+          "clippy::map_err_ignore": 0,
+          "clippy::mem_forget": 0,
+          "clippy::multiple_unsafe_ops_per_block": 0,
+          "clippy::panic": 1,
+          "clippy::panic_in_result_fn": 0,
+          "clippy::string_slice": 0,
+          "clippy::todo": 0,
+          "clippy::undocumented_unsafe_blocks": 0,
+          "clippy::unimplemented": 0,
+          "clippy::unnecessary_safety_comment": 0,
+          "clippy::unreachable": 0,
+          "clippy::unused_result_ok": 0,
+          "clippy::unwrap_in_result": 0,
+          "clippy::unwrap_used": 1
+        },
+        "strict_total": 2,
+        "workspace_lints": 0
+      },
+      "coverage": {
+        "functions": {
+          "covered": 19,
+          "pct": 100.0,
+          "total": 19
+        },
+        "lines": {
+          "covered": 188,
+          "pct": 100.0,
+          "total": 188
+        },
+        "regions": {
+          "covered": 249,
+          "pct": 100.0,
+          "total": 249
+        }
+      },
+      "crap": {
+        "functions": 4,
+        "max": 7.0,
+        "over_threshold": 0
+      },
+      "deps": {
+        "internal": [],
+        "unused": []
+      },
+      "experimental": {
+        "anatomy": {
+          "abstractness": 0.0,
+          "ca": 17,
+          "ce": 0,
+          "cohesion": 1.5,
+          "distance": 0.7071067811865475,
+          "instability": 0.0
+        },
+        "rustqual": {
+          "complexity_findings": 0,
+          "cycles": 0,
+          "dead_code": 0,
+          "dimension_scores": [
+            1.0,
+            1.0,
+            0.875,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duplicates": 0,
+          "iosp_score": 1.0,
+          "iosp_violations": 0,
+          "max_instability": 0.0,
+          "score": 0.8862500000000001,
+          "sdp_violations": 0
+        }
+      },
+      "layer": "leaf",
+      "modules": {
+        "acyclic": true,
+        "cycles": [],
+        "error": null,
+        "orphan_files": [],
+        "orphans": 0
+      },
+      "mutants": null,
+      "size": {
+        "blanks": 39,
+        "code": 321,
+        "comments": 22,
+        "files": 3,
+        "test_code": 76
+      }
+    }
+  },
+  "gates": {
+    "ceiling:clippy.workspace_lints": {
+      "kind": "ceiling",
+      "result": "pass",
+      "threshold": 0,
+      "value": 0
+    },
+    "ceiling:layers.unassigned": {
+      "kind": "ceiling",
+      "result": "pass",
+      "threshold": 0,
+      "value": 0
+    },
+    "ceiling:layers.unexcepted": {
+      "kind": "ceiling",
+      "result": "pass",
+      "threshold": 0,
+      "value": 0
+    },
+    "ceiling:modules.orphans": {
+      "kind": "ceiling",
+      "result": "pass",
+      "threshold": 0,
+      "value": 0
+    },
+    "floor:coverage.lines_pct": {
+      "kind": "floor",
+      "result": "pass",
+      "threshold": 0.0,
+      "value": 87.64
+    },
+    "floor:crates.minimald.coverage.lines_pct": {
+      "kind": "floor",
+      "result": "pass",
+      "threshold": 0.0,
+      "value": 87.95
+    },
+    "floor:crates.minvmd.coverage.lines_pct": {
+      "kind": "floor",
+      "result": "pass",
+      "threshold": 0.0,
+      "value": 93.39
+    },
+    "floor:mutants.score_pct": {
+      "kind": "floor",
+      "result": "not_evaluated",
+      "threshold": 0.0,
+      "value": null
+    },
+    "ratchet:clippy.complexity.total": {
+      "baseline": null,
+      "baseline_sha7": null,
+      "direction": "down",
+      "kind": "ratchet",
+      "result": "not_evaluated",
+      "tolerance": 0,
+      "value": 445
+    },
+    "ratchet:clippy.strict.total": {
+      "baseline": null,
+      "baseline_sha7": null,
+      "direction": "down",
+      "kind": "ratchet",
+      "result": "not_evaluated",
+      "tolerance": 0,
+      "value": 3454
+    },
+    "ratchet:coverage.lines_pct": {
+      "baseline": null,
+      "baseline_sha7": null,
+      "direction": "up",
+      "kind": "ratchet",
+      "result": "not_evaluated",
+      "tolerance": 0.25,
+      "value": 87.64
+    },
+    "ratchet:crap.over_threshold": {
+      "baseline": null,
+      "baseline_sha7": null,
+      "direction": "down",
+      "kind": "ratchet",
+      "result": "not_evaluated",
+      "tolerance": 0,
+      "value": 353
+    },
+    "ratchet:deps.unused.total": {
+      "baseline": null,
+      "baseline_sha7": null,
+      "direction": "down",
+      "kind": "ratchet",
+      "result": "not_evaluated",
+      "tolerance": 0,
+      "value": 3
+    },
+    "ratchet:layers.exceptions": {
+      "baseline": null,
+      "baseline_sha7": null,
+      "direction": "down",
+      "kind": "ratchet",
+      "result": "not_evaluated",
+      "tolerance": 0,
+      "value": 3
+    }
+  },
+  "git": {
+    "dirty": false,
+    "ref": "main",
+    "sha": "89436ef0e924d9350bcd52248a34c894bfd02560",
+    "sha7": "89436ef"
+  },
+  "hotspots": {
+    "candidates": 338,
+    "coverage_included": true,
+    "files": [
+      {
+        "churn": 126,
+        "complexity": 27,
+        "crate": "minimal",
+        "path": "crates/minimal/src/tests.rs",
+        "score": 9702.0,
+        "strict": 50,
+        "uncovered_lines": 0
+      },
+      {
+        "churn": 47,
+        "complexity": 0,
+        "crate": "minvmd",
+        "path": "crates/minvmd/src/cmd/run.rs",
+        "score": 8337.33,
+        "strict": 175,
+        "uncovered_lines": 239
+      },
+      {
+        "churn": 50,
+        "complexity": 12,
+        "crate": "minimald",
+        "path": "crates/minimald/src/env.rs",
+        "score": 6929.0,
+        "strict": 115,
+        "uncovered_lines": 1158
+      },
+      {
+        "churn": 48,
+        "complexity": 10,
+        "crate": "minvmd",
+        "path": "crates/minvmd/src/control.rs",
+        "score": 3245.76,
+        "strict": 53,
+        "uncovered_lines": 462
+      },
+      {
+        "churn": 80,
+        "complexity": 4,
+        "crate": "minimald",
+        "path": "crates/minimald/src/rpc.rs",
+        "score": 2717.6,
+        "strict": 27,
+        "uncovered_lines": 297
+      },
+      {
+        "churn": 43,
+        "complexity": 28,
+        "crate": "minvmd",
+        "path": "crates/minvmd/src/net/egress_gate.rs",
+        "score": 2208.91,
+        "strict": 18,
+        "uncovered_lines": 537
+      },
+      {
+        "churn": 50,
+        "complexity": 9,
+        "crate": "minvmd",
+        "path": "crates/minvmd/src/box_registry.rs",
+        "score": 1760.5,
+        "strict": 23,
+        "uncovered_lines": 321
+      },
+      {
+        "churn": 51,
+        "complexity": 7,
+        "crate": "minimald",
+        "path": "crates/minimald/src/box_manager.rs",
+        "score": 1680.45,
+        "strict": 22,
+        "uncovered_lines": 395
+      },
+      {
+        "churn": 46,
+        "complexity": 8,
+        "crate": "minimal",
+        "path": "crates/minimal/src/cmd/boxes/create.rs",
+        "score": 1600.34,
+        "strict": 22,
+        "uncovered_lines": 479
+      },
+      {
+        "churn": 32,
+        "complexity": 10,
+        "crate": "minimald",
+        "path": "crates/minimald/src/net/classifier.rs",
+        "score": 1550.4,
+        "strict": 33,
+        "uncovered_lines": 545
+      },
+      {
+        "churn": 69,
+        "complexity": 2,
+        "crate": "minimal",
+        "path": "crates/minimal/src/cmd/mod.rs",
+        "score": 1481.43,
+        "strict": 15,
+        "uncovered_lines": 447
+      },
+      {
+        "churn": 39,
+        "complexity": 20,
+        "crate": "minimald",
+        "path": "crates/minimald/src/box_actor/tests.rs",
+        "score": 1365.0,
+        "strict": 15,
+        "uncovered_lines": 0
+      },
+      {
+        "churn": 39,
+        "complexity": 12,
+        "crate": "minimal",
+        "path": "crates/minimal/src/resolver.rs",
+        "score": 1311.18,
+        "strict": 18,
+        "uncovered_lines": 362
+      },
+      {
+        "churn": 13,
+        "complexity": 13,
+        "crate": "sandbox",
+        "path": "crates/sandbox/src/lib.rs",
+        "score": 1234.74,
+        "strict": 61,
+        "uncovered_lines": 2098
+      },
+      {
+        "churn": 25,
+        "complexity": 4,
+        "crate": "minimald",
+        "path": "crates/minimald/src/box_actor.rs",
+        "score": 1222.5,
+        "strict": 43,
+        "uncovered_lines": 190
+      },
+      {
+        "churn": 24,
+        "complexity": 2,
+        "crate": "bep",
+        "path": "crates/bep/src/main.rs",
+        "score": 1209.12,
+        "strict": 42,
+        "uncovered_lines": 638
+      },
+      {
+        "churn": 22,
+        "complexity": 9,
+        "crate": "minvmd",
+        "path": "crates/minvmd/src/net/answerer.rs",
+        "score": 1030.92,
+        "strict": 34,
+        "uncovered_lines": 386
+      },
+      {
+        "churn": 16,
+        "complexity": 2,
+        "crate": "mctx",
+        "path": "crates/mctx/src/env.rs",
+        "score": 1023.68,
+        "strict": 57,
+        "uncovered_lines": 498
+      },
+      {
+        "churn": 44,
+        "complexity": 2,
+        "crate": "minimal",
+        "path": "crates/minimal/src/task.rs",
+        "score": 1011.56,
+        "strict": 18,
+        "uncovered_lines": 299
+      },
+      {
+        "churn": 46,
+        "complexity": 5,
+        "crate": "minimald",
+        "path": "crates/minimald/src/net/switch.rs",
+        "score": 975.66,
+        "strict": 14,
+        "uncovered_lines": 221
+      },
+      {
+        "churn": 22,
+        "complexity": 4,
+        "crate": "minimald",
+        "path": "crates/minimald/src/box_runtime.rs",
+        "score": 931.48,
+        "strict": 36,
+        "uncovered_lines": 234
+      },
+      {
+        "churn": 37,
+        "complexity": 2,
+        "crate": "minimald",
+        "path": "crates/minimald/src/main.rs",
+        "score": 916.49,
+        "strict": 19,
+        "uncovered_lines": 377
+      },
+      {
+        "churn": 52,
+        "complexity": 5,
+        "crate": "minimald",
+        "path": "crates/minimald/src/server.rs",
+        "score": 904.28,
+        "strict": 11,
+        "uncovered_lines": 139
+      },
+      {
+        "churn": 31,
+        "complexity": 2,
+        "crate": "mfile",
+        "path": "crates/mfile/src/lib.rs",
+        "score": 739.04,
+        "strict": 20,
+        "uncovered_lines": 184
+      },
+      {
+        "churn": 20,
+        "complexity": 0,
+        "crate": "minimald",
+        "path": "crates/minimald/src/test_harness.rs",
+        "score": 723.2,
+        "strict": 36,
+        "uncovered_lines": 16
+      }
+    ],
+    "findings_included": true,
+    "window_days": 90
+  },
+  "kind": "snapshot",
+  "layers": {
+    "edges": 146,
+    "exceptions": 3,
+    "stale_exceptions": [],
+    "unassigned": [],
+    "unexcepted": 0,
+    "unknown": [],
+    "violations": [
+      {
+        "excepted": true,
+        "from": "mfile",
+        "from_layer": "build",
+        "issue": "unassigned",
+        "since": "2026-10-14",
+        "to": "boxes",
+        "to_layer": "session"
+      },
+      {
+        "excepted": true,
+        "from": "minimal",
+        "from_layer": "product",
+        "issue": "unassigned",
+        "since": "2026-10-14",
+        "to": "minvmd",
+        "to_layer": "product"
+      },
+      {
+        "excepted": true,
+        "from": "minzoned",
+        "from_layer": "product",
+        "issue": "unassigned",
+        "since": "2026-10-14",
+        "to": "minvmd",
+        "to_layer": "product"
+      }
+    ]
+  },
+  "run": {
+    "host": {
+      "arch": "x86_64",
+      "os": "linux"
+    },
+    "mode": "full",
+    "not_measured": {
+      "mutants": "no reference commit for the nightly diff (--since)"
+    }
+  },
+  "schema_version": 1,
+  "scope": {
+    "crates": [
+      "args",
+      "async-dialog",
+      "bep",
+      "boxes",
+      "check",
+      "checkouts",
+      "client-config",
+      "common",
+      "decode",
+      "diagnostics",
+      "graph",
+      "lcache",
+      "mctx",
+      "mfile",
+      "minimal",
+      "minimal-client",
+      "minimald",
+      "minimald-rpc",
+      "minvmd",
+      "minzoned",
+      "mip",
+      "mlog",
+      "op",
+      "orchestrator",
+      "ot",
+      "paths",
+      "rcache",
+      "remote-client",
+      "remote-proto",
+      "sandbox",
+      "stdlib",
+      "switch",
+      "version"
+    ],
+    "excluded": {
+      "remote-proto": "generated OUT_DIR code is invisible to source-level tools"
+    }
+  },
+  "toolchain": {
+    "cargo": "1.99.1",
+    "channel": "1.99.1",
+    "rustc": "1.99.1"
+  },
+  "tools": {
+    "cargo-anatomy": "0.7.7",
+    "cargo-crap": "0.7.0",
+    "cargo-llvm-cov": "0.9.1",
+    "cargo-modules": "0.27.0",
+    "cargo-mutants": "27.1.0",
+    "cargo-nextest": "0.9.148",
+    "cargo-shear": "1.14.0",
+    "clippy": "0.1.99",
+    "rustqual": "1.8.3",
+    "tokei": "15.0.0"
+  },
+  "verdict": "pass",
+  "workspace": {
+    "clippy": {
+      "complexity": {
+        "cognitive_complexity": 64,
+        "too_many_arguments": 0,
+        "too_many_lines": 381
+      },
+      "complexity_total": 445,
+      "scope_complete": true,
+      "strict": {
+        "clippy::allow_attributes": 193,
+        "clippy::allow_attributes_without_reason": 200,
+        "clippy::assertions_on_result_states": 200,
+        "clippy::cast_sign_loss": 40,
+        "clippy::get_unwrap": 16,
+        "clippy::indexing_slicing": 404,
+        "clippy::large_futures": 127,
+        "clippy::let_underscore_must_use": 847,
+        "clippy::map_err_ignore": 128,
+        "clippy::mem_forget": 7,
+        "clippy::multiple_unsafe_ops_per_block": 46,
+        "clippy::panic": 62,
+        "clippy::panic_in_result_fn": 31,
+        "clippy::string_slice": 164,
+        "clippy::todo": 10,
+        "clippy::undocumented_unsafe_blocks": 69,
+        "clippy::unimplemented": 17,
+        "clippy::unnecessary_safety_comment": 3,
+        "clippy::unreachable": 64,
+        "clippy::unused_result_ok": 68,
+        "clippy::unwrap_in_result": 220,
+        "clippy::unwrap_used": 538
+      },
+      "strict_total": 3454,
+      "workspace_lints": 0
+    },
+    "coverage": {
+      "functions": {
+        "covered": 22972,
+        "pct": 86.1,
+        "total": 26681
+      },
+      "lines": {
+        "covered": 240352,
+        "pct": 87.64,
+        "total": 274252
+      },
+      "regions": {
+        "covered": 378350,
+        "pct": 87.58,
+        "total": 432029
+      }
+    },
+    "crap": {
+      "functions": 10277,
+      "max": 5282.62,
+      "over_threshold": 353,
+      "threshold": 30.0
+    },
+    "crates": 33,
+    "deps": {
+      "unused_total": 3,
+      "unused_workspace": [
+        "google-cloud-gax",
+        "rustc-hash"
+      ]
+    },
+    "experimental": {
+      "anatomy": {
+        "crates_in_zone_of_pain": [
+          "args",
+          "bep",
+          "boxes",
+          "client-config",
+          "common",
+          "diagnostics",
+          "mfile",
+          "minimald-rpc",
+          "mlog",
+          "ot",
+          "paths",
+          "remote-proto",
+          "sandbox",
+          "stdlib",
+          "switch",
+          "version"
+        ],
+        "mean_distance": 0.4458
+      },
+      "rustqual": {
+        "complexity_findings": 299,
+        "cycles": 6,
+        "dead_code": 738,
+        "duplicates": 109,
+        "errors": [],
+        "iosp_violations": 457,
+        "score_loc_weighted": 0.3219,
+        "score_mean": 0.3706,
+        "sdp_violations": 14
+      }
+    },
+    "modules": {
+      "cycles": 16,
+      "errors": [],
+      "orphans": 0
+    },
+    "mutants": null,
+    "size": {
+      "blanks": 33846,
+      "code": 448035,
+      "comments": 37657,
+      "files": 452,
+      "test_code": 22464
+    },
+    "strict_promotable": []
+  }
+}
