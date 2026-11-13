@@ -7248,8 +7248,10 @@ async fn projection_digests_stored_side_by_side() {
 
     // A client digest that differs is stored as sent, beside the daemon's.
     // Refusing that create is BOX-072's, not this record's.
+    let differing = "A".repeat(43);
+    assert_ne!(differing, expected);
     let mut config = unnamed_config();
-    config.set_client_projection_digest("client-digest");
+    config.set_client_projection_digest(differing.clone());
     config.attrs.insert(
         DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
         "asserted-by-client".to_owned(),
@@ -7257,8 +7259,20 @@ async fn projection_digests_stored_side_by_side() {
     let (_, record) = create(config).await;
     assert_eq!(
         digests_of(record),
-        (Some("client-digest".to_owned()), Some(expected.clone()))
+        (Some(differing), Some(expected.clone()))
     );
+
+    // A client value that is not a digest in form is not stored.
+    for malformed in ["client-digest", "A\nB", &"A".repeat(44), &"A".repeat(4096)] {
+        let mut config = unnamed_config();
+        config.set_client_projection_digest(malformed);
+        let (_, record) = create(config).await;
+        assert_eq!(
+            digests_of(record),
+            (None, Some(expected.clone())),
+            "{malformed:?}"
+        );
+    }
 
     // A client that predates the digest sends none: the daemon's alone.
     let (_, record) = create(unnamed_config()).await;

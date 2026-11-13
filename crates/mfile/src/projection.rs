@@ -465,7 +465,8 @@ fn secret_grants(spec: &toml::Table) -> Json {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecDigestError {
     /// The spec is not a table of TOML values: it is not an object, or it
-    /// holds a `null`.
+    /// holds a value that TOML has no form for. A `null` inside the spec is
+    /// not one of these: [`spec_digest`] reads it as an absent key.
     NotATable(String),
     /// The spec does not name its type's built-in root.
     NoRoot,

@@ -1539,7 +1539,19 @@ fn projection_digests(
     spec: Option<&serde_json_lenient::Value>,
     verb_type: &str,
 ) -> ProjectionDigests {
-    let client = config.client_projection_digest().map(str::to_owned);
+    let client = config
+        .client_projection_digest()
+        .filter(|digest| {
+            let well_formed = is_projection_digest(digest);
+            if !well_formed {
+                tracing::warn!(
+                    digest_len = digest.len(),
+                    "ignored a client projection digest that is not 43 base64url characters"
+                );
+            }
+            well_formed
+        })
+        .map(str::to_owned);
     let (daemon, unprojected) = match spec.map(|s| mfile::projection::spec_digest(s, verb_type)) {
         None => (None, None),
         Some(Ok(digest)) => (Some(digest), None),
@@ -1550,6 +1562,16 @@ fn projection_digests(
         daemon,
         unprojected,
     }
+}
+
+/// Whether `digest` has the form of a projection digest: SHA-256 as
+/// base64url with no padding, 43 characters. A client value of any other
+/// form is not stored, logged or recorded on the span.
+fn is_projection_digest(digest: &str) -> bool {
+    digest.len() == 43
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The spec's Box Type and the built-in type it is built on (BOX-071): the
@@ -4453,6 +4475,12 @@ impl BoxManager {
             .attrs
             .remove(minimald_rpc::DAEMON_PROJECTION_DIGEST_ATTR);
         let digests = projection_digests(&config, spec.as_ref(), verb_type);
+        // A client value that is not a digest in form is not stored.
+        if digests.client.is_none() {
+            config
+                .attrs
+                .remove(minimald_rpc::CLIENT_PROJECTION_DIGEST_ATTR);
+        }
         if let Some(daemon) = &digests.daemon {
             config.attrs.insert(
                 minimald_rpc::DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
