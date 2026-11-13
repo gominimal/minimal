@@ -416,7 +416,7 @@ impl BoxActor {
                 hooks_enabled,
             )
         };
-        let (outcome, graph_names) = match tokio::runtime::Handle::current().runtime_flavor() {
+        let (outcome, composed) = match tokio::runtime::Handle::current().runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(scaffold_and_compose)
             }
@@ -427,7 +427,10 @@ impl BoxActor {
         // `Pending` park resuming through `handle_verdict` — the
         // finalize check judges against the graph this same compose
         // evaluated, never a re-evaluation.
-        self.composed_graph_names = graph_names;
+        (self.composed_graph_names, self.composed_upstream_pin) = match composed {
+            Some(composed) => (Some(composed.names), composed.pin),
+            None => (None, None),
+        };
 
         match outcome {
             // The composition is complete: promote the record
@@ -1435,71 +1438,82 @@ impl BoxActor {
                     warn_check_expired(self.package_check_deadline);
                     return Ok(true);
                 }
-                let unknown: Vec<String> = match self.composed_graph_names.as_ref() {
-                    // A handful of set lookups: judged inline, no
-                    // blocking-pool round-trip.
-                    Some(known) => comp
-                        .packages()
-                        .iter()
-                        .filter(|p| !known.contains(p.package()))
-                        .map(|p| {
-                            format!(
-                                "{} (declared by {})",
-                                crate::env::unknown_package(p.package()),
-                                boxes::core::source::Provenanced::source(p)
-                            )
-                        })
-                        .collect(),
-                    None => {
-                        let ctx = match self.build_context(true).await {
-                            Ok(ctx) => ctx,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "package check skipped at finalize: no session context"
-                                );
-                                return Ok(true);
-                            }
-                        };
-                        // CPU-heavy (nickel evaluation), so on the blocking pool, as
-                        // the launch runs it.
-                        let graph = crate::traced::spawn_blocking(move || {
-                            let mut ctx = ctx;
-                            ctx.graph_from_all_packages().map_err(|e| e.to_string())
-                        })
-                        .await
-                        .map_err(std::io::Error::other)?;
-                        let graph = match graph {
-                            Ok(graph) => graph,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "package check skipped at finalize: no package graph"
-                                );
-                                return Ok(true);
-                            }
-                        };
-                        comp.packages()
-                            .iter()
-                            .filter_map(|p| {
-                                crate::env::session_package(&graph, p.package())
-                                    .err()
-                                    .map(|e| {
-                                        format!(
-                                            "{e} (declared by {})",
-                                            boxes::core::source::Provenanced::source(p)
-                                        )
-                                    })
+                let (unknown, pin): (Vec<String>, Option<crate::env::UpstreamPin>) =
+                    match self.composed_graph_names.as_ref() {
+                        // A handful of set lookups: judged inline, no
+                        // blocking-pool round-trip.
+                        Some(known) => (
+                            comp.packages()
+                                .iter()
+                                .filter(|p| !known.contains(p.package()))
+                                .map(|p| {
+                                    format!(
+                                        "{} (declared by {})",
+                                        crate::env::unknown_package(p.package()),
+                                        boxes::core::source::Provenanced::source(p)
+                                    )
+                                })
+                                .collect(),
+                            self.composed_upstream_pin.clone(),
+                        ),
+                        None => {
+                            let ctx = match self.build_context(true).await {
+                                Ok(ctx) => ctx,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "package check skipped at finalize: no session context"
+                                    );
+                                    return Ok(true);
+                                }
+                            };
+                            let pin = crate::env::UpstreamPin::of(ctx.minimal_file());
+                            // CPU-heavy (nickel evaluation), so on the blocking pool, as
+                            // the launch runs it.
+                            let graph = crate::traced::spawn_blocking(move || {
+                                let mut ctx = ctx;
+                                ctx.graph_from_all_packages().map_err(|e| e.to_string())
                             })
-                            .collect()
-                    }
-                };
+                            .await
+                            .map_err(std::io::Error::other)?;
+                            let graph = match graph {
+                                Ok(graph) => graph,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "package check skipped at finalize: no package graph"
+                                    );
+                                    return Ok(true);
+                                }
+                            };
+                            let unknown = comp
+                                .packages()
+                                .iter()
+                                .filter_map(|p| {
+                                    crate::env::session_package(&graph, p.package()).err().map(
+                                        |e| {
+                                            format!(
+                                                "{e} (declared by {})",
+                                                boxes::core::source::Provenanced::source(p)
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect();
+                            (unknown, pin)
+                        }
+                    };
                 if unknown.is_empty() {
                     return Ok(false);
                 }
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{}; the session was not activated", unknown.join("; ")),
+                // The pin note is added once, after every unknown name,
+                // not to each name: one commit judged them all.
+                Err(crate::env::with_upstream_pin(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("{}; the session was not activated", unknown.join("; ")),
+                    ),
+                    pin.as_ref(),
                 ))
             })
             .await;
