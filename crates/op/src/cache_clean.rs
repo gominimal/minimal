@@ -181,7 +181,7 @@ impl CleanCache {
             let path = entry.path();
             let last_touched = || match kind {
                 StaleKind::Sandbox => {
-                    newest_modified(&path, now, now.checked_sub(FOREIGN_OWNER_IDLE)?)
+                    newest_modified(&path, SystemTime::now, now.checked_sub(FOREIGN_OWNER_IDLE)?)
                 }
                 StaleKind::Task | StaleKind::TempDir => None,
             };
@@ -219,14 +219,27 @@ const FOREIGN_OWNER_IDLE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// (one that vanished mid-walk is a sign of life). A directory the caller
 /// may not list is skipped, its own time still counted. The walk stops at the
 /// first time at or after `stop_at` and returns it; it never follows a
-/// symlink or crosses onto another filesystem.
-fn newest_modified(root: &Path, now: SystemTime, stop_at: SystemTime) -> Option<SystemTime> {
+/// symlink or crosses onto another filesystem. `clock` tells the time; the
+/// sweep passes `SystemTime::now`.
+fn newest_modified(
+    root: &Path,
+    clock: impl Fn() -> SystemTime,
+    stop_at: SystemTime,
+) -> Option<SystemTime> {
     use std::os::unix::fs::MetadataExt as _;
 
-    // A time past `now` is no evidence of life: a tarball keeps upstream
+    // A time past the clock is no evidence of life: a tarball keeps upstream
     // dates, some of them in the future, and a clock stepped back leaves the
-    // same. Counting one would keep a dead daemon's sandbox for good.
-    let seen = |t: SystemTime| if t > now { SystemTime::UNIX_EPOCH } else { t };
+    // same. Counting one would keep a dead daemon's sandbox for good. The
+    // clock is read after each metadata read, not once when the sweep starts:
+    // a live daemon can write a file in between, and that time is real.
+    let seen = |t: SystemTime| {
+        if t > clock() {
+            SystemTime::UNIX_EPOCH
+        } else {
+            t
+        }
+    };
     let meta = std::fs::symlink_metadata(root).ok()?;
     let dev = meta.dev();
     let mut newest = seen(meta.modified().ok()?);
@@ -622,9 +635,12 @@ mod tests {
 
         let now = SystemTime::now();
         let far_future = now + Duration::from_secs(3600);
-        assert_eq!(newest_modified(&root, now, far_future), Some(newer));
         assert_eq!(
-            newest_modified(&tmp.path().join("missing"), now, far_future),
+            newest_modified(&root, SystemTime::now, far_future),
+            Some(newer)
+        );
+        assert_eq!(
+            newest_modified(&tmp.path().join("missing"), SystemTime::now, far_future),
             None
         );
 
@@ -641,7 +657,51 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        assert_eq!(newest_modified(&root, now, far_future), Some(newer));
+        assert_eq!(
+            newest_modified(&root, SystemTime::now, far_future),
+            Some(newer)
+        );
+    }
+
+    /// A file another daemon writes after the sweep starts, but before the walk
+    /// reads it, is a sign of life: its time is past the sweep's start, yet
+    /// not past the moment it is read, so it counts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn newest_modified_keeps_a_write_made_during_the_sweep() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("sb");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        // Whole seconds, so a filesystem with coarse times stores it exactly.
+        let sweep_start = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(
+                (SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60))
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+        let written = sweep_start + Duration::from_secs(5);
+        std::fs::File::open(&root)
+            .unwrap()
+            .set_modified(sweep_start - Duration::from_secs(4 * 24 * 60 * 60))
+            .unwrap();
+        std::fs::File::open(root.join("f"))
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+
+        // The walk reads the file after the write: the clock it reads then is
+        // past `written`, so the write counts.
+        let read_at = || sweep_start + Duration::from_secs(10);
+        let stop_at = sweep_start + Duration::from_secs(3600);
+        assert_eq!(newest_modified(&root, read_at, stop_at), Some(written));
+        // Judged against the sweep's start, the same write would have read as
+        // the epoch and left only the old directory time.
+        assert_ne!(
+            newest_modified(&root, || sweep_start, stop_at),
+            Some(written)
+        );
     }
 
     /// A daemon never sweeps its own work, even though `sandbox` stamps its
