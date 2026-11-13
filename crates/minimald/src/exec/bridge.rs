@@ -2156,10 +2156,14 @@ fn detached_notice(id: &ExecId) -> String {
     format!("\r\nDetached from exec {id}. It keeps running.\r\n")
 }
 
+/// How long a detach waits for its client to take the detach notice. The
+/// box's own terminal bounds its detach the same.
+const DETACH_NOTICE_BOUND: Duration = crate::box_actor::HOST_PROBE_TIMEOUT;
+
 /// Writes `bytes` to the client of the exec attach `id`, for at most
-/// [`EXIT_NOTICE_BOUND`]. A client that does not read, or a write that
-/// fails, skips the bytes: the caller goes on without them.
-async fn write_bounded<W>(out: &mut W, bytes: &[u8], id: &ExecId)
+/// `bound`. A client that does not read, or a write that fails, skips the
+/// bytes: the caller goes on without them.
+async fn write_bounded<W>(out: &mut W, bytes: &[u8], id: &ExecId, bound: Duration)
 where
     W: AsyncWrite + Unpin,
 {
@@ -2167,13 +2171,37 @@ where
         out.write_all(bytes).await?;
         out.flush().await
     };
-    match tokio::time::timeout(EXIT_NOTICE_BOUND, write).await {
+    match tokio::time::timeout(bound, write).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::debug!(exec_id = %id, %error, "exec: a key notice to the attached client failed");
         }
         Err(_) => {
             tracing::debug!(exec_id = %id, "exec: the attached client did not read a key notice");
+        }
+    }
+}
+
+/// Rings the bell on the client of the exec attach `id`, without a wait.
+/// The bell goes only when the client has room for it now. An awaited
+/// write would park the relay loop behind a client that does not read, as
+/// the box's own terminal notes for its bell.
+fn ring_bell<W>(out: &mut W, id: &ExecId)
+where
+    W: AsyncWrite + Unpin,
+{
+    use futures::FutureExt as _;
+    match out.write(b"\x07").now_or_never() {
+        Some(Ok(_)) => {
+            // The flush gets one poll too. The bell is a hint, and a
+            // client that is behind can do without it.
+            let _ = out.flush().now_or_never();
+        }
+        Some(Err(error)) => {
+            tracing::debug!(exec_id = %id, %error, "exec: the leader bell to the attached client failed");
+        }
+        None => {
+            tracing::debug!(exec_id = %id, "exec: the attached client had no room for the leader bell");
         }
     }
 }
@@ -2268,7 +2296,7 @@ where
                                 // The bell goes to the client, never to the
                                 // terminal, as on a box's own terminal.
                                 if matcher.keys().bell_on_leader {
-                                    write_bounded(out, b"\x07", &entry.id).await;
+                                    ring_bell(out, &entry.id);
                                 }
                             }
                             FeedOutcome::Action(KeyAction::Detach) => {
@@ -2285,8 +2313,15 @@ where
                     }
                     if detach {
                         // The detach keys are how a person leaves a stalled
-                        // attach, so the notice never holds the detach.
-                        write_bounded(out, detached_notice(&entry.id).as_bytes(), &entry.id).await;
+                        // attach, so the notice holds the detach for at
+                        // most its short bound.
+                        write_bounded(
+                            out,
+                            detached_notice(&entry.id).as_bytes(),
+                            &entry.id,
+                            DETACH_NOTICE_BOUND,
+                        )
+                        .await;
                         return Ok(AttachEnd::Detached);
                     }
                     // A chunk that leaves a chord prefix held (a lone `ESC`)
@@ -2766,6 +2801,52 @@ mod detach_tests {
         let status = tokio::time::timeout(EXIT_NOTICE_BOUND * 4, attach)
             .await
             .expect("the detach ends the attach")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(0), "a detach ends the channel with status 0");
+        assert!(entry.exit.borrow().is_none(), "the exec keeps running");
+    }
+
+    /// BCLI-068: the leader bell never parks the relay behind a client that
+    /// does not read. What the client types after the leader presses goes
+    /// to the exec at once, and the detach then ends the attach within its
+    /// short bound.
+    #[tokio::test(start_paused = true)]
+    async fn serve_exec_attach_detach_key_ends_channel_exec_runs_bell_never_stalls() {
+        let session = crate::box_actor::WeakBoxHandle::answering(Vec::new())
+            .upgrade()
+            .expect("the stand-in actor lives");
+        session.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+        let dir = tempfile::tempdir().unwrap();
+        let (entry, _terminal_input) = live_tty_entry(&dir);
+        let keys = boxes::keys::SessionKeys {
+            bell_on_leader: true,
+            ..boxes::keys::SessionKeys::default()
+        };
+
+        let (tx, msgs) = msg_stream();
+        // One byte of room, and the client never reads it.
+        let (_client, mut server) = tokio::io::duplex(1);
+        let started = tokio::time::Instant::now();
+        let attach = crate::traced::spawn({
+            let entry = Arc::clone(&entry);
+            let session = session.clone();
+            async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
+        });
+        // Three leader presses, each with an unbound key, then `ab`.
+        tx.send(typed(b"\x1dx\x1dx\x1dxab")).unwrap();
+        while entry.held_input() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.elapsed() < EXIT_NOTICE_BOUND,
+            "the bells held the input for {:?}",
+            started.elapsed()
+        );
+        tx.send(typed(b"\x1dd")).unwrap();
+        let status = tokio::time::timeout(DETACH_NOTICE_BOUND * 2, attach)
+            .await
+            .expect("the detach ends the attach within its bound")
             .unwrap()
             .unwrap();
         assert_eq!(status, Some(0), "a detach ends the channel with status 0");
