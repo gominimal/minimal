@@ -130,7 +130,7 @@ impl BoxAddressRefusal {
         match self {
             Self::Ambiguous { .. } => "Name one box as provider/host/name.",
             Self::AmbiguousIdStart { .. } => "Give more of the id.",
-            Self::NotFound { .. } => "Run `min box list --all` to see the boxes on every host.",
+            Self::NotFound { .. } => "Run `min box list --all` to see the boxes of every project.",
             Self::Unreachable { .. } => "Run the command again when the host answers.",
         }
     }
