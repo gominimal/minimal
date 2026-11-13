@@ -505,6 +505,16 @@ pub(crate) fn build_composables(
     Ok((project_composable, package_composables))
 }
 
+/// What [`run_compose`] learned about the compose-time graph for the
+/// finalize-time package check.
+#[derive(Debug)]
+pub(crate) struct ComposedGraph {
+    /// The package names the graph declared.
+    pub(crate) names: std::collections::HashSet<String>,
+    /// The project's `[upstream]` pin, if it has one.
+    pub(crate) pin: Option<crate::env::UpstreamPin>,
+}
+
 /// The full compose chain for a create flow: resolve the project,
 /// build its composables, and run the composer. Synchronous and
 /// potentially expensive (nickel evaluation, graph resolution) —
@@ -522,18 +532,22 @@ pub(crate) fn build_composables(
 /// among the most expensive steps of this chain, and the finalize-time
 /// package check asks the same question of the same workspace:
 /// handing the names back lets its caller answer from them instead of
-/// evaluating the graph a second time.
+/// evaluating the graph a second time. The project's `[upstream]` pin
+/// rides along, so that check can name the commit it judged against.
 pub(crate) fn run_compose(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
     declared_path: &paths::HostAbsPath,
     contribution: WireContribution,
     hooks_enabled: bool,
-) -> Result<(ComposeOutcome, Option<std::collections::HashSet<String>>), std::io::Error> {
+) -> Result<(ComposeOutcome, Option<ComposedGraph>), std::io::Error> {
     let resolution = resolve_project_ctx_and_graph(daemon_ctx, project_path)?;
     let graph_names = match &resolution {
         ProjectResolution::NoMFile => None,
-        ProjectResolution::Full(_, graph) => Some(graph.names().map(str::to_owned).collect()),
+        ProjectResolution::Full(ctx, graph) => Some(ComposedGraph {
+            names: graph.names().map(str::to_owned).collect(),
+            pin: crate::env::UpstreamPin::of(ctx.minimal_file()),
+        }),
     };
     let (project_composable, package_composables) = build_composables(
         project_path,
