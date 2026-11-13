@@ -115,11 +115,11 @@ impl BoxAddressRefusal {
     }
 
     /// The error kind a machine-output run answers with, the `code` of its
-    /// `min/v1/error` object, beside [`Self::exit_code`]: `usage` for exit
+    /// `min/v1/error` object, beside [`Self::exit_code`]: `ambiguous` for exit
     /// 2, `not_found` for exit 4 and `host_unreachable` for exit 7.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Ambiguous { .. } | Self::AmbiguousIdStart { .. } => "usage",
+            Self::Ambiguous { .. } | Self::AmbiguousIdStart { .. } => "ambiguous",
             Self::NotFound { .. } => "not_found",
             Self::Unreachable { .. } => "host_unreachable",
         }

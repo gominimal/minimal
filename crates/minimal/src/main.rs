@@ -501,7 +501,7 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
         ));
     }
     // BCLI-033: a box address refusal answers with the error kind its exit
-    // code stands for: `not_found` (4), `host_unreachable` (7) or `usage` (2).
+    // code stands for: `not_found` (4), `host_unreachable` (7) or `ambiguous` (2).
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             refused.code(),
@@ -1322,14 +1322,14 @@ mod tests {
                     name: address("web"),
                     candidates: Vec::new(),
                 },
-                "usage",
+                "ambiguous",
                 2,
             ),
             (
                 minimal::BoxAddressRefusal::AmbiguousIdStart {
                     start: address("01"),
                 },
-                "usage",
+                "ambiguous",
                 2,
             ),
         ] {
