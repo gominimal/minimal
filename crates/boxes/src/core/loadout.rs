@@ -126,6 +126,10 @@ pub struct LoadoutFile {
     /// `ComposeOptions::follow_symlinks`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     follow_symlinks: Option<bool>,
+    /// The raw `loadout_mode` key, kept so the expansion can refuse it: a
+    /// loadout cannot set the mode that decides whether it applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loadout_mode: Option<toml::Value>,
 }
 
 impl LoadoutFile {
@@ -293,6 +297,13 @@ impl Loadout {
     #[must_use]
     pub fn follow_symlinks(&self) -> Option<bool> {
         self.file.follow_symlinks
+    }
+
+    /// Whether the file sets `loadout_mode`. Only the box's own layers can
+    /// set it, so the expansion refuses a loadout that does.
+    #[must_use]
+    pub fn sets_loadout_mode(&self) -> bool {
+        self.file.loadout_mode.is_some()
     }
 
     /// Packages this loadout requires.
@@ -530,6 +541,19 @@ mod tests {
     use super::*;
     use crate::core::lifecyclehook::HookScript;
     use crate::core::primitives::{LenientVarName, PatchDest};
+
+    // BOX-172: the loader keeps a `loadout_mode` key, whatever its value,
+    // so the expansion can refuse it rather than drop it.
+    #[test]
+    fn loader_keeps_the_raw_loadout_mode_key() {
+        let bare = toml::from_str::<Loadout>(r#"name = "d""#).unwrap();
+        assert!(!bare.sets_loadout_mode());
+        for value in ["\"open\"", "\"merge\"", "true"] {
+            let l: Loadout =
+                toml::from_str(&format!("name = \"d\"\nloadout_mode = {value}\n")).unwrap();
+            assert!(l.sets_loadout_mode(), "{value}");
+        }
+    }
 
     /// `follow_symlinks` is optional: omitted → `None`, explicit
     /// bool → `Some(bool)`. Round-trip verifies the field is
