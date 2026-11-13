@@ -23,7 +23,28 @@ use anyhow::{Result, bail};
 use anyhow::Context as _;
 
 /// Default timeout in seconds for `run --detach` to wait for the host UDS.
-pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
+///
+/// The default budget must cover the supervisor's whole start path, not just
+/// the boot: phase 1 can first wait out [`ALIVE_LOCK_RELEASE_WAIT`] on a
+/// just-stopped daemon's alive lock, and only then spend the original
+/// readiness allowance on the boot itself. An explicit `--timeout` is a
+/// user's bound on the detach poll and is passed through unchanged, whatever
+/// it is.
+pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 =
+    ALIVE_LOCK_RELEASE_WAIT_SECS + DETACH_BOOT_READINESS_SECS;
+
+/// The boot-readiness share of [`DEFAULT_DETACH_TIMEOUT_SECS`]: the poll
+/// budget the detach loop had before the alive-lock wait existed.
+const DETACH_BOOT_READINESS_SECS: u64 = 8;
+
+/// How long `minvmd run`'s first phase waits for a just-stopped supervisor to
+/// release the alive lock before bailing, in seconds. The old supervisor
+/// writes its final `Stopped` state before `min stop` returns but releases the
+/// alive lock only at process exit, so a start issued immediately after
+/// `min stop` can lose the race and must briefly wait instead of failing.
+/// The [`Duration`] form lives beside the start path; this bare count feeds
+/// [`DEFAULT_DETACH_TIMEOUT_SECS`] on every build, libkrun or not.
+const ALIVE_LOCK_RELEASE_WAIT_SECS: u64 = 10;
 
 /// Run the `run` subcommand.
 ///
@@ -761,13 +782,11 @@ fn spawn_node_mirror(
         })
 }
 
-/// How long `minvmd run`'s first phase waits for a just-stopped supervisor to
-/// release the alive lock before bailing. The old supervisor writes its final
-/// `Stopped` state before `min stop` returns but releases the alive lock only
-/// at process exit, so a start issued immediately after `min stop` can lose
-/// the race and must briefly wait instead of failing.
+/// The [`std::time::Duration`] form of [`ALIVE_LOCK_RELEASE_WAIT_SECS`],
+/// held by the start path it bounds.
 #[cfg(minvmd_libkrun)]
-const ALIVE_LOCK_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const ALIVE_LOCK_RELEASE_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(ALIVE_LOCK_RELEASE_WAIT_SECS);
 
 /// Poll interval for that wait: each attempt re-takes the lifecycle lock and
 /// re-reads state, so a transition to Running/Starting is seen promptly.
@@ -5972,6 +5991,31 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(4),
             "a Running daemon must not be waited for"
+        );
+    }
+
+    /// The default detach budget must cover the supervisor's whole start
+    /// path: the alive-lock wait a start after `min stop` can spend in
+    /// phase 1, plus the boot-readiness allowance the detach poll had
+    /// before that wait existed. A default shorter than the wait lets the
+    /// parent report a timeout while the child is still waiting on the
+    /// lock — after which the child acquires it and boots the VM the
+    /// caller was told failed.
+    #[test]
+    fn default_detach_budget_covers_the_alive_lock_wait_plus_boot() {
+        let default = super::DEFAULT_DETACH_TIMEOUT_SECS;
+        let lock_wait = super::ALIVE_LOCK_RELEASE_WAIT_SECS;
+        let boot_readiness = super::DETACH_BOOT_READINESS_SECS;
+        assert!(
+            default > lock_wait,
+            "the default detach budget ({default}) must exceed the alive-lock wait \
+             ({lock_wait}) so a delayed release cannot outlast it"
+        );
+        assert_eq!(
+            default,
+            lock_wait + boot_readiness,
+            "the default detach budget must be the alive-lock wait plus the \
+             boot-readiness allowance"
         );
     }
 }
