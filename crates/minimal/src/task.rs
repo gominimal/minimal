@@ -161,35 +161,14 @@ fn task_box_network(
             None,
         ),
     };
-    // Where the box's egress came from, for the refusals below: each egress
-    // flag given, and the file's table whenever it declares egress, since
-    // the box would still have egress without the flags.
-    let file_layer = project_egress
-        .layer
-        .as_deref()
-        .filter(|_| file_policy)
-        .map(|layer| format!("{layer} in {}", mfile::MFILE_NAME));
-    if mode == boxes::NetworkMode::NoNet && egress.policy.is_some() {
-        let given = given_egress_flags(flags);
-        let sources = given
-            .iter()
-            .map(|flag| (*flag).to_owned())
-            .chain(file_layer.clone())
-            .collect::<Vec<_>>();
-        let mut remedy = if kind == paths::HostKind::Minvmd {
-            "Run it with --network host_ip".to_owned()
-        } else {
-            "Run it with --network host_ip or --network own_ip".to_owned()
-        };
-        if file_layer.is_none() {
-            remedy.push_str(&format!(", or without {}", and_list(&given)));
-        }
-        bail!(
-            "{refusal}. The box's egress rules come from {sources}. {remedy}.",
-            refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
-            sources = and_list(&sources),
-        );
-    }
+    let own_ip_available = kind != paths::HostKind::Minvmd;
+    refuse_egress_on_none(
+        mode,
+        egress.policy.is_some(),
+        flags,
+        project_egress.layer.as_deref().filter(|_| file_policy),
+        own_ip_available,
+    )?;
     // An own-address box on a VM host registers with the VM host daemon
     // under the name it will have, before its create (T66). A task box is a
     // fresh instance, which the daemon names only at the create, so the
@@ -265,6 +244,48 @@ pub(crate) fn apply_run_overrides(
         network.policy.quic443 = other.quic443;
     }
     Ok(())
+}
+
+/// Refuses egress rules on a `none` box (NET-065), before the daemon and in
+/// the daemon's own words. The refusal names each place the egress came
+/// from: each egress flag given, and `file_layer` in minimal.toml when the
+/// file declares egress, since the box keeps that egress without the flags.
+/// `own_ip_available` says whether the remedy can offer `--network own_ip`.
+/// `min task run`, `min box run` and a session start share it.
+///
+/// # Errors
+///
+/// The refusal, when `mode` is `none` and `has_egress` is true.
+pub(crate) fn refuse_egress_on_none(
+    mode: boxes::NetworkMode,
+    has_egress: bool,
+    flags: &crate::EgressArgs,
+    file_layer: Option<&str>,
+    own_ip_available: bool,
+) -> Result<(), anyhow::Error> {
+    if mode != boxes::NetworkMode::NoNet || !has_egress {
+        return Ok(());
+    }
+    let file_layer = file_layer.map(|layer| format!("{layer} in {}", mfile::MFILE_NAME));
+    let given = given_egress_flags(flags);
+    let sources = given
+        .iter()
+        .map(|flag| (*flag).to_owned())
+        .chain(file_layer.clone())
+        .collect::<Vec<_>>();
+    let mut remedy = if own_ip_available {
+        "Run it with --network host_ip or --network own_ip".to_owned()
+    } else {
+        "Run it with --network host_ip".to_owned()
+    };
+    if file_layer.is_none() {
+        remedy.push_str(&format!(", or without {}", and_list(&given)));
+    }
+    bail!(
+        "{refusal}. The box's egress rules come from {sources}. {remedy}.",
+        refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
+        sources = and_list(&sources),
+    );
 }
 
 /// The egress flags `flags` holds, by name.
