@@ -559,7 +559,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal detached_run_copies_no_exports
 
-- **BOX-187** WHEN BOX-185 copies an export whose path is a directory in the box THE SYSTEM SHALL copy each file of the directory's tree to the same path under the project root, and delete no file there that the box's tree does not hold.
+- **BOX-187** WHEN BOX-185 copies an export whose path is a directory in the box THE SYSTEM SHALL create each directory of the directory's tree, empty ones included, and copy each of its files, at the same paths under the project root, and delete no file there that the box's tree does not hold.
   tier:     T0
   verify:   cargo nextest run -p minimal directory_export_copies_its_tree_and_deletes_nothing
 
@@ -568,7 +568,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal export_replaces_existing_file_atomically
 
-- **BOX-189** IF a `[[file_exports]]` path is absolute or contains a `..` component THEN THE SYSTEM SHALL fail the expansion with exit 3 before any box is created, so that the run and `min box spec <entry>` both refuse it. The error SHALL quote the path, say that it points outside the folder that holds `minimal.toml`, and tell the person to use a path inside that folder.
+- **BOX-189** IF a `[[file_exports]]` path is absolute, contains a `..` component, or names the project root itself (an empty path, `.` or `./`) THEN THE SYSTEM SHALL fail the expansion with exit 3 before any box is created, so that the run and `min box spec <entry>` both refuse it. The error SHALL quote the path, say that it points outside the folder that holds `minimal.toml`, and tell the person to use a path inside that folder.
   <!-- unwanted; decided 2026-11-13: a destination outside the minimal.toml subtree is a spec error, caught before a run is spent, as BCLI-078 refuses at expansion; the architecture limits exports to that subtree (TB1, AT11) -->
   tier:     T0
   verify:   cargo nextest run -p mfile export_path_outside_project_refused_exit3
@@ -587,12 +587,12 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal export_through_escaping_symlink_writes_nothing
 
-- **BOX-193** IF BOX-190, BOX-191 or BOX-192 skips an export of a box whose entrypoint exited 0 THEN THE SYSTEM SHALL end the run with exit 1.
+- **BOX-193** IF BOX-190, BOX-191, BOX-192 or BOX-196 skips an export of a box whose entrypoint exited 0 THEN THE SYSTEM SHALL end the run with exit 1.
   <!-- unwanted; decided 2026-11-13: no new exit code; the architecture's table gives 1 to an unspecified failure -->
   tier:     T0
   verify:   cargo nextest run -p minimal skipped_export_exit1_when_task_succeeded
 
-- **BOX-194** WHEN BOX-190, BOX-191 or BOX-192 skips an export of a box whose entrypoint did not exit 0, or that timed out, ran out of memory or was stopped, THE SYSTEM SHALL end the run with the exit code it returns without exports, so that a timeout still exits 124 (BCLI-014).
+- **BOX-194** WHEN BOX-190, BOX-191, BOX-192 or BOX-196 skips an export of a box whose entrypoint did not exit 0, or that timed out, ran out of memory or was stopped, THE SYSTEM SHALL end the run with the exit code it returns without exports, so that a timeout still exits 124 (BCLI-014).
   tier:     T0
   verify:   cargo nextest run -p minimal skipped_export_keeps_failed_task_exit_code
 
@@ -600,6 +600,12 @@ After this ships, a developer on a stock install with no identity plane runs ses
   <!-- event-driven; decided 2026-11-13: the client copies and reports, the daemon appends, so the record holds the events as it holds every other; the architecture names the `file_exported` event type, and gominimal/inbox#678 extends it with schema-validation status -->
   tier:     T0
   verify:   cargo nextest run -p minimal export_report_appends_file_exported_event
+
+
+- **BOX-196** IF an export's path in the box, or any file or directory inside a directory export, is a symlink that resolves outside the box's `/workbench` THEN THE SYSTEM SHALL write nothing for that export, print on stderr one line that names the export's path and says it leads outside the box's copy of the project, and still copy the other exports.
+  <!-- unwanted; the source-side half of BOX-192: a task, possibly agent-run, must not copy files from outside its project into the project; `min box cp` reads through the box's file server, which already refuses a path that leaves the served directories -->
+  tier:     T0
+  verify:   cargo nextest run -p minimal export_source_symlink_out_of_workbench_writes_nothing
 
 
 ### O3 One grammar
@@ -683,7 +689,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 - The default `loadout_mode` of the `agent`, `service`, `build` and `container-build` types. gominimal/inbox#678 defines those types.
 - Changing a running box's spec: `min add` and any other runtime change, with the `package_added`, `port_exposed` and `file_exported` events it writes: a follow-up spec, not yet filed. A box here resumes from its creation-time spec (BOX-025).
 - Organization Box Types: resolving a type from an organization registry, and refusing a project type that redefines an organization type's name: the Gatehouse directory work, gominimal/inbox#579. Until it lands, BOX-059 resolves only built-in and project types, and `type.source` in the projection (BOX-071) is `builtin` or `project`.
-- Spec sections this spec accepts and carries but does not enforce, each warned of at creation (BOX-076): `[[file_imports]]`, whose copy at creation stays with gominimal/arch#163 and whose schema validation the Agent Box epic gominimal/inbox#678 owns; the copy of `[[file_exports]]` is BOX-185 to BOX-195, and their schema validation stays with gominimal/inbox#678; `[[github_imports]]`, unowned, a follow-up (the clone is the broker's creation-time mint under Gatehouse §6.3); `[otel]`, the observability epic gominimal/inbox#515 and the Agent Box epic gominimal/inbox#678's telemetry receiver; and `[network] vpn_network_names`, the mesh spec MRF (gominimal/minimal#1420). A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are not carried: BOX-076 leaves them out with a warning, as BEP-037 does for the first.
+- Spec sections this spec accepts and carries but does not enforce, each warned of at creation (BOX-076): `[[file_imports]]`, whose copy at creation stays with gominimal/arch#163 and whose schema validation the Agent Box epic gominimal/inbox#678 owns; `[[github_imports]]`, unowned, a follow-up (the clone is the broker's creation-time mint under Gatehouse §6.3); `[otel]`, the observability epic gominimal/inbox#515 and the Agent Box epic gominimal/inbox#678's telemetry receiver; and `[network] vpn_network_names`, the mesh spec MRF (gominimal/minimal#1420). `[[file_exports]]` is no longer on this list: BOX-185 to BOX-196 copy it, and its schema validation stays with gominimal/inbox#678. A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are not carried: BOX-076 leaves them out with a warning, as BEP-037 does for the first.
 - Nesting, the `local-box` provider, and running `min` inside a box, including `min box spec self`: gominimal/inbox#568.
 - Memory and resource declaration, admission, the per-box cgroup limit, OOM handling and `enforced`/`advisory` reporting (epic story S15): the resources spec (gominimal/inbox#698; BRES), written from that epic.
 - The dash (epic story S14: type, state, provider and host columns; resume, reap and start from the list; the create form over entries): an amendment to `docs/specs/07-spec-min-dash-tui`, filed as a follow-up issue on that spec when this merges.
