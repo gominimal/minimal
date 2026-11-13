@@ -84,6 +84,32 @@ What an MDM administrator should know:
   can delete the role account. It also forgets the receipt. With no Full
   Disk Access it removes everything but the account and exits 1; an MDM
   reports that as a failed policy, so push it through the agent.
+- **Background items.** The package installs two LaunchDaemons the old
+  way, as files under `/Library/LaunchDaemons` (Apple's `SMAppService`
+  needs an app that registers them and a user who approves, which a push
+  with nobody logged in has neither of). macOS shows each user a
+  "Background Items Added" notice for them, under the name Minimal, and
+  lets an administrator switch them off in System Settings > General >
+  Login Items; with the service off, box names would not resolve (not yet
+  measured on the farm). A fleet approves them
+  ahead of the install with a Service Management profile
+  (`com.apple.servicemanagement`), by the signing team:
+
+  ```xml
+  <key>PayloadType</key><string>com.apple.servicemanagement</string>
+  <key>Rules</key>
+  <array>
+      <dict>
+          <key>RuleType</key><string>TeamIdentifier</string>
+          <key>RuleValue</key><string>3G47C5HY64</string>
+          <key>Comment</key><string>Minimal: the box-name service and its loopback range</string>
+      </dict>
+  </array>
+  ```
+
+  A rule by label needs both: `dev.gominimal.zone` and
+  `dev.minimal.local-range`. The team rule matches a released package
+  only; a test build's program carries no team.
 - **Who may register box names** is the `_minimal` group. The first install
   puts the Mac's administrators in it, which on a managed Mac is often the
   management account alone; add standard users afterwards with
@@ -125,7 +151,7 @@ runs on a double-click. A test build (`--with`) is refused a signature: its
 service program is ad-hoc signed, and a Developer ID on the package would
 say more than is true. Nothing in the postinstall changes signed code, so
 the bundles' seals survive the install; the postinstall requires the
-Developer ID on the service bundle before it copies it (team OU
+Developer ID on the service bundle before anything names it (team OU
 `3G47C5HY64`, in `postinstall` and `build-pkg.sh` alike).
 
 ## The disk image
@@ -184,7 +210,9 @@ These come from the proposal's open questions.
   stamps the release's version only when told one), so Installer's
   bundle-version comparison sees every test build as the same version. A
   release stamps the real version; the farm's upgrade journeys run on test
-  builds and prove the scripts, not that comparison.
+  builds and prove the scripts, not that comparison. The service's bundle
+  is out of it either way: the preinstall moves the earlier one aside, so
+  Installer finds nothing to compare with and writes the payload's.
 - The pre-install script cannot stop a user's running sessions. An upgrade
   leaves their daemons on the old binaries until they restart.
 - `uninstall.sh` needs the Full Disk Access privacy permission to delete
