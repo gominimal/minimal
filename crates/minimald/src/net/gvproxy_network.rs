@@ -810,6 +810,87 @@ mod tests {
         );
     }
 
+    /// D3001's registration half: a native daemon owns its gvproxy, so two
+    /// own-address boxes on its per-daemon /24 publish into that one
+    /// switch's `min.internal.` zone, the zone its resolver at the /24's
+    /// gateway answers. Each publish goes out the way
+    /// `finish_own_ip_attach` sends it (`host_ids_for` per box). Replayed
+    /// through gvproxy's own zone merge and lookup (newest first, the first
+    /// record whose label is the name less the `.min.internal.` suffix),
+    /// the sibling's two names answer at the sibling's lease.
+    #[tokio::test]
+    async fn a_native_sibling_is_held_in_the_switch_zone_dns_add_body() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("gvproxy.sock");
+        let host_ids = dns::host_ids_for("aaaa1");
+        let mut bodies_rx = spawn_control_channel_capturing(sock_path.clone(), 2 * host_ids.len());
+        let control = ControlChannel::Unix(sock_path);
+
+        // One native daemon: its own /24 off the default switch's first
+        // one, both boxes leased from it.
+        let lease_a = Ipv4Addr::new(100, 64, 37, 9);
+        let lease_b = Ipv4Addr::new(100, 64, 37, 10);
+        for (name, lease) in [("e2e-nnat-a", lease_a), ("e2e-nnat-b", lease_b)] {
+            for host_id in &host_ids {
+                register_dns_name(&control, host_id, name, lease)
+                    .await
+                    .expect("the fake gvproxy control channel must accept the publish");
+            }
+        }
+
+        // gvproxy's `/services/dns/add` merge: one zone per name, a re-add
+        // puts its records in front of the ones the zone held.
+        let mut zone: Vec<(String, String)> = Vec::new();
+        while let Some(body) = bodies_rx.recv().await {
+            let body: serde_json_lenient::Value =
+                serde_json_lenient::from_slice(&body).expect("the zone body is JSON");
+            assert_eq!(
+                body["name"], "min.internal.",
+                "one zone for every box: {body}"
+            );
+            let mut records: Vec<(String, String)> = body["records"]
+                .as_array()
+                .expect("the zone body carries records")
+                .iter()
+                .map(|r| {
+                    (
+                        r["name"].as_str().expect("a record name").to_string(),
+                        r["ip"].as_str().expect("a record ip").to_string(),
+                    )
+                })
+                .collect();
+            records.extend(zone);
+            zone = records;
+        }
+        // gvproxy's lookup: the first record whose label is the question
+        // less the zone suffix.
+        let answer = |question: &str| {
+            let label = question
+                .strip_suffix(".min.internal.")
+                .expect("a zone name");
+            zone.iter()
+                .find(|(name, _)| name == label)
+                .map(|(_, ip)| ip.clone())
+        };
+        let lease_b = lease_b.to_string();
+        for question in [
+            "e2e-nnat-b.min.internal.",
+            "e2e-nnat-b.aaaa1.min.internal.",
+            "e2e-nnat-b.local.min.internal.",
+        ] {
+            assert_eq!(
+                answer(question).as_deref(),
+                Some(lease_b.as_str()),
+                "{question} answers the sibling's lease from the switch zone: {zone:?}"
+            );
+        }
+        assert_eq!(
+            answer("e2e-nnat-a.min.internal.").as_deref(),
+            Some(lease_a.to_string().as_str()),
+            "the first box's own name stays beside its sibling's: {zone:?}"
+        );
+    }
+
     /// A switch whose attach/detach are pure bookkeeping: `HostShuttle`
     /// leaves the gvproxy process to `minvmd`, so only the count moves —
     /// the shape a VM-backed host's daemon carries. Carries the same

@@ -5079,6 +5079,31 @@ pub(crate) mod tests {
         policy: Option<&boxes::BoxPolicy>,
         configure: impl FnOnce(&mut BoxGate),
     ) -> RelayHarness {
+        spawn_relay_on(lease, name, policy, SwitchSubnet::default(), configure)
+    }
+
+    /// A native daemon's relay shape: a box named `name` with `lease` on
+    /// `subnet`, the per-daemon /24 a native daemon's own switch runs
+    /// (`server.rs`, `switch_subnet_for`). Its gate and its relay are both
+    /// keyed to that /24, so the resolver is the /24's gateway.
+    pub(crate) fn spawn_native_relay_with(
+        lease: Ipv4Addr,
+        name: &str,
+        policy: &boxes::BoxPolicy,
+        subnet: SwitchSubnet,
+        configure: impl FnOnce(&mut BoxGate),
+    ) -> RelayHarness {
+        spawn_relay_on(lease, Some(name), Some(policy), subnet, configure)
+    }
+
+    /// [`spawn_named_relay_for`] on `subnet`: the gate and the relay share it.
+    fn spawn_relay_on(
+        lease: Ipv4Addr,
+        name: Option<&str>,
+        policy: Option<&boxes::BoxPolicy>,
+        subnet: SwitchSubnet,
+        configure: impl FnOnce(&mut BoxGate),
+    ) -> RelayHarness {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `socketpair` with a valid domain/type either returns -1
         // (checked) or fills `fds` with two fresh descriptors.
@@ -5098,7 +5123,7 @@ pub(crate) mod tests {
                     name,
                     lease,
                     policy,
-                    SwitchSubnet::default(),
+                    subnet,
                     None,
                     crate::net::dns::ProxyListenerState::down(),
                 )
@@ -5111,16 +5136,8 @@ pub(crate) mod tests {
         // (`attach_node_to_switch_vsock`): ungated, carrying the node's DNS
         // layer.
         let relay = match gate.clone() {
-            Some(gate) => spawn_relay(
-                tap_fd,
-                sock_rx,
-                sock_tx,
-                Some(gate),
-                false,
-                lease,
-                SwitchSubnet::default(),
-            ),
-            None => spawn_node_relay(tap_fd, sock_rx, sock_tx, lease, SwitchSubnet::default()),
+            Some(gate) => spawn_relay(tap_fd, sock_rx, sock_tx, Some(gate), false, lease, subnet),
+            None => spawn_node_relay(tap_fd, sock_rx, sock_tx, lease, subnet),
         }
         .expect("the harness relay spawns");
         RelayHarness {
