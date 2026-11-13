@@ -1122,7 +1122,9 @@ async fn relay_entrypoint_stream(
 /// the task.
 ///
 /// A thread copies the connection to the pipe and closes the pipe at the
-/// connection's EOF, so the task reads EOF. When the task closes its stdin
+/// connection's EOF, so the task reads EOF. With
+/// [`ForwardedStdin::start_shared`], the invocations of one task read the
+/// same pipe in turn. When the task closes its stdin
 /// or ends first, the thread reads on and drops the rest until the helper
 /// closes its side. So the helper's writes never fail, and the run's last
 /// lines (its `exit:` line among them) reach it.
@@ -1157,7 +1159,21 @@ impl ForwardedStdin {
         })
     }
 
-    /// Records that the task ended. A read of the connection that fails
+    /// Starts the copy of `connection` to a new pipe, and returns the
+    /// pipe's read end. Each invocation of a multi-invocation task gets a
+    /// dup of the read end in turn, so a later invocation reads what an
+    /// earlier one left unread. The copy's writes fail, and it drops the
+    /// rest, only once every read end is closed: drop the returned one
+    /// after the last invocation ends.
+    pub(crate) fn start_shared(
+        connection: &std::os::unix::net::UnixStream,
+    ) -> io::Result<(Self, std::io::PipeReader)> {
+        let (reader, writer) = std::io::pipe()?;
+        Ok((Self::start(connection, writer)?, reader))
+    }
+
+    /// Records that the task ended. For a task with more than one
+    /// invocation, call it once the last invocation ends. A read of the connection that fails
     /// after this is not an error: the task no longer reads its stdin.
     pub(crate) fn task_ended(&self) {
         self.task_ended
