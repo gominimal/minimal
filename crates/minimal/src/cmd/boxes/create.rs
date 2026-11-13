@@ -2445,10 +2445,12 @@ impl ActivationStep {
                 "otel.status_description",
                 minimal_client::span_status_description(error).as_str(),
             );
+            // The event is exported as a log record, so it takes the same
+            // text as the status: a reply that did not decode is not quoted.
             span.in_scope(|| {
                 tracing::info!(
                     step = self.name(),
-                    error = %format!("{error:#}"),
+                    error = %minimal_client::span_status_description(error),
                     "activation step failed"
                 );
             });
