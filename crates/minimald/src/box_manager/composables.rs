@@ -78,26 +78,16 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
             Some(mfile::StateWiring { env_var, prefix })
         })
         .map(|w| {
-            // Multi-component prefixes (`foo/bar`) are unused by
-            // any package in `gominimal/pkgs` today. The composition
-            // path's state-dir derivation would silently drop them
-            // while the legacy `SetupForPackages` path would
-            // `mkdir -p` them — a task-vs-session divergence for
-            // the same nickel entry. Reject at extraction so the
-            // divergence never gets exercised; if a package
-            // legitimately needs this shape, both branches will
-            // need to agree on how to handle it and this check can
-            // relax then.
-            if w.prefix.contains('/') {
+            // The prefix is joined onto the state dir, so it has to be one
+            // directory name. The same rule (`mfile::is_state_key`) and the
+            // same wording guard the task path in `graph::SetupForPackages`.
+            // Multi-component prefixes (`foo/bar`) are unused by any package
+            // in `gominimal/pkgs` today; if one legitimately needs that
+            // shape, both paths will need to agree on how to handle it.
+            if !mfile::is_state_key(&w.prefix) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "package `{}` declares `env_state_wiring` with prefix `{}` \
-                         containing '/'; multi-component prefixes are not supported \
-                         on the session composition path. Split into a single \
-                         component or open an issue if you need this shape.",
-                        b.name, w.prefix,
-                    ),
+                    mfile::state_prefix_refusal(&b.name, &w.prefix),
                 ));
             }
             Ok(w)

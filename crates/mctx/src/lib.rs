@@ -1107,9 +1107,11 @@ impl Context {
         let state_base_dir = match state_key {
             // the mfile's load refuses such a key; checked again for a caller
             // that hands one in another way
-            Some(name) if !name.is_empty() && !mfile::is_state_key(name) => {
+            Some(key) if !key.is_empty() && !mfile::is_state_key(key) => {
                 return Err(Error::Other(anyhow!(
-                    "state key {name:?} is not one directory name; use a plain name such as \"dev\""
+                    "The state key {key:?} for task `{name}` is not one directory name. Set \
+                     `state_key` on the task or in `[defaults.task]` to a plain name such as \
+                     \"dev\"."
                 )));
             }
             Some(name) if !name.is_empty() => mfile

@@ -54,9 +54,9 @@ pub enum Error {
     /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
     /// the task name. Exits 3.
     InteractiveTask(String),
-    /// A `state_key` is not one directory name: it holds `/`, `\\` or NUL,
-    /// or is empty, `.` or `..`. Carries the table
-    /// that set it and the value. Exits 3.
+    /// A non-empty `state_key` is not one directory name: it holds `/`, `\\`
+    /// or NUL, or is `.` or `..`. Carries the table that set it and the
+    /// value. Exits 3.
     InvalidStateKey {
         entry: String,
         value: String,
@@ -299,8 +299,8 @@ impl fmt::Display for Error {
             Error::InvalidStateKey { entry, value } => write!(
                 f,
                 "`{entry}` in minimal.toml sets `state_key` to {value:?}. A state key is one \
-                 directory name, with no `/` and not `..`, `.` or empty. Use a plain name such as \
-                 \"dev\"."
+                 directory name. It is not `.` or `..`, and has no `/` or `\\`. Use a plain \
+                 name such as \"dev\"."
             ),
             Error::InteractiveTask(name) => write!(
                 f,

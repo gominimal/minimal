@@ -864,17 +864,39 @@ pub struct ChainLink {
     pub snapshot: String,
 }
 
-/// Object key of the per-commit index snapshot for a repo + commit:
-/// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
 /// Whether `key` names one directory under a project's state base: a
 /// `state_key`, or a package's `env_state_wiring` prefix. The value is joined
 /// onto the base, so it has to be a single name: empty, `.`, `..`, and any
 /// value holding `/`, a backslash or NUL are refused.
+///
+/// An empty `state_key` on a task is allowed at load and means "no key": it
+/// opts the task out of a `[defaults.task]` key, and the task gets a
+/// temporary state directory. Only a non-empty key is checked with this.
 #[must_use]
 pub fn is_state_key(key: &str) -> bool {
     !key.is_empty() && key != "." && key != ".." && !key.contains(['/', '\\', '\0'])
 }
 
+/// Whether a `state_key` from minimal.toml is refused at load: a non-empty
+/// value that is not one name. An empty one means "no key".
+fn bad_state_key(key: &str) -> bool {
+    !key.is_empty() && !is_state_key(key)
+}
+
+/// The refusal for a package's `env_state_wiring` prefix that is not one
+/// directory name ([`is_state_key`]). The package graph and the session
+/// composition path both read the prefix, and both refuse it with this text.
+#[must_use]
+pub fn state_prefix_refusal(package: &str, prefix: &str) -> String {
+    format!(
+        "package `{package}` declares `env_state_wiring` with prefix {prefix:?}. A prefix is \
+         one directory name under the state directory. It is not empty, `.` or `..`, and has \
+         no `/` or `\\`. Fix the prefix in that package, or report it to its maintainers."
+    )
+}
+
+/// Object key of the per-commit index snapshot for a repo + commit:
+/// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
 pub fn commit_index_object(repo_url: &str, commit_sha: &str) -> String {
     format!("{}/{commit_sha}.shisha", repo_slug(repo_url))
 }
@@ -1067,7 +1089,8 @@ fn legacy_hints_due(path: Option<&Path>, bytes: &[u8]) -> bool {
         .insert((path.to_path_buf(), hash_bytes(bytes)))
 }
 
-/// Whether a load refuses a task that sets `interactive = true` (BOX-054).
+/// Whether a load refuses a task that sets `interactive = true` (BOX-054),
+/// and a `state_key` that is not one directory name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskCheck {
     /// Refuse it: the file is the project's own.
@@ -1202,8 +1225,10 @@ impl File {
     /// no `default` field, [`Error::HarnessTable`] if the file names the
     /// pre-v0.5.0 `harness` key, [`Error::MultipleTaskActions`] if a task
     /// sets more than one action key, [`Error::InteractiveTask`] if a
-    /// task sets `interactive = true`, or [`Error::InvalidSpecKey`] if
-    /// `[session]` or a task sets a `timeout` that is not a duration.
+    /// task sets `interactive = true`, [`Error::InvalidStateKey`] if a task
+    /// or `[defaults.task]` sets a `state_key` that is not one directory
+    /// name, or [`Error::InvalidSpecKey`] if `[session]` or a task sets a
+    /// `timeout` that is not a duration.
     pub fn validate(&self) -> Result<(), Error> {
         self.check(TaskCheck::Refuse)
     }
@@ -1243,22 +1268,27 @@ impl File {
             }
             if tasks == TaskCheck::Refuse {
                 task.refuse_interactive(task_name)?;
-            }
-            if let Some(key) = task.state_key.as_deref().filter(|k| !is_state_key(k)) {
-                return Err(Error::InvalidStateKey {
-                    entry: format!("[tasks.{task_name}]"),
-                    value: key.to_owned(),
-                });
+                if let Some(key) = task.state_key.as_deref().filter(|k| bad_state_key(k)) {
+                    return Err(Error::InvalidStateKey {
+                        entry: format!("[tasks.{task_name}]"),
+                        value: key.to_owned(),
+                    });
+                }
             }
         }
-        if let Some(key) = self
-            .defaults
-            .state_key
-            .as_deref()
-            .filter(|k| !is_state_key(k))
+        // An upstream layer's keys are never used, as its tasks never run, so
+        // only a file whose tasks are checked has its keys checked. The legacy
+        // `[defaults] state_key` is settled into the same field, and its hint
+        // tells the user to move the key to `[defaults.task]`.
+        if tasks == TaskCheck::Refuse
+            && let Some(key) = self
+                .defaults
+                .state_key
+                .as_deref()
+                .filter(|k| bad_state_key(k))
         {
             return Err(Error::InvalidStateKey {
-                entry: "[defaults]".to_owned(),
+                entry: "[defaults.task]".to_owned(),
                 value: key.to_owned(),
             });
         }
@@ -2806,9 +2836,10 @@ mod tests {
         );
     }
 
-    /// A state key is one directory name: a `/`, a `..`, an absolute path or
-    /// an empty value is refused at load, for a task and for `[defaults]`,
-    /// with exit 3; a plain name loads.
+    /// A state key is one directory name: a `/`, a `..` or an absolute path
+    /// is refused at load, for a task and for `[defaults.task]`, with exit 3.
+    /// A plain name loads, and so does an empty key, which means "no key".
+    /// A layer read for the graph, whose tasks never run, is not checked.
     #[test]
     fn a_state_key_that_is_not_one_name_is_refused_at_load() {
         for bad in [
@@ -2841,9 +2872,17 @@ mod tests {
         parse(&toml("state_key = \"dev\""))
             .validate()
             .expect("a plain name loads");
+        parse(&toml("state_key = \"\""))
+            .validate()
+            .expect("an empty key opts out of the default and loads");
         let d: File = toml::from_str("[defaults]\nstate_key = \"../up\"\n").unwrap();
-        let err = d.validate().expect_err("[defaults] is checked too");
-        assert!(err.to_string().contains("[defaults]"), "{err}");
+        let err = d.validate().expect_err("the default key is checked too");
+        assert!(err.to_string().contains("[defaults.task]"), "{err}");
+        d.check(TaskCheck::Skip)
+            .expect("a graph layer's default key is not checked");
+        parse(&toml("state_key = \"../../x\""))
+            .check(TaskCheck::Skip)
+            .expect("a graph layer's task key is not checked");
     }
 
     #[test]

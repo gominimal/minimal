@@ -88,7 +88,7 @@ impl EnvChannel<'_> {
                     // a package's state prefix is one name under the state dir;
                     // graph refuses others, checked again here
                     if !mfile::is_state_key(&want_dir) {
-                        writeln!(stream, "error: a package's state directory {want_dir:?} is not one directory name").ok();
+                        writeln!(stream, "error: {}", state_dir_refusal(&want_dir)).ok();
                         return;
                     }
                     std::fs::create_dir_all(self.state_dir.join(want_dir)).unwrap();
@@ -550,6 +550,17 @@ pub enum WdLayout {
         /// The host directory mounted at `/workbench`.
         working: PathBuf,
     },
+}
+
+/// The refusal for a state directory that a package's `env_state_wiring`
+/// prefix names and that is not one directory name. The set of directories
+/// no longer says which package declared each one. The package graph refuses
+/// such a prefix first and names the package, so reaching this is a bug.
+fn state_dir_refusal(dir: &str) -> String {
+    format!(
+        "A package's `env_state_wiring` prefix {dir:?} is not one directory name. The package \
+         graph should have refused it and named the package, so please report this as a bug."
+    )
 }
 
 /// Applies the working-directory layout to a fresh sandbox config.
@@ -1385,7 +1396,8 @@ impl<'a> Env<'a> {
         for want_dir in state_dirs {
             if !mfile::is_state_key(&want_dir) {
                 return Err(Error::Other(anyhow::anyhow!(
-                    "a package's state directory {want_dir:?} is not one directory name"
+                    "{}",
+                    state_dir_refusal(&want_dir)
                 )));
             }
             std::fs::create_dir_all(args.state_base_dir.join(&want_dir)).map_err(|e| {

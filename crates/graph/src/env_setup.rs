@@ -91,7 +91,7 @@ impl SetupForPackages {
                     if !mfile::is_state_key(&prefix) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("env_state_wiring prefix {prefix:?} is not one directory name"),
+                            mfile::state_prefix_refusal(&b.name, &prefix),
                         ));
                     }
 
@@ -200,6 +200,48 @@ mod tests {
                 )]),
             }
         )
+    }
+
+    /// A package's `env_state_wiring` prefix is joined onto the state dir, so
+    /// one that is not one directory name stops the whole setup with an
+    /// error naming the package and the prefix. A plain name is wired.
+    #[test]
+    fn a_state_wiring_prefix_that_is_not_one_name_is_refused() {
+        let spec = |prefix: &str| {
+            format!(
+                "let {{BuildSpec, ..}} = import \"minimal.ncl\" in
+                {{
+                    name = \"wired\",
+                    build_deps = [],
+                    cmd = \"\",
+                    attrs.env_state_wiring = [
+                      {{ env_var = \"WIRED_CACHE\", prefix = \"{prefix}\" }},
+                    ],
+                }} | BuildSpec
+                "
+            )
+        };
+        let setup = |prefix: &str| {
+            let layer = Layer::new_for_test(spec(prefix)).unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("spec parsing failed");
+            });
+            let g = Graph::new().ingest(layer).unwrap();
+            SetupForPackages::build(&g, [g.by_name("wired").unwrap()])
+        };
+        for bad in ["..", "a/b"] {
+            let err = setup(bad).expect_err(bad);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{bad}");
+            let msg = err.to_string();
+            assert!(msg.contains("`wired`"), "names the package: {msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "names the prefix: {msg}");
+        }
+        let ok = setup("wired").expect("a plain name is wired");
+        assert!(ok.state_dirs.contains("wired"), "{ok:?}");
+        assert_eq!(
+            ok.env_vars.get("WIRED_CACHE").map(String::as_str),
+            Some("/state/wired")
+        );
     }
 
     /// An entry the typed decode can't classify stops the whole setup with
