@@ -480,6 +480,33 @@ pub struct Invocation {
 }
 
 impl Config {
+    /// The session tree, home or workbench, that the host path `host` is in,
+    /// with the tree's host path, `host` relative to it, and how the box
+    /// shows the tree (`~`, `/workbench`) with its name, for a refusal;
+    /// `None` outside a session layout or outside both trees.
+    #[cfg(target_os = "linux")]
+    fn session_tree_of(&self, host: &Path) -> Option<(PathBuf, PathBuf, String, &'static str)> {
+        let WdSetup::Session {
+            home,
+            working,
+            working_name_override,
+            ..
+        } = &self.wd
+        else {
+            return None;
+        };
+        // The same trees, lookup and view the closure's binds use
+        // (`session_bind`), so the daemon's create and the closure's bind
+        // pick one tree for a host path and name it one way.
+        let wd = working_name_override
+            .as_deref()
+            .unwrap_or(crate::SESSION_DEFAULT_WD);
+        let trees = crate::session_bind::Tree::session(home, working, wd);
+        let (tree, rel) = crate::session_bind::in_tree(&trees, host)?;
+        let view = crate::session_bind::TreeView::of(&tree.mount, tree.name);
+        Some((tree.host.clone(), rel, view.shown.to_string(), tree.name))
+    }
+
     /// The home directory a command in this sandbox sees, as an absolute path
     /// inside the sandbox. One definition, used for both `$HOME` and the
     /// synthesized passwd entry so the two can never disagree.
@@ -980,16 +1007,38 @@ impl Config {
                     }
 
                     // Missing and needs to be created.
+                    let contents = if m.host_path.ends_with(".json") {
+                        "{}"
+                    } else {
+                        ""
+                    };
+                    // Inside a session's home or workbench the box owns every
+                    // name, and a dangling link there would carry `fs::write`
+                    // or `create_dir_all` out of the tree. The path is created
+                    // beneath the tree, never out of it (inbox#1152).
+                    #[cfg(target_os = "linux")]
+                    if let Some((root, rel, shown, name)) =
+                        self.session_tree_of(Path::new(&m.host_path))
+                    {
+                        let view = crate::session_bind::TreeView {
+                            shown: &shown,
+                            name,
+                        };
+                        let bytes = contents.as_bytes();
+                        let created = crate::session_bind::create_beneath(
+                            &root, view, &rel, m.is_file, bytes,
+                        );
+                        created.map_err(|e| {
+                            Error::IO(
+                                "create mapped path in the session's home or workbench",
+                                m.host_path.clone().into(),
+                                e,
+                            )
+                        })?;
+                        continue;
+                    }
                     if m.is_file {
-                        fs::write(
-                            &m.host_path,
-                            if m.host_path.ends_with(".json") {
-                                "{}"
-                            } else {
-                                ""
-                            },
-                        )
-                        .map_err(|e| {
+                        fs::write(&m.host_path, contents).map_err(|e| {
                             Error::IO("create mapped file", m.host_path.clone().into(), e)
                         })?;
                     } else {
