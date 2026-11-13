@@ -377,6 +377,16 @@ fn sweep_work_dirs(dir: &Path) {
 #[derive(Debug)]
 struct WorkDir(PathBuf);
 
+/// Removes a file when it goes out of scope, on every return path, so a
+/// shared secret the TPM wrote never stays on disk after the call.
+struct RemoveOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0);
+    }
+}
+
 impl Drop for WorkDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -637,9 +647,11 @@ impl TpmStore {
         let work = self
             .work_dir()
             .map_err(|err| store_err(format!("did not make the TPM work directory: {err}")))?;
-        let primary = self
-            .primary(&work.0)
-            .map_err(|err| err.into_key_error(role))?;
+        // A failed generation is a store error whatever the TPM answered,
+        // as `KeyStore::generate_in` promises.
+        let primary = self.primary(&work.0).map_err(|err| match err {
+            ToolError::Tpm(detail) | ToolError::Other(detail) => store_err(detail),
+        })?;
         let public = work.0.join("new.pub");
         let private = work.0.join("new.priv");
         let template = key_template(role);
@@ -679,9 +691,13 @@ impl TpmStore {
             let _ = fs::remove_file(&auth_path);
             return Err(store_err(format!("did not write the TPM key files: {err}")));
         }
-        self.open(role, &bytes, auth).inspect_err(|_| {
+        self.open(role, &bytes, auth).map_err(|err| {
             let _ = fs::remove_file(&key_path);
             let _ = fs::remove_file(&auth_path);
+            match err {
+                KeyError::Refused { detail, .. } => store_err(detail),
+                other => other,
+            }
         })
     }
 }
@@ -807,16 +823,16 @@ impl HeldKey for TpmKey {
         let out = self.work.0.join("z.point");
         self.with_context(|ctx| {
             write_private(&peer_path, &ecc_point(peer)).map_err(|e| Self::io_error(&e))?;
-            let _ = fs::remove_file(&out);
+            let out = RemoveOnDrop(&out);
+            let _ = fs::remove_file(out.0);
             let args: Vec<OsString> = args(&["-c"], &[ctx])
                 .into_iter()
                 .chain(["-p", "file:-"].map(OsString::from))
                 .chain(args(&["-u"], &[&peer_path]))
-                .chain(args(&["-o"], &[&out]))
+                .chain(args(&["-o"], &[out.0]))
                 .collect();
             self.store.run("tpm2_ecdhzgen", &args, Some(&self.auth))?;
-            let bytes = Zeroizing::new(fs::read(&out).map_err(|e| Self::io_error(&e))?);
-            let _ = fs::remove_file(&out);
+            let bytes = Zeroizing::new(fs::read(out.0).map_err(|e| Self::io_error(&e))?);
             shared_x(&bytes).map_err(ToolError::Other)
         })
     }
