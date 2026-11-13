@@ -1334,17 +1334,23 @@ pub(crate) fn task_project_egress(
 
 /// Whether a `network` key appears in a layer that a session start can
 /// read: `[defaults]`, `[defaults.session]`, a session entry, or a project
-/// Box Type's entry or `[box_types.<name>.defaults]`, whose root the client
-/// cannot resolve (#3140). A key in a task entry or in `[defaults.task]`
+/// Box Type's entry, `[defaults.<name>]` or `[box_types.<name>.defaults]`,
+/// whose root the client cannot resolve (#3140). A key in a task entry or in `[defaults.task]`
 /// never reaches a session, so it never refuses a session start.
 fn declares_network(file: &toml::Table, entries: &[mfile::entry::BoxEntry]) -> bool {
     let defaults = file.get("defaults").and_then(toml::Value::as_table);
+    // `[defaults.<name>]` reaches every entry of type `<name>`. A built-in
+    // type other than `session` is never a session's type, so only its
+    // table is skipped, by the same rule as `can_be_session` below.
     let in_defaults = defaults.is_some_and(|defaults| {
         defaults.contains_key("network")
-            || defaults
-                .get(boxes::SESSION_BOX_TYPE)
-                .and_then(toml::Value::as_table)
-                .is_some_and(|table| table.contains_key("network"))
+            || defaults.iter().any(|(name, value)| {
+                (name == boxes::SESSION_BOX_TYPE
+                    || !mfile::expand::BUILTIN_BOX_TYPES.contains(&name.as_str()))
+                    && value
+                        .as_table()
+                        .is_some_and(|table| table.contains_key("network"))
+            })
     });
     let in_type_defaults = file
         .get("box_types")
@@ -6429,6 +6435,20 @@ mod tests {
                 "{layer}: {error}"
             );
         }
+        // `[defaults.<name>]` of a project Box Type reaches a possible
+        // session, so its network key still refuses the undecided pick.
+        let project_type = "[boxes.dev]\ntype = \"mydev\"\n\n\
+                            [defaults.mydev.network.egress]\n\
+                            allow_dns_hosts = [\"github.com\"]\n";
+        let error = project_egress_from(project_type.as_bytes(), None)
+            .expect_err("[defaults.mydev] needs a resolved type");
+        assert!(
+            matches!(
+                error.downcast_ref::<SessionEntryUndecided>(),
+                Some(SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "dev"
+            ),
+            "{error}"
+        );
     }
 
     /// NET-065: a session start with project egress and `--network none`
