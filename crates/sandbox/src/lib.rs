@@ -1983,8 +1983,6 @@ struct BindOpts {
     recursive: bool,
 }
 
-// Sandbox usage
-#[cfg(target_os = "linux")]
 /// Called with the stdin pipe of a run's first invocation, once that process
 /// runs and before its output is read. An error kills the process and fails
 /// the run.
@@ -2021,6 +2019,8 @@ impl std::fmt::Debug for RunOptions {
     }
 }
 
+// Sandbox usage
+#[cfg(target_os = "linux")]
 impl<C: Channel> Sandbox<C> {
     fn bind_mount(
         path: &Path,
@@ -5061,10 +5061,6 @@ ff02::2\tip6-allrouters
         assert_eq!(got, Some(UsernsRestriction::ApparmorUnconfined));
     }
 
-    /// Creates a tempdir with the `synth/usr/` structure required by
-    /// `Sandbox::new`. The `synth/` dir is hardlinked into the rootfs;
-    /// `usr/` must be present so the subsequent `usr/lib64 → lib` symlink
-    /// step can succeed.
     /// A program that prints its working directory on one line, then copies
     /// its stdin to its stdout when its one argument is `stdin`.
     #[cfg(target_os = "linux")]
@@ -5207,6 +5203,10 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Creates a tempdir with the `synth/usr/` structure required by
+    /// `Sandbox::new`. The `synth/` dir is hardlinked into the rootfs;
+    /// `usr/` must be present so the subsequent `usr/lib64 → lib` symlink
+    /// step can succeed.
     fn make_base_with_synth() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
