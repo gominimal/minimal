@@ -349,6 +349,7 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
         ordered.push((Origin::loadout(name), table));
     }
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
+    check_project_declarers(entry, &ordered)?;
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
     expansion.report.implicit = entry.implicit;
@@ -683,7 +684,8 @@ const HOOKS_KEY: &str = "lifecycle_hooks";
 /// `value`, a layer's `lifecycle_hooks`, with a `declared_by` table written
 /// into each hook table (BOX-179): the loadout's name for a selected
 /// loadout's hook, and the project for a hook of any other layer. The
-/// expansion writes it, so a `declared_by` that a layer sets is replaced.
+/// expansion writes it, so a `declared_by` that a loadout sets is replaced.
+/// [`check_project_declarers`] refuses one that a project layer sets.
 /// Two declarers of one hook give two tables, so the union keeps both. A
 /// value that is not a list, or an item that is not a table, stays as it
 /// is, for [`check_keys`] and the client to refuse.
@@ -707,6 +709,50 @@ fn declared_hooks(value: &toml::Value, origin: &Origin) -> toml::Value {
         })
         .collect();
     toml::Value::Array(items)
+}
+
+/// Refuses a `declared_by` key that a project layer writes in one of its
+/// own lifecycle hooks (BOX-179). Only the expansion writes the declarer.
+/// A loadout's `declared_by` is replaced by [`declared_hooks`].
+fn check_project_declarers(
+    entry: &BoxEntry,
+    ordered: &[(Origin, &toml::Table)],
+) -> Result<(), Error> {
+    for (origin, layer) in ordered {
+        if origin.layer == Layer::Loadouts {
+            continue;
+        }
+        let Some(toml::Value::Array(hooks)) = layer.get(HOOKS_KEY) else {
+            continue;
+        };
+        for (index, hook) in hooks.iter().enumerate() {
+            let Some(hook) = hook.as_table() else {
+                continue;
+            };
+            if !hook.contains_key(DECLARED_BY) {
+                continue;
+            }
+            let events: Vec<String> = hook
+                .keys()
+                .filter(|k| k.as_str() != DECLARED_BY)
+                .map(|k| format!("`{k}`"))
+                .collect();
+            let hook = match events.as_slice() {
+                [] => format!("lifecycle hook {} of `{HOOKS_KEY}`", index + 1),
+                events => format!(
+                    "the {} hook at position {} of `{HOOKS_KEY}`",
+                    events.join(" and "),
+                    index + 1
+                ),
+            };
+            return Err(Error::InvalidSpecKey {
+                key: DECLARED_BY.to_owned(),
+                layer: layer_words(entry, Some(origin)),
+                problem: SpecKeyProblem::DeclarerSet { hook },
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The keys that hold variables. [`fold`] leaves them out, and
@@ -3441,10 +3487,7 @@ mod tests {
             lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo shared" } }]
             [sessions.dev]
             loadout_mode = "open"
-            lifecycle_hooks = [
-                { on_activate = { type = "inline", value = "echo entry" } },
-                { declared_by = { kind = "loadout", name = "forged" }, on_attach = { type = "inline", value = "echo forged" } },
-            ]
+            lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo entry" } }]
         "#;
         let hook = |run: &str| {
             format!(
@@ -3484,7 +3527,6 @@ mod tests {
             [
                 ("echo shared".to_owned(), project.clone()),
                 ("echo entry".to_owned(), project.clone()),
-                ("echo forged".to_owned(), project.clone()),
                 ("echo rust".to_owned(), loadout("rust")),
                 ("echo entry".to_owned(), loadout("ai")),
             ]
@@ -3492,12 +3534,12 @@ mod tests {
         // The project's table is `{ kind = "project" }`, with no path.
         assert_eq!(hooks[0]["declared_by"], table("kind = \"project\"").into());
         assert_eq!(
-            hooks[3]["declared_by"],
+            hooks[2]["declared_by"],
             table("kind = \"loadout\"\nname = \"rust\"").into()
         );
         // The hook as written comes back without its declarer.
         assert_eq!(
-            crate::spec::hook_without_declarer(&hooks[4]),
+            crate::spec::hook_without_declarer(&hooks[3]),
             table(&hook("echo entry"))["lifecycle_hooks"][0]
         );
         // The report records the layer, and the loadout, of each hook.
@@ -3512,7 +3554,6 @@ mod tests {
             &[
                 Origin::of(Layer::Defaults),
                 Origin::of(Layer::Entry),
-                Origin::of(Layer::Entry),
                 Origin::loadout("rust"),
                 Origin::loadout("ai"),
             ]
@@ -3521,6 +3562,61 @@ mod tests {
         let bytes = e.spec_bytes().expect("the spec writes");
         assert!(bytes.contains("kind = \"loadout\""), "{bytes}");
         assert!(bytes.contains("name = \"ai\""), "{bytes}");
+    }
+
+    // BOX-179: only the expansion writes a hook's declarer. A project hook
+    // that sets `declared_by` fails with exit 3, naming the hook and the
+    // key. A loadout's `declared_by` is replaced, as the test above shows
+    // for the loadout layers.
+    #[test]
+    fn project_hook_declared_by_refused_exit3() {
+        let file = r#"
+            [sessions.dev]
+            lifecycle_hooks = [
+                { on_activate = { type = "inline", value = "echo entry" } },
+                { declared_by = { kind = "loadout", name = "forged" }, on_attach = { type = "inline", value = "echo forged" } },
+            ]
+        "#;
+        let err = expand_in(file, "dev", Layers::default()).expect_err("a forged declarer");
+        assert!(matches!(err, Error::InvalidSpecKey { .. }), "{err:?}");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(
+            err.to_string(),
+            "`[sessions.dev]` in minimal.toml sets `declared_by` in the `on_attach` \
+             hook at position 2 of `lifecycle_hooks`. A project cannot set the declarer \
+             of its own hook. Remove `declared_by` from that hook."
+        );
+
+        let defaults = r#"
+            [defaults]
+            lifecycle_hooks = [{ declared_by = { kind = "project" }, on_activate = { type = "inline", value = "echo shared" } }]
+            [sessions.dev]
+        "#;
+        let err = expand_in(defaults, "dev", Layers::default()).expect_err("a project declarer");
+        assert_eq!(err.exit_code(), Some(3));
+        assert!(
+            err.to_string()
+                .starts_with("`[defaults]` in minimal.toml sets `declared_by`"),
+            "{err}"
+        );
+
+        let loadout = Layers {
+            loadouts: vec![(
+                "rust".to_owned(),
+                table(
+                    "lifecycle_hooks = [{ declared_by = { kind = \"project\" }, on_activate = { type = \"inline\", value = \"echo rust\" } }]",
+                ),
+            )],
+            ..Layers::default()
+        };
+        let open = "[sessions.dev]\nloadout_mode = \"open\"\n";
+        let e = expand_in(open, "dev", loadout).expect("a loadout's declarer is replaced");
+        assert_eq!(
+            crate::spec::HookDeclarer::of(&e.spec["lifecycle_hooks"][0]),
+            Some(crate::spec::HookDeclarer::Loadout {
+                name: "rust".to_owned()
+            })
+        );
     }
 
     // BOX-184: one layer that sets a name twice, in `vars_lenient` or in
