@@ -1,7 +1,82 @@
-let env_state_wiring_entry = {
-    env_var | String,
-    prefix | String,
-}
+# Both fields of an env_state_wiring entry are consumed verbatim by the
+# shell helpers that export state wiring into the user's live environment
+# (env_min_helper.sh / min_helper.sh), and the variable name also travels
+# on the daemon-to-helper `set_env:` line protocol. A name containing shell
+# array subscripts is evaluated by bash `declare` — `X[$(cmd)]` runs the
+# command — and a prefix containing framing characters breaks the line
+# protocol, so each field is pinned here to the exact shape the helpers
+# accept. std.contract.custom keeps both default-free, matching every other
+# contract in this file (a default would let a bad value be silently
+# replaced rather than rejected).
+let env_var_name = std.contract.custom (fun _ value =>
+    if !(std.typeof value == 'String) then
+        'Error { message = "env_state_wiring's env_var must be a string" }
+    else if !(std.string.is_match m%"^[A-Za-z_][A-Za-z0-9_]*$"% value) then
+        'Error { message = "env_state_wiring's env_var must be a bare identifier (letters, digits, underscore, not starting with a digit)" }
+    else
+        'Ok value
+)
+in
+# A prefix is one plain path component under /state: it names a directory,
+# never a path (`/`, `.`, `..`), and must carry none of the characters that
+# would let it forge daemon-to-helper framing (`:`, any control character).
+# The daemon applies the same rule again (graph::is_valid_state_prefix).
+let state_prefix = std.contract.custom (fun _ value =>
+    if !(std.typeof value == 'String) then
+        'Error { message = "env_state_wiring's prefix must be a string" }
+    else if value == "." || value == ".." then
+        'Error { message = "env_state_wiring's prefix must name a directory under /state, not `.` or `..`" }
+    else if !(std.string.is_match m%"^[^/:[:cntrl:]]+$"% value) then
+        'Error { message = "env_state_wiring's prefix must be one plain path component: non-empty, and containing no '/', ':' or control character" }
+    else
+        'Ok value
+)
+in
+# Checks one wiring entry eagerly. A record contract checks lazily, so the
+# fields are checked by hand here; a missing or malformed one is reported
+# with its own message rather than left for whoever reads it first.
+let check_wiring_entry = fun label value =>
+    if !(std.is_record value) then
+        'Error { message = "an env_state_wiring entry is a record" }
+    else if !(std.record.has_field "env_var" value) then
+        'Error { message = "an env_state_wiring entry needs `env_var`" }
+    else if !(std.record.has_field "prefix" value) then
+        'Error { message = "an env_state_wiring entry needs `prefix`" }
+    else
+        let allowed = ["env_var", "prefix"] in
+        let unknown = std.record.fields value |> std.array.filter (fun n => !(std.array.elem n allowed)) in
+        if std.array.length unknown > 0 then
+            'Error { message = "an env_state_wiring entry does not take `%{std.array.first unknown}`" }
+        else
+            std.contract.check env_var_name label value.env_var
+            |> match {
+                'Ok _ =>
+                    std.contract.check state_prefix label value.prefix
+                    |> match {
+                        'Ok _ => 'Ok value,
+                        'Error e => 'Error e,
+                    },
+                'Error e => 'Error e,
+            }
+in
+# One entry, or an array of them, folded eagerly so a bad entry is reported
+# at load time — since #2047 a consumer reading attrs as values also applies
+# an array's pending element contracts, but the fold runs first and carries
+# the per-entry error messages.
+let env_state_wiring_contract = std.contract.custom (fun label value =>
+    if std.is_array value then
+        value
+        |> std.array.try_fold_left
+            (fun acc entry =>
+                check_wiring_entry label entry
+                |> match {
+                    'Ok checked => 'Ok (acc @ [checked]),
+                    'Error e => 'Error e,
+                })
+            []
+    else
+        check_wiring_entry label value
+)
 in
 let source_provenance_gnu = {
     category = 'GnuProject,
@@ -275,7 +350,7 @@ in
     env_state_wiring = {
         name = "environment state directory & variable",
         desc = "Indicates the need for a state directory in an environment, and the environment variable through which it is communicated.",
-        validate = std.contract.any_of [env_state_wiring_entry, Array env_state_wiring_entry],
+        validate = env_state_wiring_contract,
     },
 
     needed_for_internet = {

@@ -88,15 +88,34 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
             // legitimately needs this shape, both branches will
             // need to agree on how to handle it and this check can
             // relax then.
-            if w.prefix.contains('/') {
+            if !graph::is_valid_state_prefix(&w.prefix) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "package `{}` declares `env_state_wiring` with prefix `{}` \
-                         containing '/'; multi-component prefixes are not supported \
-                         on the session composition path. Split into a single \
-                         component or open an issue if you need this shape.",
+                        "package `{}` declares `env_state_wiring` with prefix `{}`, \
+                         which is not one plain path component (not `.` or `..`, no \
+                         '/', ':' or control character); multi-component prefixes are \
+                         not supported on the session composition path. Split into a \
+                         single component or open an issue if you need this shape.",
                         b.name, w.prefix,
+                    ),
+                ));
+            }
+            // The composition path exports the same names to the session
+            // shell that the task path does; a non-identifier name would
+            // be evaluated by the helper's `set_env` branch (bash runs
+            // array-subscript arithmetic inside a `declare`d name), and
+            // framing characters would let the entry forge protocol
+            // lines. The nickel contract rejects these shapes at parse
+            // time; this re-check covers specs that arrive without it.
+            if !graph::is_valid_env_var_name(&w.env_var) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "package `{}` declares `env_state_wiring` with env_var `{}` \
+                         which is not a valid environment variable name (letters, \
+                         digits and underscore, not starting with a digit).",
+                        b.name, w.env_var,
                     ),
                 ));
             }

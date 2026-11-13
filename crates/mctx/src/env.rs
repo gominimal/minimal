@@ -2507,4 +2507,75 @@ mod tests {
         );
         assert!(std::fs::exists(rootfs.path().join("bin")).unwrap());
     }
+
+    /// A `set_env:` line hands the helper a variable name that began as
+    /// package metadata. Bash evaluates the name of a `declare`d variable
+    /// for array subscripts, so a crafted one — `X[$(touch /tmp/pwned)]` —
+    /// runs the command in the user's live shell. The helper must refuse
+    /// such a name without evaluating it, while still exporting the valid
+    /// names around it. The minimald helper has the same guard with the
+    /// same test; this is mctx's copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_with_a_crafted_name_is_refused_not_evaluated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // The payload's marker: the crafted name would `touch` it if bash
+        // evaluated the subscript. Under the fix it must stay absent.
+        let marker = tmp.path().join("pwned");
+
+        // A socat stand-in that answers a request with three `set_env:`
+        // lines — a crafted name, a valid one after it, then `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:X[$(touch {})]:/state/gocache\\n'\nprintf 'set_env:GOCACHE:/state/gocache\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'; __min_rpc status; rc=$?; echo \"GOCACHE=$GOCACHE\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("GOCACHE")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        assert!(!marker.exists(), "the crafted name ran its payload");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("min: refusing to export environment variable with an invalid name"),
+            "the refusal must say so in plain words, got: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GOCACHE=/state/gocache"),
+            "a valid name alongside must still export, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("pwned"),
+            "the crafted name must not join the export summary, got: {stdout}"
+        );
+    }
 }

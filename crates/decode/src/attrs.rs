@@ -466,6 +466,50 @@ mod tests {
         assert_eq!(m["env_dir_mappings"].as_list().unwrap().len(), 1);
     }
 
+    /// An `env_state_wiring` entry's `env_var` reaches the shell helpers'
+    /// `set_env` branch verbatim, where bash evaluates a `declare`d name for
+    /// array subscripts — `X[$(touch /tmp/pwned)]` would run the command in
+    /// the user's live shell. A `prefix` rides the same daemon-to-helper
+    /// line protocol (`set_env:{name}:{value}`, split on the first `:`), so
+    /// a `:` or newline would forge protocol lines and a `/` would name a
+    /// path. The contract must fail closed on all of these at load time.
+    #[test]
+    fn env_state_wiring_entries_fail_closed() {
+        let wiring = |entry: &str| attrs_accepted(&format!("{{env_state_wiring = [{entry}]}}"));
+
+        assert!(wiring("{ env_var = \"GOCACHE\", prefix = \"gocache\" }"));
+        // A name bash would evaluate rather than assign.
+        assert!(!wiring(
+            "{ env_var = \"X[$(touch /tmp/pwned)]\", prefix = \"gocache\" }"
+        ));
+        assert!(!wiring("{ env_var = \"-d\", prefix = \"gocache\" }"));
+        assert!(!wiring("{ env_var = \"\", prefix = \"gocache\" }"));
+        // A prefix that breaks the helper line protocol or names a path.
+        assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"cache:artifacts\" }"
+        ));
+        assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"cache/artifacts\" }"
+        ));
+        assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"cache\nartifacts\" }"
+        ));
+        assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"cache\tartifacts\" }"
+        ));
+        assert!(!wiring("{ env_var = \"GOCACHE\", prefix = \"..\" }"));
+        assert!(!wiring("{ env_var = \"GOCACHE\", prefix = \".\" }"));
+        // Missing fields, an extra field, or a non-record entry.
+        assert!(!wiring("{ env_var = \"GOCACHE\" }"));
+        assert!(!wiring("{ prefix = \"gocache\" }"));
+        assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"gocache\", extra = 1 }"
+        ));
+        assert!(!wiring("42"));
+        // The whole attribute must be an array of entries.
+        assert!(!attrs_accepted("{env_state_wiring = 42}"));
+    }
+
     #[test]
     fn attr_binary_from_ok() {
         let res = Loader::new(

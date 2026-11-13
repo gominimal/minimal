@@ -203,8 +203,18 @@ __min_rpc() {
             set_env)
                 local varname="${rest%%:*}"
                 local varval="${rest#*:}"
-                declare -gx "$varname=$varval"
-                env_pairs+=("${varname}=${varval}")
+                # The name comes from package metadata, and bash would
+                # evaluate a crafted one (array subscripts in `declare`
+                # run commands). Only export names that are bare
+                # identifiers, via `printf -v` so the name is never
+                # re-evaluated.
+                if [[ "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                    printf -v "$varname" '%s' "$varval"
+                    export "$varname"
+                    env_pairs+=("${varname}=${varval}")
+                else
+                    printf 'min: refusing to export environment variable with an invalid name: %s\n' "$varname" >&2
+                fi
                 ;;
             stdin)
                 # The task starts: copy this command's stdin to it. The

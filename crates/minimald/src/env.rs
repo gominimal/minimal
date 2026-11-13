@@ -1853,7 +1853,19 @@ impl BoxChannel {
     }
 
     /// Record and transmit a newly-acquired variable to the session shell.
+    ///
+    /// The name is passed through to the shell helper verbatim, where bash
+    /// evaluates a `declare`d name for array subscripts — a crafted one runs
+    /// commands in the user's live shell. Invalid names are refused here
+    /// rather than recorded or sent.
     fn announce_env(&self, stream: &mut UnixStream, key: &str, value: &str) {
+        if !graph::is_valid_env_var_name(key) {
+            let _ = writeln!(
+                stream,
+                "msg:min: refusing to export environment variable with an invalid name: {key}"
+            );
+            return;
+        }
         self.runtime_env.record(key, value);
         let _ = writeln!(stream, "set_env:{key}:{value}");
     }
@@ -4477,6 +4489,76 @@ mod tests {
         );
     }
 
+    /// A `set_env:` line hands the helper a variable name that began as
+    /// package metadata. Bash evaluates the name of a `declare`d variable
+    /// for array subscripts, so a crafted one — `X[$(touch /tmp/pwned)]` —
+    /// runs the command in the user's live shell. The helper must refuse
+    /// such a name without evaluating it, while still exporting the valid
+    /// names around it. Regression guard for the env_state_wiring path.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_with_a_crafted_name_is_refused_not_evaluated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // The payload's marker: the crafted name would `touch` it if bash
+        // evaluated the subscript. Under the fix it must stay absent.
+        let marker = tmp.path().join("pwned");
+
+        // A socat stand-in that answers a request with three `set_env:`
+        // lines — a crafted name, a valid one after it, then `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:X[$(touch {})]:/state/gocache\\n'\nprintf 'set_env:GOCACHE:/state/gocache\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'; __min_rpc status; rc=$?; echo \"GOCACHE=$GOCACHE\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("GOCACHE")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        assert!(!marker.exists(), "the crafted name ran its payload");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("min: refusing to export environment variable with an invalid name"),
+            "the refusal must say so in plain words, got: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GOCACHE=/state/gocache"),
+            "a valid name alongside must still export, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("pwned"),
+            "the crafted name must not join the export summary, got: {stdout}"
+        );
+    }
+
     /// Every session rootfs carries the per-attach environment hook for every
     /// shell we support, at that shell's own vendor/system integration point
     /// — installed by the daemon, so no loadout or project author has to know
@@ -7003,6 +7085,32 @@ exit $rc
                 .get("PYTHONPATH")
                 .map(String::as_str),
             Some("/second")
+        );
+    }
+
+    /// A variable name from package metadata is handed to the shell helper
+    /// verbatim, where bash evaluates a `declare`d name for array subscripts —
+    /// `X[$(touch /tmp/pwned)]` would run the command. An invalid name is
+    /// refused: not recorded, not sent as a `set_env:` line, only explained.
+    #[tokio::test]
+    async fn a_var_with_an_invalid_name_is_refused() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "X[$(touch /tmp/pwned)]", "/state/gocache");
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(
+            lines,
+            vec![
+                "msg:min: refusing to export environment variable with an invalid name: X[$(touch /tmp/pwned)]"
+            ],
+            "an invalid name must be explained and nothing else sent"
+        );
+        assert!(
+            chan.runtime_env.snapshot().is_empty(),
+            "an invalid name must not reach the daemon's environment"
         );
     }
 

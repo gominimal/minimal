@@ -8,6 +8,31 @@ use crate::{BuildSpecRef, Graph};
 use decode::AttrValue;
 use mfile::EnvPatches;
 
+/// An env var name the shell helpers can export without re-evaluation:
+/// exactly a bash identifier. Anything else — array subscripts, command
+/// substitutions, spaces — would be evaluated by `declare` or split the
+/// daemon-to-helper line protocol, so it is rejected before it ever
+/// reaches a shell.
+pub fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A state-dir prefix is one plain component under `/state`: not empty, not
+/// `.` or `..`, and carrying none of the characters that would name a deeper
+/// path or forge daemon-to-helper framing (`/`, `:`, any control character).
+pub fn is_valid_state_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix != "."
+        && prefix != ".."
+        && !prefix.contains(['/', ':'])
+        && !prefix.chars().any(char::is_control)
+}
+
 /// Describes sandbox configuration that needs to be set to power present packages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupForPackages {
@@ -88,6 +113,38 @@ impl SetupForPackages {
                     let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
                     let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
 
+                    // The variable name is handed verbatim to the shell
+                    // helpers' `set_env` branch: bash evaluates a `declare`'d
+                    // name for array subscripts, so a crafted name executes
+                    // code in the user's live shell. The prefix rides the
+                    // same daemon-to-helper line (`set_env:{name}:{value}`,
+                    // split on the first ':'), so framing characters would
+                    // let a value forge protocol lines. The nickel contract
+                    // already rejects these shapes; this re-check keeps the
+                    // helpers safe from any writer that bypasses it.
+                    if !is_valid_env_var_name(&env_var) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "package `{}` declares `env_state_wiring` with env_var `{}` \
+                                 which is not a valid environment variable name (letters, \
+                                 digits and underscore, not starting with a digit)",
+                                b.name, env_var,
+                            ),
+                        ));
+                    }
+                    if !is_valid_state_prefix(&prefix) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "package `{}` declares `env_state_wiring` with prefix `{}` \
+                                 which is not one plain path component (not `.` or `..`, no \
+                                 '/', ':' or control character)",
+                                b.name, prefix,
+                            ),
+                        ));
+                    }
+
                     state_dirs.insert(prefix.clone());
 
                     env_vars.insert(
@@ -126,9 +183,11 @@ impl SetupForPackages {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BuildSpec, Graph};
     use decode::Layer;
     use indoc::indoc;
     use mfile::PatchSetting;
+    use nickel_lang_core::term::IndexMap;
 
     /// `class = 'Credential` mappings are dropped here, matching what the
     /// session-composition path (`minimald`'s `extract_fs_mappings`) already
@@ -340,6 +399,79 @@ mod tests {
                 fs_mapping_packages: Default::default(),
             }
         )
+    }
+
+    /// The graph re-checks the wiring entry shapes the helpers export
+    /// verbatim. The nickel contract is the first gate, but a `BuildSpec`
+    /// can also arrive by wire ([`crate::wire`]) with attrs intact and no
+    /// contract ever applied — this test drives the re-check down that
+    /// path by inserting specs by hand, as the wire tests do.
+    #[test]
+    fn a_shell_unsafe_wiring_entry_fails_the_whole_setup() {
+        let wiring = |env_var: &str, prefix: &str| {
+            decode::AttrValue::Map(IndexMap::from_iter([
+                (
+                    "env_var".to_string(),
+                    decode::AttrValue::String(env_var.to_string(), None),
+                ),
+                (
+                    "prefix".to_string(),
+                    decode::AttrValue::String(prefix.to_string(), None),
+                ),
+            ]))
+        };
+
+        let mut g = Graph::new();
+        let evil = g.insert_build(BuildSpec {
+            name: "evil".into(),
+            attrs: IndexMap::from_iter([(
+                "env_state_wiring".to_string(),
+                wiring("X[$(touch /tmp/pwned)]", "gocache"),
+            )]),
+            ..Default::default()
+        });
+
+        let err = SetupForPackages::build(&g, [&evil])
+            .expect_err("a shell-unsafe env_var must fail the whole setup");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("evil"),
+            "the error must name the package, got {err}"
+        );
+
+        let mut g = Graph::new();
+        let evil = g.insert_build(BuildSpec {
+            name: "evil".into(),
+            attrs: IndexMap::from_iter([(
+                "env_state_wiring".to_string(),
+                wiring("GOCACHE", "cache/artifacts"),
+            )]),
+            ..Default::default()
+        });
+
+        let err = SetupForPackages::build(&g, [&evil])
+            .expect_err("a multi-component prefix must fail the whole setup");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("evil"),
+            "the error must name the package, got {err}"
+        );
+
+        // the rule itself, at its edges
+        for ok in ["gocache", "go-mod_cache.v2", "..."] {
+            assert!(is_valid_state_prefix(ok), "{ok}");
+        }
+        for bad in [
+            "", ".", "..", "a/b", "a:b", "a\nb", "a\rb", "a\tb", "a\u{7f}b",
+        ] {
+            assert!(!is_valid_state_prefix(bad), "{bad:?}");
+        }
+        for ok in ["GOCACHE", "_x", "a1"] {
+            assert!(is_valid_env_var_name(ok), "{ok}");
+        }
+        for bad in ["", "1a", "a-b", "a b", "a[0]", "a=b", "é"] {
+            assert!(!is_valid_env_var_name(bad), "{bad:?}");
+        }
     }
 
     /// The same packages walked in opposite orders yield the same env-var,
