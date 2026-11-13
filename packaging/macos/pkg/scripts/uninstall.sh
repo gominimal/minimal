@@ -13,6 +13,10 @@
 #
 #   sudo "/Library/Application Support/minimal/uninstall.sh"
 set -u
+# Only the base system's tools, wherever this was started from: sudo keeps
+# the caller's PATH, and a directory a user owns may be first on it.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 id=dev.minimal.min
 role=_minimal
 support="/Library/Application Support/minimal"

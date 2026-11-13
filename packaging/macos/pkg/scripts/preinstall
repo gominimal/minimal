@@ -8,6 +8,10 @@
 # are theirs and keep running the binaries they loaded until they restart;
 # an installer cannot stop a user's sessions on their behalf.
 set -eu
+# Only the base system's tools, wherever this was started from: sudo keeps
+# the caller's PATH, and a directory a user owns may be first on it.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 for job in dev.gominimal.zone dev.minimal.local-range; do
     launchctl bootout "system/$job" 2>/dev/null || true
 done
