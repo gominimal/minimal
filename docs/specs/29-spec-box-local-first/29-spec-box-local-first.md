@@ -578,11 +578,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal missing_export_named_and_others_copied
 
-- **BOX-191** IF the copy of a file fails, reading the listing of a directory in the box fails, creating a directory fails, a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at the destination that failed, leaving no partial file and no change to what is already there, keep the files a directory export already wrote, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports.
+- **BOX-191** IF the copy of a file fails, reading the listing of a directory in the box fails, creating a directory fails, a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at the destination that failed, leaving no partial file and no change to what is already there, keep the files a directory export already wrote, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports. An export that wrote only part of its files counts as skipped, so BOX-193 and BOX-194 apply and BOX-195 records it as not copied.
   tier:     T0
   verify:   cargo nextest run -p minimal failed_export_file_leaves_its_destination_unchanged
 
-- **BOX-192** IF the destination of any file an export copies, the export's own path or a file inside a directory export, resolves through a symlink to a path outside the project root THEN THE SYSTEM SHALL write nothing for that export, checking every destination of the export before it writes any of them, print on stderr one line that names the export's path and says it leads outside the project folder, and still copy the other exports.
+- **BOX-192** IF the destination of any file or directory an export writes, the export's own path or a file or directory inside a directory export, resolves through a symlink to a path outside the project root THEN THE SYSTEM SHALL write nothing for that export, checking every destination of the export before it writes any of them, print on stderr one line that names the export's path and says it leads outside the project folder, and still copy the other exports.
   <!-- unwanted; a symlink can only be seen at copy time, so this is the copy-time half of BOX-189's containment -->
   tier:     T0
   verify:   cargo nextest run -p minimal export_through_escaping_symlink_writes_nothing
@@ -613,20 +613,26 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal skipped_export_leaves_record_exit_code
 
-- **BOX-198** IF the box's record already holds a `file_exported` event for an export for the box's current end THEN THE SYSTEM SHALL copy that export no more, so that only the first command that waits for an end copies, and a later `min box wait` cannot replace a newer file.
-  <!-- unwanted; gominimal/arch#180 ruling 2: one copy for each end; `min box cp` gets a file again on request; a resumed PTY box copies again at its next end -->
+- **BOX-198** WHEN a command that waits is about to copy the exports of a box's end THE SYSTEM SHALL first claim that end from the daemon, and the daemon SHALL grant one claim for each end of a box and record it on the box's record before the copy starts, so that only one command copies the exports of an end.
+  <!-- event-driven; gominimal/arch#180 ruling 2: one copy for each end; decided 2026-11-13: the claim is recorded before the copy, so two commands that wait on one end, or a lost report (BOX-200), never copy twice and a later `min box wait` cannot replace a newer file; `min box cp` gets a file again on request; a resumed PTY box copies again at its next end -->
   tier:     T0
-  verify:   cargo nextest run -p minimal export_copied_once_for_each_end
+  verify:   cargo nextest run -p minimald export_claim_granted_once_for_each_end
 
 - **BOX-199** IF the project root of the command that waits differs from the project root in the box's record THEN THE SYSTEM SHALL copy no export of that box, and print on stderr one line that names the box and the project folder that created it and says that its exports were not copied here.
   <!-- unwanted; gominimal/arch#180 ruling 3: a box's exports are copied only in the project that created it -->
   tier:     T0
   verify:   cargo nextest run -p minimal exports_not_copied_from_another_project
 
-- **BOX-200** IF the client's report of an export to the daemon fails THEN THE SYSTEM SHALL print on stderr one line that names the export's path and says that the box's record has no entry for it, and leave the command's exit code as BOX-193 and BOX-194 set it.
+- **BOX-200** IF the client's report of an export to the daemon fails THEN THE SYSTEM SHALL print on stderr one line that names the export's path and says that the box's record has no entry for it, and leave the command's exit code as BOX-193 and BOX-194 set it. The claim BOX-198 recorded stays, so no later command copies those exports again.
   <!-- unwanted; decided 2026-11-13: the copied files are what a caller needs, and the record is the audit trail; a lost report does not change the result -->
   tier:     T0
   verify:   cargo nextest run -p minimal lost_export_report_named_exit_unchanged
+
+
+- **BOX-201** IF the daemon refuses a command's claim because another command already claimed that end THEN THE SYSTEM SHALL copy no export of that end, print on stderr one line that names the box and says its exports for that end were already copied, and leave the command's exit code as it is without exports.
+  <!-- unwanted; decided 2026-11-13: the claim of BOX-198 makes "once for each end" hold; a refused claim is not a failure of the command -->
+  tier:     T0
+  verify:   cargo nextest run -p minimal refused_export_claim_copies_nothing
 
 
 ### O3 One grammar
@@ -710,7 +716,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 - The default `loadout_mode` of the `agent`, `service`, `build` and `container-build` types. gominimal/inbox#678 defines those types.
 - Changing a running box's spec: `min add` and any other runtime change, with the `package_added`, `port_exposed` and `file_exported` events it writes: a follow-up spec, not yet filed. A box here resumes from its creation-time spec (BOX-025).
 - Organization Box Types: resolving a type from an organization registry, and refusing a project type that redefines an organization type's name: the Gatehouse directory work, gominimal/inbox#579. Until it lands, BOX-059 resolves only built-in and project types, and `type.source` in the projection (BOX-071) is `builtin` or `project`.
-- Spec sections this spec accepts and carries but does not enforce, each warned of at creation (BOX-076): `[[file_imports]]`, whose copy at creation stays with gominimal/arch#163 and whose schema validation the Agent Box epic gominimal/inbox#678 owns; `[[github_imports]]`, unowned, a follow-up (the clone is the broker's creation-time mint under Gatehouse §6.3); `[otel]`, the observability epic gominimal/inbox#515 and the Agent Box epic gominimal/inbox#678's telemetry receiver; and `[network] vpn_network_names`, the mesh spec MRF (gominimal/minimal#1420). `[[file_exports]]` is no longer on this list: BOX-185 to BOX-200 copy it, and its schema validation stays with gominimal/inbox#678. A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are not carried: BOX-076 leaves them out with a warning, as BEP-037 does for the first.
+- Spec sections this spec accepts and carries but does not enforce, each warned of at creation (BOX-076): `[[file_imports]]`, whose copy at creation stays with gominimal/arch#163 and whose schema validation the Agent Box epic gominimal/inbox#678 owns; `[[github_imports]]`, unowned, a follow-up (the clone is the broker's creation-time mint under Gatehouse §6.3); `[otel]`, the observability epic gominimal/inbox#515 and the Agent Box epic gominimal/inbox#678's telemetry receiver; and `[network] vpn_network_names`, the mesh spec MRF (gominimal/minimal#1420). `[[file_exports]]` is no longer on this list: BOX-185 to BOX-201 copy it, and its schema validation stays with gominimal/inbox#678. A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are not carried: BOX-076 leaves them out with a warning, as BEP-037 does for the first.
 - Nesting, the `local-box` provider, and running `min` inside a box, including `min box spec self`: gominimal/inbox#568.
 - Memory and resource declaration, admission, the per-box cgroup limit, OOM handling and `enforced`/`advisory` reporting (epic story S15): the resources spec (gominimal/inbox#698; BRES), written from that epic.
 - The dash (epic story S14: type, state, provider and host columns; resume, reap and start from the list; the create form over entries): an amendment to `docs/specs/07-spec-min-dash-tui`, filed as a follow-up issue on that spec when this merges.
