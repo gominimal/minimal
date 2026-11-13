@@ -38,6 +38,14 @@ e2e_timeout() {
     sleep "$secs" &
     sleep_pid=$!
     wait "$sleep_pid"
+    # CMD can end before the parent reaps it. kill still succeeds on that
+    # zombie, so check the state first: a zombie ended in time. Without ps
+    # the check finds nothing and the kill decides.
+    case "$(ps -o stat= -p "$cmd_pid" 2>/dev/null)" in
+      Z*) exit 0 ;;
+    esac
+    # CMD can still end between the check and the kill. Then it ended at the
+    # limit, and 124 is the GNU timeout answer for that case too.
     if kill -TERM "$cmd_pid" 2>/dev/null; then exit 3; fi
     exit 0
   ) </dev/null &

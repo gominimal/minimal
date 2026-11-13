@@ -17,8 +17,14 @@ trap 'rm -rf "$root"' EXIT
 
 # A bin directory with only the tools the cases run.
 mkdir "$root/bin"
-for tool in sleep cat sh; do
-  path="$(command -v "$tool")"
+# ps is optional: the helper uses it to spot a zombie, and works without it.
+for tool in sleep cat sh ps; do
+  path="$(command -v "$tool" || true)"
+  if [ -z "$path" ]; then
+    [ "$tool" = ps ] && continue
+    echo "FAIL - $tool is not on PATH"
+    exit 1
+  fi
   ln -s "$path" "$root/bin/$tool"
 done
 
