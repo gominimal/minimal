@@ -684,7 +684,12 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
                 _ => {
                     let cause = match held_no_channel {
                         Some(port) => crate::resolver::port_held_no_channel_warning(port),
-                        None => NO_PORT.to_string(),
+                        // A package install serves names from a system
+                        // service, not from this user's daemons: when that
+                        // service is installed and silent, it is what the
+                        // item names, with who looks into it.
+                        None => crate::resolver::shared_service_not_running_on_this_host()
+                            .unwrap_or_else(|| NO_PORT.to_string()),
                     };
                     return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
                 }

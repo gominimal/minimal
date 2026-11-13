@@ -4325,6 +4325,43 @@ pub(crate) fn shared_service_undo_refusal(unit_text: &str) -> Option<String> {
     ))
 }
 
+/// What `min finalize-install --show` says of the names item when no daemon
+/// reports a port and nothing answers on the one the host's hook names,
+/// on a host whose installed answerer unit is a shared service's (the
+/// minimal package's): that service is the one not running, and an
+/// administrator is who looks. "No daemon is reachable" sends a user to
+/// their own daemons, which a package install does not use for names; the
+/// commonest cause is a service an administrator switched off. `None`
+/// when no unit is installed, it cannot be read, or it is one operator's:
+/// the caller keeps its own wording.
+pub(crate) fn shared_service_not_running_on_this_host() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let path = ANSWERER_PLIST_PATH;
+    #[cfg(not(target_os = "macos"))]
+    let path = ANSWERER_UNIT_SERVICE_PATH;
+    match read_installed_unit(path) {
+        UnitRead::Text(text) => shared_service_not_running(&text),
+        UnitRead::Absent | UnitRead::Unreadable(_) => None,
+    }
+}
+
+/// [`shared_service_not_running_on_this_host`] over a unit's text. Pure.
+pub(crate) fn shared_service_not_running(unit_text: &str) -> Option<String> {
+    let group = unit_admit_group(unit_text)?;
+    #[cfg(target_os = "macos")]
+    let look = format!(
+        "an administrator sees why with `sudo launchctl print system/{ANSWERER_LAUNCHD_LABEL}`; \
+         when it was switched off (System Settings > General > Login Items, or `launchctl \
+         disable`), they switch it on and install the package again"
+    );
+    #[cfg(not(target_os = "macos"))]
+    let look = "an administrator sees why with `systemctl status` on the service".to_string();
+    Some(format!(
+        "the DNS service the minimal package installed for the group {group} is not \
+         answering on this machine, so box names do not resolve: {look}"
+    ))
+}
+
 /// [`other_operator_refusal`] over this host's installed answerer unit and
 /// the operator this CLI runs as.
 pub(crate) fn other_operator_refusal_on_this_host() -> Option<String> {
@@ -7588,6 +7625,17 @@ exit 0
                 None
             );
             assert_eq!(unit_admit_group(&shared), Some("_minimal"));
+            // The status line for a shared service that does not answer
+            // names the service and who looks, and says nothing for one
+            // operator's unit.
+            let stopped = shared_service_not_running(&shared)
+                .expect("a shared service's unit has its own status wording");
+            assert!(
+                stopped.contains("the minimal package installed for the group _minimal"),
+                "{stopped}"
+            );
+            assert!(stopped.contains("an administrator sees why"), "{stopped}");
+            assert_eq!(shared_service_not_running(text), None);
             assert_eq!(
                 unit_admit_group("ExecStart=/x/minzoned --admit-group minimal --bindings /f"),
                 Some("minimal")
