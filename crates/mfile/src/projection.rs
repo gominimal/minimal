@@ -97,8 +97,9 @@ impl TypeFacts {
         }
     }
 
-    /// The facts that `spec` itself states: the type is `box.type`, or the
-    /// flat `type` when it is a string, else `default_type`. A built-in
+    /// The facts that `spec` itself states: the type is `box.type`, else
+    /// `default_type`. This is the rule that the daemon's admission check
+    /// reads, so the digest names the type that admission checked. A built-in
     /// type is its own root. A project type takes its root from
     /// `type.root`.
     ///
@@ -110,7 +111,6 @@ impl TypeFacts {
             .get("box")
             .and_then(toml::Value::as_table)
             .and_then(|b| b.get("type"))
-            .or_else(|| spec.get("type").filter(|t| t.is_str()))
             .and_then(toml::Value::as_str)
             .unwrap_or(default_type)
             .to_owned();
@@ -931,6 +931,10 @@ mod tests {
         .unwrap();
         assert_eq!((p.source, p.root.as_str()), (TypeSource::Project, "task"));
         assert!(TypeFacts::of_spec(&table("[box]\ntype = \"ci\"\n"), "session").is_none());
+        // A flat `type` string is not the box's type: admission reads
+        // only `box.type`, so the digest does too.
+        let flat = TypeFacts::of_spec(&table("type = \"task\"\n"), "session").unwrap();
+        assert_eq!(flat.name, "session");
         assert!(
             TypeFacts::of_spec(
                 &table("[box]\ntype = \"task\"\n[type]\nroot = \"session\"\n"),
