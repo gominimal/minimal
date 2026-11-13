@@ -703,6 +703,33 @@ async fn run_the_verbs(
     runs
 }
 
+/// The daemon span a verb's request opens: its name, and the start of its
+/// `command` field where the verb names one.
+fn daemon_request(verb: &str) -> (&'static str, Option<&'static str>) {
+    match verb {
+        "exec" => ("exec", Some("min://shell ")),
+        "run" => ("exec", Some("min://task/run tp")),
+        // The task box's entrypoint runs the task, so the run owns no
+        // box and sends no `--owns-box` (T43).
+        "task run" => ("exec", Some("min://task/run tp")),
+        _ => ("attach", None),
+    }
+}
+
+/// The daemon's request span for `verb` under the CLI's cmd span `cmd_span`.
+fn request_span<'a>(
+    spans: &'a [minimald::test_harness::LoggedSpan],
+    verb: &str,
+    cmd_span: &str,
+) -> Option<&'a minimald::test_harness::LoggedSpan> {
+    let (name, command) = daemon_request(verb);
+    spans.iter().find(|s| {
+        s.name == name
+            && s.field("parent_span_id") == Some(cmd_span)
+            && command.is_none_or(|c| s.field("command").is_some_and(|v| v.starts_with(c)))
+    })
+}
+
 /// Plan T11 (spec 25 TEL-021, TEL-022, TEL-025, TEL-045): run `min session
 /// exec`, `min session run`, `min session attach` and `min task run` with
 /// telemetry on inside a caller's trace. Each `min`'s `cmd` span joins
@@ -739,7 +766,22 @@ async fn exec_run_attach_and_task_run_share_the_commands_trace() {
     ];
     let runs = run_the_verbs(&daemon, &args, &on).await;
     let sent = sent_spans(&col);
-    let daemon_spans = in_trace(&log, TRACE);
+    // A verb's answer can reach the CLI before the daemon has recorded the
+    // trace fields on its request span, so wait (bounded) until every
+    // verb's span is in the log, then assert on that read (#3398).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let daemon_spans = loop {
+        let spans = in_trace(&log, TRACE);
+        let all_in = runs.iter().all(|r| {
+            r.cmd
+                .as_ref()
+                .is_none_or(|cmd| request_span(&spans, r.verb, &cmd.span_id).is_some())
+        });
+        if all_in || std::time::Instant::now() >= deadline {
+            break spans;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     let mut exec_span_id = None;
     for r in &runs {
         let cmd = r.cmd.as_ref().unwrap_or_else(|| {
@@ -756,27 +798,13 @@ async fn exec_run_attach_and_task_run_share_the_commands_trace() {
             "{}: the collector has the spooled cmd span: {sent:#?}",
             r.verb
         );
-        let (name, command) = match r.verb {
-            "exec" => ("exec", Some("min://shell ")),
-            "run" => ("exec", Some("min://task/run tp")),
-            // The task box's entrypoint runs the task, so the run owns no
-            // box and sends no `--owns-box` (T43).
-            "task run" => ("exec", Some("min://task/run tp")),
-            _ => ("attach", None),
-        };
-        let request = daemon_spans
-            .iter()
-            .find(|s| {
-                s.name == name
-                    && s.field("parent_span_id") == Some(cmd.span_id.as_str())
-                    && command.is_none_or(|c| s.field("command").is_some_and(|v| v.starts_with(c)))
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "{}: no daemon {name} span under cmd {}: {daemon_spans:#?}",
-                    r.verb, cmd.span_id
-                )
-            });
+        let (name, _) = daemon_request(r.verb);
+        let request = request_span(&daemon_spans, r.verb, &cmd.span_id).unwrap_or_else(|| {
+            panic!(
+                "{}: no daemon {name} span under cmd {}: {daemon_spans:#?}",
+                r.verb, cmd.span_id
+            )
+        });
         if r.verb == "exec" {
             exec_span_id = request.field("span_id").map(str::to_owned);
         }
