@@ -13766,20 +13766,22 @@ async fn task_list_in_a_session_only_project_says_no_task_boxes() {
     // `min box list` for the same project lists the session box, so it
     // does not print its own empty line either.
     let root = paths::HostAbsPath::try_new(project).unwrap();
-    let mut listed = Vec::new();
-    for host in local_hosts(&global).unwrap() {
-        let records = cmd::read_host_boxes(&host).await.unwrap().unwrap();
-        listed.extend(
-            records
-                .into_iter()
-                .filter(|record| record.project_root.as_ref() == Some(&root))
-                .map(|record| cmd::ListedBox {
-                    provider: host.provider.to_string(),
-                    host: host.host.clone(),
-                    record,
-                }),
-        );
-    }
+    let host = local_hosts(&global)
+        .unwrap()
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the native host is selected");
+    let mut client = connect_daemon(&global).await.unwrap();
+    let listed: Vec<cmd::ListedBox> = list_box_records(&mut client, Some(root.clone()))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| cmd::ListedBox {
+            provider: host.provider.to_string(),
+            host: host.host.clone(),
+            record,
+        })
+        .collect();
     let mut box_list = Vec::new();
     cmd::render_box_list(&mut box_list, &listed, true).unwrap();
     let box_list = String::from_utf8(box_list).unwrap();
