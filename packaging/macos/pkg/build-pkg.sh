@@ -9,15 +9,22 @@
 #
 #   manifest prefix   package path                  what
 #   bin/              /usr/local/bin/               min, minvmd, gvproxy-min,
-#                                                   git-remote-min -> min, Minimal.app,
+#                                                   git-remote-min -> min,
 #                                                   bep.app and bep -> into it
+#   bin/Minimal.app   /Library/PrivilegedHelperTools/Minimal.app
+#                                                   the box-name service's
+#                                                   program, which root's
+#                                                   launchd jobs run: where
+#                                                   only root writes, never
+#                                                   under /usr/local
 #   lib/              /usr/local/lib/               libkrun.1.dylib (minvmd's rpath
 #                                                   finds it beside bin/)
 #   data/             /usr/local/share/minimal/     vmlinuz, rootfs.img, initramfs.cpio
 #                                                   (minvmd looks here after the
 #                                                   user's own data dir)
-#                     /usr/local/share/minimal/     uninstall.sh (macOS has no
-#                                                   package uninstall), pkg-info
+#                     /usr/local/share/minimal/     pkg-info (what this build
+#                                                   is, for a person to read;
+#                                                   no script reads it)
 #                     /usr/local/share/zsh/site-functions/_min, and the bash and
 #                     fish completions, printed by the payload's own min
 #
@@ -25,7 +32,10 @@
 # services of an earlier install, postinstall does what `min finalize-install`
 # does for a user, with nobody logged in, and the box-name service under the
 # role account `_minimal`; uninstall.sh undoes all of it and removes the
-# receipt.
+# receipt. The postinstall installs uninstall.sh, and the list of the
+# payload's files, under /Library/Application Support/minimal. What the
+# postinstall requires of the service program's signature is written into
+# it here, when the package is built.
 #
 # Usage:
 #   packaging/macos/pkg/build-pkg.sh (--version V | --channel stable|unstable)
@@ -243,7 +253,7 @@ for pair in ${WITH[@]+"${WITH[@]}"}; do
 done
 
 # A replaced bundle comes from build-app-bundle.sh, which never signs; the
-# postinstall copies only a signed bundle, so a test build's is ad-hoc signed
+# postinstall accepts only a signed bundle, so a test build's is ad-hoc signed
 # here, with the identifier the release signs it under. So is a released
 # bundle whose signature a replacement broke.
 bundle="$root/usr/local/bin/Minimal.app"
@@ -251,8 +261,14 @@ if [ "$test_build" -eq 1 ] && ! codesign --verify --strict "$bundle" 2>/dev/null
     echo "==> ad-hoc signing the replaced bundle"
     codesign --force -s - --identifier dev.minimal.minzoned "$bundle"
 fi
+# The service's program leaves /usr/local for where only root writes: root's
+# launchd jobs run it, and on a Mac where a user owns /usr/local/bin that
+# user could otherwise change it before the postinstall looked.
+mkdir -p "$root/Library/PrivilegedHelperTools"
+mv "$bundle" "$root/Library/PrivilegedHelperTools/Minimal.app"
+bundle="$root/Library/PrivilegedHelperTools/Minimal.app"
 
-# --- 3. What the package adds: completions, the uninstaller, pkg-info ------
+# --- 3. What the package adds: completions, pkg-info, the scripts ----------
 min="$root/usr/local/bin/min"
 [ -x "$min" ] || die "the payload has no executable at bin/min"
 version="$("$min" --version 2>/dev/null | sed -n 's/^min //p')"
@@ -263,14 +279,14 @@ mkdir -p "$root/usr/local/share/zsh/site-functions" \
 "$min" completions print zsh >"$root/usr/local/share/zsh/site-functions/_min"
 "$min" completions print bash >"$root/usr/local/share/bash-completion/completions/min"
 "$min" completions print fish >"$root/usr/local/share/fish/vendor_completions.d/min.fish"
-install -m 0755 "$SCRIPTS_SRC/uninstall.sh" "$root/usr/local/share/minimal/uninstall.sh"
+install -m 0755 "$SCRIPTS_SRC/uninstall.sh" "$scripts/uninstall.sh"
 install -m 0755 "$SCRIPTS_SRC/preinstall" "$scripts/preinstall"
-install -m 0755 "$SCRIPTS_SRC/postinstall" "$scripts/postinstall"
 
 # The bundle's signature decides what the postinstall requires of it: a
 # released bundle carries minimal's Developer ID and the postinstall checks
-# for exactly that before anything names it under /Library; a test build's
-# bundle is ad-hoc signed, and the postinstall checks for a valid signature.
+# for exactly that before anything names it; a test build's bundle is ad-hoc
+# signed, and the postinstall checks for a valid signature. The decision is
+# written into the postinstall below, never read from the installed Mac.
 requirement='=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "3G47C5HY64" and identifier "dev.minimal.minzoned"'
 if codesign --verify --strict -R "$requirement" "$bundle" 2>/dev/null; then
     bundle_signing=developer-id
@@ -289,10 +305,26 @@ fi
     echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$root/usr/local/share/minimal/pkg-info"
 chmod 0644 "$root/usr/local/share/minimal/pkg-info"
+# The postinstall, with this build's three facts in place of the released
+# defaults it is written with.
+for line in bundle_signing=developer-id channel=stable test_build=0; do
+    grep -qx "$line" "$SCRIPTS_SRC/postinstall" \
+        || die "scripts/postinstall has no line '$line' for this build's value to replace"
+done
+case "$CHANNEL" in stable|unstable) pkg_channel="$CHANNEL" ;; *) pkg_channel=stable ;; esac
+sed -e "s/^bundle_signing=developer-id\$/bundle_signing=$bundle_signing/" \
+    -e "s/^channel=stable\$/channel=$pkg_channel/" \
+    -e "s/^test_build=0\$/test_build=$test_build/" \
+    "$SCRIPTS_SRC/postinstall" >"$scripts/postinstall"
+chmod 0755 "$scripts/postinstall"
+grep -qx "bundle_signing=$bundle_signing" "$scripts/postinstall" || die "the postinstall did not take bundle_signing=$bundle_signing"
 
 # macOS 27 stamps com.apple.provenance on every file written; cleared so the
 # bill of materials carries no AppleDouble entries.
 xattr -rc "$root" 2>/dev/null || true
+# The payload's paths as `pkgutil --files` prints a receipt's: what the
+# uninstaller removes when a failed first install left no receipt.
+(cd "$root" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort) >"$scripts/payload-files"
 
 # --- 4. The package ---------------------------------------------------------
 mkdir -p "$OUT"
@@ -309,8 +341,8 @@ fi
 # The bundles stay where the payload puts them. pkgbuild's own analysis
 # marks every bundle relocatable, and Installer would then follow an older
 # copy of the same bundle identifier elsewhere on the disk (a user's
-# ~/.local/bin/Minimal.app from the curl installer, the service's copy
-# under /Library/PrivilegedHelperTools) instead of writing /usr/local/bin.
+# ~/.local/bin/Minimal.app from the curl installer) instead of writing
+# the payload's path.
 # The analysis is kept and the one key turned off, for each bundle found.
 components="$work/components.plist"
 pkgbuild --quiet --analyze --root "$root" "$components" 2> >(grep -v '^write: Permission denied$' >&2)
@@ -322,7 +354,7 @@ while /usr/libexec/PlistBuddy -c "Print :$i:RootRelativeBundlePath" "$components
         || /usr/libexec/PlistBuddy -c "Add :$i:BundleIsRelocatable bool false" "$components"
     i=$((i + 1))
 done
-[ "$i" -ge 1 ] || die "pkgbuild --analyze found no bundle in the payload (expected usr/local/bin/Minimal.app)"
+[ "$i" -ge 1 ] || die "pkgbuild --analyze found no bundle in the payload (expected Library/PrivilegedHelperTools/Minimal.app)"
 echo "==> pkgbuild $ID $version ($i bundle(s) pinned in place)"
 # pkgbuild prints "write: Permission denied" lines on macOS 27 and still exits
 # 0 with a good package (a one-file root reproduces it); dropped.
@@ -400,4 +432,4 @@ echo "distribution: arm64 only, macOS $MIN_OS or later, local system, $i bundle(
 echo "receipt $ID $version, release $VERSION, bundle $bundle_signing$( [ "$test_build" -eq 1 ] && echo ', TEST BUILD')$( [ -n "$NOTARIZE" ] && echo ', notarized and stapled')"
 echo "install: sudo installer -pkg $pkg -target /"
 [ -z "$dmg" ] || echo "download page: $dmg (open it, double-click $(basename "$pkg"))"
-echo "remove:  sudo /usr/local/share/minimal/uninstall.sh"
+echo 'remove:  sudo "/Library/Application Support/minimal/uninstall.sh"'
