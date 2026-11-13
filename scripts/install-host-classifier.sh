@@ -1796,7 +1796,13 @@ done
 # but never on the slice: it is still a member of the slice's tree at that
 # point, and a cgroup that holds a process cannot enable a controller for
 # its children. So the slice is this step's, as root, once its leaves exist
-# and before anything is placed. What the mount root offers the slice is
+# and before anything is placed. The cohort and its two subtrees are this
+# step's too, top down after the slice: a daemon that started before the
+# slice offered the controller ran its cascade for nothing, and repeats it
+# only at its next start, so without this its new boxes would read no
+# memory.max until then. None of the three holds a process (boxes stand in
+# leaves below them), and enabling a controller already enabled changes
+# nothing. What the mount root offers the slice is
 # the root's own cgroup.subtree_control; a root that offers no memory
 # controller is a note, not a failure: boxes still get their leaves and
 # their rules, and read no memory.max. (A rehearsal's stand-in root has
@@ -1806,16 +1812,34 @@ done
 parent=$(dirname "$tree_root")
 if grep -qw memory "$parent/cgroup.subtree_control" 2>/dev/null; then
     if err=$(printf '+memory\n' 2>&1 >"$tree_root/cgroup.subtree_control"); then
-        note "enabled the memory controller on the slice, $tree_root. Boxes can read their own memory.max."
+        # top down: a cgroup gets the controller only once the one above it has enabled it, so the
+        # first refusal leaves every cgroup below it without one, and the walk stops there
+        enabled="the slice, $tree_root"
+        for cgroup in "/$BOXES_DIR" "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"; do
+            if ! err=$(printf '+memory\n' 2>&1 >"$tree_root$cgroup/cgroup.subtree_control"); then
+                note "enabled the memory controller on $enabled, and could not enable it on $tree_root$cgroup/cgroup.subtree_control. The write failed (${err:-no error text}). Boxes under $tree_root$cgroup read no memory.max."
+                enabled=
+                break
+            fi
+            enabled="$enabled, $tree_root$cgroup"
+        done
+        [ -z "$enabled" ] ||
+            note "enabled the memory controller on $enabled. Boxes can read their own memory.max."
     else
         # the one cause this step can prove is a process standing in the slice itself (cgroup v2 refuses
         # a controller for the children of a cgroup that holds a process); any other failure is named as
-        # the write's own error
-        standing=$(tr '\n' ' ' <"$tree_root/cgroup.procs" 2>/dev/null)
-        if [ -n "${standing// /}" ]; then
-            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control). A process stands in the slice itself rather than in a leaf (pid ${standing% }). Boxes read no memory.max. Stop that daemon (min host stop local0), so that its next start places it in a leaf, then run min finalize-install again."
+        # the write's own error. The note names each such pid and the command it runs, read from
+        # /proc, and claims no more: the step cannot tell whose process it is.
+        standing=
+        while read -r pid || [ -n "$pid" ]; do
+            [ -n "$pid" ] || continue
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null) || comm="command unreadable"
+            standing="${standing:+$standing, }pid $pid ($comm)"
+        done < <(cat "$tree_root/cgroup.procs" 2>/dev/null)
+        if [ -n "$standing" ]; then
+            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control). A process stands in the slice itself rather than in a leaf: $standing. The kernel refuses a controller for the children of a cgroup that holds a process, so boxes read no memory.max. Once $tree_root/cgroup.procs is empty (stop each of those processes, or move it into a leaf), run min finalize-install again."
         else
-            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control). The write failed (${err:-no error text}). Boxes read no memory.max. Run min finalize-install again once the slice takes the controller."
+            note "could not enable the memory controller on the slice ($tree_root/cgroup.subtree_control). The write failed (${err:-no error text}). Boxes read no memory.max."
         fi
     fi
 else
