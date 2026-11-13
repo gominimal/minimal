@@ -406,11 +406,11 @@ impl HeldKey for SecretServiceKey {
             .expect("a P-256 public key")
     }
 
-    /// `true`: Secret Service lets the private half out to any program of
-    /// the proxy's user (Gatehouse §6.10). So
-    /// [`custody`](crate::keys::custody) refuses this key in a release build.
+    /// `false`: the custody rule of [`custody`](crate::keys::custody) is
+    /// the keychain's export flag. A Secret Service key is a software key
+    /// by design (BEP-088), and the proxy reports it as such (BEP-090).
     fn exportable(&self) -> bool {
-        true
+        false
     }
 
     fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
@@ -801,15 +801,19 @@ esac
         ));
     }
 
-    // BEP-089: Secret Service lets the private half out, so the key is
-    // exportable and a release build refuses it.
+    // BEP-088, BEP-089: Secret Service is the one store of software keys
+    // that a release build holds. BEP-014 and BEP-059 exempt it, so the
+    // custody rule never refuses its key and a release build can start.
     #[test]
-    fn secret_service_key_is_exportable() {
+    fn a_release_build_holds_a_secret_service_key() {
         use crate::keys::{Build, Custody, custody};
         let dir = tempfile::tempdir().unwrap();
         let store = fake(dir.path());
-        let key = store.generate_in(Role::Root, Slot::Held).unwrap();
-        assert!(key.exportable());
-        assert_eq!(custody(&key, Build::Release), Custody::Refused);
+        for role in Role::ALL {
+            let key = store.generate_in(role, Slot::Held).unwrap();
+            assert!(!key.exportable());
+            assert_eq!(custody(&key, Build::Release), Custody::Held);
+            assert_eq!(custody(&key, Build::Debug), Custody::Held);
+        }
     }
 }
