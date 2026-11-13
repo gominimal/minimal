@@ -1583,7 +1583,9 @@ pub(crate) struct BoxEntryExpansion {
     /// carry only the project's.
     pub(crate) wire: boxes::wire::request::WireBoxEntry,
     /// The expanded spec over every layer, the selected loadouts included.
-    /// Each of its hooks names its declarer (BOX-179).
+    /// Each of its hooks names its declarer (BOX-179). Only the tests read
+    /// it until the daemon stores this spec.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) spec: toml::Table,
 }
 
