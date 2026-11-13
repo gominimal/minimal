@@ -161,35 +161,14 @@ fn task_box_network(
             None,
         ),
     };
-    // Where the box's egress came from, for the refusals below: each egress
-    // flag given, and the file's table whenever it declares egress, since
-    // the box would still have egress without the flags.
-    let file_layer = project_egress
-        .layer
-        .as_deref()
-        .filter(|_| file_policy)
-        .map(|layer| format!("{layer} in {}", mfile::MFILE_NAME));
-    if mode == boxes::NetworkMode::NoNet && egress.policy.is_some() {
-        let given = given_egress_flags(flags);
-        let sources = given
-            .iter()
-            .map(|flag| (*flag).to_owned())
-            .chain(file_layer.clone())
-            .collect::<Vec<_>>();
-        let mut remedy = if kind == paths::HostKind::Minvmd {
-            "Run it with --network host_ip".to_owned()
-        } else {
-            "Run it with --network host_ip or --network own_ip".to_owned()
-        };
-        if file_layer.is_none() {
-            remedy.push_str(&format!(", or without {}", and_list(&given)));
-        }
-        bail!(
-            "{refusal}. The box's egress rules come from {sources}. {remedy}.",
-            refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
-            sources = and_list(&sources),
-        );
-    }
+    let own_ip_available = kind != paths::HostKind::Minvmd;
+    refuse_egress_on_none(
+        mode,
+        egress.policy.is_some(),
+        flags,
+        project_egress.layer.as_deref().filter(|_| file_policy),
+        own_ip_available,
+    )?;
     // An own-address box on a VM host registers with the VM host daemon
     // under the name it will have, before its create (T66). A task box is a
     // fresh instance, which the daemon names only at the create, so the
@@ -265,6 +244,48 @@ pub(crate) fn apply_run_overrides(
         network.policy.quic443 = other.quic443;
     }
     Ok(())
+}
+
+/// Refuses egress rules on a `none` box (NET-065), before the daemon and in
+/// the daemon's own words. The refusal names each place the egress came
+/// from: each egress flag given, and `file_layer` in minimal.toml when the
+/// file declares egress, since the box keeps that egress without the flags.
+/// `own_ip_available` says whether the remedy can offer `--network own_ip`.
+/// `min task run`, `min box run` and a session start share it.
+///
+/// # Errors
+///
+/// The refusal, when `mode` is `none` and `has_egress` is true.
+pub(crate) fn refuse_egress_on_none(
+    mode: boxes::NetworkMode,
+    has_egress: bool,
+    flags: &crate::EgressArgs,
+    file_layer: Option<&str>,
+    own_ip_available: bool,
+) -> Result<(), anyhow::Error> {
+    if mode != boxes::NetworkMode::NoNet || !has_egress {
+        return Ok(());
+    }
+    let file_layer = file_layer.map(|layer| format!("{layer} in {}", mfile::MFILE_NAME));
+    let given = given_egress_flags(flags);
+    let sources = given
+        .iter()
+        .map(|flag| (*flag).to_owned())
+        .chain(file_layer.clone())
+        .collect::<Vec<_>>();
+    let mut remedy = if own_ip_available {
+        "Run it with --network host_ip or --network own_ip".to_owned()
+    } else {
+        "Run it with --network host_ip".to_owned()
+    };
+    if file_layer.is_none() {
+        remedy.push_str(&format!(", or without {}", and_list(&given)));
+    }
+    bail!(
+        "{refusal}. The box's egress rules come from {sources}. {remedy}.",
+        refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
+        sources = and_list(&sources),
+    );
 }
 
 /// The egress flags `flags` holds, by name.
@@ -1481,30 +1502,19 @@ pub(crate) async fn run_entry(
     let upload_root = crate::resolve_upload_root(&utf8_path)?;
     crate::stamp_project_root(&mut request, &upload_root)?;
 
-    // Loadouts and user policy: the same defaults as an activate with no
-    // loadout flags — the config's `default_loadouts` apply, unless
-    // `--no-loadouts` selects none (BCLI-075). Resolved before
-    // the daemon connection so a broken loadout fails loudly client-side, and
-    // through the same shared helper an activate uses so the staged hook
-    // scripts and the finalize budget match. The helper gets the resolved
-    // project root, not the directory `min task run` was invoked from, so a
-    // task started in a subdirectory still finds the project's config.
-    //
-    // `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
-    // reach the daemon inside the uploaded mfile, and this command never
-    // refused a project whose hook script the staging check rejects.
-    let selection = crate::loadouts::LoadoutSelection::from_flags(&[], args.other.no_loadouts);
-    let hook_prep = if args.other.no_hooks {
-        crate::loadouts::HookPrep::Disabled
-    } else {
-        crate::loadouts::HookPrep::StageOnly
-    };
-    let inputs = crate::loadouts::prepare_activation_inputs(
+    // Loadouts and user policy, resolved before the daemon connection so a
+    // broken loadout fails loudly client-side, and through the same shared
+    // helper an activate uses so the staged hook scripts and the finalize
+    // budget match. The helper gets the resolved project root, not the
+    // directory `min task run` was invoked from, so a task started in a
+    // subdirectory still finds the project's config.
+    let inputs = task_activation_inputs(
         global,
         &upload_root,
-        selection,
-        hook_prep,
-        Some(amended_policy),
+        &args.entry,
+        args.other.no_loadouts,
+        args.other.no_hooks,
+        amended_policy,
     )?;
     inputs.announce_loadouts();
 
@@ -2051,6 +2061,40 @@ pub(crate) async fn release_task_name_hold(
     name: &str,
 ) {
     crate::release_held_box_name(control_sock, id, Some(name), None).await;
+}
+
+/// The loadouts and user policy of the box `min task run` creates for task
+/// `entry` in the project at `project`. The config's `default_loadouts`
+/// apply, unless `--no-loadouts` (`no_loadouts`) selects none (BCLI-075).
+/// `--no-hooks` (`no_hooks`) disables every hook.
+///
+/// BOX-175: the task's loadout mode is read first, before any loadout
+/// file. A sealed task, the task type's default, selects none. So a broken
+/// default loadout cannot fail it, and nothing prints about the skipped
+/// defaults (BOX-171).
+///
+/// `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
+/// reach the daemon inside the uploaded mfile, and this command never
+/// refused a project whose hook script the staging check rejects.
+pub(crate) fn task_activation_inputs(
+    global: &crate::GlobalArgs,
+    project: &camino::Utf8Path,
+    entry: &str,
+    no_loadouts: bool,
+    no_hooks: bool,
+    policy: boxes::core::policy::UserPolicy,
+) -> anyhow::Result<crate::loadouts::ActivationInputs> {
+    let mode = crate::task_loadout_mode(project, entry)?;
+    let selection = crate::loadouts::gate_selection(
+        crate::loadouts::LoadoutSelection::from_flags(&[], no_loadouts),
+        mode,
+    );
+    let hook_prep = if no_hooks {
+        crate::loadouts::HookPrep::Disabled
+    } else {
+        crate::loadouts::HookPrep::StageOnly
+    };
+    crate::loadouts::prepare_activation_inputs(global, project, selection, hook_prep, Some(policy))
 }
 
 #[cfg(test)]

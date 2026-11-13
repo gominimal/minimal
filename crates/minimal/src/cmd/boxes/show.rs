@@ -45,8 +45,205 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
     }
     tracing::info!(verb = "box show", box_id = %id, outcome = "ok", host = %host.host);
     let mut out = std::io::stdout().lock();
-    render_box_show(&mut out, &shown, host.provider, &host.host)?;
+    match args.output {
+        None => render_box_show(&mut out, &shown, host.provider, &host.host)?,
+        Some(format) => render_box_show_as(&mut out, format, &shown, host.provider, &host.host)?,
+    }
     Ok(())
+}
+
+/// One box as `min box show -o` writes it (BCLI-033): the `min/v1/box`
+/// object with the fields the text form shows, and the box's live execs
+/// as `min/v1/exec` objects in `execs`. A value the record does not carry
+/// is `null` in JSON, and is left out of YAML.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ShownBoxDoc {
+    schema: &'static str,
+    id: String,
+    name: Option<String>,
+    #[serde(rename = "type")]
+    box_type: Option<String>,
+    parent: Option<String>,
+    project: Option<String>,
+    state: String,
+    reason: Option<String>,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    disk_bytes: Option<u64>,
+    identity: &'static str,
+    provider: String,
+    host: String,
+    execs: Vec<ShownExecDoc>,
+}
+
+/// One live exec of a box, as a `min/v1/exec` object (BCLI-033, BCLI-053).
+/// `mode` is `terminal`, `detached` or `attached`, as the text form says.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ShownExecDoc {
+    schema: &'static str,
+    id: String,
+    mode: &'static str,
+    argv: Vec<String>,
+}
+
+/// How an exec meets its client, in the words `min box show` prints.
+fn exec_mode_word(mode: &minimald_rpc::exec::ExecMode) -> &'static str {
+    match mode {
+        minimald_rpc::exec::ExecMode::Tty => "terminal",
+        minimald_rpc::exec::ExecMode::Detached => "detached",
+        minimald_rpc::exec::ExecMode::Attached => "attached",
+    }
+}
+
+/// The identity a box runs under, in the words `min box show` prints.
+fn identity_word(identity: &minimald_rpc::BoxIdentity) -> &'static str {
+    match identity {
+        minimald_rpc::BoxIdentity::None => "none",
+        minimald_rpc::BoxIdentity::Unknown => "unknown",
+    }
+}
+
+/// The document `min box show -o` writes for `shown`, on `host` of
+/// `provider`.
+pub(crate) fn shown_box_doc(
+    shown: &minimald_rpc::ShowBoxResponse,
+    provider: &str,
+    host: &str,
+) -> ShownBoxDoc {
+    use crate::output::ObjectType;
+    let record = &shown.record;
+    ShownBoxDoc {
+        schema: ObjectType::Box.schema(),
+        id: record.box_id.to_string(),
+        name: record.name.clone(),
+        box_type: record.box_type.clone(),
+        parent: record.parent.map(|parent| parent.to_string()),
+        project: record.project_root.as_ref().map(|root| root.to_string()),
+        state: record.state.clone(),
+        reason: record.reason.clone(),
+        exit_code: record.exit_code,
+        signal: record.signal,
+        disk_bytes: shown.disk_bytes,
+        identity: identity_word(&shown.identity),
+        provider: provider.to_owned(),
+        host: host.to_owned(),
+        execs: shown
+            .live_execs
+            .iter()
+            .map(|exec| ShownExecDoc {
+                schema: ObjectType::Exec.schema(),
+                id: exec.id.clone(),
+                mode: exec_mode_word(&exec.mode),
+                argv: exec.argv.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Writes one box in `format`: one pretty JSON object or one YAML
+/// mapping. Both carry the same document.
+///
+/// # Errors
+///
+/// Fails when the document does not encode or `out` fails.
+pub(crate) fn render_box_show_as(
+    out: &mut impl std::io::Write,
+    format: BoxShowOutputFormat,
+    shown: &minimald_rpc::ShowBoxResponse,
+    provider: &str,
+    host: &str,
+) -> std::io::Result<()> {
+    let doc = shown_box_doc(shown, provider, host);
+    match format {
+        BoxShowOutputFormat::Json => {
+            serde_json_lenient::to_writer_pretty(&mut *out, &doc)?;
+            writeln!(out)
+        }
+        BoxShowOutputFormat::Yaml => {
+            let text = toml::to_string(&doc).map_err(std::io::Error::other)?;
+            let table: toml_edit::DocumentMut = text.parse().map_err(std::io::Error::other)?;
+            let mut yaml = String::new();
+            yaml_table(&mut yaml, table.as_table(), 0);
+            out.write_all(yaml.as_bytes())
+        }
+    }
+}
+
+/// Writes `table` as a YAML block mapping at `indent`, in the order of
+/// its keys. The keys of a box document are plain words, so they need no
+/// quotes.
+fn yaml_table(out: &mut String, table: &toml_edit::Table, indent: usize) {
+    let pad = " ".repeat(indent);
+    for (key, item) in table.iter() {
+        match item {
+            toml_edit::Item::Value(value) => {
+                out.push_str(&format!("{pad}{key}:"));
+                yaml_value(out, value, indent + 2);
+            }
+            toml_edit::Item::Table(inner) => {
+                out.push_str(&format!("{pad}{key}:\n"));
+                yaml_table(out, inner, indent + 2);
+            }
+            toml_edit::Item::ArrayOfTables(tables) => {
+                out.push_str(&format!("{pad}{key}:\n"));
+                for inner in tables.iter() {
+                    let mut nested = String::new();
+                    yaml_table(&mut nested, inner, indent + 2);
+                    // The first key goes on the line of its dash.
+                    out.push_str(&format!("{pad}- "));
+                    out.push_str(nested.get(indent + 2..).unwrap_or_default());
+                }
+            }
+            toml_edit::Item::None => {}
+        }
+    }
+}
+
+/// Writes the rest of the line for `value`: ` <scalar>` and a newline, or
+/// a newline and a block sequence at `indent` for a non-empty array.
+fn yaml_value(out: &mut String, value: &toml_edit::Value, indent: usize) {
+    match value {
+        toml_edit::Value::Array(items) if !items.is_empty() => {
+            out.push('\n');
+            for item in items.iter() {
+                out.push_str(&format!("{}-", " ".repeat(indent)));
+                yaml_value(out, item, indent + 2);
+            }
+        }
+        toml_edit::Value::Array(_) => out.push_str(" []\n"),
+        toml_edit::Value::InlineTable(inner) => {
+            out.push('\n');
+            yaml_table(out, &inner.clone().into_table(), indent);
+        }
+        toml_edit::Value::String(text) => out.push_str(&format!(" {}\n", yaml_quote(text.value()))),
+        toml_edit::Value::Integer(number) => out.push_str(&format!(" {}\n", number.value())),
+        toml_edit::Value::Boolean(flag) => out.push_str(&format!(" {}\n", flag.value())),
+        toml_edit::Value::Float(number) => out.push_str(&format!(" {}\n", number.value())),
+        toml_edit::Value::Datetime(time) => {
+            out.push_str(&format!(" {}\n", yaml_quote(&time.value().to_string())));
+        }
+    }
+}
+
+/// `text` as a double-quoted YAML scalar. A control character is escaped,
+/// so a command line in the document cannot reach a terminal raw.
+fn yaml_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}') => {
+                quoted.push_str(&format!("\\u{:04x}", u32::from(c)));
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Writes the `[network]` section that box `id` stores on the host `client`
@@ -146,10 +343,7 @@ pub(crate) fn render_box_show(
 ) -> std::io::Result<()> {
     let record = &shown.record;
     let or_none = |value: Option<String>| value.unwrap_or_else(|| NO_VALUE.to_string());
-    let identity = match shown.identity {
-        minimald_rpc::BoxIdentity::None => "none",
-        minimald_rpc::BoxIdentity::Unknown => "unknown",
-    };
+    let identity = identity_word(&shown.identity);
     let mut lines = vec![
         ("ID", record.box_id.to_string()),
         ("Name", or_none(record.name.clone())),
@@ -187,11 +381,7 @@ pub(crate) fn render_box_show(
     if !shown.live_execs.is_empty() {
         writeln!(out, "Live execs:")?;
         for exec in &shown.live_execs {
-            let mode = match exec.mode {
-                minimald_rpc::exec::ExecMode::Tty => "terminal",
-                minimald_rpc::exec::ExecMode::Detached => "detached",
-                minimald_rpc::exec::ExecMode::Attached => "attached",
-            };
+            let mode = exec_mode_word(&exec.mode);
             let command: Vec<String> = exec.argv.iter().map(|word| shell_word(word)).collect();
             writeln!(out, "  {}  {mode:<8}  {}", exec.id, command.join(" "))?;
         }
