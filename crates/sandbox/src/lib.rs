@@ -5106,7 +5106,8 @@ int main(int argc, char **argv) {
         .find(|dir| {
             tempfile::tempdir_in(dir).is_ok()
                 && statvfs(dir).is_ok_and(|st| {
-                    !st.flags().intersects(FsFlags::ST_NODEV | FsFlags::ST_NOEXEC)
+                    !st.flags()
+                        .intersects(FsFlags::ST_NODEV | FsFlags::ST_NOEXEC)
                 })
         })
     }
