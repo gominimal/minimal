@@ -13,14 +13,31 @@ const GIT_SEC_ARGS: [&str; 5] = [
     "protocol.ext.allow=never",
 ];
 
-/// Refuses a repository URL or ref that is empty or starts with `-`, which
-/// git would parse as an option rather than a value. No real URL or ref
-/// does.
-fn refuse_option_like(what: &'static str, value: &str) -> Result<(), Error> {
-    if value.is_empty() || value.starts_with('-') {
+/// Whether git would parse `value` as an option rather than a value: it is
+/// empty or starts with `-`. No real URL or ref is.
+fn is_option_like(value: &str) -> bool {
+    value.is_empty() || value.starts_with('-')
+}
+
+/// Refuses a repository URL that git would read as an option. The error
+/// keeps the URL as [`crate::scrubbed_remote`] gives it, so a credential in a
+/// malformed URL reaches neither its Display nor its Debug.
+pub(crate) fn refuse_option_like_url(url: &str) -> Result<(), Error> {
+    if is_option_like(url) {
         return Err(Error::OptionLike {
-            what,
-            value: value.to_owned(),
+            what: "repository",
+            value: crate::scrubbed_remote(url).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a ref that git would read as an option.
+pub(crate) fn refuse_option_like_ref(git_ref: &GitRef) -> Result<(), Error> {
+    if is_option_like(git_ref.as_str()) {
+        return Err(Error::OptionLike {
+            what: "ref",
+            value: git_ref.as_str().to_owned(),
         });
     }
     Ok(())
@@ -39,7 +56,7 @@ impl Repo {
     /// given path with be re-used if it is already initialized.
     pub fn new<S: Into<String>, P: Into<PathBuf>>(url: S, base: P) -> Result<Self, Error> {
         let url = url.into();
-        refuse_option_like("repository", &url)?;
+        refuse_option_like_url(&url)?;
         // Absolute, because every git call below pairs `current_dir(base)`
         // with `GIT_DIR=base`, and git resolves a relative `GIT_DIR` against
         // that new working directory.
@@ -147,7 +164,7 @@ impl Repo {
         worktree_path: &Path,
         git_ref: &GitRef,
     ) -> Result<String, Error> {
-        refuse_option_like("ref", git_ref.as_str())?;
+        refuse_option_like_ref(git_ref)?;
         match git_ref {
             GitRef::Branch(b) => self.run_git_checkout(
                 worktree_path,
@@ -189,7 +206,7 @@ impl Repo {
     /// worktree would land on the clone-time tip and a branch created
     /// upstream since would not resolve at all.
     pub fn new_worktree(&mut self, path: PathBuf, git_ref: GitRef) -> Result<Checkout, Error> {
-        refuse_option_like("ref", git_ref.as_str())?;
+        refuse_option_like_ref(&git_ref)?;
         // Drop registrations whose directories are gone first, so a stale
         // entry cannot claim the path this add is about to use.
         self.run_git_bare(

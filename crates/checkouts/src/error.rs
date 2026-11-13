@@ -31,7 +31,13 @@ pub enum Error {
         "the {what} {value:?} starts with `-` or is empty, so git would read it as an option; \
          no repository or ref does. Fix it in minimal.toml"
     )]
-    OptionLike { what: &'static str, value: String },
+    OptionLike {
+        /// `"repository"` or `"ref"`.
+        what: &'static str,
+        /// The refused value; a URL without its userinfo, query or fragment,
+        /// as `scrubbed_remote` gives it.
+        value: String,
+    },
 
     /// A generic error with a custom message.
     #[error("other: {0}")]
