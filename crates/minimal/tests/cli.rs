@@ -4233,17 +4233,12 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
         )
         .unwrap();
         let ls = String::from_utf8(out).unwrap();
-        // One proxy verdict per VM: beside a Native verdict the cause is
-        // its own HOSTNAME PROXY row; a Proxy verdict folds the cause into
-        // the BOX NAMES row and prints no separate cause row.
-        let cause_rows = match surface {
-            resolver::LiveSurface::Proxy => 0,
-            _ => 1,
-        };
+        // One proxy verdict per VM (NET-020): beside any verdict the cause
+        // is its own HOSTNAME PROXY row, and BOX NAMES does not repeat it.
         assert_eq!(
             ls.matches("HOSTNAME PROXY:").count(),
-            cause_rows,
-            "the cause prints on at most one proxy row: {ls}"
+            1,
+            "the cause prints on one proxy row: {ls}"
         );
         assert_eq!(
             ls.matches("another program on this machine holds 127.0.0.1:19911")
@@ -4269,9 +4264,8 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
 /// The multi-VM listing keeps one proxy verdict per VM, as the single-VM
 /// one does: the VM whose reply carries a proxy-down sibling gets no
 /// `listening on` row for its reported port, its cause is named exactly
-/// once (its own `HOSTNAME PROXY` row beside a Native verdict, folded into
-/// its BOX NAMES row beside a Proxy verdict), and its surface row never
-/// names the down proxy as serving. The other VM's rows are untouched.
+/// once, on its own `HOSTNAME PROXY` row beside any verdict (NET-020), and
+/// its surface row never names the down proxy as serving. The other VM's rows are untouched.
 #[test]
 fn ls_across_vms_names_one_proxy_verdict_per_vm() {
     let listing = |vm: &str, proxy_port: u16| VmListing {
@@ -4332,14 +4326,10 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
 
         // The down VM: no listening row, the cause named exactly once.
         let default_proxy = rows_of("HOSTNAME PROXY:", "default");
-        let cause_rows = match down_surface {
-            resolver::LiveSurface::Proxy => 0,
-            _ => 1,
-        };
         assert_eq!(
             default_proxy.len(),
-            cause_rows,
-            "the down VM's cause prints on at most one proxy row:\n{text}"
+            1,
+            "the down VM's cause prints on one proxy row:\n{text}"
         );
         assert!(
             default_proxy

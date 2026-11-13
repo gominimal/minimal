@@ -10127,6 +10127,207 @@ async fn box_attach_exec_own_end_code7_exits_0() {
     );
 }
 
+/// BCLI-068: Ctrl-] then d ends `min box attach <box> --exec <id>` with 0.
+/// The attach's ssh sends the session keys from the config, the keys the
+/// daemon reads to end the channel on a detach with status 0. The exec
+/// keeps running, `min box show` still lists it, and a second attach
+/// reaches it.
+#[tokio::test]
+async fn exec_attach_detach_key_returns_0_exec_keeps_running() {
+    use minimald_rpc::exec::ExecId;
+
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        true,
+    );
+    let _live = alpha
+        .server
+        .list_running_exec(web, AN_EXEC_ID, &["sh", "-i"], true);
+    let exec_id = ExecId::parse(AN_EXEC_ID).unwrap();
+
+    // The ssh the attach runs asks for a terminal and sends the session
+    // keys: the default keys with no config, and the configured ones.
+    let config = tempfile::TempDir::new().unwrap();
+    let sent = |config_dir: &std::path::Path| {
+        let ssh = exec_attach_ssh(&alpha.host.sock, web, &exec_id, Some(config_dir))
+            .expect("the exec attach's ssh");
+        let args: Vec<String> = ssh
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let envs: std::collections::BTreeMap<String, String> = ssh
+            .get_envs()
+            .filter_map(|(name, value)| {
+                Some((
+                    name.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        (args, envs)
+    };
+    let (args, envs) = sent(config.path());
+    assert_eq!(args.first().map(String::as_str), Some("-tt"), "{args:?}");
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    assert!(args.contains(&wire), "the exec attach's request: {args:?}");
+    let defaults = boxes::keys::SessionKeys::default();
+    for (name, value) in [
+        (boxes::keys::LEADER_ENV, defaults.leader.as_config_str()),
+        (
+            boxes::keys::DETACH_KEY_ENV,
+            defaults.detach_key.as_config_str(),
+        ),
+    ] {
+        assert_eq!(envs.get(name), Some(&value), "{name}: {envs:?}");
+        assert!(
+            args.contains(&format!("SendEnv={name}")),
+            "{name}: {args:?}"
+        );
+    }
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"q\"\n",
+    )
+    .unwrap();
+    let (_, envs) = sent(config.path());
+    assert_eq!(
+        envs.get(boxes::keys::DETACH_KEY_ENV).map(String::as_str),
+        Some("q"),
+        "the configured detach key: {envs:?}"
+    );
+
+    // The daemon ends a detached channel with 0, and the attach ends with
+    // 0 and no line.
+    let ending = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async |_: &BoxAttachTarget, _: &ExecId| Ok(0),
+    )
+    .await
+    .expect("the detach ends the attach");
+    assert_eq!(
+        ending,
+        AttachEnding {
+            code: 0,
+            notice: None
+        }
+    );
+
+    // The exec keeps running, and a second attach reaches it.
+    let text = box_show_text(&alpha.host, "web").await;
+    assert_eq!(
+        live_exec_rows(&text),
+        [
+            "Live execs:".to_owned(),
+            format!("  {AN_EXEC_ID}  terminal  sh -i"),
+        ],
+        "{text}"
+    );
+    let mut reached = None;
+    let ending = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async |target: &BoxAttachTarget, exec_id: &ExecId| {
+            reached = Some((target.box_id, exec_id.clone()));
+            Ok(0)
+        },
+    )
+    .await
+    .expect("the second attach ends");
+    assert_eq!(reached, Some((web, exec_id)), "the second attach ran");
+    assert_eq!(ending.code, 0);
+}
+
+/// BCLI-068: `min box exec -t`'s first attach sends the configured session
+/// keys. With `detach = "q"` in the config, its ssh carries the leader and
+/// detach env vars and forwards both with `SendEnv`.
+#[tokio::test]
+async fn box_exec_t_attach_sends_configured_session_keys() {
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let exec_id = minimald_rpc::exec::ExecId::parse(AN_EXEC_ID).unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"q\"\n",
+    )
+    .unwrap();
+
+    let session_keys = minimal_client::attach::resolve_session_keys(Some(config.path()))
+        .expect("the session-key config resolves");
+    let ssh = exec_terminal_ssh(&alpha.host.sock, web, &exec_id, &session_keys)
+        .expect("the exec -t attach's ssh");
+    let args: Vec<String> = ssh
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let envs: std::collections::BTreeMap<String, String> = ssh
+        .get_envs()
+        .filter_map(|(name, value)| {
+            Some((
+                name.to_string_lossy().into_owned(),
+                value?.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect();
+    assert_eq!(args.first().map(String::as_str), Some("-tt"), "{args:?}");
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    assert!(args.contains(&wire), "the exec attach's request: {args:?}");
+    let defaults = boxes::keys::SessionKeys::default();
+    for (name, value) in [
+        (boxes::keys::LEADER_ENV, defaults.leader.as_config_str()),
+        (boxes::keys::DETACH_KEY_ENV, "q".to_owned()),
+    ] {
+        assert_eq!(envs.get(name), Some(&value), "{name}: {envs:?}");
+        assert!(
+            args.contains(&format!("SendEnv={name}")),
+            "{name}: {args:?}"
+        );
+    }
+}
+
+/// BCLI-068: `min box exec -t` resolves the session keys before it starts
+/// the exec. A session-key config that is not valid ends the command with
+/// no exec started, so no exec runs without its attach.
+#[tokio::test]
+async fn box_exec_t_invalid_session_keys_starts_no_exec() {
+    let mut host = exec_host().await;
+    let config = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    // The detach key is the leader, which the config refuses.
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"ctrl-]\"\n",
+    )
+    .unwrap();
+    host.global.config_dir = Some(config.path().to_path_buf());
+    let marker_dir = tempfile::TempDir::new().unwrap();
+    let marker = marker_dir.path().join("ran");
+    let touch = marker.to_str().expect("a UTF-8 marker path");
+
+    let run =
+        run_box_exec_on_host(&host, &box_exec_request("web", &["-t"], &["touch", touch])).await;
+    let error = run.error.as_ref().expect("the exec -t fails");
+    assert!(
+        format!("{error:#}").contains("session-keys"),
+        "the session-key config is named\n{run}"
+    );
+    assert_eq!(run.stderr, "", "no exec id is printed\n{run}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!marker.exists(), "no exec ran\n{run}");
+}
+
 /// BCLI-068: `min box stop` ends the attached exec by its signal, which the
 /// daemon reports as 1, before it writes the stopped record. The command
 /// reads the box again, and ends with 254 and the stop's line. A removed
@@ -11367,6 +11568,7 @@ async fn run_box_exec_on_host_with(
         cmd::daemon_host_kind(&host.global),
         request,
         terminal,
+        host.global.config_dir.as_deref(),
         None,
         &mut stdout,
         &mut stderr,
@@ -12381,7 +12583,8 @@ fn none_box_hold_is_released_by_destroy_and_moved_by_rename() {
 /// host daemon only, so the guest reply carries no proxy port. The BOX NAMES
 /// row then reads the port the VM host daemon serves on, and says the names
 /// open through it, on one VM and across VMs. While the port is held, the
-/// row names the cause.
+/// HOSTNAME PROXY row names the cause once, and the BOX NAMES row does not
+/// repeat it (NET-020).
 #[test]
 fn ls_warning_clears_on_recovery_with_no_guest_port() {
     let mut resp = listing_of(&[("web", None, None)]);
@@ -12424,10 +12627,23 @@ fn ls_warning_clears_on_recovery_with_no_guest_port() {
             .unwrap_or_else(|| panic!("a BOX NAMES row:\n{text}"))
     };
 
+    let cause = "the hostname proxy is not serving: pid 4242 (python3) holds 127.0.0.1:7654. \
+                 It starts serving by itself when the port is free.";
     let before = render(held.clone(), &[]);
     assert!(
-        box_names(&before).contains("the hostname proxy is not serving: pid 4242 (python3)"),
-        "the held port names its cause:\n{before}"
+        before.contains(&format!("HOSTNAME PROXY:  {cause}")),
+        "the HOSTNAME PROXY row names the cause:\n{before}"
+    );
+    assert_eq!(
+        before.matches("pid 4242 (python3)").count(),
+        1,
+        "the cause prints once:\n{before}"
+    );
+    assert!(
+        box_names(&before)
+            .starts_with("BOX NAMES:       <box>.min.internal: the hostname proxy is not serving")
+            && !box_names(&before).contains("127.0.0.1:7654"),
+        "the BOX NAMES row does not repeat the cause:\n{before}"
     );
 
     let after = render(recovered.clone(), &[7_654]);
@@ -12491,8 +12707,26 @@ fn ls_warning_clears_on_recovery_with_no_guest_port() {
         "the recovered VM carries no cause:\n{across}"
     );
     assert!(
-        rows[1].contains("other") && rows[1].contains("not serving"),
-        "the held VM keeps its cause:\n{across}"
+        rows[1].contains("other") && !rows[1].contains("pid 4242"),
+        "the held VM's BOX NAMES row does not repeat the cause:\n{across}"
+    );
+    let proxy_rows: Vec<&str> = across
+        .lines()
+        .filter(|line| line.starts_with("HOSTNAME PROXY:") && line.contains("other"))
+        .collect();
+    assert_eq!(
+        proxy_rows.len(),
+        1,
+        "one HOSTNAME PROXY row for the held VM:\n{across}"
+    );
+    assert!(
+        proxy_rows[0].contains(cause),
+        "the held VM's HOSTNAME PROXY row names the cause:\n{across}"
+    );
+    assert_eq!(
+        across.matches("pid 4242 (python3)").count(),
+        1,
+        "the cause prints once across VMs:\n{across}"
     );
 }
 
@@ -12708,20 +12942,21 @@ fn show_and_prune_dry_run_report_disk_unit_boundaries() {
 /// BCLI-017: bare `min init` writes the entry shape. The test drives
 /// `write_init_plan`, the write half of `run_init_flow`, with the plan the
 /// project initializer returns, and reads the file it writes. That file
-/// loads through mfile with no unknown-field warning, and a session start
-/// on it sends the `[defaults.session]` packages.
+/// loads through mfile with no legacy-table hint and no unknown-field
+/// warning, and a session start on it sends the `[defaults.session]`
+/// packages (D3112).
 #[test]
 fn init_scaffolds_entry_shape_loads_and_starts_with_its_packages() {
     // The initializer's own output (`op::project::init::generate_mfile`,
-    // which is private to `op`; its legacy shape is pinned there by
-    // `generate_mfile_falls_back_to_upstream_with_session`).
+    // which is private to `op`; its layout is pinned there by
+    // `generate_mfile_writes_entry_layout_with_no_legacy_tables`).
     const GENERATED: &str = "# Generated by `min init`\n\n\
         [upstream] # Source of software & tooling\n\
         repo = \"https://github.com/gominimal/pkgs\"\n\
         locked_commit = \"abc123\"\n\n\
-        [defaults]\n\
+        [defaults.task]\n\
         state_key = \"dev\"\n\n\
-        [session] # min session attach\n\
+        [defaults.session] # min session attach\n\
         packages = [\"base\", \"vim\", \"git\"]\n";
     let dir = tempfile::tempdir().unwrap();
     let toml_path = dir.path().join(mfile::MFILE_NAME);
@@ -12740,6 +12975,16 @@ fn init_scaffolds_entry_shape_loads_and_starts_with_its_packages() {
         Some("session"),
         "{written}"
     );
+    assert_eq!(
+        doc["defaults"]["task"]["state_key"].as_str(),
+        Some("dev"),
+        "{written}"
+    );
+    // The legacy tables are what make a load print a hint. The written
+    // file carries none of them.
+    let hints = mfile::legacy::canonicalize(&mut doc.clone(), mfile::legacy::this_release())
+        .expect("the scaffold reads");
+    assert!(hints.is_empty(), "no legacy hint: {hints:?}\n{written}");
 
     let capture = minimald::test_harness::CaptureWriter::default();
     let subscriber = tracing_subscriber::fmt()
