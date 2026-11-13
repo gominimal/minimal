@@ -871,10 +871,57 @@ impl crate::ca::CaKey for TpmKey {
     }
 }
 
+impl TpmStore {
+    /// Puts back the authorization file of the key in `slot` when a move
+    /// stopped half way. `relabel` moves the authorization file first and
+    /// the key file second, so a proxy that dies between the two leaves the
+    /// key file in one slot and its authorization file, with no key file
+    /// beside it, in another. Only one move runs for a role at a time, so a
+    /// single such authorization file belongs to the key in `slot`.
+    fn recover_auth(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
+        let exists = |path: &Path| {
+            path.try_exists().map_err(|err| KeyError::Store {
+                role,
+                detail: format!("did not check for {}: {err}", path.display()),
+            })
+        };
+        let auth = self.auth_path(role, slot);
+        if !exists(&self.key_path(role, slot))? || exists(&auth)? {
+            return Ok(());
+        }
+        let mut orphans = Vec::new();
+        for other in [Slot::Held, Slot::New, Slot::Old] {
+            if other == slot {
+                continue;
+            }
+            let other_auth = self.auth_path(role, other);
+            if exists(&other_auth)? && !exists(&self.key_path(role, other))? {
+                orphans.push(other_auth);
+            }
+        }
+        let [orphan] = orphans.as_slice() else {
+            return Ok(());
+        };
+        fs::rename(orphan, &auth).map_err(|err| KeyError::Store {
+            role,
+            detail: format!("did not restore the TPM key's authorization file: {err}"),
+        })?;
+        tracing::warn!(
+            role = %role,
+            from = %orphan.display(),
+            to = %auth.display(),
+            store = "tpm",
+            "restored an authorization file that an interrupted key move left behind"
+        );
+        Ok(())
+    }
+}
+
 impl KeyStore for TpmStore {
     type Key = TpmKey;
 
     fn find(&self, role: Role) -> Result<Option<TpmKey>, KeyError> {
+        self.recover_auth(role, Slot::Held)?;
         let Some(bytes) = self.read_key(role, Slot::Held)? else {
             return Ok(None);
         };
@@ -941,6 +988,7 @@ impl KeyStore for TpmStore {
 
     fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
         let (key_from, key_to) = (self.key_path(role, from), self.key_path(role, to));
+        self.recover_auth(role, from)?;
         if !self.holds_in(role, from)? {
             if from == Slot::Held {
                 return Ok(());
@@ -1123,6 +1171,47 @@ mod tests {
         assert!(!stale.exists());
         assert!(live.exists());
         assert!(work.0.exists());
+    }
+
+    // A proxy that dies between the two renames of a move leaves the key
+    // file in one slot and its authorization file in the other. The next
+    // look at the key puts the authorization file back beside it.
+    #[test]
+    fn an_interrupted_move_gets_its_authorization_file_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TpmStore::new(dir.path().to_path_buf(), DEVICE_TCTI);
+        let role = Role::Sealing;
+        fs::write(store.key_path(role, Slot::Held), b"key").expect("write");
+        fs::write(store.auth_path(role, Slot::Old), b"auth").expect("write");
+        store.recover_auth(role, Slot::Held).expect("recover");
+        assert_eq!(
+            fs::read(store.auth_path(role, Slot::Held)).expect("read"),
+            b"auth"
+        );
+        assert!(!store.auth_path(role, Slot::Old).exists());
+
+        // A complete move goes on as before, and the orphan check leaves a
+        // key that has its own authorization file alone.
+        store.relabel(role, Slot::Held, Slot::Old).expect("relabel");
+        assert!(store.key_path(role, Slot::Old).exists());
+        assert!(store.auth_path(role, Slot::Old).exists());
+        assert!(!store.key_path(role, Slot::Held).exists());
+
+        // A crash after the first rename of New to Held: the next relabel
+        // of New finishes the move.
+        fs::write(store.key_path(role, Slot::New), b"new").expect("write");
+        fs::write(store.auth_path(role, Slot::Held), b"new-auth").expect("write");
+        fs::remove_file(store.auth_path(role, Slot::Old)).expect("rm");
+        fs::remove_file(store.key_path(role, Slot::Old)).expect("rm");
+        store.relabel(role, Slot::New, Slot::Held).expect("relabel");
+        assert_eq!(
+            fs::read(store.key_path(role, Slot::Held)).expect("read"),
+            b"new"
+        );
+        assert_eq!(
+            fs::read(store.auth_path(role, Slot::Held)).expect("read"),
+            b"new-auth"
+        );
     }
 
     #[test]
