@@ -31,6 +31,21 @@ pub(crate) async fn check_stack(
         ))
     })?;
 
+    // Confined like a package (see `ParseCheck`): an import that leaves the
+    // layer is refused before Nickel reads it, and every file it read is
+    // checked once it has, so no file outside the layer is evaluated or quoted.
+    let root = match decode::layer_root(&crate::layer_dir_of(&stacks_dir)).and_then(|root| {
+        decode::confine_imports(std::slice::from_ref(&entry_file), &root, &ctx.stdlib_dir)
+            .map(|()| root)
+    }) {
+        Ok(root) => root,
+        Err(e) => return Ok(vec![CheckResult::parse_failure(e.to_string())]),
+    };
+    let confine = |program: &Program<CacheImpl>| {
+        decode::confine_files_read(&program.files(), &root, &ctx.stdlib_dir)
+            .map_err(|e| vec![CheckResult::parse_failure(e.to_string())])
+    };
+
     let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
         .add_source(
             std::io::Cursor::new(format!("import \"{entry_file_str}\"")),
@@ -59,6 +74,9 @@ pub(crate) async fn check_stack(
     };
 
     if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
+        if let Err(refused) = confine(&program) {
+            return Ok(refused);
+        }
         return Ok(vec![CheckResult::parse_failure(report_as_str(
             &mut program.files(),
             e,
@@ -66,11 +84,17 @@ pub(crate) async fn check_stack(
         ))]);
     }
     if let Err(e) = program.compile() {
+        if let Err(refused) = confine(&program) {
+            return Ok(refused);
+        }
         return Ok(vec![CheckResult::parse_failure(report_as_str(
             &mut program.files(),
             e,
             nickel_lang_core::error::report::ColorOpt::Never,
         ))]);
+    }
+    if let Err(refused) = confine(&program) {
+        return Ok(refused);
     }
 
     out.push(check_stack_name(stack.clone(), ctx, &mut program)?);

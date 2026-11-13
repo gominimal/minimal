@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 mod load;
-pub use load::{LoadOptions, build_decls_in_dir};
+pub use load::{LoadOptions, build_decls_in_dir, confine_files_read, confine_imports, layer_root};
 
 mod error;
 pub use error::{Error, LocalInputWhy};
