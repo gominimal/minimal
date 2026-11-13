@@ -2702,6 +2702,91 @@ pub(crate) mod tests {
         }
     }
 
+    /// D3001: an own-address box on a native host, with the shape the
+    /// session e2e activates (`--allow-subnets 100.64.0.0/10
+    /// --allow-protocols tcp`), resolves a sibling's `<box>.min.internal`
+    /// name. The UDP query to the gateway's port 53 goes on to the switch
+    /// unchanged, though the box declared TCP only. The switch resolver's
+    /// zone reply then reaches the box unchanged.
+    #[tokio::test]
+    async fn a_sibling_box_name_resolves_through_the_relay() {
+        let tcp_subnets = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                allow_subnets: Some(vec!["100.64.0.0/10".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        // The native attach's shape: a per-daemon /24 inside the switch /16
+        // (its gateway is still the resolver), the box's own name on its gate,
+        // and the host-exposures table only a native relay reads.
+        let subnet = crate::net::SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 24)
+            .expect("a /24 inside the switch /16");
+        assert_eq!(subnet.dns_server(), RESOLVER);
+        let config = tempfile::tempdir().expect("a config dir");
+        let table = Arc::new(client_config::host_exposures::HostExposuresFile::new(
+            config.path().join("config.toml"),
+        ));
+        let mut harness = spawn_test_relay_with(&tcp_subnets, |gate| {
+            *gate = crate::net::switch::BoxGate::for_session_steered(
+                LEASE.to_string(),
+                Some("e2e-nnat-a"),
+                LEASE,
+                &tcp_subnets,
+                subnet,
+                None,
+                crate::net::dns::ProxyListenerState::down(),
+            );
+            gate.use_host_exposures(table);
+        });
+        let sibling = Ipv4Addr::new(100, 64, 0, 11);
+        for (port, name) in [
+            (40100, "e2e-nnat-b.min.internal."),
+            (40101, "e2e-nnat-b.local.min.internal."),
+        ] {
+            let query =
+                udp_payload_frame(LEASE, port, RESOLVER, 53, &dns_query(name, RecordType::A));
+            harness.box_end.write_all(&query).unwrap();
+            let forwarded =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the sibling's A query is forwarded to the switch resolver")
+                    .expect("the switch side stays open");
+            assert_eq!(
+                forwarded, query,
+                "{name}: the query reaches the switch unchanged"
+            );
+
+            let reply =
+                udp_payload_frame(RESOLVER, 53, LEASE, port, &dns_response(name, &[sibling]));
+            harness.switch.write_all(&wire_frame(&reply)).await.unwrap();
+            let passed = read_box_frame(&harness)
+                .await
+                .expect("the resolver's zone reply reaches the box");
+            assert_eq!(passed, reply, "{name}: the reply reaches the box unchanged");
+            let (_, payload) = udp_datagram(&passed).expect("the reply is a UDP frame");
+            let message = Message::from_vec(payload).expect("the reply parses");
+            assert_eq!(message.metadata.response_code, ResponseCode::NoError);
+            let answered: Vec<Ipv4Addr> = message
+                .answers
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::A(a) => Some(a.0),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                answered,
+                vec![sibling],
+                "{name}: the box reads the sibling's address"
+            );
+        }
+    }
+
     /// NET-067's log: each refused answer says the name and the address, in
     /// one rate-limited warn line per name per rule per minute through the
     /// same limiter the frame drops use — a burst of the same name's
