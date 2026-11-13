@@ -4709,9 +4709,53 @@ mod tests {
             crate::control::PublishDecision::FailStart { port, .. } if port == pin
         ));
         // Once the holder exits, the watcher's check passes and takes the
-        // reservation.
+        // reservation. The pin is the first question: a regression in
+        // reclaiming a just-released pin fails here. Another test in the
+        // process can take the released pin before the check probes it, and
+        // the check then correctly answers Skip; only then does the test fall
+        // back to fresh freed ports for the remaining attempts, which prove
+        // the same reclaim on a port nothing raced for. The check folds every
+        // refusal into the same None, so each fallback waits for the pin's
+        // own verdict to name the race: a bind refusal or a loopback answer
+        // is another test holding the freed pin, while the pin's reservation
+        // still held — the assignment carried none to leak — or the probe's
+        // own error is a regression no fresh port may paper over.
         drop(held);
-        assert!(super::proxy_reclaim_check(ports.path().to_path_buf())(pin).is_some());
+        let check = |port| super::proxy_reclaim_check(ports.path().to_path_buf())(port);
+        let mut reclaimed = check(pin);
+        let mut fresh_attempts = 0;
+        while reclaimed.is_none() && fresh_attempts < NODE_PORT_RACE_ATTEMPTS {
+            match super::candidate_verdict(ports.path(), pin, false, &super::node_port_probe(false))
+            {
+                // The race this retry exists for: a parallel test holds the
+                // freed pin, so the fallback asks a fresh port instead.
+                super::CandidateCheck::Skip(super::SKIP_BIND_REFUSED)
+                | super::CandidateCheck::Skip(super::SKIP_LOOPBACK_ANSWERING) => {}
+                // The parallel test released the pin before this probe: the
+                // reservation the verdict hands back is the check's own
+                // answer on the pin.
+                super::CandidateCheck::Free(reservation) => {
+                    reclaimed = Some(reservation);
+                    break;
+                }
+                super::CandidateCheck::Skip(reason) => {
+                    panic!("the released pin {pin} was not reclaimed: {reason}")
+                }
+                super::CandidateCheck::Error(error) => {
+                    panic!("probing the released pin {pin} errored: {error:#}")
+                }
+            }
+            fresh_attempts += 1;
+            let freed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            reclaimed = check(free);
+        }
+        assert!(
+            reclaimed.is_some(),
+            "the watcher takes neither the released pin {pin} (another test took it in \
+             the window) nor any of {fresh_attempts} fresh freed ports after it"
+        );
 
         let reserved = crate::net::answerer::DEFAULT_ANSWERER_PORT;
         let err = super::configured_node_port(ports.path(), reserved)
