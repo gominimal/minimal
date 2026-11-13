@@ -1495,8 +1495,8 @@ enum AdmissionRootRefusal {
 /// received.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProjectionDigests {
-    /// The client's digest, `None` when the client sent none.
-    client: Option<String>,
+    /// The client's digest, or why the create carries none.
+    client: ClientDigest,
     /// The daemon's digest, `None` when the create carries no spec or the
     /// spec has no projection.
     daemon: Option<String>,
@@ -1504,12 +1504,32 @@ struct ProjectionDigests {
     unprojected: Option<String>,
 }
 
+/// The client's projection digest on a create (BOX-071).
+///
+/// A malformed value stays distinct from an absent one, so that BOX-072
+/// can refuse it as a differing digest and not accept it as a client that
+/// predates the key. The malformed value itself is never kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum ClientDigest {
+    /// The client sent no digest.
+    #[default]
+    Absent,
+    /// The client sent a value that is not a digest in form.
+    Malformed,
+    /// The client sent a digest in form.
+    Digest(String),
+}
+
 impl ProjectionDigests {
     /// Records both digests on the create's span and writes them to the
     /// daemon log.
     fn record(&self, span: &tracing::Span, session_name: &str) {
         let none = "none";
-        let client = self.client.as_deref().unwrap_or(none);
+        let client = match &self.client {
+            ClientDigest::Absent => none,
+            ClientDigest::Malformed => "malformed",
+            ClientDigest::Digest(digest) => digest.as_str(),
+        };
         let daemon = self.daemon.as_deref().unwrap_or(none);
         span.record("client_projection_digest", client);
         span.record("daemon_projection_digest", daemon);
@@ -1539,19 +1559,17 @@ fn projection_digests(
     spec: Option<&serde_json_lenient::Value>,
     verb_type: &str,
 ) -> ProjectionDigests {
-    let client = config
-        .client_projection_digest()
-        .filter(|digest| {
-            let well_formed = is_projection_digest(digest);
-            if !well_formed {
-                tracing::warn!(
-                    digest_len = digest.len(),
-                    "ignored a client projection digest that is not 43 base64url characters"
-                );
-            }
-            well_formed
-        })
-        .map(str::to_owned);
+    let client = match config.client_projection_digest() {
+        None => ClientDigest::Absent,
+        Some(digest) if is_projection_digest(digest) => ClientDigest::Digest(digest.to_owned()),
+        Some(digest) => {
+            tracing::warn!(
+                digest_len = digest.len(),
+                "ignored a client projection digest that is not 43 base64url characters"
+            );
+            ClientDigest::Malformed
+        }
+    };
     let (daemon, unprojected) = match spec.map(|s| mfile::projection::spec_digest(s, verb_type)) {
         None => (None, None),
         Some(Ok(digest)) => (Some(digest), None),
@@ -1566,7 +1584,8 @@ fn projection_digests(
 
 /// Whether `digest` has the form of a projection digest: SHA-256 as
 /// base64url with no padding, 43 characters. A client value of any other
-/// form is not stored, logged or recorded on the span.
+/// form is not stored, logged or recorded on the span: the span and the
+/// log say `malformed` in its place.
 fn is_projection_digest(digest: &str) -> bool {
     digest.len() == 43
         && digest
@@ -4476,7 +4495,7 @@ impl BoxManager {
             .remove(minimald_rpc::DAEMON_PROJECTION_DIGEST_ATTR);
         let digests = projection_digests(&config, spec.as_ref(), verb_type);
         // A client value that is not a digest in form is not stored.
-        if digests.client.is_none() {
+        if !matches!(digests.client, ClientDigest::Digest(_)) {
             config
                 .attrs
                 .remove(minimald_rpc::CLIENT_PROJECTION_DIGEST_ATTR);

@@ -7366,6 +7366,16 @@ async fn projection_digests_stored_side_by_side() {
 
     // The daemon log names both digests.
     let logged = log.contents();
+    // A malformed client value logs as `malformed`, never as `none` and
+    // never as sent.
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains("client_projection_digest=\"malformed\"")
+        }),
+        "a log line names a malformed client digest:\n{logged}"
+    );
+    assert!(!logged.contains("client-digest"), "{logged}");
     let line = logged
         .lines()
         .find(|line| {
