@@ -1954,18 +1954,64 @@ impl File {
         let joined = state_base.join(&dir_name).join(state_key);
         // The state key is one component, so `joined` can only leave the
         // state base through a symlink planted in an existing component.
-        // If the path exists, require its canonical form to stay under the
-        // canonical state base.
-        if let Ok(canonical) = joined.canonicalize() {
-            let canonical_base = state_base
-                .canonicalize()
-                .unwrap_or_else(|_| state_base.to_path_buf());
-            if !canonical.starts_with(&canonical_base) {
+        // Resolve the deepest existing prefix of `joined` and require its
+        // canonical form to stay under the canonical state base, so a
+        // symlinked parent cannot redirect a not-yet-created state
+        // directory outside the base. A state base that does not exist
+        // yet has no entries, so nothing on the path can be a planted
+        // symlink and the path is accepted as it stands.
+        let canonical_base = match state_base.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && state_base.symlink_metadata().is_err() =>
+            {
+                return Ok(joined);
+            }
+            Err(e) => {
                 return Err(format!(
-                    "resolves to {}, which is outside the state base {}",
-                    canonical.display(),
-                    canonical_base.display()
+                    "cannot resolve the state base {}: {e}",
+                    state_base.display()
                 ));
+            }
+        };
+        let mut existing = joined.clone();
+        loop {
+            match existing.canonicalize() {
+                Ok(canonical) => {
+                    if !canonical.starts_with(&canonical_base) {
+                        return Err(format!(
+                            "resolves to {}, which is outside the state base {}",
+                            canonical.display(),
+                            canonical_base.display()
+                        ));
+                    }
+                    break;
+                }
+                // An entry that exists but resolves nowhere is a dangling
+                // symlink: where it points cannot be checked, so refuse
+                // the state key instead of creating a directory through
+                // it. Any other resolution error is refused for the same
+                // reason.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && existing.symlink_metadata().is_err() =>
+                {
+                    if !existing.pop() {
+                        return Err(format!(
+                            "cannot resolve {} under the state base {}: {e}",
+                            joined.display(),
+                            canonical_base.display()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "cannot resolve {} under the state base {}: {e}",
+                        joined.display(),
+                        canonical_base.display()
+                    ));
+                }
             }
         }
         Ok(joined)
@@ -2954,6 +3000,71 @@ mod tests {
         assert!(
             err.starts_with("resolves to"),
             "the error must report the escape, got {err}"
+        );
+    }
+
+    /// A symlinked parent must also be caught when the state key names a
+    /// directory that does not exist yet, the usual case for a new state
+    /// key, so the escape is refused before anything is created through it.
+    #[test]
+    fn state_dir_symlinked_parent_with_missing_key_is_rejected() {
+        let state_base = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mfile_dir = tempfile::tempdir_in(home.path()).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        // The `env` state key does not exist under the symlink target.
+
+        let mfile_name = mfile_dir
+            .path()
+            .file_name()
+            .map(File::encode_component)
+            .unwrap();
+        let link_name = format!("~{}", mfile_name.to_string_lossy());
+        std::os::unix::fs::symlink(target.path(), state_base.path().join(link_name)).unwrap();
+
+        let err = File::state_dir_from_path(
+            "env",
+            state_base.path(),
+            Some(home.path()),
+            mfile_dir.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("resolves to"),
+            "the error must report the escape, got {err}"
+        );
+    }
+
+    /// A symlink on the path that points nowhere cannot be validated, so
+    /// the state key is refused rather than created through it.
+    #[test]
+    fn state_dir_dangling_symlink_on_path_is_rejected() {
+        let state_base = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mfile_dir = tempfile::tempdir_in(home.path()).unwrap();
+
+        let mfile_name = mfile_dir
+            .path()
+            .file_name()
+            .map(File::encode_component)
+            .unwrap();
+        let link_name = format!("~{}", mfile_name.to_string_lossy());
+        std::os::unix::fs::symlink(
+            state_base.path().join("nowhere"),
+            state_base.path().join(link_name),
+        )
+        .unwrap();
+
+        let err = File::state_dir_from_path(
+            "env",
+            state_base.path(),
+            Some(home.path()),
+            mfile_dir.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("cannot resolve"),
+            "the error must name the unresolvable path, got {err}"
         );
     }
 
