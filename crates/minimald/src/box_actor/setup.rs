@@ -1281,7 +1281,8 @@ impl BoxActor {
         if wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             return Ok(());
         }
-        match mfile::File::from_dir(wsp.as_utf8_path()) {
+        // Read beneath the workspace: the box controls it.
+        match mfile::File::from_dir_within(wsp.as_utf8_path()) {
             Ok(_) => Ok(()), // it exists
             Err(mfile::Error::NotFound) => {
                 let (toml_path, content) = self.default_mfile_plan(wsp)?;
@@ -1324,7 +1325,9 @@ impl BoxActor {
             let config = self.workspace_config(wsp)?;
 
             use op::ProjectOp as _;
-            let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+            let root = wsp.as_utf8_path().as_std_path().to_path_buf();
+            let mut env =
+                mctx::ProjectSetup::for_init_within(config, root).map_err(|e| e.to_string())?;
             let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
 
             Ok((plan.toml_path, plan.content))
@@ -1358,12 +1361,17 @@ impl BoxActor {
                 _ => scaffold(),
             }?;
         }
-        let mut ctx =
-            mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())?;
-        // inbox#1245: the box controls everything under its workspace, so an
-        // edit of its minimal.toml (`min add` in the box) must not follow a
-        // link there to a file outside the workspace.
-        ctx.confine_mfile_edits_to(wsp.as_utf8_path().into());
+        // The box controls everything under its workspace, so a read of its
+        // minimal.toml, here and on every reload, and an edit of it (`min
+        // add` in the box) must not follow a link there to a file outside the
+        // workspace.
+        let root = wsp.as_utf8_path().as_std_path().to_path_buf();
+        let mut ctx = mctx::Context::new_with_strategy(
+            self.workspace_config(&wsp)?,
+            mctx::MFileSearchStrategy::Within(root.clone()),
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.confine_mfile_edits_to(root);
         // NET-155: an own-address box has no classifier leaf. Every package
         // build its context starts, the activation launch's among them,
         // attaches to a network of the box's own, under the box's egress

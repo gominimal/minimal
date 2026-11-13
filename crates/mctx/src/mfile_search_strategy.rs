@@ -7,6 +7,11 @@ pub enum MFileSearchStrategy {
     // Only look at a specific path, if there is no mfile there,
     // we do not find one
     Override(PathBuf),
+    /// Only look at a specific directory that someone other than the caller
+    /// controls, the workspace of a box: as [`Self::Override`], but every
+    /// name is resolved beneath the directory, and a `minimal.toml` that
+    /// leads out of it is refused ([`mfile::File::from_dir_within`]).
+    Within(PathBuf),
     /// Try the current directory first, if there is no mfile there,
     /// we do not find one
     CurrentDirOnly,
@@ -19,6 +24,7 @@ impl MFileSearchStrategy {
     pub fn find_mfile(&self) -> Result<mfile::File, Error> {
         match self {
             Self::Override(path) => mfile::File::from_dir(path).map_err(|e| e.into()),
+            Self::Within(root) => mfile::File::from_dir_within(root).map_err(Error::MFile),
             Self::CurrentDirOnly => {
                 let current_dir = std::env::current_dir()
                     .map_err(|e| Error::IO("Getting current directory", PathBuf::new(), e))?;
@@ -86,6 +92,33 @@ mod tests {
         // Case: Override path exists but has no mfile
         let strategy = MFileSearchStrategy::Override(uninitialized_repo());
         assert!(strategy.find_mfile().is_err());
+    }
+
+    #[test]
+    fn mfile_search_strategy_within() {
+        // Case: the directory has an mfile
+        let strategy = MFileSearchStrategy::Within(fakerepo());
+        let mfile = strategy.find_mfile().unwrap();
+        assert_eq!(*mfile.file_path().unwrap(), fakerepo().join("minimal.toml"));
+
+        // Case: the directory's minimal.toml links out of it
+        let workspace = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            fakerepo().join("minimal.toml"),
+            workspace.path().join("minimal.toml"),
+        )
+        .unwrap();
+        let err = MFileSearchStrategy::Within(workspace.path().to_path_buf())
+            .find_mfile()
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::MFile(mfile::Error::IO(_, _, io))
+                    if io.to_string().contains("leads outside its workspace")
+            ),
+            "error: {err:?}"
+        );
     }
 
     #[test]

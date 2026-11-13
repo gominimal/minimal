@@ -277,9 +277,10 @@ pub struct Context {
     /// network attaches to it, so the box's egress verdict decides the
     /// build's connections.
     pub(crate) box_network: Option<op::BuildNetwork>,
-    /// The workspace a box's `minimal.toml` edits must stay inside, for a
-    /// context the daemon builds for a box (inbox#1245). `None` for a
-    /// context whose caller chose the project itself, as the host CLI does.
+    /// The workspace a box's `minimal.toml` edits and re-reads must stay
+    /// inside, for a context the daemon builds for a box (inbox#1245).
+    /// `None` for a context whose caller chose the project itself, as the
+    /// host CLI does.
     pub(crate) mfile_edit_root: Option<PathBuf>,
 }
 
@@ -512,11 +513,14 @@ impl Context {
         self.box_network.as_ref()
     }
 
-    /// Confines every edit this context makes to its `minimal.toml` to the
-    /// directory `root`, the workspace of the box the daemon built it for
+    /// Confines every edit this context makes to its `minimal.toml`, and
+    /// every re-read of it ([`Self::cloned_reinit`]), to the directory
+    /// `root`, the workspace of the box the daemon built it for
     /// (inbox#1245). The box controls that directory, so a link there must
-    /// not carry the edit to a file outside it; see
-    /// [`mfile::File::edit_exclusively_within`].
+    /// not carry the edit or the read to a file outside it; see
+    /// [`mfile::File::edit_exclusively_within`] and
+    /// [`mfile::File::from_dir_within`]. Build the context itself with
+    /// [`MFileSearchStrategy::Within`] so its first read is confined too.
     pub fn confine_mfile_edits_to(&mut self, root: PathBuf) {
         self.mfile_edit_root = Some(root);
     }
@@ -544,9 +548,13 @@ impl Context {
     /// per-session repo override), then any config-provided override,
     /// then a recursive search from the daemon's cwd as a last-ditch
     /// fallback for CLI-style callers that constructed via
-    /// [`Self::new`].
+    /// [`Self::new`]. A context confined to a box's workspace
+    /// ([`Self::confine_mfile_edits_to`]) re-reads beneath that workspace
+    /// instead.
     pub fn cloned_reinit(&self) -> Result<Self, Error> {
-        let strategy = if let Some(path) = self.mfile.repo_path() {
+        let strategy = if let Some(root) = self.mfile_edit_root.as_ref() {
+            MFileSearchStrategy::Within(root.clone())
+        } else if let Some(path) = self.mfile.repo_path() {
             MFileSearchStrategy::Override(path.to_path_buf())
         } else if let Some(path) = self.daemon.config.repo_dir_override() {
             MFileSearchStrategy::Override(path.to_path_buf())
@@ -1993,6 +2001,51 @@ mod tests {
             String::from_utf8(std::fs::read(&mfile_path).unwrap())
                 .unwrap()
                 .contains("[session]\npackages = [\"uroot\"]")
+        );
+    }
+
+    /// A context confined to a box's workspace re-reads its `minimal.toml`
+    /// beneath the workspace: a file swapped for a link out of it is
+    /// refused rather than read.
+    #[test]
+    fn cloned_reinit_refuses_a_confined_mfile_that_links_out() {
+        let state = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let content = "[defaults.session]\npackages = [\"base\"]\n";
+        let mfile_path = workspace.path().join("minimal.toml");
+        std::fs::write(&mfile_path, content).unwrap();
+        let outside_path = outside.path().join("minimal.toml");
+        std::fs::write(&outside_path, content).unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(workspace.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let mut ctx = Context::new_with_strategy(
+            config,
+            MFileSearchStrategy::Within(workspace.path().to_path_buf()),
+        )
+        .unwrap();
+        ctx.confine_mfile_edits_to(workspace.path().to_path_buf());
+        // The context reloads once the file is a link out of the workspace.
+        std::fs::rename(&mfile_path, workspace.path().join("was-minimal.toml")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, &mfile_path).unwrap();
+
+        let err = ctx.cloned_reinit().unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                Error::MFile(mfile::Error::IO(_, _, io))
+                    if io.to_string().contains("leads outside its workspace")
+            ),
+            "error: {err:?}"
         );
     }
 

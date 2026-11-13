@@ -1067,6 +1067,76 @@ enum TaskCheck {
     Skip,
 }
 
+/// What a confined access to a box's `minimal.toml` does, for its messages.
+#[derive(Debug, Clone, Copy)]
+enum Access {
+    Edit,
+    Read,
+}
+
+impl Access {
+    /// The operation an error names: `editing` or `reading`.
+    fn op(self) -> &'static str {
+        match self {
+            Self::Edit => "editing",
+            Self::Read => "reading",
+        }
+    }
+
+    /// What a refusal refuses: the `edit` or the `read`.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Edit => "edit",
+            Self::Read => "read",
+        }
+    }
+}
+
+/// How a load reads the files of a project directory.
+#[derive(Debug, Clone, Copy)]
+enum Reader<'a> {
+    /// By path, following links: a directory the caller chose.
+    Host,
+    /// Beneath this directory: a box's workspace ([`File::from_dir_within`]).
+    Within(&'a Path),
+}
+
+impl Reader<'_> {
+    /// The file's content, `None` if it does not exist.
+    fn read(self, path: &Path) -> Result<Option<Vec<u8>>, Error> {
+        match self {
+            Self::Host => File::read_by_path(path),
+            Self::Within(root) => File::read_within(root, path),
+        }
+    }
+
+    /// Whether the file exists.
+    fn exists(self, path: &Path) -> Result<bool, Error> {
+        match self {
+            Self::Host => {
+                std::fs::exists(path).map_err(|e| Error::IO("stat", path.to_path_buf(), e))
+            }
+            Self::Within(root) => File::read_within(root, path).map(|data| data.is_some()),
+        }
+    }
+}
+
+/// What [`File::resolve_beneath`] found for a name under a workspace.
+#[cfg(target_os = "linux")]
+enum Beneath {
+    /// The open directory that holds the file, the file's name in it, and
+    /// the file's real path, for the lock key and the messages.
+    Found {
+        dir: std::os::fd::OwnedFd,
+        name: OsString,
+        shown: PathBuf,
+    },
+    /// The directory that would hold the file does not exist.
+    NoDir(std::io::Error),
+    /// The kernel has no `openat2`: the caller checks the components.
+    NoOpenat2,
+}
+
 impl File {
     /// Parses a `minimal.toml` from raw bytes — the pure, filesystem-free core
     /// of [`File::from_dir`], exposed for fuzzing (crates/mfile/fuzz) and tests.
@@ -1269,42 +1339,125 @@ impl File {
         Self::load_dir(dir.as_ref(), TaskCheck::Skip)
     }
 
+    /// [`File::from_dir`] for a directory that someone other than the caller
+    /// controls: the workspace of a box, read by the daemon on the box's
+    /// behalf. Every name the read resolves stays inside `root`, as
+    /// [`File::edit_exclusively_within`] keeps an edit there: a link that
+    /// stays inside is followed, and a `minimal.toml` (or `.minimal`) that
+    /// leads out of `root`, or that dangles, is refused before anything is
+    /// read. The refusal names the file in the workspace and carries nothing
+    /// of the file the link points at. `root` itself is trusted.
+    pub fn from_dir_within<P: AsRef<Path>>(root: P) -> Result<Self, Error> {
+        let root = root.as_ref();
+        Self::load_dir_by(root, TaskCheck::Refuse, Reader::Within(root))
+    }
+
     fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Error> {
+        Self::load_dir_by(dir, tasks, Reader::Host)
+    }
+
+    fn load_dir_by(dir: &Path, tasks: TaskCheck, reader: Reader<'_>) -> Result<Self, Error> {
         // Check for the minimal file at the directory root.
         let path = dir.join(MFILE_NAME);
-        match std::fs::read(&path) {
-            Ok(file_data) => {
-                let conflicting_path = dir.join(".minimal").join(MFILE_NAME);
-                if std::fs::exists(&conflicting_path)
-                    .map_err(|e| Error::IO("stat", conflicting_path.clone(), e))?
-                {
-                    return Err(Error::ConflictingLayouts(vec![path, conflicting_path]));
-                }
-
-                return Self::init_toml(
-                    Self::parse(&file_data, Some(&path))?,
-                    &path,
-                    Layout::Root,
-                    hash_bytes(&file_data),
-                    tasks,
-                );
+        if let Some(file_data) = reader.read(&path)? {
+            let conflicting_path = dir.join(".minimal").join(MFILE_NAME);
+            if reader.exists(&conflicting_path)? {
+                return Err(Error::ConflictingLayouts(vec![path, conflicting_path]));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Error::IO("minimal file", path, e)),
-        };
+
+            return Self::init_toml(
+                Self::parse(&file_data, Some(&path))?,
+                &path,
+                Layout::Root,
+                hash_bytes(&file_data),
+                tasks,
+            );
+        }
 
         // Check for the minimal file at `./.minimal`.
         let path = dir.join(".minimal").join(MFILE_NAME);
-        match std::fs::read(&path) {
-            Ok(file_data) => Self::init_toml(
+        match reader.read(&path)? {
+            Some(file_data) => Self::init_toml(
                 Self::parse(&file_data, Some(&path))?,
                 &path,
                 Layout::DotMinimal,
                 hash_bytes(&file_data),
                 tasks,
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
-            Err(e) => Err(Error::IO("minimal file", path, e)),
+            None => Err(Error::NotFound),
+        }
+    }
+
+    /// Reads `path` by name, following any link: `None` if it does not
+    /// exist.
+    fn read_by_path(path: &Path) -> Result<Option<Vec<u8>>, Error> {
+        match std::fs::read(path) {
+            Ok(file_data) => Ok(Some(file_data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::IO("minimal file", path.to_path_buf(), e)),
+        }
+    }
+
+    /// Reads `path`, a file under `root`, resolving every name beneath
+    /// `root` as [`File::edit_exclusively_within`] does: `None` if it does
+    /// not exist, an error if it leads out of `root` or dangles.
+    fn read_within(root: &Path, path: &Path) -> Result<Option<Vec<u8>>, Error> {
+        let rel = Self::rel_within(root, path, Access::Read)?;
+        Self::read_confined(root, rel, path)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_confined(root: &Path, rel: &Path, path: &Path) -> Result<Option<Vec<u8>>, Error> {
+        Self::check_components(root, rel, path, Access::Read)?;
+        Self::read_by_path(path)
+    }
+
+    /// Resolves `rel` beneath `root` with `openat2(2)`, then reads the file
+    /// through the descriptor of the directory that holds it.
+    #[cfg(target_os = "linux")]
+    fn read_confined(root: &Path, rel: &Path, path: &Path) -> Result<Option<Vec<u8>>, Error> {
+        use std::io::Read as _;
+        use std::os::fd::AsFd as _;
+
+        let root_fd = match beneath::open_root(root) {
+            Ok(fd) => fd,
+            // As `from_dir` finds no file in a directory that is not there.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(e) => return Err(Error::IO("opening workspace", root.to_path_buf(), e)),
+        };
+        let (dir, name, shown) =
+            match Self::resolve_beneath(root, root_fd.as_fd(), rel, path, Access::Read)? {
+                Beneath::Found { dir, name, shown } => (dir, name, shown),
+                Beneath::NoDir(_) => return Ok(None),
+                Beneath::NoOpenat2 => {
+                    Self::check_components(root, rel, path, Access::Read)?;
+                    return Self::read_by_path(path);
+                }
+            };
+        match beneath::open_at(dir.as_fd(), &name, libc::O_RDONLY) {
+            Ok(fd) => {
+                let mut file = std::fs::File::from(fd);
+                let meta = file
+                    .metadata()
+                    .map_err(|e| Error::IO("statting", shown.clone(), e))?;
+                if !meta.is_file() {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "not a regular file; the read is refused",
+                    );
+                    return Err(Error::IO("minimal file", shown, e));
+                }
+                let mut file_data = Vec::new();
+                file.read_to_end(&mut file_data)
+                    .map_err(|e| Error::IO("minimal file", shown, e))?;
+                Ok(Some(file_data))
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+            // A link put at `name` after it was resolved.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                Err(Self::leads_outside(&shown, Access::Read))
+            }
+            Err(e) => Err(Error::IO("minimal file", shown, e)),
         }
     }
 
@@ -1524,30 +1677,41 @@ impl File {
     where
         E: From<Error>,
     {
-        let rel = path.strip_prefix(root).ok().filter(|rel| {
-            rel.file_name().is_some() && rel.components().all(|c| matches!(c, Component::Normal(_)))
-        });
-        let Some(rel) = rel else {
-            let e = std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "not a file under the workspace {}; the edit is refused",
-                    root.display()
-                ),
-            );
-            return Err(Error::IO("editing", path.to_path_buf(), e).into());
-        };
+        let rel = Self::rel_within(root, path, Access::Edit)?;
         Self::edit_confined(lock_dir, timeout, root, rel, path, edit)
     }
 
+    /// `path` relative to `root`, the names [`File::edit_confined`] and
+    /// [`File::read_confined`] resolve beneath it. A `path` that is not a
+    /// file under `root` is refused.
+    fn rel_within<'p>(root: &Path, path: &'p Path, access: Access) -> Result<&'p Path, Error> {
+        let rel = path.strip_prefix(root).ok().filter(|rel| {
+            rel.file_name().is_some() && rel.components().all(|c| matches!(c, Component::Normal(_)))
+        });
+        rel.ok_or_else(|| {
+            let e = std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "not a file under the workspace {}; the {} is refused",
+                    root.display(),
+                    access.noun()
+                ),
+            );
+            Error::IO(access.op(), path.to_path_buf(), e)
+        })
+    }
+
     /// The error for a `minimal.toml` whose name leads out of the workspace.
-    fn leads_outside(path: &Path) -> Error {
+    fn leads_outside(path: &Path, access: Access) -> Error {
         let e = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "the box's minimal.toml leads outside its workspace (a link or `..` out of it); \
-             the edit is refused",
+            format!(
+                "the box's minimal.toml leads outside its workspace (a link or `..` out of it); \
+                 the {} is refused",
+                access.noun()
+            ),
         );
-        Error::IO("editing", path.to_path_buf(), e)
+        Error::IO(access.op(), path.to_path_buf(), e)
     }
 
     /// The error for a `minimal.toml` that is a link to nothing.
@@ -1561,9 +1725,24 @@ impl File {
     }
 
     /// The best-effort confinement: no component of `rel` under `root` may
-    /// be a symlink. A link swapped in between this check and the edit is
-    /// not caught, which is why Linux uses [`File::edit_confined`]'s
-    /// `openat2` path instead.
+    /// be a symlink. A link swapped in between this check and the edit or
+    /// read is not caught, which is why Linux resolves the names with
+    /// `openat2` instead.
+    fn check_components(root: &Path, rel: &Path, path: &Path, access: Access) -> Result<(), Error> {
+        let mut at = root.to_path_buf();
+        for component in rel.components() {
+            at.push(component);
+            match std::fs::symlink_metadata(&at) {
+                Ok(meta) if meta.is_symlink() => return Err(Self::leads_outside(path, access)),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(Error::IO("statting", at, e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// [`File::check_components`], then the path-based edit.
     fn edit_checking_components<E>(
         lock_dir: Option<&Path>,
         timeout: Duration,
@@ -1575,16 +1754,7 @@ impl File {
     where
         E: From<Error>,
     {
-        let mut at = root.to_path_buf();
-        for component in rel.components() {
-            at.push(component);
-            match std::fs::symlink_metadata(&at) {
-                Ok(meta) if meta.is_symlink() => return Err(Self::leads_outside(path).into()),
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Err(e) => return Err(Error::IO("statting", at, e).into()),
-            }
-        }
+        Self::check_components(root, rel, path, Access::Edit)?;
         // No component under `root` is a link, so the path-based editor's
         // canonical path stays under the (trusted) canonical `root`.
         Self::edit_exclusively_in(lock_dir, timeout, path, edit)
@@ -1623,79 +1793,108 @@ impl File {
 
         let root_fd = beneath::open_root(root)
             .map_err(|e| Error::IO("opening workspace", root.to_path_buf(), e))?;
+        match Self::resolve_beneath(root, root_fd.as_fd(), rel, path, Access::Edit)? {
+            Beneath::Found { dir, name, shown } => Self::edit_in_dir(
+                lock_dir,
+                timeout,
+                std::fs::File::from(dir),
+                &name,
+                &shown,
+                edit,
+            ),
+            Beneath::NoDir(e) => Err(Error::IO("opening", path.to_path_buf(), e).into()),
+            Beneath::NoOpenat2 => {
+                Self::edit_checking_components(lock_dir, timeout, root, rel, path, edit)
+            }
+        }
+    }
+
+    /// Resolves `rel` beneath `root` (open as `root_fd`) with `openat2(2)`
+    /// to the directory that holds the file and the file's name in it, for
+    /// [`File::edit_confined`] and [`File::read_confined`]. A `..` or a link
+    /// that leads out of `root` is refused, and so is a link at the final
+    /// name that dangles. `path` is `root` joined with `rel`, for messages.
+    #[cfg(target_os = "linux")]
+    fn resolve_beneath(
+        root: &Path,
+        root_fd: std::os::fd::BorrowedFd<'_>,
+        rel: &Path,
+        path: &Path,
+        access: Access,
+    ) -> Result<Beneath, Error> {
+        use std::os::fd::AsFd as _;
+
         let parent_rel = rel.parent().unwrap_or(Path::new(""));
         let Some(name) = rel.file_name() else {
-            return Err(Self::leads_outside(path).into());
+            return Err(Self::leads_outside(path, access));
         };
 
-        let dir_fd = match beneath::open_beneath(root_fd.as_fd(), parent_rel, beneath::DIR_FLAGS) {
+        let dir_fd = match beneath::open_beneath(root_fd, parent_rel, beneath::DIR_FLAGS) {
             Ok(fd) => fd,
             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
                 tracing::warn!(
-                    "this kernel has no openat2; checking {} for links before editing it",
-                    path.display()
+                    "this kernel has no openat2; checking {} for links before {} it",
+                    path.display(),
+                    access.op()
                 );
-                return Self::edit_checking_components(lock_dir, timeout, root, rel, path, edit);
+                return Ok(Beneath::NoOpenat2);
             }
-            Err(e) if beneath::escaped(&e) => return Err(Self::leads_outside(path).into()),
-            Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e).into()),
+            Err(e) if beneath::escaped(&e) => return Err(Self::leads_outside(path, access)),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(Beneath::NoDir(e)),
+            Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e)),
         };
 
-        // A link at the final name: resolve it beneath `root` too, and edit
+        // A link at the final name: resolve it beneath `root` too, and use
         // the file it reaches in the directory that holds that file. The
         // link entry itself is left in place, as the host editor leaves it.
         let is_link = beneath::is_symlink_at(dir_fd.as_fd(), name);
         let (dir_fd, name) = match is_link {
             Ok(false) => (dir_fd, name.to_os_string()),
             Ok(true) => {
-                let target = match beneath::open_beneath(root_fd.as_fd(), rel, libc::O_PATH) {
+                let target = match beneath::open_beneath(root_fd, rel, libc::O_PATH) {
                     Ok(fd) => fd,
                     Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                        return Err(Self::dangling_within(path).into());
+                        return Err(Self::dangling_within(path));
                     }
                     Err(e) if beneath::escaped(&e) => {
-                        return Err(Self::leads_outside(path).into());
+                        return Err(Self::leads_outside(path, access));
                     }
-                    Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e).into()),
+                    Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e)),
                 };
                 let resolved = beneath::fd_path(target.as_fd())
                     .map_err(|e| Error::IO("resolving", path.to_path_buf(), e))?;
-                let root_real = beneath::fd_path(root_fd.as_fd())
+                let root_real = beneath::fd_path(root_fd)
                     .map_err(|e| Error::IO("resolving", root.to_path_buf(), e))?;
                 let Some(real_rel) = resolved.strip_prefix(&root_real).ok() else {
-                    return Err(Self::leads_outside(path).into());
+                    return Err(Self::leads_outside(path, access));
                 };
                 let Some(real_name) = real_rel.file_name() else {
-                    return Err(Self::leads_outside(path).into());
+                    return Err(Self::leads_outside(path, access));
                 };
                 // Opened beneath `root` again rather than by the absolute
                 // path, so a directory swapped for a link meanwhile is
                 // refused instead of followed.
                 let real_parent = real_rel.parent().unwrap_or(Path::new(""));
-                let dir =
-                    match beneath::open_beneath(root_fd.as_fd(), real_parent, beneath::DIR_FLAGS) {
-                        Ok(fd) => fd,
-                        Err(e) if beneath::escaped(&e) => {
-                            return Err(Self::leads_outside(path).into());
-                        }
-                        Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e).into()),
-                    };
+                let dir = match beneath::open_beneath(root_fd, real_parent, beneath::DIR_FLAGS) {
+                    Ok(fd) => fd,
+                    Err(e) if beneath::escaped(&e) => {
+                        return Err(Self::leads_outside(path, access));
+                    }
+                    Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e)),
+                };
                 (dir, real_name.to_os_string())
             }
-            Err(e) => return Err(Error::IO("statting", path.to_path_buf(), e).into()),
+            Err(e) => return Err(Error::IO("statting", path.to_path_buf(), e)),
         };
         // The real location, for the lock key and the messages.
         let shown = beneath::fd_path(dir_fd.as_fd())
             .map(|dir| dir.join(&name))
             .unwrap_or_else(|_| path.to_path_buf());
-        Self::edit_in_dir(
-            lock_dir,
-            timeout,
-            std::fs::File::from(dir_fd),
-            &name,
-            &shown,
-            edit,
-        )
+        Ok(Beneath::Found {
+            dir: dir_fd,
+            name,
+            shown,
+        })
     }
 
     /// The read-edit-write of [`File::edit_exclusively_in`], done relative
@@ -1758,7 +1957,7 @@ impl File {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
             // A link put at `name` after it was resolved.
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(Self::leads_outside(shown).into());
+                return Err(Self::leads_outside(shown, Access::Edit).into());
             }
             Err(e) => return Err(Error::IO("reading", shown.to_path_buf(), e).into()),
         };
@@ -1804,7 +2003,7 @@ impl File {
         }
         let (_file, tmp_path) = tmp.into_parts();
         let Some(tmp_name) = tmp_path.file_name().map(OsStr::to_os_string) else {
-            return Err(Self::leads_outside(shown).into());
+            return Err(Self::leads_outside(shown, Access::Edit).into());
         };
         match beneath::rename_at(dir.as_fd(), &tmp_name, name) {
             // The temp's name is now the file's: nothing is left to remove.
@@ -4642,6 +4841,165 @@ bash = \"true\"
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// A `minimal.toml` that loads: the one the daemon scaffolds.
+    const READABLE: &str = "[defaults.session]\npackages = [\"base\", \"vim\"]\n";
+
+    /// Not TOML, so a parse of it would quote it back: a refusal must not.
+    const OUTSIDE_SECRET: &str = "outside-secret = = 1\n";
+
+    /// Whether a confined read at `root` checks the components for links
+    /// instead of resolving the names with `openat2`: always off Linux, and
+    /// on a Linux kernel without `openat2`.
+    fn reads_by_component_check(root: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            takes_the_no_openat2_fallback(root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = root;
+            true
+        }
+    }
+
+    /// The read was refused as leading out of the workspace, nothing of the
+    /// file outside is in the error, and `link` is still the link it was.
+    fn assert_read_refused(err: &Error, link: &Path, target: &Path) {
+        let shown = format!("{err} {err:?}");
+        assert!(
+            shown.contains("leads outside its workspace"),
+            "error: {err}"
+        );
+        assert!(
+            !shown.contains("outside-secret"),
+            "the refusal carries the content of the file outside: {shown}"
+        );
+        assert_eq!(
+            std::fs::read_link(link).expect("the link entry was replaced"),
+            target
+        );
+    }
+
+    #[test]
+    fn from_dir_within_reads_a_plain_file() {
+        let (_dir, root, _) = workspace_and_outside();
+        let path = root.join(MFILE_NAME);
+        std::fs::write(&path, READABLE).unwrap();
+
+        let file = File::from_dir_within(&root).unwrap();
+
+        assert_eq!(file.file_path(), Some(&path));
+        assert!(matches!(file.layout(), Some(Layout::Root)));
+    }
+
+    #[test]
+    fn from_dir_within_reads_the_dot_minimal_layout() {
+        let (_dir, root, _) = workspace_and_outside();
+        std::fs::create_dir(root.join(".minimal")).unwrap();
+        let path = root.join(".minimal").join(MFILE_NAME);
+        std::fs::write(&path, READABLE).unwrap();
+
+        let file = File::from_dir_within(&root).unwrap();
+
+        assert_eq!(file.file_path(), Some(&path));
+        assert!(matches!(file.layout(), Some(Layout::DotMinimal)));
+    }
+
+    #[test]
+    fn from_dir_within_finds_no_file_in_an_empty_workspace() {
+        let (_dir, root, _) = workspace_and_outside();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        assert!(matches!(err, Error::NotFound), "error: {err}");
+    }
+
+    #[test]
+    fn from_dir_within_refuses_an_absolute_link_out_of_the_workspace() {
+        let (_dir, root, outside) = workspace_and_outside();
+        std::fs::write(&outside, OUTSIDE_SECRET).unwrap();
+        let link = root.join(MFILE_NAME);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        assert_read_refused(&err, &link, &outside);
+    }
+
+    #[test]
+    fn from_dir_within_refuses_a_relative_link_out_of_the_workspace() {
+        let (_dir, root, outside) = workspace_and_outside();
+        std::fs::write(&outside, OUTSIDE_SECRET).unwrap();
+        let link = root.join(MFILE_NAME);
+        let target = Path::new("../outside.toml");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        assert_read_refused(&err, &link, target);
+    }
+
+    #[test]
+    fn from_dir_within_refuses_a_dot_minimal_link_out_of_the_workspace() {
+        let (dir, root, _) = workspace_and_outside();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(MFILE_NAME), OUTSIDE_SECRET).unwrap();
+        let link = root.join(".minimal");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        assert_read_refused(&err, &link, &elsewhere);
+    }
+
+    #[test]
+    fn from_dir_within_refuses_a_dangling_link() {
+        let (_dir, root, _) = workspace_and_outside();
+        let link = root.join(MFILE_NAME);
+        let target = Path::new("missing.toml");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        if reads_by_component_check(&root) {
+            eprintln!("no openat2 here: checking the fallback's refusal of every link instead");
+            assert!(
+                err.to_string().contains("leads outside its workspace"),
+                "error: {err}"
+            );
+        } else {
+            assert!(err.to_string().contains("does not exist"), "error: {err}");
+        }
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    }
+
+    #[test]
+    fn from_dir_within_follows_a_relative_link_that_stays_inside() {
+        let (_dir, root, _) = workspace_and_outside();
+        std::fs::create_dir(root.join("conf")).unwrap();
+        std::fs::write(root.join("conf").join("real.toml"), READABLE).unwrap();
+        let link = root.join(MFILE_NAME);
+        let target = Path::new("conf/real.toml");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        if reads_by_component_check(&root) {
+            eprintln!("no openat2 here: checking the fallback's refusal of every link instead");
+            let err = File::from_dir_within(&root).unwrap_err();
+            assert!(
+                err.to_string().contains("leads outside its workspace"),
+                "error: {err}"
+            );
+            assert_eq!(std::fs::read_link(&link).unwrap(), target);
+            return;
+        }
+
+        let file = File::from_dir_within(&root).unwrap();
+
+        assert_eq!(file.file_path(), Some(&link));
+        assert!(matches!(file.layout(), Some(Layout::Root)));
     }
 
     #[test]

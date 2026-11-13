@@ -226,8 +226,11 @@ pub(crate) fn resolve_project_ctx_and_graph(
     // `packages/*.ncl`, `stacks/*.ncl`, and `profiles/*.ncl` all
     // contribute to graph construction and have to be on disk when
     // this runs.
+    //
+    // The box controls that tree, so the mfile is read beneath it: a
+    // `minimal.toml` that links out of the workspace is refused.
     let project_path_std = project_path.as_utf8_path().as_std_path().to_path_buf();
-    let mfile = match mctx::MFileSearchStrategy::Override(project_path_std).find_mfile() {
+    let mfile = match mctx::MFileSearchStrategy::Within(project_path_std.clone()).find_mfile() {
         Ok(m) => m,
         Err(mctx::Error::MFile(mfile::Error::NotFound)) => {
             tracing::debug!(
@@ -244,6 +247,7 @@ pub(crate) fn resolve_project_ctx_and_graph(
         }
     };
     let mut ctx = mctx::Context::from_daemon(Arc::clone(daemon_ctx), mfile);
+    ctx.confine_mfile_edits_to(project_path_std);
     let graph = {
         let _g = tracing::info_span!("compose.graph_from_all_packages").entered();
         ctx.graph_from_all_packages()
