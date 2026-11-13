@@ -1499,11 +1499,99 @@ fn entry_egress(
 /// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
 /// Fails with [`SessionEntryUndecided`] (exit 2) when no single session
 /// entry can be picked.
+///
+/// The start path calls [`session_box_expansion`] with its selected
+/// loadouts. This form selects none.
+#[cfg(test)]
 pub(crate) fn session_box_entry(
     project: &camino::Utf8Path,
     entry: Option<&str>,
     hooks_enabled: bool,
 ) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
+    session_box_expansion(project, entry, hooks_enabled, &SelectedLoadouts::default())
+        .map(|expanded| expanded.map(|expanded| expanded.wire))
+}
+
+/// The loadouts that the box takes at the selected-loadouts layer, after
+/// the loadout gate, in selection order (BOX-064, BOX-167).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SelectedLoadouts {
+    /// The gated loadouts. A sealed box has none.
+    pub(crate) loadouts: Vec<boxes::core::loadout::Loadout>,
+    /// The user policy's var `ignore` list. A loadout var it matches is
+    /// dropped before the merge, so it never conflicts (BOX-183).
+    pub(crate) ignore: Option<boxes::core::policy::VarNameGlobs>,
+}
+
+impl SelectedLoadouts {
+    /// The layer of each loadout, with its name: the keys that BOX-167
+    /// applies, without the vars that the policy ignores.
+    fn layers(&self) -> anyhow::Result<Vec<(String, toml::Table)>> {
+        const APPLIED: [&str; 5] = [
+            "packages",
+            "patches",
+            "vars",
+            "vars_lenient",
+            "lifecycle_hooks",
+        ];
+        let ignored = |name: &str| self.ignore.as_ref().is_some_and(|g| g.is_match(name));
+        self.loadouts
+            .iter()
+            .map(|loadout| {
+                let name = loadout.name().as_ref().to_owned();
+                let mut table = toml::Table::try_from(loadout)
+                    .with_context(|| format!("Cannot read loadout {name}"))?;
+                table.retain(|key, _| APPLIED.contains(&key));
+                if let Some(toml::Value::Table(vars)) = table.get_mut("vars") {
+                    vars.retain(|var, _| !ignored(var));
+                }
+                if let Some(toml::Value::Array(items)) = table.get_mut("vars_lenient") {
+                    items.retain(|item| {
+                        !item
+                            .get("name")
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(ignored)
+                    });
+                }
+                Ok((name, table))
+            })
+            .collect()
+    }
+}
+
+/// An expanded entry: the lists the daemon composes, and the whole
+/// expanded spec.
+#[derive(Debug, Clone)]
+pub(crate) struct BoxEntryExpansion {
+    /// The project's lists, for the daemon (BOX-068). A loadout's items
+    /// reach the daemon on the contribution, with their loadout, so these
+    /// carry only the project's.
+    pub(crate) wire: boxes::wire::request::WireBoxEntry,
+    /// The expanded spec over every layer, the selected loadouts included.
+    /// Each of its hooks names its declarer (BOX-179).
+    pub(crate) spec: toml::Table,
+}
+
+/// The expanded session entry of the project at `project`, with
+/// `selected` as the selected-loadouts layer. `entry` names the entry.
+/// With no name, the session entry pick applies, and the implicit
+/// `default` entry answers a project that declares none (BOX-165). A
+/// selected loadout that conflicts with the project refuses the start
+/// here, before the box is created (BOX-183).
+///
+/// `None` for a project with no `minimal.toml`.
+///
+/// # Errors
+///
+/// Fails with exit 3 on a `minimal.toml` whose entry does not expand, and
+/// on a loadout var conflict. Fails with [`SessionEntryUndecided`] (exit 2)
+/// when no single session entry can be picked.
+pub(crate) fn session_box_expansion(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    hooks_enabled: bool,
+    selected: &SelectedLoadouts,
+) -> anyhow::Result<Option<BoxEntryExpansion>> {
     let Some(bytes) = project_file_bytes(project)? else {
         return Ok(None);
     };
@@ -1516,7 +1604,7 @@ pub(crate) fn session_box_entry(
         // project's `[session]` table.
         None => pick_session_entry(&entries)?,
     };
-    box_entry(project, &bytes, picked, hooks_enabled).map(Some)
+    box_entry(project, &bytes, picked, hooks_enabled, selected).map(Some)
 }
 
 /// The expanded `[tasks.<task>]` entry of the project at `project`, for the
@@ -1541,7 +1629,16 @@ pub(crate) fn task_box_entry(
     }) else {
         return Ok(None);
     };
-    box_entry(project, &bytes, entry, hooks_enabled).map(Some)
+    // `min task run` does not pass its loadouts yet, and a task is sealed
+    // by default (BOX-169).
+    box_entry(
+        project,
+        &bytes,
+        entry,
+        hooks_enabled,
+        &SelectedLoadouts::default(),
+    )
+    .map(|expanded| Some(expanded.wire))
 }
 
 /// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
@@ -1555,12 +1652,18 @@ pub(crate) fn task_box_entry(
 /// keys from `[defaults]` and `[defaults.task]` do not reach a task box.
 /// gominimal/minimal#3266 tracks that gap. With hooks off (`--no-hooks`), no
 /// `lifecycle_hooks` list is sent.
+///
+/// The entry also expands with `selected` as its selected-loadouts layer,
+/// so a loadout that conflicts with the project fails here (BOX-183), and
+/// each hook of that spec names its declarer (BOX-179). The lists sent
+/// come from the expansion without the loadouts.
 fn box_entry(
     project: &camino::Utf8Path,
     bytes: &[u8],
     entry: mfile::entry::BoxEntry,
     hooks_enabled: bool,
-) -> anyhow::Result<boxes::wire::request::WireBoxEntry> {
+    selected: &SelectedLoadouts,
+) -> anyhow::Result<BoxEntryExpansion> {
     let format_error = |error| ProjectFileInvalid {
         error: mfile::Error::Format(error),
     };
@@ -1588,14 +1691,45 @@ fn box_entry(
     // BOX-183, BOX-184: the merge compares resolved values, so each
     // `inherit` name takes this process's value. A name it does not set
     // stays out, and the merge falls back to the `default`.
-    // Gap (BOX-183, residual of T125, issue #3302): `layers.loadouts` stays
-    // empty here. So the loadout var conflict refusal in `merge_vars` does
-    // not run before `min box create`, `min session start` or `min task run`
-    // creates the box.
-    layers.host_vars = mfile::expand::inherited_var_names(&entry, &layers)
+    let host_vars = |layers: &mfile::expand::Layers| {
+        mfile::expand::inherited_var_names(&entry, layers)
+            .into_iter()
+            .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
+            .collect()
+    };
+    // BOX-064, BOX-179: the whole spec has one layer for each selected
+    // loadout, with its name. It reads the type chain's layers too, so its
+    // loadout gate opens as the start's gate did. Its expansion comes
+    // first, so a loadout that conflicts with the project refuses the
+    // start before the box exists (BOX-183).
+    let mut whole = layers.clone();
+    whole.loadouts = selected.layers()?;
+    (whole.type_defaults, whole.type_constraints) = entry_type_layers(&doc, &entry);
+    whole.host_vars = host_vars(&whole);
+    let full =
+        mfile::expand::expand(&entry, &whole).map_err(|error| ProjectFileInvalid { error })?;
+    // The report keeps the layer, and the loadout, of each hook.
+    let origins = match full.report.values.get("lifecycle_hooks") {
+        Some(mfile::expand::ValueOrigin::List(origins)) => origins.as_slice(),
+        _ => &[],
+    };
+    for (hook, origin) in full
+        .spec
+        .get("lifecycle_hooks")
+        .and_then(toml::Value::as_array)
         .into_iter()
-        .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
-        .collect();
+        .flatten()
+        .zip(origins)
+    {
+        tracing::debug!(
+            entry = %entry.name,
+            declared_by = ?mfile::spec::HookDeclarer::of(hook),
+            layer = ?origin.layer,
+            loadout = ?origin.loadout,
+            "lifecycle hook of the expanded spec"
+        );
+    }
+    layers.host_vars = host_vars(&layers);
     let expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
     let spec = &expansion.spec;
@@ -1618,7 +1752,21 @@ fn box_entry(
     let mut wire = boxes::wire::request::WireBoxEntry::new(&entry.name, &box_type, project_path);
     wire.packages = list(spec, "packages").map_err(format_error)?;
     if hooks_enabled {
-        wire.lifecycle_hooks = list(spec, "lifecycle_hooks").map_err(format_error)?;
+        // The daemon takes a hook as the project wrote it, so the
+        // `declared_by` the expansion wrote stays in the spec.
+        let hooks = spec.get("lifecycle_hooks").map(|hooks| match hooks {
+            toml::Value::Array(items) => toml::Value::Array(
+                items
+                    .iter()
+                    .map(mfile::spec::hook_without_declarer)
+                    .collect(),
+            ),
+            other => other.clone(),
+        });
+        wire.lifecycle_hooks = hooks
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(format_error)?;
     }
     // A task entry sends no `vars`, `vars_lenient` or `patches`, so the
     // `[defaults]` and `[defaults.task]` values for them do not reach the
@@ -1635,7 +1783,39 @@ fn box_entry(
         packages = ?wire.packages,
         "expanded the box's entry"
     );
-    Ok(wire)
+    Ok(BoxEntryExpansion {
+        wire,
+        spec: full.spec,
+    })
+}
+
+/// A table for each type of a chain, with the type's name.
+type TypeTables = Vec<(String, toml::Table)>;
+
+/// The defaults and the constraints of each type in the chain of `entry`,
+/// as the start's loadout gate reads them: the resolved chain, or the
+/// built-in layers of a built-in type name that does not resolve. Empty
+/// for any other name, which the gate already refused.
+fn entry_type_layers(
+    doc: &toml::Table,
+    entry: &mfile::entry::BoxEntry,
+) -> (TypeTables, TypeTables) {
+    if let Ok(types) = mfile::box_types::BoxTypes::from_file(doc)
+        && let Ok(resolved) = mfile::expand::expandable_type(entry, &types)
+    {
+        return (resolved.defaults, resolved.constraints);
+    }
+    match entry
+        .box_type
+        .as_deref()
+        .and_then(mfile::box_types::builtin)
+    {
+        Some(root) => (
+            vec![(root.to_owned(), mfile::box_types::builtin_defaults(root))],
+            vec![(root.to_owned(), mfile::box_types::builtin_constraints(root))],
+        ),
+        None => (Vec::new(), Vec::new()),
+    }
 }
 
 /// The refusal for a `[network]` key that the network module cannot read:
@@ -3414,6 +3594,7 @@ pub(crate) async fn activate_box(
         finalize_hook_budget,
         contribution,
         user_policy,
+        selected,
     ) = ActivationStep::ResolveLoadouts
         .run(async {
             // Resolve and compose the loadouts BEFORE opening the daemon
@@ -3437,8 +3618,22 @@ pub(crate) async fn activate_box(
             } else {
                 loadouts::HookPrep::Enforce
             };
-            let inputs =
-                loadouts::prepare_activation_inputs(global, &project_root, selection, hooks, None)?;
+            let cfg = config::read_client_config(global)?;
+            let inputs = loadouts::prepare_activation_inputs_with_config(
+                &cfg,
+                global,
+                &project_root,
+                selection.clone(),
+                hooks,
+                None,
+            )?;
+            // BOX-064, BOX-179: the gated loadouts again, whole, for the
+            // selected-loadouts layer of the entry's expansion. The read
+            // above already refused a missing or malformed one.
+            let selected = SelectedLoadouts {
+                loadouts: loadouts::resolve_active_loadouts(selection, &cfg, global)?.loadouts,
+                ignore: Some(inputs.user_policy.vars().ignore().clone()),
+            };
 
             // Scaffold-offer a missing `minimal.toml` only after the loadouts
             // resolve and compose: a bad `--loadout` must error before anything
@@ -3472,6 +3667,7 @@ pub(crate) async fn activate_box(
                 inputs.hook_budget,
                 inputs.contribution,
                 inputs.user_policy,
+                selected,
             ))
         })
         .await?;
@@ -3482,9 +3678,22 @@ pub(crate) async fn activate_box(
     use tracing::Instrument as _;
     let entry_span = tracing::info_span!("box_entry", box_type = boxes::SESSION_BOX_TYPE);
     let mut contribution = contribution;
-    contribution.entry = entry_span
-        .in_scope(|| session_box_entry(&project_root, options.entry.as_deref(), !args.no_hooks))?
-        .map(Box::new);
+    let expanded = entry_span.in_scope(|| {
+        session_box_expansion(
+            &project_root,
+            options.entry.as_deref(),
+            !args.no_hooks,
+            &selected,
+        )
+    })?;
+    if let Some(expanded) = &expanded {
+        tracing::debug!(
+            parent: &entry_span,
+            spec = ?expanded.spec,
+            "the expanded spec, with the selected loadouts"
+        );
+    }
+    contribution.entry = expanded.map(|expanded| Box::new(expanded.wire));
 
     // The upload decision needs no TTY — the interactive `Confirm` is answered
     // at the upload step, once the session exists — so it is resolved here,
