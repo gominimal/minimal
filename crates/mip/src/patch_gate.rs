@@ -28,7 +28,21 @@
 //!   probe runs only when some `deny` pattern can reach inside the directory
 //!   and the entry would otherwise be mounted (an ignored entry exposes
 //!   nothing, so it is not probed), and it is bounded: a tree it cannot read
-//!   whole is refused, not mounted.
+//!   whole is refused, not mounted. A symlink the directory holds that
+//!   resolves inside the directory is followed, and what it leads to is
+//!   judged under the link's name too, since the mount exposes it there.
+//!
+//! The gate judges the entries as they are on disk when it runs, and
+//! `Context::make_env` binds them afterwards, from the declared path. Nothing
+//! is checked again in between or later: a symlink swapped in for an entry
+//! after the check is followed by the bind, and a path created inside a
+//! directory entry after the check is visible through the mount. Only
+//! someone who can write the entry's parent directory, or the directory
+//! itself, can do that: the user, a process running as the user, or a
+//! sandbox the user gave a read-write mount of that directory (whose nested
+//! `run <task>` is gated here as well). Binding the path the gate resolved
+//! would close the first half; nothing checked before the mount closes the
+//! second, since a bind mount shows the directory live.
 //!
 //! A denied entry refuses the run (`policy denied ...`). An ignored entry is
 //! dropped from the sandbox, and the caller says so. An entry no rule decides
@@ -126,6 +140,8 @@ impl TaskPatchGate for UserPolicyGate {
             &ProcessEnv::current(),
         )
         .map_err(Error::Other)?;
+        // judged as the entries are now; the module docs say what can change
+        // before `make_env` binds them
         task.patch = kept;
         Ok(GatedTask { task, ignored })
     }
@@ -474,12 +490,26 @@ impl std::error::Error for ProbeRefusal {}
 /// is checked both there and under `declared`, the path the mount exposes.
 /// Returns the first denied path.
 ///
-/// A symlink inside the directory is judged as the link, not at its target.
-/// The bind mount carries the link itself, and the sandbox resolves it in its
-/// own mount namespace, where a host target is reachable only if some entry
-/// mounts it, and that entry is gated on its own. Following contained links
-/// here would also make the answer depend on whether a `deny` happens to
-/// reach inside the directory, since only then is it walked.
+/// A symlink inside the directory is judged by its own name, and where it
+/// leads decides whether the probe looks further:
+///
+/// - A link that resolves to a directory inside `on_disk` is followed, and
+///   every path under its target is judged under the link's name as well as
+///   its own. The bind mount mirrors the directory one-for-one, so in the
+///   sandbox the link resolves inside the same mount and exposes the target
+///   under the link's name: with `patch.dir."~"` and `~/.ssh -> dotfiles/ssh`,
+///   the sandbox reads `~/.ssh/id_ed25519`, and `deny = ["**/.ssh/**"]` must
+///   see that name. Such a link is followed whether the walk covers the whole
+///   directory or starts at a deny's own root, so every spelling of a deny
+///   reaches the same paths.
+/// - A link that leads out of `on_disk` is not followed. The sandbox resolves
+///   it in its own mount namespace, where a host target is reachable only if
+///   some entry mounts it, and that entry is gated on its own.
+/// - A link whose target holds the link (a link to an ancestor), or a link
+///   already followed on the way to it, is not followed again, so a cycle
+///   ends. What it would add are further names, such as `a/up/a/...`, for
+///   paths the walk already judges under their own names: a deny that
+///   matches a path only under such a looped name is not seen.
 ///
 /// Nothing is walked when no `deny` pattern can reach inside the directory.
 /// A missing directory holds nothing yet (a read-write mapping creates it).
@@ -487,8 +517,9 @@ impl std::error::Error for ProbeRefusal {}
 /// # Errors
 ///
 /// When the walk cannot check the tree whole: more than
-/// [`DIR_PROBE_LIMIT`] entries, or a part it cannot read. The entry is then
-/// refused rather than mounted unchecked.
+/// [`DIR_PROBE_LIMIT`] entries, counting those under followed links, or a
+/// part it cannot read. The entry is then refused rather than mounted
+/// unchecked.
 fn probe_dir_for_deny(
     expanded: &ExpandedPatchesPolicy,
     source: &Source,
@@ -501,12 +532,66 @@ fn probe_dir_for_deny(
     if !on_disk.as_std_path().is_dir() {
         return Ok(None);
     }
-    let denied = |p: &Utf8Path| decide(expanded, source, p) == Verdict::Denied;
-    let mut seen = 0usize;
-    for start in starts {
+    let mut probe = Probe {
+        expanded,
+        source,
+        declared,
+        on_disk,
+        seen: 0,
+    };
+    // each walk carries the contained links followed to reach it
+    let mut work: std::collections::VecDeque<(ProbeStart, Vec<Utf8PathBuf>)> =
+        starts.into_iter().map(|s| (s, Vec::new())).collect();
+    while let Some((start, chain)) = work.pop_front() {
+        if let Some(hit) = probe.walk(&start, &chain, &mut work)? {
+            return Ok(Some(hit));
+        }
+    }
+    Ok(None)
+}
+
+/// Where one walk of the deny probe starts: `real`, a directory on disk
+/// inside `on_disk`, seen in the sandbox as `seen_as`. The two differ under
+/// a contained symlink the probe followed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProbeStart {
+    real: Utf8PathBuf,
+    seen_as: Utf8PathBuf,
+}
+
+impl ProbeStart {
+    fn at(path: &Utf8Path) -> Self {
+        Self {
+            real: path.to_path_buf(),
+            seen_as: path.to_path_buf(),
+        }
+    }
+}
+
+/// The state of one directory's deny probe: what it judges against, and how
+/// many entries its walks have met so far, shared by every walk so the
+/// probe stays within [`DIR_PROBE_LIMIT`] however many links it follows.
+struct Probe<'a> {
+    expanded: &'a ExpandedPatchesPolicy,
+    source: &'a Source,
+    declared: &'a Utf8Path,
+    on_disk: &'a Utf8Path,
+    seen: usize,
+}
+
+impl Probe<'_> {
+    /// Walk the tree at `start`, judging each path; queue a walk for each
+    /// contained link the probe follows, with `chain` (the links followed to
+    /// reach `start`) plus that link.
+    fn walk(
+        &mut self,
+        start: &ProbeStart,
+        chain: &[Utf8PathBuf],
+        work: &mut std::collections::VecDeque<(ProbeStart, Vec<Utf8PathBuf>)>,
+    ) -> Result<Option<String>, ProbeRefusal> {
         // a root under the directory that holds nothing has nothing to match;
         // a root that cannot be looked at is a part of the tree left unchecked
-        match std::fs::symlink_metadata(start.as_std_path()) {
+        match std::fs::symlink_metadata(start.real.as_std_path()) {
             Ok(_) => {}
             Err(e)
                 if matches!(
@@ -514,19 +599,20 @@ fn probe_dir_for_deny(
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                 ) =>
             {
-                continue;
+                return Ok(None);
             }
             Err(e) => {
                 return Err(ProbeRefusal(format!(
                     "A part of it cannot be read to check it against `[patches] deny`: \
-                     `{start}`: {e}. Narrow the entry in the project's minimal.toml to the part \
-                     you can read."
+                     `{}`: {e}. Narrow the entry in the project's minimal.toml to the part \
+                     you can read.",
+                    start.real
                 )));
             }
         }
         // the directory itself was decided already; a deny's own root is a path to judge
-        let min_depth = usize::from(start == on_disk);
-        for item in walkdir::WalkDir::new(start.as_std_path())
+        let min_depth = usize::from(start.real == self.on_disk);
+        for item in walkdir::WalkDir::new(start.real.as_std_path())
             .follow_links(false)
             .min_depth(min_depth)
         {
@@ -539,8 +625,8 @@ fn probe_dir_for_deny(
                     )));
                 }
             };
-            seen += 1;
-            if seen > DIR_PROBE_LIMIT {
+            self.seen += 1;
+            if self.seen > DIR_PROBE_LIMIT {
                 return Err(ProbeRefusal(format!(
                     "It holds more than {DIR_PROBE_LIMIT} entries, too many to check against \
                      `[patches] deny`. Narrow the entry in the project's minimal.toml, or narrow \
@@ -548,18 +634,73 @@ fn probe_dir_for_deny(
                 )));
             }
             let real = Utf8PathBuf::from(item.path().to_string_lossy().into_owned());
-            if denied(real.as_path()) {
-                return Ok(Some(real.to_string()));
+            let seen_as = match real.strip_prefix(&start.real) {
+                Ok(rel) if !rel.as_str().is_empty() => start.seen_as.join(rel),
+                _ => start.seen_as.clone(),
+            };
+            if let Some(hit) = self.denied_name(&real, &seen_as) {
+                return Ok(Some(hit));
             }
-            if let Ok(rel) = real.strip_prefix(on_disk) {
-                let exposed = declared.join(rel);
-                if exposed != real && denied(exposed.as_path()) {
-                    return Ok(Some(exposed.to_string()));
+            if item.file_type().is_symlink()
+                && let Some(target) = contained_target(self.on_disk, &real, chain)
+            {
+                let mut followed = chain.to_vec();
+                followed.push(real);
+                work.push_back((
+                    ProbeStart {
+                        real: target,
+                        seen_as,
+                    },
+                    followed,
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The first name a `deny` matches among those `real` is seen by: its
+    /// own, `seen_as` (its name through the links followed to it), and each
+    /// of those under `declared`, the path the mount exposes.
+    fn denied_name(&self, real: &Utf8Path, seen_as: &Utf8Path) -> Option<String> {
+        let mut names: Vec<Utf8PathBuf> = Vec::with_capacity(4);
+        for name in [real, seen_as] {
+            let exposed = match name.strip_prefix(self.on_disk) {
+                Ok(rel) if !rel.as_str().is_empty() => self.declared.join(rel),
+                Ok(_) => self.declared.to_path_buf(),
+                Err(_) => name.to_path_buf(),
+            };
+            for n in [name.to_path_buf(), exposed] {
+                if !names.contains(&n) {
+                    names.push(n);
                 }
             }
         }
+        names
+            .into_iter()
+            .find(|n| decide(self.expanded, self.source, n) == Verdict::Denied)
+            .map(|n| n.to_string())
     }
-    Ok(None)
+}
+
+/// Where the contained symlink at `link` leads, when the deny probe follows
+/// it (see [`probe_dir_for_deny`]): a directory inside `on_disk`. `None` for
+/// a link out of `on_disk`, a link to a file (judged by the link's own name
+/// already), a link that does not resolve or cannot be resolved (the sandbox,
+/// running as the same user, cannot follow it either), and a link that would
+/// close a cycle: its target holds the link, or `chain`, the links followed
+/// on the way here, holds it already.
+fn contained_target(
+    on_disk: &Utf8Path,
+    link: &Utf8Path,
+    chain: &[Utf8PathBuf],
+) -> Option<Utf8PathBuf> {
+    let target = std::fs::canonicalize(link.as_std_path()).ok()?;
+    let target = Utf8PathBuf::from(target.to_string_lossy().into_owned());
+    let followed = target.starts_with(on_disk)
+        && !link.starts_with(&target)
+        && !chain.iter().any(|c| c.as_path() == link)
+        && target.as_std_path().is_dir();
+    followed.then_some(target)
 }
 
 /// Where the probe of a directory walks: `None` when no `deny` can reach
@@ -573,8 +714,8 @@ fn probe_starts(
     expanded: &ExpandedPatchesPolicy,
     declared: &Utf8Path,
     on_disk: &Utf8Path,
-) -> Option<Vec<Utf8PathBuf>> {
-    let mut starts: Vec<Utf8PathBuf> = Vec::new();
+) -> Option<Vec<ProbeStart>> {
+    let mut starts: Vec<ProbeStart> = Vec::new();
     let mut whole = false;
     let mut any = false;
     for fs in expanded.deny() {
@@ -600,31 +741,39 @@ fn probe_starts(
         return None;
     }
     Some(if whole {
-        vec![on_disk.to_path_buf()]
+        vec![ProbeStart::at(on_disk)]
     } else {
         starts
     })
 }
 
-/// `on_disk` joined with the longest leading part of `rel` that passes
-/// through no symlink: where a probe narrowed to `rel` may start.
+/// Where a probe narrowed to `rel` under `on_disk` may start: `on_disk`
+/// joined with the longest leading part of `rel` the probe can follow.
 ///
 /// A path lookup follows every symlink on the way, whatever the walk's
-/// `follow_links`, so a walk rooted at `<dir>/link/sub` would read the host
-/// target of a link the directory holds. The probe judges a contained link as
-/// the link and never looks at its target (see [`probe_dir_for_deny`]), so
-/// the root stops at the link's parent, where the walk meets the link as an
-/// entry and does not descend into it. A part that does not exist, or cannot
-/// be looked at, is joined as is: the probe skips a root that is not there
-/// and refuses one it cannot read.
-fn narrowed_root(on_disk: &Utf8Path, rel: &str) -> Utf8PathBuf {
-    let mut start = on_disk.to_path_buf();
+/// `follow_links`, so a walk rooted at `<dir>/link/sub` would read the
+/// target of a link the directory holds. A link the probe follows (one that
+/// resolves to a directory inside `on_disk`, see [`contained_target`]) is
+/// narrowed through: the walk starts at its target, seen under the link's
+/// name. At any other link the root stops at the link's parent, where the
+/// walk meets the link as an entry and does not descend into it. A part
+/// that does not exist, or cannot be looked at, is joined as is: the probe
+/// skips a root that is not there and refuses one it cannot read.
+fn narrowed_root(on_disk: &Utf8Path, rel: &str) -> ProbeStart {
+    let mut start = ProbeStart::at(on_disk);
     for seg in rel.split('/').filter(|s| !s.is_empty()) {
-        let next = start.join(seg);
-        if std::fs::symlink_metadata(next.as_std_path()).is_ok_and(|m| m.file_type().is_symlink()) {
-            break;
-        }
-        start = next;
+        let next = start.real.join(seg);
+        let is_link =
+            std::fs::symlink_metadata(next.as_std_path()).is_ok_and(|m| m.file_type().is_symlink());
+        start.real = if is_link {
+            match contained_target(on_disk, &next, &[]) {
+                Some(target) => target,
+                None => break,
+            }
+        } else {
+            next
+        };
+        start.seen_as.push(seg);
     }
     start
 }
@@ -890,10 +1039,11 @@ mod tests {
         assert!(err.contains("too many to check"), "{err}");
     }
 
-    /// A symlink inside an allowed directory is judged as the link: the mount
-    /// carries the link, which resolves in the sandbox's namespace, not the
-    /// host's. Its host target is not looked up, so the result does not
-    /// depend on whether some `deny` reaches inside the directory.
+    /// A symlink inside an allowed directory that leads out of it is judged
+    /// as the link: the mount carries the link, which resolves in the
+    /// sandbox's namespace, where its host target is not mounted. The target
+    /// is not followed, so the result does not depend on whether some `deny`
+    /// reaches inside the directory.
     #[cfg(unix)]
     #[test]
     fn a_contained_symlink_is_judged_as_the_link() {
@@ -918,9 +1068,9 @@ mod tests {
         );
     }
 
-    /// A `deny` whose root lies under a symlink the directory holds does not
+    /// A `deny` whose root lies under a symlink out of the directory does not
     /// narrow the probe through the link: a walk rooted past the link would
-    /// read the link's host target, which the probe never looks at. The link
+    /// read the link's host target, which the probe does not follow. The link
     /// is judged as the link, as when the directory is walked whole, while
     /// the same `deny` under a real subdirectory still narrows and finds what
     /// it names.
@@ -932,7 +1082,7 @@ mod tests {
         t.file("vault/sub/id.pem");
         let home = t.dir("home");
         std::os::unix::fs::symlink(&vault, home.join("link")).unwrap();
-        assert_eq!(narrowed_root(&home, "link/sub"), home);
+        assert_eq!(narrowed_root(&home, "link/sub"), ProbeStart::at(&home));
         let rules =
             format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{home}/link/sub/*.pem\"]\n");
         assert_eq!(
@@ -941,9 +1091,91 @@ mod tests {
         );
 
         let key = t.file("home/real/sub/id.pem");
-        assert_eq!(narrowed_root(&home, "real/sub"), home.join("real/sub"));
+        assert_eq!(
+            narrowed_root(&home, "real/sub"),
+            ProbeStart::at(&home.join("real/sub"))
+        );
         let rules =
             format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{home}/real/sub/*.pem\"]\n");
+        let err = gate(&t, &dir_patch(&home), &policy(&rules))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("policy denied"), "{err}");
+        assert!(err.contains(key.as_str()), "{err}");
+    }
+
+    /// A stow layout: `patch.dir` is the home, and `~/.ssh` is a link to a
+    /// directory inside it. The mount mirrors the home, so the sandbox reads
+    /// the key as `~/.ssh/id_ed25519`, and both spellings of the deny refuse
+    /// the entry: one with no root, which walks the home and follows the
+    /// link, and one rooted at `~/.ssh`, which narrows through the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_inside_the_directory_is_judged_under_its_name() {
+        let t = Tree::new();
+        let home = t.dir("home");
+        t.file("home/dotfiles/ssh/id_ed25519");
+        std::os::unix::fs::symlink("dotfiles/ssh", home.join(".ssh")).unwrap();
+        assert_eq!(
+            narrowed_root(&home, ".ssh"),
+            ProbeStart {
+                real: home.join("dotfiles/ssh"),
+                seen_as: home.join(".ssh"),
+            }
+        );
+        for deny in ["**/.ssh/**".to_owned(), format!("{home}/.ssh/**")] {
+            let rules = format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{deny}\"]\n");
+            let err = gate(&t, &dir_patch(&home), &policy(&rules))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("policy denied"), "{deny}: {err}");
+            let exposed = home.join(".ssh/id_ed25519");
+            assert!(err.contains(exposed.as_str()), "{deny}: {err}");
+        }
+    }
+
+    /// A link out of the directory is not followed, with or without a root
+    /// on the deny: its target is reachable in the sandbox only if another
+    /// entry mounts it, and that entry is gated on its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_directory_is_not_followed() {
+        let t = Tree::new();
+        let home = t.dir("home");
+        let outside = t.dir("elsewhere/ssh");
+        t.file("elsewhere/ssh/id_ed25519");
+        std::os::unix::fs::symlink(&outside, home.join(".ssh")).unwrap();
+        assert_eq!(narrowed_root(&home, ".ssh"), ProbeStart::at(&home));
+        for deny in ["**/.ssh/**".to_owned(), format!("{home}/.ssh/**")] {
+            let rules = format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{deny}\"]\n");
+            assert_eq!(
+                gate(&t, &dir_patch(&home), &policy(&rules)).unwrap(),
+                dir_patch(&home),
+                "{deny}"
+            );
+        }
+    }
+
+    /// Link cycles inside the directory end: a link to an ancestor, two
+    /// links into each other, and a link to itself. The probe stays far
+    /// below its limit, and a denied file inside the loop is still found.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_cycle_inside_the_directory_ends() {
+        let t = Tree::new();
+        let home = t.dir("home");
+        let a = t.dir("home/a");
+        let b = t.dir("home/b");
+        std::os::unix::fs::symlink(&home, a.join("up")).unwrap();
+        std::os::unix::fs::symlink(&b, a.join("to-b")).unwrap();
+        std::os::unix::fs::symlink(&a, b.join("to-a")).unwrap();
+        std::os::unix::fs::symlink("self", home.join("self")).unwrap();
+        let rules = format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"**/*.pem\"]\n");
+        assert_eq!(
+            gate(&t, &dir_patch(&home), &policy(&rules)).unwrap(),
+            dir_patch(&home)
+        );
+        let key = t.file("home/b/id.pem");
         let err = gate(&t, &dir_patch(&home), &policy(&rules))
             .unwrap_err()
             .to_string();

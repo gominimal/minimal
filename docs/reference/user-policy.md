@@ -157,6 +157,9 @@ a `deny` pattern can match inside a directory (`**/*.pem` can match in any
 directory; `~/.ssh/**` only under `~/.ssh`), the part of the directory it can
 reach is also checked for a path the rule names, and the entry is refused if
 one is found, or if that part holds more than 10,000 entries to check. A
+symlink in the directory that leads elsewhere in it is checked under the
+link's name too, since the sandbox sees it there: with `~/.ssh` a link to
+`~/dotfiles/ssh`, `**/.ssh/**` refuses a home with a key in it. A
 directory no `deny` pattern can reach inside is mounted without the check.
 `$NAME` references expand against the environment `mip` runs in. `mip` does
 not prompt: an entry that no rule allows refuses the run, with the
