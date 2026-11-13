@@ -21,14 +21,18 @@ __min_rpc() {
                 # The name comes from package metadata, and bash would
                 # evaluate a crafted one (array subscripts in `declare`
                 # run commands). Only export names that are bare
-                # identifiers, via `printf -v` so the name is never
-                # re-evaluated.
-                if [[ "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-                    printf -v "$varname" '%s' "$varval"
-                    export "$varname"
-                    env_pairs+=("${varname}=${varval}")
-                else
+                # identifiers. `declare -g` writes the global even where
+                # a local of the same name, here or in a caller, would
+                # take a plain assignment. Its value stays literal unless
+                # the global is an array and the value opens with `(`,
+                # which is read as an array list, so that is refused.
+                if [[ ! "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
                     printf 'min: refusing to export environment variable with an invalid name: %s\n' "$varname" >&2
+                elif [[ "$varval" == \(* ]]; then
+                    printf 'min: refusing to export %s: a value starting with ( would be read as an array\n' "$varname" >&2
+                else
+                    declare -gx -- "${varname}=${varval}"
+                    env_pairs+=("${varname}=${varval}")
                 fi
                 ;;
             done)
