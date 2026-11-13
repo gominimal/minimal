@@ -7050,3 +7050,150 @@ async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
         assert!(line.contains("exit_code=3"), "{line}");
     }
 }
+
+/// BOX-059, BOX-061, BOX-156, BOX-160 end to end: a project Box Type that
+/// extends `task` only narrows it. A type that tries to loosen the root's
+/// constraint does not resolve. An entry of the narrowing type that breaks
+/// a constraint is refused at expansion, with exit 3. The spec that the
+/// client did not check is refused again at the daemon, with exit 3,
+/// naming the type, its root `task` and the key. The daemon log names both
+/// refusals (the flat key and the key under its section), and the create
+/// span records each one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn derived_task_type_refused_at_expansion_and_admission() {
+    use mfile::box_types::{BoxTypeError, BoxTypes};
+    use mfile::expand::{Layers, check_constraints, expand, expandable_type};
+
+    const FILE: &str = r#"
+        [box_types.ci]
+        extends = "task"
+        constraints = { pty_enabled = false, restart = "never" }
+
+        [boxes.lint-flat]
+        type = "ci"
+        pty_enabled = true
+
+        [boxes.lint-nested]
+        type = "ci"
+        io = { pty_enabled = true }
+    "#;
+
+    // A type cannot loosen the constraint of the root it extends.
+    let loose = format!(
+        "{FILE}\n[box_types.ci-loose]\nextends = \"task\"\n\
+         constraints = {{ pty_enabled = [false, true] }}\n"
+    );
+    let doc = loose.parse().expect("the file is TOML");
+    let err = BoxTypes::from_file(&doc).expect_err("a loosening type does not resolve");
+    assert!(
+        matches!(&err, BoxTypeError::Loosening { name, key, parent, .. }
+            if name == "ci-loose" && key == "pty_enabled" && parent == "task"),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 3);
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let doc = FILE.parse().expect("the file is TOML");
+    let types = BoxTypes::from_file(&doc).expect("the narrowing type resolves");
+    let entries = mfile::entry::read_entries(FILE.as_bytes()).expect("the entries read");
+
+    for (name, key) in [
+        ("lint-flat", "pty_enabled"),
+        ("lint-nested", "io.pty_enabled"),
+    ] {
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"));
+        let resolved = expandable_type(entry, &types).expect("a task-rooted type expands");
+        assert_eq!((resolved.name.as_str(), resolved.root), ("ci", "task"));
+        let layers = Layers {
+            type_defaults: resolved.defaults.clone(),
+            ..Layers::default()
+        };
+        let expansion = expand(entry, &layers).expect("the entry expands");
+
+        // Refused at expansion.
+        let err = check_constraints(entry, &expansion, &resolved)
+            .expect_err("the entry breaks the type's constraint");
+        assert_eq!(err.exit_code(), 3, "{name}");
+        let text = err.to_string();
+        for word in [
+            format!("`[boxes.{name}]`"),
+            format!("`{key}`"),
+            "`[box_types.ci]`".to_owned(),
+        ] {
+            assert!(
+                text.contains(&word),
+                "{name}: expansion names {word}: {text}"
+            );
+        }
+
+        // Refused again at the daemon, which receives the spec unchecked.
+        let mut spec = task_spec(name, None);
+        let expanded =
+            serde_json_lenient::to_value(&expansion.spec).expect("a TOML table serializes");
+        for (k, v) in expanded.as_object().expect("the spec is a table") {
+            match (spec.get_mut(k), v) {
+                (
+                    Some(serde_json_lenient::Value::Object(base)),
+                    serde_json_lenient::Value::Object(over),
+                ) => base.extend(over.clone()),
+                _ => {
+                    spec[k.as_str()] = v.clone();
+                }
+            }
+        }
+        spec["box"]["type"] = serde_json_lenient::json!(resolved.name);
+        spec["type"] = serde_json_lenient::json!({ "root": resolved.root });
+
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let err = mngr
+            .create_box_with_spec(as_task(unnamed_config()), Some(spec), None, None)
+            .await
+            .expect_err("the daemon refuses the spec its root excludes");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{name}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<RootConstraintRefusal>())
+            .unwrap_or_else(|| panic!("{name}: the error is the root refusal: {err}"));
+        assert_eq!(refusal.exit_code(), 3, "{name}");
+        assert_eq!(
+            (
+                refusal.box_type.as_str(),
+                refusal.root.as_str(),
+                refusal.key.as_str(),
+                refusal.value.as_str()
+            ),
+            ("ci", "task", key, "true"),
+            "{name}"
+        );
+        let text = err.to_string();
+        for word in ["`ci`", "`task`", &format!("`{key}`")] {
+            assert!(
+                text.contains(word),
+                "{name}: the daemon names {word}: {text}"
+            );
+        }
+        assert!(!text.contains("BOX-"), "{name}: {text}");
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{name}: a refused create files no record"
+        );
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("its type's built-in root excludes")
+                    && line.contains(&format!("box_type=ci root=task key={key} "))
+            })
+            .unwrap_or_else(|| panic!("{name}: the daemon log names the refusal:\n{logged}"));
+        assert!(line.contains("exit_code=3"), "{line}");
+        assert!(
+            line.contains("refusal="),
+            "the create span records it: {line}"
+        );
+    }
+}
