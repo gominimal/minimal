@@ -1010,8 +1010,19 @@ pub fn replace_outcome<S: KeyStore>(
     // move back. It comes back too.
     // A store that does not say whether `Slot::New` holds a key stops the
     // replacement, so the cleanup never removes an old key it can recover.
-    let mut held = true;
-    if matches!(store.find(role), Ok(None)) {
+    // BEP-089: a key whose key file is gone leaves the label as empty as
+    // `Ok(None)` does, so it takes the same path. Any other lost key is
+    // still under the label, but no key is in use.
+    let found = store.find(role);
+    let mut held = !matches!(found, Err(KeyError::TpmLost { .. }));
+    if matches!(
+        found,
+        Ok(None)
+            | Err(KeyError::TpmLost {
+                case: TpmLost::MissingKeyFile { .. },
+                ..
+            })
+    ) {
         held = match recover_interrupted(store, role, published) {
             Ok(recovered) => recovered,
             Err(Interrupted::Check(err)) => {

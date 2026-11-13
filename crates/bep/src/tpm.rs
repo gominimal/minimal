@@ -199,7 +199,10 @@ fn load_error(role: Role, err: ToolError) -> KeyError {
         ToolError::Tpm(detail) => {
             let code = detail.rsplit(' ').next().unwrap_or_default();
             let response = format!("TPM response code {code}");
-            if is_lost_key(code) {
+            // Only `tpm2_load` reads the key file. The same code from
+            // `tpm2_createprimary` says the owner hierarchy is off now,
+            // which can change, and the key file is still good.
+            if detail.starts_with("tpm2_load ") && is_lost_key(code) {
                 KeyError::TpmLost {
                     role,
                     case: TpmLost::NotThisTpm { response },
@@ -227,6 +230,14 @@ fn read_error(role: Role, path: &Path, err: &io::Error, missing: TpmLost) -> Key
             role,
             case: missing,
         },
+        _ => unreadable_error(role, path, err),
+    }
+}
+
+/// Sorts a failed read of a file that is there (BEP-089). A file the
+/// proxy's user cannot read keeps the key.
+fn unreadable_error(role: Role, path: &Path, err: &io::Error) -> KeyError {
+    match err.kind() {
         io::ErrorKind::PermissionDenied => KeyError::TpmKept {
             role,
             case: TpmKept::Unreadable {
@@ -804,12 +815,7 @@ impl TpmStore {
         match fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(read_error(
-                role,
-                &path,
-                &err,
-                TpmLost::MissingKeyFile { path: path.clone() },
-            )),
+            Err(err) => Err(unreadable_error(role, &path, &err)),
         }
     }
 
@@ -1702,6 +1708,22 @@ mod tests {
                 )
             );
         }
+
+        // A hierarchy error from the storage key says the owner hierarchy
+        // is off now, not that the key file is bad, so the key is kept.
+        let err = load_error(
+            Role::Root,
+            ToolError::Tpm("tpm2_createprimary failed with TPM response code 0x00000085".into()),
+        );
+        assert_eq!(
+            err,
+            KeyError::TpmKept {
+                role: Role::Root,
+                case: TpmKept::Unavailable {
+                    response: "TPM response code 0x00000085".into(),
+                },
+            }
+        );
     }
 
     // BEP-089: a missing key file, a missing authorization file, and a key
