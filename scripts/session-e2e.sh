@@ -416,6 +416,10 @@
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# e2e_timeout: a host-side timeout that also works with no GNU timeout on
+# PATH, as on a stock Mac.
+# shellcheck disable=SC1091
+source "$ROOT/scripts/e2e-host-timeout.sh"
 E2E_VM="${E2E_VM:-}"
 
 # The VM-backed cases documented as such above and invoked directly by their
@@ -1768,7 +1772,7 @@ er_detached() {
     echo "--- stderr ---" >&2; cat "$WORK/exec-reattach-$1.err" >&2 2>/dev/null || true
     return 1
   fi
-  timeout 30 "${er_ssh[@]}" "min://exec/wait $id" </dev/null >/dev/null 2>>"$WORK/exec-reattach-$1.err"
+  e2e_timeout 30 "${er_ssh[@]}" "min://exec/wait $id" </dev/null >/dev/null 2>>"$WORK/exec-reattach-$1.err"
   rc=$?
   if [ "$rc" -ne "$3" ]; then
     echo "::error::'min://exec/wait $id' ($1) exited $rc (expected the exec's $3)" >&2
@@ -1861,7 +1865,7 @@ fi
 
 # No client now. The exec writes on. A second client, with the id alone,
 # gets the replay, types again, and ends with the exec's exit code.
-printf 'two\n' | timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" \
+printf 'two\n' | e2e_timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" \
   >"$WORK/exec-reattach-attach2.out" 2>&1
 rc=$?
 out2="$(tr -d '\r' <"$WORK/exec-reattach-attach2.out")"
@@ -1887,7 +1891,7 @@ if ! printf '%s' "$det_id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-
   fail
 fi
 echo "detached exec: $det_id"
-timeout 30 "${er_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/exec-reattach-wait.err"
+e2e_timeout 30 "${er_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/exec-reattach-wait.err"
 rc=$?
 if [ "$rc" -ne 7 ]; then
   echo "::error::'min://exec/wait $det_id' exited $rc (expected the exec's 7)"
@@ -2049,7 +2053,7 @@ user="$(printf '%s' "$entry" | jq -r .username)"
 opts=()
 while IFS= read -r i; do opts+=("$i"); done < <(printf '%s' "$entry" | jq -r '.args[]')
 be_ssh=(ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=30 "${opts[@]}" "$user@$host")
-timeout 30 "${be_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/box-exec-wait.err"
+e2e_timeout 30 "${be_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/box-exec-wait.err"
 rc=$?
 if [ "$rc" -ne 7 ]; then
   echo "::error::'min://exec/wait $det_id' exited $rc (expected the detached command's 7)"
