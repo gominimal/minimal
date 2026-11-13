@@ -2141,21 +2141,105 @@ pub(crate) enum AttachEnd {
     Exited(ExecExit),
     /// The client went away. The exec keeps running for a later attach.
     ClientGone,
+    /// The client typed the detach keys. The exec keeps running for a later
+    /// attach, and the client's channel ends with status 0.
+    Detached,
+}
+
+/// How long a chord prefix the matcher holds (a lone `ESC`) waits for the
+/// next keystroke before it goes to the terminal as typed. The box's own
+/// terminal waits the same.
+const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What an exec attach prints on its terminal when the client detaches.
+fn detached_notice(id: &ExecId) -> String {
+    format!("\r\nDetached from exec {id}. It keeps running.\r\n")
+}
+
+/// How long a detach waits for its client to take the detach notice. The
+/// box's own terminal bounds its detach the same.
+const DETACH_NOTICE_BOUND: Duration = crate::box_actor::HOST_PROBE_TIMEOUT;
+
+/// Writes `bytes` to the client of the exec attach `id`, for at most
+/// `bound`. A client that does not read, or a write that fails, skips the
+/// bytes: the caller goes on without them.
+async fn write_bounded<W>(out: &mut W, bytes: &[u8], id: &ExecId, bound: Duration)
+where
+    W: AsyncWrite + Unpin,
+{
+    let write = async {
+        out.write_all(bytes).await?;
+        out.flush().await
+    };
+    match tokio::time::timeout(bound, write).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(exec_id = %id, %error, "exec: a key notice to the attached client failed");
+        }
+        Err(_) => {
+            tracing::debug!(exec_id = %id, "exec: the attached client did not read a key notice");
+        }
+    }
+}
+
+/// Rings the bell on the client of the exec attach `id`, without a wait.
+/// The bell goes only when the client has room for it now. An awaited
+/// write would park the relay loop behind a client that does not read, as
+/// the box's own terminal notes for its bell.
+fn ring_bell<W>(out: &mut W, id: &ExecId)
+where
+    W: AsyncWrite + Unpin,
+{
+    use futures::FutureExt as _;
+    match out.write(b"\x07").now_or_never() {
+        Some(Ok(_)) => {
+            // The flush gets one poll too. The bell is a hint, and a
+            // client that is behind can do without it.
+            let _ = out.flush().now_or_never();
+        }
+        Some(Err(error)) => {
+            tracing::debug!(exec_id = %id, %error, "exec: the leader bell to the attached client failed");
+        }
+        None => {
+            tracing::debug!(exec_id = %id, "exec: the attached client had no room for the leader bell");
+        }
+    }
 }
 
 /// Resumes a tty exec's terminal for one client: the transcript so far,
 /// then what the terminal writes, while what the client types goes to the
 /// terminal. Returns when the exec ends or the client goes away. The exec
 /// keeps running when the client goes away.
+#[cfg(test)]
 pub(crate) async fn relay_terminal<M, W>(
     entry: &ExecEntry,
-    mut msgs: M,
+    msgs: M,
     out: &mut W,
 ) -> io::Result<AttachEnd>
 where
     M: Stream<Item = russh::ChannelMsg> + Unpin,
     W: AsyncWrite + Unpin,
 {
+    relay_terminal_keyed(entry, msgs, out, None).await
+}
+
+/// [`relay_terminal`], with the session keys the client negotiated. With
+/// `keys`, what the client types goes through the same leader and detach
+/// state machine as a box's own terminal: the leader is swallowed, the
+/// detach key ends the attach as [`AttachEnd::Detached`], and the forward
+/// key sends one leader byte to the terminal. The exec keeps running after
+/// a detach (BCLI-068). Without `keys`, every byte goes to the terminal.
+pub(crate) async fn relay_terminal_keyed<M, W>(
+    entry: &ExecEntry,
+    mut msgs: M,
+    out: &mut W,
+    keys: Option<boxes::keys::SessionKeys>,
+) -> io::Result<AttachEnd>
+where
+    M: Stream<Item = russh::ChannelMsg> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use boxes::keys::{ChordMatcher, FeedOutcome, KeyAction};
     let (replay, live) = entry.replay_and_follow()?;
     replay.copy_to(out).await?;
     out.flush().await?;
@@ -2164,7 +2248,10 @@ where
     };
     let mut exit = entry.exit.subscribe();
     let mut typing = true;
+    let mut chords = keys.map(ChordMatcher::new);
+    let mut flush_at: Option<tokio::time::Instant> = None;
     loop {
+        let deadline = flush_at;
         tokio::select! {
             biased;
             chunk = live.recv() => match chunk {
@@ -2195,13 +2282,73 @@ where
             }
             msg = msgs.next(), if typing => match msg {
                 Some(russh::ChannelMsg::Data { data }) => {
-                    entry.send_input(&data);
+                    let Some(matcher) = chords.as_mut() else {
+                        entry.send_input(&data);
+                        continue;
+                    };
+                    let mut forward = Vec::new();
+                    let mut detach = false;
+                    for outcome in matcher.feed(&data) {
+                        match outcome {
+                            FeedOutcome::Forward(bytes) => forward.extend_from_slice(&bytes),
+                            FeedOutcome::Action(KeyAction::Swallow) => {}
+                            FeedOutcome::Action(KeyAction::EnterCommandMode) => {
+                                // The bell goes to the client, never to the
+                                // terminal, as on a box's own terminal.
+                                if matcher.keys().bell_on_leader {
+                                    ring_bell(out, &entry.id);
+                                }
+                            }
+                            FeedOutcome::Action(KeyAction::Detach) => {
+                                detach = true;
+                                break;
+                            }
+                            FeedOutcome::Action(KeyAction::ForwardLeader) => {
+                                forward.push(matcher.keys().leader.plain_byte());
+                            }
+                        }
+                    }
+                    if !forward.is_empty() {
+                        entry.send_input(&forward);
+                    }
+                    if detach {
+                        // The detach keys are how a person leaves a stalled
+                        // attach, so the notice holds the detach for at
+                        // most its short bound.
+                        write_bounded(
+                            out,
+                            detached_notice(&entry.id).as_bytes(),
+                            &entry.id,
+                            DETACH_NOTICE_BOUND,
+                        )
+                        .await;
+                        return Ok(AttachEnd::Detached);
+                    }
+                    // A chunk that leaves a chord prefix held (a lone `ESC`)
+                    // must not hold it until the next keystroke.
+                    flush_at = matcher
+                        .has_pending()
+                        .then(|| tokio::time::Instant::now() + CHORD_FLUSH_IDLE);
                 }
                 // The client sends no more input, but it still reads.
                 Some(russh::ChannelMsg::Eof) => typing = false,
                 Some(russh::ChannelMsg::Close) | None => return Ok(AttachEnd::ClientGone),
                 Some(_) => {}
             },
+            () = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                flush_at = None;
+                if let Some(matcher) = chords.as_mut() {
+                    let held = matcher.flush();
+                    if !held.is_empty() {
+                        entry.send_input(&held);
+                    }
+                }
+            }
         }
     }
 }
@@ -2364,6 +2511,7 @@ pub(crate) fn attach_end_status(exit: ExecExit, box_ending: bool) -> u32 {
 /// Resumes a tty exec's terminal for one client, as [`relay_terminal`]
 /// does, and returns the exit status for the client's channel. `None` when
 /// the client went away.
+#[cfg(test)]
 pub(crate) async fn attach_terminal<M, W>(
     entry: &ExecEntry,
     session: &BoxHandle,
@@ -2374,7 +2522,24 @@ where
     M: Stream<Item = russh::ChannelMsg> + Unpin,
     W: AsyncWrite + Unpin,
 {
-    match relay_terminal(entry, msgs, out).await? {
+    attach_terminal_keyed(entry, session, msgs, out, None).await
+}
+
+/// [`attach_terminal`], with the session keys the client negotiated
+/// ([`relay_terminal_keyed`]). A detach gives status 0, as a detach from a
+/// box's own terminal does, and the exec keeps running.
+pub(crate) async fn attach_terminal_keyed<M, W>(
+    entry: &ExecEntry,
+    session: &BoxHandle,
+    msgs: M,
+    out: &mut W,
+    keys: Option<boxes::keys::SessionKeys>,
+) -> io::Result<Option<u32>>
+where
+    M: Stream<Item = russh::ChannelMsg> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match relay_terminal_keyed(entry, msgs, out, keys).await? {
         AttachEnd::Exited(exit) => {
             let ending = box_is_ending(session);
             let status = attach_end_status(exit, ending);
@@ -2389,15 +2554,22 @@ where
             Ok(Some(status))
         }
         AttachEnd::ClientGone => Ok(None),
+        AttachEnd::Detached => {
+            tracing::info!(exec_id = %entry.id, "exec: the attached client detached; the exec runs on");
+            Ok(Some(0))
+        }
     }
 }
 
 /// Serves `min://exec/attach`: resumes a tty exec's terminal on the channel.
+/// `keys` are the session keys the channel negotiated. Their detach key ends
+/// the channel with status 0 and leaves the exec running (BCLI-068).
 pub(crate) async fn serve_exec_attach(
     channel: Channel<Msg>,
     session: BoxHandle,
     box_id: SessionId,
     id: ExecId,
+    keys: boxes::keys::SessionKeys,
 ) {
     let Some(entry) = find_exec(box_id, &id) else {
         answer_exec(channel, b"", unknown_exit_message(&id).as_bytes(), 1).await;
@@ -2416,7 +2588,7 @@ pub(crate) async fn serve_exec_attach(
     }));
     let mut w = ws.make_writer();
     tracing::info!(exec_id = %id, "exec: a client attached to the exec's terminal");
-    match attach_terminal(&entry, &session, msgs, &mut w).await {
+    match attach_terminal_keyed(&entry, &session, msgs, &mut w, Some(keys)).await {
         Ok(Some(status)) => {
             let _ = w.flush().await;
             let _ = ws.eof().await;
@@ -2483,4 +2655,201 @@ fn unknown_exit_message(id: &ExecId) -> String {
 /// The line a wait prints for an exec that its own timeout ended.
 fn timeout_message(id: &ExecId) -> String {
     format!("exec {id} ran past its timeout and was stopped.\n")
+}
+
+#[cfg(test)]
+mod detach_tests {
+    use super::*;
+
+    /// A tty exec's entry with a live terminal and an empty transcript, as
+    /// the daemon registers one, without a process behind it. The reader is
+    /// the terminal's side of the input, which holds what clients type.
+    fn live_tty_entry(dir: &tempfile::TempDir) -> (Arc<ExecEntry>, HeldInputReader) {
+        let id = crate::exec::process::mint_exec_id();
+        let transcript =
+            camino::Utf8PathBuf::from_path_buf(dir.path().join(id.as_str())).expect("a UTF-8 path");
+        std::fs::write(&transcript, b"").expect("the transcript is written");
+        let (terminal, typed) = ExecTerminal::new(HeldInputLimits::for_daemon());
+        let entry = Arc::new(ExecEntry::new(
+            id,
+            SessionId::mint(),
+            ExecMode::Tty,
+            vec!["sh".to_owned(), "-i".to_owned()],
+            transcript,
+            Some(terminal),
+        ));
+        register_exec(Arc::clone(&entry));
+        (entry, typed)
+    }
+
+    fn msg_stream() -> (
+        tokio::sync::mpsc::UnboundedSender<russh::ChannelMsg>,
+        std::pin::Pin<Box<dyn futures::Stream<Item = russh::ChannelMsg> + Send>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let msgs = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|m| (m, rx))
+        }));
+        (tx, msgs)
+    }
+
+    fn typed(bytes: &[u8]) -> russh::ChannelMsg {
+        russh::ChannelMsg::Data {
+            data: bytes.to_vec().into(),
+        }
+    }
+
+    /// BCLI-068: the detach keys end an exec attach as a box attach ends,
+    /// with status 0 on the channel and a line that says the exec runs on.
+    /// The leader and the detach key never reach the exec's terminal. The
+    /// exec keeps running, and a second attach reaches it.
+    #[tokio::test]
+    async fn serve_exec_attach_detach_key_ends_channel_exec_runs() {
+        use tokio::io::AsyncReadExt as _;
+
+        let session = crate::box_actor::WeakBoxHandle::answering(Vec::new())
+            .upgrade()
+            .expect("the stand-in actor lives");
+        session.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+        let dir = tempfile::tempdir().unwrap();
+        let (entry, _terminal_input) = live_tty_entry(&dir);
+        let keys = boxes::keys::SessionKeys::default();
+
+        // First attach: `ab`, then Ctrl-] d.
+        let (tx, msgs) = msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let first = crate::traced::spawn({
+            let entry = Arc::clone(&entry);
+            let session = session.clone();
+            async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
+        });
+        tx.send(typed(b"ab\x1dd")).unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), first)
+            .await
+            .expect("the detach ends the attach")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(0), "a detach ends the channel with status 0");
+        let mut seen = Vec::new();
+        client.read_to_end(&mut seen).await.unwrap();
+        let seen = String::from_utf8_lossy(&seen);
+        assert!(
+            seen.contains(&format!(
+                "Detached from exec {}. It keeps running.",
+                entry.id
+            )),
+            "{seen:?}"
+        );
+        assert_eq!(
+            entry.held_input(),
+            2,
+            "only `ab` reaches the terminal, not the keys"
+        );
+        assert!(entry.exit.borrow().is_none(), "the exec keeps running");
+        assert!(find_exec(entry.box_id, &entry.id).is_some());
+
+        // Second attach: it takes input, and ends with the exec.
+        let (tx, msgs) = msg_stream();
+        let (_client, mut server) = tokio::io::duplex(1 << 16);
+        let second = crate::traced::spawn({
+            let entry = Arc::clone(&entry);
+            let session = session.clone();
+            async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
+        });
+        tx.send(typed(b"hi")).unwrap();
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while entry.held_input() != 4 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(reached.is_ok(), "the second attach reaches the exec");
+        entry.finish(ExecExit {
+            code: Some(3),
+            reason: ExecExitReason::Exited,
+        });
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+            .await
+            .expect("the exec's end ends the attach")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(3), "the second attach ends with the exec");
+    }
+
+    /// BCLI-068: the detach keys end an exec attach whose client does not
+    /// read. The notice waits at most its bound, and the channel still ends
+    /// with status 0 while the exec runs on.
+    #[tokio::test(start_paused = true)]
+    async fn serve_exec_attach_detach_key_ends_channel_exec_runs_for_a_client_that_does_not_read() {
+        let session = crate::box_actor::WeakBoxHandle::answering(Vec::new())
+            .upgrade()
+            .expect("the stand-in actor lives");
+        session.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+        let dir = tempfile::tempdir().unwrap();
+        let (entry, _terminal_input) = live_tty_entry(&dir);
+        let keys = boxes::keys::SessionKeys::default();
+
+        let (tx, msgs) = msg_stream();
+        // One byte of room, and the client never reads it.
+        let (_client, mut server) = tokio::io::duplex(1);
+        let attach = crate::traced::spawn({
+            let entry = Arc::clone(&entry);
+            let session = session.clone();
+            async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
+        });
+        tx.send(typed(b"\x1dd")).unwrap();
+        let status = tokio::time::timeout(EXIT_NOTICE_BOUND * 4, attach)
+            .await
+            .expect("the detach ends the attach")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(0), "a detach ends the channel with status 0");
+        assert!(entry.exit.borrow().is_none(), "the exec keeps running");
+    }
+
+    /// BCLI-068: the leader bell never parks the relay behind a client that
+    /// does not read. What the client types after the leader presses goes
+    /// to the exec at once, and the detach then ends the attach within its
+    /// short bound.
+    #[tokio::test(start_paused = true)]
+    async fn serve_exec_attach_detach_key_ends_channel_exec_runs_bell_never_stalls() {
+        let session = crate::box_actor::WeakBoxHandle::answering(Vec::new())
+            .upgrade()
+            .expect("the stand-in actor lives");
+        session.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+        let dir = tempfile::tempdir().unwrap();
+        let (entry, _terminal_input) = live_tty_entry(&dir);
+        let keys = boxes::keys::SessionKeys {
+            bell_on_leader: true,
+            ..boxes::keys::SessionKeys::default()
+        };
+
+        let (tx, msgs) = msg_stream();
+        // One byte of room, and the client never reads it.
+        let (_client, mut server) = tokio::io::duplex(1);
+        let started = tokio::time::Instant::now();
+        let attach = crate::traced::spawn({
+            let entry = Arc::clone(&entry);
+            let session = session.clone();
+            async move { attach_terminal_keyed(&entry, &session, msgs, &mut server, Some(keys)).await }
+        });
+        // Three leader presses, each with an unbound key, then `ab`.
+        tx.send(typed(b"\x1dx\x1dx\x1dxab")).unwrap();
+        while entry.held_input() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.elapsed() < EXIT_NOTICE_BOUND,
+            "the bells held the input for {:?}",
+            started.elapsed()
+        );
+        tx.send(typed(b"\x1dd")).unwrap();
+        let status = tokio::time::timeout(DETACH_NOTICE_BOUND * 2, attach)
+            .await
+            .expect("the detach ends the attach within its bound")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(0), "a detach ends the channel with status 0");
+        assert!(entry.exit.borrow().is_none(), "the exec keeps running");
+    }
 }
