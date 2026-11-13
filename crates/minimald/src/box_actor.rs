@@ -825,6 +825,11 @@ pub struct BoxActor {
     /// where the check falls back to evaluating the graph itself.
     composed_graph_names: Option<HashSet<String>>,
 
+    /// The project's `[upstream]` pin as compose read it, beside
+    /// [`Self::composed_graph_names`] and set and cleared with it, so the
+    /// fast-path refusal names the commit those names came from.
+    composed_upstream_pin: Option<crate::env::UpstreamPin>,
+
     /// How the box ended, kept when a stop killed its processes but could
     /// not write the `stopped` record. The actor then keeps hosting the box,
     /// and a retried stop writes this ending, not one it has no process
@@ -905,6 +910,7 @@ impl BoxActor {
             // `None` until then (and forever for an actor restored from
             // disk, whose compose predates this process).
             composed_graph_names: None,
+            composed_upstream_pin: None,
             // No stop has run yet.
             unrecorded_stop: None,
             // No timeout has ended the box yet.
@@ -2861,6 +2867,7 @@ impl BoxActor {
             #[cfg(test)]
             BoxMessage::ForgetComposedGraphNames(r) => {
                 self.composed_graph_names = None;
+                self.composed_upstream_pin = None;
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the asker may already be gone; there is nothing to answer then"
