@@ -1644,8 +1644,11 @@ pub(crate) fn task_box_entry(
     }) else {
         return Ok(None);
     };
-    // `min task run` does not pass its loadouts yet, and a task is sealed
-    // by default (BOX-169).
+    // Gap (BOX-183, issue #3302): `min task run` does not pass its gated
+    // loadouts here yet, so the loadout var conflict refusal does not run
+    // before it creates the task box. A task is sealed by default
+    // (BOX-169), but an open task takes its loadouts only on the
+    // contribution from `task_activation_inputs`.
     box_entry(
         project,
         &bytes,
@@ -1721,8 +1724,12 @@ fn box_entry(
     whole.loadouts = selected.layers()?;
     (whole.type_defaults, whole.type_constraints) = entry_type_layers(&doc, &entry);
     whole.host_vars = host_vars(&whole);
-    let full =
+    let mut full =
         mfile::expand::expand(&entry, &whole).map_err(|error| ProjectFileInvalid { error })?;
+    // With hooks off (`--no-hooks`), the spec carries no hook.
+    if !hooks_enabled {
+        full.spec.remove("lifecycle_hooks");
+    }
     // The report keeps the layer, and the loadout, of each hook.
     let origins = match full.report.values.get("lifecycle_hooks") {
         Some(mfile::expand::ValueOrigin::List(origins)) => origins.as_slice(),

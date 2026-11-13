@@ -14669,6 +14669,18 @@ lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo project" } }
         ]
     );
 
+    // With hooks off (`--no-hooks`), the expanded spec keeps no hook, and
+    // the daemon gets none.
+    let unhooked = crate::session_box_expansion(root, None, false, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+    assert!(
+        !unhooked.spec.contains_key("lifecycle_hooks"),
+        "{:?}",
+        unhooked.spec
+    );
+    assert!(unhooked.wire.lifecycle_hooks.is_none());
+
     // The daemon gets only the project's hook, without `declared_by`, and
     // composes the box from it.
     let sent = expanded.wire.lifecycle_hooks.clone().expect("hooks are on");
