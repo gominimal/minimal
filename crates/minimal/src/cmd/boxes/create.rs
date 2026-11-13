@@ -3740,13 +3740,8 @@ pub(crate) async fn activate_box(
             &selected,
         )
     })?;
-    if let Some(expanded) = &expanded {
-        tracing::debug!(
-            parent: &entry_span,
-            spec = ?expanded.spec,
-            "the expanded spec, with the selected loadouts"
-        );
-    }
+    // The expansion logs each hook with its declarer and layer. The whole
+    // spec is not logged, because it carries loadout variable values.
     contribution.entry = expanded.map(|expanded| Box::new(expanded.wire));
 
     // The upload decision needs no TTY — the interactive `Confirm` is answered
