@@ -564,6 +564,12 @@ pub struct BoxLogsArgs {
     /// writes it, until the box is removed or the command is interrupted
     #[arg(short = 'f', long)]
     pub follow: bool,
+    /// Write the box's own output byte for byte, with its terminal control
+    /// codes. Without `--raw`, the codes are removed from the output of a
+    /// box with a terminal when stdout is not a terminal. `--exec` output is
+    /// always written unchanged, so `--exec` does not take `--raw`
+    #[arg(long)]
+    pub raw: bool,
 }
 
 // BCLI-012, BCLI-056: `min box logs <box> [-f | --exec <id>]`. Only the box
@@ -575,7 +581,11 @@ pub struct BoxLogsExecArgs {
     pub logs: BoxLogsArgs,
     /// Show what one command printed, by the exec id that `min box exec`
     /// printed for it. The command can be running or ended
-    #[arg(long = "exec", value_name = "EXEC_ID", conflicts_with = "follow")]
+    #[arg(
+        long = "exec",
+        value_name = "EXEC_ID",
+        conflicts_with_all = ["follow", "raw"]
+    )]
     pub exec: Option<String>,
 }
 
@@ -759,6 +769,21 @@ pub struct BoxShowArgs {
     /// the command that created it applied
     #[arg(long)]
     pub network: bool,
+    /// Write the box and its running commands in this format instead of
+    /// text
+    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "network")]
+    pub output: Option<BoxShowOutputFormat>,
+}
+
+/// The formats `min box show` writes, beside text.
+// BCLI-033: each format carries one `min/v1/box` object, its execs as
+// `min/v1/exec` objects.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxShowOutputFormat {
+    /// JSON: one object for the box
+    Json,
+    /// YAML: one mapping for the box
+    Yaml,
 }
 
 // BOX-013 (BCLI-059), BOX-151 (BCLI-055):

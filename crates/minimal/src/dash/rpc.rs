@@ -350,7 +350,7 @@ pub async fn prepare_attach(
     // it: a VM host daemon that restarted holds none, and its gate then drops
     // the box's frames outside the VM (NET-085). Idempotent. The record was
     // read before the admit, so a session destroyed in between has its rules
-    // retired here once a second lookup finds it gone.
+    // retired here, with the retries, once a second lookup finds it gone.
     if let Some(record) = record.as_ref()
         && record.network == NetworkMode::HostNet
         && crate::host_ip_box_with_vm_host_declaring(
@@ -361,15 +361,25 @@ pub async fn prepare_attach(
             crate::HostIpBoxChange::Admit,
         )
         .await
-        && let Ok(None) = crate::attached_box_record(sock, record.id).await
     {
-        crate::host_ip_box_with_vm_host(
-            minimal_client::box_registration::vm_host_control_sock(sock),
-            record.id,
-            None,
-            crate::HostIpBoxChange::Retire(crate::HostIpBoxEnd::Destroyed),
-        )
-        .await;
+        match crate::attached_box_record(sock, record.id).await {
+            Ok(None) => {
+                crate::retire_host_ip_box_with_vm_host(
+                    minimal_client::box_registration::vm_host_control_sock(sock),
+                    record.id,
+                    crate::HostIpBoxEnd::Destroyed,
+                )
+                .await;
+            }
+            // Only a session still there was admitted for good, as on
+            // `min session attach`.
+            Ok(Some(_)) => tracing::info!(
+                session = %record.id,
+                box = record.name.as_deref().unwrap_or("<unnamed>"),
+                "admitted the host_ip box's egress on the VM host daemon"
+            ),
+            Err(_) => {}
+        }
     }
     // The pair and the box id beside it, for the after-attach withdrawal:
     // the id proves a box renamed since its registration (#1116), and goes
@@ -383,12 +393,13 @@ pub async fn prepare_attach(
 /// box's zone hold is released. A session that held neither owes nothing.
 async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record) {
     // A `host_ip` box's egress goes with its session, named or not (NET-085).
+    // The retire is sent again when an exchange fails, so one lost exchange
+    // leaves no gone box's rules in the gate's union.
     if record.network == NetworkMode::HostNet && record.box_addresses.is_none() {
-        crate::host_ip_box_with_vm_host(
+        crate::retire_host_ip_box_with_vm_host(
             minimal_client::box_registration::vm_host_control_sock(sock),
             id,
-            None,
-            crate::HostIpBoxChange::Retire(crate::HostIpBoxEnd::Destroyed),
+            crate::HostIpBoxEnd::Destroyed,
         )
         .await;
     }
@@ -1424,6 +1435,115 @@ mod tests {
             panic!("a destroyed host_ip box goes by the retire verb first: {request:?}");
         };
         assert_eq!(retire.session_id, id);
+    }
+
+    /// A stand-in VM host daemon at `control_sock` that answers every
+    /// `host_ip` admit, and drops the first `unanswered` retires: their
+    /// connection closes, so the exchange fails. Returns the count of
+    /// admits and the count of retires it was sent.
+    fn fake_vm_host_dropping_retires(
+        control_sock: &Path,
+        unanswered: u32,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::UnixListener::bind(control_sock).unwrap();
+        let admits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let retires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (seen_admits, seen_retires) = (admits.clone(), retires.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut lines = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                if lines.read_line(&mut line).await.is_err() {
+                    continue;
+                }
+                let session_id = match serde_json_lenient::from_str(line.trim()) {
+                    Ok(minimald_rpc::BoxControlRequest::AdmitHostIpBox(admit)) => {
+                        seen_admits.fetch_add(1, SeqCst);
+                        admit.session_id
+                    }
+                    Ok(minimald_rpc::BoxControlRequest::RetireHostIpBox(retire)) => {
+                        if seen_retires.fetch_add(1, SeqCst) < unanswered {
+                            continue;
+                        }
+                        retire.session_id
+                    }
+                    _ => continue,
+                };
+                let answer =
+                    serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::HostIpBox {
+                        session_id,
+                        resident: false,
+                    })
+                    .unwrap();
+                let mut writer = lines.into_inner();
+                let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
+            }
+        });
+        (admits, retires)
+    }
+
+    /// NET-085: the dashboard's destroy of a `host_ip` box sends the retire
+    /// again when the first exchange fails, as `min session destroy` does,
+    /// so the gone box's rules leave the gate's union.
+    #[tokio::test]
+    async fn tui_destroy_retires_a_host_ip_box_after_a_lost_exchange() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = vm_host_dir(&dir);
+        let ssh_sock = host_dir.join("ssh.sock");
+        let (_, retires) = fake_vm_host_dropping_retires(
+            &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            1,
+        );
+        let mut record = own_ip_record(None);
+        record.id = SessionId::from_bytes([7; 16]);
+        record.network = NetworkMode::HostNet;
+        settle_destroyed_box(&ssh_sock, record.id, &record).await;
+        assert_eq!(
+            retires.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the destroy's retire is sent again after the first is lost"
+        );
+    }
+
+    /// NET-085: a dashboard attach re-admits a `host_ip` box, and a session
+    /// gone by the second lookup has the admit undone. The undo sends the
+    /// retire again when the first exchange fails, as `min session attach`
+    /// does.
+    #[tokio::test]
+    async fn dashboard_attach_retires_a_gone_host_ip_box_after_a_lost_exchange() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = vm_host_dir(&dir);
+        let ssh_sock = host_dir.join("ssh.sock");
+        let (admits, retires) = fake_vm_host_dropping_retires(
+            &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            1,
+        );
+        // A session daemon with no sessions: the second lookup finds the
+        // box gone.
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let mut record = own_ip_record(None);
+        record.id = SessionId::from_bytes([7; 16]);
+        record.network = NetworkMode::HostNet;
+        let pair = prepare_attach(&ssh_sock, Some(record))
+            .await
+            .expect("a host_ip box has no row to ask back");
+        assert_eq!(pair, None, "a host_ip box has no pair");
+        assert_eq!(
+            admits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the attach re-admits the box first"
+        );
+        assert_eq!(
+            retires.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the undo's retire is sent again after the first is lost"
+        );
     }
 
     /// BOX-001: the dashboard's create from a form path `<root>/sub` sends
