@@ -1397,19 +1397,28 @@ impl Context {
                     }
                 }
                 AddDepMode::SessionPackages => {
-                    if let Some(h) = doc["session"].as_table_like_mut() {
-                        edited |= upsert_toml_packages_list(h, "packages", &resolved)?;
+                    // BOX-050: the session packages live under
+                    // [defaults.session]. A legacy [session] table moves
+                    // there first, so the file reads with no rename hint.
+                    edited |= move_legacy_session_table(&mut doc)?;
+                    let defaults = defaults_item(&mut doc)?;
+                    let inline = defaults.is_inline_table();
+                    let defaults = defaults.as_table_like_mut().ok_or_else(not_a_table)?;
+                    if let Some(s) = defaults.get_mut("session") {
+                        let s = s.as_table_like_mut().ok_or_else(not_a_table)?;
+                        edited |= upsert_toml_packages_list(s, "packages", &resolved)?;
                     } else {
-                        doc.insert(
-                            "session",
-                            Item::Table(toml_edit::Table::from_iter([(
-                                "packages",
-                                Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
-                            )])),
-                        );
+                        let session = toml_edit::Table::from_iter([(
+                            "packages",
+                            Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
+                        )]);
+                        defaults.insert("session", fit_item(Item::Table(session), inline));
                         edited = true;
                     }
-                    added = Some(format!("Added {} to session.packages", resolved.join(", ")));
+                    added = Some(format!(
+                        "Added {} to defaults.session.packages",
+                        resolved.join(", ")
+                    ));
                 }
             }
 
@@ -1436,8 +1445,95 @@ pub enum AddDepMode {
     RuntimePackages,
     /// Add the specified packages to a task with a given name.
     TaskPackages { name: String },
-    /// Add the specified packages to session.packages.
+    /// Add the specified packages to defaults.session.packages. A legacy
+    /// top-level [session] table moves to [defaults.session] first.
     SessionPackages,
+}
+
+/// The refusal when `defaults` or `defaults.session` is not a table.
+fn not_a_table() -> Error {
+    Error::Other(anyhow!(
+        "`defaults` and `defaults.session` in minimal.toml must be tables: fix them, then run the command again"
+    ))
+}
+
+/// The top-level `defaults` item, made as an implicit table when the file
+/// has none, so that only `[defaults.session]` prints.
+fn defaults_item(doc: &mut DocumentMut) -> Result<&mut Item, Error> {
+    let item = doc.entry("defaults").or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        Item::Table(t)
+    });
+    if item.is_table_like() {
+        Ok(item)
+    } else {
+        Err(not_a_table())
+    }
+}
+
+/// `item` in the form a parent table can hold: an inline table when the
+/// parent is inline, else unchanged.
+fn fit_item(item: Item, inline: bool) -> Item {
+    if !inline || item.is_value() {
+        return item;
+    }
+    match item.into_value() {
+        Ok(v) => Item::Value(v),
+        Err(item) => item,
+    }
+}
+
+/// Whether two TOML values are the same, ignoring their decor.
+fn same_value(a: &Value, b: &Value) -> bool {
+    a.to_string().trim() == b.to_string().trim()
+}
+
+/// Moves a top-level `[session]` table to `[defaults.session]`, with its
+/// keys and its inline form (BOX-050). Where `[defaults.session]` already
+/// exists, the keys merge as the reader merges them: an array takes the
+/// legacy items first, and any other key keeps the `[defaults.session]`
+/// value. Returns whether the document changed.
+fn move_legacy_session_table(doc: &mut DocumentMut) -> Result<bool, Error> {
+    if !doc.get("session").is_some_and(Item::is_table_like) {
+        return Ok(false);
+    }
+    // A bad `defaults` is refused before the [session] table moves.
+    defaults_item(doc)?;
+    let Some(old) = doc.remove("session") else {
+        return Ok(false);
+    };
+    let defaults = defaults_item(doc)?;
+    let inline = defaults.is_inline_table();
+    let defaults = defaults.as_table_like_mut().ok_or_else(not_a_table)?;
+    let Some(new) = defaults.get_mut("session") else {
+        defaults.insert("session", fit_item(old, inline));
+        return Ok(true);
+    };
+    let new_inline = new.is_inline_table();
+    let new = new.as_table_like_mut().ok_or_else(not_a_table)?;
+    let old = old.as_table_like().ok_or_else(not_a_table)?;
+    for (key, value) in old.iter() {
+        match (value.as_array(), new.get_mut(key)) {
+            (Some(items), Some(newer)) => {
+                if let Some(newer) = newer.as_array_mut() {
+                    let missing: Vec<Value> = items
+                        .iter()
+                        .filter(|i| !newer.iter().any(|n| same_value(n, i)))
+                        .cloned()
+                        .collect();
+                    for (at, item) in missing.into_iter().enumerate() {
+                        newer.insert_formatted(at, item);
+                    }
+                }
+            }
+            (_, Some(_)) => {}
+            (_, None) => {
+                new.insert(key, fit_item(value.clone(), new_inline));
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn upsert_toml_packages_list<T: TableLike + ?Sized>(
@@ -1970,7 +2066,12 @@ mod tests {
         assert!(
             String::from_utf8(std::fs::read(&mfile_path).unwrap())
                 .unwrap()
-                .contains("[session]\npackages = [\"uroot\"]")
+                .contains("[defaults.session]\npackages = [\"uroot\"]")
+        );
+        assert!(
+            !String::from_utf8(std::fs::read(&mfile_path).unwrap())
+                .unwrap()
+                .contains("[session]")
         );
     }
 
@@ -2073,18 +2174,99 @@ mod tests {
             .is_err()
         );
 
-        // Adding to an inline [session] must not replace the whole table.
+        // Adding to an inline [session] moves it to [defaults.session] and
+        // keeps its inline form and its other keys.
         ctx.add_deps(&graph, ["uroot"], AddDepMode::SessionPackages)
             .unwrap();
         let doc = read_doc();
-        assert!(doc["session"].is_inline_table(), "session lost inline form");
-        assert_eq!(str_list(&doc["session"]["packages"]), ["uroot"]);
-        assert_eq!(doc["session"]["vars"]["ANSWER"].as_str(), Some("42"));
+        assert!(doc.get("session").is_none(), "[session] stayed: {doc}");
+        let session = &doc["defaults"]["session"];
+        assert!(session.is_inline_table(), "session lost inline form");
+        assert_eq!(str_list(&session["packages"]), ["uroot"]);
+        assert_eq!(session["vars"]["ANSWER"].as_str(), Some("42"));
 
         // The surviving settings must still parse into the config.
         let session = ctx.minimal_file().session.clone().unwrap_or_default();
         assert!(session.vars.keys().any(|k| k.as_ref() == "ANSWER"));
         assert!(session.packages.contains(&"uroot".to_string()));
+    }
+
+    // BOX-050: adding a session package writes [defaults.session], moves a
+    // legacy [session] table there, and leaves a file that reads with no
+    // legacy hint.
+    #[test]
+    fn add_session_package_writes_defaults_session() {
+        let state = tempdir().unwrap();
+        let cwd = tempdir().unwrap();
+        let mfile_path = cwd.path().join("minimal.toml");
+        std::fs::write(
+            &mfile_path,
+            format!(
+                indoc! {
+                    "
+                    [upstream]
+                    dir = \"{}\"
+
+                    [stack]
+                    use = \"fake-stack\"
+
+                    # The session.
+                    [session]
+                    packages = [\"uroot\"]
+
+                    [session.vars]
+                    ANSWER = \"42\"
+
+                    [defaults.session]
+                    packages = []
+                    "
+                },
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("testdata")
+                    .join("fakerepo-with-stack")
+                    .to_str()
+                    .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(cwd.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+        let graph = ctx.graph_from_all_packages().unwrap();
+        ctx.add_deps(&graph, ["extra-runtime-pkg"], AddDepMode::SessionPackages)
+            .unwrap();
+
+        let text = std::fs::read_to_string(&mfile_path).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert!(doc.get("session").is_none(), "[session] stayed: {text}");
+        let session = &doc["defaults"]["session"];
+        let packages: Vec<&str> = session["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(packages, ["uroot", "extra-runtime-pkg"], "{text}");
+        assert_eq!(session["vars"]["ANSWER"].as_str(), Some("42"), "{text}");
+
+        // The written file carries no legacy table, so a read prints no hint.
+        let mut raw: toml::Table = toml::from_str(&text).unwrap();
+        let hints = mfile::legacy::canonicalize(&mut raw, mfile::legacy::this_release()).unwrap();
+        assert!(hints.is_empty(), "legacy hints {hints:?} for:\n{text}");
+
+        let session = ctx.minimal_file().session.clone().unwrap_or_default();
+        assert!(session.packages.contains(&"uroot".to_string()));
+        assert!(session.packages.contains(&"extra-runtime-pkg".to_string()));
+        assert!(session.vars.keys().any(|k| k.as_ref() == "ANSWER"));
     }
 
     #[test]
