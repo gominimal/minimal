@@ -3,8 +3,9 @@
 //! * `a_tpm_key_is_fixed_exempt_from_lockout_and_needs_its_authorization`
 //!   generates the proxy's three keys in the TPM that `BEP_TPM_TCTI` names,
 //!   as `swtpm` in CI (`swtpm:host=localhost,port=2321`). It checks that the
-//!   TPM reports `fixedTPM`, `fixedParent` and `noDA` on each key, so the TPM
-//!   refuses to duplicate it. It signs and agrees through the TPM, and checks
+//!   TPM reports `fixedTPM`, `fixedParent` and `noDA` on each key. It asks
+//!   the TPM to duplicate each key with its authorization value, and checks
+//!   that the TPM refuses with a response code. It signs and agrees through the TPM, and checks
 //!   each result in software. It loads each key again in a new store from
 //!   its key file and its authorization file alone. Last, it checks that the
 //!   TPM refuses the root key with another authorization value, with the
@@ -56,6 +57,22 @@ fn a_tpm_key_is_fixed_exempt_from_lockout_and_needs_its_authorization() {
             assert_ne!(public.attributes & bit, 0, "{role}: bit {bit:#x}");
         }
         assert_eq!(public.key, key.public());
+
+        // The TPM refuses to duplicate the key, even with its authorization
+        // value, and says why with a response code.
+        match key.duplicate() {
+            Err(KeyError::Refused {
+                role: refused,
+                detail,
+            }) => {
+                assert_eq!(refused, role);
+                assert!(
+                    detail.starts_with("tpm2_duplicate failed with TPM response code 0x"),
+                    "{role}: {detail}"
+                );
+            }
+            other => panic!("{role}: expected the TPM to refuse duplication, got {other:?}"),
+        }
 
         // The authorization value is at least 128 bits, and only its user
         // reads it.
