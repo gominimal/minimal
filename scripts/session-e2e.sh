@@ -29384,7 +29384,9 @@ PAR_EO
     # chief among them, is denied by the caller's own compiled rules. The
     # literal is the default switch subnet's daemon address (the subnet every
     # lane this script runs on uses; the alias literal the min.internal proof
-    # prints carries the same posture).
+    # prints carries the same posture). The port is not a literal: the
+    # switch-side opening follows the port the daemon serves on, the same
+    # PROXY_PORT every other probe here sends to.
     PAR_CALLER_SEED_DIR="$(hook_mktemp /tmp/mnlpy.XXXXXX)"
     hook_seed_preamble > "$PAR_CALLER_SEED_DIR/minimal.toml"
     mkdir "$PAR_CALLER_SEED_DIR/.git"
@@ -29411,7 +29413,7 @@ PAR_EO
     par_direct "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" 5
     par_direct_rc="$PAR_RC"
     par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
-    par_proxied "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "100.64.255.253:7654" 20
+    par_proxied "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "100.64.255.253:$PROXY_PORT" 20
     par_pair "a caller whose egress rules deny the target" \
       "$par_direct_line" \
       "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy at the daemon's switch address -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
