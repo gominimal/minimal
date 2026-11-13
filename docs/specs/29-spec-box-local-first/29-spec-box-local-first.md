@@ -568,7 +568,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal export_replaces_existing_file_atomically
 
-- **BOX-189** IF a `[[file_exports]]` path is absolute, contains a `..` component, or names the project root itself (an empty path, `.` or `./`) THEN THE SYSTEM SHALL fail the expansion with exit 3 before any box is created, so that the run and `min box spec <entry>` both refuse it. The error SHALL quote the path, say that it points outside the folder that holds `minimal.toml`, and tell the person to use a path inside that folder.
+- **BOX-189** IF a `[[file_exports]]` path is absolute, contains a `..` component, or names the project root itself (an empty path, `.` or `./`) THEN THE SYSTEM SHALL fail the expansion with exit 3 before any box is created, so that the run and `min box spec <entry>` both refuse it. The error SHALL quote the path, say that it points outside the folder that holds `minimal.toml` or names that folder itself, and ask for the path of a file or folder inside it.
   <!-- unwanted; decided 2026-11-13: a destination outside the minimal.toml subtree is a spec error, caught before a run is spent, as BCLI-078 refuses at expansion; the architecture limits exports to that subtree (TB1, AT11) -->
   tier:     T0
   verify:   cargo nextest run -p mfile export_path_outside_project_refused_exit3
@@ -578,9 +578,9 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal missing_export_named_and_others_copied
 
-- **BOX-191** IF the copy of a file fails, or a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at that destination, leaving no partial file and no change to what is already there, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports.
+- **BOX-191** IF the copy of a file fails, creating a directory fails, a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at the destination that failed, leaving no partial file and no change to what is already there, keep the files a directory export already wrote, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports.
   tier:     T0
-  verify:   cargo nextest run -p minimal failed_export_copy_keeps_destination_unchanged
+  verify:   cargo nextest run -p minimal failed_export_file_leaves_its_destination_unchanged
 
 - **BOX-192** IF the destination of any file an export copies, the export's own path or a file inside a directory export, resolves through a symlink to a path outside the project root THEN THE SYSTEM SHALL write nothing for that export, print on stderr one line that names the export's path and says it leads outside the project folder, and still copy the other exports.
   <!-- unwanted; a symlink can only be seen at copy time, so this is the copy-time half of BOX-189's containment -->
@@ -602,7 +602,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p minimal export_report_appends_file_exported_event
 
 
-- **BOX-196** IF an export's path in the box, or any file or directory inside a directory export, is a symlink that resolves outside the box's `/workbench` THEN THE SYSTEM SHALL write nothing for that export, print on stderr one line that names the export's path and says it leads outside the box's copy of the project, and still copy the other exports.
+- **BOX-196** IF any component of an export's path in the box, or any file or directory inside a directory export, is a symlink that resolves outside the box's `/workbench` THEN THE SYSTEM SHALL write nothing for that export, print on stderr one line that names the export's path and says it leads outside the box's copy of the project, and still copy the other exports.
   <!-- unwanted; the source-side half of BOX-192: a task, possibly agent-run, must not copy files from outside its project into the project; `min box cp` reads through the box's file server, which already refuses a path that leaves the served directories -->
   tier:     T0
   verify:   cargo nextest run -p minimal export_source_symlink_out_of_workbench_writes_nothing
