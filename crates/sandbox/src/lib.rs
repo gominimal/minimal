@@ -6148,13 +6148,13 @@ ff02::2\tip6-allrouters
 
     /// inbox#1152, the daemon's side: a mapping it must create in the
     /// session's home is made beneath the home, so a dangling link there that
-    /// leaves the home refuses the sandbox and makes nothing outside it. A
-    /// revert of that path to `fs::write` would follow the link out, and this
-    /// is the test that fails then.
+    /// leaves the home refuses the sandbox and makes nothing outside it. The
+    /// create is `Config::build`'s, before `Sandbox::new`, so the build is
+    /// what is refused here. A revert of that path to `fs::write` would
+    /// follow the link out, and this is the test that fails then.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_created_mapping_never_follows_a_link_out_of_the_home() {
-        let (_tmp, base) = make_base_with_synth();
+    #[tokio::test]
+    async fn a_created_mapping_never_follows_a_link_out_of_the_home() {
         let trees = tempfile::TempDir::new().unwrap();
         let home = trees.path().join("home");
         let working = trees.path().join("working");
@@ -6173,7 +6173,7 @@ ff02::2\tip6-allrouters
         let config = Config::new("test-create-beneath")
             .with_dns(false)
             .with_session_dirs_mapped(home.clone(), working, vec![mapping]);
-        let Err(err) = Sandbox::new(base, config, ()) else {
+        let Err(err) = config.build(trees.path().join("base"), ()).await else {
             panic!("a link out of the home refuses the sandbox");
         };
         let text = err.to_string();
