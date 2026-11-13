@@ -19,7 +19,10 @@
 set -euo pipefail
 
 readonly PROFILE_NAME=minimald
-readonly APPARMOR_D=/etc/apparmor.d
+# The policy directory, and the kernel's user-namespace switch: overridable so
+# a test can drive this script over a scratch tree and a stub parser.
+readonly APPARMOR_D="${MINIMAL_APPARMOR_D:-/etc/apparmor.d}"
+readonly USERNS_RESTRICT_FILE="${MINIMAL_APPARMOR_RESTRICT_FILE:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
 # In a checkout the profile + tunable live at ../packaging/apparmor. When the
 # curl|sh installer ships them, this script sits flat beside them under
 # ~/.local/share/minimal/apparmor. Prefer the checkout layout, else the script's
@@ -58,8 +61,37 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# apparmor_parser lives in /usr/sbin (Debian, Ubuntu), which a user's PATH
+# does not hold: --check runs unprivileged, so look there too.
+PATH="$PATH:/usr/sbin:/sbin"
 command -v apparmor_parser >/dev/null 2>&1 ||
     die "apparmor_parser not found; this host does not have AppArmor (nothing to install)"
+
+# The profile's one rule, `userns`, exists from AppArmor 4.0, the abi it
+# declares. An older parser (Debian 12 ships 3.0) cannot open that abi and
+# would refuse the file. Whether that matters is the kernel's switch, the
+# one `min finalize-install` reads (userns_item_over): a kernel that does not
+# restrict unprivileged user namespaces needs no profile, so there is nothing
+# to install (gominimal/inbox#1197); one that does needs a parser that can
+# load this one, and the old parser cannot, so say so and fail rather than
+# print a skip that leaves every box to EPERM. --check parses only, so it
+# reports the skip either way. The --uninstall path still runs, for a file
+# an earlier run left.
+if [ "$mode" != uninstall ] && [ ! -e "$APPARMOR_D/abi/4.0" ]; then
+    parser_version="$(apparmor_parser --version 2>/dev/null | head -1)"
+    note "This host's AppArmor has no abi/4.0 (parser: ${parser_version:-unknown})."
+    if [ "$mode" = check ]; then
+        # a lane that depends on the parse reads this line, not a silent 0
+        note "Check skipped. The profile declares abi/4.0, which this parser cannot read, so it was not parsed here."
+        exit 0
+    fi
+    restrict="$(cat "$USERNS_RESTRICT_FILE" 2>/dev/null || echo 0)"
+    if [ "${restrict:-0}" != 0 ]; then
+        die "this host restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=$restrict), and its apparmor_parser cannot load the profile that allows them for minimald, which needs abi/4.0. Install AppArmor 4.0 or newer, or set that sysctl to 0, then run min finalize-install again."
+    fi
+    note "This kernel does not restrict unprivileged user namespaces. minimald needs no AppArmor profile on this host. Nothing was installed."
+    exit 0
+fi
 
 # --check: parse the profile out of the source tree without touching the kernel
 # or the policy cache, so CI and pre-commit can run it unprivileged.
