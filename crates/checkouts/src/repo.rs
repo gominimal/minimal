@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tracing::trace;
 
-/// Prepended to every git call on a repository a project named. The `ext`
+/// Prepended to every git command this crate runs: the two in [`Repo::new`]
+/// and whatever `run_git_bare` and `run_git_checkout` run. The `ext`
 /// transport is turned off whatever the host's git config says.
 const GIT_SEC_ARGS: [&str; 5] = [
     "--no-optional-locks",
@@ -13,34 +14,38 @@ const GIT_SEC_ARGS: [&str; 5] = [
     "protocol.ext.allow=never",
 ];
 
-/// Whether git would parse `value` as an option rather than a value: it is
-/// empty or starts with `-`. No real URL or ref is.
-fn is_option_like(value: &str) -> bool {
-    value.is_empty() || value.starts_with('-')
+/// Refuses a `value` git would not take as a URL or a ref: an empty one,
+/// or one starting with `-`, which git would parse as an option. The error
+/// names the one condition that failed; `shown` renders the value for it.
+fn refuse_option_like(
+    what: &'static str,
+    value: &str,
+    shown: impl FnOnce() -> String,
+) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::EmptyValue { what });
+    }
+    if value.starts_with('-') {
+        return Err(Error::OptionLike {
+            what,
+            value: shown(),
+        });
+    }
+    Ok(())
 }
 
 /// Refuses a repository URL that git would read as an option. The error
 /// keeps the URL as [`crate::scrubbed_remote`] gives it, so a credential in a
 /// malformed URL reaches neither its Display nor its Debug.
 pub(crate) fn refuse_option_like_url(url: &str) -> Result<(), Error> {
-    if is_option_like(url) {
-        return Err(Error::OptionLike {
-            what: "repository",
-            value: crate::scrubbed_remote(url).into_owned(),
-        });
-    }
-    Ok(())
+    refuse_option_like("repository URL", url, || {
+        crate::scrubbed_remote(url).into_owned()
+    })
 }
 
 /// Refuses a ref that git would read as an option.
 pub(crate) fn refuse_option_like_ref(git_ref: &GitRef) -> Result<(), Error> {
-    if is_option_like(git_ref.as_str()) {
-        return Err(Error::OptionLike {
-            what: "ref",
-            value: git_ref.as_str().to_owned(),
-        });
-    }
-    Ok(())
+    refuse_option_like("ref", git_ref.as_str(), || git_ref.as_str().to_owned())
 }
 
 /// A git repository of some remote.
@@ -70,6 +75,7 @@ impl Repo {
             // `--local` so a `remote.origin.url` in global or system config
             // cannot stand in for a cache whose own config lacks one.
             let output = Command::new("git")
+                .args(GIT_SEC_ARGS)
                 .args(["config", "--local", "--get", "remote.origin.url"])
                 .current_dir(&base)
                 // Explicit GIT_DIR so git recognises the bare repo as
@@ -141,13 +147,12 @@ impl Repo {
     ///
     /// This updates the remote-tracking branches but does not modify any checkouts.
     pub fn fetch(&mut self) -> Result<(), Error> {
-        self.run_git_bare(
-            GIT_SEC_ARGS
-                .into_iter()
-                .chain(["fetch", "--quiet"])
-                .chain(["origin", "+refs/heads/*:refs/remotes/origin/*"])
-                .collect::<Vec<_>>(),
-        )?;
+        self.run_git_bare(vec![
+            "fetch",
+            "--quiet",
+            "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ])?;
         Ok(())
     }
 
@@ -168,18 +173,11 @@ impl Repo {
         match git_ref {
             GitRef::Branch(b) => self.run_git_checkout(
                 worktree_path,
-                GIT_SEC_ARGS
-                    .into_iter()
-                    .chain(["checkout", format!("origin/{}", b).as_str()])
-                    .collect(),
+                vec!["checkout", format!("origin/{}", b).as_str()],
             ),
-            GitRef::Commit(s) | GitRef::Tag(s) => self.run_git_checkout(
-                worktree_path,
-                GIT_SEC_ARGS
-                    .into_iter()
-                    .chain(["checkout", s])
-                    .collect::<Vec<_>>(),
-            ),
+            GitRef::Commit(s) | GitRef::Tag(s) => {
+                self.run_git_checkout(worktree_path, vec!["checkout", s])
+            }
         }?;
 
         let output = self.run_git_checkout(worktree_path, ["rev-parse", "HEAD"].into())?;
@@ -209,12 +207,7 @@ impl Repo {
         refuse_option_like_ref(&git_ref)?;
         // Drop registrations whose directories are gone first, so a stale
         // entry cannot claim the path this add is about to use.
-        self.run_git_bare(
-            GIT_SEC_ARGS
-                .into_iter()
-                .chain(["worktree", "prune"])
-                .collect::<Vec<_>>(),
-        )?;
+        self.run_git_bare(vec!["worktree", "prune"])?;
         let target = match &git_ref {
             // A cache cloned before remote-tracking refs were fetched at clone
             // time, and never updated since, carries only `refs/heads/<b>`;
@@ -229,19 +222,14 @@ impl Repo {
             }
             GitRef::Commit(s) | GitRef::Tag(s) => s.clone(),
         };
-        self.run_git_bare(
-            GIT_SEC_ARGS
-                .into_iter()
-                .chain([
-                    "worktree",
-                    "add",
-                    "-f",
-                    "--detach",
-                    path.to_str().unwrap(),
-                    target.as_str(),
-                ])
-                .collect::<Vec<_>>(),
-        )?;
+        self.run_git_bare(vec![
+            "worktree",
+            "add",
+            "-f",
+            "--detach",
+            path.to_str().unwrap(),
+            target.as_str(),
+        ])?;
 
         let output = self.run_git_checkout(&path, ["rev-parse", "HEAD"].into())?;
         Ok(Checkout {
@@ -285,11 +273,13 @@ impl Repo {
         Ok(branches)
     }
 
-    /// Runs a git command in the bare repository directory.
+    /// Runs a git command in the bare repository directory, behind
+    /// [`GIT_SEC_ARGS`].
     fn run_git_bare(&self, args: Vec<&str>) -> Result<Output, Error> {
         trace!("Running bare git command: git {:?}", &args.join(" "));
 
         let output = Command::new("git")
+            .args(GIT_SEC_ARGS)
             .current_dir(self.bare_repo_path())
             // Explicitly set GIT_DIR so git recognises the bare repo as
             // intentional even when `safe.bareRepository = explicit` is set
@@ -310,7 +300,8 @@ impl Repo {
         Ok(output)
     }
 
-    /// Runs a git command in a specific checkout directory.
+    /// Runs a git command in a specific checkout directory, behind
+    /// [`GIT_SEC_ARGS`].
     fn run_git_checkout<P: AsRef<Path>>(
         &self,
         checkout: P,
@@ -319,6 +310,7 @@ impl Repo {
         trace!("Running worktree git command: git {}", args.join(" "));
 
         let output = Command::new("git")
+            .args(GIT_SEC_ARGS)
             .current_dir(checkout)
             .args(&args)
             .output()?;

@@ -925,21 +925,31 @@ mod tests {
         let bares = base.path().join("git").join("db");
         let bare_count = || std::fs::read_dir(&bares).unwrap().count();
         let mut handle = Manager::new_in_dir(base.path()).unwrap();
-        for url in ["--not-a-url", ""] {
-            let err = handle
-                .checkout_of(url, GitRef::Branch("main".into()))
-                .expect_err("an option-like URL is refused");
-            assert!(
-                matches!(
-                    err,
-                    Error::OptionLike {
-                        what: "repository",
-                        ..
-                    }
-                ),
-                "{err}"
-            );
-        }
+        let err = handle
+            .checkout_of("--not-a-url", GitRef::Branch("main".into()))
+            .expect_err("an option-like URL is refused");
+        assert!(
+            matches!(
+                err,
+                Error::OptionLike {
+                    what: "repository URL",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let err = handle
+            .checkout_of("", GitRef::Branch("main".into()))
+            .expect_err("an empty URL is refused");
+        assert!(
+            matches!(
+                err,
+                Error::EmptyValue {
+                    what: "repository URL"
+                }
+            ),
+            "{err}"
+        );
         assert_eq!(bare_count(), 0, "a refused URL leaves no bare directory");
 
         // Nothing is at this remote, so a clone would fail with
@@ -989,7 +999,7 @@ mod tests {
             matches!(
                 err,
                 Error::OptionLike {
-                    what: "repository",
+                    what: "repository URL",
                     ..
                 }
             ),
