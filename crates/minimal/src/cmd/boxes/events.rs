@@ -201,6 +201,7 @@ pub(crate) async fn box_events_on_hosts(
             address: address.to_owned(),
             seen: ids.iter().map(|(id, _)| *id).collect(),
             failed: std::collections::HashMap::new(),
+            list_failures: 0,
         });
         follow_events(reads, watch, mode, out).await
     } else {
@@ -267,6 +268,10 @@ const CHILD_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// open before `--parent --follow` stops with the open error.
 const CHILD_OPEN_TRIES: u32 = 5;
 
+/// How many listings in a row can fail before `--parent --follow` stops
+/// with the list error. A shorter outage keeps the follow and its streams.
+const CHILD_LIST_TRIES: u32 = 5;
+
 /// The state `--parent --follow` keeps to add the stream of each new child
 /// of `parent` to the follow.
 struct ChildWatch {
@@ -279,6 +284,8 @@ struct ChildWatch {
     /// For each new child whose read did not open, the number of listings
     /// in a row that showed it.
     failed: std::collections::HashMap<boxes::BoxId, u32>,
+    /// The number of listings in a row that failed.
+    list_failures: u32,
 }
 
 impl ChildWatch {
@@ -288,20 +295,30 @@ impl ChildWatch {
     async fn new_children(
         &mut self,
     ) -> Result<Option<Vec<(String, client::SubsystemLines)>>, anyhow::Error> {
-        let listing = list_box_records(&mut self.client, None)
-            .await
-            .map_err(|e| {
+        let listing = match list_box_records(&mut self.client, None).await {
+            Ok(listing) => {
+                self.list_failures = 0;
+                listing
+            }
+            Err(e) => {
+                self.list_failures += 1;
                 tracing::warn!(
                     verb = "box events",
                     box_id = %self.parent,
+                    tries = self.list_failures,
                     "list the children of the parent again: {e:#}"
                 );
-                anyhow::anyhow!(
+                // A short outage keeps the follow: the next poll lists again.
+                if self.list_failures < CHILD_LIST_TRIES {
+                    return Ok(Some(Vec::new()));
+                }
+                return Err(anyhow::anyhow!(
                     "Could not find the new child boxes of box {address}. \
                      Run `min box show {address}` to check that the box still exists.",
                     address = self.address
-                )
-            })?;
+                ));
+            }
+        };
         if !listing.iter().any(|entry| entry.box_id == self.parent) {
             tracing::info!(verb = "box events", box_id = %self.parent, "the parent is removed");
             return Ok(None);
