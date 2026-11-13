@@ -358,6 +358,10 @@ pub struct SwitchRelay {
     /// the clear is what makes the records end with the stop rather than
     /// with the last holder.
     gate: Option<Arc<BoxGate>>,
+    /// The box's zone name, published under its lease in [`LIVE_NAMES`]
+    /// while this relay lives (NET-163). `None` for a relay with no box
+    /// name: the daemon's own relay and a task launch.
+    _zone_name: Option<Arc<str>>,
 }
 
 // Not derived: [`BoxGate`] carries the whole session's policy state and
@@ -435,6 +439,7 @@ pub async fn attach_to_switch(
     tap_fd: OwnedFd,
     api_sock: &Path,
     gate: Option<Arc<BoxGate>>,
+    box_name: Option<&str>,
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
@@ -448,7 +453,9 @@ pub async fn attach_to_switch(
     if let Some(gate) = &gate {
         gate.use_host_exposures(Arc::clone(&NATIVE_HOST_EXPOSURES));
     }
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate, false, lease, subnet)
+    spawn_relay(
+        tap_fd, sock_rx, sock_tx, gate, box_name, false, lease, subnet,
+    )
 }
 
 /// The native host's `[host-exposures]` table: the one in the client's
@@ -484,6 +491,7 @@ pub async fn attach_to_switch_vsock(
     cid: u32,
     port: u32,
     gate: Option<Arc<BoxGate>>,
+    box_name: Option<&str>,
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
@@ -495,7 +503,9 @@ pub async fn attach_to_switch_vsock(
         gate.mark_host_gated();
     }
     let (sock_rx, sock_tx) = tokio::io::split(sock);
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate, announce, lease, subnet)
+    spawn_relay(
+        tap_fd, sock_rx, sock_tx, gate, box_name, announce, lease, subnet,
+    )
 }
 
 /// A gratuitous ARP announcing `lease` from its own MAC
@@ -667,6 +677,7 @@ where
         sock_rx,
         sock_tx,
         None,
+        None,
         false,
         Some(node_dns),
         lease,
@@ -691,11 +702,17 @@ where
 /// `announce` says whether this relay's first frame is the lease announcement
 /// ([`announce_lease`]): true for a gated vsock attach, false for the daemon's
 /// own relay and anything else.
+///
+/// `box_name` is the name of an ungated box that other boxes can name
+/// (NET-163). A gated relay takes its name from its gate, and the daemon's
+/// own relay and a task launch pass `None`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_relay<R, W>(
     tap_fd: OwnedFd,
     sock_rx: R,
     sock_tx: W,
     gate: Option<Arc<BoxGate>>,
+    box_name: Option<&str>,
     announce: bool,
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
@@ -705,7 +722,7 @@ where
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     spawn_relay_with(
-        tap_fd, sock_rx, sock_tx, gate, announce, None, lease, subnet,
+        tap_fd, sock_rx, sock_tx, gate, box_name, announce, None, lease, subnet,
     )
 }
 
@@ -719,6 +736,7 @@ fn spawn_relay_with<R, W>(
     sock_rx: R,
     sock_tx: W,
     gate: Option<Arc<BoxGate>>,
+    box_name: Option<&str>,
     announce: bool,
     node_dns: Option<DnsGate>,
     lease: Ipv4Addr,
@@ -758,6 +776,17 @@ where
     // nothing.
     if let Some(gate) = &gate {
         register_live_gate(lease, gate);
+    }
+    // NET-163: every box relay publishes its zone name under its lease,
+    // gated or not, so a box whose `allow_dns_hosts` names an ungated box
+    // reaches it as it reaches a gated one.
+    let zone_name: Option<Arc<str>> = gate
+        .as_deref()
+        .and_then(|gate| gate.zone_name.clone())
+        .or_else(|| box_name.map(box_zone_name))
+        .map(Arc::from);
+    if let Some(name) = &zone_name {
+        register_live_name(lease, name);
     }
     // NET-004: a session relay tells its box — rate-limited — that frames to the
     // literal host-alias address are deprecated. The daemon's own relay (`gate`
@@ -816,6 +845,7 @@ where
         reset_writer,
         box_reset_writer,
         gate,
+        _zone_name: zone_name,
     })
 }
 
@@ -1422,6 +1452,33 @@ fn register_live_gate(lease: Ipv4Addr, gate: &Arc<BoxGate>) {
 #[cfg(test)]
 pub(crate) fn register_live_gate_for_test(lease: Ipv4Addr, gate: &Arc<BoxGate>) {
     register_live_gate(lease, gate);
+}
+
+/// The zone name of every box relay this daemon runs, gated or not, keyed by
+/// its lease (NET-163). A box's name rule reads it for a target with no gate,
+/// which [`LIVE_GATES`] does not hold. Values are [`Weak`], as in
+/// [`LIVE_GATES`]: the relay holds the name, so a dead relay's entry answers
+/// nothing, and the next holder of the lease overwrites it.
+static LIVE_NAMES: LazyLock<Mutex<HashMap<Ipv4Addr, Weak<str>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Publishes a box relay's zone name under its lease in [`LIVE_NAMES`],
+/// sweeping dead entries first when the table is at its threshold.
+fn register_live_name(lease: Ipv4Addr, name: &Arc<str>) {
+    let mut names = LIVE_NAMES.lock().expect("live name table poisoned");
+    if names.len() >= LIVE_GATES_SWEEP_AT {
+        names.retain(|_, weak| weak.strong_count() > 0);
+    }
+    names.insert(lease, Arc::downgrade(name));
+}
+
+/// The zone name of the box `addr` belongs to, while its relay lives.
+fn live_name(addr: Ipv4Addr) -> Option<Arc<str>> {
+    LIVE_NAMES
+        .lock()
+        .expect("live name table poisoned")
+        .get(&addr)
+        .and_then(Weak::upgrade)
 }
 
 /// The live gate of the box `addr` belongs to, while its relay lives — `None`
@@ -2084,11 +2141,21 @@ impl BoxGate {
     /// it under [`BOX_NAME_RULE`], with the zone name the target holds.
     /// The rule reads the target's own name, so it needs no lookup, and it
     /// still holds after the target's relay starts again under that name.
+    /// A target with no gate is read from [`LIVE_NAMES`]: a box with no
+    /// policy is named as a gated box is, and a relay with no name (a task
+    /// launch) is no box the rule can name.
     fn box_name_verdict(&self, dst: Ipv4Addr) -> Option<Result<(), String>> {
         if self.box_names.is_empty() {
             return None;
         }
-        let target = live_gate(dst)?;
+        let Some(target) = live_gate(dst) else {
+            let name = live_name(dst)?;
+            return Some(if self.box_names.iter().any(|n| **n == *name) {
+                Ok(())
+            } else {
+                Err(name.to_string())
+            });
+        };
         if std::ptr::eq(Arc::as_ptr(&target), self) {
             return None;
         }
@@ -5134,10 +5201,30 @@ pub(crate) mod tests {
             });
         // The daemon's own relay is the one the guest's root egress attaches
         // (`attach_node_to_switch_vsock`): ungated, carrying the node's DNS
-        // layer.
-        let relay = match gate.clone() {
-            Some(gate) => spawn_relay(tap_fd, sock_rx, sock_tx, Some(gate), false, lease, subnet),
-            None => spawn_node_relay(tap_fd, sock_rx, sock_tx, lease, subnet),
+        // layer. A named box with no policy gets an ungated box relay that
+        // carries its name (NET-163).
+        let relay = match (gate.clone(), name) {
+            (Some(gate), _) => spawn_relay(
+                tap_fd,
+                sock_rx,
+                sock_tx,
+                Some(gate),
+                None,
+                false,
+                lease,
+                subnet,
+            ),
+            (None, Some(name)) => spawn_relay(
+                tap_fd,
+                sock_rx,
+                sock_tx,
+                None,
+                Some(name),
+                false,
+                lease,
+                subnet,
+            ),
+            (None, None) => spawn_node_relay(tap_fd, sock_rx, sock_tx, lease, subnet),
         }
         .expect("the harness relay spawns");
         RelayHarness {
@@ -8085,6 +8172,57 @@ pub(crate) mod tests {
         assert_eq!(reached, again, "the restarted box is reached by its name");
     }
 
+    /// NET-163 on a native host, for a target with no policy: box A's
+    /// `allow_dns_hosts` names box B, whose relay is ungated. A's own leg
+    /// forwards the first SYN to B's lease, with no undeclared-subnet drop,
+    /// and B's relay delivers it. A relay with no name, a task launch's,
+    /// is no box the name rule can name, so A's leg still drops a SYN to it.
+    /// After B's relay ends, its lease answers no name.
+    #[tokio::test]
+    async fn zone_name_in_allow_dns_hosts_admits_an_ungated_named_box() {
+        use crate::net::dns_gate::tests::{read_box_frame, wire_frame};
+        const SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 48);
+        const TARGET: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 49);
+        const TASK: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 50);
+        let mut source = spawn_named_relay_for(
+            SOURCE,
+            Some("box-a4"),
+            Some(&zone_named_egress(&["Box-U.min.internal."], Vec::new())),
+            |_| {},
+        );
+        let mut target = spawn_named_relay_for(TARGET, Some("box-u"), None, |_| {});
+        assert!(target.gate.is_none(), "the target box has no policy");
+        let gate = source.gate.clone().expect("the source relay is gated");
+        let sentinel = arp_frame(SOURCE);
+
+        assert_eq!(gate.box_name_verdict(TARGET), Some(Ok(())));
+        let syn = egress_tcp_segment(SOURCE, 40011, TARGET, ZONE_TARGET_PORT, SYN);
+        let forwarded = source_leg_out(&mut source, &syn, &sentinel).await;
+        assert_eq!(
+            forwarded, syn,
+            "the listed name carries the flow out of the source box"
+        );
+        target.switch.write_all(&wire_frame(&syn)).await.unwrap();
+        let reached = read_box_frame(&target)
+            .await
+            .expect("the SYN reaches the ungated target box");
+        assert_eq!(reached, syn, "the named ungated box is reached");
+
+        // A task launch's relay carries no name: the rules decide alone.
+        let _task = spawn_relay_for(TASK, None, |_| {});
+        assert_eq!(gate.box_name_verdict(TASK), None);
+        let to_task = egress_tcp_segment(SOURCE, 40012, TASK, ZONE_TARGET_PORT, SYN);
+        let forwarded = source_leg_out(&mut source, &to_task, &sentinel).await;
+        assert_eq!(forwarded, sentinel, "a box with no name is not reached");
+
+        drop(target);
+        assert_eq!(
+            gate.box_name_verdict(TARGET),
+            None,
+            "a dead relay's lease answers no name"
+        );
+    }
+
     /// NET-163 through the hostname proxy: the caller's half of a proxied
     /// request follows the name rule the caller's relay applies to a direct
     /// connection. A caller whose `allow_dns_hosts` names `box-n` reaches
@@ -8331,7 +8469,14 @@ pub(crate) mod tests {
                 ))
             });
             let (relay, accepted) = tokio::join!(
-                attach_to_switch(tap_fd, &api_sock, gate, lease, SwitchSubnet::default()),
+                attach_to_switch(
+                    tap_fd,
+                    &api_sock,
+                    gate,
+                    None,
+                    lease,
+                    SwitchSubnet::default()
+                ),
                 listener.accept(),
             );
             let _relay = relay.expect("the attach completes against the stand-in");
@@ -8390,6 +8535,7 @@ pub(crate) mod tests {
                 sock_rx,
                 sock_tx,
                 Some(gate),
+                None,
                 announce,
                 lease,
                 SwitchSubnet::default(),

@@ -2074,6 +2074,7 @@ impl Ptask {
             fd,
             api_sock,
             Some(std::sync::Arc::new(gate)),
+            None,
             lease.ip,
             subnet,
         )
