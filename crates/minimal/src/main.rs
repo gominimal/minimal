@@ -500,14 +500,13 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             timed_out.hint().to_string(),
         ));
     }
-    // BCLI-033: an address that matches no box is `not_found`.
-    if let Some(minimal::BoxAddressRefusal::NotFound { .. }) =
-        e.downcast_ref::<minimal::BoxAddressRefusal>()
-    {
+    // BCLI-033: a box address refusal answers with the error kind its exit
+    // code stands for: `not_found` (4), `host_unreachable` (7) or `usage` (2).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
-            "not_found",
+            refused.code(),
             format!("{e:#}"),
-            "`min box list` lists the boxes there are".to_string(),
+            refused.hint().to_string(),
         ));
     }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
@@ -1296,6 +1295,60 @@ mod tests {
         ] {
             let err = anyhow::Error::from(refusal).context("showing the box");
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    #[test]
+    fn box_address_refusals_answer_with_their_error_kinds() {
+        let address = |s: &str| s.to_owned();
+        for (refusal, kind, exit) in [
+            (
+                minimal::BoxAddressRefusal::NotFound {
+                    address: address("web"),
+                },
+                "not_found",
+                4,
+            ),
+            (
+                minimal::BoxAddressRefusal::Unreachable {
+                    address: address("web"),
+                    hosts: vec![address("beta.local-minvmd0")],
+                },
+                "host_unreachable",
+                7,
+            ),
+            (
+                minimal::BoxAddressRefusal::Ambiguous {
+                    name: address("web"),
+                    candidates: Vec::new(),
+                },
+                "usage",
+                2,
+            ),
+            (
+                minimal::BoxAddressRefusal::AmbiguousIdStart {
+                    start: address("01"),
+                },
+                "usage",
+                2,
+            ),
+        ] {
+            let text = refusal.to_string();
+            let hint = refusal.hint();
+            let err = anyhow::Error::from(refusal).context("showing the box");
+            let MachineModeAnswer::Object(failure) = machine_mode_answer(&err) else {
+                panic!("a box address refusal is an error object: {err:#}");
+            };
+            let line = machine_mode_error_line(&failure).unwrap();
+            let object: serde_json_lenient::Value = serde_json_lenient::from_str(&line).unwrap();
+            assert_eq!(object["schema"], "min/v1/error", "{line}");
+            assert_eq!(object["code"], kind, "{line}");
+            assert!(
+                object["message"].as_str().unwrap().contains(&text),
+                "{line}"
+            );
+            assert_eq!(object["hint"], hint, "{line}");
+            assert_eq!(failure_exit_code(&err), exit, "{err:#}");
         }
     }
 

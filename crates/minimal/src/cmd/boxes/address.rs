@@ -114,6 +114,27 @@ impl BoxAddressRefusal {
         }
     }
 
+    /// The error kind a machine-output run answers with, the `code` of its
+    /// `min/v1/error` object, beside [`Self::exit_code`]: `usage` for exit
+    /// 2, `not_found` for exit 4 and `host_unreachable` for exit 7.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Ambiguous { .. } | Self::AmbiguousIdStart { .. } => "usage",
+            Self::NotFound { .. } => "not_found",
+            Self::Unreachable { .. } => "host_unreachable",
+        }
+    }
+
+    /// The next step the error object's `hint` names.
+    pub fn hint(&self) -> &'static str {
+        match self {
+            Self::Ambiguous { .. } => "Name one box as provider/host/name.",
+            Self::AmbiguousIdStart { .. } => "Give more of the id.",
+            Self::NotFound { .. } => "Run `min box list --all` to see the boxes on every host.",
+            Self::Unreachable { .. } => "Run the command again when the host answers.",
+        }
+    }
+
     /// The outcome the command's tracing event records.
     fn outcome(&self) -> &'static str {
         match self {
