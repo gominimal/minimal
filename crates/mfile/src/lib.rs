@@ -866,6 +866,15 @@ pub struct ChainLink {
 
 /// Object key of the per-commit index snapshot for a repo + commit:
 /// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
+/// Whether `key` names one directory under a project's state base: a
+/// `state_key`, or a package's `env_state_wiring` prefix. The value is joined
+/// onto the base, so it has to be a single name: empty, `.`, `..`, and any
+/// value holding `/`, a backslash or NUL are refused.
+#[must_use]
+pub fn is_state_key(key: &str) -> bool {
+    !key.is_empty() && key != "." && key != ".." && !key.contains(['/', '\\', '\0'])
+}
+
 pub fn commit_index_object(repo_url: &str, commit_sha: &str) -> String {
     format!("{}/{commit_sha}.shisha", repo_slug(repo_url))
 }
@@ -1235,6 +1244,23 @@ impl File {
             if tasks == TaskCheck::Refuse {
                 task.refuse_interactive(task_name)?;
             }
+            if let Some(key) = task.state_key.as_deref().filter(|k| !is_state_key(k)) {
+                return Err(Error::InvalidStateKey {
+                    entry: format!("[tasks.{task_name}]"),
+                    value: key.to_owned(),
+                });
+            }
+        }
+        if let Some(key) = self
+            .defaults
+            .state_key
+            .as_deref()
+            .filter(|k| !is_state_key(k))
+        {
+            return Err(Error::InvalidStateKey {
+                entry: "[defaults]".to_owned(),
+                value: key.to_owned(),
+            });
         }
         // BOX-049: an entry's `timeout` takes the duration grammar. A bad
         // value is refused here, before a spec is built from the entry.
@@ -2778,6 +2804,46 @@ mod tests {
             File::encode_component(input).as_bytes(),
             b"he--llo\x80wor--ld"
         );
+    }
+
+    /// A state key is one directory name: a `/`, a `..`, an absolute path or
+    /// an empty value is refused at load, for a task and for `[defaults]`,
+    /// with exit 3; a plain name loads.
+    #[test]
+    fn a_state_key_that_is_not_one_name_is_refused_at_load() {
+        for bad in [
+            "/home/user",
+            "../../etc",
+            "a/b",
+            "..",
+            ".",
+            "",
+            "a\\b",
+            "x\0y",
+        ] {
+            assert!(!is_state_key(bad), "{bad:?}");
+        }
+        for good in ["dev", "env", "go-cache", "v1.2", "~home"] {
+            assert!(is_state_key(good), "{good:?}");
+        }
+        let toml = |t: &str| format!("[tasks.t]\nexec = \"true\"\n{t}\n");
+        let parse = |text: &str| -> File { toml::from_str(text).unwrap() };
+        let err = parse(&toml("state_key = \"/home/user\""))
+            .validate()
+            .expect_err("an absolute key is refused");
+        assert_eq!(err.exit_code(), Some(3));
+        let text = err.to_string();
+        assert!(
+            text.contains("[tasks.t]") && text.contains("/home/user"),
+            "{text}"
+        );
+        assert!(parse(&toml("state_key = \"../../x\"")).validate().is_err());
+        parse(&toml("state_key = \"dev\""))
+            .validate()
+            .expect("a plain name loads");
+        let d: File = toml::from_str("[defaults]\nstate_key = \"../up\"\n").unwrap();
+        let err = d.validate().expect_err("[defaults] is checked too");
+        assert!(err.to_string().contains("[defaults]"), "{err}");
     }
 
     #[test]

@@ -54,6 +54,13 @@ pub enum Error {
     /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
     /// the task name. Exits 3.
     InteractiveTask(String),
+    /// A `state_key` is not one directory name: it holds `/`, `\\` or NUL,
+    /// or is empty, `.` or `..`. Carries the table
+    /// that set it and the value. Exits 3.
+    InvalidStateKey {
+        entry: String,
+        value: String,
+    },
     /// A selected loadout sets a variable to a resolved value other than
     /// the one the layers up to and including the entry, or another
     /// selected loadout, give it (BOX-183). Carries the variable and the
@@ -142,6 +149,7 @@ impl Error {
             | Error::InvalidSpecKey { .. }
             | Error::LegacyTable { .. }
             | Error::InteractiveTask(_)
+            | Error::InvalidStateKey { .. }
             | Error::LoadoutVarConflict { .. }
             | Error::DuplicateVar { .. } => Some(3),
             _ => None,
@@ -288,6 +296,12 @@ impl fmt::Display for Error {
                     legacy.what()
                 )
             }
+            Error::InvalidStateKey { entry, value } => write!(
+                f,
+                "`{entry}` in minimal.toml sets `state_key` to {value:?}. A state key is one \
+                 directory name, with no `/` and not `..`, `.` or empty. Use a plain name such as \
+                 \"dev\"."
+            ),
             Error::InteractiveTask(name) => write!(
                 f,
                 "`{}` in minimal.toml sets `interactive = true`, and a task \
@@ -335,6 +349,7 @@ impl std::error::Error for Error {
             Error::InvalidSpecKey { .. } => None,
             Error::LegacyTable { .. } => None,
             Error::InteractiveTask(_) => None,
+            Error::InvalidStateKey { .. } => None,
             Error::LoadoutVarConflict { .. } => None,
             Error::DuplicateVar { .. } => None,
         }

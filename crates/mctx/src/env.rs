@@ -85,6 +85,12 @@ impl EnvChannel<'_> {
                 }
 
                 for want_dir in setup.state_dirs {
+                    // a package's state prefix is one name under the state dir;
+                    // graph refuses others, checked again here
+                    if !mfile::is_state_key(&want_dir) {
+                        writeln!(stream, "error: a package's state directory {want_dir:?} is not one directory name").ok();
+                        return;
+                    }
                     std::fs::create_dir_all(self.state_dir.join(want_dir)).unwrap();
                 }
                 setup.env_vars.iter().for_each(|(k, v)| {
@@ -1377,6 +1383,11 @@ impl<'a> Env<'a> {
                     .unwrap_or_else(|| e.into())
             })?;
         for want_dir in state_dirs {
+            if !mfile::is_state_key(&want_dir) {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "a package's state directory {want_dir:?} is not one directory name"
+                )));
+            }
             std::fs::create_dir_all(args.state_base_dir.join(&want_dir)).map_err(|e| {
                 Error::IO("creating state dir", args.state_base_dir.join(want_dir), e)
             })?;
