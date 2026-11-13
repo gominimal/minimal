@@ -5954,7 +5954,7 @@ exit $rc
     /// Hands `raw` to a channel over the project at `repo`, as the listener
     /// does for a line that was not valid UTF-8, and returns its reply.
     async fn handle_lossy_line(repo: &Path, raw: &[u8]) -> String {
-        let (_state, _rootfs, _cwd, mut chan) =
+        let (_state, _rootfs, _cwd, mut chan, _sender) =
             setup_channel_in(crate::box_actor::WeakBoxHandle::dangling(), "web", repo);
         let (mut ours, mut theirs) = UnixStream::pair().unwrap();
         let line = String::from_utf8_lossy(raw).into_owned();
@@ -6064,6 +6064,23 @@ exit $rc
         session: crate::box_actor::WeakBoxHandle,
         name: &str,
     ) -> (TempDir, TempDir, TempDir, BoxChannel) {
+        let (state, rootfs, cwd, channel, _sender) = setup_channel_sender(session, name);
+        (state, rootfs, cwd, channel)
+    }
+
+    /// [`setup_channel_with`] keeping the request sender too, for a test
+    /// that drives the actor's own loop ([`BoxChannel::run`]) rather than a
+    /// handler: the loop ends when the sender is dropped.
+    fn setup_channel_sender(
+        session: crate::box_actor::WeakBoxHandle,
+        name: &str,
+    ) -> (
+        TempDir,
+        TempDir,
+        TempDir,
+        BoxChannel,
+        mpsc::Sender<ChannelRequest>,
+    ) {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         setup_channel_in(
             session,
@@ -6072,12 +6089,18 @@ exit $rc
         )
     }
 
-    /// [`setup_channel_with`] for the project at `repo`.
+    /// [`setup_channel_sender`] for the project at `repo`.
     fn setup_channel_in(
         session: crate::box_actor::WeakBoxHandle,
         name: &str,
         repo: &Path,
-    ) -> (TempDir, TempDir, TempDir, BoxChannel) {
+    ) -> (
+        TempDir,
+        TempDir,
+        TempDir,
+        BoxChannel,
+        mpsc::Sender<ChannelRequest>,
+    ) {
         setup_channel_under(session, name, repo, &std::env::temp_dir())
     }
 
@@ -6087,7 +6110,13 @@ exit $rc
         name: &str,
         repo: &Path,
         base: &Path,
-    ) -> (TempDir, TempDir, TempDir, BoxChannel) {
+    ) -> (
+        TempDir,
+        TempDir,
+        TempDir,
+        BoxChannel,
+        mpsc::Sender<ChannelRequest>,
+    ) {
         let cwd = tempfile::tempdir_in(base).unwrap();
         let state = tempfile::tempdir_in(base).unwrap();
         let home = tempfile::tempdir_in(base).unwrap();
@@ -6105,7 +6134,7 @@ exit $rc
         let mut graph = ctx.graph_from_all_packages().unwrap();
         graph.top_levels = vec![];
 
-        let (_tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(4);
         let channel = BoxChannel {
             name: name.to_string(),
             rootfs: DaemonAbsPath::try_new(
@@ -6133,7 +6162,86 @@ exit $rc
             graph,
             rx,
         };
-        (state, rootfs, cwd, channel)
+        (state, rootfs, cwd, channel, tx)
+    }
+
+    /// TEL-045 at the channel's own loop: an opted-out helper request
+    /// (`otel%off%`) leaves no command line in the daemon's records, the
+    /// trace-level "session channel handling" record included, while the
+    /// same request without the prefix leaves its line. The loop is driven
+    /// through the request sender, so the guard at the record is what is
+    /// under test, not the span alone. A thread-local subscriber at TRACE
+    /// reads the record: the shared capture sits above it.
+    #[tokio::test]
+    async fn an_opted_out_helper_request_keeps_its_line_out_of_the_log() {
+        let capture = crate::test_harness::CaptureWriter::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let (_state, _rootfs, _cwd, chan, tx) =
+            setup_channel_sender(crate::box_actor::WeakBoxHandle::dangling(), "optout");
+        // Two public-exposure requests, refused without a session so the
+        // handler is quick: the plain one and the opted-out one. The ports
+        // tell their lines apart in the log.
+        let mut replies = Vec::new();
+        for line in ["net-expose-public%3131", "otel%off%net-expose-public%3232"] {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            replies.push(ours);
+            tx.send(ChannelRequest {
+                line: line.to_string(),
+                raw: None,
+                stream: theirs,
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        chan.run().await;
+        for reply in &replies {
+            assert_eq!(
+                read_lines(reply),
+                vec![
+                    "error: public exposure is not available on this host. Nothing was published."
+                ],
+                "both requests were handled"
+            );
+        }
+        // The channel's own line, the one that names the request as it
+        // arrived, is written for the plain request and withheld for the
+        // opted-out one. The handler's lines under the opted-out request
+        // carry the span's `telemetry="opt-out"` mark, which the export
+        // layer honours (TEL-045); a plain local sink like this one shows
+        // them, and that is not what the opt-out is for.
+        let logged = capture.contents();
+        assert!(
+            logged.contains("session channel handling: net-expose-public%3131"),
+            "the plain request leaves its line: {logged}"
+        );
+        assert!(
+            !logged.contains("session channel handling: otel%off%net-expose-public%3232")
+                && !logged.contains("session channel handling: net-expose-public%3232"),
+            "the opted-out request's own line is withheld: {logged}"
+        );
+        let opted_out_lines: Vec<&str> =
+            logged.lines().filter(|l| l.contains("port=3232")).collect();
+        assert!(
+            !opted_out_lines.is_empty()
+                && opted_out_lines
+                    .iter()
+                    .all(|l| l.contains("telemetry=\"opt-out\"")),
+            "every line under the opted-out request carries the opt-out mark: {opted_out_lines:?}"
+        );
+        assert!(
+            logged
+                .lines()
+                .filter(|l| l.contains("port=3131"))
+                .all(|l| !l.contains("telemetry=\"opt-out\"")),
+            "the plain request's lines carry no opt-out mark: {logged}"
+        );
     }
 
     /// Reads all currently-available lines from a `UnixStream`.
@@ -6229,7 +6337,7 @@ exit $rc
             .await
             .unwrap()
             .expect("the session resolves");
-        let (_state, _rootfs, cwd, mut chan) =
+        let (_state, _rootfs, cwd, mut chan, _sender) =
             setup_channel_under(handle.downgrade(), "runweb", repo.path(), &base);
         std::fs::create_dir(cwd.path().join("sub")).unwrap();
         // The harness drops the home tempdir it made. A run mounts the home,
