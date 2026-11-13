@@ -10127,6 +10127,207 @@ async fn box_attach_exec_own_end_code7_exits_0() {
     );
 }
 
+/// BCLI-068: Ctrl-] then d ends `min box attach <box> --exec <id>` with 0.
+/// The attach's ssh sends the session keys from the config, the keys the
+/// daemon reads to end the channel on a detach with status 0. The exec
+/// keeps running, `min box show` still lists it, and a second attach
+/// reaches it.
+#[tokio::test]
+async fn exec_attach_detach_key_returns_0_exec_keeps_running() {
+    use minimald_rpc::exec::ExecId;
+
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        true,
+    );
+    let _live = alpha
+        .server
+        .list_running_exec(web, AN_EXEC_ID, &["sh", "-i"], true);
+    let exec_id = ExecId::parse(AN_EXEC_ID).unwrap();
+
+    // The ssh the attach runs asks for a terminal and sends the session
+    // keys: the default keys with no config, and the configured ones.
+    let config = tempfile::TempDir::new().unwrap();
+    let sent = |config_dir: &std::path::Path| {
+        let ssh = exec_attach_ssh(&alpha.host.sock, web, &exec_id, Some(config_dir))
+            .expect("the exec attach's ssh");
+        let args: Vec<String> = ssh
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let envs: std::collections::BTreeMap<String, String> = ssh
+            .get_envs()
+            .filter_map(|(name, value)| {
+                Some((
+                    name.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        (args, envs)
+    };
+    let (args, envs) = sent(config.path());
+    assert_eq!(args.first().map(String::as_str), Some("-tt"), "{args:?}");
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    assert!(args.contains(&wire), "the exec attach's request: {args:?}");
+    let defaults = boxes::keys::SessionKeys::default();
+    for (name, value) in [
+        (boxes::keys::LEADER_ENV, defaults.leader.as_config_str()),
+        (
+            boxes::keys::DETACH_KEY_ENV,
+            defaults.detach_key.as_config_str(),
+        ),
+    ] {
+        assert_eq!(envs.get(name), Some(&value), "{name}: {envs:?}");
+        assert!(
+            args.contains(&format!("SendEnv={name}")),
+            "{name}: {args:?}"
+        );
+    }
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"q\"\n",
+    )
+    .unwrap();
+    let (_, envs) = sent(config.path());
+    assert_eq!(
+        envs.get(boxes::keys::DETACH_KEY_ENV).map(String::as_str),
+        Some("q"),
+        "the configured detach key: {envs:?}"
+    );
+
+    // The daemon ends a detached channel with 0, and the attach ends with
+    // 0 and no line.
+    let ending = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async |_: &BoxAttachTarget, _: &ExecId| Ok(0),
+    )
+    .await
+    .expect("the detach ends the attach");
+    assert_eq!(
+        ending,
+        AttachEnding {
+            code: 0,
+            notice: None
+        }
+    );
+
+    // The exec keeps running, and a second attach reaches it.
+    let text = box_show_text(&alpha.host, "web").await;
+    assert_eq!(
+        live_exec_rows(&text),
+        [
+            "Live execs:".to_owned(),
+            format!("  {AN_EXEC_ID}  terminal  sh -i"),
+        ],
+        "{text}"
+    );
+    let mut reached = None;
+    let ending = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async |target: &BoxAttachTarget, exec_id: &ExecId| {
+            reached = Some((target.box_id, exec_id.clone()));
+            Ok(0)
+        },
+    )
+    .await
+    .expect("the second attach ends");
+    assert_eq!(reached, Some((web, exec_id)), "the second attach ran");
+    assert_eq!(ending.code, 0);
+}
+
+/// BCLI-068: `min box exec -t`'s first attach sends the configured session
+/// keys. With `detach = "q"` in the config, its ssh carries the leader and
+/// detach env vars and forwards both with `SendEnv`.
+#[tokio::test]
+async fn box_exec_t_attach_sends_configured_session_keys() {
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let exec_id = minimald_rpc::exec::ExecId::parse(AN_EXEC_ID).unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"q\"\n",
+    )
+    .unwrap();
+
+    let session_keys = minimal_client::attach::resolve_session_keys(Some(config.path()))
+        .expect("the session-key config resolves");
+    let ssh = exec_terminal_ssh(&alpha.host.sock, web, &exec_id, &session_keys)
+        .expect("the exec -t attach's ssh");
+    let args: Vec<String> = ssh
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let envs: std::collections::BTreeMap<String, String> = ssh
+        .get_envs()
+        .filter_map(|(name, value)| {
+            Some((
+                name.to_string_lossy().into_owned(),
+                value?.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect();
+    assert_eq!(args.first().map(String::as_str), Some("-tt"), "{args:?}");
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    assert!(args.contains(&wire), "the exec attach's request: {args:?}");
+    let defaults = boxes::keys::SessionKeys::default();
+    for (name, value) in [
+        (boxes::keys::LEADER_ENV, defaults.leader.as_config_str()),
+        (boxes::keys::DETACH_KEY_ENV, "q".to_owned()),
+    ] {
+        assert_eq!(envs.get(name), Some(&value), "{name}: {envs:?}");
+        assert!(
+            args.contains(&format!("SendEnv={name}")),
+            "{name}: {args:?}"
+        );
+    }
+}
+
+/// BCLI-068: `min box exec -t` resolves the session keys before it starts
+/// the exec. A session-key config that is not valid ends the command with
+/// no exec started, so no exec runs without its attach.
+#[tokio::test]
+async fn box_exec_t_invalid_session_keys_starts_no_exec() {
+    let mut host = exec_host().await;
+    let config = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    // The detach key is the leader, which the config refuses.
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"ctrl-]\"\n",
+    )
+    .unwrap();
+    host.global.config_dir = Some(config.path().to_path_buf());
+    let marker_dir = tempfile::TempDir::new().unwrap();
+    let marker = marker_dir.path().join("ran");
+    let touch = marker.to_str().expect("a UTF-8 marker path");
+
+    let run =
+        run_box_exec_on_host(&host, &box_exec_request("web", &["-t"], &["touch", touch])).await;
+    let error = run.error.as_ref().expect("the exec -t fails");
+    assert!(
+        format!("{error:#}").contains("session-keys"),
+        "the session-key config is named\n{run}"
+    );
+    assert_eq!(run.stderr, "", "no exec id is printed\n{run}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!marker.exists(), "no exec ran\n{run}");
+}
+
 /// BCLI-068: `min box stop` ends the attached exec by its signal, which the
 /// daemon reports as 1, before it writes the stopped record. The command
 /// reads the box again, and ends with 254 and the stop's line. A removed
@@ -11367,6 +11568,7 @@ async fn run_box_exec_on_host_with(
         cmd::daemon_host_kind(&host.global),
         request,
         terminal,
+        host.global.config_dir.as_deref(),
         None,
         &mut stdout,
         &mut stderr,
