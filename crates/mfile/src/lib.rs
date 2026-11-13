@@ -4550,6 +4550,21 @@ bash = \"true\"
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), BASE);
     }
 
+    /// Whether the edit of a file at `root` takes the fallback for a kernel
+    /// without `openat2`. It makes the first call [`File::edit_confined`]
+    /// makes and checks the one answer that sends it to the fallback,
+    /// `ENOSYS`. An `EPERM` (a seccomp filter) fails the edit there instead.
+    #[cfg(target_os = "linux")]
+    fn takes_the_no_openat2_fallback(root: &Path) -> bool {
+        use std::os::fd::AsFd as _;
+
+        let root_fd = beneath::open_root(root).unwrap();
+        match beneath::open_beneath(root_fd.as_fd(), Path::new(""), beneath::DIR_FLAGS) {
+            Ok(_) => false,
+            Err(e) => e.raw_os_error() == Some(libc::ENOSYS),
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn edit_within_refuses_a_dangling_link() {
@@ -4560,7 +4575,17 @@ bash = \"true\"
 
         let err = edit_within_test(&root, &link, append_k).unwrap_err();
 
-        assert!(err.to_string().contains("does not exist"), "error: {err}");
+        if takes_the_no_openat2_fallback(&root) {
+            eprintln!(
+                "this kernel has no openat2: checking the fallback's refusal of every link instead"
+            );
+            assert!(
+                err.to_string().contains("leads outside its workspace"),
+                "error: {err}"
+            );
+        } else {
+            assert!(err.to_string().contains("does not exist"), "error: {err}");
+        }
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
         assert!(
             !root.join(target).exists(),
@@ -4578,6 +4603,20 @@ bash = \"true\"
         let link = root.join(MFILE_NAME);
         let target = Path::new("conf/real.toml");
         std::os::unix::fs::symlink(target, &link).unwrap();
+
+        if takes_the_no_openat2_fallback(&root) {
+            eprintln!(
+                "this kernel has no openat2: checking the fallback's refusal of every link instead"
+            );
+            let err = edit_within_test(&root, &link, append_k).unwrap_err();
+            assert!(
+                err.to_string().contains("leads outside its workspace"),
+                "error: {err}"
+            );
+            assert_eq!(std::fs::read_to_string(&real).unwrap(), BASE);
+            assert_eq!(std::fs::read_link(&link).unwrap(), target);
+            return;
+        }
 
         edit_within_test(&root, &link, append_k).unwrap();
 
