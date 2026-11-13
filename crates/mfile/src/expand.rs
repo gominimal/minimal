@@ -270,26 +270,6 @@ fn write_store_authorities(spec: &mut toml::Table, rules: &BTreeMap<String, Stor
     }
 }
 
-/// The built-in root of the entry's type: the first type of its chain,
-/// else the entry's own type when it is a built-in, else the root that
-/// its table implies.
-fn entry_root(entry: &BoxEntry, layers: &Layers) -> &'static str {
-    layers
-        .type_defaults
-        .first()
-        .and_then(|(name, _)| crate::box_types::builtin(name))
-        .or_else(|| {
-            entry
-                .box_type
-                .as_deref()
-                .and_then(crate::box_types::builtin)
-        })
-        .unwrap_or(match entry.table {
-            EntryTable::Tasks => "task",
-            _ => "session",
-        })
-}
-
 impl Layers {
     /// Sets [`Layers::defaults`] and [`Layers::defaults_type`] from the
     /// file's top-level `[defaults]` table (BOX-048).
@@ -399,19 +379,12 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
-    // BOX-071: the store references carry the client's authorities, and
-    // the omitted values the digest binds are filled, before the spec is
-    // checked or projected.
+    // BOX-071: the store references carry the client's authorities, so
+    // the daemon projects the same `secret_grants` from the spec it
+    // receives. The omitted values the digest binds are filled by the
+    // projection itself (`projection::fill_effective`), in the client and
+    // the daemon alike, so the spec bytes keep only what a layer set.
     write_store_authorities(&mut expansion.spec, &layers.store_rules);
-    let root = entry_root(entry, layers);
-    let had_network = expansion.spec.contains_key("network");
-    crate::projection::fill_effective(&mut expansion.spec, root);
-    if !had_network {
-        expansion.report.values.insert(
-            "network".to_owned(),
-            ValueOrigin::Value(Origin::type_defaults(root)),
-        );
-    }
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
@@ -1610,10 +1583,6 @@ mod tests {
 
                 [network]
                 mode = "own_ip"
-                quic443 = "auto"
-
-                [network.bep]
-                steering = "dns"
 
                 [network.egress]
                 allow_dns_hosts = ["b.example", "a.example"]
@@ -1997,9 +1966,7 @@ mod tests {
         let none = implicit_default_entry(&[], test_root).expect("an implicit entry");
         assert_eq!(none, entry);
         let e = expand(&none, &Layers::default()).expect("expands");
-        // BOX-071: expansion fills only the values the digest binds.
-        let filled = table("[network]\nquic443 = \"auto\"\n[network.bep]\nsteering = \"dns\"\n");
-        assert_eq!(e.spec, filled, "{:?}", e.spec);
+        assert!(e.spec.is_empty(), "{:?}", e.spec);
         assert!(e.report.implicit);
 
         // A session entry, direct or through a type rooted at `session`,
@@ -2564,9 +2531,7 @@ mod tests {
         }
         let (bare, _) = expand_checked(file, "bare", "", "");
         assert!(bare.spec.get("packages").is_none());
-        let bare_network = bare.spec["network"].as_table().expect("network");
-        assert!(bare_network.get("ingress").is_none());
-        assert!(bare_network.get("egress").is_none());
+        assert!(bare.spec.get("network").is_none());
         let (dev, _) = expand_checked(file, "dev", "", "");
         assert_eq!(strings(dev.spec.get("packages")), ["git"]);
         let network = dev.spec["network"].as_table().expect("network");
@@ -3244,33 +3209,71 @@ mod tests {
         mode = "installation"
     "#;
 
-    // BOX-071: expansion fills each `github:*` grant's omitted `mode` from
-    // the type's `github_token_mode`, an omitted `network.quic443` with
-    // `auto` and an omitted `bep.steering` with `dns`, so the digest binds
-    // the effective values. A value the spec sets is kept.
+    // BOX-071: before the projection is canonicalised, each `github:*`
+    // grant's omitted `mode` is filled from the type's
+    // `github_token_mode`, an omitted `network.quic443` with `auto` and an
+    // omitted `bep.steering` with `dns`, so the digest binds the effective
+    // values. A value the spec sets is kept. The spec bytes keep only what
+    // a layer set.
     #[test]
     fn expansion_fills_token_mode_quic443_steering_before_digest() {
-        let mode = |e: &Expansion, name: &str| {
-            e.spec["secrets"][name]
-                .get("mode")
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned)
+        use crate::projection::Json;
+        let projected = |name: &str| {
+            let doc = table(GRANTS_FILE);
+            let types = BoxTypes::from_file(&doc).expect("the types resolve");
+            let (e, digest) = expand_projected(GRANTS_FILE, name, "", BTreeMap::new());
+            let entries = read_entries(GRANTS_FILE.as_bytes()).expect("entries read");
+            let entry = entries.iter().find(|x| x.name == name).expect("entry");
+            let resolved = expandable_type(entry, &types).expect("expandable");
+            (e.clone(), e.projection(&resolved).record, digest)
         };
-        let (dev, dev_digest) = expand_projected(GRANTS_FILE, "dev", "", BTreeMap::new());
-        assert_eq!(mode(&dev, "GH").as_deref(), Some("user"));
-        assert_eq!(mode(&dev, "API"), None, "not a GitHub grant");
-        assert_eq!(dev.spec["network"]["quic443"].as_str(), Some("auto"));
-        assert_eq!(dev.spec["network"]["bep"]["steering"].as_str(), Some("dns"));
-        let (lint, _) = expand_projected(GRANTS_FILE, "lint", "", BTreeMap::new());
-        assert_eq!(mode(&lint, "GH").as_deref(), Some("user"));
-        let (ship, _) = expand_projected(GRANTS_FILE, "ship", "", BTreeMap::new());
-        assert_eq!(mode(&ship, "GH").as_deref(), Some("installation"));
-        let (set, _) = expand_projected(GRANTS_FILE, "set", "", BTreeMap::new());
-        assert_eq!(mode(&set, "GH").as_deref(), Some("installation"));
-        assert_eq!(set.spec["network"]["quic443"].as_str(), Some("block"));
+        let mode = |record: &Json, name: &str| -> Option<Json> {
+            let Some(Json::List(grants)) = record.get("secret_grants") else {
+                panic!("secret_grants is a list: {record:?}");
+            };
+            let grant = grants
+                .iter()
+                .find(|g| g.get("name") == Some(&Json::Str(name.to_owned())))
+                .expect("the grant is projected");
+            grant.get("mode").cloned()
+        };
+        let s = |v: &str| Some(Json::Str(v.to_owned()));
+        let (dev, record, dev_digest) = projected("dev");
+        assert_eq!(mode(&record, "GH"), s("user"));
+        assert_eq!(mode(&record, "API"), None, "not a GitHub grant");
         assert_eq!(
-            set.spec["network"]["bep"]["steering"].as_str(),
-            Some("proxy_env")
+            record
+                .get("network")
+                .and_then(|n| n.get("quic443"))
+                .cloned(),
+            s("auto")
+        );
+        assert_eq!(
+            record.get("bep").and_then(|b| b.get("steering")).cloned(),
+            s("dns")
+        );
+        assert!(
+            dev.spec.get("network").is_none(),
+            "the spec bytes are not filled"
+        );
+        assert!(dev.spec["secrets"]["GH"].get("mode").is_none());
+        let (_, lint, _) = projected("lint");
+        assert_eq!(mode(&lint, "GH"), s("user"));
+        let (_, ship, _) = projected("ship");
+        assert_eq!(
+            mode(&ship, "GH"),
+            s("installation"),
+            "the type's token mode"
+        );
+        let (_, set, _) = projected("set");
+        assert_eq!(mode(&set, "GH"), s("installation"));
+        assert_eq!(
+            set.get("network").and_then(|n| n.get("quic443")).cloned(),
+            s("block")
+        );
+        assert_eq!(
+            set.get("bep").and_then(|b| b.get("steering")).cloned(),
+            s("proxy_env")
         );
 
         // Writing the filled values out projects the same digest, and
