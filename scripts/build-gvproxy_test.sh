@@ -128,7 +128,7 @@ fi
 setup digest
 printf 'diff --git a/y b/y\n' >>"$case_dir/patches/$patch_name"
 run_build
-if [ "$status" -ne 0 ] && printf '%s' "$err" | grep -q "patch $patch_name does not match its SHA-256"; then
+if [ "$status" -ne 0 ] && case "$err" in *"patch $patch_name does not match its SHA-256"*) true ;; *) false ;; esac; then
   ok "a patch whose digest differs from the lock stops the build and is named"
 else
   bad "a patch whose digest differs from the lock stops the build and is named (exit $status): $err"
@@ -148,7 +148,7 @@ fi
 setup stale
 export STUB_APPLY_FAIL="$patch_name"
 run_build
-if [ "$status" -ne 0 ] && printf '%s' "$err" | grep -q "patch $patch_name does not apply"; then
+if [ "$status" -ne 0 ] && case "$err" in *"patch $patch_name does not apply"*) true ;; *) false ;; esac; then
   ok "a stale patch stops the build and is named"
 else
   bad "a stale patch stops the build and is named (exit $status): $err"
@@ -163,7 +163,7 @@ fi
 setup unpinned
 sed -i.bak '/^patch\./d' "$GVPROXY_LOCK"
 run_build
-if [ "$status" -ne 0 ] && printf '%s' "$err" | grep -q "patch $patch_name has no patch.$patch_name= line"; then
+if [ "$status" -ne 0 ] && case "$err" in *"patch $patch_name has no patch.$patch_name= line"*) true ;; *) false ;; esac; then
   ok "a patch the lock does not pin stops the build and is named"
 else
   bad "a patch the lock does not pin stops the build and is named (exit $status): $err"
