@@ -195,7 +195,7 @@ impl std::fmt::Display for BoxAddressRefusal {
             Self::NotFound { address } => write!(
                 f,
                 "No box named {address}. \
-                 Run `min box list --all` to see the boxes on every host."
+                 Run `min box list --all` to see the boxes of every project."
             ),
         }
     }
