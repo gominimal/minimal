@@ -99,7 +99,11 @@ impl std::fmt::Display for ProjectFileInvalid {
         // cause (the io error of `Error::IO`) is in its Display already.
         // A loadout file is not the project's file, so its refusal does not
         // say that the project's file does not load.
-        if let mfile::Error::LoadoutSetsLoadoutMode { .. } = self.error {
+        // A var conflict with a loadout (BOX-183) names both sources and
+        // the remedy, so it does not blame the project's file either.
+        if let mfile::Error::LoadoutSetsLoadoutMode { .. }
+        | mfile::Error::LoadoutVarConflict { .. } = self.error
+        {
             return write!(f, "Cannot start the box: {}", self.error);
         }
         write!(
@@ -1499,10 +1503,30 @@ fn entry_egress(
 /// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
 /// Fails with [`SessionEntryUndecided`] (exit 2) when no single session
 /// entry can be picked.
+#[cfg(test)]
 pub(crate) fn session_box_entry(
     project: &camino::Utf8Path,
     entry: Option<&str>,
     hooks_enabled: bool,
+) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
+    session_box_entry_with_loadouts(project, entry, hooks_enabled, &[])
+}
+
+/// [`session_box_entry`], expanded with `loadouts`, one layer for each
+/// selected loadout that the box's loadout gate let through, by name
+/// ([`loadout_layers`]). The expansion refuses a loadout var conflict
+/// (BOX-183) and names the declarer of each hook (BOX-179). The entry it
+/// sends carries only the project's part: the loadouts' items reach the
+/// daemon in the contribution.
+///
+/// # Errors
+///
+/// The errors of [`session_box_entry`], and a loadout var conflict, exit 3.
+pub(crate) fn session_box_entry_with_loadouts(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    hooks_enabled: bool,
+    loadouts: &[(String, toml::Table)],
 ) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
     let Some(bytes) = project_file_bytes(project)? else {
         return Ok(None);
@@ -1516,7 +1540,7 @@ pub(crate) fn session_box_entry(
         // project's `[session]` table.
         None => pick_session_entry(&entries)?,
     };
-    box_entry(project, &bytes, picked, hooks_enabled).map(Some)
+    box_entry(project, &bytes, picked, hooks_enabled, loadouts).map(Some)
 }
 
 /// The expanded `[tasks.<task>]` entry of the project at `project`, for the
@@ -1541,7 +1565,137 @@ pub(crate) fn task_box_entry(
     }) else {
         return Ok(None);
     };
-    box_entry(project, &bytes, entry, hooks_enabled).map(Some)
+    // Gap: `min task run` does not pass its loadouts here yet, so a task
+    // box's loadout var conflict is not refused before its create.
+    box_entry(project, &bytes, entry, hooks_enabled, &[]).map(Some)
+}
+
+/// One expansion layer for each selected loadout in `contribution`, by
+/// name, in the order of `names` (BOX-179). `contribution` is the composed
+/// user contribution, so the box's loadout gate and the user policy
+/// already apply: a sealed box has no loadout here, and a var that the
+/// policy ignores is not here. Each layer carries the loadout's `vars`,
+/// as the values it resolved, its `packages` and its `lifecycle_hooks`.
+pub(crate) fn loadout_layers(
+    contribution: &boxes::wire::request::WireContribution,
+    names: &[String],
+) -> Vec<(String, toml::Table)> {
+    use boxes::wire::primitives::WireSource;
+    let of = |source: &WireSource, name: &str| matches!(source, WireSource::UserLoadout { name: n } if n == name);
+    names
+        .iter()
+        .map(|name| {
+            let mut layer = toml::Table::new();
+            let vars: toml::Table = contribution
+                .vars
+                .iter()
+                .filter(|v| of(&v.source, name))
+                .map(|v| (v.var.name.clone(), v.var.value.clone().into()))
+                .collect();
+            if !vars.is_empty() {
+                layer.insert("vars".to_owned(), vars.into());
+            }
+            let packages: Vec<toml::Value> = contribution
+                .requested_packages
+                .iter()
+                .filter(|p| of(&p.source, name))
+                .map(|p| p.name.clone().into())
+                .collect();
+            if !packages.is_empty() {
+                layer.insert("packages".to_owned(), packages.into());
+            }
+            let hooks: Vec<toml::Value> = contribution
+                .lifecycle_hooks
+                .iter()
+                .filter(|h| of(&h.source, name))
+                .filter_map(|h| toml::Value::try_from(&h.hook).ok())
+                .collect();
+            if !hooks.is_empty() {
+                layer.insert("lifecycle_hooks".to_owned(), hooks.into());
+            }
+            (name.clone(), layer)
+        })
+        .collect()
+}
+
+/// The project's part of `expansion`'s spec: the spec without the items
+/// that a selected loadout set, and with no `declared_by` in a hook. A
+/// list or a `vars` table that only loadouts set is left out.
+fn project_part(expansion: &mfile::expand::Expansion) -> toml::Table {
+    use mfile::expand::{Layer, ValueOrigin};
+    let mut spec = expansion.spec.clone();
+    let report = &expansion.report;
+    let from_loadout = |o: &mfile::expand::Origin| o.layer == Layer::Loadouts;
+    let var_from_loadout = |name: &str| report.vars.get(name).is_some_and(from_loadout);
+    if let Some(ValueOrigin::List(origins)) = report.values.get("packages")
+        && let Some(toml::Value::Array(items)) = spec.get_mut("packages")
+        && items.len() == origins.len()
+    {
+        let had = !items.is_empty();
+        let mut kept = origins.iter().map(|o| !from_loadout(o));
+        items.retain(|_| kept.next().unwrap_or(true));
+        if had && items.is_empty() {
+            spec.remove("packages");
+        }
+    }
+    if let Some(toml::Value::Table(vars)) = spec.get_mut("vars") {
+        let had = !vars.is_empty();
+        vars.retain(|name, _| !var_from_loadout(name));
+        if had && vars.is_empty() {
+            spec.remove("vars");
+        }
+    }
+    if let Some(toml::Value::Array(items)) = spec.get_mut("vars_lenient") {
+        let had = !items.is_empty();
+        items.retain(|item| {
+            !item
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .is_some_and(var_from_loadout)
+        });
+        if had && items.is_empty() {
+            spec.remove("vars_lenient");
+        }
+    }
+    if let Some(toml::Value::Array(hooks)) = spec.get_mut("lifecycle_hooks") {
+        let had = !hooks.is_empty();
+        hooks.retain(|hook| {
+            hook.get("declared_by")
+                .and_then(|by| by.get("kind"))
+                .and_then(toml::Value::as_str)
+                != Some("loadout")
+        });
+        for hook in hooks.iter_mut() {
+            if let toml::Value::Table(hook) = hook {
+                hook.remove("declared_by");
+            }
+        }
+        if had && hooks.is_empty() {
+            spec.remove("lifecycle_hooks");
+        }
+    }
+    spec
+}
+
+/// Each hook of `spec` as its declarer, in the spec's order: `project`, or
+/// `loadout <name>`. For the log.
+fn hook_declarers(spec: &toml::Table) -> Vec<String> {
+    let Some(toml::Value::Array(hooks)) = spec.get("lifecycle_hooks") else {
+        return Vec::new();
+    };
+    hooks
+        .iter()
+        .map(|hook| {
+            let by = hook.get("declared_by");
+            let kind = by.and_then(|b| b.get("kind")).and_then(toml::Value::as_str);
+            let name = by.and_then(|b| b.get("name")).and_then(toml::Value::as_str);
+            match (kind, name) {
+                (Some(kind), Some(name)) => format!("{kind} {name}"),
+                (Some(kind), None) => kind.to_owned(),
+                (None, _) => "unknown".to_owned(),
+            }
+        })
+        .collect()
 }
 
 /// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
@@ -1560,6 +1714,7 @@ fn box_entry(
     bytes: &[u8],
     entry: mfile::entry::BoxEntry,
     hooks_enabled: bool,
+    loadouts: &[(String, toml::Table)],
 ) -> anyhow::Result<boxes::wire::request::WireBoxEntry> {
     let format_error = |error| ProjectFileInvalid {
         error: mfile::Error::Format(error),
@@ -1585,20 +1740,21 @@ fn box_entry(
         entry.box_type.as_deref(),
         &project_types,
     );
+    // BOX-179, BOX-183: one layer for each selected loadout, by name. The
+    // expansion gates them again, so a sealed entry takes none of them.
+    layers.selected_loadouts = loadouts.to_vec();
     // BOX-183, BOX-184: the merge compares resolved values, so each
     // `inherit` name takes this process's value. A name it does not set
     // stays out, and the merge falls back to the `default`.
-    // Gap (BOX-183, residual of T125, issue #3302): `layers.loadouts` stays
-    // empty here. So the loadout var conflict refusal in `merge_vars` does
-    // not run before `min box create`, `min session start` or `min task run`
-    // creates the box.
     layers.host_vars = mfile::expand::inherited_var_names(&entry, &layers)
         .into_iter()
         .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
         .collect();
     let expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
-    let spec = &expansion.spec;
+    let hooks = hook_declarers(&expansion.spec);
+    let project_spec = project_part(&expansion);
+    let spec = &project_spec;
     fn list<T: serde::de::DeserializeOwned>(
         spec: &toml::Table,
         key: &str,
@@ -1633,6 +1789,8 @@ fn box_entry(
         box_type = %wire.box_type,
         implicit = entry.implicit,
         packages = ?wire.packages,
+        loadouts = loadouts.len(),
+        hooks = ?hooks,
         "expanded the box's entry"
     );
     Ok(wire)
@@ -3414,6 +3572,7 @@ pub(crate) async fn activate_box(
         finalize_hook_budget,
         contribution,
         user_policy,
+        loadout_names,
     ) = ActivationStep::ResolveLoadouts
         .run(async {
             // Resolve and compose the loadouts BEFORE opening the daemon
@@ -3472,6 +3631,7 @@ pub(crate) async fn activate_box(
                 inputs.hook_budget,
                 inputs.contribution,
                 inputs.user_policy,
+                inputs.loadout_names,
             ))
         })
         .await?;
@@ -3479,11 +3639,22 @@ pub(crate) async fn activate_box(
     // BOX-068: the box's expanded entry rides on the contribution, and the
     // daemon composes the project's part of the box from it. One span
     // covers the expansion and the compose call that sends it.
+    // BOX-179, BOX-183: the expansion takes each selected loadout that the
+    // gate let through, by name, so a loadout var conflict refuses the
+    // start here, before the daemon creates any record.
     use tracing::Instrument as _;
     let entry_span = tracing::info_span!("box_entry", box_type = boxes::SESSION_BOX_TYPE);
     let mut contribution = contribution;
+    let selected = loadout_layers(&contribution, &loadout_names);
     contribution.entry = entry_span
-        .in_scope(|| session_box_entry(&project_root, options.entry.as_deref(), !args.no_hooks))?
+        .in_scope(|| {
+            session_box_entry_with_loadouts(
+                &project_root,
+                options.entry.as_deref(),
+                !args.no_hooks,
+                &selected,
+            )
+        })?
         .map(Box::new);
 
     // The upload decision needs no TTY — the interactive `Confirm` is answered

@@ -19114,3 +19114,210 @@ async fn box_rename_native_host_prints_no_vm_host_warning() {
         warnings.join("\n")
     );
 }
+
+/// A project at a temp dir whose `minimal.toml` is `mfile`, and a config
+/// dir (`--config-dir`) whose loadouts dir holds `rust.toml` as `rust`.
+fn project_and_rust_loadout(mfile: &str, rust: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), mfile).unwrap();
+    let config = tempfile::tempdir().expect("a config dir");
+    let loadouts_dir = config.path().join("minimal").join("loadouts");
+    std::fs::create_dir_all(&loadouts_dir).unwrap();
+    std::fs::write(loadouts_dir.join("rust.toml"), rust).unwrap();
+    (project, config)
+}
+
+// BOX-179: a box with a project hook and a loadout hook stores both, each
+// with its declarer. The client expands the entry with the selected
+// `rust` loadout as its own layer, and sends only the project's hook in
+// the entry. The loadout's hook rides on the contribution. The daemon's
+// stored composition then names the project for one hook and the loadout
+// `rust` for the other.
+#[tokio::test]
+async fn stored_spec_keeps_each_hook_with_its_declarer() {
+    use boxes::wire::policy::WireHookVerdict;
+    use boxes::wire::primitives::WireSource;
+    use boxes::wire::request::ContributionVerdict;
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSession,
+        Errorable, GetSessionHooks, GetSessionHooksRequest, SubmitVerdict,
+    };
+
+    let (project, config) = project_and_rust_loadout(
+        "[sessions.default]\n\
+         loadout_mode = \"open\"\n\n\
+         [[sessions.default.lifecycle_hooks]]\n\
+         description = \"project mark\"\n\
+         on_detach = { type = \"inline\", value = \"true\" }\n",
+        "description = \"r\"\n\n\
+         [[lifecycle_hooks]]\n\
+         description = \"rust mark\"\n\
+         on_detach = { type = \"inline\", value = \"true\" }\n",
+    );
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    let global = GlobalArgs {
+        config_dir: Some(config.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+    let inputs = loadouts::prepare_activation_inputs_with_config(
+        &boxes::client::config::Config::default(),
+        &global,
+        root,
+        loadouts::LoadoutSelection::Cli(vec!["rust".to_owned()]),
+        loadouts::HookPrep::StageOnly,
+        Some(boxes::core::policy::UserPolicy::default()),
+    )
+    .unwrap_or_else(|e| panic!("the loadouts compose: {e:#}"));
+    let selected = crate::loadout_layers(&inputs.contribution, &inputs.loadout_names);
+    assert_eq!(
+        selected.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["rust"]
+    );
+    assert!(
+        selected[0].1.contains_key("lifecycle_hooks"),
+        "the rust layer carries its hook: {selected:?}"
+    );
+
+    let entry = crate::session_box_entry_with_loadouts(root, None, true, &selected)
+        .expect("the entry expands with the loadout")
+        .expect("the project declares the entry");
+    let sent: Vec<_> = entry
+        .lifecycle_hooks
+        .as_deref()
+        .expect("the entry sends its hooks")
+        .iter()
+        .map(|h| h.description().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        sent,
+        [Some("project mark".to_owned())],
+        "the entry sends the project's hook, and not the loadout's"
+    );
+
+    let server = minimald::test_harness::TestServer::new().await;
+    let mut daemon = server.connect().await;
+    let request = minimald::test_harness::create_session_req(
+        "marks",
+        project.path().to_str().expect("a UTF-8 project path"),
+    );
+    let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
+    let mut contribution = inputs.contribution;
+    contribution.entry = Some(Box::new(entry));
+    match daemon
+        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+            session_id: id,
+            contribution,
+        })
+        .await
+    {
+        Errorable::Ok(ConfigureLoadoutResponse::Pending { response }) => {
+            let verdict = ContributionVerdict {
+                session_id: id,
+                vars: Vec::new(),
+                patches: Vec::new(),
+                lifecycle_hooks: response
+                    .lifecycle_hooks
+                    .iter()
+                    .map(|hook| WireHookVerdict::Approved { id: hook.id })
+                    .collect(),
+            };
+            if let Errorable::Err { error } = daemon.call::<SubmitVerdict>(&verdict).await {
+                panic!("SubmitVerdict failed: {error}");
+            }
+        }
+        Errorable::Ok(ConfigureLoadoutResponse::Materialized) => {}
+        Errorable::Err { error } => panic!("ConfigureLoadout failed: {error}"),
+    }
+    finalize_from_entry(&mut daemon, id).await;
+
+    let hooks = match daemon
+        .call::<GetSessionHooks>(&GetSessionHooksRequest::Id(id))
+        .await
+    {
+        Errorable::Ok(hooks) => hooks,
+        Errorable::Err { error } => panic!("the box's hooks: {error}"),
+    };
+    let declared: Vec<(Option<String>, String)> = hooks
+        .iter()
+        .map(|h| {
+            let by = match &h.source {
+                WireSource::Project { .. } => "project".to_owned(),
+                WireSource::UserLoadout { name } => format!("loadout {name}"),
+                WireSource::Package { name } => format!("package {name}"),
+            };
+            (h.hook.description.clone(), by)
+        })
+        .collect();
+    assert!(
+        declared.contains(&(Some("project mark".to_owned()), "project".to_owned())),
+        "{declared:?}"
+    );
+    assert!(
+        declared.contains(&(Some("rust mark".to_owned()), "loadout rust".to_owned())),
+        "{declared:?}"
+    );
+    assert_eq!(declared.len(), 2, "{declared:?}");
+}
+
+// BOX-183: a loadout that sets a variable of the entry to another value
+// fails `min box start` with exit 3 before the daemon creates a record.
+// The refusal names the variable, the entry and the loadout.
+#[tokio::test]
+async fn conflicting_loadout_var_refused_before_create() {
+    let (project, config) = project_and_rust_loadout(
+        "[sessions.default]\n\
+         loadout_mode = \"open\"\n\
+         vars = { EDITOR = \"hx\" }\n",
+        "[vars]\nEDITOR = \"vim\"\n",
+    );
+    let (_state, global, server) = show_network_daemon().await;
+    let global = GlobalArgs {
+        config_dir: Some(config.path().to_path_buf()),
+        ..global
+    };
+    let args = ActivateArgs {
+        name: Some("conflict".into()),
+        path: Some(project.path().to_string_lossy().into_owned()),
+        loadout: vec!["rust".to_owned()],
+        no_loadouts: false,
+        no_hooks: false,
+        no_prompt: true,
+        attach: false,
+        ..ActivateArgs::unflagged()
+    };
+    let error = crate::activate_box(&global, args, false)
+        .await
+        .expect_err("the loadout var conflict refuses the start");
+    let invalid = error
+        .downcast_ref::<crate::ProjectFileInvalid>()
+        .unwrap_or_else(|| panic!("not a refusal with exit 3: {error:#}"));
+    assert_eq!(invalid.error.exit_code(), Some(3));
+    assert!(
+        matches!(
+            &invalid.error,
+            mfile::Error::LoadoutVarConflict { name, .. } if name == "EDITOR"
+        ),
+        "{:?}",
+        invalid.error
+    );
+    assert_eq!(
+        format!("{error:#}"),
+        "Cannot start the box: The variable `EDITOR` has two different values. \
+         `[sessions.default]` in minimal.toml sets one value, and the loadout `rust` \
+         sets the other. A loadout cannot change a variable that is already set. \
+         Remove `EDITOR` from one of them, or add `EDITOR` to the `ignore` list under \
+         `[vars]` in user_policy.toml to drop every value of `EDITOR`."
+    );
+    // The refusal comes before the create: the daemon holds no record.
+    let listed = server
+        .connect()
+        .await
+        .call::<minimald_rpc::ListSessions>(&())
+        .await;
+    assert!(
+        listed.sessions.is_empty(),
+        "the refused start created no box: {:?}",
+        listed.sessions
+    );
+}
