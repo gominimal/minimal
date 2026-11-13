@@ -12317,6 +12317,75 @@ async fn events_parent_merges_children() {
     );
 }
 
+// Issue 3024: `min box events --parent <box> --follow` adds the stream of
+// a box that becomes a child of the parent after the follow starts.
+#[tokio::test]
+async fn events_parent_follow_picks_up_new_children() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let parent =
+        minimald::test_harness::create_configured_session(&mut daemon, "lead", project).await;
+    let first =
+        minimald::test_harness::create_configured_session(&mut daemon, "one", project).await;
+    let mut stopped = Vec::new();
+    stop_box_on_hosts(local_hosts(&global).unwrap(), &mut stopped, "one", false)
+        .await
+        .expect("the first child stops");
+    set_record_parent(&state_path, first, parent);
+
+    let shared = SharedOut::default();
+    let args = events_args(None, Some("lead"), true);
+    let follow = async {
+        let (mut out, mut err) = (shared.clone(), Vec::new());
+        box_events_on_hosts(local_hosts(&global).unwrap(), &args, &mut out, &mut err).await
+    };
+    let drive = async {
+        let before = shared.more_than(0).await;
+        assert!(
+            before.iter().all(|line| line["box"] == first.to_string()),
+            "only the first child is followed yet: {before:?}"
+        );
+        let second =
+            minimald::test_harness::create_configured_session(&mut daemon, "two", project).await;
+        let mut stopped = Vec::new();
+        stop_box_on_hosts(local_hosts(&global).unwrap(), &mut stopped, "two", false)
+            .await
+            .expect("the second child stops");
+        set_record_parent(&state_path, second, parent);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let lines = shared.lines();
+            let types: Vec<&str> = lines
+                .iter()
+                .filter(|line| line["box"] == second.to_string())
+                .filter_map(|line| line["type"].as_str())
+                .collect();
+            if types.len() > 1 {
+                assert_eq!(types.first(), Some(&"created"), "{lines:?}");
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the new child's events never joined the follow: {lines:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::select! {
+            followed = follow => panic!("the follow ended while the parent exists: {followed:?}"),
+            () = drive => {}
+        }
+    })
+    .await
+    .expect("the new child's events arrive in time");
+}
+
 /// A session record carrying `mode` and `box_addresses`, with everything
 /// else at its default.
 fn hold_record(
