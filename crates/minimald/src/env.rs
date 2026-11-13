@@ -508,6 +508,65 @@ pub(crate) fn unknown_package(name: &str) -> std::io::Error {
     std::io::Error::other(format!("no such package: {name}"))
 }
 
+/// The project's `[upstream]` pin: the repo the session's packages come
+/// from and the `locked_commit` they are read at. Captured so a refusal
+/// for an unknown package can say which commit it judged against, since a
+/// package newer than the pin is unknown until `min update` moves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpstreamPin {
+    /// The `[upstream]` `repo`, as `minimal.toml` writes it.
+    pub(crate) repo: String,
+    /// The full `locked_commit`.
+    pub(crate) locked_commit: String,
+}
+
+impl UpstreamPin {
+    /// The pin `file` declares. `None` for a `dir` upstream, a git
+    /// upstream with no `locked_commit`, or no `[upstream]` at all: none
+    /// of those has a commit that `min update` can move.
+    pub(crate) fn of(file: &mfile::File) -> Option<Self> {
+        match &file.upstream.as_ref()?.link {
+            mfile::LinkConfig::Git {
+                repo,
+                locked_commit: Some(commit),
+                ..
+            } => Some(Self {
+                repo: repo.clone(),
+                locked_commit: commit.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The pin in the short form `git log --oneline` prints.
+    pub(crate) fn short_commit(&self) -> &str {
+        self.locked_commit
+            .get(..7)
+            .unwrap_or(self.locked_commit.as_str())
+    }
+
+    /// The note added once to an unknown-package refusal: where the names
+    /// were looked up, and the command that moves the pin.
+    pub(crate) fn hint(&self) -> String {
+        format!(
+            "Packages come from {} at commit {}, the [upstream] pin in minimal.toml. \
+             If a package is newer than that commit, run `min update` to move the pin \
+             to the head of its branch.",
+            self.repo,
+            self.short_commit()
+        )
+    }
+}
+
+/// `err` (an unknown-package refusal) with `pin`'s [`UpstreamPin::hint`]
+/// appended, or `err` unchanged when the project has no pin.
+pub(crate) fn with_upstream_pin(err: std::io::Error, pin: Option<&UpstreamPin>) -> std::io::Error {
+    match pin {
+        Some(pin) => std::io::Error::new(err.kind(), format!("{err}. {}", pin.hint())),
+        None => err,
+    }
+}
+
 impl Env {
     /// Build a runtime environment. Resolves and locally builds the
     /// requested packages (plus `bash`/`socat` for the `min`
@@ -528,7 +587,8 @@ impl Env {
             .packages
             .iter()
             .map(|n| session_package(&graph, n))
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>()
+            .map_err(|e| with_upstream_pin(e, UpstreamPin::of(ctx.minimal_file()).as_ref()))?;
         for helper_dep in ["bash", "socat"] {
             if let Some(bsr) = graph.by_name(helper_dep).copied()
                 && !graph.top_levels.contains(&bsr)

@@ -27,29 +27,21 @@ locked_commit = "9d36aa3d0fec09658fe3bbc676beeae49a89c53d"
 [stack]
 use = "rust"
 
-[defaults]
-state_key = "dev"
-
-[session] # min session attach
-packages = ["base", "vim"]
-```
-
-- `[upstream]` pins the software supply chain: the package registry and the exact commit it is read from.
-- `[stack]` declares how the project builds. See the [stack reference](../reference/stack-specs.md).
-- `[defaults]` sets defaults for the project's tasks and sessions, such as the `state_key` that tasks share persistent state under.
-- `[session]` is the one that matters for day-to-day work: it lists the tools every contributor's session gets. See the [`minimal.toml` reference](../reference/minimal-dot-toml.md) for the full schema.
-
-`min init` writes the older spellings `[session]` and `state_key` under `[defaults]`. Release 0.8 reads them, and prints a hint for each one each time it reads the file. Release 0.9.0 and later refuse them. Rename `[session]` to `[defaults.session]`, and move `state_key` under `[defaults.task]`:
-
-```toml
 [defaults.task]
 state_key = "dev"
 
 [defaults.session] # min session attach
 packages = ["base", "vim"]
+
+[boxes.dev]
+type = "session"
 ```
 
-See [Legacy tables](../reference/minimal-dot-toml.md#legacy) for every older spelling.
+- `[upstream]` pins the software supply chain: the package registry and the exact commit it is read from.
+- `[stack]` declares how the project builds. See the [stack reference](../reference/stack-specs.md).
+- `[defaults.task]` sets defaults for the project's tasks, such as the `state_key` that tasks share persistent state under.
+- `[defaults.session]` is the one that matters for day-to-day work: it lists the tools every contributor's session gets. See the [`minimal.toml` reference](../reference/minimal-dot-toml.md) for the full schema.
+- `[boxes.dev]` declares the project's session, `dev`.
 
 ## Declare your session's tools
 
