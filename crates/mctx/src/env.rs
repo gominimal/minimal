@@ -1496,16 +1496,38 @@ impl<'a> Env<'a> {
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
+        self.run_with_options(
+            invocations,
+            stdout_writer,
+            stderr_writer,
+            sandbox::RunOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Self::run`] with the run's working directory, stdin pipe and
+    /// cancellation in `options`, passed to the sandbox as they are.
+    pub async fn run_with_options<W1, W2>(
+        &mut self,
+        invocations: Vec<Invocation>,
+        stdout_writer: Option<W1>,
+        stderr_writer: Option<W2>,
+        options: sandbox::RunOptions,
+    ) -> Result<(), Error>
+    where
+        W1: tokio::io::AsyncWrite + Unpin + Send,
+        W2: tokio::io::AsyncWrite + Unpin + Send,
+    {
         #[cfg(target_os = "linux")]
         {
             self.sandbox
-                .run(invocations, stdout_writer, stderr_writer)
+                .run_with_cancel(invocations, stdout_writer, stderr_writer, options)
                 .await
                 .map_err(Error::from)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (invocations, stdout_writer, stderr_writer);
+            let _ = (invocations, stdout_writer, stderr_writer, options);
             Err(op::sandbox_unsupported().into())
         }
     }
