@@ -174,9 +174,9 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
 /// The `[patches]` gate for the task `mip run <task>` names (inbox#1128):
 /// [`mctx::gate_task_patches`], the one gate a task run by name passes, here
 /// and in a nested `run <task>` over the sandbox's channel. `mip` builds its
-/// config with [`mctx::TaskPatchPolicy::UserPolicy`] (see `base_config`), so
-/// the task's entries are judged against the user's `user_policy.toml`. An
-/// entry an `ignore` rule dropped is named in a warning.
+/// config with a [`crate::patch_gate::UserPolicyGate`] (see `base_config`),
+/// so the task's entries are judged against the user's `user_policy.toml`.
+/// An entry an `ignore` rule dropped is named in a warning.
 ///
 /// Only the named-task lane is gated here: the project file is the untrusted
 /// input. A `--task-spec` is typed by the user on the command line.
@@ -362,7 +362,9 @@ pub async fn run_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patch_gate::UserPolicyGate;
     use mctx::{ConfigBuilder, TaskPatchPolicy};
+    use std::sync::Arc;
 
     /// `mip run <task>` judges the task's patches before it builds anything
     /// (inbox#1128, scenario 812's shape): a task whose `patch.dir` the user
@@ -384,7 +386,9 @@ mod tests {
             .with_repo_dir(manifest_dir.join("../mctx/testdata/patchrepo"))
             .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
             .with_no_fetch(true)
-            .with_task_patch_policy(TaskPatchPolicy::UserPolicyAt(policy_file.clone()))
+            .with_task_patch_policy(TaskPatchPolicy::Gated(Arc::new(UserPolicyGate::at(
+                policy_file.clone(),
+            ))))
             .build()
             .unwrap();
         let mut ctx = Context::new(config).unwrap();

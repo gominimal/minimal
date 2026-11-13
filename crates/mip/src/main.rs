@@ -8,7 +8,12 @@ use mctx::{ConfigBuilder, Context, Error};
 use std::io;
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+// The `[patches]` gate every `mip` context runs a named task's patches
+// through (inbox#1128).
+mod patch_gate;
 
 // `cmd_pkg` owns the `mip package` subcommand table and dispatches into the
 // `cmd_pkg_*` modules below.
@@ -172,7 +177,9 @@ pub(crate) fn enforce_science_mode() -> Result<(), Error> {
 /// user's own host, where that file is the user's, so the policy is on for
 /// every context `mip` builds, the `--task-spec` lane's included.
 fn base_config() -> ConfigBuilder {
-    ConfigBuilder::new().with_task_patch_policy(mctx::TaskPatchPolicy::UserPolicy)
+    ConfigBuilder::new().with_task_patch_policy(mctx::TaskPatchPolicy::Gated(Arc::new(
+        patch_gate::UserPolicyGate::user(),
+    )))
 }
 
 #[tokio::main]
@@ -286,9 +293,10 @@ mod tests {
     #[test]
     fn mip_contexts_gate_task_patches_on_the_user_policy() {
         let config = base_config().with_no_fetch(true).build().unwrap();
-        assert_eq!(
-            config.task_patch_policy(),
-            &mctx::TaskPatchPolicy::UserPolicy
-        );
+        let mctx::TaskPatchPolicy::Gated(gate) = config.task_patch_policy() else {
+            panic!("mip's contexts run task patches ungated");
+        };
+        // the user's own policy file, not a fixed one
+        assert_eq!(format!("{gate:?}"), "UserPolicyGate { policy_file: None }");
     }
 }

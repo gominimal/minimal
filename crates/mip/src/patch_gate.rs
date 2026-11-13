@@ -7,14 +7,14 @@
 //! `user_policy.toml`. This module judges a task's entries against the same
 //! file, with the same precedence, before the sandbox is built.
 //!
-//! [`gate_task_patches`] is the one gate. Both ways a task is run by name in
-//! a [`Context`] call it after the task is looked up and before
-//! [`Context::make_env`]: `mip run <task>` on the host, and a nested
-//! `run <task>` that a sandbox sends over its `/run/minenv_sock` channel
-//! (the in-sandbox `min run <task>` helper). Whether it judges anything is
-//! the context's [`TaskPatchPolicy`]: `mip` sets
-//! [`TaskPatchPolicy::UserPolicy`]; the default, [`TaskPatchPolicy::Ungated`],
-//! keeps the daemon's behaviour, whose task patches are inbox#602.
+//! [`UserPolicyGate`] is the gate. `mip` builds every context with
+//! [`mctx::TaskPatchPolicy::Gated`] holding one (see `base_config`), and
+//! both ways a task is run by name in a [`mctx::Context`] reach it through
+//! [`mctx::gate_task_patches`], the hook in `mctx`: `mip run <task>` on the
+//! host, and a nested `run <task>` that a sandbox sends over its
+//! `/run/minenv_sock` channel (the in-sandbox `min run <task>` helper). The
+//! policy lives here, not in `mctx`, because its types are in `boxes`, a
+//! session-plane crate the build-plane facade may not depend on.
 //!
 //! Each entry is decided as one path, since the sandbox binds it whole:
 //!
@@ -49,89 +49,86 @@ use boxes::core::expansion::VarLookup;
 use boxes::core::policy::{ExpandedPatchesPolicy, PatchesPolicy, UserPolicy};
 use boxes::core::source::{Provenanced, Source};
 use camino::{Utf8Path, Utf8PathBuf};
-
-use crate::{Context, Error, PatchHome, TaskPatchPolicy};
+use mctx::{Context, Error, GatedTask, PatchHome, TaskPatchGate};
 
 /// The most entries a directory's deny probe walks before it refuses the
 /// entry rather than mount a tree it has not checked whole.
 pub(crate) const DIR_PROBE_LIMIT: usize = 10_000;
 
-/// A task that passed [`gate_task_patches`].
+/// The `[patches]` gate `mip` runs a named task's patches through
+/// (inbox#1128), behind [`mctx::TaskPatchGate`].
+///
+/// Judges the `patch.dir` / `patch.file` entries a task declares against the
+/// user policy, and returns the task with only the entries the sandbox may
+/// mount. `~/` expands against [`PatchHome::Ambient`], the home both callers
+/// hand to `Context::make_env`.
 #[derive(Debug)]
-pub struct GatedTask {
-    /// The task, with only the patch entries the sandbox may mount.
-    pub task: mfile::Task,
-    /// The entries an `ignore` rule dropped, as declared, for the caller to
-    /// tell the user about: the task runs without them.
-    pub ignored: Vec<String>,
+pub struct UserPolicyGate {
+    /// The policy file; `None` for the user's own
+    /// `<config>/minimal/user_policy.toml`, resolved only when a task has
+    /// patches.
+    policy_file: Option<PathBuf>,
 }
 
-impl GatedTask {
-    /// One line naming the dropped entries, or `None` when nothing was
-    /// dropped.
+impl UserPolicyGate {
+    /// Judge against the `[patches]` section of the user's
+    /// `<config>/minimal/user_policy.toml`, the file `min` reads.
     #[must_use]
-    pub fn ignored_notice(&self, task_name: &str) -> Option<String> {
-        if self.ignored.is_empty() {
-            return None;
+    pub fn user() -> Self {
+        Self { policy_file: None }
+    }
+
+    /// Judge against the policy in `policy_file`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn at(policy_file: PathBuf) -> Self {
+        Self {
+            policy_file: Some(policy_file),
         }
-        Some(format!(
-            "task `{task_name}`: not mounting {} (ignored by `[patches]` in user_policy.toml)",
-            self.ignored.join(", ")
-        ))
     }
 }
 
-/// The one `[patches]` gate for a task run by name in `ctx` (inbox#1128).
-///
-/// Judges the `patch.dir` / `patch.file` entries `task` declares against the
-/// user policy `ctx`'s [`TaskPatchPolicy`] names, and returns the task with
-/// only the entries the sandbox may mount. Under
-/// [`TaskPatchPolicy::Ungated`], and for a task without patches, the task is
-/// returned untouched and no policy file is read.
-///
-/// `~/` expands against [`PatchHome::Ambient`], the home both callers hand
-/// to [`Context::make_env`].
-///
-/// # Errors
-///
-/// - `policy denied ...` when a `deny` rule matches an entry, its resolved
-///   path, or a path a directory entry holds.
-/// - A refusal carrying the `[patches] allow` snippet when an entry is
-///   undecided: there is no prompt.
-/// - The policy file cannot be found, read or parsed; a pattern in it does
-///   not expand; a directory's contents cannot be checked whole; or a path
-///   cannot be resolved.
-pub fn gate_task_patches(
-    ctx: &Context,
-    task_name: &str,
-    mut task: mfile::Task,
-) -> Result<GatedTask, Error> {
-    let policy_path = match ctx.daemon.config.task_patch_policy() {
-        TaskPatchPolicy::Ungated => None,
-        _ if task.patch.dir.is_empty() && task.patch.file.is_empty() => None,
-        TaskPatchPolicy::UserPolicy => Some(user_policy_path().map_err(Error::Other)?),
-        TaskPatchPolicy::UserPolicyAt(path) => Some(path.clone()),
-    };
-    let Some(policy_path) = policy_path else {
-        return Ok(GatedTask {
-            task,
-            ignored: Vec::new(),
-        });
-    };
-    let policy = boxes::core::policy::read_user_policy_or_default(&policy_path)
-        .map_err(|e| Error::Other(anyhow!("{e}")))?;
-    let (kept, ignored) = judge_task_patches(
-        task_name,
-        &task.patch,
-        &policy,
-        &policy_path,
-        ctx.repo_dir()?,
-        PatchHome::Ambient.resolve().as_deref(),
-        &ProcessEnv::current(),
-    )
-    .map_err(Error::Other)?;
-    task.patch = kept;
-    Ok(GatedTask { task, ignored })
+impl TaskPatchGate for UserPolicyGate {
+    /// # Errors
+    ///
+    /// - `policy denied ...` when a `deny` rule matches an entry, its
+    ///   resolved path, or a path a directory entry holds.
+    /// - A refusal carrying the `[patches] allow` snippet when an entry is
+    ///   undecided: there is no prompt.
+    /// - The policy file cannot be found, read or parsed; a pattern in it
+    ///   does not expand; a directory's contents cannot be checked whole; or
+    ///   a path cannot be resolved.
+    fn gate(
+        &self,
+        ctx: &Context,
+        task_name: &str,
+        mut task: mfile::Task,
+    ) -> Result<GatedTask, Error> {
+        if task.patch.dir.is_empty() && task.patch.file.is_empty() {
+            return Ok(GatedTask {
+                task,
+                ignored: Vec::new(),
+            });
+        }
+        let policy_path = match &self.policy_file {
+            Some(path) => path.clone(),
+            None => user_policy_path().map_err(Error::Other)?,
+        };
+        let policy = boxes::core::policy::read_user_policy_or_default(&policy_path)
+            .map_err(|e| Error::Other(anyhow!("{e}")))?;
+        let (kept, ignored) = judge_task_patches(
+            task_name,
+            &task.patch,
+            &policy,
+            &policy_path,
+            ctx.repo_dir()?,
+            PatchHome::Ambient.resolve().as_deref(),
+            &ProcessEnv::current(),
+        )
+        .map_err(Error::Other)?;
+        task.patch = kept;
+        Ok(GatedTask { task, ignored })
+    }
 }
 
 /// What the policy says about one path. Ordered by strictness, so the
@@ -507,9 +504,25 @@ fn probe_dir_for_deny(
     let denied = |p: &Utf8Path| decide(expanded, source, p) == Verdict::Denied;
     let mut seen = 0usize;
     for start in starts {
-        // a root under the directory that holds nothing has nothing to match
-        if std::fs::symlink_metadata(start.as_std_path()).is_err() {
-            continue;
+        // a root under the directory that holds nothing has nothing to match;
+        // a root that cannot be looked at is a part of the tree left unchecked
+        match std::fs::symlink_metadata(start.as_std_path()) {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => {
+                return Err(ProbeRefusal(format!(
+                    "A part of it cannot be read to check it against `[patches] deny`: \
+                     `{start}`: {e}. Narrow the entry in the project's minimal.toml to the part \
+                     you can read."
+                )));
+            }
         }
         // the directory itself was decided already; a deny's own root is a path to judge
         let min_depth = usize::from(start == on_disk);
@@ -574,7 +587,7 @@ fn probe_starts(
             match fs.walk_root() {
                 Some(root) if root.as_str().starts_with(&inside) => {
                     let rel = root.as_str()[inside.len()..].trim_end_matches('/');
-                    let start = on_disk.join(rel);
+                    let start = narrowed_root(on_disk, rel);
                     if !starts.contains(&start) {
                         starts.push(start);
                     }
@@ -591,6 +604,29 @@ fn probe_starts(
     } else {
         starts
     })
+}
+
+/// `on_disk` joined with the longest leading part of `rel` that passes
+/// through no symlink: where a probe narrowed to `rel` may start.
+///
+/// A path lookup follows every symlink on the way, whatever the walk's
+/// `follow_links`, so a walk rooted at `<dir>/link/sub` would read the host
+/// target of a link the directory holds. The probe judges a contained link as
+/// the link and never looks at its target (see [`probe_dir_for_deny`]), so
+/// the root stops at the link's parent, where the walk meets the link as an
+/// entry and does not descend into it. A part that does not exist, or cannot
+/// be looked at, is joined as is: the probe skips a root that is not there
+/// and refuses one it cannot read.
+fn narrowed_root(on_disk: &Utf8Path, rel: &str) -> Utf8PathBuf {
+    let mut start = on_disk.to_path_buf();
+    for seg in rel.split('/').filter(|s| !s.is_empty()) {
+        let next = start.join(seg);
+        if std::fs::symlink_metadata(next.as_std_path()).is_ok_and(|m| m.file_type().is_symlink()) {
+            break;
+        }
+        start = next;
+    }
+    start
 }
 
 /// Whether the expanded `deny` pattern can match a path strictly inside the
@@ -880,6 +916,124 @@ mod tests {
             gate(&t, &dir_patch(&d), &policy(&rules)).unwrap(),
             dir_patch(&d)
         );
+    }
+
+    /// A `deny` whose root lies under a symlink the directory holds does not
+    /// narrow the probe through the link: a walk rooted past the link would
+    /// read the link's host target, which the probe never looks at. The link
+    /// is judged as the link, as when the directory is walked whole, while
+    /// the same `deny` under a real subdirectory still narrows and finds what
+    /// it names.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_does_not_narrow_through_a_contained_symlink() {
+        let t = Tree::new();
+        let vault = t.dir("vault");
+        t.file("vault/sub/id.pem");
+        let home = t.dir("home");
+        std::os::unix::fs::symlink(&vault, home.join("link")).unwrap();
+        assert_eq!(narrowed_root(&home, "link/sub"), home);
+        let rules =
+            format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{home}/link/sub/*.pem\"]\n");
+        assert_eq!(
+            gate(&t, &dir_patch(&home), &policy(&rules)).unwrap(),
+            dir_patch(&home)
+        );
+
+        let key = t.file("home/real/sub/id.pem");
+        assert_eq!(narrowed_root(&home, "real/sub"), home.join("real/sub"));
+        let rules =
+            format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{home}/real/sub/*.pem\"]\n");
+        let err = gate(&t, &dir_patch(&home), &policy(&rules))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("policy denied"), "{err}");
+        assert!(err.contains(key.as_str()), "{err}");
+    }
+
+    /// A `deny` root under the directory that is not there holds nothing to
+    /// match; one the probe cannot look at is a part of the tree left
+    /// unchecked, so the entry is refused, not mounted. Here the lookup fails
+    /// because the name is longer than a file name may be.
+    #[test]
+    fn a_probe_root_that_cannot_be_looked_at_refuses_the_entry() {
+        let t = Tree::new();
+        let home = t.dir("home");
+        let rules = format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{home}/.ssh/**\"]\n");
+        assert_eq!(
+            gate(&t, &dir_patch(&home), &policy(&rules)).unwrap(),
+            dir_patch(&home)
+        );
+
+        let long = "n".repeat(300);
+        let rules = format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{home}/{long}/**\"]\n");
+        let err = gate(&t, &dir_patch(&home), &policy(&rules))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be read to check it"), "{err}");
+        assert!(err.contains("rules are in"), "{err}");
+    }
+
+    /// As above, for the case the probe exists for: a `deny` root under a
+    /// directory the user cannot search. Skipped when the process can read
+    /// the directory anyway (it runs as root).
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_root_under_an_unsearchable_directory_refuses_the_entry() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = Tree::new();
+        let home = t.dir("home");
+        let locked = t.dir("home/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let privileged = std::fs::read_dir(&locked).is_ok();
+        let rules =
+            format!("[patches]\nallow = [\"{home}\"]\ndeny = [\"{home}/locked/.ssh/**\"]\n");
+        let judged = gate(&t, &dir_patch(&home), &policy(&rules));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if privileged {
+            return;
+        }
+        let err = judged.unwrap_err().to_string();
+        assert!(err.contains("cannot be read to check it"), "{err}");
+        assert!(err.contains("locked/.ssh"), "{err}");
+    }
+
+    /// The gate as `mip`'s contexts carry it, through the hook in `mctx`: the
+    /// fixture's task `peek-denied` declares a patch the policy file denies,
+    /// and the refusal names that file. A task without patches passes.
+    #[test]
+    fn the_user_policy_gate_refuses_through_the_context_hook() {
+        let state = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        let policy_file = cfg.path().join("user_policy.toml");
+        std::fs::write(
+            &policy_file,
+            "[patches]\ndeny = [\"/min-test-1128-denied\", \"/min-test-1128-denied/**\"]\n",
+        )
+        .unwrap();
+        let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let user_gate = UserPolicyGate::at(policy_file.clone());
+        let config = mctx::ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(manifest_dir.join("../mctx/testdata/patchrepo"))
+            .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+            .with_no_fetch(true)
+            .with_task_patch_policy(mctx::TaskPatchPolicy::Gated(std::sync::Arc::new(user_gate)))
+            .build()
+            .unwrap();
+        let mut ctx = Context::new(config).unwrap();
+        let graph = ctx.graph_from_all_packages().unwrap();
+        let (task, graph) = ctx.task(graph, "peek-denied").unwrap().unwrap();
+        let err = mctx::gate_task_patches(&ctx, "peek-denied", task)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("policy denied"), "{err}");
+        assert!(err.contains("/min-test-1128-denied"), "{err}");
+        assert!(err.contains(policy_file.to_str().unwrap()), "{err}");
+
+        let (task, _) = ctx.task(graph, "no-patches").unwrap().unwrap();
+        let gated = mctx::gate_task_patches(&ctx, "no-patches", task).unwrap();
+        assert!(gated.task.patch.dir.is_empty() && gated.task.patch.file.is_empty());
     }
 
     /// Deny outranks allow: an allowed directory holding a denied file is

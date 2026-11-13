@@ -25,11 +25,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 sandbox.workspace = true
-# The user's `[patches]` policy, which a task run by name has its patches
-# judged against (inbox#1128); with the path and walk crates the gate uses.
-boxes.workspace = true
-camino.workspace = true
-walkdir.workspace = true
 
 args.workspace = true
 lcache.workspace = true

@@ -1,6 +1,7 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use checkouts::ManagerHandle;
@@ -86,19 +87,17 @@ fn parse_remote_cache_url(raw: &str) -> Result<(AnyUrl, Option<String>), ConfigE
 /// task it runs by name: `mip run <task>`, or a nested `run <task>` a sandbox
 /// sends over its environment channel (inbox#1128). Read by
 /// [`crate::gate_task_patches`], the one gate both paths call.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub enum TaskPatchPolicy {
     /// Mount the entries as declared. The default, and what the daemon runs
     /// with: a session's task patches are inbox#602, and the guest holds no
     /// copy of the user's `user_policy.toml` to judge them against.
     #[default]
     Ungated,
-    /// Judge the entries against the `[patches]` section of the user's
-    /// `<config>/minimal/user_policy.toml`, the file `min` reads. What `mip`
-    /// runs with. The location is resolved only when a task has patches.
-    UserPolicy,
-    /// As [`Self::UserPolicy`], with the policy read from this file.
-    UserPolicyAt(PathBuf),
+    /// Judge the entries with this gate. `mip` sets one that reads the
+    /// `[patches]` section of the user's `user_policy.toml`, the file `min`
+    /// reads.
+    Gated(Arc<dyn crate::TaskPatchGate>),
 }
 
 /// Builder for [Config].
