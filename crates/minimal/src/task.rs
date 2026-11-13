@@ -1615,10 +1615,13 @@ pub(crate) async fn run_entry(
     let mut collected_patches = minimal_client::contribution_patch_uploads(&contribution);
 
     let configured = client
-        .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
-            session_id: id,
-            contribution,
-        })
+        .oneshot_rpc_with_deadline::<ConfigureLoadout>(
+            ConfigureLoadoutRequest {
+                session_id: id,
+                contribution,
+            },
+            minimal_client::LOADOUT_COMPOSE_TIMEOUT,
+        )
         .instrument(entry_span)
         .await
         .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error))?;

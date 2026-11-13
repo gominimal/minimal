@@ -619,10 +619,13 @@ pub async fn activate(
         let mut patches = minimal_client::contribution_patch_uploads(&inputs.contribution);
         minimal_client::dedup_patch_uploads(&mut patches);
         let configured = client
-            .oneshot_rpc::<minimald_rpc::ConfigureLoadout>(minimald_rpc::ConfigureLoadoutRequest {
-                session_id: id,
-                contribution: inputs.contribution,
-            })
+            .oneshot_rpc_with_deadline::<minimald_rpc::ConfigureLoadout>(
+                minimald_rpc::ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: inputs.contribution,
+                },
+                minimal_client::LOADOUT_COMPOSE_TIMEOUT,
+            )
             .await
             .map_err(|error| session_rpc_failed(SessionRpc::ConfigureLoadout, error))?;
         match configured {
