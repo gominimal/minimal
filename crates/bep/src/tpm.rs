@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -331,6 +332,45 @@ pub struct TpmStore {
 
 static WORK_DIRS: AtomicU64 = AtomicU64::new(0);
 
+/// How long one `tpm2-tools` command can run before the store stops it.
+/// A P-256 operation takes well under a second on a TPM, so a command
+/// that runs this long is blocked on the device.
+const TOOL_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How often the store looks whether a running command finished.
+const TOOL_POLL: Duration = Duration::from_millis(5);
+
+/// Removes the `.work-<pid>-<n>` directories in `dir` whose process is
+/// gone. A proxy that was killed leaves its work directories behind, with
+/// copies of key blobs and saved contexts in them.
+fn sweep_work_dirs(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".work-"))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || Path::new("/proc").join(pid.to_string()).exists() {
+            continue;
+        }
+        match fs::remove_dir_all(entry.path()) {
+            Ok(()) => {
+                tracing::debug!(path = %entry.path().display(), "removed a stale TPM work directory")
+            }
+            Err(err) => {
+                tracing::warn!(path = %entry.path().display(), %err, "could not remove a stale TPM work directory")
+            }
+        }
+    }
+}
+
 /// A directory that only the proxy's user can read, for one key's saved
 /// contexts and the files one command reads and writes. It goes away with
 /// its owner.
@@ -393,6 +433,7 @@ impl TpmStore {
 
     fn work_dir(&self) -> io::Result<WorkDir> {
         self.make_dir()?;
+        sweep_work_dirs(&self.dir);
         let n = WORK_DIRS.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!(".work-{}-{n}", std::process::id()));
         fs::DirBuilder::new().mode(0o700).create(&path)?;
@@ -418,6 +459,19 @@ impl TpmStore {
         args: &[OsString],
         stdin: Option<&[u8]>,
     ) -> Result<(), ToolError> {
+        self.run_within(tool, args, stdin, TOOL_DEADLINE)
+    }
+
+    /// Runs one command, and stops it when it runs longer than `deadline`.
+    /// A key holds its lock across a command, so a command that blocks on
+    /// the TPM must not block every other user of the key for ever.
+    fn run_within(
+        &self,
+        tool: &str,
+        args: &[OsString],
+        stdin: Option<&[u8]>,
+        deadline: Duration,
+    ) -> Result<(), ToolError> {
         let mut child = Command::new(tool)
             .args(args)
             .env("TPM2TOOLS_TCTI", &self.tcti)
@@ -436,19 +490,55 @@ impl TpmStore {
                     format!("{tool} did not start: {err}")
                 })
             })?;
+        let started = Instant::now();
         // A tool that fails before it reads its input closes the pipe. Its
         // exit status and its stderr then carry the real reason, so a broken
-        // pipe falls through to the wait. The wait also reaps the child.
-        let mut write_error = None;
-        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            write_error = pipe
-                .write_all(input)
-                .err()
-                .filter(|err| err.kind() != io::ErrorKind::BrokenPipe);
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|err| ToolError::Other(format!("{tool} did not finish: {err}")))?;
+        // pipe falls through to the wait. The input and stderr move on their
+        // own threads, so a tool that blocks cannot block the deadline.
+        let (status, write_error, stderr) = std::thread::scope(|scope| {
+            let writer = stdin.zip(child.stdin.take()).map(|(input, mut pipe)| {
+                scope.spawn(move || {
+                    pipe.write_all(input)
+                        .err()
+                        .filter(|err| err.kind() != io::ErrorKind::BrokenPipe)
+                })
+            });
+            let reader = child.stderr.take().map(|mut pipe| {
+                scope.spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = io::Read::read_to_end(&mut pipe, &mut buf);
+                    buf
+                })
+            });
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) if started.elapsed() >= deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(format!(
+                            "{tool} did not finish within {} seconds, so the proxy stopped it",
+                            deadline.as_secs_f64()
+                        ));
+                    }
+                    Ok(None) => std::thread::sleep(TOOL_POLL),
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(format!("{tool} did not finish: {err}"));
+                    }
+                }
+            };
+            let write_error = writer.and_then(|w| w.join().ok().flatten());
+            let stderr = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+            (status, write_error, stderr)
+        });
+        let status = status.map_err(ToolError::Other)?;
+        let output = std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr,
+        };
         if output.status.success() {
             return match write_error {
                 Some(err) => Err(ToolError::Other(format!(
@@ -974,6 +1064,49 @@ mod tests {
             Err(ToolError::Other(detail)) => panic!("lost the response code: {detail}"),
             Ok(()) => panic!("expected a failure"),
         }
+    }
+
+    // A tool that blocks is stopped at its deadline, and its key's lock
+    // does not wait on it for ever.
+    #[test]
+    fn a_tool_that_runs_past_its_deadline_is_stopped() {
+        let store = TpmStore::new(PathBuf::from("/nonexistent"), DEVICE_TCTI);
+        let started = Instant::now();
+        let result = store.run_within(
+            "sh",
+            &args(&["-c", "exec sleep 30"], &[]),
+            Some(&[0u8; 16]),
+            Duration::from_millis(200),
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        match result {
+            Err(ToolError::Other(detail)) => {
+                assert!(detail.contains("did not finish within"), "{detail}")
+            }
+            Err(ToolError::Tpm(detail)) => panic!("unexpected response code: {detail}"),
+            Ok(()) => panic!("expected a failure"),
+        }
+    }
+
+    // A work directory that a killed proxy left behind goes away when the
+    // store next makes one. A live process keeps its own.
+    #[test]
+    fn a_stale_work_directory_is_swept_when_the_store_opens_a_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TpmStore::new(dir.path().to_path_buf(), DEVICE_TCTI);
+        // pid_max is at most 2^22, so this process cannot exist.
+        let stale = dir.path().join(".work-4294967294-0");
+        let live = dir
+            .path()
+            .join(format!(".work-{}-999999", std::process::id()));
+        for path in [&stale, &live] {
+            fs::create_dir_all(path).expect("mkdir");
+            fs::write(path.join("ctx"), b"x").expect("write");
+        }
+        let work = store.work_dir().expect("work dir");
+        assert!(!stale.exists());
+        assert!(live.exists());
+        assert!(work.0.exists());
     }
 
     #[test]
