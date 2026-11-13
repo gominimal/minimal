@@ -85,9 +85,9 @@ pub(crate) enum TtyAttach {
     Terminal {
         sock: std::path::PathBuf,
         id: boxes::SessionId,
-        /// Where the session-key config is read from, so the attach sends
-        /// the user's detach keys.
-        config_dir: Option<std::path::PathBuf>,
+        /// The user's session keys, resolved before the exec starts, so
+        /// the attach sends the user's detach keys.
+        session_keys: boxes::keys::SessionKeys,
     },
     /// Through an exec channel, with the caller's stdio as pipes. Only the
     /// scripted tests take it: `min box exec -t` refuses a stdin that is not
@@ -324,6 +324,16 @@ where
 {
     let sock = resolved.host.sock.as_path();
     let id = resolved.box_id;
+    // A tty exec resolves the session keys before it starts the exec. A
+    // session-key config that is not valid then ends the command with no
+    // exec started, not with an exec that has no attach (BCLI-068). Other
+    // modes do not attach a terminal and do not read the config.
+    let session_keys = match request.mode {
+        minimald_rpc::exec::ExecMode::Tty => {
+            minimal_client::attach::resolve_session_keys(config_dir)?
+        }
+        _ => boxes::keys::SessionKeys::default(),
+    };
     // A VM-backed box gets its row and its name hold back before the
     // command runs, as `min session exec` does before its ssh exec.
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
@@ -348,7 +358,7 @@ where
     let attach = TtyAttach::Terminal {
         sock: sock.to_path_buf(),
         id,
-        config_dir: config_dir.map(std::path::Path::to_path_buf),
+        session_keys,
     };
     exec_over(&mut channels, request, attach, input, out, err).await
 }
@@ -420,10 +430,10 @@ where
                 TtyAttach::Terminal {
                     sock,
                     id,
-                    config_dir,
+                    session_keys,
                 } => {
                     drop(input);
-                    attach_exec_terminal(&sock, id, &exec_id, config_dir.as_deref()).await?
+                    attach_exec_terminal(&sock, id, &exec_id, &session_keys).await?
                 }
             };
             // The attach ends with 124 for an exec that its timeout ended,
@@ -668,35 +678,33 @@ where
 }
 
 /// The `ssh -tt` command that `min box exec -t`'s terminal attach runs to
-/// reach the exec `exec_id` in the box `id`. It carries the session keys
-/// from `config_dir`, the same command `min box attach --exec` runs
-/// (BCLI-068).
+/// reach the exec `exec_id` in the box `id`. It carries `session_keys`,
+/// the same command `min box attach --exec` runs (BCLI-068).
 ///
 /// # Errors
 ///
-/// When the session-key config is not valid, or ssh's command cannot be
-/// built.
+/// When ssh's command cannot be built.
 pub(crate) fn exec_terminal_ssh(
     sock: &std::path::Path,
     id: boxes::SessionId,
     exec_id: &minimald_rpc::exec::ExecId,
-    config_dir: Option<&std::path::Path>,
+    session_keys: &boxes::keys::SessionKeys,
 ) -> Result<std::process::Command, anyhow::Error> {
-    super::attach::exec_attach_ssh(sock, id, exec_id, config_dir)
+    super::attach::exec_attach_ssh_with_keys(sock, id, exec_id, session_keys)
 }
 
 /// Connects this process's terminal to the tty exec that `attach_wire`
 /// resumes, through `ssh -tt` and the terminal relay `min session attach`
-/// uses. It sends the session keys from `config_dir`, as `min box attach
-/// --exec` does (BCLI-068). Returns ssh's exit status: the exec's, or 0
+/// uses. It sends `session_keys`, as `min box attach --exec` does
+/// (BCLI-068). Returns ssh's exit status: the exec's, or 0
 /// after a detach.
 async fn attach_exec_terminal(
     sock: &std::path::Path,
     id: boxes::SessionId,
     exec_id: &minimald_rpc::exec::ExecId,
-    config_dir: Option<&std::path::Path>,
+    session_keys: &boxes::keys::SessionKeys,
 ) -> Result<i32, anyhow::Error> {
-    let ssh = exec_terminal_ssh(sock, id, exec_id, config_dir)?;
+    let ssh = exec_terminal_ssh(sock, id, exec_id, session_keys)?;
     tokio::task::spawn_blocking(move || {
         interactive_attach(ssh, true, crate::attach::TerminalUnwind::arm, |ssh| {
             let real = minimal_client::tty_relay::RealTty::acquire()

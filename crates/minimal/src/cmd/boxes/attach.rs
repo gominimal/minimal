@@ -160,9 +160,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 ///
 /// The interactive path (no `wire`) negotiates the configurable session
 /// keys from `config_dir` so the daemon adopts the user's detach/forward
-/// chord for that channel. The exec path (`wire` set) has no detach and
-/// sends none. An attach to a terminal exec goes through
-/// [`exec_attach_ssh`], which sends them.
+/// chord for that channel. The exec path (`wire` set) sends no keys.
 ///
 /// `host_asks_for` names the box whose pending asks the interactive attach
 /// answers on a VM-backed host (NET-045): the attach subscribes on the VM
@@ -1376,8 +1374,25 @@ pub(crate) fn exec_attach_ssh(
     config_dir: Option<&std::path::Path>,
 ) -> Result<std::process::Command, anyhow::Error> {
     let session_keys = minimal_client::attach::resolve_session_keys(config_dir)?;
+    exec_attach_ssh_with_keys(sock, id, exec_id, &session_keys)
+}
+
+/// [`exec_attach_ssh`] with the session keys already resolved. `min box
+/// exec -t` resolves them before it starts the exec, so a session-key
+/// config that is not valid never leaves an exec without its attach.
+///
+/// # Errors
+///
+/// When ssh's command cannot be built
+/// ([`minimal_client::attach::attach_command`]).
+pub(crate) fn exec_attach_ssh_with_keys(
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    exec_id: &minimald_rpc::exec::ExecId,
+    session_keys: &boxes::keys::SessionKeys,
+) -> Result<std::process::Command, anyhow::Error> {
     let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
-    let ssh = minimal_client::attach::attach_command(sock, id, Some(&wire), Some(&session_keys))?;
+    let ssh = minimal_client::attach::attach_command(sock, id, Some(&wire), Some(session_keys))?;
     // `-tt` before the other arguments, so ssh asks for a terminal.
     let mut forced = std::process::Command::new(ssh.get_program());
     forced.arg("-tt").args(ssh.get_args());
