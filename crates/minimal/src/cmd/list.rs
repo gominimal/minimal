@@ -1197,10 +1197,11 @@ pub(crate) fn format_ls_with_proxy_ports_on(
                 out,
                 "BOX NAMES:       {}",
                 crate::resolver::with_install_pointer(
-                    crate::resolver::name_surface_line_at(
+                    crate::resolver::name_surface_line_beside(
                         surface.clone(),
                         serving_proxy_port,
                         boxes_at_own_address(resp),
+                        proxy_down,
                     ),
                     crate::resolver::install_unfinished(&surface, host),
                 ),
@@ -1745,10 +1746,11 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
                     out,
                     "BOX NAMES:       {vm:<width$} {}",
                     crate::resolver::with_install_pointer(
-                        crate::resolver::name_surface_line_at(
+                        crate::resolver::name_surface_line_beside(
                             surface.clone(),
                             serving_proxy_port,
                             boxes_at_own_address(&listing.resp),
+                            proxy_down,
                         ),
                         crate::resolver::install_unfinished(&surface, host),
                     ),

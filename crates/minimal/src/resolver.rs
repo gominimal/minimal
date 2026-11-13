@@ -4897,9 +4897,9 @@ pub fn serving_proxy_port(reported: Option<u16>, proxy_down: Option<&ProxyDown>)
 
 /// The surface verdict with a proxy-down sibling folded in (T93): a
 /// `Proxy` or `ProxyNotServing` verdict beside the VM host daemon's cause
-/// becomes a plain [`LiveSurface::Proxy`], so the BOX NAMES line says the
-/// names go through the proxy and that it is not serving, and does not
-/// repeat the cause. The cause prints once, on the HOSTNAME PROXY row
+/// becomes a plain [`LiveSurface::Proxy`], so the BOX NAMES line
+/// ([`name_surface_line_beside`]) says the cause's headline and does not
+/// repeat its detail. The cause prints once, on the HOSTNAME PROXY row
 /// ([`proxy_down_line_beside`]), as NET-020 says (#3046). A `Native`
 /// verdict is returned unchanged.
 #[must_use]
@@ -5328,6 +5328,33 @@ pub fn name_surface_line_at(
         proxy_port,
         at_own_address,
     )
+}
+
+/// [`name_surface_line_at`] beside a proxy-down sibling (NET-020, #3046):
+/// pass the surface folded by [`surface_beside_proxy_down`]. A `Proxy`
+/// verdict beside a cause keeps the cause's headline, "not serving" or
+/// "not confirmed yet", so the row agrees with the HOSTNAME PROXY row. It
+/// leaves out the detail, because that row names it once. Any other
+/// verdict, or no cause, reads as [`name_surface_line_at`].
+#[must_use]
+pub fn name_surface_line_beside(
+    surface: LiveSurface,
+    proxy_port: Option<u16>,
+    at_own_address: bool,
+    proxy_down: Option<&ProxyDown>,
+) -> String {
+    match (&surface, proxy_down) {
+        (LiveSurface::Proxy, Some(down)) => {
+            let headline = match down.cause {
+                ProxyDownCause::PublishUnconfirmed => "not confirmed yet",
+                ProxyDownCause::PortHeld
+                | ProxyDownCause::RedrawsRanOut
+                | ProxyDownCause::PortHeldAfterStart { .. } => "not serving",
+            };
+            format!("<box>.{ZONE}: the hostname proxy is {headline}")
+        }
+        _ => name_surface_line_at(surface, proxy_port, at_own_address),
+    }
 }
 
 /// The reserved range as `network/prefix`, the form the advisory and the
@@ -7433,7 +7460,17 @@ exit 0
                 );
                 let mut lines = vec![cause_line];
                 if let Some(surface) = folded.clone() {
-                    let names = name_surface_line(surface, serving);
+                    let names = name_surface_line_beside(surface, serving, true, Some(&down));
+                    if folded == Some(LiveSurface::Proxy) {
+                        // The headline agrees with the HOSTNAME PROXY row.
+                        let headline = match cause {
+                            ProxyDownCause::PublishUnconfirmed => {
+                                "<box>.min.internal: the hostname proxy is not confirmed yet"
+                            }
+                            _ => "<box>.min.internal: the hostname proxy is not serving",
+                        };
+                        assert_eq!(names, headline, "the BOX NAMES row for {cause:?}");
+                    }
                     assert!(
                         !names.contains("127.0.0.1:19911")
                             && !names.contains("holds")
@@ -7876,7 +7913,7 @@ exit 0
             // The BOX NAMES row folded beside a Proxy verdict: no cause.
             let folded = surface_beside_proxy_down(LiveSurface::Proxy, Some(down));
             assert_eq!(
-                name_surface_line(folded, None),
+                name_surface_line_beside(folded, None, true, Some(down)),
                 "<box>.min.internal: the hostname proxy is not serving"
             );
             // The `min session activate` names: line, on a finished host and
