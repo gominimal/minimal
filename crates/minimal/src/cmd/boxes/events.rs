@@ -200,6 +200,7 @@ pub(crate) async fn box_events_on_hosts(
             parent: resolved.box_id,
             address: address.to_owned(),
             seen: ids.iter().map(|(id, _)| *id).collect(),
+            failed: std::collections::HashMap::new(),
         });
         follow_events(reads, watch, mode, out).await
     } else {
@@ -262,6 +263,10 @@ async fn open_events_read(
 /// find a child that is new since the follow started.
 const CHILD_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How many listings in a row can show a new child whose read does not
+/// open before `--parent --follow` stops with the open error.
+const CHILD_OPEN_TRIES: u32 = 5;
+
 /// The state `--parent --follow` keeps to add the stream of each new child
 /// of `parent` to the follow.
 struct ChildWatch {
@@ -271,6 +276,9 @@ struct ChildWatch {
     address: String,
     /// The children whose read is already in the follow.
     seen: std::collections::HashSet<boxes::BoxId>,
+    /// For each new child whose read did not open, the number of listings
+    /// in a row that showed it.
+    failed: std::collections::HashMap<boxes::BoxId, u32>,
 }
 
 impl ChildWatch {
@@ -305,17 +313,28 @@ impl ChildWatch {
             }
             // A child removed between the listing and the open is gone
             // from the next listing, so a failed open is tried again then.
+            // A child that the listings keep showing but whose read never
+            // opens ends the follow with the open error, not a silent gap.
             match open_events_read(&mut self.client, id, &label, true).await {
                 Ok(lines) => {
                     tracing::info!(verb = "box events", box_id = %id, parent = %self.parent, "follow a new child");
+                    self.failed.remove(&id);
                     self.seen.insert(id);
                     reads.push((label, lines));
                 }
                 Err(e) => {
-                    tracing::debug!(verb = "box events", box_id = %id, "{e:#}");
+                    let tries = self.failed.entry(id).or_insert(0);
+                    *tries += 1;
+                    tracing::debug!(verb = "box events", box_id = %id, tries = *tries, "{e:#}");
+                    if *tries >= CHILD_OPEN_TRIES {
+                        return Err(e);
+                    }
                 }
             }
         }
+        // A child gone from the listing starts its count again if it comes back.
+        self.failed
+            .retain(|id, _| listing.iter().any(|entry| entry.box_id == *id));
         Ok(Some(reads))
     }
 }
