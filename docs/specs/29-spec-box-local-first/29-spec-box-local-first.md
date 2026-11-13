@@ -559,9 +559,9 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal detached_run_copies_no_exports
 
-- **BOX-187** WHEN BOX-185 copies an export whose path is a directory in the box THE SYSTEM SHALL copy the directory's whole tree to the same path under the project root.
+- **BOX-187** WHEN BOX-185 copies an export whose path is a directory in the box THE SYSTEM SHALL copy each file of the directory's tree to the same path under the project root, and delete no file there that the box's tree does not hold.
   tier:     T0
-  verify:   cargo nextest run -p minimal directory_export_copies_its_tree
+  verify:   cargo nextest run -p minimal directory_export_copies_its_tree_and_deletes_nothing
 
 - **BOX-188** WHEN BOX-185 copies a file to a path under the project root where a file already exists THE SYSTEM SHALL write the new file beside it under a temporary name and then rename it over the old one, so that the destination holds either the old file or the whole new one, even when two runs export the same path at once.
   <!-- event-driven; decided 2026-11-13: a task's declared output is its latest result, as `min box cp` replaces a file today -->
@@ -578,7 +578,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal missing_export_named_and_others_copied
 
-- **BOX-191** IF the copy of a file fails THEN THE SYSTEM SHALL leave the destination as it was before the copy, with any earlier file there unchanged and no partial file, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports.
+- **BOX-191** IF the copy of a file fails, or a file export meets an existing directory at its destination, or a directory export meets an existing file, THEN THE SYSTEM SHALL make no change at that destination, leaving no partial file and no change to what is already there, print on stderr one line that names the export's path and the reason the system gave, and still copy the other exports.
   tier:     T0
   verify:   cargo nextest run -p minimal failed_export_copy_keeps_destination_unchanged
 
@@ -596,7 +596,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal skipped_export_keeps_failed_task_exit_code
 
-- **BOX-195** WHEN BOX-185 finishes with one export, copied or skipped, THE SYSTEM SHALL append one `file_exported` event to the box's record, from a report the client sends the daemon, carrying the export's path, whether it was copied, and a `files` list. The list SHALL hold one entry for each file copied, with its path under the project root, its size in bytes and its sha256: one entry for a file export, one for each file of a directory export, and none for a skipped export.
+- **BOX-195** WHEN BOX-185 finishes with one export, copied or skipped, THE SYSTEM SHALL append one `file_exported` event to the box's record, from a report the client sends the daemon, carrying the export's path, whether it was copied, and a `files` list. The list SHALL hold one entry for each file this run wrote under the project root, with its path, its size in bytes and its sha256, including the files a directory export wrote before one of its files failed, and none when the run wrote no file for the export.
   <!-- event-driven; decided 2026-11-13: the client copies and reports, the daemon appends, so the record holds the events as it holds every other; the architecture names the `file_exported` event type, and gominimal/inbox#678 extends it with schema-validation status -->
   tier:     T0
   verify:   cargo nextest run -p minimal export_report_appends_file_exported_event
