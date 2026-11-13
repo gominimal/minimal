@@ -960,7 +960,7 @@ EOF
     want_ok "darwin+pkg: the note says the setup is the package's and names its uninstaller" \
         grep -q "is the minimal package's (dev.minimal.min)" "$OUT"
     want_ok "darwin+pkg: the note names the package's uninstaller" \
-        grep -q "sudo /usr/local/share/minimal/uninstall.sh" "$OUT"
+        grep -q 'sudo "/Library/Application Support/minimal/uninstall.sh"' "$OUT"
     want_err "darwin+pkg: no root remedy is advised for the package's setup" \
         grep -q "still installed on this host" "$OUT"
     want_err "darwin+pkg: no launchctl bootout is advised" \

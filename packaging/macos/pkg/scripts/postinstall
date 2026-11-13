@@ -3,65 +3,100 @@
 # What `min finalize-install` does for a user after a curl install, done by
 # the package: DNS names for boxes (<box>.min.internal) in every program,
 # the box-name service under its own role account, the loopback range at
-# every boot. Runs as root; the payload is already in place under /usr/local.
+# every boot. Runs as root; the payload is already in place: what users run
+# under /usr/local, the service's program under /Library/PrivilegedHelperTools.
+#
+# Nothing here reads /usr/local. On a Mac where a user owns /usr/local/bin
+# or /usr/local/share (Homebrew's Intel layout, and Macs migrated from one),
+# that user can change those files between the payload and this script, and
+# what this script reads it acts on as root. What it needs comes from the
+# package's own scripts directory and from /Library, which are root's.
 set -eu
 
-# The preinstall stopped the two services for the swap. Should this script
-# fail before it starts them again, the plists on disk are the previous
-# install's, still naming a program that is there: start them again, so a
-# failed upgrade leaves the previous service running, not a resolver file
-# pointing at a dead port.
+# Set by build-pkg.sh when it packs this script. As written here they are
+# the released values, so the script unchanged requires minimal's Developer
+# ID on the service program.
+bundle_signing=developer-id
+channel=stable
+test_build=0
+
+here="$(cd "$(dirname "$0")" && pwd)"
+role=_minimal
+helpers=/Library/PrivilegedHelperTools
+bundle="$helpers/Minimal.app"
+support="/Library/Application Support/minimal"
+run="$support/run"
+new_user=0
+new_group=0
+
+# The preinstall stopped the two services and moved an earlier install's
+# program aside (Minimal.app.old). Should this script fail:
+# - on an upgrade, the earlier program goes back and the services start
+#   again, so a failed upgrade leaves the previous service running, not a
+#   resolver file pointing at a dead port;
+# - on a first install, what this script made that runs or redirects is
+#   undone (the two services, the program, the resolver file, the account
+#   when this run made it), so a failed install leaves nothing of root's
+#   running. The files under /usr/local stay, as Installer placed them and
+#   kept no receipt; the uninstaller, installed first below, removes them.
 restore() {
     status=$?
-    if [ "$status" -ne 0 ]; then
-        # A bundle still being staged when the script failed.
-        [ -z "${t:-}" ] || rm -rf "$t"
+    if [ "$status" -eq 0 ]; then
+        rm -rf "$bundle.old"
+        exit 0
+    fi
+    if [ -d "$bundle.old" ]; then
+        rm -rf "$bundle"
+        mv "$bundle.old" "$bundle" || true
         for job in dev.gominimal.zone dev.minimal.local-range; do
             if [ -f "/Library/LaunchDaemons/$job.plist" ]; then
                 launchctl bootstrap system "/Library/LaunchDaemons/$job.plist" 2>/dev/null || true
             fi
         done
+    else
+        for job in dev.gominimal.zone dev.minimal.local-range; do
+            launchctl bootout "system/$job" 2>/dev/null || true
+            rm -f "/Library/LaunchDaemons/$job.plist"
+        done
+        rm -f /etc/resolver/min.internal
+        rm -rf "$bundle" "$run"
+        # Deleting an account needs Full Disk Access even as root; where
+        # this session lacks it the account stays, and the uninstaller
+        # reports it.
+        if [ "$new_user" = 1 ]; then dscl . -delete "/Users/$role" 2>/dev/null || true; fi
+        if [ "$new_group" = 1 ] && ! dscl . -read "/Users/$role" >/dev/null 2>&1; then
+            dscl . -delete "/Groups/$role" 2>/dev/null || true
+        fi
+        echo "minimal: the install failed and its services are removed again; the files it placed are removed with: sudo \"$support/uninstall.sh\"" >&2
     fi
     exit "$status"
 }
 trap restore EXIT
 
-role=_minimal
-helpers=/Library/PrivilegedHelperTools
-app=/usr/local/bin/Minimal.app
-share=/usr/local/share/minimal
-run="/Library/Application Support/minimal/run"
+# 0. The uninstaller, before anything can fail: macOS has no command to
+#    remove a package, and a first install that fails leaves no receipt, so
+#    the uninstaller and the list of files the payload placed go where only
+#    root writes.
+install -d -m 0755 -o root -g wheel "$support"
+install -m 0755 -o root -g wheel "$here/uninstall.sh" "$support/uninstall.sh"
+install -m 0644 -o root -g wheel "$here/payload-files" "$support/payload-files"
 
-# 1. The DNS service's program: the bundle, root-owned under $helpers, and
-#    checked there before anything names it. A released bundle must carry
-#    minimal's Developer ID; a test build (pkg-info: bundle_signing=ad-hoc)
-#    must carry a valid signature.
-bundle_signing="$(sed -n 's/^bundle_signing=//p' "$share/pkg-info" 2>/dev/null || true)"
-install -d -m 0755 -o root -g wheel "$helpers"
-t="$(mktemp -d "$helpers/.Minimal.app.XXXXXX")"
-for d in Contents Contents/MacOS Contents/Resources Contents/_CodeSignature; do
-    install -d -m 0755 -o root -g wheel "$t/$d"
-done
-install -m 0755 -o root -g wheel "$app/Contents/MacOS/minzoned" "$t/Contents/MacOS/minzoned"
-for f in Contents/Info.plist Contents/Resources/AppIcon.icns Contents/_CodeSignature/CodeResources; do
-    install -m 0644 -o root -g wheel "$app/$f" "$t/$f"
-done
-# The notarization ticket is stapled to a released bundle only.
-if [ -f "$app/Contents/CodeResources" ]; then
-    install -m 0644 -o root -g wheel "$app/Contents/CodeResources" "$t/Contents/CodeResources"
-fi
+# 1. The DNS service's program: the bundle, placed by the payload under
+#    $helpers (root's), checked there before anything names it. A released
+#    bundle must carry minimal's Developer ID; a test build's (build-pkg.sh
+#    --with) must carry a valid signature. Which of the two was decided when
+#    the package was built, and is part of this script.
+[ -x "$bundle/Contents/MacOS/minzoned" ] && [ ! -L "$bundle" ] \
+    || { echo "minimal: the DNS service program is not at $bundle" >&2; exit 1; }
+chown -R root:wheel "$bundle"
+chmod -R go-w "$bundle"
 if [ "$bundle_signing" = ad-hoc ]; then
-    codesign --verify --strict "$t" \
-        || { rm -rf "$t"; echo "minimal: the DNS service program has no valid signature" >&2; exit 1; }
+    codesign --verify --strict "$bundle" \
+        || { echo "minimal: the DNS service program has no valid signature" >&2; exit 1; }
 else
-    codesign --verify --strict -R '=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "3G47C5HY64" and identifier "dev.minimal.minzoned"' "$t" \
-        || { rm -rf "$t"; echo "minimal: the DNS service program failed its Developer ID check" >&2; exit 1; }
+    codesign --verify --strict -R '=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "3G47C5HY64" and identifier "dev.minimal.minzoned"' "$bundle" \
+        || { echo "minimal: the DNS service program failed its Developer ID check" >&2; exit 1; }
 fi
-chmod 0755 "$t"
-rm -rf "$helpers/Minimal.app.old"
-if [ -e "$helpers/Minimal.app" ]; then mv "$helpers/Minimal.app" "$helpers/Minimal.app.old"; fi
-mv "$t" "$helpers/Minimal.app"
-rm -rf "$helpers/Minimal.app.old"
 
 # 2. The resolver file (*.min.internal to the box-name service on
 #    127.0.0.1:7656) is written last, in step 5, once the service holds that
@@ -91,7 +126,6 @@ free_id() {
     [ "$id" -lt 500 ] || { echo "minimal: no free system account id in 400..499 for $role" >&2; exit 1; }
     echo "$id"
 }
-new_group=0
 if ! dscl . -read "/Groups/$role" >/dev/null 2>&1; then
     gid="$(free_id)"
     dscl . -create "/Groups/$role"
@@ -104,6 +138,7 @@ case "$gid" in ''|*[!0-9]*) echo "minimal: the $role group's id could not be rea
 if ! dscl . -read "/Users/$role" >/dev/null 2>&1; then
     uid="$(free_id)"
     dscl . -create "/Users/$role"
+    new_user=1
     dscl . -create "/Users/$role" UniqueID "$uid"
     dscl . -create "/Users/$role" PrimaryGroupID "$gid"
     dscl . -create "/Users/$role" UserShell /usr/bin/false
@@ -168,7 +203,7 @@ launchctl bootstrap system /Library/LaunchDaemons/dev.minimal.local-range.plist
 #    and its channel socket; the program runs as the role account. It keeps
 #    no state: a restart holds nothing until the users' daemons reconnect.
 launchctl bootout system/dev.gominimal.zone 2>/dev/null || true
-install -d -m 0755 -o root -g wheel "/Library/Application Support/minimal" "$run"
+install -d -m 0755 -o root -g wheel "$run"
 rm -f "$run/answerer.sock"
 cat > /Library/LaunchDaemons/dev.gominimal.zone.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -243,8 +278,8 @@ if ! { [ -S "$run/answerer.sock" ] && running; }; then
     # earlier install's resolver file goes, and this install fails. With the
     # file in place, whichever program holds the port (any user can bind it)
     # would answer every user's box names. The admin is told which program
-    # holds it, when one does; the service itself is loaded and takes the
-    # port as soon as it is free, and installing again writes the file.
+    # holds it, when one does; installing again, with the port free, sets
+    # it up.
     rm -f /etc/resolver/min.internal
     holder="$(/usr/sbin/lsof -nP -iUDP:7656 2>/dev/null \
         | awk 'NR > 1 && $1 != "launchd" { print $1 " (pid " $2 ", user " $3 ")"; exit }')"
@@ -265,9 +300,7 @@ chmod 0644 /etc/resolver/min.internal
 #    reads, it never writes); the admin is told, by user, with the command
 #    that user runs to remove theirs. Other homes (/var/empty, role
 #    accounts) have no .local/bin.
-channel="$(sed -n 's/^channel=//p' "$share/pkg-info" 2>/dev/null || true)"
 case "$channel" in stable|unstable) ;; *) channel=stable ;; esac
-test_build="$(sed -n 's/^test_build=//p' "$share/pkg-info" 2>/dev/null || true)"
 dscl . -list /Users NFSHomeDirectory 2>/dev/null | while read -r user home; do
     case "$home" in /Users/*) ;; *) continue ;; esac
     if [ -e "$home/.local/bin/min" ]; then

@@ -1678,7 +1678,7 @@ fn refuse_replacing_the_shared(step: AnswererStep, shared: &SharedService) -> An
 /// it, never `min finalize-install`.
 pub(crate) const SHARED_SERVICE_REMEDY: &str = "A newer minimal package upgrades it \
     (sudo installer -pkg minimal-VERSION.pkg -target /), and its uninstaller removes it \
-    (sudo /usr/local/share/minimal/uninstall.sh)";
+    (sudo \"/Library/Application Support/minimal/uninstall.sh\")";
 
 /// Whether the account of `uid` is in the group `gid`, by the service's
 /// own definition ([`minvmd::net::answerer::uid_in_group`]), so `--show`

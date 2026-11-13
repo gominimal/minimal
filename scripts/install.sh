@@ -518,7 +518,7 @@ maybe_remove_finalize_install() {
             else
                 say ""
                 say "note: the host DNS setup ($_ns_p) is the minimal package's (dev.minimal.min), installed for"
-                say "  every user of this Mac; it stays. To remove the package: sudo /usr/local/share/minimal/uninstall.sh"
+                say "  every user of this Mac; it stays. To remove the package: sudo \"/Library/Application Support/minimal/uninstall.sh\""
             fi
             return 0
         done

@@ -1,12 +1,20 @@
 #!/bin/sh
 # preinstall: make room for the payload. On an upgrade (an earlier package's
 # receipt or privileged services exist) the box-name service and the
-# local-range job are stopped so the postinstall can replace their program;
-# the postinstall starts them again. Users' own daemons (minvmd, minimald)
+# local-range job are stopped and their program is moved aside
+# (Minimal.app.old), so the payload writes a whole new bundle, never into an
+# older one; the postinstall starts the services again, and puts the earlier
+# program back should it fail. Users' own daemons (minvmd, minimald)
 # are theirs and keep running the binaries they loaded until they restart;
 # an installer cannot stop a user's sessions on their behalf.
 set -eu
 for job in dev.gominimal.zone dev.minimal.local-range; do
     launchctl bootout "system/$job" 2>/dev/null || true
 done
+bundle=/Library/PrivilegedHelperTools/Minimal.app
+# An install that stopped between this script and its postinstall left the
+# earlier program aside: it is the current one again.
+if [ ! -e "$bundle" ] && [ -d "$bundle.old" ]; then mv "$bundle.old" "$bundle"; fi
+rm -rf "$bundle.old"
+if [ -d "$bundle" ] && [ ! -L "$bundle" ]; then mv "$bundle" "$bundle.old"; fi
 exit 0

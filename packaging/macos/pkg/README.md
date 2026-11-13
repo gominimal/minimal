@@ -13,21 +13,39 @@ stays as the per-user path. One artifact set feeds both.
   installer does. It maps the installer's prefixes to `/usr/local`: `bin/`
   to `/usr/local/bin`, `lib/` to `/usr/local/lib`, and `data/` (the guest
   images) to `/usr/local/share/minimal`. minvmd looks there after the
-  user's own data directory (`crates/minvmd/src/image.rs`).
-- The package adds three things. The shell completions, printed by the
-  payload's own `min`, go under the system completion directories.
-  `uninstall.sh` goes in, because macOS has no package uninstall. `pkg-info`
-  names the release the payload came from and says whether it is a test
-  build.
+  user's own data directory (`crates/minvmd/src/image.rs`). The one
+  exception is the box-name service's bundle, `bin/Minimal.app`: root's
+  launchd jobs run it, so the payload puts it at
+  `/Library/PrivilegedHelperTools/Minimal.app`, where only root writes.
+- The package adds two things under `/usr/local`. The shell completions,
+  printed by the payload's own `min`, go under the system completion
+  directories. `pkg-info` names the release the payload came from and says
+  whether it is a test build; it is for a person to read, and no script
+  reads it.
+- **Root reads nothing from `/usr/local`.** On a Mac where a user owns
+  `/usr/local/bin` or `/usr/local/share` (Homebrew's Intel layout, and Macs
+  migrated from one), that user can change those files while the package
+  installs. So what root runs or reads comes from the package's scripts
+  directory and from `/Library`: the service's bundle, the uninstaller, and
+  what the postinstall requires of the bundle's signature, which
+  `build-pkg.sh` writes into the postinstall when it builds the package.
 - `scripts/postinstall` does what `min finalize-install` does for a user,
-  with nobody logged in. It copies the box-name service's bundle to
-  `/Library/PrivilegedHelperTools` behind the same Developer ID check. It
+  with nobody logged in. It first installs `uninstall.sh` (macOS has no
+  package uninstall) and the list of the payload's files under
+  `/Library/Application Support/minimal`. It checks the box-name service's
+  bundle where the payload put it, behind the same Developer ID check. It
   writes the resolver file for `min.internal` and the boot-time
   loopback-range job. It runs the box-name service under a role account,
   `_minimal`, rather than the installing user. `scripts/preinstall` stops
-  those two services on an upgrade. `scripts/uninstall.sh` undoes all of
-  it, account included. Then it removes every file in the receipt, and the
-  receipt.
+  those two services on an upgrade and moves the earlier bundle aside; a
+  postinstall that fails puts it back and starts them again.
+  `scripts/uninstall.sh` undoes all of it, account included. Then it
+  removes every file in the receipt, and the receipt.
+- A first install that fails (the DNS port held by another program, say)
+  removes its services, the bundle and the resolver file again, and names
+  the uninstaller. Installer keeps no receipt for a failed install, so the
+  uninstaller then works from the file list instead and removes what the
+  payload placed.
 
 ## A test build
 
@@ -61,7 +79,7 @@ older copy of the same bundle elsewhere on the disk.
 
 What an MDM administrator should know:
 
-- **Removal** is `sudo /usr/local/share/minimal/uninstall.sh`, pushed as
+- **Removal** is `sudo "/Library/Application Support/minimal/uninstall.sh"`, pushed as
   a root script through the MDM agent, which holds Full Disk Access and so
   can delete the role account. It also forgets the receipt. With no Full
   Disk Access it removes everything but the account and exits 1; an MDM
