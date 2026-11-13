@@ -526,11 +526,23 @@ async fn finish_own_ip_attach(
     // of this, so it is the failed bind's own rollback that withdraws it
     // above — the name is never left standing for a port that refused.
     let host_ids = dns::host_ids_for(switch.lock().await.host_id());
+    // A success is logged too: a sibling's lookup from inside a box that
+    // fails reads this pair to tell a missing record from a lost reply.
     for host_id in host_ids {
-        if let Err(e) =
-            crate::net::policy::register_dns_name(&control, &host_id, session_name, lease_ip).await
+        match crate::net::policy::register_dns_name(&control, &host_id, session_name, lease_ip)
+            .await
         {
-            tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
+            Ok(()) => tracing::debug!(
+                session = session_name,
+                host_id,
+                switch_address = %lease_ip,
+                "registered *.min.internal name on gvproxy"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                session = session_name,
+                "registering *.min.internal name on gvproxy"
+            ),
         }
     }
 
