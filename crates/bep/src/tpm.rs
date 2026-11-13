@@ -17,6 +17,10 @@
 //!
 //! The store passes the authorization value to `tpm2-tools` on standard
 //! input, never in an argument list, which other users of the host can read.
+//! It passes it in the `hex:` form, because `tpm2-tools` reads a raw value as
+//! a C string and drops every byte from the first zero byte.
+//! The shared secret of an ECDH goes through a file in a directory in memory,
+//! under `$XDG_RUNTIME_DIR` or `/dev/shm`, and never through the disk.
 //! A key keeps a saved context of itself while the proxy runs, and loads
 //! itself again from its blob when the TPM refuses that context, as it does
 //! after a TPM reset.
@@ -133,6 +137,83 @@ pub fn new_auth() -> Result<Zeroizing<Vec<u8>>, getrandom::Error> {
     let mut auth = Zeroizing::new(vec![0u8; AUTH_LEN]);
     getrandom::fill(&mut auth)?;
     Ok(auth)
+}
+
+/// What the store writes on the standard input of a tool that reads the
+/// authorization value as `-p file:-`.
+///
+/// `tpm2-tools` reads a raw value as a C string and strips trailing newline
+/// bytes, so a raw value loses everything from its first zero byte. The
+/// `hex:` form carries every byte of the value to the TPM.
+fn auth_input(auth: &[u8]) -> Zeroizing<Vec<u8>> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    // The capacity is exact, so the buffer never moves and leaves no copy.
+    let mut out = Zeroizing::new(Vec::with_capacity(4 + 2 * auth.len()));
+    out.extend_from_slice(b"hex:");
+    for byte in auth {
+        out.push(HEX[usize::from(byte >> 4)]);
+        out.push(HEX[usize::from(byte & 0x0f)]);
+    }
+    out
+}
+
+/// Whether a TPM response code says the authorization value was wrong:
+/// `TPM_RC_BAD_AUTH` or `TPM_RC_AUTH_FAIL`, in any session. A reload does
+/// not change the answer, so the store does not ask the TPM again.
+fn is_auth_failure(code: &str) -> bool {
+    let Some(rc) = code
+        .strip_prefix("0x")
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+    else {
+        return false;
+    };
+    // Layer 0 is the TPM itself. Bit 7 marks a format-one code, whose error
+    // number is in bits 0 to 5. Bit 6 and bits 8 to 11 name the parameter
+    // or the session.
+    rc >> 16 == 0 && matches!(rc & 0xbf, 0xa2 | 0x8e)
+}
+
+/// The directory, in memory, for the files that hold an ECDH shared secret:
+/// `minimal-bep-tpm` under `runtime`, or `minimal-bep-tpm-<uid>` under `shm`
+/// when there is no runtime directory. Only `uid` can use it.
+fn secret_root_in(runtime: Option<&Path>, shm: &Path, uid: u32) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = match runtime {
+        Some(dir) => dir.join("minimal-bep-tpm"),
+        None if shm.is_dir() => shm.join(format!("minimal-bep-tpm-{uid}")),
+        None => {
+            return Err(format!(
+                "XDG_RUNTIME_DIR is not set and {} does not exist, so the proxy has no \
+                 directory in memory for the TPM's shared secrets",
+                shm.display()
+            ));
+        }
+    };
+    match fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(format!("did not make {}: {err}", path.display())),
+    }
+    let meta = fs::symlink_metadata(&path)
+        .map_err(|err| format!("did not read {}: {err}", path.display()))?;
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is not a directory that only this user can use",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// [`secret_root_in`] for this process: `$XDG_RUNTIME_DIR`, or `/dev/shm`.
+fn secret_root() -> Result<PathBuf, String> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute() && dir.is_dir());
+    // SAFETY: `geteuid` takes no argument, reads process state and cannot
+    // fail.
+    let uid = unsafe { libc::geteuid() };
+    secret_root_in(runtime.as_deref(), Path::new("/dev/shm"), uid)
 }
 
 /// What the TPM reported for a key in its public area.
@@ -332,6 +413,12 @@ pub struct TpmStore {
 
 static WORK_DIRS: AtomicU64 = AtomicU64::new(0);
 
+/// Held across one command and its flush when no resource manager stands
+/// between the store and the TPM. The flush removes every transient object
+/// and session in the TPM, so without this lock it can remove the object
+/// that another key's command just loaded.
+static NO_RESOURCE_MANAGER: Mutex<()> = Mutex::new(());
+
 /// How long one `tpm2-tools` command can run before the store stops it.
 /// A P-256 operation takes well under a second on a TPM, so a command
 /// that runs this long is blocked on the device.
@@ -345,6 +432,9 @@ const TOOL_POLL: Duration = Duration::from_millis(5);
 /// work directories behind, with copies of key blobs and saved contexts in
 /// them. A proxy killed inside `write_private` leaves a temporary file,
 /// with an authorization value in it.
+///
+/// A pid that the kernel gave to another process since keeps its files
+/// until that process ends too. They are only left behind longer.
 fn sweep_work_dirs(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -391,16 +481,6 @@ fn sweep_work_dirs(dir: &Path) {
 /// its owner.
 #[derive(Debug)]
 struct WorkDir(PathBuf);
-
-/// Removes a file when it goes out of scope, on every return path, so a
-/// shared secret the TPM wrote never stays on disk after the call.
-struct RemoveOnDrop<'a>(&'a Path);
-
-impl Drop for RemoveOnDrop<'_> {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.0);
-    }
-}
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
@@ -458,22 +538,22 @@ impl TpmStore {
 
     fn work_dir(&self) -> io::Result<WorkDir> {
         self.make_dir()?;
-        sweep_work_dirs(&self.dir);
-        let n = WORK_DIRS.fetch_add(1, Ordering::Relaxed);
-        let path = self.dir.join(format!(".work-{}-{n}", std::process::id()));
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(WorkDir(path))
+        work_dir_in(&self.dir)
     }
 
     /// Runs one `tpm2-tools` command, with `stdin` on its standard input.
     /// Flushes what the command left in the TPM when no resource manager
-    /// does it.
+    /// does it, under a lock that no other command of this process passes.
     fn run(&self, tool: &str, args: &[OsString], stdin: Option<&[u8]>) -> Result<(), ToolError> {
+        if self.tcti == DEVICE_TCTI {
+            return self.run_once(tool, args, stdin);
+        }
+        let _guard = NO_RESOURCE_MANAGER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = self.run_once(tool, args, stdin);
-        if self.tcti != DEVICE_TCTI {
-            for flag in ["-t", "-l", "-s"] {
-                let _ = self.run_once("tpm2_flushcontext", &[flag.into()], None);
-            }
+        for flag in ["-t", "-l", "-s"] {
+            let _ = self.run_once("tpm2_flushcontext", &[flag.into()], None);
         }
         result
     }
@@ -688,7 +768,7 @@ impl TpmStore {
             .chain(args(&["-u"], &[&public]))
             .chain(args(&["-r"], &[&private]))
             .collect();
-        self.run("tpm2_create", &create_args, Some(&auth))
+        self.run("tpm2_create", &create_args, Some(&auth_input(&auth)))
             .map_err(|err| match err {
                 ToolError::Tpm(detail) | ToolError::Other(detail) => store_err(detail),
             })?;
@@ -738,6 +818,15 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     written
+}
+
+/// A new `.work-<pid>-<n>` directory in `dir`, after the stale ones go.
+fn work_dir_in(dir: &Path) -> io::Result<WorkDir> {
+    sweep_work_dirs(dir);
+    let n = WORK_DIRS.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(".work-{}-{n}", std::process::id()));
+    fs::DirBuilder::new().mode(0o700).create(&path)?;
+    Ok(WorkDir(path))
 }
 
 fn args(flags: &[&str], paths: &[&Path]) -> Vec<OsString> {
@@ -807,7 +896,9 @@ impl TpmKey {
         }
         match op(&self.context()) {
             Ok(value) => Ok(value),
-            Err(ToolError::Tpm(_)) if !fresh => {
+            Err(ToolError::Tpm(detail))
+                if !fresh && !detail.rsplit(' ').next().is_some_and(is_auth_failure) =>
+            {
                 self.reload(&mut state)?;
                 op(&self.context()).map_err(|err| err.into_key_error(self.role))
             }
@@ -835,19 +926,32 @@ impl HeldKey for TpmKey {
 
     fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
         let peer_path = self.work.0.join("peer.point");
-        let out = self.work.0.join("z.point");
+        // The shared secret goes to a directory in memory, never to the
+        // disk under the key files. The directory goes away with the call.
+        let secrets = secret_root()
+            .and_then(|root| {
+                work_dir_in(&root)
+                    .map_err(|err| format!("did not make a directory in {}: {err}", root.display()))
+            })
+            .map_err(|detail| KeyError::Store {
+                role: self.role,
+                detail,
+            })?;
+        let out = secrets.0.join("z.point");
+        let auth = auth_input(&self.auth);
         self.with_context(|ctx| {
             write_private(&peer_path, &ecc_point(peer)).map_err(|e| Self::io_error(&e))?;
-            let out = RemoveOnDrop(&out);
-            let _ = fs::remove_file(out.0);
+            let _ = fs::remove_file(&out);
             let args: Vec<OsString> = args(&["-c"], &[ctx])
                 .into_iter()
                 .chain(["-p", "file:-"].map(OsString::from))
                 .chain(args(&["-u"], &[&peer_path]))
-                .chain(args(&["-o"], &[out.0]))
+                .chain(args(&["-o"], &[&out]))
                 .collect();
-            self.store.run("tpm2_ecdhzgen", &args, Some(&self.auth))?;
-            let bytes = Zeroizing::new(fs::read(out.0).map_err(|e| Self::io_error(&e))?);
+            let ran = self.store.run("tpm2_ecdhzgen", &args, Some(&auth));
+            let read = ran.and_then(|()| fs::read(&out).map_err(|e| Self::io_error(&e)));
+            let _ = fs::remove_file(&out);
+            let bytes = Zeroizing::new(read?);
             shared_x(&bytes).map_err(ToolError::Other)
         })
     }
@@ -865,6 +969,7 @@ impl crate::ca::CaKey for TpmKey {
         let digest_path = self.work.0.join("msg.digest");
         let out = self.work.0.join("msg.sig");
         let digest = Sha256::digest(msg);
+        let auth = auth_input(&self.auth);
         self.with_context(|ctx| {
             write_private(&digest_path, &digest).map_err(|e| Self::io_error(&e))?;
             let _ = fs::remove_file(&out);
@@ -879,7 +984,7 @@ impl crate::ca::CaKey for TpmKey {
                 .chain(args(&["-o"], &[&out]))
                 .chain([digest_path.as_os_str().to_owned()])
                 .collect();
-            self.store.run("tpm2_sign", &args, Some(&self.auth))?;
+            self.store.run("tpm2_sign", &args, Some(&auth))?;
             let bytes = fs::read(&out).map_err(|e| Self::io_error(&e))?;
             der_signature(&bytes).map_err(ToolError::Other)
         })
@@ -1129,6 +1234,93 @@ mod tests {
             .mode();
         assert_eq!(dir_mode & 0o777, 0o700);
         assert_eq!(fs::read(&path).expect("read"), *a);
+
+        // The tools get every byte of the value, in the hex form.
+        assert_auth_input_is_hex(&a);
+    }
+
+    fn assert_auth_input_is_hex(auth: &[u8]) {
+        let input = auth_input(auth);
+        let hex = input.strip_prefix(b"hex:").expect("the hex: prefix");
+        assert_eq!(hex.len(), 2 * auth.len());
+        assert!(hex.iter().all(|b| b.is_ascii_hexdigit()), "{input:?}");
+        let decoded: Vec<u8> = hex
+            .chunks(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("ascii"), 16).expect("hex")
+            })
+            .collect();
+        assert_eq!(decoded, auth);
+    }
+
+    // `tpm2-tools` reads a raw authorization value as a C string, so a zero
+    // byte or a trailing newline would cut it short. The tools get the hex
+    // form, which holds neither.
+    #[test]
+    fn an_authorization_value_reaches_the_tools_whole_in_hex() {
+        let mut auth = [0x5au8; AUTH_LEN];
+        auth[0] = 0x00;
+        auth[7] = 0x00;
+        auth[AUTH_LEN - 2] = b'\r';
+        auth[AUTH_LEN - 1] = b'\n';
+        assert_auth_input_is_hex(&auth);
+        assert_eq!(
+            &auth_input(&[0x00, 0x0a, 0xff])[..],
+            b"hex:000aff".as_slice()
+        );
+        let input = auth_input(&auth);
+        assert!(!input.contains(&0));
+        assert!(!input.ends_with(b"\n"));
+    }
+
+    // A wrong authorization value is not worth a second try after a reload.
+    #[test]
+    fn an_authorization_failure_is_not_retried() {
+        for code in ["0x000009a2", "0x0000098e", "0x000001a2", "0x000000a2"] {
+            assert!(is_auth_failure(code), "{code}");
+        }
+        for code in [
+            "0x00000128",
+            "0x00000922",
+            "0x000b0009a2",
+            "0x00000902",
+            "x",
+        ] {
+            assert!(!is_auth_failure(code), "{code}");
+        }
+    }
+
+    // The ECDH shared secret goes to a directory in memory that only the
+    // proxy's user can use, under the runtime directory when there is one.
+    #[test]
+    fn the_shared_secret_directory_is_in_memory_and_private() {
+        use std::os::unix::fs::MetadataExt as _;
+        let runtime = tempfile::tempdir().expect("tempdir");
+        let shm = tempfile::tempdir().expect("tempdir");
+        let uid = fs::metadata(runtime.path()).expect("meta").uid();
+
+        let root = secret_root_in(Some(runtime.path()), shm.path(), uid).expect("runtime");
+        assert_eq!(root, runtime.path().join("minimal-bep-tpm"));
+        let mode = fs::metadata(&root).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A second call finds the same directory.
+        assert_eq!(
+            secret_root_in(Some(runtime.path()), shm.path(), uid).expect("again"),
+            root
+        );
+
+        let root = secret_root_in(None, shm.path(), uid).expect("shm");
+        assert_eq!(root, shm.path().join(format!("minimal-bep-tpm-{uid}")));
+
+        let missing = shm.path().join("missing");
+        let err = secret_root_in(None, &missing, uid).expect_err("no directory in memory");
+        assert!(err.contains("XDG_RUNTIME_DIR"), "{err}");
+
+        // A directory that another user can read is refused.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(secret_root_in(None, shm.path(), uid).is_err());
+        // A directory that another user owns is refused.
+        assert!(secret_root_in(Some(runtime.path()), shm.path(), uid + 1).is_err());
     }
 
     // A tool that exits before it reads its input still reports the TPM's

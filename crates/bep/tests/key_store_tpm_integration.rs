@@ -102,7 +102,10 @@ fn a_tpm_key_is_fixed_exempt_from_lockout_and_needs_its_authorization() {
     // an object with noDA. An object without it gets TPM_RC_AUTH_FAIL.
     let root_auth_path = store.auth_path(Role::Root, Slot::Held);
     let root_auth = fs::read(&root_auth_path).expect("root auth file");
-    fs::write(&root_auth_path, [0u8; 32]).expect("write");
+    // Every byte differs from the real value, so the wrong value can never
+    // equal it, whatever bytes the real value holds.
+    let wrong: Vec<u8> = root_auth.iter().map(|b| b ^ 0xa5).collect();
+    fs::write(&root_auth_path, &wrong).expect("write");
     for _ in 0..5 {
         let key = again.find(Role::Root).expect("load").expect("held");
         match key.sign(b"wrong authorization") {
