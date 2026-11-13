@@ -328,12 +328,16 @@ where
     // A failed command marks its root span as an error, whether or not the
     // failure was expected, and says why in the status itself, so a trace
     // filter on failed commands reads the cause without opening the span's
-    // events (gominimal/minimal#3223). A hand-off is not a failure.
+    // events (gominimal/minimal#3223), never quoting a daemon reply that
+    // did not decode. A hand-off is not a failure.
     if let Err(e) = &result
         && outcome == "error"
     {
         span.record("otel.status_code", "ERROR");
-        span.record("otel.status_description", format!("{e:#}").as_str());
+        span.record(
+            "otel.status_description",
+            minimal_client::span_status_description(e).as_str(),
+        );
     }
     // Release every handle on the span, so it closes here.
     drop(slot);

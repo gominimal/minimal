@@ -2438,9 +2438,13 @@ impl ActivationStep {
             // The status, so a trace query for failed steps finds them, and
             // its message, so the query reads why without the event
             // (gominimal/minimal#3223); the event stays at INFO, since a
-            // failed step is often expected.
+            // failed step is often expected. A daemon reply that did not
+            // decode is named, never quoted, in the status.
             span.record("otel.status_code", "ERROR");
-            span.record("otel.status_description", format!("{error:#}").as_str());
+            span.record(
+                "otel.status_description",
+                minimal_client::span_status_description(error).as_str(),
+            );
             span.in_scope(|| {
                 tracing::info!(
                     step = self.name(),

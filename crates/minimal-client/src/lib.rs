@@ -576,7 +576,7 @@ impl Client {
             }
 
             let response: R::Response = serde_json_lenient::from_slice(&resp_buf)
-                .with_context(|| decode_context(R::NAME, &resp_buf))?;
+                .map_err(|source| UndecodedReply::new(R::NAME, &resp_buf, source))?;
             // Most RPCs answer a refusal as `Errorable::Err` inside a decoded
             // response, and `SubmitVerdict` as a `Fault` step; the caller
             // still gets it as a response, and the span is marked failed.
@@ -595,10 +595,14 @@ impl Client {
         if let Err(e) = &result {
             // A failed or timed-out RPC marks its span, so a daemon-side
             // "rpc failed" has a failed client-side span to match, and the
-            // status says what failed (gominimal/minimal#3223).
+            // status says what failed (gominimal/minimal#3223), without the
+            // reply's bytes when the reply did not decode.
             let span = tracing::Span::current();
             span.record("otel.status_code", "ERROR");
-            span.record("otel.status_description", format!("{e:#}").as_str());
+            span.record(
+                "otel.status_description",
+                span_status_description(e).as_str(),
+            );
         }
         result
     }
@@ -1458,6 +1462,80 @@ fn decode_context(rpc: &str, body: &[u8]) -> String {
     format!("decode response for {rpc} (daemon replied: {excerpt})")
 }
 
+/// A daemon reply that did not decode. Its message is [`decode_context`]'s,
+/// quoting the reply, and its source is the decoder's error, so the error a
+/// person sees reads as it always has. The reply can hold user content (a
+/// terminal snapshot, a box record), and the decoder's error can quote a
+/// value from it, so neither goes into telemetry: [`span_status_description`]
+/// names the RPC, the reply's size and where the decode failed instead.
+#[derive(Debug)]
+struct UndecodedReply {
+    rpc: &'static str,
+    bytes: usize,
+    message: String,
+    source: serde_json_lenient::Error,
+}
+
+impl UndecodedReply {
+    fn new(rpc: &'static str, body: &[u8], source: serde_json_lenient::Error) -> Self {
+        Self {
+            rpc,
+            bytes: body.len(),
+            message: decode_context(rpc, body),
+            source,
+        }
+    }
+
+    /// What a span may say of this failure: no byte of the reply.
+    fn summary(&self) -> String {
+        let kind = match self.source.classify() {
+            serde_json_lenient::error::Category::Io => "an I/O",
+            serde_json_lenient::error::Category::Syntax => "a syntax",
+            serde_json_lenient::error::Category::Data => "a data",
+            serde_json_lenient::error::Category::Eof => "an end-of-input",
+        };
+        format!(
+            "decode response for {}: the daemon's reply ({} bytes) has {kind} error at line {} \
+             column {}",
+            self.rpc,
+            self.bytes,
+            self.source.line(),
+            self.source.column(),
+        )
+    }
+}
+
+impl std::fmt::Display for UndecodedReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UndecodedReply {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// The text for a failed span's `otel.status_description`: the error chain
+/// as `{:#}` prints it, except that a daemon reply that did not decode is
+/// named by its RPC, size and fault position and never quoted, nor is the
+/// decoder's error under it. A reply can carry user content, and a status
+/// description is exported as is (gominimal/minimal#3223). The error itself,
+/// what `min` prints, keeps the quote.
+#[must_use]
+pub fn span_status_description(error: &anyhow::Error) -> String {
+    let mut links = Vec::new();
+    for link in error.chain() {
+        if let Some(reply) = link.downcast_ref::<UndecodedReply>() {
+            links.push(reply.summary());
+            break;
+        }
+        links.push(link.to_string());
+    }
+    links.join(": ")
+}
+
 /// The wording, the override, and the placeholder for a daemon too old to
 /// report its build all live in the wire crate: the daemon produces the same
 /// message when it refuses a `CreateSession` whose `must_match_version` does
@@ -1964,6 +2042,39 @@ mod tests {
             rendered.contains("finalized_at"),
             "the reply must be quoted so the tripping field is identifiable, got: {rendered}"
         );
+    }
+
+    /// A reply that does not decode is quoted in the error a person sees,
+    /// but a span's status description names only the RPC, the reply's size
+    /// and where the decode failed, under any context added above it: the
+    /// reply, here a terminal line, can be user content, and the decoder's
+    /// own error quotes the value it rejected (gominimal/minimal#3223).
+    #[test]
+    fn a_span_status_never_quotes_an_undecodable_reply() {
+        use anyhow::Context as _;
+
+        // A terminal line where a count was expected: the decoder's error
+        // quotes the string it rejected.
+        let body = br#""$ export TOKEN=hunter2""#;
+        let source = serde_json_lenient::from_slice::<u32>(body).unwrap_err();
+        assert!(source.to_string().contains("hunter2"), "{source}");
+        let err = Err::<(), _>(super::UndecodedReply::new("GetSessionScreen", body, source))
+            .context("read the session's screen")
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("hunter2"), "{err:#}");
+        let status = super::span_status_description(&err);
+        assert!(!status.contains("hunter2"), "{status}");
+        let expected = format!(
+            "read the session's screen: decode response for GetSessionScreen: the daemon's \
+             reply ({} bytes) has a data error at line 1 column ",
+            body.len()
+        );
+        assert!(status.starts_with(&expected), "{status}");
+
+        // Any other error reads as `{:#}` prints it.
+        let other = anyhow::anyhow!("connection reset").context("open channel for X");
+        assert_eq!(super::span_status_description(&other), format!("{other:#}"));
     }
 
     /// A pathological body is quoted, but bounded — the excerpt must not
@@ -3079,7 +3190,23 @@ mod rpc_status_tests {
         let undecodable = client
             .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
             .await;
-        let undecodable = format!("{:#}", undecodable.expect_err("the reply does not decode"));
+        let undecodable = undecodable.expect_err("the reply does not decode");
+        // The caller's error quotes the reply, for a bug report; the span's
+        // status names the RPC and the reply's size and quotes nothing, since
+        // a reply can carry user content.
+        assert!(
+            format!("{undecodable:#}").contains("not json"),
+            "{undecodable:#}"
+        );
+        let undecodable = super::span_status_description(&undecodable);
+        assert!(!undecodable.contains("not json"), "{undecodable}");
+        assert!(
+            undecodable.starts_with(&format!(
+                "decode response for {}: the daemon's reply (8 bytes) has a syntax error",
+                <SubmitVerdict as minimald_rpc::OneshotSshRpc>::NAME
+            )),
+            "{undecodable}"
+        );
 
         *reply.lock().unwrap() = Reply::Hang;
         let timed_out = client

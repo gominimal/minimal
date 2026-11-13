@@ -128,14 +128,15 @@ const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// (`FETCH_BACKOFF_BASE` doubling per attempt) between tries. `what` names
 /// the object in the log. The caller decides what a spent retry budget
 /// means (the index reports `Unavailable`; an artifact surfaces the error).
-/// A success comes back with the number of attempts it took, so a span can
-/// say whether a slow fetch was one long transfer or several.
+/// The outcome comes back with the number of attempts it took, a failure's
+/// as well as a success's, so a span can say whether a slow or failed fetch
+/// was one long transfer or several.
 async fn retrying_transient<T, E, Fut>(
     what: &str,
     retries: u32,
     is_transient: impl Fn(&E) -> bool,
     mut once: impl FnMut() -> Fut,
-) -> Result<(T, u32), E>
+) -> (Result<T, E>, u32)
 where
     E: std::fmt::Display,
     Fut: std::future::Future<Output = Result<T, E>>,
@@ -144,7 +145,7 @@ where
     loop {
         attempt += 1;
         match once().await {
-            Ok(v) => return Ok((v, attempt)),
+            Ok(v) => return (Ok(v), attempt),
             Err(e) if attempt <= retries && is_transient(&e) => {
                 let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
                 tracing::warn!(
@@ -157,7 +158,7 @@ where
                 if attempt > 1 {
                     tracing::warn!("fetching {what} failed after {attempt} attempts: {e}");
                 }
-                return Err(e);
+                return (Err(e), attempt);
             }
         }
     }
@@ -645,14 +646,13 @@ impl<B: FetchBackend> RemoteCache<B> {
         // Pinned on the heap, the loop's state is a pointer in the caller's
         // state, and the depth stops here.
         let (index, gcs_generation) = Box::pin(async {
-            let fetched = retrying_transient(
+            let (fetched, _attempts) = retrying_transient(
                 source.object(),
                 DEFAULT_FETCH_RETRIES,
                 Self::is_transient,
                 || Self::fetch_index_once(&backend, &url, &source, index_dir.as_deref(), &fetch_op),
             )
-            .await
-            .map(|(fetched, _attempts)| fetched);
+            .await;
             match fetched {
                 Ok(pair) => Ok(pair),
                 // The same class of failure artifact downloads already
@@ -925,16 +925,19 @@ impl<B: FetchBackend> RemoteCache<B> {
         });
 
         let start = Instant::now();
-        let (mut tar_file, attempts) = retrying_transient(
+        let (fetched, attempts) = retrying_transient(
             &hex::encode(sha256),
             self.fetch_retries,
             Self::is_transient,
             || self.fetch_verified(sha256, &materialize_op),
         )
-        .await?;
+        .await;
+        // Recorded before a failed fetch returns: a fetch that retried and
+        // then gave up is the one a span most needs to explain.
         let span = tracing::Span::current();
         span.record("attempts", attempts);
         span.record("fetch_s", start.elapsed().as_secs_f64());
+        let mut tar_file = fetched?;
         if let Ok(meta) = tar_file.metadata() {
             span.record("bytes", meta.len());
         }
@@ -956,15 +959,17 @@ impl<B: FetchBackend> RemoteCache<B> {
         // renderer never observes the ExtractPkg state — so the extract spinner
         // is never drawn.
         let dest = cache_hnd.path().to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        let extracted = tokio::task::spawn_blocking(move || {
             archive::extract_compressed_tar(tar_file, archive::Compression::Zstd, &dest, None)
         })
         .await
         .expect("extract task is awaited immediately and never cancelled")
-        .map_err(Error::ArchiveError)?;
+        .map_err(Error::ArchiveError);
+        // Recorded whether or not the extraction succeeded.
+        span.record("extract_s", extract_start.elapsed().as_secs_f64());
+        extracted?;
 
         materialize_op.set_done();
-        span.record("extract_s", extract_start.elapsed().as_secs_f64());
 
         Ok((Instant::now().duration_since(start), cache_hnd))
     }
@@ -1853,6 +1858,169 @@ mod tests {
         );
         // One index fetch + two artifact attempts (initial + one retry).
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// What one `materialize` span recorded, field by field.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct MaterializeFields {
+        attempts: Option<u64>,
+        bytes: Option<u64>,
+        fetch_s: Option<f64>,
+        extract_s: Option<f64>,
+    }
+
+    impl tracing::field::Visit for MaterializeFields {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "attempts" => self.attempts = Some(value),
+                "bytes" => self.bytes = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            match field.name() {
+                "fetch_s" => self.fetch_s = Some(value),
+                "extract_s" => self.extract_s = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    /// Records the fields of each `materialize` span, in the order the spans
+    /// are created.
+    #[derive(Clone, Default)]
+    struct MaterializeSpans(std::sync::Arc<std::sync::Mutex<MaterializeLog>>);
+
+    #[derive(Default)]
+    struct MaterializeLog {
+        spans: Vec<MaterializeFields>,
+        /// The index in `spans` of each `materialize` span, by id.
+        by_id: std::collections::HashMap<u64, usize>,
+    }
+
+    impl MaterializeSpans {
+        fn all(&self) -> Vec<MaterializeFields> {
+            self.0.lock().unwrap().spans.clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MaterializeSpans {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "materialize" {
+                let mut log = self.0.lock().unwrap();
+                let at = log.spans.len();
+                log.spans.push(MaterializeFields::default());
+                log.by_id.insert(id.into_u64(), at);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut recorded = MaterializeFields::default();
+            values.record(&mut recorded);
+            let mut log = self.0.lock().unwrap();
+            if let Some(&at) = log.by_id.get(&id.into_u64()) {
+                let seen = &mut log.spans[at];
+                seen.attempts = recorded.attempts.or(seen.attempts);
+                seen.bytes = recorded.bytes.or(seen.bytes);
+                seen.fetch_s = recorded.fetch_s.or(seen.fetch_s);
+                seen.extract_s = recorded.extract_s.or(seen.extract_s);
+            }
+        }
+    }
+
+    /// gominimal/minimal#3223: a fetch that retried and then gave up still
+    /// says on its span how many attempts it made and how long they took.
+    /// No artifact arrived, so there is no size and no extraction.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failed_fetch_records_its_attempts_and_time() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let spans = MaterializeSpans::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+        let (spec_hash, art_url, mut responses) = artifact_fixture();
+        responses.insert(art_url, b"always wrong".to_vec());
+        let rc = RemoteCache::new(
+            MockBackend::new(responses),
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap()
+        .with_fetch_retries(1);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        let seen = spans.all();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].attempts, Some(2), "{seen:?}");
+        assert!(seen[0].fetch_s.is_some(), "{seen:?}");
+        assert_eq!((seen[0].bytes, seen[0].extract_s), (None, None), "{seen:?}");
+    }
+
+    /// gominimal/minimal#3223: an artifact that arrives whole but does not
+    /// extract still says on its span what the fetch cost and how long the
+    /// extraction ran before it failed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_extraction_records_its_time() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let spans = MaterializeSpans::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+        // Bytes that match the index's hash, so the fetch succeeds, but are
+        // not a zstd archive, so the extraction fails.
+        let spec_hash = SpecHash::from_bytes([0xAB; 32]);
+        let artifact = b"not a zstd archive".to_vec();
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&sha2::Sha256::digest(&artifact));
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("mock://cache/{INDEX_FILENAME}"),
+            index_bytes_for(&spec_hash, sha256),
+        );
+        responses.insert(
+            format!("mock://cache/{}.zst", hex::encode(sha256)),
+            artifact.clone(),
+        );
+        let rc = RemoteCache::new(
+            MockBackend::new(responses),
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap()
+        .with_fetch_retries(0);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        assert!(matches!(err, Error::ArchiveError(_)), "{err:?}");
+        let seen = spans.all();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].attempts, Some(1), "{seen:?}");
+        assert_eq!(seen[0].bytes, Some(artifact.len() as u64), "{seen:?}");
+        assert!(seen[0].fetch_s.is_some(), "{seen:?}");
+        assert!(seen[0].extract_s.is_some(), "{seen:?}");
     }
 
     #[tokio::test]
