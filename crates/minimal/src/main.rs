@@ -1322,14 +1322,14 @@ mod tests {
                     name: address("web"),
                     candidates: Vec::new(),
                 },
-                "usage",
+                "ambiguous",
                 2,
             ),
             (
                 minimal::BoxAddressRefusal::AmbiguousIdStart {
                     start: address("01"),
                 },
-                "usage",
+                "ambiguous",
                 2,
             ),
         ] {
