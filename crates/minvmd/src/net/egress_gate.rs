@@ -5194,11 +5194,14 @@ async fn relay_frames_to_switch(
         }
         let admitted = match decided {
             Ok(admitted) => admitted,
-            // Every line below names the box the frame's source resolves to
-            // (its row as it is now, a rename moves it), beside the address
+            // Every line below whose source a row can hold names the box that
+            // row holds (as it is now, a rename moves it), beside the address
             // the line already carried: the address alone means nothing once
-            // the box is gone (gominimal/inbox#1228). The row is read only
-            // for a line the limiter lets through.
+            // the box is gone (gominimal/inbox#1228). All of them resolve
+            // through [`Who`], which reads the row only for a line the
+            // limiter lets through and names no box for the node address.
+            // The unregistered-source line has no row to name, and the node
+            // plane's two lines come from the node address.
             Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
                 limiter.warn_switch_surface(src, Who::of(table, Some(src)), dst_port);
                 continue;
@@ -5214,20 +5217,21 @@ async fn relay_frames_to_switch(
             Err(GateDrop::BoxName { src, dst, dst_port }) => {
                 // The line names both boxes by the rows that hold their
                 // addresses, so a host reads who reached for whom.
-                let source = table.by_source(src).map(|record| record.name());
-                let target = table.by_source(dst).map(|record| record.name());
-                limiter.warn_box_name(src, dst, dst_port, source.as_deref(), target.as_deref());
+                limiter.warn_box_name(
+                    src,
+                    Who::of(table, Some(src)),
+                    dst,
+                    Who::of(table, Some(dst)),
+                    dst_port,
+                );
                 continue;
             }
             Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
                 // The plan's diagnostics line wants the refusal to name the
-                // box, not only its address: the row the frame's source
-                // resolved to carries the name, when one did, read as it is
-                // now (a rename moves it, #1116) — and with no row, the
-                // address the line already names is all the identity there
-                // is.
-                let name = table.by_source(src).map(|record| record.name());
-                limiter.warn_proxy_lane(src, dst, dst_port, name.as_deref());
+                // box, not only its address (#1116). The node plane and the
+                // `host_ip` cohort raise this drop from the node address,
+                // which names no one box, so that line names none.
+                limiter.warn_proxy_lane(src, Who::of(table, Some(src)), dst, dst_port);
                 continue;
             }
             Err(GateDrop::UnregisteredSource { src }) => {
@@ -7186,25 +7190,29 @@ impl DropLimiter {
     /// Emits the warning for one frame to another box's lease that the
     /// source's name rules refuse (NET-163): the same rate limit a drop's
     /// line answers to, keyed by the source and the rule. The line names
-    /// the source box, the target box, the target's address and port, and
-    /// the rule. Returns whether a line was written.
+    /// the source box and its id, the target box, the target's address and
+    /// port, and the rule; both rows are read only for a line the limiter
+    /// lets through. Returns whether a line was written.
     fn warn_box_name(
         &self,
         src: [u8; 4],
+        who: Who<'_>,
         dst: [u8; 4],
+        target: Who<'_>,
         dst_port: u16,
-        source_box: Option<&str>,
-        target_box: Option<&str>,
     ) -> bool {
         match self.should_warn_at(Some(src), BOX_NAME_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
+                let who = who.resolve();
+                let target = target.resolve();
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     destination = %Ipv4Addr::from(dst),
                     port = dst_port,
-                    box = source_box,
-                    target = target_box,
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
+                    target = target.name().as_deref(),
                     rule_matched = BOX_NAME_RULE,
                     "dropped a frame to another box; this box's allow_dns_hosts does not \
                      name that box, and its allow_subnets does not cover the address",
@@ -7229,24 +7237,21 @@ impl DropLimiter {
     /// the listener a lane opens: the same rate limit a drop's line answers
     /// to, keyed by the source and the rule, and naming the destination and
     /// the port the frame gave it — the line a host reads to learn which box
-    /// was reaching for the proxy, the box named by the row that holds its
-    /// source when one does, and the reason by the rule. Returns whether a
+    /// was reaching for the proxy, the box and its id as the row that holds
+    /// its source names them when one does (read only for a line the
+    /// limiter lets through), and the reason by the rule. Returns whether a
     /// line was written.
-    fn warn_proxy_lane(
-        &self,
-        src: [u8; 4],
-        dst: [u8; 4],
-        dst_port: u16,
-        box_name: Option<&str>,
-    ) -> bool {
+    fn warn_proxy_lane(&self, src: [u8; 4], who: Who<'_>, dst: [u8; 4], dst_port: u16) -> bool {
         match self.should_warn_at(Some(src), PROXY_LANE_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
+                let who = who.resolve();
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     destination = %Ipv4Addr::from(dst),
                     port = dst_port,
-                    box = box_name,
+                    box = who.name().as_deref(),
+                    box_id = who.id(),
                     rule_matched = PROXY_LANE_RULE,
                     "dropped a frame to the box egress proxy's address; the proxy's \
                      listener is a credentialed lane's infrastructure, and this box's \
@@ -17631,16 +17636,24 @@ mod tests {
             "box-name"
         );
 
-        // The drop line names the rule, the source box and the target box.
+        // The drop line names the rule, the source box and its id, and the
+        // target box, each read from the row that holds its address.
         let (log, _guard) = capture_log();
         let limiter = DropLimiter::new();
-        assert!(limiter.warn_box_name(app, instance, 8080, Some("app"), Some("web-2")));
+        assert!(limiter.warn_box_name(
+            app,
+            Who::of(&table, Some(app)),
+            instance,
+            Who::of(&table, Some(instance)),
+            8080,
+        ));
         let logged = log.contents();
         for expected in [
             "source=100.64.0.9",
             "destination=100.64.0.12",
             "port=8080",
             "box=\"app\"",
+            "box_id=",
             "target=\"web-2\"",
             "rule_matched=\"box-name\"",
         ] {

@@ -270,24 +270,6 @@ pub async fn move_tap_into_netns(
     lease: PtaskLease,
     subnet: SwitchSubnet,
 ) -> io::Result<()> {
-    // Before the tap arrives and comes up: a namespace with IPv6 on sends
-    // router solicitations and MLD reports out of every interface that comes
-    // up in it, and the switch, which carries IPv4 alone, drops each one with
-    // a warning per box (gominimal/inbox#1228). Turned off on `all` and
-    // `default`, so the tap moved in below is born with it off. Best-effort:
-    // a namespace that keeps IPv6 still gets its tap, and only the warnings.
-    if let Err(e) = crate::traced::spawn_blocking(move || disable_ipv6_in_netns(netns_pid))
-        .await
-        .map_err(io::Error::other)
-        .and_then(|r| r)
-    {
-        tracing::debug!(
-            netns_pid,
-            error = %e,
-            "could not turn IPv6 off in the PTask's network namespace; its router \
-             solicitations will be dropped at the switch"
-        );
-    }
     for (index, argv) in tap_netns_commands(tap, netns_pid, lease, subnet)
         .into_iter()
         .enumerate()
@@ -336,38 +318,6 @@ pub async fn move_tap_into_netns(
             )));
         }
     }
-    Ok(())
-}
-
-/// Turns IPv6 off in the network namespace `/proc/<netns_pid>/ns/net`, for
-/// the interfaces it holds and every one moved in after: the `all` and
-/// `default` `disable_ipv6` sysctls, written from a thread that entered the
-/// namespace, since `/proc/sys/net` is read against the writer's own. Needs
-/// `CAP_NET_ADMIN` over the namespace, which the daemon that wires the tap
-/// has. Runs on its own thread: `setns(2)` moves the calling thread alone,
-/// and a tokio worker must not be left in a box's namespace.
-#[cfg(target_os = "linux")]
-fn disable_ipv6_in_netns(netns_pid: u32) -> io::Result<()> {
-    let ns = std::fs::File::open(format!("/proc/{netns_pid}/ns/net"))?;
-    std::thread::Builder::new()
-        .name("ptask-ipv6-off".into())
-        .spawn(move || -> io::Result<()> {
-            nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNET)
-                .map_err(|e| io::Error::other(format!("setns: {e}")))?;
-            for scope in ["all", "default"] {
-                std::fs::write(
-                    format!("/proc/sys/net/ipv6/conf/{scope}/disable_ipv6"),
-                    "1\n",
-                )?;
-            }
-            Ok(())
-        })?
-        .join()
-        .map_err(|_| io::Error::other("the IPv6 switch-off thread panicked"))?
-}
-
-#[cfg(not(target_os = "linux"))]
-fn disable_ipv6_in_netns(_netns_pid: u32) -> io::Result<()> {
     Ok(())
 }
 
