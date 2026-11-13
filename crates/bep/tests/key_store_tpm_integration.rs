@@ -7,7 +7,9 @@
 //!   refuses to duplicate it. It signs and agrees through the TPM, and checks
 //!   each result in software. It loads each key again in a new store from
 //!   its key file and its authorization file alone. Last, it checks that the
-//!   TPM refuses a key whose authorization file holds another value.
+//!   TPM refuses the root key with another authorization value, with the
+//!   response code a noDA object gets, and that the root key works again
+//!   with its own authorization file.
 //!
 //! The test needs `tpm2-tools` and a TPM. It is ignored by default, and
 //! returns early when `BEP_TPM_TCTI` is not set, as the `_root_integration`
@@ -95,21 +97,28 @@ fn a_tpm_key_is_fixed_exempt_from_lockout_and_needs_its_authorization() {
     }
 
     // A wrong authorization value is refused, and does not lock the TPM out.
-    fs::write(store.auth_path(Role::Root, Slot::Held), [0u8; 32]).expect("write");
+    // The TPM answers TPM_RC_BAD_AUTH in session 1 (`0x000009a2`) only for
+    // an object with noDA. An object without it gets TPM_RC_AUTH_FAIL.
+    let root_auth_path = store.auth_path(Role::Root, Slot::Held);
+    let root_auth = fs::read(&root_auth_path).expect("root auth file");
+    fs::write(&root_auth_path, [0u8; 32]).expect("write");
     for _ in 0..5 {
         let key = again.find(Role::Root).expect("load").expect("held");
         match key.sign(b"wrong authorization") {
             Err(KeyError::Refused { role, detail }) => {
                 assert_eq!(role, Role::Root);
-                assert!(detail.contains("0x"), "{detail}");
+                assert!(detail.ends_with("0x000009a2"), "{detail}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
-    let signing = again.find(Role::Signing).expect("load").expect("held");
-    signing
-        .probe()
-        .expect("no lockout after wrong authorizations");
+
+    // The root key still works with its own authorization. Without noDA on
+    // the root key, the failures above count toward lockout.
+    fs::write(&root_auth_path, &root_auth).expect("restore root auth file");
+    let root = again.find(Role::Root).expect("load").expect("held");
+    root.probe().expect("no lockout after wrong authorizations");
+    use_key(Role::Root, &root);
 }
 
 fn use_key(role: Role, key: &bep::tpm::TpmKey) {
