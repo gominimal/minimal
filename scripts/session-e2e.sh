@@ -1008,11 +1008,14 @@ mnl() {
 # between proofs, and a stop-race must not read as a conflict. Returns 0 with
 # PROXY_PORT set; 1 when the row still says the proxy is not serving (a pinned
 # port another process owns — the daemon retries that by design, so the caller
-# degrades or fails by lane); 2 when no row named an address at all.
+# degrades or fails by lane); 2 when no row named an address at all; 3 when
+# the row names several ports and jq is not available to read the one the
+# daemon reports — said once and returned at once, since waiting changes
+# nothing about that.
 PROXY_PORT=""
 PROXY_LS_OUT=""
 proxy_port_from_ls() {
-  local try
+  local try ambiguous=""
   PROXY_PORT=""
   PROXY_LS_OUT=""
   for try in 1 2 3 4 5; do
@@ -1038,15 +1041,20 @@ proxy_port_from_ls() {
           case "$(printf '%s\n' "$row_ports" | grep -c .)" in
             1) PROXY_PORT="$row_ports" ;;
             0) ;;
-            *) echo "hostname proxy: the row names several ports ($(printf '%s' "$row_ports" | tr '\n' ' ')) and jq is not available to read the reported one; not guessing" ;;
+            *)
+              echo "hostname proxy: the row names several ports ($(printf '%s' "$row_ports" | tr '\n' ' ')) and jq is not available to read the reported one; not guessing"
+              ambiguous=1
+              ;;
           esac
         fi
         ;;
     esac
     [ -n "$PROXY_PORT" ] && break
+    [ -n "$ambiguous" ] && break
     [ "$try" = 5 ] || sleep 3
   done
   if [ -z "$PROXY_PORT" ]; then
+    [ -n "$ambiguous" ] && return 3
     case "$PROXY_LS_OUT" in
       *"the hostname proxy is not serving"*) return 1 ;;
     esac
@@ -1058,6 +1066,16 @@ proxy_port_from_ls() {
     echo "hostname proxy: the default 127.0.0.1:7654 was busy, so this run's daemon selected 127.0.0.1:$PROXY_PORT (NET-025); every probe below goes through that port"
   fi
   return 0
+}
+
+# proxy_port_from_ls returned 3: the row names several ports and jq is not
+# there to read the reported one. Says so and fails; every caller of the
+# helper routes code 3 here so the transcript names the real cause, not "no
+# address".
+proxy_port_fail_without_jq() {
+  echo "::error::'min ls' names several HOSTNAME PROXY ports for this run's daemon (a VM host's served ports) and jq is not available to read the one the daemon reports (hostname_proxy_port in min ls --json); install jq on this lane"
+  echo "--- min ls ---"; printf '%s\n' "${1:-}"
+  fail
 }
 
 # mnl hands the staged switch only to a daemon its own call autospawns. A
@@ -24202,6 +24220,7 @@ proof_min_internal_names_through_proxy() {
   #    then degrades to the one name requirement that needs no listener.
   proxy_port_from_ls; proxy_bind_taken=$?
   proxy_ls_out="$PROXY_LS_OUT"
+  [ "$proxy_bind_taken" -eq 3 ] && proxy_port_fail_without_jq "$proxy_ls_out"
   if [ "$proxy_bind_taken" -eq 2 ]; then
     echo "::error::'min ls' shows no HOSTNAME PROXY address for this run's daemon, so there is no proxy port to send the probes through (NET-026)"
     echo "--- min ls ---"; printf '%s\n' "${proxy_ls_out:-}"
@@ -24936,6 +24955,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # never the literal default: see proxy_port_from_ls.
   proxy_port_from_ls; da_bind_taken=$?
   da_ls_out="$PROXY_LS_OUT"
+  [ "$da_bind_taken" -eq 3 ] && proxy_port_fail_without_jq "$da_ls_out"
   if [ "$da_bind_taken" -eq 1 ]; then
     if da_gate_can_skip; then
       echo "::warning::deny-all answer proof SKIPPED — this run's daemon reports its hostname proxy as not serving (a pinned port another process owns)"
@@ -25468,6 +25488,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     # (NET-026), never the literal default: see proxy_port_from_ls.
     proxy_port_from_ls; po_bind_taken=$?
     po_ls="$PROXY_LS_OUT"
+    [ "$po_bind_taken" -eq 3 ] && proxy_port_fail_without_jq "$po_ls"
     if [ "$po_bind_taken" -eq 1 ]; then
       if po_can_skip; then
         echo "::warning::port-publish half SKIPPED — this run's daemon reports its hostname proxy as not serving (a pinned port another process owns)"
@@ -29058,6 +29079,7 @@ proof_proxy_refuses_like_direct() {
   #    See proxy_port_from_ls.
   proxy_port_from_ls; par_bind_taken=$?
   par_ls_out="$PROXY_LS_OUT"
+  [ "$par_bind_taken" -eq 3 ] && proxy_port_fail_without_jq "$par_ls_out"
   if [ "$par_bind_taken" -eq 1 ]; then
     if par_gate_can_skip; then
       echo "::warning::proxy parity proof SKIPPED — this run's daemon reports its hostname proxy as not serving (a pinned port another process owns)"
