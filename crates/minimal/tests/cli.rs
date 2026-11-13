@@ -4233,17 +4233,12 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
         )
         .unwrap();
         let ls = String::from_utf8(out).unwrap();
-        // One proxy verdict per VM: beside a Native verdict the cause is
-        // its own HOSTNAME PROXY row; a Proxy verdict folds the cause into
-        // the BOX NAMES row and prints no separate cause row.
-        let cause_rows = match surface {
-            resolver::LiveSurface::Proxy => 0,
-            _ => 1,
-        };
+        // One proxy verdict per VM (NET-020): beside any verdict the cause
+        // is its own HOSTNAME PROXY row, and BOX NAMES does not repeat it.
         assert_eq!(
             ls.matches("HOSTNAME PROXY:").count(),
-            cause_rows,
-            "the cause prints on at most one proxy row: {ls}"
+            1,
+            "the cause prints on one proxy row: {ls}"
         );
         assert_eq!(
             ls.matches("another program on this machine holds 127.0.0.1:19911")
