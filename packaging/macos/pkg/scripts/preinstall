@@ -1,10 +1,10 @@
 #!/bin/sh
 # preinstall: make room for the payload. On an upgrade (an earlier package's
-# receipt or privileged services exist) the box-name service and the
-# local-range job are stopped and their program is moved aside
-# (Minimal.app.old), so the payload writes a whole new bundle, never into an
-# older one; the postinstall starts the services again, and puts the earlier
-# program back should it fail. Users' own daemons (minvmd, minimald)
+# receipt or privileged services exist) the local-range job is stopped and
+# the services' program is moved aside (Minimal.app.old), so the payload
+# writes a whole new bundle, never into an older one; the postinstall
+# restarts the box-name service on it, and puts the earlier program back
+# should it fail. Users' own daemons (minvmd, minimald)
 # are theirs and keep running the binaries they loaded until they restart;
 # an installer cannot stop a user's sessions on their behalf.
 set -eu
@@ -24,9 +24,15 @@ for job in dev.gominimal.zone dev.minimal.local-range; do
         exit 1
     fi
 done
-for job in dev.gominimal.zone dev.minimal.local-range; do
-    launchctl bootout "system/$job" 2>/dev/null || true
-done
+# The box-name service stays loaded through an upgrade: launchd holds its
+# UDP port for as long as the job is loaded, and the port is unprivileged,
+# so a bootout here would hand it to whichever local program asks first
+# (one loop took it during an upgrade and failed the install for every
+# user: minfarm j-0a7aeb65f643ca23). The running program keeps the file it
+# was started from when the bundle is moved aside below; the postinstall
+# restarts it on the new one, or loads the job again when its definition
+# changed. The local-range job is a one-shot with no port, and goes.
+launchctl bootout system/dev.minimal.local-range 2>/dev/null || true
 # Packages before this layout kept the service's bundle and the uninstaller
 # under /usr/local. Installer does not remove what a newer package no longer
 # carries, so the two would stay for good, in no receipt. They go here, and
