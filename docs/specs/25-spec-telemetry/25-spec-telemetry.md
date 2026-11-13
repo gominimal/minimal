@@ -25,10 +25,16 @@ work. This spec is that work.
 With this work in a release, a user who opts in gets every process's spans
 and log records at a collector they run. The records travel as OTLP over
 HTTP, joined into one trace per command. The same user also gets a local
-OTLP-JSON copy of those records that survives a crash. A user who does not opt in gets nothing new.
+OTLP-JSON copy of those records that survives a crash. A user who does not
+opt in gets nothing new from this spec. The daily update check of
+gominimal/inbox#589 is outside it: on by default until 1.0 under
+gominimal/arch#152 (D9), with its own switches, documented in
+`docs/reference/telemetry.md` under "Update check".
 
 **Arch alignment (re-checked 2026-10-05 against `gominimal/arch` `5c120151`).**
-This spec covers AT20 ("telemetry is opt-in and minimized") and the
+This spec covers AT20 ("telemetry is opt-in and minimized"; gominimal/arch#152
+splits the update check out of it as the one on-by-default exception until
+1.0) and the
 threat-model scrub rule of gominimal/inbox#515 follow-up 4. Where this spec
 differs from AT20, gominimal/arch#102 carries the amendment, and this spec
 differs from AT20 until arch#102 closes. A box receives `TRACEPARENT` and
@@ -134,6 +140,11 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
 - **TEL-001** THE SYSTEM SHALL export nothing, spool nothing and open no
   connection for telemetry unless `MINIMAL_TELEMETRY` is `1`, `true`, `yes`
   or `on` (any case). Plain `OTEL_*` variables alone never turn it on.
+  The daily update check (gominimal/inbox#589) is not telemetry in this
+  sense: it is the one on-by-default exception until 1.0 (gominimal/arch#152,
+  D9), makes one request a day under its own switches, and
+  `OTEL_SDK_DISABLED=true`, `DO_NOT_TRACK` and a falsy `MINIMAL_TELEMETRY`
+  turn it off as well.
   tier:     T2
   verify:   cargo nextest run -p mlog without_the_opt_in_export_is_off_and_installs_nothing
   test:     crates/mlog/src/otel.rs::without_the_opt_in_export_is_off_and_installs_nothing;
@@ -378,8 +389,9 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   lab:      716, trace-health on every telemetry-on run (the daemon side)
 - **TEL-022** THE SYSTEM SHALL run the daemon's work for a request (manager and
   session messages, compose, checkouts, blocking-pool work, spawned
-  short-lived tasks, package fetches, orchestrator and check tasks) in
-  descendants of that request's span.
+  short-lived tasks, package fetches, orchestrator and check tasks, port
+  hand-overs and publish moves, the reap of a session its connection left
+  unfinalized) in descendants of that request's span.
   tier:     T0
   verify:   cargo nextest run -p minimald a_message_carries_its_senders_context_not_its_span
   test:     crates/minimald/src/traced.rs::a_message_carries_its_senders_context_not_its_span;
@@ -393,6 +405,8 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
             crates/minimald/src/exec.rs::a_git_upload_lookup_runs_in_its_span;
             crates/minimald/src/exec.rs::a_git_receive_task_runs_in_its_span;
             crates/minimald/src/exec.rs::a_git_upload_task_runs_in_its_span;
+            crates/minimald/src/box_manager/tests.rs::a_hand_over_and_a_publish_move_join_the_requests_trace;
+            crates/minimald/src/server/tests.rs::the_reap_of_an_unfinalized_session_joins_its_creators_trace;
             crates/minimald/src/traced.rs::no_direct_tokio_spawn_blocking (a text guard;
             review S15 lists spawn forms it misses)
   lab:      710d, 713, 716
@@ -435,14 +449,17 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   verify:   cargo nextest run -p minimald a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix
   test:     crates/minimald/src/env.rs::a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix
             (the shipped in-box helper under bash, then the span the daemon
-            serves its line in)
+            serves its line in; its opted-out cases send `otel%off%` and no
+            `TRACEPARENT`)
   lab:      717, 717b
   - A `min` inside a box is the in-box helper, a shell function with no
     exporter. It sends the value as the request line's `traceparent%`
     prefix, and only in the 55-character W3C form; the daemon's span for
     the request adopts it. The host binary does not forward an inherited
     context when it does not export: it sends the opt-out marker instead
-    (TEL-045).
+    (TEL-045). A box handed that marker (`MINIMAL_OTEL=off`) sends the
+    `otel%off%` prefix and no `TRACEPARENT`: the daemon's span for the
+    request records nothing, and a task the request runs gets the marker.
 - **TEL-026** WHEN `min task run` starts a task THE SYSTEM SHALL add the exec
   span's `TRACEPARENT` to the task's environment on opt-in, nothing from the
   host telemetry environment when off, and leave the task's own `env_vars`
@@ -486,7 +503,17 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
             crates/minimald/src/traced.rs::a_spawned_task_holds_its_callers_span_open (the contrast);
             crates/minimald/src/traced.rs::a_message_carries_its_senders_context_not_its_span;
             crates/minimald/src/rpc.rs::a_request_span_closes_when_its_rpc_returns
-            (CreateSession's spans close at its answer; the session actor is a root)
+            (CreateSession's spans close at its answer; the session actor is a root);
+            crates/minimald/src/box_manager/tests.rs::the_managers_own_work_runs_in_its_root_trace
+            (the manager's loops and the work no request asks for are in its root's trace);
+            crates/minimald/src/box_manager/tests.rs::the_managers_root_closes_when_its_mainloop_ends
+  - A loop that lives exactly as long as an actor (the manager's
+    `sessions.hand_overs` and `sessions.publish_moves`) runs under that
+    actor's root, not in a root of its own, and work the daemon does by
+    itself (the boot resume, a microVM daemon's start walk) joins the
+    actor's trace. Such a loop ends with the actor's mainloop, so the root
+    closes, and exports, when the actor does. A root with no link that is
+    not one of the daemon-lifetime actors reads as a stray trace.
 - **TEL-031** WHEN `min` hands its process off (`exit()` with ssh's status
   after `session exec`, `run` or an attach, or dying of SIGTERM or SIGHUP in
   `min net forward`) THE SYSTEM
@@ -739,11 +766,14 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   each request and no `TRACEPARENT`, and the daemon SHALL record nothing for
   that request: a non-recording span and no command line.
   tier:     T0
-  verify:   cargo nextest run -p minimald an_opted_out_request_leaves_no_daemon_span
+  verify:   cargo nextest run -p minimald an_opted_out_request_leaves_no_daemon_span an_opted_out_helper_request_records_no_span_and_opts_its_task_out an_opted_out_helper_request_keeps_its_line_out_of_the_log
   test:     crates/minimald/src/exec.rs::an_opted_out_request_leaves_no_daemon_span;
-            crates/minimal-client/src/lib.rs::do_not_track_sends_the_opt_out_and_no_traceparent
-            (both come with the code round)
-  lab:      785
+            crates/minimal-client/src/lib.rs::do_not_track_sends_the_opt_out_and_no_traceparent;
+            crates/minimald/src/env.rs::an_opted_out_helper_request_records_no_span_and_opts_its_task_out
+            (the in-box helper's `otel%off%` request);
+            crates/minimald/src/env.rs::an_opted_out_helper_request_keeps_its_line_out_of_the_log
+            (the channel's own trace record)
+  lab:      785, 712e
 - **TEL-046** IF the host receiver on vsock port 7353 is unreachable THEN THE
   SYSTEM SHALL keep the guest daemon spooling, SHALL retry the connection
   every 5 s, SHALL log one warning per guest process, and SHALL drop

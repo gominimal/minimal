@@ -38,10 +38,10 @@ runtime_packages = ["openssl"]
 
 ## Session tools
 
-Tools you want available while developing interactively go in the project's `[session]` block, not the build plane. Every contributor's [dev session](./dev-shell.md) picks them up:
+Tools you want available while developing interactively go in the project's `[defaults.session]` table, not the build plane. Every contributor's [dev session](./dev-shell.md) picks them up:
 
 ```toml
-[session]
+[defaults.session]
 packages = ["git", "ripgrep", "jq"]
 ```
 

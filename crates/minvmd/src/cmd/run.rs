@@ -292,6 +292,79 @@ fn parent_pid(pid: u32) -> Option<u32> {
     fields.next().and_then(|s| s.parse::<u32>().ok())
 }
 
+/// Moves the supervisor log of the previous start to `run.log.old`, so a
+/// failed start does not erase the story of the start before it. No log is
+/// not an error.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn keep_previous_run_log(log: &std::path::Path) -> std::io::Result<()> {
+    let mut old = log.as_os_str().to_owned();
+    old.push(".old");
+    match std::fs::rename(log, old) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// The text of `log` from byte `start` on, lossily decoded. A log shorter
+/// than `start` moved aside since then ([`cap_bep_log`]), so all of it is
+/// this start's. A log that cannot be read reads as empty.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn read_log_from(log: &std::path::Path, start: u64) -> String {
+    let Ok(bytes) = std::fs::read(log) else {
+        return String::new();
+    };
+    let start = usize::try_from(start)
+        .ok()
+        .filter(|&start| start <= bytes.len())
+        .unwrap_or(0);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+/// The most lines of the proxy's refusal that a failed start repeats.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const BEP_REFUSAL_MAX_LINES: usize = 40;
+
+/// The refusal `bep serve` printed over an unreadable audit log, from its
+/// first line ([`bep::UNREADABLE_AUDIT_LOG_REFUSAL`]) on, when `text` holds
+/// one.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn unreadable_audit_refusal(text: &str) -> Option<String> {
+    let at = text.find(bep::UNREADABLE_AUDIT_LOG_REFUSAL)?;
+    let refusal: Vec<&str> = text[at..].lines().take(BEP_REFUSAL_MAX_LINES).collect();
+    Some(refusal.join("\n").trim_end().to_owned())
+}
+
+/// The error of a detached start whose supervisor exited before the VM was
+/// ready. When this start's proxy log or `run.log` holds the proxy's refusal
+/// over an unreadable audit log, the error repeats that refusal, which names
+/// `bep serve --quarantine-unreadable`.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn detach_failure_message(
+    status: std::process::ExitStatus,
+    run_log_path: &std::path::Path,
+    run_log: &str,
+    bep_log_path: Option<&std::path::Path>,
+    bep_log: &str,
+) -> String {
+    let head = format!(
+        "the detached supervisor exited during startup ({status}). \
+         Its error output is in {}.",
+        run_log_path.display()
+    );
+    let (refusal, source) = match unreadable_audit_refusal(bep_log) {
+        Some(refusal) => (refusal, bep_log_path.unwrap_or(run_log_path)),
+        None => match unreadable_audit_refusal(run_log) {
+            Some(refusal) => (refusal, run_log_path),
+            None => return head,
+        },
+    };
+    format!(
+        "{head}\nThe Box Egress Proxy (bep) refused to start in this start. \
+         It wrote this to {}:\n{refusal}",
+        source.display()
+    )
+}
+
 /// Spawn `minvmd run` as a detached background supervisor, then poll until
 /// the VM is serving (up to `timeout_secs`).
 #[cfg(minvmd_libkrun)]
@@ -316,6 +389,18 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     let state_dir = crate::state::StateDir::new(crate::state::StateDir::default_path())
         .context("opening state dir")?;
     let log_path = state_dir.dir().join("run.log");
+    if let Err(error) = keep_previous_run_log(&log_path) {
+        tracing::warn!(log = %log_path.display(), %error, "could not keep the previous supervisor log");
+    }
+    // The proxy's log is appended across boots: note where this start's
+    // bytes begin, so a failure reads only what this start wrote.
+    let bep_log_path = crate::net::resolve_switch_sock()
+        .ok()
+        .map(|sock| sock.with_file_name(BEP_LOG_FILE));
+    let bep_log_start = bep_log_path
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |meta| meta.len());
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating supervisor log at {}", log_path.display()))?;
     cmd.stdin(std::process::Stdio::null())
@@ -360,11 +445,23 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
         let vmm_owned = state.vmm_pid.is_some_and(vmm_owned_by_live_supervisor);
         match classify_detach_poll(ready, child_status, daemon_alive, state.vmm_pid, vmm_owned) {
             DetachPoll::Ready => return Ok(()),
-            DetachPoll::Failed(status) => bail!(
-                "the detached supervisor exited during startup ({status}); \
-                 see {} for its error output",
-                log_path.display()
-            ),
+            DetachPoll::Failed(status) => {
+                let run_log = read_log_from(&log_path, 0);
+                let bep_log = bep_log_path
+                    .as_deref()
+                    .map(|path| read_log_from(path, bep_log_start))
+                    .unwrap_or_default();
+                bail!(
+                    "{}",
+                    detach_failure_message(
+                        status,
+                        &log_path,
+                        &run_log,
+                        bep_log_path.as_deref(),
+                        &bep_log
+                    )
+                )
+            }
             DetachPoll::LeakedVmm(pid) => bail!(
                 "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
                  alive lock; run `min stop` (or `kill -9 {pid}`), then retry"
@@ -2683,9 +2780,21 @@ struct NodePortAssignment {
 /// answerer port would be an admitted port with nothing behind it.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn assign_node_proxy_port(dir: &std::path::Path) -> Result<NodePortAssignment> {
+    assign_node_proxy_port_from(dir, NODE_DEFAULT_PROXY_PORT)
+}
+
+/// [`assign_node_proxy_port`] with the preferred port passed in. The
+/// supervisor passes [`NODE_DEFAULT_PROXY_PORT`]; a unit test passes a port
+/// it holds itself, so the draw never binds or dials the host's real 7654,
+/// which a running daemon or a session e2e beside the test may own.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn assign_node_proxy_port_from(
+    dir: &std::path::Path,
+    preferred: u16,
+) -> Result<NodePortAssignment> {
     let proxy = match node_port_override(crate::vm::NODE_PROXY_PORT_ENV)? {
         Some(proxy) => configured_node_port(dir, proxy)?,
-        None => assign_node_port(dir, NODE_DEFAULT_PROXY_PORT, false)?,
+        None => assign_node_port(dir, preferred, false)?,
     };
     log_node_port_assignment(&proxy);
     Ok(proxy)
@@ -4001,6 +4110,85 @@ mod tests {
         );
     }
 
+    // D1229: a detached start that fails after the proxy refused an
+    // unreadable audit log repeats that refusal, which names the flag that
+    // moves the unreadable segments aside.
+    #[test]
+    fn detach_failure_names_quarantine_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bep_log = dir.path().join(super::BEP_LOG_FILE);
+        std::fs::write(&bep_log, "an earlier boot's line\n").unwrap();
+        let start = std::fs::metadata(&bep_log).unwrap().len();
+        let refusal = format!(
+            "{}\nThe audit log has 1 line that bep cannot read, in:\n  /a/audit-0.jsonl\n\
+             To move that segment into /a/quarantine and start, \
+             run `bep serve` again with `--quarantine-unreadable`.\n",
+            bep::UNREADABLE_AUDIT_LOG_REFUSAL
+        );
+        let mut text = std::fs::read_to_string(&bep_log).unwrap();
+        text.push_str("ERROR refused the start\n");
+        text.push_str(&refusal);
+        std::fs::write(&bep_log, text).unwrap();
+        let run_log = dir.path().join("run.log");
+
+        let this_start = super::read_log_from(&bep_log, start);
+        assert!(!this_start.contains("an earlier boot"), "{this_start}");
+        let message =
+            super::detach_failure_message(exited(1), &run_log, "", Some(&bep_log), &this_start);
+        assert!(
+            message.contains(&run_log.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("refused to start"), "{message}");
+        assert!(
+            message.contains(bep::UNREADABLE_AUDIT_LOG_REFUSAL),
+            "{message}"
+        );
+        assert!(message.contains("`bep serve`"), "{message}");
+        assert!(message.contains("--quarantine-unreadable"), "{message}");
+        assert!(
+            message.contains(&bep_log.display().to_string()),
+            "{message}"
+        );
+
+        // The refusal found in run.log is named there too.
+        let from_run = super::detach_failure_message(exited(1), &run_log, &refusal, None, "");
+        assert!(from_run.contains("--quarantine-unreadable"), "{from_run}");
+
+        // A failure with no refusal in either log says nothing of the proxy.
+        let plain = super::detach_failure_message(exited(1), &run_log, "boom", Some(&bep_log), "");
+        assert!(!plain.contains("quarantine"), "{plain}");
+        assert!(plain.contains("exited during startup"), "{plain}");
+
+        // A log shorter than its start offset moved aside: all of it counts.
+        assert_eq!(
+            super::read_log_from(&bep_log, u64::MAX).len(),
+            std::fs::metadata(&bep_log).unwrap().len() as usize
+        );
+    }
+
+    // D1229: a new detached start keeps the previous start's run.log.
+    #[test]
+    fn detach_start_keeps_previous_run_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        super::keep_previous_run_log(&log).expect("no log is not an error");
+        assert!(!dir.path().join("run.log.old").exists());
+        std::fs::write(&log, "the previous start").unwrap();
+        super::keep_previous_run_log(&log).unwrap();
+        assert!(!log.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("run.log.old")).unwrap(),
+            "the previous start"
+        );
+        std::fs::write(&log, "the next start").unwrap();
+        super::keep_previous_run_log(&log).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("run.log.old")).unwrap(),
+            "the next start"
+        );
+    }
+
     #[test]
     fn detach_poll_ready_predicate_wins_over_child_exit() {
         // The child exited, but the readiness predicate already holds: the VM
@@ -4192,14 +4380,27 @@ mod tests {
         // the TCP probe refuses nothing that is actually free, so a lone VM
         // still lands on the default proxy port — the case the session e2e's
         // hardcoded 7654 depends on.
-        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let free = freed.local_addr().unwrap().port();
-        drop(freed);
+        // The port is released before the draw probes it, so another
+        // process on the host can take it in between (#2653): a skip is
+        // that lost race only while the port is held again, so the draw
+        // asks for a fresh port then, and a skip of a port nothing holds
+        // fails at once.
+        let mut handed = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
+            if assigned.port == free || super::tcp_bind_probe(free).is_ok() {
+                handed = Some((free, assigned));
+                break;
+            }
+        }
+        let (free, assigned) = handed.expect("a released port stays free for one draw");
         assert!(
             !super::loopback_answers(free),
             "the loopback probe leaves a free port alone"
         );
-        let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
         assert_eq!(
             assigned.port, free,
             "a free preferred port is handed unchanged"
@@ -4214,11 +4415,22 @@ mod tests {
         );
 
         // The answerer's UDP probe is unchanged by the TCP probe's second
-        // check: a free UDP port is handed as asked.
-        let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-        let free_udp = freed_udp.local_addr().unwrap().port();
-        drop(freed_udp);
-        let assigned_udp = super::assign_node_port(ports.path(), free_udp, true).unwrap();
+        // check: a free UDP port is handed as asked, under the same race.
+        let mut handed_udp = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+            let free_udp = freed_udp.local_addr().unwrap().port();
+            drop(freed_udp);
+            let assigned_udp = super::assign_node_port(ports.path(), free_udp, true).unwrap();
+            if assigned_udp.port == free_udp
+                || std::net::UdpSocket::bind(("0.0.0.0", free_udp)).is_ok()
+            {
+                handed_udp = Some((free_udp, assigned_udp));
+                break;
+            }
+        }
+        let (free_udp, assigned_udp) =
+            handed_udp.expect("a released UDP port stays free for one draw");
         assert_eq!(
             assigned_udp.port, free_udp,
             "a free UDP preferred port is handed unchanged"
@@ -4374,8 +4586,15 @@ mod tests {
         // whatever the host picked, it is a real port the guest can bind as
         // handed (the cmdline and bind halves are the vm.rs and minimald
         // tests of the same name).
-        let assigned = super::assign_node_proxy_port(ports.path()).unwrap();
+        // Preferred at the port this test still holds, never the real
+        // default: a running daemon or a session e2e may own 7654 on this
+        // host, and the draw's probes would bind and dial it.
+        let assigned = super::assign_node_proxy_port_from(ports.path(), busy).unwrap();
         assert!(assigned.port != 0, "the node's proxy port is assigned");
+        assert_ne!(
+            assigned.port, busy,
+            "the proxy assignment skips a held preferred port like any draw"
+        );
 
         // The answerer's probe is the same default-first over UDP, held on
         // the same wildcard the UDP probe addresses.
@@ -4513,22 +4732,35 @@ mod tests {
     /// e2e lanes check it.
     #[test]
     fn node_port_draw_skips_a_held_preferred_port_and_hands_it_back_once_released() {
-        // The preferred port: hold it on the loopback the TCP probe
-        // addresses, so the first draw sees it refused.
-        let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let default = stale.local_addr().unwrap().port();
         let ports = tempfile::tempdir().expect("a test reservation dir");
-        let drawn_before = super::assign_node_port(ports.path(), default, false).unwrap();
-        assert_eq!(drawn_before.preferred, default);
-        assert_eq!(drawn_before.skipped, Some(super::SKIP_BIND_REFUSED));
-        assert_ne!(
-            drawn_before.port, default,
-            "the held default is not handed to the proxy"
-        );
+        // Released, the port is anyone's on the host until the second draw
+        // probes it (#2653): a second draw that skips a port something holds
+        // again lost that race, so the whole round runs again on a fresh
+        // port. A skip of a port nothing holds fails at once.
+        let mut handed_back = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            // The preferred port: hold it on the loopback the TCP probe
+            // addresses, so the first draw sees it refused.
+            let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let default = stale.local_addr().unwrap().port();
+            let drawn_before = super::assign_node_port(ports.path(), default, false).unwrap();
+            assert_eq!(drawn_before.preferred, default);
+            assert_eq!(drawn_before.skipped, Some(super::SKIP_BIND_REFUSED));
+            assert_ne!(
+                drawn_before.port, default,
+                "the held default is not handed to the proxy"
+            );
 
-        // Release the holder, and the same draw hands the port back.
-        drop(stale);
-        let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
+            // Release the holder, and the same draw hands the port back.
+            drop(stale);
+            let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
+            if drawn_after.port == default || super::tcp_bind_probe(default).is_ok() {
+                handed_back = Some((default, drawn_after));
+                break;
+            }
+        }
+        let (default, drawn_after) =
+            handed_back.expect("a released preferred port stays free for one draw");
         assert_eq!(drawn_after.port, default);
         assert_eq!(drawn_after.skipped, None);
     }

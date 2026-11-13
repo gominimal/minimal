@@ -1059,6 +1059,18 @@ fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm
     true
 }
 
+/// The loadout selection of a dashboard create in the project at `root`.
+/// The mode of the project's session entry is read before any loadout, as
+/// `min box start` reads it, so a sealed box reads no default loadout
+/// (BOX-171, BOX-175).
+fn create_loadout_selection(
+    root: &camino::Utf8Path,
+    loadouts: crate::loadouts::LoadoutSelection,
+) -> anyhow::Result<crate::loadouts::LoadoutSelection> {
+    let mode = crate::session_loadout_mode(root, None, &[])?;
+    Ok(crate::loadouts::gate_selection(loadouts, mode))
+}
+
 /// Entry point for `min dash`: discover hosts, then drive the
 /// Elm loop until the user quits.
 pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
@@ -1186,9 +1198,10 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
                         // The box's row is asked back before the attach
                         // (NET-138), and the pair it was registered with is
-                        // read: a Delete at the shell-exit prompt leaves no
-                        // record to read it from after.
-                        let box_addresses = match box_name {
+                        // read, with the box id beside it (#1116): a Delete
+                        // at the shell-exit prompt leaves no record to read
+                        // them from after.
+                        let box_row = match box_name {
                             Some(_) => {
                                 rpc::prepare_attach(&sock, rpc::record_of(p, key.id).await).await
                             }
@@ -1196,8 +1209,8 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         };
                         // A VM host that cannot be reached fails the attach
                         // closed (#1790), with the CLI's message.
-                        let box_addresses = match box_addresses {
-                            Ok(box_addresses) => box_addresses,
+                        let box_row = match box_row {
+                            Ok(box_row) => box_row,
                             Err(error) => {
                                 model.status = Some(format!("error: {error:#}"));
                                 continue;
@@ -1217,13 +1230,8 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         // helper (it carries the lookup timeout the dashboard's
                         // old copy lacked).
                         if let Some(name) = box_name.as_deref() {
-                            crate::release_held_name_after_attach(
-                                &sock,
-                                key.id,
-                                name,
-                                box_addresses,
-                            )
-                            .await;
+                            crate::release_held_name_after_attach(&sock, key.id, name, box_row)
+                                .await;
                         }
                         inbox.push_back(Msg::Tick);
                     }
@@ -1281,6 +1289,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                     let global_blocking = global.clone();
                                     let root = upload_root.clone();
                                     tokio::task::spawn_blocking(move || {
+                                        let loadouts = create_loadout_selection(&root, loadouts)?;
                                         let inputs =
                                             crate::loadouts::prepare_activation_inputs_with_config(
                                                 &client_config,
@@ -1656,6 +1665,47 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use crate::dash::rpc::HostData;
+
+    // BOX-171, BOX-175: a dashboard create in a project whose session entry
+    // is sealed selects no loadout, so a broken default loadout is never
+    // read. The same create in an open project reads it, and fails.
+    #[test]
+    fn sealed_dash_create_reads_no_default_loadout() {
+        let project = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let loadouts = config.path().join("minimal/loadouts");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        std::fs::write(loadouts.join("default.toml"), "= not = toml =").unwrap();
+        let global = crate::GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            ..Default::default()
+        };
+        let cfg = crate::config::read_client_config(&global).unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(project.path().to_path_buf()).unwrap();
+        let write = |toml: &str| {
+            std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+        };
+
+        write("[sessions.default]\nloadout_mode = 'sealed'\n");
+        let selection =
+            create_loadout_selection(&root, crate::loadouts::LoadoutSelection::Defaults)
+                .expect("a sealed entry decides its mode");
+        assert!(
+            matches!(selection, crate::loadouts::LoadoutSelection::None),
+            "{selection:?}"
+        );
+        crate::loadouts::resolve_active_loadouts(selection, &cfg, &global)
+            .expect("a sealed create reads no loadout");
+
+        write("[sessions.default]\nloadout_mode = 'open'\n");
+        let selection =
+            create_loadout_selection(&root, crate::loadouts::LoadoutSelection::Defaults)
+                .expect("an open entry decides its mode");
+        assert!(
+            crate::loadouts::resolve_active_loadouts(selection, &cfg, &global).is_err(),
+            "an open create reads the broken default"
+        );
+    }
 
     fn id(n: u128) -> SessionId {
         SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()

@@ -28,6 +28,173 @@ pub enum Error {
     /// toolchain surfaces much later as a bare linker error. Carries
     /// the path of the offending file when it is known.
     HarnessTable(Option<PathBuf>),
+    /// An entry breaks a naming rule or a `type` rule (BOX-007, BOX-046).
+    /// Carries the table key (`sessions`), the entry name and the rule.
+    /// Exits 3.
+    InvalidEntryName {
+        table: &'static str,
+        name: String,
+        rule: EntryNameRule,
+    },
+    /// An expanded box spec carries a key it cannot carry, or a value of
+    /// the wrong shape (BOX-066). Carries the key, the layer that set it,
+    /// as the message names it, and the problem. Exits 3.
+    InvalidSpecKey {
+        key: String,
+        layer: String,
+        problem: SpecKeyProblem,
+    },
+    /// The file carries a legacy table, and this release is past the one
+    /// release that read it (BOX-050). Carries the file, when it is known,
+    /// and the table. Exits 3.
+    LegacyTable {
+        path: Option<PathBuf>,
+        legacy: crate::legacy::LegacyTable,
+    },
+    /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
+    /// the task name. Exits 3.
+    InteractiveTask(String),
+    /// A selected loadout sets `loadout_mode`, which only the layers up to
+    /// and including the entry can set (BOX-172). Carries the loadout's
+    /// name, when the caller knows it. Exits 3.
+    LoadoutSetsLoadoutMode {
+        loadout: Option<String>,
+    },
+    /// A `--loadout` flag names a loadout for a box whose `loadout_mode` is
+    /// `sealed` (BOX-173). Carries the named loadouts, the layer that set
+    /// the mode (`None` when no layer sets it), the entry's table header,
+    /// and the type whose constraint holds the mode, if one does. Exits 3.
+    NamedLoadoutOnSealedBox {
+        loadouts: Vec<String>,
+        layer: Option<String>,
+        entry: String,
+        held_by: Option<String>,
+    },
+    /// A Box Type constraint holds a key at a value other than the one the
+    /// layers set (BOX-061, BOX-181). Carries the key, the layer that set
+    /// the value, the value, the type as the message names it, and the
+    /// values the constraint admits. Exits 3.
+    ///
+    /// This check duplicates `check_constraints` and
+    /// `BoxTypeError::ConstraintBroken`. When #3292 merges, the two become
+    /// one check and this variant goes:
+    /// <https://github.com/gominimal/minimal/issues/3304>.
+    ConstraintViolated {
+        key: String,
+        layer: String,
+        found: String,
+        box_type: String,
+        admitted: Vec<String>,
+    },
+    /// The entry's Box Type does not resolve, or the entry cannot use it.
+    /// Exits 3.
+    BoxType(Box<crate::box_types::BoxTypeError>),
+    /// A selected loadout sets a variable to a resolved value other than
+    /// the one the layers up to and including the entry, or another
+    /// selected loadout, give it (BOX-183). Carries the variable and the
+    /// two sources, as the message names them. Exits 3.
+    LoadoutVarConflict {
+        name: String,
+        first: String,
+        second: String,
+    },
+    /// One layer sets a variable twice, to different values (BOX-184).
+    /// Carries the variable and the layer, as the message names it. Exits 3.
+    DuplicateVar {
+        name: String,
+        layer: String,
+    },
+}
+
+/// What is wrong with a key of an expanded box spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecKeyProblem {
+    /// No box setting has this name.
+    Unknown,
+    /// The key is inside an `[upstream]` table, and is not one of the
+    /// registry pin's keys.
+    UnknownUpstream,
+    /// The value has the wrong shape. Carries what the key takes and what
+    /// the layer wrote, each as the message names it.
+    WrongShape {
+        expected: &'static str,
+        found: &'static str,
+    },
+    /// The value is a string, but not one the key accepts. Carries the
+    /// value the layer wrote and the values the key accepts, in order.
+    UnknownValue {
+        found: String,
+        accepted: &'static [&'static str],
+    },
+}
+
+/// The naming rule that an entry name breaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryNameRule {
+    /// The name is `self`, which addresses the caller's own box.
+    Reserved,
+    /// The name is not a lowercase DNS label.
+    NotDnsSafe,
+    /// An earlier entry, in the table this carries, has the same name.
+    Duplicate { other_table: &'static str },
+    /// The entry's `type` key is not a string.
+    TypeNotString,
+    /// A type-noun table sets a `type` other than its noun's type. Carries
+    /// the noun's type and the `type` the entry wrote.
+    TypeMismatch {
+        expected: &'static str,
+        found: String,
+    },
+}
+
+/// Writes an entry as its table header, `[sessions.dev]`, and quotes a name
+/// that TOML cannot write as a bare key.
+pub(crate) struct EntryHeader<'a>(pub(crate) &'a str, pub(crate) &'a str);
+
+impl fmt::Display for EntryHeader<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let EntryHeader(table, name) = self;
+        let bare = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if bare {
+            write!(f, "[{table}.{name}]")
+        } else {
+            write!(f, "[{table}.{name:?}]")
+        }
+    }
+}
+
+/// `words` with its first letter in upper case, to open a sentence.
+fn sentence_start(words: &str) -> String {
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+impl Error {
+    /// The exit code a command ends with on this error, when the
+    /// architecture's exit-code table fixes one. An invalid entry name is a
+    /// configuration error: exit 3.
+    #[must_use]
+    pub fn exit_code(&self) -> Option<u8> {
+        match self {
+            Error::InvalidEntryName { .. }
+            | Error::InvalidSpecKey { .. }
+            | Error::LegacyTable { .. }
+            | Error::InteractiveTask(_)
+            | Error::LoadoutSetsLoadoutMode { .. }
+            | Error::NamedLoadoutOnSealedBox { .. }
+            | Error::ConstraintViolated { .. }
+            | Error::BoxType(_)
+            | Error::LoadoutVarConflict { .. }
+            | Error::DuplicateVar { .. } => Some(3),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -36,6 +203,8 @@ impl fmt::Display for Error {
             Error::IO(ctx, path, e) => {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
+            // `Display` carries the parse error and `source()` returns none,
+            // so `{}` and `{:#}` each print its snippet once.
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
             Error::LinkConfig {
                 path, line, table, ..
@@ -90,6 +259,174 @@ impl fmt::Display for Error {
                      as `name = \"x\"` under `[stack]`.",
                 )
             }
+            Error::InvalidEntryName { table, name, rule } => {
+                write!(f, "entry `{}` in minimal.toml: ", EntryHeader(table, name))?;
+                match rule {
+                    EntryNameRule::Reserved => write!(
+                        f,
+                        "`self` is reserved and cannot name an entry. \
+                         Rename the entry."
+                    ),
+                    EntryNameRule::NotDnsSafe => write!(
+                        f,
+                        "an entry name must be 1 to 63 lowercase letters, \
+                         digits or hyphens, and cannot start or end with a \
+                         hyphen. Rename the entry."
+                    ),
+                    EntryNameRule::Duplicate { other_table } => write!(
+                        f,
+                        "the name `{name}` also names `{}`. Entry names must \
+                         be unique in the file. Rename one of the entries.",
+                        EntryHeader(other_table, name)
+                    ),
+                    EntryNameRule::TypeNotString => write!(
+                        f,
+                        "`type` must be a quoted string, such as \
+                         `type = \"session\"`. Fix the `type` key."
+                    ),
+                    EntryNameRule::TypeMismatch { expected, found } => write!(
+                        f,
+                        "a `[{table}.*]` table always has `type = \"{expected}\"`, \
+                         so it cannot set `type = {found:?}`. Remove the `type` \
+                         key, or move the entry to `{}`.",
+                        EntryHeader("boxes", name)
+                    ),
+                }
+            }
+            Error::InvalidSpecKey {
+                key,
+                layer,
+                problem,
+            } => match problem {
+                SpecKeyProblem::Unknown => write!(
+                    f,
+                    "{layer} sets `{key}`, which is not a box setting. \
+                     Remove the key or correct its name."
+                ),
+                SpecKeyProblem::UnknownUpstream => write!(
+                    f,
+                    "{layer} sets `{key}`, which is not an `[upstream]` setting. \
+                     The `[upstream]` settings are `repo_url`, `branch`, \
+                     `commit` and `build_cache_url`. Remove the key or correct \
+                     its name."
+                ),
+                SpecKeyProblem::WrongShape { expected, found } => write!(
+                    f,
+                    "{layer} sets `{key}` to {found}, but `{key}` takes \
+                     {expected}. Fix the value."
+                ),
+                SpecKeyProblem::UnknownValue { found, accepted } => {
+                    let accepted: Vec<String> = accepted.iter().map(|a| format!("`{a}`")).collect();
+                    write!(
+                        f,
+                        "{layer} sets `{key}` to {found:?}. `{key}` accepts only \
+                         {}. Fix the value.",
+                        accepted.join(" or ")
+                    )
+                }
+            },
+            Error::LegacyTable { path, legacy } => {
+                match path {
+                    Some(path) => write!(f, "{}: ", path.display())?,
+                    None => write!(f, "minimal.toml: ")?,
+                }
+                write!(
+                    f,
+                    "this release no longer reads {}.\n{legacy}",
+                    legacy.what()
+                )
+            }
+            Error::InteractiveTask(name) => write!(
+                f,
+                "`{}` in minimal.toml sets `interactive = true`, and a task \
+                 cannot be interactive. Declare the entry as `{}` instead.",
+                EntryHeader("tasks", name),
+                EntryHeader("sessions", name)
+            ),
+            Error::LoadoutSetsLoadoutMode { loadout } => {
+                let (which, that) = match loadout {
+                    Some(name) => (format!("loadout `{name}`"), format!("loadout `{name}`")),
+                    None => ("a selected loadout".to_owned(), "that loadout".to_owned()),
+                };
+                write!(
+                    f,
+                    "{which} sets `loadout_mode`, but a loadout cannot set \
+                     `loadout_mode`. Remove `loadout_mode` from {that}."
+                )
+            }
+            Error::NamedLoadoutOnSealedBox {
+                loadouts,
+                layer,
+                entry,
+                held_by,
+            } => {
+                let names: Vec<String> = loadouts.iter().map(|l| format!("`{l}`")).collect();
+                let noun = if names.len() == 1 {
+                    "loadout"
+                } else {
+                    "loadouts"
+                };
+                write!(
+                    f,
+                    "`--loadout` names {noun} {}, but this box takes no loadout. ",
+                    names.join(", ")
+                )?;
+                match layer {
+                    Some(layer) => write!(
+                        f,
+                        "{} sets `loadout_mode` to `sealed`. ",
+                        sentence_start(layer)
+                    )?,
+                    None => write!(
+                        f,
+                        "No layer of minimal.toml sets `loadout_mode`, and a box \
+                         without it is sealed. "
+                    )?,
+                }
+                write!(f, "Run the command without `--loadout`")?;
+                match held_by {
+                    None => write!(f, ", or set `loadout_mode = \"open\"` in `{entry}`."),
+                    Some(box_type) => write!(
+                        f,
+                        ". {box_type} constrains `loadout_mode` to `sealed`, so \
+                         `{entry}` cannot set it to `open`."
+                    ),
+                }
+            }
+            // The type error's own message is the whole message.
+            Error::BoxType(error) => write!(f, "{error}"),
+            Error::ConstraintViolated {
+                key,
+                layer,
+                found,
+                box_type,
+                admitted,
+            } => {
+                let admitted: Vec<String> = admitted.iter().map(|a| format!("`{a}`")).collect();
+                write!(
+                    f,
+                    "{layer} sets `{key}` to {found:?}, but {box_type} \
+                     constrains `{key}` to {}. Fix the value.",
+                    admitted.join(" or ")
+                )
+            }
+            Error::LoadoutVarConflict {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "The variable `{name}` has two different values. {first} sets one \
+                 value, and {second} sets the other. A loadout cannot change a \
+                 variable that is already set. Remove `{name}` from one of them, \
+                 or add `{name}` to the `ignore` list under `[vars]` in \
+                 user_policy.toml to drop every value of `{name}`."
+            ),
+            Error::DuplicateVar { name, layer } => write!(
+                f,
+                "{layer} sets the variable `{name}` twice, to different values. \
+                 Remove one of the two settings."
+            ),
         }
     }
 }
@@ -98,7 +435,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::IO(_, _, e) => Some(e),
-            Error::Format(e) => Some(e),
+            // `Display` carries the parse error, so a chain printer such as
+            // `{:#}` prints it once.
+            Error::Format(_) => None,
             // The serde error only restates serde's internal enum name,
             // which the Display above replaces; it stays for Debug.
             Error::LinkConfig { .. } => None,
@@ -107,6 +446,50 @@ impl std::error::Error for Error {
             Error::MissingParamDefault(_) => None,
             Error::MultipleTaskActions(..) => None,
             Error::HarnessTable(_) => None,
+            Error::InvalidEntryName { .. } => None,
+            Error::InvalidSpecKey { .. } => None,
+            Error::LegacyTable { .. } => None,
+            Error::InteractiveTask(_) => None,
+            Error::LoadoutSetsLoadoutMode { .. } => None,
+            Error::NamedLoadoutOnSealedBox { .. } => None,
+            Error::ConstraintViolated { .. } => None,
+            // `Display` prints the type error, so a chain printer prints it
+            // once.
+            Error::BoxType(_) => None,
+            Error::LoadoutVarConflict { .. } => None,
+            Error::DuplicateVar { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::error::Error as _;
+
+    /// Renders an error the way anyhow's `{:#}` does: the error, then each
+    /// cause in its `source()` chain, joined with `": "`.
+    fn render_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut out = e.to_string();
+        let mut cur = e.source();
+        while let Some(cause) = cur {
+            out.push_str(": ");
+            out.push_str(&cause.to_string());
+            cur = cause.source();
+        }
+        out
+    }
+
+    #[test]
+    fn format_error_display_carries_toml_error_once() {
+        let err = crate::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("an unterminated table header must not parse");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+        let shown = err.to_string();
+        assert_eq!(shown.matches("TOML parse error").count(), 1, "{shown}");
+        assert_eq!(shown.matches("[boxes.dev").count(), 1, "{shown}");
+        assert!(err.source().is_none());
+        let chained = render_chain(&err);
+        assert_eq!(chained.matches("TOML parse error").count(), 1, "{chained}");
     }
 }

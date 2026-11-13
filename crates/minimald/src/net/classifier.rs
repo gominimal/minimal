@@ -310,6 +310,21 @@ pub enum Cause {
     /// what failed to be read, and a person reading it decides what to look
     /// at.
     ProbeUnreadable,
+    /// The step is installed, but this native daemon is not in its own
+    /// leaf: the placement unit is missing or out of date, or a start
+    /// outran it (gominimal/inbox#1206). A daemon outside the tree cannot
+    /// migrate a box into a leaf, so no box it launches is placed, and an
+    /// unplaced box is never refused on a probe cause (the launch's
+    /// `refused_unenforced_host_address_box`): every host-address box, a
+    /// deny-all one included, runs unenforced. Its probe reads only as a
+    /// table whose effect could not be read, so the decision is re-spelled
+    /// over the daemon's placement ([`Decision::over_daemon_placement`]),
+    /// and the advisory says what the launch does instead of what a placed
+    /// daemon would. `min finalize-install` reinstalls the placement unit,
+    /// which places the daemon at its next start, so the install command
+    /// is named. Native only: a guest daemon outside its tree refuses every
+    /// host-address box on that ground itself.
+    DaemonNotPlaced,
 }
 
 impl Cause {
@@ -339,6 +354,10 @@ impl Cause {
                  own control connection or the probe's placement failed, so \
                  whether the table is refusing is unknown"
             }
+            Self::DaemonNotPlaced => {
+                "this daemon is not in its classifier leaf, so it cannot place a \
+                 host-address box in one"
+            }
         }
     }
 
@@ -365,11 +384,13 @@ impl Cause {
     /// decided while nothing refuses it, so the launch refuses it and the
     /// boxes that need no verdict enforced still run. The match stays
     /// exhaustive over causes, never claiming a host kind that cannot
-    /// produce it.
+    /// produce it. [`Cause::DaemonNotPlaced`] is native only; its guest arm
+    /// is the guest's own unplaced state, where no box can be placed and
+    /// every host-address box is refused.
     pub fn host_ip_box_outcome(self, guest: bool) -> &'static str {
         if guest {
             return match self {
-                Self::CannotConfine => {
+                Self::CannotConfine | Self::DaemonNotPlaced => {
                     "its host-address boxes are refused: it cannot place one in a \
                      leaf that confines"
                 }
@@ -383,9 +404,10 @@ impl Cause {
             };
         }
         match self {
-            Self::StepNotInstalled | Self::CannotConfine | Self::GuestTableNotLoaded => {
-                "its host-address boxes run unenforced"
-            }
+            Self::StepNotInstalled
+            | Self::CannotConfine
+            | Self::GuestTableNotLoaded
+            | Self::DaemonNotPlaced => "its host-address boxes run unenforced",
             Self::TableNotEffective | Self::ProbeUnreadable => {
                 "its deny-all host-address boxes are refused and its other \
                  host-address boxes run unenforced"
@@ -402,10 +424,14 @@ impl Cause {
     /// the marker vouches for but the probe does not names nothing either:
     /// the marker is what the install's item reads, so with it present the
     /// install is a no-op, not a reload. A probe that could not read the
-    /// table names nothing: no command is known to make a probe run.
+    /// table names nothing: no command is known to make a probe run. A
+    /// daemon outside its leaf names the install, which reinstalls the unit
+    /// that places the daemon at its next start.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled => Some(sandbox::classifier::install_hint()),
+            Self::StepNotInstalled | Self::DaemonNotPlaced => {
+                Some(sandbox::classifier::install_hint())
+            }
             Self::CannotConfine
             | Self::GuestTableNotLoaded
             | Self::TableNotEffective
@@ -429,7 +455,9 @@ impl Cause {
 /// the box declares egress. The two probe causes refuse a deny-all box at
 /// placement rather than run it unenforced ([`Cause::host_ip_box_outcome`]),
 /// so over those the line says the box is refused instead of claiming it
-/// runs. The install is named only where running it enforces the
+/// runs. A daemon outside its leaf places no box, so nothing is refused
+/// there ([`Cause::DaemonNotPlaced`]): the box runs, and the line says
+/// so. The install is named only where running it enforces the
 /// declaration: a cause no install ends names the own-address start alone
 /// and says why the install cannot help, and a declaration the classifier
 /// cannot enforce on a host address names the own-address start alone too,
@@ -517,6 +545,27 @@ impl Decision {
         }
     }
 
+    /// This decision as an unplaced native daemon reads it: a
+    /// [`Cause::ProbeUnreadable`] read by a daemon outside its own leaf is
+    /// re-spelled [`Cause::DaemonNotPlaced`], because such a daemon's probe
+    /// child cannot be placed, so it reads only as a table it could not
+    /// read, while the launch that follows places no box and so refuses
+    /// none. [`Cause::TableNotEffective`] is kept as read: that reading needs
+    /// a probe child placed in the deny leaf, which proves this daemon can
+    /// place a box whatever its own leaf says, and its remedy is the
+    /// table's, not the placement's. The other causes already say the boxes
+    /// run unenforced, and a decided host, a placed daemon and the guest
+    /// keep their decision as read.
+    #[must_use]
+    pub fn over_daemon_placement(self, guest: bool, daemon_unplaced: bool) -> Self {
+        match self.cause {
+            Some(Cause::ProbeUnreadable) if !guest && daemon_unplaced => {
+                Self::undecidable(Cause::DaemonNotPlaced)
+            }
+            _ => self,
+        }
+    }
+
     /// This decision with the carve-out the native table recorded.
     #[must_use]
     pub fn with_carve_out(mut self, carve_out: Option<SocketAddrV4>) -> Self {
@@ -556,6 +605,251 @@ pub const QUIC443_LEAF_SET: &str = "quic443_blocked_leaves";
 /// connection to the Box Egress Proxy's address (BEP-083). Spelled the same
 /// as `PROXY_LANE_SET` in `scripts/install-host-classifier.sh`.
 pub const PROXY_LANE_SET: &str = "bep_lane_leaves";
+
+/// The name of the guest table's chain that fences one host-address box's
+/// steering answerer at `address` (BEP-086): `steer_127_53_0_1` for
+/// `127.53.0.1`. One chain per answerer, so its removal touches no other
+/// rule of the table.
+#[must_use]
+pub(crate) fn steering_fence_chain(address: Ipv4Addr) -> String {
+    let [a, b, c, d] = address.octets();
+    format!("steer_{a}_{b}_{c}_{d}")
+}
+
+/// The `nft -f` script that fences the steering answerer at
+/// `address`:`port` to the box leaf `leaf`, spelled as its path below the
+/// cgroup2 mount (BEP-086). A socket created in `leaf` may reach the
+/// answerer over UDP or TCP. Every other socket's packet to it is counted,
+/// logged at a bounded rate and rejected, so no other box and no other
+/// process of the guest gets this box's steered answers. The chain is a
+/// base chain of its own on the output hook, flushed before it is filled,
+/// so a second fence of one address replaces the first.
+#[must_use]
+pub(crate) fn render_steering_fence(address: Ipv4Addr, port: u16, leaf: &Path) -> String {
+    let chain = steering_fence_chain(address);
+    let rel = leaf.to_string_lossy();
+    let rel = rel.trim_matches('/');
+    let level = rel.split('/').filter(|part| !part.is_empty()).count();
+    let to_answerer = format!("ip daddr {address} meta l4proto {{ tcp, udp }} th dport {port}");
+    format!(
+        "add table inet {TABLE_NAME}\n\
+         add chain inet {TABLE_NAME} {chain} {{ type filter hook output priority filter; policy accept; }}\n\
+         flush chain inet {TABLE_NAME} {chain}\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} socket cgroupv2 level {level} \"{rel}\" return\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} counter limit rate 1/second burst 4 packets \
+         log prefix \"minimal-classifier: refused \" level warn\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} reject with icmpx admin-prohibited\n"
+    )
+}
+
+/// The `nft -f` script that fences the steering answerer at
+/// `address`:`port` to no leaf at all: every socket's packet to it is
+/// counted, logged at a bounded rate and rejected (BEP-086). The plan sets
+/// it as soon as the answerer binds, so nothing reaches the answerer before
+/// attach knows the box's leaf and replaces it with
+/// [`render_steering_fence`].
+#[must_use]
+pub(crate) fn render_steering_closed_fence(address: Ipv4Addr, port: u16) -> String {
+    let chain = steering_fence_chain(address);
+    let to_answerer = format!("ip daddr {address} meta l4proto {{ tcp, udp }} th dport {port}");
+    format!(
+        "add table inet {TABLE_NAME}\n\
+         add chain inet {TABLE_NAME} {chain} {{ type filter hook output priority filter; policy accept; }}\n\
+         flush chain inet {TABLE_NAME} {chain}\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} counter limit rate 1/second burst 4 packets \
+         log prefix \"minimal-classifier: refused \" level warn\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} reject with icmpx admin-prohibited\n"
+    )
+}
+
+/// Closes the steering answerer at `address`:`port` to every leaf, until
+/// [`fence_steering_answerer`] admits the box's own.
+///
+/// # Errors
+///
+/// `nft` refuses the fence.
+pub(crate) async fn close_steering_answerer(
+    nft: &Path,
+    address: Ipv4Addr,
+    port: u16,
+) -> std::io::Result<()> {
+    run_nft_script(nft, &render_steering_closed_fence(address, port)).await
+}
+
+/// The `nft -f` script that removes the fence of the steering answerer at
+/// `address`.
+#[must_use]
+pub(crate) fn render_steering_unfence(address: Ipv4Addr) -> String {
+    let chain = steering_fence_chain(address);
+    format!(
+        "flush chain inet {TABLE_NAME} {chain}\n\
+         delete chain inet {TABLE_NAME} {chain}\n"
+    )
+}
+
+/// The unified (cgroup2) path in the text of a `/proc/<pid>/cgroup` file,
+/// with no leading slash: `minimald.slice/boxes/allow/b1` for the line
+/// `0::/minimald.slice/boxes/allow/b1`.
+#[must_use]
+pub(crate) fn unified_cgroup_path(text: &str) -> Option<PathBuf> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| PathBuf::from(path.trim().trim_start_matches('/')))
+}
+
+/// Whether `rel`, a path below the cgroup2 mount, is a box leaf: a
+/// directory under the classifier tree's `boxes` directory.
+#[must_use]
+pub(crate) fn is_box_leaf(rel: &Path) -> bool {
+    let mut parts = rel.components().map(|part| part.as_os_str().to_owned());
+    parts.any(|part| part == sandbox::classifier::BOXES_DIR) && parts.next().is_some()
+}
+
+/// Whether `rel`, a leaf path that a fence writes into an `nft` script
+/// between double quotes, holds only characters that cannot end the quote
+/// or the line: ASCII letters, digits, and `.`, `_`, `-`, `@`, `:`, `+`
+/// and `/`.
+#[must_use]
+pub(crate) fn is_safe_leaf_path(rel: &Path) -> bool {
+    rel.to_str().is_some_and(|text| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-@:+/".contains(&b))
+    })
+}
+
+/// How many times a fence reads the box's cgroup before it gives up, and
+/// how long it waits between reads: the box's first process joins its own
+/// leaf before its program runs, which can be just after the launch hands
+/// the process to the network.
+const STEERING_FENCE_READS: usize = 20;
+const STEERING_FENCE_READ_WAIT: Duration = Duration::from_millis(50);
+
+/// The box leaf of the process `pid`, read from `/proc/<pid>/cgroup`
+/// until the process is in a box leaf, a bounded number of times.
+///
+/// # Errors
+///
+/// The file cannot be read, or the process is not in a box leaf after the
+/// last read.
+pub(crate) async fn box_leaf_of(pid: u32) -> std::io::Result<PathBuf> {
+    let file = format!("/proc/{pid}/cgroup");
+    let mut last = None;
+    for _ in 0..STEERING_FENCE_READS {
+        let text = tokio::fs::read_to_string(&file).await?;
+        match unified_cgroup_path(&text) {
+            Some(rel) if is_box_leaf(&rel) => return Ok(rel),
+            other => last = other,
+        }
+        tokio::time::sleep(STEERING_FENCE_READ_WAIT).await;
+    }
+    Err(std::io::Error::other(format!(
+        "process {pid} is not in a box leaf: its cgroup is {}",
+        last.map_or_else(|| "unknown".to_string(), |rel| rel.display().to_string())
+    )))
+}
+
+/// Runs `nft -f -` with `script` on stdin. The `nft` binary is `nft`: the
+/// guest's own in production, and a stand-in in a test.
+///
+/// # Errors
+///
+/// `nft` cannot be run, or it exits with a failure, with what it said.
+pub(crate) async fn run_nft_script(nft: &Path, script: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut child = tokio::process::Command::new(nft)
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot run {}: {error}", nft.display()),
+            )
+        })?;
+    // nft may exit before it has read the whole script (a refusal on its first lines): the write then
+    // ends in EPIPE, and what nft said is in its stderr below, which is the error to report. Only an nft
+    // that exits 0 without reading its whole script is an error of its own.
+    let mut unread = false;
+    if let Some(mut stdin) = child.stdin.take() {
+        match stdin.write_all(script.as_bytes()).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => unread = true,
+            Err(error) => return Err(error),
+        }
+    }
+    let ran = tokio::time::timeout(TABLE_LIST_DEADLINE, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{} did not finish in time", nft.display()),
+            )
+        })??;
+    if ran.status.success() {
+        if unread {
+            return Err(std::io::Error::other(format!(
+                "{} exited 0 before reading its whole script",
+                nft.display()
+            )));
+        }
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "{} exited with {}: {}",
+        nft.display(),
+        ran.status,
+        String::from_utf8_lossy(&ran.stderr).trim()
+    )))
+}
+
+/// Fences the steering answerer at `address`:`port` to the box leaf of
+/// the process `pid` (BEP-086): that leaf may reach it, and no other leaf
+/// may. Returns the leaf.
+///
+/// # Errors
+///
+/// The process's leaf cannot be read, its path holds a character that
+/// [`is_safe_leaf_path`] refuses, or `nft` refuses the fence.
+pub(crate) async fn fence_steering_answerer(
+    nft: &Path,
+    address: Ipv4Addr,
+    port: u16,
+    pid: u32,
+) -> std::io::Result<PathBuf> {
+    let leaf = box_leaf_of(pid).await?;
+    if !is_safe_leaf_path(&leaf) {
+        return Err(std::io::Error::other(format!(
+            "process {pid}'s box leaf {:?} holds a character an nft script cannot carry",
+            leaf.display().to_string()
+        )));
+    }
+    run_nft_script(nft, &render_steering_fence(address, port, &leaf)).await?;
+    tracing::info!(
+        leaf = %leaf.display(),
+        %address,
+        port,
+        "fenced a host-address box's steering answerer to the box's own leaf"
+    );
+    Ok(leaf)
+}
+
+/// Removes the fence of the steering answerer at `address`. A refusal is
+/// logged, not returned: the answerer is gone by then, and a fence of a
+/// gone answerer refuses only packets that nothing answers.
+pub(crate) async fn unfence_steering_answerer(nft: &Path, address: Ipv4Addr) {
+    if let Err(error) = run_nft_script(nft, &render_steering_unfence(address)).await {
+        tracing::debug!(
+            %address,
+            %error,
+            "could not remove the fence of a host-address box's steering answerer"
+        );
+    }
+}
 
 /// The cohort's blocked leaf under the classifier tree `root`:
 /// `<root>/boxes/quic443-blocked`.
@@ -3216,12 +3510,102 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
 ///
 /// [`enter_daemon_leaf`]: sandbox::classifier::enter_daemon_leaf
 pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
-    let members =
-        std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
-    members
-        .lines()
-        .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
+    daemon_in_leaf(root)
+        .ok()?
         .then_some(sandbox::classifier::DAEMON_LEAF)
+}
+
+/// Whether this process is among the members of its daemon leaf's
+/// `cgroup.procs`, read once. `Err` is a leaf that is not there
+/// (`NotFound`) or one whose members could not be read; [`unplaced_over`]
+/// keeps the two apart.
+pub fn daemon_in_leaf(root: &Path) -> std::io::Result<bool> {
+    let members = std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE))?;
+    Ok(members
+        .lines()
+        .any(|member| member.trim().parse::<u32>() == Ok(std::process::id())))
+}
+
+/// Whether one read of the daemon leaf ([`daemon_in_leaf`]) counts this
+/// daemon as standing outside it: every read but one that finds this
+/// process among the leaf's members does, on purpose.
+///
+/// The only cause this re-spells is an unreadable probe
+/// ([`Decision::over_daemon_placement`]), which [`decide`] reaches only
+/// past its step checks, so a host without the step keeps
+/// [`Cause::StepNotInstalled`] whatever this says. Over an unreadable
+/// probe, the box that follows either runs unenforced (not placed) or is
+/// refused at launch (placed). Saying the box can still reach the network
+/// is wrong only in the second case, where the box is refused anyway.
+/// Keeping the probe's "refuses to start the box" would be wrong in the
+/// first, claiming a refusal for a box that has the network
+/// (gominimal/minimal#3240). So a daemon not proven in its leaf counts as
+/// unplaced: a leaf read whole without this process, a missing leaf beside
+/// an installed tree, and a leaf whose members could not be read. Pure:
+/// start-up logs that read error once, and a launch's re-read does not.
+///
+/// Counting the daemon unplaced never changes a launch's outcome: the
+/// launcher places a box by its own migration probe
+/// (`create_session_leaf`), and the gate refuses a placed deny-all box over
+/// [`Cause::DaemonNotPlaced`] as it does over [`Cause::ProbeUnreadable`].
+/// Only the words of a box that is not placed change, to the ones that are
+/// true of it.
+pub fn unplaced_over(in_leaf: &std::io::Result<bool>) -> bool {
+    !matches!(in_leaf, Ok(true))
+}
+
+/// Whether this daemon stands outside a daemon leaf the step installed,
+/// over one fresh read of it ([`unplaced_over`]).
+pub fn daemon_unplaced(root: &Path) -> bool {
+    unplaced_over(&daemon_in_leaf(root))
+}
+
+/// How long a daemon waits for the placer to finish: the placer scans every
+/// process's fd table and looks once more after a second when it finds no
+/// holder, so a few seconds cover it on a loaded host.
+pub const PLACE_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
+/// What asking the placement unit for a placement came to.
+#[derive(Debug)]
+pub enum PlaceRequest {
+    /// The placer ran and closed the connection. Whether it placed this
+    /// daemon is [`daemon_fetch_leaf`]'s to read.
+    Answered,
+    /// No placer listens: the socket is not there, refuses, or is not this
+    /// account's to reach.
+    NoPlacer(std::io::Error),
+    /// The placer accepted the connection but did not close it in time, or
+    /// the read failed.
+    NoAnswer(std::io::Error),
+}
+
+/// Asks the placement unit at `socket` to place this daemon in its leaf
+/// (NET-079), and waits up to `wait` for the placer to finish. Call it once
+/// the daemon's own listener is bound, because the placer finds the daemon
+/// as that socket's holder. The connection carries nothing: systemd starts
+/// one placer per connection and closes the connection when it exits.
+///
+/// The daemon connects to a socket systemd holds in `/run` because SELinux
+/// policy can deny systemd a watch on a socket under the account's home;
+/// connecting to a socket systemd itself created needs no such permission.
+pub fn request_daemon_placement(socket: &Path, wait: Duration) -> PlaceRequest {
+    use std::io::Read as _;
+    let mut stream = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(e) => return PlaceRequest::NoPlacer(e),
+    };
+    if let Err(e) = stream.set_read_timeout(Some(wait)) {
+        return PlaceRequest::NoAnswer(e);
+    }
+    let mut sink = [0_u8; 256];
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => return PlaceRequest::Answered,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return PlaceRequest::NoAnswer(e),
+        }
+    }
 }
 
 /// NET-080: the node-plane record for the daemon's own fetches — one line
@@ -6540,6 +6924,117 @@ mod tests {
         );
     }
 
+    /// Whether an nft older than 1.0.9 loads a base chain of the inet family
+    /// at `priority` on `hook`. A number loads on every hook. A standard
+    /// name loads only where nft's family and hook matrix pairs it with the
+    /// hook: up to 1.0.8, `dstnat` (-100) on prerouting alone and `srcnat`
+    /// (100) on postrouting alone, so either name on another hook is
+    /// refused with "invalid priority expression value in this context".
+    /// 1.0.9 (nftables commit 8beafab7) added output to `dstnat` and input
+    /// to `srcnat`; Debian 12 ships 1.0.6 and Ubuntu 22.04 ships 1.0.2,
+    /// and one refused chain fails the classifier's whole transaction.
+    fn pre_1_0_9_nft_takes_priority(hook: &str, priority: &str) -> bool {
+        if priority.parse::<i32>().is_ok() {
+            return true;
+        }
+        // `name`, or `name + n` / `name - n`: the name is what is checked.
+        match priority.split_whitespace().next().unwrap_or_default() {
+            "raw" | "mangle" | "filter" | "security" => true,
+            "dstnat" => hook == "prerouting",
+            "srcnat" => hook == "postrouting",
+            _ => false,
+        }
+    }
+
+    /// Every base chain a rendered table declares, as (chain, type, hook,
+    /// priority), read off its `type … hook … priority …;` line.
+    fn base_chains(ruleset: &str) -> Vec<(String, String, String, String)> {
+        let mut chains = Vec::new();
+        let mut chain = String::new();
+        for line in ruleset.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("chain ") {
+                chain = rest.trim_end_matches('{').trim().to_owned();
+                continue;
+            }
+            let Some(decl) = line.strip_prefix("type ") else {
+                continue;
+            };
+            let decl = decl.split(';').next().unwrap_or_default();
+            let words: Vec<&str> = decl.split_whitespace().collect();
+            match words.as_slice() {
+                [kind, "hook", hook, "priority", priority @ ..] if !priority.is_empty() => {
+                    chains.push((
+                        chain.clone(),
+                        (*kind).to_owned(),
+                        (*hook).to_owned(),
+                        priority.join(" "),
+                    ));
+                }
+                _ => panic!("a base chain declaration nft would read: {line:?}"),
+            }
+        }
+        chains
+    }
+
+    /// The matrix the check below holds the table to, pinned on its own:
+    /// the refused spelling of inbox#1196 and its accepted equivalent.
+    #[test]
+    fn pre_1_0_9_nft_priority_matrix() {
+        assert!(!pre_1_0_9_nft_takes_priority("output", "dstnat"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "-100"));
+        assert!(pre_1_0_9_nft_takes_priority("prerouting", "dstnat"));
+        assert!(!pre_1_0_9_nft_takes_priority("input", "srcnat"));
+        assert!(pre_1_0_9_nft_takes_priority("postrouting", "srcnat"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "mangle"));
+        assert!(pre_1_0_9_nft_takes_priority("output", "filter"));
+        assert!(pre_1_0_9_nft_takes_priority("postrouting", "mangle"));
+        assert!(!pre_1_0_9_nft_takes_priority("output", "dstnat + 5"));
+        assert!(!pre_1_0_9_nft_takes_priority("output", "nonsense"));
+    }
+
+    /// The table loads on the oldest nft a supported host ships, not only
+    /// on 1.0.9 and later: every base chain of the native render and of
+    /// the guest's names its priority in a form nft 1.0.2 through 1.0.8
+    /// accept on its hook. The dstnat chain, the one that once spelled
+    /// `priority dstnat` on output and so loaded nowhere before 1.0.9
+    /// (inbox#1196), is a nat chain on output at -100, dstnat's value.
+    #[test]
+    fn every_base_chain_loads_on_nft_before_1_0_9() {
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let renders = [
+            ("native", rendered_ruleset()),
+            (
+                "guest",
+                String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+                    .expect("the guest's render is text"),
+            ),
+        ];
+        for (which, ruleset) in &renders {
+            let chains = base_chains(ruleset);
+            assert!(
+                chains.len() >= 5,
+                "the {which} render declares its base chains: {chains:?}"
+            );
+            for (chain, _, hook, priority) in &chains {
+                assert!(
+                    pre_1_0_9_nft_takes_priority(hook, priority),
+                    "the {which} render's {chain} chain says `hook {hook} priority \
+                     {priority}`, which nft before 1.0.9 refuses: {ruleset}"
+                );
+            }
+            let dstnat: Vec<_> = chains
+                .iter()
+                .filter(|(chain, ..)| chain == "dstnat")
+                .map(|(_, kind, hook, priority)| (kind.as_str(), hook.as_str(), priority.as_str()))
+                .collect();
+            assert_eq!(
+                dstnat,
+                [("nat", "output", "-100")],
+                "the {which} render steers at output's nat hook, at dstnat's -100: {ruleset}"
+            );
+        }
+    }
+
     /// The guest's table writes the sender's cgroup into every packet it
     /// sends: the boxes cohort's connections leave with the box mark, and
     /// every other packet with the field cleared, so the VM host's gate
@@ -9490,6 +9985,310 @@ mod tests {
         assert!(
             elapsed < retransmit,
             "the per-launch reading ends inside one retransmit: {elapsed:?}"
+        );
+    }
+
+    /// gominimal/inbox#1206: a placement request is answered when the placer
+    /// closes the connection, and reports no placer where nothing listens
+    /// and no answer where the placer holds the connection past the wait.
+    #[test]
+    fn a_placement_request_reads_the_placer_closing_the_connection() {
+        let dir = tempfile::tempdir().expect("a scratch directory for the request socket");
+        let socket = dir.path().join("place.sock");
+
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_secs(1)),
+                PlaceRequest::NoPlacer(_)
+            ),
+            "no socket is no placer"
+        );
+
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let placer = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().expect("accept");
+            drop(connection);
+            listener
+        });
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_secs(5)),
+                PlaceRequest::Answered
+            ),
+            "a placer that closes the connection answered"
+        );
+
+        let listener = placer.join().expect("the placer thread");
+        let holder = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_millis(500));
+            drop(connection);
+        });
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_millis(100)),
+                PlaceRequest::NoAnswer(_)
+            ),
+            "a placer that holds the connection past the wait gave no answer"
+        );
+        holder.join().expect("the holder thread");
+    }
+
+    /// BEP-086: a steered `host_ip` box's answerer is fenced to the box's
+    /// own leaf. The fence reads the leaf from the process's unified cgroup
+    /// line, and takes only a leaf under the classifier tree's `boxes`
+    /// directory. Its chain returns for a socket of that leaf alone, and
+    /// rejects every other socket's packet to the answerer's address and
+    /// port, so a lookup outside the box never gets its steered answers.
+    /// The script goes to `nft -f -` whole, and the unfence removes the
+    /// one chain.
+    #[tokio::test]
+    async fn host_ip_lookup_outside_a_steered_box_resolves_real_fence_admits_only_the_box_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let text = "0::/minimald.slice/boxes/allow/grant\n";
+        let leaf = unified_cgroup_path(text).expect("the unified line");
+        assert_eq!(leaf, Path::new("minimald.slice/boxes/allow/grant"));
+        assert!(is_box_leaf(&leaf));
+        for outside in [
+            "minimald.slice",
+            "minimald.slice/boxes",
+            "user.slice/session-1.scope",
+        ] {
+            assert!(!is_box_leaf(Path::new(outside)), "{outside}");
+        }
+        assert_eq!(unified_cgroup_path("1:name=systemd:/x\n"), None);
+        assert!(is_safe_leaf_path(&leaf));
+        for unsafe_leaf in [
+            "minimald.slice/boxes/allow/a\"b",
+            "minimald.slice/boxes/allow/a\nadd rule",
+            "minimald.slice/boxes/allow/a b",
+            "minimald.slice/boxes/allow/a;b",
+            "",
+        ] {
+            assert!(
+                !is_safe_leaf_path(Path::new(unsafe_leaf)),
+                "{unsafe_leaf:?}"
+            );
+        }
+
+        let address = Ipv4Addr::new(127, 53, 0, 7);
+        let fence = render_steering_fence(address, 53, &leaf);
+        let chain = steering_fence_chain(address);
+        assert_eq!(chain, "steer_127_53_0_7");
+        let rules: Vec<&str> = fence
+            .lines()
+            .filter(|line| line.starts_with(&format!("add rule inet {TABLE_NAME} {chain} ")))
+            .collect();
+        assert_eq!(rules.len(), 3, "{fence}");
+        let to_answerer = "ip daddr 127.53.0.7 meta l4proto { tcp, udp } th dport 53";
+        assert!(
+            rules.iter().all(|rule| rule.contains(to_answerer)),
+            "{fence}"
+        );
+        assert!(
+            rules[0]
+                .ends_with("socket cgroupv2 level 4 \"minimald.slice/boxes/allow/grant\" return"),
+            "the box's own leaf returns first: {fence}"
+        );
+        assert!(
+            rules[2].ends_with("reject with icmpx admin-prohibited"),
+            "{fence}"
+        );
+        assert!(
+            fence.contains(&format!("flush chain inet {TABLE_NAME} {chain}\n")),
+            "a second fence replaces the first: {fence}"
+        );
+        // Before attach knows the leaf, the answerer is closed to every
+        // leaf, in the same chain the fence later replaces.
+        let closed = render_steering_closed_fence(address, 53);
+        let closed_rules: Vec<&str> = closed
+            .lines()
+            .filter(|line| line.starts_with(&format!("add rule inet {TABLE_NAME} {chain} ")))
+            .collect();
+        assert_eq!(closed_rules.len(), 2, "{closed}");
+        assert!(!closed.contains("return"), "{closed}");
+        assert!(
+            closed_rules[1].ends_with(&format!("{to_answerer} reject with icmpx admin-prohibited")),
+            "{closed}"
+        );
+        assert!(
+            closed.contains(&format!("flush chain inet {TABLE_NAME} {chain}\n")),
+            "{closed}"
+        );
+        assert_eq!(
+            render_steering_unfence(address),
+            format!(
+                "flush chain inet {TABLE_NAME} {chain}\ndelete chain inet {TABLE_NAME} {chain}\n"
+            )
+        );
+
+        // The script reaches `nft -f -` on stdin, whole.
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let nft = dir.path().join("nft");
+        let seen = dir.path().join("seen");
+        std::fs::write(
+            &nft,
+            format!(
+                "#!/bin/sh\n[ \"$1 $2\" = \"-f -\" ] || exit 9\ncat > '{}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run_nft_script(&nft, &fence)
+            .await
+            .expect("the stand-in nft takes the fence");
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), fence);
+
+        // A refusing nft is an error that carries what it said.
+        let refusing = dir.path().join("refusing");
+        std::fs::write(&refusing, "#!/bin/sh\necho 'no such table' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = run_nft_script(&refusing, &fence)
+            .await
+            .expect_err("refused");
+        assert!(error.to_string().contains("no such table"), "{error}");
+
+        // An nft that refuses before reading its whole script still reports what it said: a script past
+        // the pipe's buffer makes nft exit before it reads it, and the write then ends in EPIPE.
+        let big = "# padding\n".repeat(20_000);
+        let error = run_nft_script(&refusing, &big)
+            .await
+            .expect_err("refused before reading");
+        assert!(error.to_string().contains("no such table"), "{error}");
+        // and one that exits 0 without reading it is its own error, not a success
+        let silent = dir.path().join("silent");
+        std::fs::write(&silent, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = run_nft_script(&silent, &big)
+            .await
+            .expect_err("exit 0 without reading the script");
+        assert!(
+            error
+                .to_string()
+                .contains("before reading its whole script"),
+            "{error}"
+        );
+    }
+
+    /// gominimal/minimal#3067: a native daemon outside its leaf places no
+    /// box, so its deny-all box runs unenforced. The advisory, the start-up
+    /// outcome and the remedy say that, in the words the issue binds.
+    #[test]
+    fn an_unplaced_daemon_says_its_deny_all_box_runs_unenforced() {
+        let deny_all = boxes::EgressPolicy::deny_all();
+        assert_eq!(
+            advisory_text(Cause::DaemonNotPlaced, &deny_all),
+            "note: you asked this box for no network access, but this machine can't \
+             enforce it yet, so the box can still reach the network.\n  Enforce it: \
+             min finalize-install   (or start the box with --network own_ip, which \
+             enforces it now)"
+        );
+        assert_eq!(
+            Cause::DaemonNotPlaced.host_ip_box_outcome(false),
+            "its host-address boxes run unenforced"
+        );
+        assert_eq!(
+            Cause::DaemonNotPlaced.install_command(),
+            Some(sandbox::classifier::install_hint())
+        );
+        // A placed daemon's probe causes still refuse a deny-all box.
+        for cause in [Cause::TableNotEffective, Cause::ProbeUnreadable] {
+            assert!(
+                advisory_text(cause, &deny_all).contains("so it refuses to start the box"),
+                "{cause:?}"
+            );
+        }
+    }
+
+    /// Only an unreadable probe read by an unplaced native daemon is
+    /// re-spelled; every other decision keeps what it read.
+    #[test]
+    fn a_probe_cause_over_an_unplaced_native_daemon_is_its_placement() {
+        let read = Decision::undecidable(Cause::ProbeUnreadable);
+        assert_eq!(
+            read.clone().over_daemon_placement(false, true).cause(),
+            Some(Cause::DaemonNotPlaced),
+            "ProbeUnreadable, native, unplaced"
+        );
+        assert_eq!(
+            read.clone().over_daemon_placement(false, false).cause(),
+            Some(Cause::ProbeUnreadable)
+        );
+        assert_eq!(
+            read.over_daemon_placement(true, true).cause(),
+            Some(Cause::ProbeUnreadable)
+        );
+        // A table that read as not in force placed its probe child, so this
+        // daemon can place a box: the cause and its remedy stay the table's.
+        for kept in [
+            Cause::TableNotEffective,
+            Cause::StepNotInstalled,
+            Cause::CannotConfine,
+        ] {
+            assert_eq!(
+                Decision::undecidable(kept)
+                    .over_daemon_placement(false, true)
+                    .cause(),
+                Some(kept)
+            );
+        }
+        let decided = Decision::decided().over_daemon_placement(false, true);
+        assert!(decided.can_decide_per_box(), "{decided:?}");
+    }
+
+    /// A daemon is unplaced unless a read of its leaf finds it there; the
+    /// step not installed keeps its own cause, because only an unreadable
+    /// probe is re-spelled and the step checks come first.
+    #[test]
+    fn a_daemon_is_unplaced_unless_its_leaf_lists_it() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        assert!(
+            daemon_unplaced(tree.path()),
+            "no leaf, so not proven in one"
+        );
+        assert_eq!(
+            Decision::undecidable(Cause::StepNotInstalled)
+                .over_daemon_placement(false, daemon_unplaced(tree.path()))
+                .cause(),
+            Some(Cause::StepNotInstalled),
+            "a host without the step keeps its cause"
+        );
+        assert_eq!(
+            Decision::undecidable(Cause::ProbeUnreadable)
+                .over_daemon_placement(false, daemon_unplaced(tree.path()))
+                .cause(),
+            Some(Cause::DaemonNotPlaced),
+            "an unreadable probe beside a missing daemon leaf is the placement"
+        );
+        let leaf = sandbox::classifier::daemon_leaf(tree.path());
+        std::fs::create_dir_all(&leaf).expect("the daemon leaf");
+        std::fs::write(leaf.join(PROCS_FILE), "1\n").expect("another member");
+        assert!(
+            daemon_unplaced(tree.path()),
+            "a leaf this process is not in"
+        );
+        std::fs::write(
+            leaf.join(PROCS_FILE),
+            format!("1\n{}\n", std::process::id()),
+        )
+        .expect("this process as a member");
+        assert!(!daemon_unplaced(tree.path()), "a leaf this process is in");
+        // A leaf whose members cannot be read proves no placement, and it
+        // counts as unplaced, so the advisory never claims a refusal for a
+        // box that may run unenforced.
+        std::fs::remove_file(leaf.join(PROCS_FILE)).expect("drop the members file");
+        std::fs::create_dir(leaf.join(PROCS_FILE)).expect("an unreadable members file");
+        let read = daemon_in_leaf(tree.path());
+        assert!(
+            read.as_ref()
+                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound),
+            "{read:?}"
+        );
+        assert!(
+            daemon_unplaced(tree.path()),
+            "a leaf whose members cannot be read"
         );
     }
 }

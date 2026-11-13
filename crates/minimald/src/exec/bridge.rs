@@ -212,6 +212,10 @@ impl<P: Process> Process for StoppedOnDestroy<P> {
     fn start_kill(&mut self) -> io::Result<()> {
         self.inner.start_kill()
     }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        self.inner.exit_notice()
+    }
 }
 
 /// Runs [`bridge`] and writes the notice for why the command ended to `e`
@@ -1528,6 +1532,22 @@ where
             }
         }
     };
+    // A task whose sandbox failed may have written nothing, so the reason
+    // goes on stderr ahead of the status. A client that stops reading holds
+    // the write, so the wait for it is bounded and the status still returns.
+    if let Some(notice) = process.exit_notice() {
+        match tokio::time::timeout(EXIT_NOTICE_BOUND, e.write_all(notice.as_bytes())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::debug!(%channel_id, "exec: the exit notice was not written; the client is gone");
+            }
+            Err(_) => tracing::debug!(
+                %channel_id,
+                bound = ?EXIT_NOTICE_BOUND,
+                "exec: the exit notice was not written; the client did not take it in time",
+            ),
+        }
+    }
     match status {
         Ok(code) => code.unwrap_or(1) as u32,
         Err(err) => {
@@ -1539,6 +1559,10 @@ where
         }
     }
 }
+
+/// How long [`bridge_one`] waits to write a process's exit notice to a
+/// client that is not reading, before it returns the status without it.
+pub(super) const EXIT_NOTICE_BOUND: Duration = Duration::from_secs(5);
 
 /// How long [`drain_ready`] waits for a pipe to produce something after
 /// the child has been reaped, before concluding that whatever still
@@ -1762,6 +1786,9 @@ pub(crate) struct ExecEntry {
     /// The box the exec runs in. A request from another box does not find it.
     pub(crate) box_id: SessionId,
     pub(crate) mode: ExecMode,
+    /// The exec's argv as the client sent it, the same argv its
+    /// `exec_started` event records (BOX-152). A box read lists it (BOX-159).
+    pub(crate) argv: Vec<String>,
     /// Where the exec's output is captured, beside the box's record.
     pub(crate) transcript: camino::Utf8PathBuf,
     terminal: Option<ExecTerminal>,
@@ -1776,6 +1803,7 @@ impl ExecEntry {
         id: ExecId,
         box_id: SessionId,
         mode: ExecMode,
+        argv: Vec<String>,
         transcript: camino::Utf8PathBuf,
         terminal: Option<ExecTerminal>,
     ) -> Self {
@@ -1783,6 +1811,7 @@ impl ExecEntry {
             id,
             box_id,
             mode,
+            argv,
             transcript,
             terminal,
             input_dropped: std::sync::atomic::AtomicBool::new(false),
@@ -2061,6 +2090,23 @@ pub(crate) fn register_exec(entry: Arc<ExecEntry>) {
     let mut execs = EXECS.lock().unwrap_or_else(|e| e.into_inner());
     execs.retain(|_, entry| !entry.is_reaped());
     execs.insert(entry.id.clone(), entry);
+}
+
+/// Each exec of the box `box_id` that this daemon started and that has not
+/// ended, in id order, for a read of the box's record (BOX-159). An exec
+/// leaves the list when it ends.
+pub(crate) fn live_execs(box_id: SessionId) -> Vec<minimald_rpc::LiveExec> {
+    EXECS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|entry| entry.box_id == box_id && entry.exit.borrow().is_none())
+        .map(|entry| minimald_rpc::LiveExec {
+            id: entry.id.as_str().to_owned(),
+            argv: entry.argv.clone(),
+            mode: entry.mode,
+        })
+        .collect()
 }
 
 /// The exec `id` of the box `box_id`, if this daemon started it.

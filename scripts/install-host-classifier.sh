@@ -37,9 +37,9 @@
 # because the common ancestor of the cgroup the daemon starts in and the
 # slice is the root-owned hierarchy root. --place-listener makes the same
 # placement for every process of the delegated account that holds the unix
-# socket at SOCK — the daemon's own listener — so a manager-held path unit
-# watching that socket (`min finalize-install` installs one) places each
-# daemon the account starts, and no restart needs a root step of its own.
+# socket at SOCK — the daemon's own listener — so a manager-held socket unit
+# the daemon connects to at start (`min finalize-install` installs one)
+# places each daemon the account starts, with no root step per restart.
 #
 # The install also lays out the cohort's two subtrees, boxes/deny and
 # boxes/allow — a box's declaration, not its session name, decides which
@@ -561,8 +561,8 @@ readonly PROC=${MINIMAL_OVERRIDE_PROC:-/proc}
 # place_listener — the --pid placement for every process of the delegated
 # account that holds the unix socket at $listener: the daemon's own
 # listener names the daemon without anyone having to read its pid, so the
-# manager-held path unit `min finalize-install` installs can make the
-# placement at every start the socket announces. The holders are read the
+# manager-held socket unit `min finalize-install` installs can make the
+# placement at every start the daemon asks for. The holders are read the
 # way the kernel states them — the socket's inode from net/unix, then every
 # process whose fd table carries it — never from a pidfile the account
 # could write any pid into. Only the delegated account's own processes are
@@ -574,8 +574,8 @@ readonly PROC=${MINIMAL_OVERRIDE_PROC:-/proc}
 # all — is left where it is, because moving it into the daemon's leaf would
 # lift it out of its verdict (design §4.1: a box's placement is
 # inescapable, by root's hand as much as its own). A socket nobody holds is
-# nothing to place and exits 0: the unit fires on the socket's removal too,
-# and that is not a failure.
+# nothing to place and exits 0: a request can outlive the daemon that sent
+# it, and that is not a failure.
 place_listener() {
     verify_mount
     resolve_owner
@@ -596,8 +596,8 @@ place_listener() {
     # The holders, one pass over every fd table per inode (find walks it
     # without a fork per descriptor; the unit runs this as root on every
     # start, so the scan must be cheap). A daemon that restarts while the
-    # scan runs is a holder that vanishes under it, and the manager does
-    # not watch the path while the oneshot is active, so a vanished holder
+    # scan runs is a holder that vanishes under it, and the restarted daemon
+    # asks again with a request of its own, so a vanished holder
     # is noted, never fatal, and a socket whose holder was not found is
     # looked for once more after a moment before it reads as unheld.
     holders="$(listener_holders)"
@@ -912,7 +912,7 @@ install_quic443_helper() {
 # run left — never an add-to-it that could leave half a table deciding
 # things — and leaves the previous table standing when it dies.
 #
-# The dstnat chain (priority dstnat, before the filter output chain)
+# The dstnat chain (priority -100, before the filter output chain)
 # retargets the deny subtree's DNS-port lookups onto the answerer's own
 # port: a deny-all box resolves through the carve-out (NET-079)
 # by asking DNS's port like any resolver would, and the one destination
@@ -920,6 +920,14 @@ install_quic443_helper() {
 # destination address: on a guest the box asks the switch gateway, not the
 # answerer, and the retarget is what steers the lookup onto the listener
 # that answers it.
+#
+# Its priority is spelled as the number, never the name `dstnat` that
+# stands for the same -100: nft before 1.0.9 takes `dstnat` on a
+# prerouting hook only and refuses it on output ("invalid priority
+# expression value in this context"), and that refusal fails the whole
+# transaction, so Debian 12 (1.0.6) and Ubuntu 22.04 (1.0.2) would load no
+# table at all. A number is accepted on every hook by every nft. The
+# postrouting chain's `srcnat` is on the one hook every nft takes it on.
 #
 # The filter output chain runs before the postrouting chain (priority
 # srcnat), so a connection refused on the box's own cgroup is refused
@@ -1057,7 +1065,7 @@ render_ruleset() {
         ip daddr $answerer_address udp dport $answerer_port accept"
     dstnat_chain="
     chain dstnat {
-        type nat hook output priority dstnat; policy accept;
+        type nat hook output priority -100; policy accept;
         socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" udp dport 53 dnat ip to $answerer_address:$answerer_port
     }"
     cat <<RULES
@@ -1698,6 +1706,14 @@ if [ "$mode" = uninstall ]; then
     for record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT_RECORD_PREFIX"*; do
         [ -d "$record" ] || continue
         rmdir "$record" 2>/dev/null || true
+    done
+    # The effect probe's throwaway leaves, filter-probe-<pid>: a daemon
+    # stopped in the middle of its probe leaves one behind, empty. rmdir
+    # removes only an empty one, and a box's own leaf is never swept here:
+    # it still stops the uninstall below.
+    for probe_leaf in "$tree_root/$BOXES_DIR/$DENY_DIR"/filter-probe-*; do
+        [ -d "$probe_leaf" ] || continue
+        rmdir "$probe_leaf" 2>/dev/null || true
     done
     rmdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null || true

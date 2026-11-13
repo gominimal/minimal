@@ -166,6 +166,14 @@ pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
 pub const MINVMD_LOCK_FILE: &str = "minvmd.lock";
+/// The socket the placement unit `min finalize-install` installs listens on
+/// (`minimald-place.socket`), which native minimald connects to once its
+/// listener is bound. systemd holds it in `/run`, owned by the delegated
+/// account with mode 0600, so only that account and root connect. systemd
+/// starts the root-owned placer for each connection. The placer finds the
+/// daemon from the holders of its listening socket, never from the
+/// connection, so a connection asks for a placement and names nothing.
+pub const PLACE_REQUEST_SOCKET: &str = "/run/minimald-place.sock";
 
 /// Which local daemon backend (box host) an instance directory belongs to.
 ///
@@ -492,6 +500,19 @@ pub fn minimal_config_dir_with_override(over: Option<&Path>) -> std::path::PathB
             .as_utf8_path()
             .as_std_path()
             .to_path_buf(),
+    }
+}
+
+/// [`minimal_config_dir_with_override`] without the panics: `None` when no
+/// override is given and neither `$XDG_CONFIG_HOME` nor a home directory
+/// resolves, or the default path is not valid UTF-8 or not absolute. For a
+/// caller that runs before every command and can do without the directory.
+#[must_use]
+pub fn try_minimal_config_dir_with_override(over: Option<&Path>) -> Option<std::path::PathBuf> {
+    match over {
+        Some(dir) => Some(dir.join("minimal")),
+        None => try_default_dir(xdg_config_home, ".config")
+            .map(|p| p.as_utf8_path().as_std_path().to_path_buf()),
     }
 }
 

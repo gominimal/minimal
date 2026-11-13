@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-11-05
+updated: 2026-11-12
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -68,6 +68,12 @@ PAC recipe and `host_ip` cohort handling are later slices.
 The `host_ip` lane on a host that runs its boxes in a VM, with `dns` as its
 default steering, is BEP-082 to BEP-087. The direct TLS path that `dns`
 steering needs is BEP-080 and BEP-081.
+
+The epic asks for one host store, the macOS Keychain. The Linux key custody of
+BEP-088 to BEP-090 comes from the architecture instead. Gatehouse §6.10 asks
+for hardware custody where the host offers it, and names TPM 2.0 for Linux.
+The owner chose the Secret Service fallback on 2026-11-12, after the experiment
+on [#2436](https://github.com/gominimal/minimal/issues/2436).
 
 ## Users and stories
 
@@ -173,10 +179,14 @@ Minting and sealing
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_box_env_holds_sealed_value_only
 
-- **BEP-008** IF a box spec declares a GitHub grant and its `egress.allow_dns_hosts` does not admit every host in the module's host set THEN THE SYSTEM SHALL refuse expansion with exit 3 naming each missing host.
+- **BEP-008** IF a box spec declares a GitHub grant and its egress does not admit every host in the module's host set THEN THE SYSTEM SHALL refuse expansion with exit 3 naming each missing host.
   tier:     T1
   verify:   cargo nextest run -p boxes prop_grant_host_set_outside_egress_is_exit_3
-  property: for every box spec and every module host set, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
+  property: for every box spec that declares a GitHub grant and every module host set, except a `host_ip` box with no `egress` section, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
+  - WHERE a `host_ip` box has no `egress` section THE SYSTEM SHALL treat its egress as admitting every host in the module's host set.
+    tier:   T0
+    verify: cargo nextest run -p boxes host_ip_grant_box_with_no_egress_section_reaches_the_github_hosts
+    <!-- such a box is allow-all, so it reaches the hosts this requirement protects; it can declare no list, because NET-079 refuses name rules on a host-address box -->
 
 - **BEP-009** IF a box spec declares `network.mode = "none"` and a GitHub grant THEN THE SYSTEM SHALL refuse expansion with exit 3.
   tier:     T1
@@ -249,12 +259,14 @@ Steering and the interception CA
     verify: cargo nextest run -p bep root_recertified_under_same_key_and_subject
     <!-- Gatehouse §6.10: re-certification is not rotation; a running box keeps validating the names its root already permitted and reaches an added authority once re-created; the certificates below the root carry a key-identifier-only authority key identifier, so they chain to either issue of it -->
 
-- **BEP-014** WHILE the proxy is a release build THE SYSTEM SHALL hold the signing CA private key in the host keychain as a non-exportable key and write it to no file.
+- **BEP-014** WHILE the proxy is a release build and the signing CA key is not in Secret Service THE SYSTEM SHALL hold the signing CA private key in the host's hardware key store as a non-exportable key and write no copy of it that another machine can load.
   tier:     T0
   verify:   cargo nextest run -p bep signing_key_is_non_exportable_and_has_no_file
+  <!-- the hardware key store is the Secure Enclave on macOS and TPM 2.0 on Linux (BEP-088); a TPM key's wrapped blob on disk is a file, but only the TPM that made it can load it, so it is not a copy another machine can load; a Linux host with no usable TPM holds software keys in Secret Service, the one exception (BEP-088, BEP-090); a macOS release build has no exception: it holds its keys in the Secure Enclave, and `bep::keys::custody` refuses an exportable key in a release build, so a release build never runs on login-keychain keys -->
+
   <!-- a debug build keeps an exportable key, and writes a warning for each role at each start: the macOS login keychain lets the process that made a key export it although `kSecAttrIsExtractable` is false (the probe on #2436), and the keychain that enforces it needs an entitlement that only a Developer ID signature carries, so a debug build would never start on a developer's Mac; decided 2026-10-31, this note is the record, and the architecture's key-custody rule stays as it is; `bep::keys::custody` is the one decision, at the keychain's generation, at `bep::keys::load` for a stored sealing key, and at the CA's key check for the root and signing keys -->
 
-- **BEP-059** WHILE the proxy is a release build THE SYSTEM SHALL generate the proxy's sealing key and the root CA key non-exportable on the host, hold them in the host keychain across proxy restarts, and write them to no file.
+- **BEP-059** WHILE the proxy is a release build THE SYSTEM SHALL generate in the host's hardware key store, as a non-exportable key, each of the sealing key and the root CA key that it does not generate in Secret Service, hold that key there across proxy restarts, and write no copy of it that another machine can load.
   tier:     T0
   verify:   cargo nextest run -p bep sealing_and_root_keys_persist_non_exportable
   <!-- Gatehouse §6.10 un-enrolled lifecycle and the hardware-backed custody bullet -->
@@ -271,19 +283,74 @@ Steering and the interception CA
 - **BEP-060** THE SYSTEM SHALL replace the sealing key or the root CA only on an explicit operator command, and never on restart.
   tier:     T0
   verify:   cargo nextest run -p bep keys_never_regenerated_on_restart
-  <!-- Gatehouse §6.10 un-enrolled lifecycle: replacement is never a silent overlap failure -->
+  <!-- Gatehouse §6.10 un-enrolled lifecycle: replacement is never a silent overlap failure; the published identity (BEP-072) is the record of which roles the proxy made, so a start refuses a role the identity names and the store lost; a host that lost every key and its identity file holds no record that it ever had keys, so its next start is a first start; that fails closed: a box created before then holds values sealed to the old key and a trust store with the old root, which the proxy refuses and does not present, and the box is re-created, as after a replacement -->
   - WHEN the sealing key or the root CA is replaced THE SYSTEM SHALL refuse every member sealed to the previous key and report that running boxes holding one are re-created to re-mint.
     tier:   T0
     verify: cargo nextest run -p bep key_replacement_kills_outstanding_members
     <!-- the recreate-to-re-mint rule of Gatehouse §8.3 -->
-  - IF the host keychain refuses the proxy a key it holds for the proxy THEN THE SYSTEM SHALL refuse to start and name `bep --replace-key` with the role of each refused key.
+  - IF the macOS keychain refuses the proxy a key it holds for the proxy THEN THE SYSTEM SHALL refuse to start and name `bep --replace-key` with the role of each refused key.
     tier:   T0
     verify: cargo nextest run -p bep refused_key_names_the_replacement_command
-    <!-- unwanted; the keychain admits a key to the program that generated it, so a rebuilt proxy is a different program and is refused its predecessor's keys; the replacement is this requirement's operator command, and it runs without the files a serving proxy reads, since the case it exists for is a proxy that will not start -->
+    <!-- unwanted; the keychain admits a key to the program that generated it, so a rebuilt proxy is a different program and is refused its predecessor's keys; the replacement is this requirement's operator command, and it runs without the files a serving proxy reads, since the case it exists for is a proxy that will not start; a Linux key store's refusals are BEP-089's: a locked or unreachable Secret Service keeps its keys and names no replacement, and a TPM that cannot load a key names it -->
 
 - **BEP-061** WHEN the signing CA rotates under an unchanged root THE SYSTEM SHALL keep every running box's trust anchor valid with no change inside the box.
   tier:     T0
   verify:   cargo nextest run -p bep signing_ca_rotation_invisible_to_boxes
+
+- **BEP-088** WHEN the proxy generates a key on a Linux host THE SYSTEM SHALL generate it in the host's TPM 2.0 where the TPM creates and loads the key, and otherwise in Secret Service.
+  tier:     T0
+  verify:   cargo nextest run -p bep linux_key_store_is_the_tpm_where_usable_else_secret_service
+  <!-- Gatehouse §6.10 hardware-backed custody is a SHOULD "where the host offers it", and names TPM 2.0 for Linux; the fallback is the owner's decision of 2026-11-12, after the experiment on #2436; the store is chosen by trying it at generation, not by finding a device: a TPM that is present but refuses to create a key, because an owner authorization is set or it is in lockout, is not usable; the choice is made at generation only, never at a later start (BEP-089) -->
+  - WHERE the proxy generates a key in a TPM THE SYSTEM SHALL make the key fixed to that TPM, exempt from dictionary-attack lockout, and usable only by the proxy's user, through an authorization value of at least 128 bits from the OS CSPRNG that the proxy reads from a file only its user can read.
+    tier:   T0
+    verify: cargo nextest run -p bep --run-ignored ignored-only a_tpm_key_is_fixed_exempt_from_lockout_and_needs_its_authorization
+    <!-- `fixedTPM|fixedParent` and `noDA`; a host that loses power can put the TPM into dictionary-attack lockout, and in the experiment a key without `noDA` was unusable for the TPM's 1000-second recovery time; without its own authorization value, any member of the `tss` group can load and use the key; the test lives in a `crates/bep/tests/*_tpm_integration.rs` binary, ignored unless a TPM is named, and runs against `swtpm` in the Linux native lane and in a local VM; ECDH needs the TPM's own interface, because `tpm2-pkcs11` has no ECDH mechanism -->
+  - IF the TPM cannot generate the key and Secret Service is locked or cannot be reached THEN THE SYSTEM SHALL refuse to start and report that this host has no usable TPM and no unlocked Secret Service keyring.
+    tier:   T0
+    verify: cargo nextest run -p bep no_tpm_and_no_secret_service_refuses_start
+    <!-- unwanted; a headless host with no TPM is this case, because Secret Service needs an unlocked desktop session -->
+
+- **BEP-089** WHILE the proxy holds a key in a key store THE SYSTEM SHALL load that key from the same store at each start, and never generate it in another store.
+  tier:     T0
+  verify:   cargo nextest run -p bep a_held_key_is_never_moved_to_another_store
+  <!-- a key generated in another store is a replacement (BEP-060), and replacement is an operator command; so a TPM that becomes usable later does not take over a Secret Service key, and a TPM that stops working does not cause a fallback; `bep --replace-key <role>` generates in whichever store BEP-088 chooses at that time -->
+  - IF a proxy key is in Secret Service and the keyring that holds it is locked THEN THE SYSTEM SHALL refuse to start and report that the login keyring must be unlocked.
+    tier:   T0
+    verify: cargo nextest run -p bep a_locked_secret_service_refuses_start
+    <!-- unwanted; the remedy is not `bep --replace-key`, because the keys still exist; no command unlocks the keyring for every desktop, so the message states the situation -->
+  - IF a proxy key is in Secret Service and Secret Service cannot be reached THEN THE SYSTEM SHALL refuse to start, report that Secret Service cannot be reached from this session, and report that the proxy starts from the desktop session that holds the login keyring.
+    tier:   T0
+    verify: cargo nextest run -p bep an_unreachable_secret_service_refuses_start
+    <!-- unwanted; distinct from a locked keyring, because unlocking does not help when no session bus or keyring daemon runs, as in a plain SSH session; the keys still exist, so the remedy is where the proxy starts, never `bep --replace-key` -->
+  - IF a proxy key is in a TPM and the TPM cannot be reached, or answers that it cannot load an object now, THEN THE SYSTEM SHALL refuse to start, report that the TPM cannot load the key of that role now, and not name `bep --replace-key`.
+    tier:   T0
+    verify: cargo nextest run -p bep an_unreachable_tpm_refuses_start_and_keeps_the_key
+    <!-- unwanted; a TPM that is disabled in firmware, not yet ready, or whose device the proxy's user cannot open, and a TPM that answers a load with a response the TCG library defines as temporary, such as `TPM_RC_OBJECT_MEMORY` or `TPM_RC_RETRY`, can load the key later, so replacing it would throw away a key that still works; the proxy never generates the key again by itself and never falls back to Secret Service -->
+  - IF a proxy key is in a TPM and its key file or its authorization file exists and the proxy's user cannot read it THEN THE SYSTEM SHALL refuse to start, report which file the proxy's user cannot read for that role, and not name `bep --replace-key`.
+    tier:   T0
+    verify: cargo nextest run -p bep an_unreadable_tpm_key_file_refuses_start_and_keeps_the_key
+    <!-- unwanted; a file the proxy cannot read because of its mode or owner is intact, and restoring access recovers the key, so replacing it would discard a key that still works -->
+  - IF a proxy key is in a TPM and its key file or its authorization file is missing, or the TPM refuses the key file as not its own, THEN THE SYSTEM SHALL refuse to start, report which of the three it is for that role, and name `bep --replace-key <role>` with that role.
+    tier:   T0
+    verify: cargo nextest run -p bep a_tpm_key_the_tpm_cannot_load_refuses_start
+    <!-- unwanted; each is a lost key: a key file that the TPM refuses as not its own (an integrity or hierarchy error) belongs to a cleared TPM or another one, and without its key file or its authorization value no TPM can use the key; replacement is the remedy, as BEP-060's refusal names it; a `noDA` key is not refused by dictionary-attack lockout, so lockout is not this case -->
+  - IF the proxy holds a key for one role, no reachable key store holds a key for another role, and a key store is locked or cannot be reached, THEN THE SYSTEM SHALL refuse to start, report which key store it cannot read, and not name `bep --replace-key`.
+    tier:   T0
+    verify: cargo nextest run -p bep a_missing_role_with_an_unreadable_store_refuses_start_and_keeps_the_key
+    <!-- unwanted; the missing key can be in the store the proxy cannot read, so naming replacement could discard it, and generating it elsewhere would make a second key for the role (BEP-089); the locked and unreachable Secret Service refusals above say what the operator does -->
+  - IF the proxy holds a key for one role and none of the host's key stores holds a key for another role, with every key store reachable and unlocked, THEN THE SYSTEM SHALL refuse to start, report that no key store holds the key of that role, and name `bep --replace-key <role>` with that role.
+    tier:   T0
+    verify: cargo nextest run -p bep a_missing_role_key_refuses_start_and_names_replacement
+    <!-- unwanted; an unlocked, reachable keyring with no entry for a role, or a TPM key directory with no file for it, while another role's key is held, is a lost key and never a first start, so the proxy never generates it at start (BEP-060); each role is looked up in every store, because BEP-088 can put the roles in different stores; only a host whose stores hold no key for any role, and whose published identity (BEP-072) names no role, is a first start; a host that lost every key and its identity file is indistinguishable from a new host and starts as one, which BEP-060 records; a first start stopped between two generations leaves this state too, and its way forward is the named command: `bep --replace-key <role>` generates the missing role's key alone and keeps the key already made, and no box holds a value sealed to either, because the proxy publishes its identity (BEP-072) only after every key exists -->
+
+- **BEP-090** WHILE the proxy holds a key in Secret Service THE SYSTEM SHALL report on `min auth status` that key's role and that it is a software key, which a program running as the operator's user can copy.
+  tier:     T0
+  verify:   cargo nextest run -p minimal auth_status_reports_software_key_custody
+  <!-- the reduced custody is reported where it stays, never before a box shell; the store is per key, because BEP-089 lets one role be replaced into another store; the published material of BEP-072 carries which store holds each key, so the client reads it without opening the store -->
+  - THE SYSTEM SHALL publish, beside the material of BEP-072, which store holds each of the proxy's keys.
+    tier:   T0
+    verify: cargo nextest run -p bep the_published_identity_names_each_key_store
+    <!-- ubiquitous; the client reads the store without opening it, as BEP-072 requires; macOS publishes the keychain for every key -->
 
 - **BEP-015** WHILE a box with steering `proxy_env` holds a sealed GitHub member THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no tool configuration in the box beyond what the box carries at creation.
   tier:     T0
@@ -478,6 +545,10 @@ Redemption
   verify:   cargo nextest run -p bep prop_undeclared_egress_authority_is_refused
   property: for every egress declaration and every authority, the proxy admits only when the declaration admits the authority, whether or not the request carries a sealed value
   harness:  kani_redeem_requires_egress_admission, same bound and purity constraint as BEP-019
+  - WHEN a `host_ip` box that declares a GitHub grant and has no `egress` section registers with the proxy THE SYSTEM SHALL register the module's host set as its declared egress.
+    tier:   T0
+    verify: cargo nextest run -p minimal host_ip_grant_box_with_no_egress_section_registers_the_github_hosts
+    <!-- the box lists no names, so an empty registration would refuse the hosts BEP-008 lets it reach -->
 
 - **BEP-023** IF a request's `Host` header, or the authority of an absolute-form request target, differs from the connection authority it arrived on THEN THE SYSTEM SHALL refuse the request before substitution.
   tier:     T2
@@ -857,7 +928,7 @@ Setting secrets
 
 - Caching public artifacts through the proxy: a separate story, not yet filed.
 - Presets for Slack, Google Drive, Notion and other services whose clients sign in through OAuth with tokens that expire. A stored secret stops working when its token expires. Each such service needs a module with a sign-in flow and renewal at the proxy, as the GitHub module has, and follows the Anthropic and MCP module epics.
-- Anthropic and MCP upstream modules; 1Password, LastPass, Linux Secret Service, `pass` and Bitwarden store backends: follow-on epics reusing this document's module and resolver seams (Gatehouse §6.10 store members lists the roster).
+- Anthropic and MCP upstream modules; 1Password, LastPass, Linux Secret Service, `pass` and Bitwarden store backends: follow-on epics reusing this document's module and resolver seams (Gatehouse §6.10 store members lists the roster). This document uses Secret Service for the proxy's own keys on a Linux host with no TPM (BEP-088). It does not use it as a `min secret` store.
 - The Gatehouse-hosted proxy, the enrolled `gateway` helper, the tenant secret store and the revocation feed: [GHI](https://github.com/gominimal/gatehouse/pull/1), Gatehouse §6.10, §6.11, §8.6. With a Gatehouse configured, `min` delegates sign-in, minting and sealing to it; nothing here forecloses that and the envelope is the same.
 - Repository narrowing of a locally minted GitHub member: later work, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7); an open question below records the residual meanwhile.
 - An in-box re-mint path for a locally minted member or store handle: none is needed un-enrolled, because both are references resolved at the proxy on each request (BEP-005, BEP-063), and Gatehouse v1.23 closed §14.4 item 7's re-mint surface by construction. A box is re-created only for what a reference cannot cross: the root's expiry and a sealing-key or root replacement (BEP-060).
@@ -1066,7 +1137,12 @@ observes directly in the box's environment and filesystem (BEP-002, BEP-007,
 BEP-033), and unattended key and store access confined to the proxy identity is
 enforced by keychain access control rather than by a decision function this code
 owns (BEP-014, BEP-051, BEP-059), so a property test would restate the
-keychain's contract.
+keychain's contract. The same holds for the TPM and Secret Service (BEP-088,
+BEP-089): the key's attributes and the authorization value are the store's
+contract. The one decision this code owns there is the store choice. Its
+inputs are whether the TPM works, the state of the keyring, and whether a key
+is already held. Example tests enumerate those few states in full, so a
+property adds nothing.
 
 **Three-layer CA, keys in the keychain.** A self-signed root as the injected
 anchor, a keychain-held signing CA that rotates freely, and per-hostname leaves
@@ -1106,6 +1182,39 @@ credentials" fix carry over in intent; its lane endpoint, bearer token store and
 path-segment selector do not, because reachability was the authorization and
 Gatehouse §12.11 dismissed that shape. The shipped `:7654` Host-header router
 is the closest code; the proxy stands beside it as its own crate.
+
+**Linux keys: the TPM first, Secret Service after.** In BEP-014 and BEP-059,
+the host's hardware key store is the Secure Enclave on macOS. On Linux it is a
+TPM 2.0. The experiment on
+[#2436](https://github.com/gominimal/minimal/issues/2436) ran on a cloud VM
+with a virtual TPM and on Lima with `swtpm`. A TPM 2.0 key did the sealing
+key's ECDH and the ECDSA of the signing CA. The TPM refused to duplicate the key,
+and the key survived a reset. Secret Service holds software keys and has no
+control per program. It works only in an unlocked desktop session. So the
+proxy uses the TPM where it can. On a desktop host with no usable TPM, it uses
+Secret Service (BEP-088).
+
+We did not choose a refusal to start without a TPM. The architecture asks for
+hardware custody only where the host offers it, and many developer machines
+and VMs have no TPM. The cost is that BEP-014 and BEP-059 do not hold for a key in
+Secret Service, and BEP-090 reports each such key. The proxy chooses the store when it generates a
+key, and never at a start (BEP-089). A key in another store is a replacement.
+
+A TPM key is a blob in a file that only that TPM can load. We did not choose
+persistent handles in the TPM. A TPM has few of them, and they need the owner
+authorization too. So BEP-014 and BEP-059 say "no copy another machine can
+load" in place of "no file".
+
+**Process identity on Linux is the user.** The architecture binds key use to
+the proxy's process identity. macOS binds a key to a code signature. Linux has
+no such binding for a TPM key or a Secret Service item. So the nearest binding
+is the OS user. The TPM key needs an authorization value in a file that only
+the proxy's user reads (BEP-088). The proxy runs as the operator's user (see
+Non-goals). So today any program of that user can use a TPM key, and can copy a
+Secret Service key. That is the single-operator premise of T31, recorded in
+Security considerations. A dedicated proxy user
+([gominimal/inbox#1184](https://github.com/gominimal/inbox/issues/1184))
+makes the file readable by the proxy alone.
 
 **Generality:** the requirements hold on any LocalVM host OS and for any
 upstream module declaring a host set; GitHub and the macOS Keychain are the
@@ -1150,7 +1259,8 @@ destroyed box's values redeemable from the cohort until the root expires, with
 no revocation record ever written (BEP-043's sub-requirement holds only once
 NET-133 is built). T31 for host-OS compromise, which on a single-operator laptop is
 compromise of the operator's own machine, reaching the signing key by use but
-not export; the proxy's keychain holds the sign-in's 6-month refresh material,
+not export, and by export too on a Linux host whose keys are in Secret
+Service (BEP-090); the proxy's keychain holds the sign-in's 6-month refresh material,
 usable off the host until GitHub revokes it (BEP-044 asks it to); the listener
 is parser surface reachable from credentialed-lane boxes; and the audit log's
 chain detects an edit that is not followed by recomputation and nothing more.
@@ -1179,9 +1289,11 @@ per-request Keychain access control.
   enforced by: audit record construction from the decision only; `min box spec` and `min secret` render identifiers and references only
   covered by: BEP-004, BEP-038, BEP-040, BEP-050, BEP-052
 
-- **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone.
-  enforced by: keychain access control bound to the proxy's code signature, and process separation
-  covered by: BEP-014, BEP-051, BEP-059, BEP-060, BEP-072
+- **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone, which on a Linux host is the proxy's OS user.
+  enforced by: keychain access control bound to the proxy's code signature on macOS, a TPM key's authorization value in a file only the proxy's user reads on Linux, and process separation
+  covered by: BEP-014, BEP-051, BEP-059, BEP-060, BEP-072, BEP-088, BEP-089
+  <!-- On Linux the proxy's identity is its OS user. Today that is the operator's login user, and a key in Secret Service has no control per program. So on a Linux host this invariant holds only up to the operator's user (Design reasoning, "Process identity on Linux is the user"). -->
+
   <!-- The proxy, gvproxy and the VM run as the same login user, so process separation keeps them in separate processes but not under separate users. The user split is deferred to gominimal/inbox#1184. Custody on a real macOS keychain is unproven: gominimal/minimal#2436 is open because the login keychain was observed to make keys exportable. -->
 
 - **Invariant:** THE SYSTEM SHALL stop redeeming a revoked or expired value within 60 seconds.
@@ -1196,4 +1308,3 @@ AT7 and AT25 (architecture threat model).
 - [NEEDS CLARIFICATION (MEDIUM): When does local repository narrowing land? The path is recorded, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7), and until it does the member is `full` breadth and the T28 residual is the signed-in account's manifest-capped reach for the reference's life.]
 - [NEEDS CLARIFICATION (MEDIUM): Does every intended client accept the sealed handle as its bearer unmodified? Claude Code with an OAuth token and MCP clients send `Authorization: Bearer <value>`, which BEP-032 substitutes, but a client that validates token shape before sending, or sends the credential in a header the rule does not name, needs the harness adapter ([gominimal/inbox#345](https://github.com/gominimal/inbox/issues/345)); unmeasured, a plan spike.]
 - [NEEDS CLARIFICATION (MEDIUM): How long is the root valid ([gominimal/arch#85](https://github.com/gominimal/arch/issues/85))? Its remaining validity at mint is the expiry of every sign-in reference and store handle (BEP-005, BEP-063), so it is the ceiling on a box's credentialed life and on the T28 window of a stolen reference, and the point at which a running box has to be re-created.]
-- [NEEDS CLARIFICATION (MEDIUM): On a Linux LocalVM host, which key store holds the signing CA key as non-exportable (TPM 2.0 via a PKCS#11 provider, or Secret Service without hardware backing)? BEP-014 is written over "the host keychain"; the plan carries a spike, and until it lands the Linux host is unverified for BEP-014.]

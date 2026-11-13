@@ -1,0 +1,56 @@
+{
+ "Rust": {
+  "blanks": 10,
+  "code": 532,
+  "comments": 15,
+  "reports": [
+   {
+    "name": "crates/graph/src/lib.rs",
+    "stats": {
+     "blanks": 2,
+     "code": 120,
+     "comments": 3,
+     "blobs": {}
+    }
+   },
+   {
+    "name": "crates/graph/src/plan.rs",
+    "stats": {
+     "blanks": 2,
+     "code": 60,
+     "comments": 3,
+     "blobs": {}
+    }
+   },
+   {
+    "name": "crates/graph/tests/it.rs",
+    "stats": {
+     "blanks": 2,
+     "code": 40,
+     "comments": 3,
+     "blobs": {}
+    }
+   },
+   {
+    "name": "crates/decode/src/lib.rs",
+    "stats": {
+     "blanks": 2,
+     "code": 300,
+     "comments": 3,
+     "blobs": {}
+    }
+   },
+   {
+    "name": "crates/decode/build.rs",
+    "stats": {
+     "blanks": 2,
+     "code": 12,
+     "comments": 3,
+     "blobs": {}
+    }
+   }
+  ],
+  "children": {},
+  "inaccurate": false
+ }
+}

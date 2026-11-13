@@ -205,7 +205,7 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
-            _leaf: Option<&sandbox::config::ClassifierLeaf>,
+            _place: Option<crate::SourcePlace<'_>>,
             _op: &ot::OpTracker,
         ) -> anyhow::Result<(std::path::PathBuf, bool)> {
             unreachable!("source fetch must not happen on these build paths")

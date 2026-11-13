@@ -3640,21 +3640,34 @@ pub(crate) const CLASSIFIER_PROGRAM_PATH: &str =
     "/usr/local/lib/minimal/install-host-classifier.sh";
 
 /// The systemd unit pair that places the daemon's listener in its leaf on
-/// every daemon start: the path unit watches the daemon's socket, and the
-/// oneshot service it starts runs the step's `--place-listener`. The pair
-/// is why no daemon restart needs a root step of its own.
+/// every daemon start: a socket unit at [`paths::PLACE_REQUEST_SOCKET`], which the
+/// daemon connects to once its own listener is bound, and the template
+/// service systemd starts for each connection, which runs the step's
+/// `--place-listener`. The pair is why no daemon restart needs a root step
+/// of its own. A socket in `/run` that systemd itself created needs no
+/// inotify watch, which SELinux policy can deny systemd for a socket under
+/// the account's home (gominimal/inbox#1206).
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const PLACE_SYSTEMD_UNIT: &str = "minimald-place";
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
+pub(crate) const PLACE_UNIT_SOCKET_PATH: &str = "/etc/systemd/system/minimald-place.socket";
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place.service";
+pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place@.service";
+/// The path unit and its oneshot an earlier install placed the daemon with,
+/// by watching the daemon's socket. The install removes them before it
+/// writes the socket pair, and `--undo` removes whichever it finds.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const LEGACY_PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const LEGACY_PLACE_UNIT_SERVICE_PATH: &str =
+    "/etc/systemd/system/minimald-place.service";
 
 /// The boot unit: a oneshot that re-runs the classifier's step from the
-/// root-owned copy at every boot, ordered before the path unit. The tree
-/// lives in cgroupfs and the table in the kernel, so neither survives a
-/// reboot on its own; without this unit the first socket event after a
-/// boot would find no tree to place the daemon in.
+/// root-owned copy at every boot, which the placement service is ordered
+/// after. The tree lives in cgroupfs and the table in the kernel, so
+/// neither survives a reboot on its own; without this unit the first
+/// placement request after a boot would find no tree to place the daemon
+/// in.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const CLASSIFIER_SYSTEMD_UNIT: &str = "minimald-classifier";
 #[cfg(any(test, not(target_os = "macos")))]
@@ -3693,10 +3706,16 @@ fn linux_host_items_removal(root: &str) -> String {
          stays; remove it with: apparmor_parser --remove {root}{APPARMOR_DIR}/minimald && rm -f \
          {root}{APPARMOR_DIR}/minimald {root}{APPARMOR_DIR}/tunables/minimald' >&2\n\
          fi\n\
-         systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
-         {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true\n\
-         rm -f {root}{PLACE_UNIT_PATH_PATH} {root}{PLACE_UNIT_SERVICE_PATH} {root}{CLASSIFIER_UNIT_SERVICE_PATH} \
-         {root}{CLASSIFIER_PROGRAM_PATH}\n\
+         # One unit per call: systemctl refuses a whole call that names a unit this\n\
+         # host does not have, and an install carries either the socket pair or the\n\
+         # earlier path pair.\n\
+         for unit in {PLACE_SYSTEMD_UNIT}.socket {PLACE_SYSTEMD_UNIT}.path \
+         {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do\n\
+         \x20 systemctl disable --now \"$unit\" 2>/dev/null || true\n\
+         done\n\
+         rm -f {root}{PLACE_UNIT_SOCKET_PATH} {root}{PLACE_UNIT_SERVICE_PATH} \
+         {root}{LEGACY_PLACE_UNIT_PATH_PATH} {root}{LEGACY_PLACE_UNIT_SERVICE_PATH} \
+         {root}{CLASSIFIER_UNIT_SERVICE_PATH} {root}{CLASSIFIER_PROGRAM_PATH}\n\
          systemctl daemon-reload 2>/dev/null || true\n\
          rmdir \"{root}{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
          \n\
@@ -4632,6 +4651,20 @@ pub(crate) struct HostAnswererRead {
 /// claims nothing, and the CLI keeps that mapping for the daemons that
 /// still send it.
 pub(crate) async fn host_answerer_read(reply: AnswererStatusReply) -> HostAnswererRead {
+    host_answerer_read_probing(reply, answerer_bound_at).await
+}
+
+/// [`host_answerer_read`] with the liveness query passed in: `probe` is
+/// called at most once, with the port of an arm that earns the query, and
+/// its answer is [`HostAnswererRead::answerer_bound`]. The verbs pass
+/// [`answerer_bound_at`]; a unit test passes its own answer, so a zone
+/// answerer some other daemon on the machine holds at the reply's port
+/// cannot decide the test's read.
+async fn host_answerer_read_probing<P, F>(reply: AnswererStatusReply, probe: P) -> HostAnswererRead
+where
+    P: FnOnce(u16) -> F,
+    F: std::future::Future<Output = bool>,
+{
     let proxy_down = reply
         .proxy_down
         .as_ref()
@@ -4657,7 +4690,7 @@ pub(crate) async fn host_answerer_read(reply: AnswererStatusReply) -> HostAnswer
         | ZoneAnswererStatus::Registered { port }
         | ZoneAnswererStatus::ManagerHeld { port } => HostAnswererRead {
             port: Some(port),
-            answerer_bound: answerer_bound_at(port).await,
+            answerer_bound: probe(port).await,
             held_no_channel: false,
             proxy_down,
         },
@@ -5388,7 +5421,7 @@ pub(crate) async fn naming_surface() -> NamingSurface {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     // T126 (NET-138): `min session activate` of a `host_ip` box on a VM host
     // reads the collided mirror ports over the VM host daemon's control
@@ -6545,11 +6578,13 @@ mod tests {
             format!("  [ -n \"$classifier_held\" ] || rm -f {CLASSIFIER_TREE_RECORD}"),
             format!("elif [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
             format!(
-                "systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
-                 {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true"
+                "for unit in {PLACE_SYSTEMD_UNIT}.socket {PLACE_SYSTEMD_UNIT}.path \
+                 {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do"
             ),
+            "  systemctl disable --now \"$unit\" 2>/dev/null || true".to_string(),
             format!(
-                "rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} \
+                "rm -f {PLACE_UNIT_SOCKET_PATH} {PLACE_UNIT_SERVICE_PATH} \
+                 {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH} \
                  {CLASSIFIER_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}"
             ),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
@@ -6687,7 +6722,7 @@ mod tests {
     /// `root`, so a test that renders a script for the host fails here.
     /// It never reaches `rm`. Every tool in [`HOST_TOOLS`] that `stubs`
     /// lacks gets a stand-in that exits 1.
-    fn run_confined(
+    pub(crate) fn run_confined(
         root: &std::path::Path,
         stubs: &std::path::Path,
         script: &str,
@@ -6755,8 +6790,10 @@ mod tests {
         let root = "/minimal-undo-test-root";
         let linux = paths_outside(&linux_undo_command("/run/minimal/answerer.sock"), root);
         for path in [
-            PLACE_UNIT_PATH_PATH,
+            PLACE_UNIT_SOCKET_PATH,
             PLACE_UNIT_SERVICE_PATH,
+            LEGACY_PLACE_UNIT_PATH_PATH,
+            LEGACY_PLACE_UNIT_SERVICE_PATH,
             CLASSIFIER_UNIT_SERVICE_PATH,
             CLASSIFIER_PROGRAM_PATH,
             ANSWERER_UNIT_SOCKET_PATH,
@@ -7656,8 +7693,21 @@ exit 0
             }),
         };
         // The session start's read: the answerer's port and its liveness
-        // query still run, and the cause rides whole beside them.
-        let read = host_answerer_read(reply.clone()).await;
+        // query still run, and the cause rides whole beside them. The
+        // query is this test's own stand-in, never a datagram to
+        // 127.0.0.1:7656: any daemon's zone answerer on the machine running
+        // the test holds that port, and would answer a real query.
+        let probed = std::cell::Cell::new(None);
+        let read = host_answerer_read_probing(reply.clone(), |port| {
+            probed.set(Some(port));
+            std::future::ready(false)
+        })
+        .await;
+        assert_eq!(
+            probed.get(),
+            Some(7_656),
+            "the liveness proof still ran at the holder's port"
+        );
         assert_eq!(
             read.port,
             Some(7_656),
@@ -7665,7 +7715,7 @@ exit 0
         );
         assert!(
             !read.answerer_bound,
-            "the liveness proof still ran at the holder's port"
+            "a query nobody answered proves no answerer"
         );
         assert!(
             !read.held_no_channel,
@@ -7675,6 +7725,17 @@ exit 0
             read.proxy_down,
             Some((19_911, ProxyDownCause::RedrawsRanOut)),
             "the sibling cause rides the same read whole"
+        );
+        // A query the holder answers is the proof, cause or no cause.
+        let live = host_answerer_read_probing(reply.clone(), |_| std::future::ready(true)).await;
+        assert!(
+            live.answerer_bound && live.port == Some(7_656),
+            "an answered query reads as a bound answerer beside the down proxy: {live:?}"
+        );
+        assert_eq!(
+            live.proxy_down,
+            Some((19_911, ProxyDownCause::RedrawsRanOut)),
+            "and the cause still rides beside it"
         );
         // The answerer row prints from the answerer field, not from the
         // cause — the DNS SERVICE line names the holder.

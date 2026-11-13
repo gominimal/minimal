@@ -95,7 +95,13 @@
 #                                    TCP 53 is dropped (NET-141)
 #   task_run                         `min task run` / `min session run` loop
 #   task_network_inherits_session    a task's network mode follows its session
-#                                    (own_ip egress + loopback isolation, none)
+#                                    (own_ip egress + loopback isolation, none);
+#                                    native: `min task run --network own_ip`
+#                                    cannot reach a host loopback listener
+#                                    no [host-exposures] entry opens; an
+#                                    own_ip task run gets the deny-all
+#                                    default, and one whose entry allows a
+#                                    name reaches it and not another
 #   hooks                            lifecycle hooks, loadouts, patches, shells
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
 #   sandbox                          interactive attach: in-sandbox `min add`
@@ -3255,7 +3261,7 @@ proof_host_ip_deny_all() {
     # the common ancestor of its starting cgroup and the slice is the
     # root-owned hierarchy root — the barrier that stops a box climbing out
     # is the same fact that stops the daemon climbing in. The installer's
-    # --place-listener step is the placement the path unit `min
+    # --place-listener step is the placement the socket unit `min
     # finalize-install` installs makes at every daemon start: it finds the
     # daemon by the socket it holds, never by a pid anyone names, and the
     # placement probe is per launch, so the next box this daemon launches
@@ -6749,6 +6755,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[stack]\nuse = "shell"\n'
     printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
     printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
+    # shellcheck disable=SC2016 # $l is the task's, expanded in the box
+    printf '\n[tasks.e2e-stdin]\nbash = "read -r l; echo STDIN_GOT:$l"\n'
     printf '\n[tasks.e2e-sleep]\nbash = "sleep 300"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
     # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
@@ -6835,6 +6843,25 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   task_kept_check e2e-fail "$WORK/task-fail.err"
   echo "task run exit-code relay: 7 → 7 OK"
+
+  # A piped stdin reaches the task through the in-box `min task run`
+  # (T123), and stdout is the task's alone: `cat q.sql | min task run
+  # query > out.csv`.
+  task_out="$(cd "$TASK_SEED_DIR" && printf 'piped-line\n' | mnl task run e2e-stdin 2>"$WORK/task-stdin.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-stdin' with a piped stdin exited $rc (expected 0)"
+    echo "--- task stderr ---"; cat "$WORK/task-stdin.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$task_out" != "STDIN_GOT:piped-line" ]; then
+    echo "::error::'min task run e2e-stdin' did not give the task its piped stdin, or stdout is not the task's alone"
+    echo "--- task stdout ---"; printf '%s\n' "$task_out"
+    echo "--- task stderr ---"; cat "$WORK/task-stdin.err" 2>/dev/null || true
+    fail
+  fi
+  task_kept_check e2e-stdin "$WORK/task-stdin.err"
+  echo "task run stdin: piped input reached the task OK"
 
   # Ctrl-C on a running task stops its box (BOX-013) and keeps its record
   # (BOX-038): the run exits 130, the box lists as stopped, and
@@ -6946,14 +6973,14 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   grep -q 'e2e-echo' "$WORK/task-unknown.err" \
     || { echo "::error::unknown-task error does not list the declared tasks"; cat "$WORK/task-unknown.err" 2>/dev/null || true; fail; }
 
-  # Muscle-memory catch: the hidden bare `min run <task>` errors naming the
-  # canonical spelling.
+  # The hidden bare `min run <task>` is gone (BCLI-011): `run` is no longer
+  # a subcommand, so clap refuses it as unrecognized.
   if mnl run e2e-echo >/dev/null 2>"$WORK/task-alias.err"; then
-    echo "::error::hidden 'min run' unexpectedly succeeded"
+    echo "::error::removed 'min run' unexpectedly succeeded"
     fail
   fi
-  grep -q 'min task run' "$WORK/task-alias.err" \
-    || { echo "::error::hidden 'min run' error does not name 'min task run'"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
+  grep -q "unrecognized subcommand 'run'" "$WORK/task-alias.err" \
+    || { echo "::error::removed 'min run' error does not say 'run' is not a subcommand"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
 
   # env_vars inherit crosses the VM boundary: the client reads the value out
   # of the invoking shell and the task's `printenv` sees it inside the
@@ -7039,11 +7066,18 @@ fi
 # exit code, so a task that fails for another reason (curl missing, the task
 # never starting) cannot pass for a refused connection. A host_ip control
 # task reaches the same host listener, so the own-IP refusal is shown to
-# depend on the mode. The own-IP and host_ip legs are native-only: on a VM
-# lane a task self-allocates a switch address the host-side table holds no
-# row for, so the egress gate drops its traffic (NET-085, until NET-138
-# registers every box), and the listener is on the CI host while every task
-# runs in the guest. The none leg runs on every lane. Own seeded project (the
+# depend on the mode. The same loopback task then runs with no session, as
+# `min task run --network own_ip` and `--network host_ip` (NET-060): the
+# own-IP box cannot reach the host listener, whose port no [host-exposures]
+# entry opens, and the host_ip box can. Then the task box's egress rules:
+# with no rules an own-IP task run reaches no external name (NET-074), and
+# a task whose entry declares `mode = "own_ip"` and one allowed name
+# reaches that name and not another. The own-IP and host_ip legs (the
+# task-run ones too: `min task run` refuses own_ip on a VM host) are
+# native-only: on a VM lane a task self-allocates a switch address the
+# host-side table holds no row for, so the egress gate drops its traffic
+# (NET-085, until NET-138 registers every box), and the listener is on the
+# CI host while every task runs in the guest. The none leg runs on every lane. Own seeded project (the
 # shared seed declares no tasks), switch-gated like the own-IP proofs above
 # (a task in an own-IP session needs the tap the switch carries):
 # MINVMD_GVPROXY_BIN on a VM lane, E2E_NATIVE_SWITCH on the native one.
@@ -7076,6 +7110,10 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[tasks.e2e-tn-egress-com]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.com"\n'
     printf '\n[tasks.e2e-tn-egress-org]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.org"\n'
     printf '\n[tasks.e2e-tn-loopback]\nbash = "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:%s/"\n' "$TN_LB_PORT"
+    # Own-IP tasks whose entry declares the mode and one allowed name: the
+    # `min task run` egress leg runs them with no flag.
+    printf '\n[tasks.e2e-tn-dns-com]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.com"\nnetwork = { mode = "own_ip", egress = { allow_dns_hosts = ["example.com"] } }\n'
+    printf '\n[tasks.e2e-tn-dns-org]\nbash = "curl -fsS --max-time 10 -o /dev/null https://example.org"\nnetwork = { mode = "own_ip", egress = { allow_dns_hosts = ["example.com"] } }\n'
   } > "$TN_SEED_DIR/minimal.toml"
   mkdir "$TN_SEED_DIR/.git"
 
@@ -7128,6 +7166,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # answering passes (a host that fails all three is a warning, not a fail —
   # the other host proves the box's egress).
   tn_egress_ok=0
+  tn_com_reached=""
   for tn_h in com org; do
     tn_status=1
     for tn_t in 1 2 3; do
@@ -7142,6 +7181,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     done
     if [ "$tn_status" -eq 0 ]; then
       tn_egress_ok=$((tn_egress_ok + 1))
+      [ "$tn_h" = com ] && tn_com_reached=1
     else
       echo "::warning::outbound from the own-IP session's task to example.$tn_h failed all 3 attempts; not fatal while the other host still proves egress"
       cat "$WORK/tn-egress.err" 2>/dev/null || true
@@ -7204,6 +7244,141 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   echo "host_ip session task: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
   mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
+
+  # -- `min task run --network own_ip`: a fresh task box, no session --------
+  # The same loopback task, run as its own box (NET-060). This lane writes no
+  # [host-exposures] table, so no entry opens the listener's port. The box
+  # declares reach to every address, so the only thing between it and the
+  # listener is that its 127.0.0.1 is its own: curl must exit 7. A host_ip
+  # task run reaches the same listener and exits 0, so the refusal is shown
+  # to follow the flag. Every task run keeps its box; each is removed here.
+  # $1: the run's stderr; $2: the task, e2e-tn-loopback by default.
+  tn_rm_kept() {
+    local tn_kept
+    # The run names the box, or gives its id when it cannot read the name.
+    tn_kept="$(grep -Eo "Kept box (${2:-e2e-tn-loopback}-[0-9]+|[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})" "$1" | head -n1)"
+    tn_kept="${tn_kept#Kept box }"
+    if [ -z "$tn_kept" ]; then
+      echo "::warning::no 'Kept box' line in $1; the task-run box, if any, stays until teardown"
+      return 0
+    fi
+    for _ in $(seq 1 20); do
+      mnl box rm "$tn_kept" >/dev/null 2>&1 && return 0
+      sleep 0.5
+    done
+    echo "::warning::'min box rm $tn_kept' failed after the task-run leg"
+  }
+  (cd "$TN_SEED_DIR" && mnl task run --network own_ip --allow-subnets 0.0.0.0/0 \
+    e2e-tn-loopback >/dev/null 2>"$WORK/tn-taskrun-ownip.err")
+  rc=$?
+  tn_rm_kept "$WORK/tn-taskrun-ownip.err"
+  if [ "$rc" -ne 7 ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::'min task run --network own_ip' reached the host's listener at 127.0.0.1:$TN_LB_PORT, which no [host-exposures] entry opens — the task box's loopback is not its own"
+    else
+      echo "::error::'min task run --network own_ip' of the loopback task exited $rc, want 7 (curl: could not connect) — it failed for a reason other than an empty loopback"
+      echo "--- task stderr ---"; cat "$WORK/tn-taskrun-ownip.err" 2>/dev/null || true
+    fi
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "own-IP task run: 127.0.0.1:$TN_LB_PORT unreachable (exit $rc: $(grep -m1 'curl:' "$WORK/tn-taskrun-ownip.err" 2>/dev/null || true))"
+  (cd "$TN_SEED_DIR" && mnl task run --network host_ip \
+    e2e-tn-loopback >/dev/null 2>"$WORK/tn-taskrun-hostip.err")
+  rc=$?
+  tn_rm_kept "$WORK/tn-taskrun-hostip.err"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run --network host_ip' could not reach the host's listener at 127.0.0.1:$TN_LB_PORT (exit $rc) — the own-IP task run's refusal above is not shown to follow the flag"
+    echo "--- task stderr ---"; cat "$WORK/tn-taskrun-hostip.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "host_ip task run: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
+
+  # -- `min task run` egress: the task box's rules are enforced -----------
+  # NET-074, NET-060: an own-IP task box with no egress rules gets the
+  # deny-all default, so example.com fails at resolution (curl exit 6) and
+  # the run prints the deny-all note. A task whose entry declares
+  # `mode = "own_ip"` and `allow_dns_hosts = ["example.com"]`, run with no
+  # flag, reaches example.com and not example.org, whose name its relay
+  # refuses (exit 6). The allowed run goes first, with the outbound proofs'
+  # three attempts, and only once it completes do the refusals prove the
+  # rules rather than a dead network. Its own control is the own-IP session
+  # leg above: when that reached example.com, an allowed run that never does
+  # is the rules' fault, not the weather's.
+  tn_dns_ok=""
+  tn_egress_proven=""
+  for tn_t in 1 2 3; do
+    (cd "$TN_SEED_DIR" && mnl task run e2e-tn-dns-com >/dev/null 2>"$WORK/tn-taskrun-dns-com.err")
+    rc=$?
+    tn_rm_kept "$WORK/tn-taskrun-dns-com.err" e2e-tn-dns-com
+    echo "exec: min task run e2e-tn-dns-com (allow_dns_hosts example.com, attempt $tn_t) → exit $rc"
+    if [ "$rc" -eq 0 ]; then
+      tn_dns_ok=1
+      break
+    fi
+    [ "$tn_t" -lt 3 ] && sleep "$((tn_t * 3))"
+  done
+  if [ -z "$tn_dns_ok" ] && [ -n "$tn_com_reached" ]; then
+    echo "::error::'min task run e2e-tn-dns-com' could not reach https://example.com, which its allow_dns_hosts names, while the own-IP session above reached it on this run — the task's declared egress is not applied"
+    echo "--- task stderr ---"; cat "$WORK/tn-taskrun-dns-com.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  elif [ -z "$tn_dns_ok" ]; then
+    echo "::warning::'min task run e2e-tn-dns-com' could not reach https://example.com in 3 attempts, and neither did the own-IP session above; the task-run egress refusals are skipped as a weather warning"
+    cat "$WORK/tn-taskrun-dns-com.err" 2>/dev/null || true
+  else
+    echo "own-IP task run from the entry's network table: https://example.com reachable (exit 0)"
+    if grep -qF "This box can reach no external address" "$WORK/tn-taskrun-dns-com.err"; then
+      echo "::error::'min task run e2e-tn-dns-com' printed the deny-all note for a box that declares egress"
+      cat "$WORK/tn-taskrun-dns-com.err"
+      kill "$TN_LISTENER_PID" 2>/dev/null || true
+      TN_LISTENER_PID=""
+      fail
+    fi
+    (cd "$TN_SEED_DIR" && mnl task run e2e-tn-dns-org >/dev/null 2>"$WORK/tn-taskrun-dns-org.err")
+    rc=$?
+    tn_rm_kept "$WORK/tn-taskrun-dns-org.err" e2e-tn-dns-org
+    if [ "$rc" -ne 6 ]; then
+      if [ "$rc" -eq 0 ]; then
+        echo "::error::'min task run e2e-tn-dns-org' reached https://example.org, which its allow_dns_hosts does not name — the task box's egress rules are not enforced"
+      else
+        echo "::error::'min task run e2e-tn-dns-org' exited $rc, want 6 (curl: could not resolve) — it failed for a reason other than its relay refusing the name"
+      fi
+      echo "--- task stderr ---"; cat "$WORK/tn-taskrun-dns-org.err" 2>/dev/null || true
+      kill "$TN_LISTENER_PID" 2>/dev/null || true
+      TN_LISTENER_PID=""
+      fail
+    fi
+    echo "own-IP task run from the entry's network table: https://example.org refused at resolution (exit 6)"
+    (cd "$TN_SEED_DIR" && mnl task run --network own_ip e2e-tn-egress-com \
+      >/dev/null 2>"$WORK/tn-taskrun-denyall.err")
+    rc=$?
+    tn_rm_kept "$WORK/tn-taskrun-denyall.err" e2e-tn-egress-com
+    if [ "$rc" -ne 6 ]; then
+      if [ "$rc" -eq 0 ]; then
+        echo "::error::'min task run --network own_ip e2e-tn-egress-com' reached https://example.com with no egress rules — the deny-all default (NET-074) is not in force for a task box"
+      else
+        echo "::error::'min task run --network own_ip e2e-tn-egress-com' exited $rc, want 6 (curl: could not resolve) — it failed for a reason other than the deny-all default"
+      fi
+      echo "--- task stderr ---"; cat "$WORK/tn-taskrun-denyall.err" 2>/dev/null || true
+      kill "$TN_LISTENER_PID" 2>/dev/null || true
+      TN_LISTENER_PID=""
+      fail
+    fi
+    if ! grep -qF "This box can reach no external address" "$WORK/tn-taskrun-denyall.err"; then
+      echo "::error::'min task run --network own_ip' with no egress rules did not print the deny-all note"
+      cat "$WORK/tn-taskrun-denyall.err" 2>/dev/null || true
+      kill "$TN_LISTENER_PID" 2>/dev/null || true
+      TN_LISTENER_PID=""
+      fail
+    fi
+    echo "own-IP task run with no egress rules: https://example.com refused at resolution (exit 6), with the deny-all note"
+    tn_egress_proven=1
+  fi
   tn_own_proven=1
   else
     known_gap task_network_inherits_session "own-IP/host_ip task legs on a VM lane: a task self-allocates a switch address the host-side table holds no row for, so the egress gate drops its traffic (NET-085, closed by NET-138); the host listener is also unreachable from the guest"
@@ -7243,7 +7418,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   TN_LISTENER_PID=""
   rm -rf "$TN_SEED_DIR"; TN_SEED_DIR=""
   if [ -n "$tn_own_proven" ]; then
-    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable; host_ip: host loopback reachable; none: no network)"
+    tn_taskrun_egress="task-run egress skipped as weather"
+    [ -n "$tn_egress_proven" ] && tn_taskrun_egress="a task run takes its entry's own_ip mode and allow_dns_hosts, and an own_ip task run with no rules gets the deny-all default"
+    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable, in a session and from 'min task run --network own_ip'; $tn_taskrun_egress; host_ip: host loopback reachable; none: no network)"
   else
     echo "task network proof OK (none: no network; own-IP and host_ip legs known_gap on this VM lane)"
   fi
@@ -7951,7 +8128,7 @@ echo "::endgroup::"
 #      which stays listed as exited (BOX-038),
 #   3. a re-attach resumes the exited box, and killing the ssh transport
 #      mid-attach (the `min proxy` ProxyCommand,
-#      as a dropped connection) exits 255 and leaves the terminal's termios
+#      as a dropped connection) exits 7 (BCLI-068) and leaves the terminal's termios
 #      (its `stty -g`) exactly as it was before the attach,
 #   4. the session outlives the drop, its shell's `exit` ends the box as
 #      exited, and `min session destroy` then removes it.
@@ -8021,10 +8198,10 @@ echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte p
 # 3. Re-attach, which resumes the exited box, and kill the transport
 # mid-attach.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=255 \
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=7 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-drop.err")" || {
-  echo "::error::the transport-drop attach did not exit 255"
+  echo "::error::the transport-drop attach did not exit 7"
   echo "--- transcript ---"; printf '%s\n' "$relay_out"
   echo "--- stderr ---"; cat "$WORK/relay-drop.err" 2>/dev/null || true
   fail
@@ -8034,7 +8211,7 @@ if [[ "$relay_out" != *OUTER_STTY_UNCHANGED* ]]; then
   echo "--- transcript ---"; printf '%s\n' "$relay_out"
   fail
 fi
-echo "a dropped transport exited 255 and left the terminal's stty -g unchanged"
+echo "a dropped transport exited 7 and left the terminal's stty -g unchanged"
 
 # 4. The session outlived the drop. Its shell's `exit` ends the box, and the
 # destroy removes it.
@@ -8809,7 +8986,7 @@ setup_classifier_note() {
 # the unit's journal, which this run's own output never carries.
 setup_units_journal() {
   command -v journalctl >/dev/null 2>&1 || return 0
-  for unit in minimald-classifier.service minimald-place.path minimald-place.service; do
+  for unit in minimald-classifier.service minimald-place.socket 'minimald-place@*.service' minimald-place.path minimald-place.service; do
     echo "--- journal: $unit ---"
     sudo -n journalctl --no-pager -n 40 -u "$unit" 2>&1 || true
   done
@@ -8819,7 +8996,7 @@ setup_units_journal() {
 # SETUP_CLASSIFIER_INSTALLED): the cases that run the script are about names,
 # and the two classifier proofs later in the lane install their own and refuse
 # a host that already carries one, so the host must be as the case found it.
-# The order is the installer's: the daemon stops first (the path unit placed
+# The order is the installer's: the daemon stops first (the placement unit placed
 # it in the tree's daemon leaf, and the uninstall refuses while a process or
 # a live leaf holds the tree), the units go before the tree so no later
 # daemon start is placed and no boot re-installs it, then the step's own
@@ -8828,8 +9005,12 @@ setup_units_journal() {
 setup_classifier_teardown() {
   [ -n "${SETUP_CLASSIFIER_INSTALLED:-}" ] || return 0
   mnl stop --force >/dev/null 2>&1 || true
-  sudo -n systemctl disable --now minimald-place.path minimald-place.service \
-    minimald-classifier.service >/dev/null 2>&1 || true
+  # One unit per call: systemctl refuses a whole call that names a unit the
+  # host does not have.
+  for unit in minimald-place.socket minimald-place.path minimald-place.service \
+    minimald-classifier.service; do
+    sudo -n systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done
   # A box's leaf can outlive the stop by a moment; the uninstall is retried
   # over a bounded wait rather than failed on the first refusal.
   for _ in $(seq 1 20); do
@@ -8837,16 +9018,28 @@ setup_classifier_teardown() {
     sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 && break
     sleep 0.5
   done
-  sudo -n rm -f /etc/systemd/system/minimald-place.path \
+  sudo -n rm -f /etc/systemd/system/minimald-place.socket \
+    '/etc/systemd/system/minimald-place@.service' \
+    /etc/systemd/system/minimald-place.path \
     /etc/systemd/system/minimald-place.service \
     /etc/systemd/system/minimald-classifier.service \
     /usr/local/lib/minimal/install-host-classifier.sh \
     /usr/local/lib/minimal/install-host-classifier.sh.new >/dev/null 2>&1 || true
   sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
   sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
-  sudo -n systemctl reset-failed minimald-place.path minimald-place.service \
-    minimald-classifier.service >/dev/null 2>&1 || true
+  sudo -n systemctl reset-failed minimald-place.socket minimald-place.path \
+    minimald-place.service minimald-classifier.service >/dev/null 2>&1 || true
   if [ -e /sys/fs/cgroup/minimald.slice ]; then
+    # What still holds the tree: each cgroup under it with its members,
+    # and each member's command line, so a failed teardown names its holder.
+    echo "--- the classifier tree's remaining cgroups and their processes ---"
+    find /sys/fs/cgroup/minimald.slice -name cgroup.procs 2>/dev/null | while IFS= read -r procs; do
+      echo "${procs%/cgroup.procs}: $(tr '\n' ' ' < "$procs" 2>/dev/null)"
+      while IFS= read -r member; do
+        [ -n "$member" ] || continue
+        echo "  $member: $(tr '\0' ' ' < "/proc/$member/cmdline" 2>/dev/null)"
+      done < "$procs"
+    done
     return 1
   fi
   sudo -n rm -f /var/lib/minimal/finalize-install-classifier >/dev/null 2>&1 || true
@@ -14178,7 +14371,7 @@ proof_bep_first_slice_end_to_end() {
   mkdir "$GRANT_SEED_DIR/.git"
 
   # 1. `min box spec` (BEP-038).
-  if ! fs_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
+  if ! fs_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
     echo "::error::'min box spec' of the demo project failed"
     cat "$WORK/$fs_case.spec.err" 2>/dev/null || true
     fs_fail
@@ -14455,7 +14648,7 @@ proof_bep_store_reference_end_to_end() {
     printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
-  if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+  if ! sr_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
     echo "::error::'min box spec' of the store-reference project failed"
     cat "$WORK/$sr_case.spec.err" 2>/dev/null || true
     sr_fail
@@ -15037,7 +15230,7 @@ proof_bep_signing_rotation_keeps_running_box_working() {
   # The root CA fingerprint from `min box spec` of the project ($1 = the
   # round, for the error).
   sr_root_fingerprint() {
-    if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+    if ! sr_spec="$(mnl box spec --repo-dir "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
       echo "::error::'min box spec' of the grant project failed $1 the rotation" >&2
       cat "$WORK/$sr_case.spec.err" >&2 2>/dev/null || true
       return 1
@@ -16045,6 +16238,391 @@ print(rcode, an, addr)' "$dq_b64"
   echo "::endgroup::"
 }
 
+# Host-address boxes reach GitHub through the proxy, end to end (BEP T122,
+# BEP-087). Three cases on a VM host with the Box Egress Proxy running. Each
+# prints "<case>: PASS", or NOT RUN with the gate it misses.
+#   bep_host_ip_git_and_gh_under_dns_steering
+#       A `host_ip` box that declares a GitHub grant and no steering (the
+#       default is dns) carries no proxy variable, resolves github.com to the
+#       proxy's address, and runs git clone, git push and gh api against
+#       E2E_BEP_PRIVATE_REPO. A second `host_ip` box with no grant resolves
+#       github.com to a real address (BEP-086's unwanted half).
+#   bep_host_ip_git_and_gh_under_proxy_env
+#       The same grant box with `steering = "proxy_env"` carries HTTPS_PROXY,
+#       and runs the same git and gh steps.
+#   bep_host_ip_grant_box_reaches_the_proxy_lane
+#       A GitHub grant box started with `--network host_ip` shows a box id in
+#       `min box show` and connects to the proxy's listener. After it ends, a
+#       `host_ip` box with no grant cannot connect to the proxy's address
+#       (T117, T124).
+# The first two need a GitHub sign-in and E2E_BEP_PRIVATE_REPO, the third a
+# sign-in. A `host_ip` box takes no narrowing allow list, so the boxes here
+# declare no egress flags. On a failure each case prints `min box audit` for
+# each box it started and the proxy's log lines that name the box.
+# #2500 (https://github.com/gominimal/minimal/issues/2500) owns the macOS lane
+# that runs them.
+BEP_HI_PROXY_IP=100.64.255.252
+BEP_HI_PROXY_PORT=8118
+BEP_HI_CASE="" BEP_HI_SIDS="" BEP_HI_PUSHED="" BEP_HI_ID=""
+
+# The proxy's debug records name each box connection. A daemon that runs
+# without them restarts in bep_live_gate. The debug directive follows
+# bep=info, so it wins, and the gate adds no second bep=info.
+bep_hi_debug_log() {
+  case ",${RUST_LOG:-}," in
+    *,bep=info,bep=debug,*) ;;
+    *)
+      RUST_LOG="$(printf '%s' "${RUST_LOG:-}" | tr ',' '\n' \
+        | grep -vE '^bep=(info|debug)$' | paste -sd, -)"
+      export RUST_LOG="${RUST_LOG:+$RUST_LOG,}bep=info,bep=debug"
+      BEP_LIVE_DAEMON=""
+      ;;
+  esac
+}
+
+# Prints the evidence for each box this case started: its `min box audit`
+# records, and the proxy's log lines that name its id.
+bep_hi_evidence() {
+  local ev_sid ev_lines ev_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  for ev_sid in $BEP_HI_SIDS; do
+    echo "--- min box audit $ev_sid ---"
+    mnl box audit "$ev_sid" -o jsonl </dev/null 2>&1 | tail -40 || true
+    echo "--- bep.log lines for $ev_sid (tail) ---"
+    ev_lines="$(grep -hF -- "$ev_sid" "$ev_log" 2>/dev/null | tail -40)"
+    printf '%s\n' "${ev_lines:-(none)}"
+  done
+}
+bep_hi_cleanup() {
+  local cl_sid cl_box cl_repo cl_branch
+  # A branch that the push made and the delete step did not remove: try the
+  # delete once more from the same box, and name the branch if it stays.
+  if [ -n "$BEP_HI_PUSHED" ]; then
+    read -r cl_box cl_repo cl_branch <<<"$BEP_HI_PUSHED"
+    # The push can fail before it writes the branch: ls-remote exits 2 when
+    # the branch is not there, and then nothing is left to delete.
+    if ! mnl session exec "$cl_box" sh -c \
+      "cd /tmp/bep-repo && export GIT_TERMINAL_PROMPT=0
+       timeout 60 git ls-remote --exit-code --heads origin $cl_branch >/dev/null; rc=\$?
+       [ \$rc -eq 2 ] && exit 0
+       timeout 120 git push origin --delete $cl_branch" \
+      >/dev/null 2>&1 </dev/null; then
+      echo "::warning::branch $cl_branch stays in $cl_repo: remove it with 'git push https://github.com/$cl_repo --delete $cl_branch'"
+    fi
+    BEP_HI_PUSHED=""
+  fi
+  for cl_sid in $BEP_HI_SIDS; do
+    mnl session destroy --force "$cl_sid" >/dev/null 2>&1 || true
+  done
+  BEP_HI_SIDS=""
+  [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+  GRANT_SEED_DIR=""
+  return 0
+}
+bep_hi_fail() {
+  bep_hi_evidence
+  bep_hi_cleanup
+  rm -f "${WORK:?}/${BEP_HI_CASE:?}".*
+  fail
+}
+
+# Writes a seed project to GRANT_SEED_DIR. $1 is grant or none, $2 the
+# steering line ("" for the default).
+bep_hi_seed() {
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlhostip.XXXXXX)"
+  {
+    hook_seed_preamble
+    if [ "$1" = grant ]; then
+      printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
+      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    fi
+    [ -n "$2" ] && printf '\n[session.network.bep]\nsteering = "%s"\n' "$2"
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+}
+
+# Activates GRANT_SEED_DIR as the host_ip box $1 and sets BEP_HI_ID to its
+# id. The name goes in BEP_HI_SIDS before the activate, so cleanup destroys
+# a box that the activate made before it failed. On success the id takes
+# the name's place. Any refusal fails the case.
+bep_hi_activate() {
+  local ha_out
+  BEP_HI_ID=""
+  BEP_HI_SIDS="${BEP_HI_SIDS:+$BEP_HI_SIDS }$1"
+  ha_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$1" \
+    --network host_ip </dev/null 2>"$WORK/$BEP_HI_CASE.$1.activate.err")" || {
+    echo "::error::'min session activate --network host_ip' of $1 failed" >&2
+    echo "--- stdout ---" >&2; printf '%s\n' "$ha_out" >&2
+    echo "--- stderr ---" >&2; cat "$WORK/$BEP_HI_CASE.$1.activate.err" >&2 2>/dev/null || true
+    return 1
+  }
+  ha_out="$(printf '%s\n' "$ha_out" | tail -n1 | tr -d '\r')"
+  [ -n "$ha_out" ] || { echo "::error::'min session activate' of $1 printed no box id" >&2; return 1; }
+  BEP_HI_SIDS="${BEP_HI_SIDS% "$1"}"; BEP_HI_SIDS="${BEP_HI_SIDS%"$1"}"
+  BEP_HI_SIDS="${BEP_HI_SIDS:+$BEP_HI_SIDS }$ha_out"
+  BEP_HI_ID="$ha_out"
+}
+
+# A raw A query for $2 from inside box $1 to its own resolver, as the
+# box-zone resolver case sends one. Prints "rcode ancount first-A-address"
+# for a reply to the query's own id, or nothing.
+bep_hi_dns_a() {
+  local dq_ns dq_q dq_b64
+  dq_ns="$(mnl session exec "$1" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r' \
+    | awk '$1 == "nameserver" { print $2; exit }')"
+  [ -n "$dq_ns" ] || return 0
+  dq_q="$(python3 -c '
+import base64, struct, sys
+wire = b"".join(bytes([len(l)]) + l.encode() for l in sys.argv[1].split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x5e34, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", 1, 1)
+).decode())' "$2")"
+  dq_b64="$(mnl session exec "$1" \
+    "printf %s '$dq_q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$dq_ns:53 | /usr/bin/base64 -w0" \
+    2>"$WORK/$BEP_HI_CASE.dns.err" | tr -d '\r\n')" || true
+  python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) < 12 or r[0:2] != b"\x5e\x34" or not r[2] & 0x80:
+    sys.exit(0)
+rcode, an = r[3] & 0x0f, int.from_bytes(r[6:8], "big")
+def skip(i):
+    while i < len(r):
+        n = r[i]
+        if n == 0:
+            return i + 1
+        if n & 0xc0 == 0xc0:
+            return i + 2
+        i += 1 + n
+    return len(r)
+i = skip(12) + 4
+addr = "-"
+for _ in range(an):
+    i = skip(i)
+    if i + 10 > len(r):
+        break
+    t, ln = int.from_bytes(r[i:i+2], "big"), int.from_bytes(r[i+8:i+10], "big")
+    i += 10
+    if t == 1 and ln == 4:
+        addr = ".".join(str(b) for b in r[i:i+4])
+        break
+    i += ln
+print(rcode, an, addr)' "$dq_b64"
+}
+
+# The gates a private-repository case needs: E2E_BEP_PRIVATE_REPO, then the
+# live proxy with a sign-in. Returns 1 after it records NOT RUN.
+bep_hi_repo_gate() { # $1 case, $2 repo
+  if [ -z "$2" ]; then
+    not_run "$1" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    return 1
+  fi
+  if ! [[ "$2" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$2', not <owner>/<name>"
+    fail
+  fi
+  bep_hi_debug_log
+  bep_live_gate "$1" || return 1
+}
+
+# git clone, git push and gh api against the private repository $3 from the
+# host_ip grant box $1, whose steering is $2.
+bep_hi_git_and_gh_steps() {
+  local gs_sid="$1" gs_steering="$2" gs_repo="$3" gs_branch gs_step gs_private
+  gs_branch="e2e-bep-hostip-$(date +%s)-$$"
+  # The push records the branch before it runs: a push that writes the
+  # branch and then fails still leaves it for bep_hi_cleanup to delete.
+  for gs_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gs_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gs_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gs_branch"; do
+    [ "${gs_step%%:*}" = push ] && BEP_HI_PUSHED="$gs_sid $gs_repo $gs_branch"
+    if ! mnl session exec "$gs_sid" sh -c "${gs_step#*:}" \
+      >"$WORK/$BEP_HI_CASE.${gs_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gs_step%%:*}' against the private repository $gs_repo failed in the $gs_steering host_ip box"
+      cat "$WORK/$BEP_HI_CASE.${gs_step%%:*}.out" 2>/dev/null || true
+      return 1
+    fi
+    [ "${gs_step%%:*}" = delete ] && BEP_HI_PUSHED=""
+    echo "git ${gs_step%%:*}: OK"
+  done
+  if ! gs_private="$(mnl session exec "$gs_sid" sh -c \
+    "timeout 60 gh api repos/$gs_repo --jq .private" 2>"$WORK/$BEP_HI_CASE.gh.err")"; then
+    echo "::error::'gh api repos/$gs_repo' failed in the $gs_steering host_ip box"
+    cat "$WORK/$BEP_HI_CASE.gh.err" 2>/dev/null || true
+    return 1
+  fi
+  gs_private="$(printf '%s' "$gs_private" | tr -d '\r' | tail -n1)"
+  if [ "$gs_private" != true ]; then
+    echo "::error::'gh api repos/$gs_repo' answered private='$gs_private': the case needs a private repository"
+    return 1
+  fi
+  echo "gh api repos/$gs_repo: OK (private)"
+}
+
+# Prints the box's proxy variable names, one a line. Returns 1 when `env`
+# in the box fails or prints no PATH, so an empty list is evidence.
+bep_hi_proxy_vars() {
+  local pv_env
+  if ! pv_env="$(mnl session exec "$1" sh -c 'env' </dev/null 2>"$WORK/$BEP_HI_CASE.env.err")" \
+    || ! printf '%s\n' "$pv_env" | tr -d '\r' | grep -q '^PATH='; then
+    echo "::error::'env' in the box $1 failed or printed no PATH" >&2
+    cat "$WORK/$BEP_HI_CASE.env.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  printf '%s\n' "$pv_env" | tr -d '\r' | grep -iE '^(https?|all)_proxy=' | cut -d= -f1
+  return 0
+}
+
+proof_bep_host_ip_git_and_gh_under_dns_steering() {
+  echo "::group::host_ip grant box under the default dns steering: git clone, git push and gh api against a private repository (BEP-087)"
+  local hd_repo="${E2E_BEP_PRIVATE_REPO:-}" hd_sid hd_plain hd_ans hd_vars
+  BEP_HI_CASE=bep_host_ip_git_and_gh_under_dns_steering
+  bep_hi_repo_gate "$BEP_HI_CASE" "$hd_repo" || { echo "::endgroup::"; return 0; }
+
+  # No steering line: the default steering is dns in every mode.
+  bep_hi_seed grant ""
+  bep_hi_activate e2e-bep-hostip-dns || bep_hi_fail
+  hd_sid="$BEP_HI_ID"
+  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  mnl session exec "$hd_sid" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
+    echo "::error::the host_ip grant box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
+    bep_hi_fail
+  }
+  hd_vars="$(bep_hi_proxy_vars "$hd_sid")" || bep_hi_fail
+  if [ -n "$hd_vars" ]; then
+    echo "::error::the host_ip grant box under the default steering has proxy variables: $(printf '%s' "$hd_vars" | tr '\n' ' ')"
+    bep_hi_fail
+  fi
+  echo "proxy variables in the grant box: none"
+  hd_ans="$(bep_hi_dns_a "$hd_sid" github.com)"
+  echo "A github.com in the grant box -> rcode, answers and address: ${hd_ans:-no reply}"
+  if [ "${hd_ans%% *}" != 0 ] || [ "${hd_ans##* }" != "$BEP_HI_PROXY_IP" ]; then
+    echo "::error::github.com in the host_ip grant box did not resolve to the proxy's address $BEP_HI_PROXY_IP: got '${hd_ans:-no reply}'"
+    cat "$WORK/$BEP_HI_CASE.dns.err" 2>/dev/null || true
+    bep_hi_fail
+  fi
+  bep_hi_git_and_gh_steps "$hd_sid" dns "$hd_repo" || bep_hi_fail
+
+  # A host_ip box with no grant shares the node's network, and its lookup of
+  # github.com gets the real answer, never the proxy's address.
+  bep_hi_seed none ""
+  bep_hi_activate e2e-bep-hostip-plain || bep_hi_fail
+  hd_plain="$BEP_HI_ID"
+  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  hd_ans="$(bep_hi_dns_a "$hd_plain" github.com)"
+  echo "A github.com in the box with no grant -> rcode, answers and address: ${hd_ans:-no reply}"
+  if [ "${hd_ans%% *}" != 0 ] || [ "${hd_ans##* }" = - ] || [ "${hd_ans##* }" = "$BEP_HI_PROXY_IP" ]; then
+    echo "::error::github.com in the host_ip box with no grant did not resolve to a real address: got '${hd_ans:-no reply}'"
+    cat "$WORK/$BEP_HI_CASE.dns.err" 2>/dev/null || true
+    bep_hi_fail
+  fi
+
+  bep_hi_cleanup
+  rm -f "${WORK:?}/${BEP_HI_CASE:?}".*
+  echo "$BEP_HI_CASE: PASS (dns steering: github.com resolved to $BEP_HI_PROXY_IP, git and gh reached $hd_repo with no proxy variable, and a box with no grant resolved github.com to ${hd_ans##* })"
+  echo "::endgroup::"
+}
+
+proof_bep_host_ip_git_and_gh_under_proxy_env() {
+  echo "::group::host_ip grant box under proxy_env steering: git clone, git push and gh api against a private repository (BEP-087)"
+  local hp_repo="${E2E_BEP_PRIVATE_REPO:-}" hp_sid hp_vars
+  BEP_HI_CASE=bep_host_ip_git_and_gh_under_proxy_env
+  bep_hi_repo_gate "$BEP_HI_CASE" "$hp_repo" || { echo "::endgroup::"; return 0; }
+
+  bep_hi_seed grant proxy_env
+  bep_hi_activate e2e-bep-hostip-proxy-env || bep_hi_fail
+  hp_sid="$BEP_HI_ID"
+  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  hp_vars="$(bep_hi_proxy_vars "$hp_sid")" || bep_hi_fail
+  if ! printf '%s\n' "$hp_vars" | grep -qx HTTPS_PROXY; then
+    echo "::error::the proxy_env host_ip grant box has no HTTPS_PROXY (proxy variables: ${hp_vars:-none})"
+    bep_hi_fail
+  fi
+  echo "proxy variables in the grant box: $(printf '%s' "$hp_vars" | tr '\n' ' ')"
+  bep_hi_git_and_gh_steps "$hp_sid" proxy_env "$hp_repo" || bep_hi_fail
+
+  bep_hi_cleanup
+  rm -f "${WORK:?}/${BEP_HI_CASE:?}".*
+  echo "$BEP_HI_CASE: PASS (proxy_env steering: git and gh reached $hp_repo through HTTPS_PROXY)"
+  echo "::endgroup::"
+}
+
+proof_bep_host_ip_grant_box_reaches_the_proxy_lane() {
+  echo "::group::host_ip grant box: a box id, the proxy's listener, and no reach for a box with no grant after it ends (T117)"
+  local hl_sid hl_id hl_shown hl_plain hl_start hl_ms
+  BEP_HI_CASE=bep_host_ip_grant_box_reaches_the_proxy_lane
+  bep_hi_debug_log
+  bep_live_gate "$BEP_HI_CASE" || { echo "::endgroup::"; return 0; }
+
+  bep_hi_seed grant ""
+  bep_hi_activate e2e-bep-hostip-lane || bep_hi_fail
+  hl_sid="$BEP_HI_ID"
+  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  hl_shown="$(mnl box show e2e-bep-hostip-lane </dev/null 2>&1)" || hl_shown=""
+  hl_id="$(printf '%s\n' "$hl_shown" | sed -n 's/^ID: *//p' | tr -d '\r' | head -n1)"
+  if [ -z "$hl_id" ]; then
+    echo "::error::'min box show e2e-bep-hostip-lane' shows no box id for the host_ip grant box"
+    printf '%s\n' "$hl_shown"
+    bep_hi_fail
+  fi
+  echo "min box show e2e-bep-hostip-lane -> ID: $hl_id"
+  [ "$hl_id" = "$hl_sid" ] || BEP_HI_SIDS="$BEP_HI_SIDS $hl_id"
+  mnl session exec "$hl_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::the host_ip grant box has no /usr/bin/socat (a launcher baseline package)"
+    bep_hi_fail
+  }
+  if ! mnl session exec "$hl_sid" \
+    "/usr/bin/socat /dev/null TCP:$BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT,connect-timeout=15" \
+    >/dev/null 2>"$WORK/$BEP_HI_CASE.grant.err"; then
+    echo "::error::the host_ip grant box did not connect to the proxy's listener $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT"
+    cat "$WORK/$BEP_HI_CASE.grant.err" 2>/dev/null || true
+    bep_hi_fail
+  fi
+  echo "the grant box connected to the proxy's listener $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT"
+  if ! mnl session destroy --force "$hl_sid" >/dev/null 2>"$WORK/$BEP_HI_CASE.destroy.err"; then
+    echo "::error::'min session destroy --force $hl_sid' failed"
+    cat "$WORK/$BEP_HI_CASE.destroy.err" 2>/dev/null || true
+    bep_hi_fail
+  fi
+  echo "destroyed the grant box $hl_sid"
+
+  # With no grant box left, nothing admits the proxy's address for a
+  # host_ip box: the connect fails.
+  bep_hi_seed none ""
+  bep_hi_activate e2e-bep-hostip-nogrant || bep_hi_fail
+  hl_plain="$BEP_HI_ID"
+  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  # Probe socat first, so a missing tool or a failed exec does not pass as
+  # a refusal. The connect error must then name a connect failure.
+  mnl session exec "$hl_plain" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::the host_ip box with no grant has no /usr/bin/socat (a launcher baseline package)"
+    bep_hi_fail
+  }
+  hl_start="$(now_ms)"
+  if mnl session exec "$hl_plain" \
+    "/usr/bin/socat /dev/null TCP:$BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT,connect-timeout=10" \
+    >/dev/null 2>"$WORK/$BEP_HI_CASE.nogrant.err"; then
+    echo "::error::a host_ip box with no grant connected to the proxy's address $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT after the grant box ended"
+    bep_hi_fail
+  fi
+  hl_ms=$(( $(now_ms) - hl_start ))
+  if ! grep -qiE 'timed out|timeout|Connection refused|No route to host|unreachable|Operation not permitted|Permission denied' \
+    "$WORK/$BEP_HI_CASE.nogrant.err" 2>/dev/null; then
+    echo "::error::the connect from the host_ip box with no grant to $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT failed, but not with a connect failure or a timeout"
+    cat "$WORK/$BEP_HI_CASE.nogrant.err" 2>/dev/null || true
+    bep_hi_fail
+  fi
+  echo "the box with no grant could not connect to $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT (${hl_ms} ms): $(tr -d '\r' <"$WORK/$BEP_HI_CASE.nogrant.err" | tail -n1)"
+
+  bep_hi_cleanup
+  rm -f "${WORK:?}/${BEP_HI_CASE:?}".*
+  echo "$BEP_HI_CASE: PASS (box id $hl_id, the proxy's listener reached, and refused to a box with no grant after the grant box ended)"
+  echo "::endgroup::"
+}
+
 # Round-two conditions closed, end to end (BEP T76, #2591). One walk over
 # the residuals that the second review round filed. Each leg prints PASS, or
 # records NOT RUN with the gate it misses. On a lane that runs no leg, the
@@ -16546,7 +17124,7 @@ rt_leg_cohort() {
 
 rt_leg_quarantine() {
   local qu_leg="$RT_CASE/quarantine" qu_bep qu_dir qu_seg qu_name qu_out qu_try
-  local qu_sockets qu_listener qu_control
+  local qu_sockets qu_listener qu_control qu_named
   if [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
     not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 on a host whose audit log may be moved aside to run it. The manual macOS lane runs it (#2500)"
     return 0
@@ -16586,9 +17164,22 @@ rt_leg_quarantine() {
     fail
   fi
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  if [[ "$qu_out" != *"--quarantine-unreadable"* ]] \
-     && ! grep -qF -- '--quarantine-unreadable' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
-    echo "::error::the refused creation names no way out: neither its error nor the proxy log names 'bep serve --quarantine-unreadable'"
+  # The proxy can write its refusal to bep.log after the activate fails,
+  # so wait up to 15 s for it before the leg fails.
+  qu_named=""
+  if [[ "$qu_out" == *"--quarantine-unreadable"* ]]; then
+    qu_named=1
+  else
+    for qu_try in $(seq 1 15); do
+      [ "$qu_try" -gt 1 ] && sleep 1
+      if grep -qF -- '--quarantine-unreadable' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
+        qu_named=1
+        break
+      fi
+    done
+  fi
+  if [ -z "$qu_named" ]; then
+    echo "::error::the refused creation names no way out: neither its error nor the proxy log names 'bep serve --quarantine-unreadable' within 15 s"
     printf '%s\n' "$qu_out"
     fail
   fi
@@ -22646,17 +23237,12 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 #     host-side boot log. The attempt never reads the server's SSH banner
 #     either way.
 #
-#   * the build leg (NET-155 under NET-130): `min add --session` of a
-#     project-local package whose one web source is a literal address in
-#     TEST-NET-2. An own-address box has no classifier leaf, so the daemon
-#     fetches the source from its own namespace with the node's address,
-#     and the host-side gate decides it by the node-plane baseline set: the
-#     address is no registry or cache pin, so the gate drops it and writes
-#     its `egress-node-plane-unpinned` line naming the destination. The
-#     build fails and the package is not installed. This is the interim
-#     that the NET-155 scope note names, and issue #2802 owns it. When #2802
-#     gives an own-address box its own leaf, change this leg to expect the
-#     box's own drop in place of the node's.
+#   * the build leg (NET-155): `min add --session` of a project-local
+#     package whose one web source is a literal address in TEST-NET-2. The
+#     box's rules admit no destination, so the fetch opens no connection.
+#     The build fails, its error names the destination and the box's rules,
+#     the package is not installed, and no frame reaches the host-side gate,
+#     so the gate writes no line for the destination.
 #
 #   * the escape leg (NET-085): a root escapee wearing the node's own
 #     address speaks the shuttle protocol at the gate's landing edge (the
@@ -22671,10 +23257,8 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 #     no infrastructure destination and no pin. The gate drops it under
 #     `egress-node-plane-unpinned`, which proves the pin itself.
 #
-# The build leg runs before the escape leg on purpose: the gate writes one
-# line per source per rule per 60 s, and both legs' lines are the node
-# address's under the same rule, so each escape probe waits out the window
-# that the line before it opened. Every leg's failure prints the record it expected
+# The gate writes one line per source per rule per 60 s, so each leg waits out
+# the window that the line before it opened. Every leg's failure prints the record it expected
 # and the host log lines it searched.
 proof_escapes_and_builds_stay_inside_box_rules() {
   local ebr_sid="" ebr_rec="" ebr_ip="" ebr_node="" ebr_host="" ebr_out=""
@@ -23009,11 +23593,11 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
   # ---- the build leg: a deny-all box's package build (NET-155) -------------
   # The gate writes one line per source address per rule in a 60 s window,
   # whatever the destination. An earlier drop from the node's address (the
-  # activate, or an earlier case) can hold that window open and silence this
-  # leg's line. Wait it out, as the escape leg does.
+  # activate, or an earlier case) can hold that window open, and then a line
+  # this leg must not see could not appear. Wait it out, as the escape leg does.
   echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
   sleep 61
-  EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, and the gate writes an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_build_dst"
+  EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, its error names $ebr_build_dst and the egress rules of box e2e-ebr, and the gate writes no line for $ebr_build_dst"
   ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)"
   # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
   ebr_out="$(mnl session exec "$ebr_sid" \
@@ -23028,7 +23612,7 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
   printf '%s\n' "$ebr_out" | tail -n 20 | sed 's/^/  /'
   ebr_rc="$(printf '%s\n' "$ebr_out" | sed -n 's/^min-add-exit=//p' | tail -n1)"
   if [ -z "$ebr_rc" ] || [ "$ebr_rc" = 0 ]; then
-    echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules and the baseline set"
+    echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules"
     ebr_fail
   fi
   if [ "$ebr_rc" = 124 ]; then
@@ -23040,17 +23624,22 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
     echo "::error::the build never started: the box did not resolve the project's own package $ebr_pkg"
     ebr_fail
   fi
-  ebr_line="$(ebr_wait_new_gate_line "$ebr_node" egress-node-plane-unpinned \
-    "$ebr_build_dst" "$ebr_prior")" || {
-    echo "::error::the build failed, but the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_build_dst ($ebr_prior such line(s) before the leg)"
+  if ! grep -q "could not reach $ebr_build_dst: the egress rules of box e2e-ebr do not allow it" <<<"$ebr_out"; then
+    echo "::error::the build failed, but its error does not name $ebr_build_dst and the box's rules"
     ebr_fail
-  }
+  fi
+  # A line takes a moment to reach the log, so look only after that moment.
+  sleep 5
+  if [ "$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)" -gt "$ebr_prior" ]; then
+    echo "::error::the gate wrote a line for $ebr_node toward $ebr_build_dst: the fetch of a box whose rules admit nothing must send nothing"
+    ebr_fail
+  fi
   ebr_rows="$ebr_rows
-attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build failed (exit $ebr_rc) record=gate: $ebr_line"
-  echo "build leg OK: the deny-all box's build reached nothing outside its rules and the baseline set"
+attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build failed (exit $ebr_rc) record=the build's error, and no gate line"
+  echo "build leg OK: the deny-all box's fetch sent nothing, and its build named the rules"
 
   # ---- the escape leg: root in the VM wearing the node's address (NET-085) --
-  # Two probes, each after a 61 s wait: the build leg's line, and the first
+  # Two probes, each after a 61 s wait: an earlier drop, and the first
   # probe's line, each open the gate's 60 s window for this source and rule.
   #
   # Probe 1 aims at the runner's own address, where the host listener sits.
@@ -32387,6 +32976,9 @@ case "${1:-}" in
     proof_bep_revoke_and_sign_out_end_to_end
     proof_bep_dns_steering_fails_closed_end_to_end
     proof_bep_dns_steering_through_the_box_zone_resolver
+    proof_bep_host_ip_git_and_gh_under_dns_steering
+    proof_bep_host_ip_git_and_gh_under_proxy_env
+    proof_bep_host_ip_grant_box_reaches_the_proxy_lane
     proof_bep_round_two_conditions_closed
     proof_bep_audit_rotation_and_doctor_end_to_end
     proof_bep_audit_http_and_messages_closed
@@ -32487,6 +33079,9 @@ case "${1:-}" in
     | bep_revoke_and_sign_out_end_to_end \
     | bep_dns_steering_fails_closed_end_to_end \
     | bep_dns_steering_through_the_box_zone_resolver \
+    | bep_host_ip_git_and_gh_under_dns_steering \
+    | bep_host_ip_git_and_gh_under_proxy_env \
+    | bep_host_ip_grant_box_reaches_the_proxy_lane \
     | bep_round_two_conditions_closed \
     | bep_audit_rotation_and_doctor_end_to_end \
     | bep_host_ip_cohort_blocks_udp_443 \
@@ -32559,6 +33154,8 @@ case "${1:-}" in
     echo "         bep_box_recreated_under_its_name_redeems bep_revoke_and_sign_out_end_to_end"
     echo "         bep_dns_steering_fails_closed_end_to_end bep_round_two_conditions_closed"
     echo "         bep_dns_steering_through_the_box_zone_resolver"
+    echo "         bep_host_ip_git_and_gh_under_dns_steering bep_host_ip_git_and_gh_under_proxy_env"
+    echo "         bep_host_ip_grant_box_reaches_the_proxy_lane"
     echo "         bep_host_ip_cohort_blocks_udp_443 bep_conditions_closed_end_to_end"
     echo "         bep_r3_spec_names_jti_and_quarantine bep_r3_pre_flip_udp_443_refused"
     echo "         bep_r3_finalize_install_names_quic_helper bep_r3_uninstall_removes_quic_helper"

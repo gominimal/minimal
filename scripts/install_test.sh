@@ -106,6 +106,9 @@ mkdir -p "$mock/versions/v1"
 write_min_stub() {
     printf '#!/bin/sh\n# mock min (%s)\n' "${2:-previous release}" >"$1"
     cat >>"$1" <<'MOCKEOF'
+# Every call records whether it ran with the installer's update-check guard
+# (MINIMAL_UNDER_INSTALLER) and its verb, in $HOME/min.calls.
+printf '%s %s\n' "${MINIMAL_UNDER_INSTALLER:-unset}" "${1:-}" >>"$HOME/min.calls"
 comp_target() {
     case "$1" in
         bash) printf '%s/bash-completion/completions/min\n' "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
@@ -659,6 +662,23 @@ case_install() {
     want_ok "the card names the first command (R10.4)" \
         grep -qE "min +build the sandbox and step inside" "$OUT"
     want_card_last "the card closes a fresh install (R10.4)"
+    # The install's description for the update check (R6.1b): the target,
+    # the method and the pointer installed, recorded so uninstall removes it.
+    _im="$H1/xdg-state/minimal/install.toml"
+    want_ok "install.toml is written beside the record (R6.1b)" test -f "$_im"
+    want_ok "install.toml names the target channel (R6.1b)" grep -qx 'channel = "stable"' "$_im"
+    want_ok "install.toml names the installer as the method (R6.1b)" grep -qx 'method = "installer"' "$_im"
+    want_ok "install.toml carries the installed pointer (R6.1b)" grep -qx 'key = "v1"' "$_im"
+    want_ok "install.toml names the binary it describes (R6.1b)" grep -qxF "bin = '$H1/bin/min'" "$_im"
+    want_ok "the installer runs its own min calls (R6.1b)" test -s "$H1/min.calls"
+    want_err "every min call of the installer is kept out of the update check (R6.1b)" \
+        grep -qv '^1 ' "$H1/min.calls"
+    want_ok "install.toml is recorded for uninstall (R6.1b)" \
+        record_has install-metadata "$_im" "$H1/xdg-state/minimal/installed"
+    want_ok "the card points at the update check's docs (R6.1b)" grep -q "reference/telemetry#update-check" "$OUT"
+    want_ok "the card says what the check sends (R6.1b)" grep -q "install id to update.minimal.dev" "$OUT"
+    want_ok "the card names the install method among the fields (R6.1b)" grep -q "architecture, install method and" "$OUT"
+    want_ok "the card names the check's off switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
     # Nothing on a redirected stream may carry terminal escapes (R10.1): this
     # output is a file, so a stray SGR here would land in every CI log. `run` sets a
     # terminal-like TERM, so what this pins is the `[ -t 2 ]` half of the guard:
@@ -839,6 +859,7 @@ EOF
     run ns_run "$HNS" --uninstall
     FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with the host DNS setup present exits 0"
+    want_err "uninstall removes install.toml (R6.1b)" test -e "$HNS/xdg-state/minimal/install.toml"
     want_ok "uninstall advises the host DNS setup is still installed" \
         grep -q "still installed on this host.*host DNS setup" "$OUT"
     want_ok "advisory names min finalize-install --undo" grep -q "min finalize-install --undo" "$OUT"
@@ -969,6 +990,33 @@ EOF
         "$(head -n 1 "$remedy_calls")" "the boot unit is disabled before anything is removed"
     want_ok "the remedy removes the classifier table" \
         grep -qx "nft delete table inet minimal_class" "$remedy_calls"
+
+    # The placement socket pair a current install leaves (gominimal/inbox#1206):
+    # the remedy disables the units whose files are there, never the earlier
+    # path pair this host does not carry, because systemctl refuses a whole
+    # call that names a unit it does not have.
+    HNS4S="$root/hns4s"; mkdir -p "$HNS4S"
+    run ns4s_seed "$HNS4S"
+    fake_ns4s="$root/fake net root-4s \$HOME"
+    cls_files_s="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.socket etc/systemd/system/minimald-place@.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
+    mkdir -p "$fake_ns4s/$cls_tree/classifier-table" "$fake_ns4s/$cls_tree/daemon" \
+        "$fake_ns4s/$cls_tree/boxes/allow" "$fake_ns4s/$cls_tree/boxes/deny"
+    for f in $cls_files_s; do
+        mkdir -p "$fake_ns4s/$(dirname "$f")"
+        printf 'unit\n' >"$fake_ns4s/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_ns4s"
+    run ns4s_run "$HNS4S" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the placement socket pair exits 0"
+    want_ok "the socket pair's units are advised" \
+        grep -q "still installed on this host.*classifier units" "$OUT"
+    apply_remedies 3
+    for f in $cls_files_s "$cls_tree" usr/local/lib/minimal; do
+        want_err "the printed remedies remove $f" test -e "$fake_ns4s/$f"
+    done
+    check "systemctl disable --now minimald-classifier.service minimald-place.socket" \
+        "$(head -n 1 "$remedy_calls")" "the remedy disables the units this host carries, and only those"
 
     # A tree without the step's record was installed another way: it is not
     # the step's to remove, so nothing advises removing it.
@@ -1366,6 +1414,11 @@ case_target_validation() {
     check 0 "$rc" "--version installs without a pointer (R2.5)"
     check "$h_minimald" "$(hash_file "$HV/bin/minimald")" "--version installs that version's bytes (R2.5)"
     want_ok "--version names the version, not a target (R2.5)" grep -q "version.*v1" "$OUT"
+    want_ok "--version records a pinned install, never notified (R6.1b)" \
+        grep -qx 'channel = "pinned"' "$HV/xdg-state/minimal/install.toml"
+    want_ok "--version is told the install is counted (R6.1b)" grep -q "no release notices for --version" "$OUT"
+    want_ok "--version is told what is sent and the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
+    want_ok "--version is told the channel it sends (R6.1b)" grep -q "(pinned), version, OS, architecture, install method" "$OUT"
     HV2="$root/hv2"; mkdir -p "$HV2"
     run versioneq "$HV2" --force-stop --version=v1
     check 0 "$rc" "--version=VER with another flag installs (R2.5)"
@@ -2861,8 +2914,15 @@ originates is refused" \
         grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
     want_ok "the deny subtree's DNS-port lookups are steered onto the answerer" \
         grep -q 'level 3 "minimald.slice/boxes/deny" udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
-    want_ok "the steer runs at dstnat, before the filter chain decides" \
-        grep -q 'type nat hook output priority dstnat' "$nft_input"
+    want_ok "the steer runs at dstnat's -100, before the filter chain decides" \
+        grep -q 'type nat hook output priority -100;' "$nft_input"
+    # nft before 1.0.9 refuses a priority name on a hook its matrix does not
+    # pair it with (dstnat is prerouting's, srcnat postrouting's), and one
+    # refusal fails the whole transaction, so no base chain may spell one.
+    want_err "no chain names dstnat off prerouting: nft before 1.0.9 refuses it" \
+        grep -qE 'hook (input|forward|output|postrouting) priority dstnat' "$nft_input"
+    want_err "no chain names srcnat off postrouting: nft before 1.0.9 refuses it" \
+        grep -qE 'hook (prerouting|input|forward|output) priority srcnat' "$nft_input"
     want_ok "the deny rule refuses actively, never a silent drop" \
         grep -q 'reject with icmpx admin-prohibited' "$nft_input"
     # NET-078, translated: classification and translation are two chains,
@@ -3243,6 +3303,10 @@ STUB
     drop_cgroup_files "$tree/boxes/deny"
     drop_cgroup_files "$tree/boxes/allow"
     drop_cgroup_files "$tree/boxes/quic443-blocked"
+    # The probe leaf a daemon stopped mid-probe leaves behind
+    # (gominimal/inbox#1206) is the probe's own, so it does not stop the
+    # uninstall.
+    mkdir "$tree/boxes/deny/filter-probe-4242"
     run_hc uninstall "$root/mi-on" --uninstall
     check 0 "$rc" "uninstall removes the installed tree"
     want_err "uninstall leaves no tree behind" test -e "$tree"
@@ -3276,8 +3340,8 @@ STUB
         grep -q "numeric process id" "$OUT"
 
     # --- --place-listener: the same placement, found from the daemon's own
-    # listener so a manager-held path unit can make it at every start the
-    # socket announces (no per-restart --pid). Over a stand-in process table:
+    # listener so the manager-held placement unit can make it at every start
+    # the daemon asks for (no per-restart --pid). Over a stand-in process table:
     # the holder of the socket that runs as the delegated account outside
     # the slice is placed; a holder of another uid, a holder of another
     # socket, a same-uid holder already inside the slice (a box in
@@ -3669,6 +3733,59 @@ case_answerer_source_installed() {
     PLAT_S=Linux; PLAT_M=x86_64
 }
 
+# --- inbox#1197: the profile installer on a host whose parser has no abi/4.0 --
+# The shipped loader decides by the kernel's switch, as `min finalize-install`
+# does: with the switch off it installs nothing and says so, with it on it
+# fails and names the remedy, and --check reports a skip either way. Driven
+# over a scratch policy directory and a stub apparmor_parser, under bash,
+# the loader's own shell.
+case_apparmor_profile_installer() {
+    aa_loader="$here/install-apparmor-profile.sh"
+    aa_stub="$root/aa-stub"; mkdir -p "$aa_stub"
+    # shellcheck disable=SC2016 # the $1 is the stub's own, read when it runs
+    printf '#!/bin/sh\ncase "$1" in --version) echo "AppArmor parser version 3.0.8";; esac\nexit 0\n' >"$aa_stub/apparmor_parser"
+    chmod +x "$aa_stub/apparmor_parser"
+    aa_old="$root/aa-old"; mkdir -p "$aa_old/abi"          # no abi/4.0
+    aa_new="$root/aa-new"; mkdir -p "$aa_new/abi"; : >"$aa_new/abi/4.0"
+    aa_sw="$root/aa-switch"
+    run_aa() {
+        _label="$1"; _d="$2"; _sw="$3"; shift 3
+        OUT="$root/out.$_label"
+        set +e
+        env -i PATH="$aa_stub:/usr/bin:/bin" HOME="$root" \
+            MINIMAL_APPARMOR_D="$_d" MINIMAL_APPARMOR_RESTRICT_FILE="$_sw" \
+            bash "$aa_loader" "$@" >"$OUT" 2>&1
+        rc=$?
+        set -e
+    }
+    # The switch off: nothing to install, said in sentences, exit 0, no root needed.
+    printf '0\n' >"$aa_sw"
+    run_aa aa_off "$aa_old" "$aa_sw"
+    check 0 "$rc" "an old parser on a kernel that does not restrict userns installs nothing and exits 0"
+    want_ok "the note says the kernel does not restrict user namespaces" \
+        grep -q "does not restrict unprivileged user namespaces" "$OUT"
+    want_ok "the note says nothing was installed" grep -q "Nothing was installed" "$OUT"
+    want_err "the note says nothing false about the parser mediating" grep -q "does not mediate" "$OUT"
+    # The switch on: the profile is needed and this parser cannot load it; fail, with the remedy.
+    printf '1\n' >"$aa_sw"
+    run_aa aa_on "$aa_old" "$aa_sw"
+    check 1 "$rc" "an old parser on a kernel that restricts userns fails"
+    want_ok "the failure names the switch and the remedy" \
+        grep -q "apparmor_restrict_unprivileged_userns=1" "$OUT"
+    want_ok "the failure names min finalize-install" grep -q "run min finalize-install again" "$OUT"
+    # The switch file absent (a kernel without the knob): as off.
+    run_aa aa_noknob "$aa_old" "$root/no-such-switch"
+    check 0 "$rc" "a kernel without the switch is one that does not restrict"
+    # --check on the old parser: a skip line, exit 0, whatever the switch says.
+    run_aa aa_check_old "$aa_old" "$aa_sw" --check
+    check 0 "$rc" "--check exits 0 on an old parser"
+    want_ok "--check says it skipped the parse" grep -q "Check skipped" "$OUT"
+    # --check with abi/4.0 present: the parser runs (the stub exits 0) and the profile parses.
+    run_aa aa_check_new "$aa_new" "$aa_sw" --check
+    check 0 "$rc" "--check parses with abi/4.0 present"
+    want_ok "--check reports the parse" grep -q "profile parses" "$OUT"
+}
+
 # --- Case dispatch -----------------------------------------------------------
 # Every scenario group above is one named case. No argument runs them all, in
 # the order the linear script used to have; one argument runs exactly that
@@ -3680,6 +3797,7 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
+        apparmor_profile_installer)         case_apparmor_profile_installer ;;
         finalize_install_uninstall)         case_finalize_install_uninstall ;;
         installer_offers_finalize_install_on_a_tty) case_installer_offers_finalize_install_on_a_tty ;;
         installer_prints_the_pointer_when_declined_or_without_tty)
@@ -3708,7 +3826,8 @@ case_for() {
 }
 case "${1:-}" in
     "")
-        for _c in install apparmor apparmor_uninstall finalize_install_uninstall \
+        for _c in install apparmor apparmor_uninstall apparmor_profile_installer \
+            finalize_install_uninstall \
             installer_offers_finalize_install_on_a_tty \
             installer_prints_the_pointer_when_declined_or_without_tty \
             installer_does_not_prompt_on_a_finished_host checksum_mismatch \
