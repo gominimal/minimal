@@ -12980,12 +12980,10 @@ while True:
 # proxy on the same port. A second activate after the recovery names that
 # port on its `names:` line, as `min ls` does.
 #
-# The `min ls` row that names the cause: on a native lane it is the
-# HOSTNAME PROXY row, as NET-020 says. On a VM lane `min ls` prints the
-# cause on the BOX NAMES row and prints no HOSTNAME PROXY row while the port
-# is held. That differs from NET-020, and #3046 tracks it. After the
-# recovery the cause is gone from every row, and the HOSTNAME PROXY row
-# names the port on both lanes.
+# The `min ls` row that names the cause is the HOSTNAME PROXY row on every
+# lane, as NET-020 says. On a VM lane the BOX NAMES row does not repeat the
+# cause. After the recovery the cause is gone from every row, and the
+# HOSTNAME PROXY row names the port on both lanes.
 #
 # Lanes: on a VM lane (E2E_VM) the case pins the VM's proxy port with
 # MINVMD_NODE_PROXY_PORT, so the VM starts with its proxy down and the VM
@@ -13172,10 +13170,8 @@ while True:
   fi
   echo "activate (port held), matched once: $prf_line"
 
-  # The row that names the cause: BOX NAMES on a VM lane (#3046), HOSTNAME
-  # PROXY on a native lane (NET-020).
+  # The row that names the cause: HOSTNAME PROXY on every lane (NET-020).
   local prf_cause_row="HOSTNAME PROXY:"
-  if [ "$min_daemon" = minvmd ]; then prf_cause_row="BOX NAMES:"; fi
   prf_row=""
   for _ in $(seq 1 30); do
     prf_ls="$(mnl ls 2>"$WORK/prf-ls.err" || true)"
@@ -13197,9 +13193,14 @@ while True:
         printf '%s\n' "$prf_row"
         prf_restore_env; fail ;;
     esac
-    prf_count="$(printf '%s\n' "$prf_ls" | grep -c -F -- 'the hostname proxy is not serving' || true)"
+    prf_count="$(printf '%s\n' "$prf_ls" | grep -c -F -- "holds 127.0.0.1:$prf_pin." || true)"
     if [ "${prf_count:-0}" != 1 ]; then
       echo "::error::min ls printed the proxy's cause ${prf_count:-0} times, not once (NET-020)"
+      echo "--- min ls ---"; printf '%s\n' "$prf_ls"
+      prf_restore_env; fail
+    fi
+    if printf '%s\n' "$prf_ls" | grep -F -- 'BOX NAMES:' | grep -qF -- "127.0.0.1:$prf_pin"; then
+      echo "::error::min ls's BOX NAMES row repeats the cause on 127.0.0.1:$prf_pin (NET-020)"
       echo "--- min ls ---"; printf '%s\n' "$prf_ls"
       prf_restore_env; fail
     fi
