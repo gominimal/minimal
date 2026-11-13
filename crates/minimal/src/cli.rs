@@ -759,6 +759,21 @@ pub struct BoxShowArgs {
     /// the command that created it applied
     #[arg(long)]
     pub network: bool,
+    /// Write the box and its running commands in this format instead of
+    /// text
+    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "network")]
+    pub output: Option<BoxShowOutputFormat>,
+}
+
+/// The formats `min box show` writes, beside text.
+// BCLI-033: each format carries one `min/v1/box` object, its execs as
+// `min/v1/exec` objects.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxShowOutputFormat {
+    /// JSON: one object for the box
+    Json,
+    /// YAML: one mapping for the box
+    Yaml,
 }
 
 // BOX-013 (BCLI-059), BOX-151 (BCLI-055):
