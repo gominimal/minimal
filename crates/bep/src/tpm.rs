@@ -20,7 +20,8 @@
 //! It passes it in the `hex:` form, because `tpm2-tools` reads a raw value as
 //! a C string and drops every byte from the first zero byte.
 //! The shared secret of an ECDH goes through a file in a directory in memory,
-//! under `$XDG_RUNTIME_DIR` or `/dev/shm`, and never through the disk.
+//! under `$XDG_RUNTIME_DIR` or `/dev/shm`, and never through the disk. The
+//! store uses such a directory only when `statfs` reports `tmpfs` or `ramfs`.
 //! A key keeps a saved context of itself while the proxy runs, and loads
 //! itself again from its blob when the TPM refuses that context, as it does
 //! after a TPM reset.
@@ -175,16 +176,22 @@ fn is_auth_failure(code: &str) -> bool {
 
 /// The directory, in memory, for the files that hold an ECDH shared secret:
 /// `minimal-bep-tpm` under `runtime`, or `minimal-bep-tpm-<uid>` under `shm`
-/// when there is no runtime directory. Only `uid` can use it.
-fn secret_root_in(runtime: Option<&Path>, shm: &Path, uid: u32) -> Result<PathBuf, String> {
+/// when there is no runtime directory in memory. `in_memory` says whether a
+/// directory is on a file system in memory. Only `uid` can use the result.
+fn secret_root_in(
+    runtime: Option<&Path>,
+    shm: &Path,
+    uid: u32,
+    in_memory: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, String> {
     use std::os::unix::fs::MetadataExt as _;
     let path = match runtime {
-        Some(dir) => dir.join("minimal-bep-tpm"),
-        None if shm.is_dir() => shm.join(format!("minimal-bep-tpm-{uid}")),
-        None => {
+        Some(dir) if in_memory(dir) => dir.join("minimal-bep-tpm"),
+        _ if shm.is_dir() && in_memory(shm) => shm.join(format!("minimal-bep-tpm-{uid}")),
+        _ => {
             return Err(format!(
-                "XDG_RUNTIME_DIR is not set and {} does not exist, so the proxy has no \
-                 directory in memory for the TPM's shared secrets",
+                "XDG_RUNTIME_DIR does not name a directory in memory and {} is not one \
+                 either, so the proxy has no directory in memory for the TPM's shared secrets",
                 shm.display()
             ));
         }
@@ -213,7 +220,33 @@ fn secret_root() -> Result<PathBuf, String> {
     // SAFETY: `geteuid` takes no argument, reads process state and cannot
     // fail.
     let uid = unsafe { libc::geteuid() };
-    secret_root_in(runtime.as_deref(), Path::new("/dev/shm"), uid)
+    secret_root_in(runtime.as_deref(), Path::new("/dev/shm"), uid, in_memory)
+}
+
+/// Whether `path` is on `tmpfs` or `ramfs`, the file systems that keep
+/// their files in memory. A path that `statfs` cannot read is not.
+fn in_memory(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c_path` is a NUL-terminated string that lives for the call,
+    // and `stat` points at space for one `statfs` that the call fills.
+    if unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `statfs` returned 0, so it filled `stat`.
+    let stat = unsafe { stat.assume_init() };
+    // The type of `f_type` and of the magic numbers differs between libc
+    // targets, so compare them as `u64`.
+    #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+    let fs_type = stat.f_type as u64;
+    #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+    let tmpfs = libc::TMPFS_MAGIC as u64;
+    // `RAMFS_MAGIC` from `linux/magic.h`, which `libc` does not export.
+    const RAMFS_MAGIC: u64 = 0x8584_58f6;
+    fs_type == tmpfs || fs_type == RAMFS_MAGIC
 }
 
 /// What the TPM reported for a key in its public area.
@@ -1299,28 +1332,43 @@ mod tests {
         let shm = tempfile::tempdir().expect("tempdir");
         let uid = fs::metadata(runtime.path()).expect("meta").uid();
 
-        let root = secret_root_in(Some(runtime.path()), shm.path(), uid).expect("runtime");
+        let root =
+            secret_root_in(Some(runtime.path()), shm.path(), uid, |_| true).expect("runtime");
         assert_eq!(root, runtime.path().join("minimal-bep-tpm"));
         let mode = fs::metadata(&root).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         // A second call finds the same directory.
         assert_eq!(
-            secret_root_in(Some(runtime.path()), shm.path(), uid).expect("again"),
+            secret_root_in(Some(runtime.path()), shm.path(), uid, |_| true).expect("again"),
             root
         );
 
-        let root = secret_root_in(None, shm.path(), uid).expect("shm");
+        let root = secret_root_in(None, shm.path(), uid, |_| true).expect("shm");
         assert_eq!(root, shm.path().join(format!("minimal-bep-tpm-{uid}")));
 
+        // A runtime directory on the disk is passed over for `shm`.
+        let on_disk = runtime.path().to_path_buf();
+        let root = secret_root_in(Some(runtime.path()), shm.path(), uid, |dir| dir != on_disk)
+            .expect("shm, not the runtime directory on the disk");
+        assert_eq!(root, shm.path().join(format!("minimal-bep-tpm-{uid}")));
+        // With neither directory in memory, the store refuses.
+        let err = secret_root_in(Some(runtime.path()), shm.path(), uid, |_| false)
+            .expect_err("no directory in memory");
+        assert!(err.contains("XDG_RUNTIME_DIR"), "{err}");
+        // `/proc` is not in memory in the sense the store needs.
+        assert!(!in_memory(Path::new("/proc")));
+        assert!(!in_memory(Path::new("/no/such/directory")));
+
         let missing = shm.path().join("missing");
-        let err = secret_root_in(None, &missing, uid).expect_err("no directory in memory");
+        let err =
+            secret_root_in(None, &missing, uid, |_| true).expect_err("no directory in memory");
         assert!(err.contains("XDG_RUNTIME_DIR"), "{err}");
 
         // A directory that another user can read is refused.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert!(secret_root_in(None, shm.path(), uid).is_err());
+        assert!(secret_root_in(None, shm.path(), uid, |_| true).is_err());
         // A directory that another user owns is refused.
-        assert!(secret_root_in(Some(runtime.path()), shm.path(), uid + 1).is_err());
+        assert!(secret_root_in(Some(runtime.path()), shm.path(), uid + 1, |_| true).is_err());
     }
 
     // A tool that exits before it reads its input still reports the TPM's
