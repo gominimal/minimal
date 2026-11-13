@@ -10127,6 +10127,207 @@ async fn box_attach_exec_own_end_code7_exits_0() {
     );
 }
 
+/// BCLI-068: Ctrl-] then d ends `min box attach <box> --exec <id>` with 0.
+/// The attach's ssh sends the session keys from the config, the keys the
+/// daemon reads to end the channel on a detach with status 0. The exec
+/// keeps running, `min box show` still lists it, and a second attach
+/// reaches it.
+#[tokio::test]
+async fn exec_attach_detach_key_returns_0_exec_keeps_running() {
+    use minimald_rpc::exec::ExecId;
+
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        true,
+    );
+    let _live = alpha
+        .server
+        .list_running_exec(web, AN_EXEC_ID, &["sh", "-i"], true);
+    let exec_id = ExecId::parse(AN_EXEC_ID).unwrap();
+
+    // The ssh the attach runs asks for a terminal and sends the session
+    // keys: the default keys with no config, and the configured ones.
+    let config = tempfile::TempDir::new().unwrap();
+    let sent = |config_dir: &std::path::Path| {
+        let ssh = exec_attach_ssh(&alpha.host.sock, web, &exec_id, Some(config_dir))
+            .expect("the exec attach's ssh");
+        let args: Vec<String> = ssh
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let envs: std::collections::BTreeMap<String, String> = ssh
+            .get_envs()
+            .filter_map(|(name, value)| {
+                Some((
+                    name.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        (args, envs)
+    };
+    let (args, envs) = sent(config.path());
+    assert_eq!(args.first().map(String::as_str), Some("-tt"), "{args:?}");
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    assert!(args.contains(&wire), "the exec attach's request: {args:?}");
+    let defaults = boxes::keys::SessionKeys::default();
+    for (name, value) in [
+        (boxes::keys::LEADER_ENV, defaults.leader.as_config_str()),
+        (
+            boxes::keys::DETACH_KEY_ENV,
+            defaults.detach_key.as_config_str(),
+        ),
+    ] {
+        assert_eq!(envs.get(name), Some(&value), "{name}: {envs:?}");
+        assert!(
+            args.contains(&format!("SendEnv={name}")),
+            "{name}: {args:?}"
+        );
+    }
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"q\"\n",
+    )
+    .unwrap();
+    let (_, envs) = sent(config.path());
+    assert_eq!(
+        envs.get(boxes::keys::DETACH_KEY_ENV).map(String::as_str),
+        Some("q"),
+        "the configured detach key: {envs:?}"
+    );
+
+    // The daemon ends a detached channel with 0, and the attach ends with
+    // 0 and no line.
+    let ending = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async |_: &BoxAttachTarget, _: &ExecId| Ok(0),
+    )
+    .await
+    .expect("the detach ends the attach");
+    assert_eq!(
+        ending,
+        AttachEnding {
+            code: 0,
+            notice: None
+        }
+    );
+
+    // The exec keeps running, and a second attach reaches it.
+    let text = box_show_text(&alpha.host, "web").await;
+    assert_eq!(
+        live_exec_rows(&text),
+        [
+            "Live execs:".to_owned(),
+            format!("  {AN_EXEC_ID}  terminal  sh -i"),
+        ],
+        "{text}"
+    );
+    let mut reached = None;
+    let ending = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async |target: &BoxAttachTarget, exec_id: &ExecId| {
+            reached = Some((target.box_id, exec_id.clone()));
+            Ok(0)
+        },
+    )
+    .await
+    .expect("the second attach ends");
+    assert_eq!(reached, Some((web, exec_id)), "the second attach ran");
+    assert_eq!(ending.code, 0);
+}
+
+/// BCLI-068: `min box exec -t`'s first attach sends the configured session
+/// keys. With `detach = "q"` in the config, its ssh carries the leader and
+/// detach env vars and forwards both with `SendEnv`.
+#[tokio::test]
+async fn box_exec_t_attach_sends_configured_session_keys() {
+    let (alpha, _state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let exec_id = minimald_rpc::exec::ExecId::parse(AN_EXEC_ID).unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"q\"\n",
+    )
+    .unwrap();
+
+    let session_keys = minimal_client::attach::resolve_session_keys(Some(config.path()))
+        .expect("the session-key config resolves");
+    let ssh = exec_terminal_ssh(&alpha.host.sock, web, &exec_id, &session_keys)
+        .expect("the exec -t attach's ssh");
+    let args: Vec<String> = ssh
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let envs: std::collections::BTreeMap<String, String> = ssh
+        .get_envs()
+        .filter_map(|(name, value)| {
+            Some((
+                name.to_string_lossy().into_owned(),
+                value?.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect();
+    assert_eq!(args.first().map(String::as_str), Some("-tt"), "{args:?}");
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    assert!(args.contains(&wire), "the exec attach's request: {args:?}");
+    let defaults = boxes::keys::SessionKeys::default();
+    for (name, value) in [
+        (boxes::keys::LEADER_ENV, defaults.leader.as_config_str()),
+        (boxes::keys::DETACH_KEY_ENV, "q".to_owned()),
+    ] {
+        assert_eq!(envs.get(name), Some(&value), "{name}: {envs:?}");
+        assert!(
+            args.contains(&format!("SendEnv={name}")),
+            "{name}: {args:?}"
+        );
+    }
+}
+
+/// BCLI-068: `min box exec -t` resolves the session keys before it starts
+/// the exec. A session-key config that is not valid ends the command with
+/// no exec started, so no exec runs without its attach.
+#[tokio::test]
+async fn box_exec_t_invalid_session_keys_starts_no_exec() {
+    let mut host = exec_host().await;
+    let config = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+    // The detach key is the leader, which the config refuses.
+    std::fs::write(
+        config.path().join("minimal").join("config.toml"),
+        "[session-keys.subcommands]\ndetach = \"ctrl-]\"\n",
+    )
+    .unwrap();
+    host.global.config_dir = Some(config.path().to_path_buf());
+    let marker_dir = tempfile::TempDir::new().unwrap();
+    let marker = marker_dir.path().join("ran");
+    let touch = marker.to_str().expect("a UTF-8 marker path");
+
+    let run =
+        run_box_exec_on_host(&host, &box_exec_request("web", &["-t"], &["touch", touch])).await;
+    let error = run.error.as_ref().expect("the exec -t fails");
+    assert!(
+        format!("{error:#}").contains("session-keys"),
+        "the session-key config is named\n{run}"
+    );
+    assert_eq!(run.stderr, "", "no exec id is printed\n{run}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!marker.exists(), "no exec ran\n{run}");
+}
+
 /// BCLI-068: `min box stop` ends the attached exec by its signal, which the
 /// daemon reports as 1, before it writes the stopped record. The command
 /// reads the box again, and ends with 254 and the stop's line. A removed
@@ -11367,6 +11568,7 @@ async fn run_box_exec_on_host_with(
         cmd::daemon_host_kind(&host.global),
         request,
         terminal,
+        host.global.config_dir.as_deref(),
         None,
         &mut stdout,
         &mut stderr,
@@ -13119,6 +13321,7 @@ async fn type_noun_logs_follow() {
         let once = BoxLogsArgs {
             target: target.to_owned(),
             follow: false,
+            raw: false,
         };
         let mut out = Vec::new();
         box_logs_on_hosts(
@@ -13126,6 +13329,7 @@ async fn type_noun_logs_follow() {
             &once,
             box_type,
             verb,
+            false,
             &mut out,
         )
         .await
@@ -13143,12 +13347,14 @@ async fn type_noun_logs_follow() {
         let other = BoxLogsArgs {
             target: target.to_owned(),
             follow: false,
+            raw: false,
         };
         box_logs_on_hosts(
             local_hosts(&global).unwrap(),
             &other,
             Some(box_type),
             verb,
+            false,
             &mut out,
         )
         .await
@@ -13166,6 +13372,7 @@ async fn type_noun_logs_follow() {
                     args,
                     *box_type,
                     verb,
+                    false,
                     &mut out,
                 )
                 .await
@@ -13209,17 +13416,165 @@ async fn type_noun_logs_follow() {
     let gone = BoxLogsArgs {
         target: "web".to_owned(),
         follow: false,
+        raw: false,
     };
     box_logs_on_hosts(
         local_hosts(&global).unwrap(),
         &gone,
         None,
         "box logs",
+        false,
         &mut out,
     )
     .await
     .expect_err("the removed box has no output to read");
     assert!(out.is_empty());
+}
+
+/// What a terminal box writes: a bracketed-paste switch, a window title
+/// (OSC ended by BEL), colour (CSI), a DCS string ended by ST, a charset
+/// switch, a bare BEL, and UTF-8 text.
+const PTY_TRANSCRIPT: &[u8] = b"\x1b[?2004h\x1b]0;user@web: ~\x07\x1b[1;32mgreen\x1b[0m text\r\n\
+\x1bPq#0\x1b\\\x1b(Bdone\x07\r\n\xc3\xa9t\xc3\xa9\r\n";
+
+/// [`PTY_TRANSCRIPT`] with the control sequences removed.
+const PTY_TEXT: &str = "green text\r\ndone\r\n\u{e9}t\u{e9}\r\n";
+
+/// Reads the output of box `target` as the logs verb does, with `raw` and
+/// `stdout_is_terminal` as given.
+async fn read_box_logs(
+    global: &GlobalArgs,
+    target: &str,
+    raw: bool,
+    stdout_is_terminal: bool,
+) -> Vec<u8> {
+    let args = BoxLogsArgs {
+        target: target.to_owned(),
+        follow: false,
+        raw,
+    };
+    let mut out = Vec::new();
+    box_logs_on_hosts(
+        local_hosts(global).unwrap(),
+        &args,
+        None,
+        "box logs",
+        stdout_is_terminal,
+        &mut out,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("`min box logs {target}` reads the output: {e:#}"));
+    out
+}
+
+// BCLI-012 (T45): `min box logs <pty box> | cat` gets the transcript text
+// with no terminal control sequences. A box with no terminal gets its
+// bytes unchanged, and so does a stdout that is a terminal.
+#[tokio::test]
+async fn box_logs_piped_pty_transcript_has_no_control_codes() {
+    // The stripper keeps its state across chunks, so a sequence split
+    // between two output chunks is still removed whole.
+    for split in 0..=PTY_TRANSCRIPT.len() {
+        let mut strip = ControlStripper::default();
+        let mut text = Vec::new();
+        strip.strip(&PTY_TRANSCRIPT[..split], &mut text);
+        strip.strip(&PTY_TRANSCRIPT[split..], &mut text);
+        assert_eq!(String::from_utf8_lossy(&text), PTY_TEXT, "split at {split}");
+    }
+    // A sequence the stream ends inside writes nothing.
+    let mut text = Vec::new();
+    ControlStripper::default().strip(b"end\x1b]0;tit", &mut text);
+    assert_eq!(text, b"end");
+    // A string with no end stops at the line feed, so the rest of the
+    // transcript still shows.
+    let mut text = Vec::new();
+    ControlStripper::default().strip(b"a\x1b]0;title\nnext line\n", &mut text);
+    assert_eq!(text, b"a\nnext line\n");
+    // A CSI or escape sequence with no final byte stops at the line end,
+    // so the next line still shows.
+    let mut text = Vec::new();
+    ControlStripper::default().strip(b"a\x1b[12\nnext line\n", &mut text);
+    assert_eq!(text, b"a\nnext line\n");
+    let mut text = Vec::new();
+    ControlStripper::default().strip(b"a\x1b(\rnext\x1b[1;\nline\n", &mut text);
+    assert_eq!(text, b"a\rnext\nline\n");
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let web = create_attach_box(&mut daemon, "web", project.path(), Some(true)).await;
+    let plain = create_attach_box(&mut daemon, "plain", project.path(), Some(false)).await;
+    append_box_output(&box_store_dir(&state_path, web), PTY_TRANSCRIPT);
+    append_box_output(&box_store_dir(&state_path, plain), PTY_TRANSCRIPT);
+
+    let piped = read_box_logs(&global, "web", false, false).await;
+    assert_eq!(String::from_utf8_lossy(&piped), PTY_TEXT);
+    assert!(
+        !piped.iter().any(|b| *b == 0x1b || *b == 0x07),
+        "no ESC or BEL in {piped:?}"
+    );
+
+    // A terminal gets the raw stream.
+    let terminal = read_box_logs(&global, "web", false, true).await;
+    assert_eq!(terminal, PTY_TRANSCRIPT);
+
+    // A box with no terminal writes its bytes as they are.
+    let plain_piped = read_box_logs(&global, "plain", false, false).await;
+    assert_eq!(plain_piped, PTY_TRANSCRIPT);
+}
+
+// BCLI-012 (T45): `--raw` writes a terminal box's transcript unchanged,
+// with its control sequences, to a stdout that is not a terminal. Each
+// logs noun takes the flag.
+#[tokio::test]
+async fn box_logs_raw_keeps_control_codes() {
+    use clap::Parser as _;
+
+    for noun in ["session", "task", "box"] {
+        let cli = Cli::try_parse_from(["min", noun, "logs", "web", "--raw"])
+            .unwrap_or_else(|e| panic!("`min {noun} logs web --raw` parses: {e}"));
+        let raw = match cli.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Logs(args),
+            }))
+            | Some(Command::Task(TaskArgs {
+                command: TaskCommand::Logs(args),
+            })) => args.raw,
+            Some(Command::Box(BoxArgs {
+                command: BoxCommand::Logs(args),
+            })) => args.logs.raw,
+            _ => panic!("expected `min {noun} logs`"),
+        };
+        assert!(raw, "`min {noun} logs --raw` sets raw");
+    }
+    let cli = Cli::try_parse_from(["min", "box", "logs", "web"]).expect("parses");
+    let Some(Command::Box(BoxArgs {
+        command: BoxCommand::Logs(args),
+    })) = cli.command
+    else {
+        panic!("expected `min box logs`");
+    };
+    assert!(!args.logs.raw, "raw is off by default");
+    // `--exec` writes one command's output as it is, so it refuses `--raw`.
+    assert!(
+        Cli::try_parse_from(["min", "box", "logs", "web", "--exec", "1", "--raw"]).is_err(),
+        "`min box logs --exec --raw` is refused"
+    );
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let web = create_attach_box(&mut daemon, "web", project.path(), Some(true)).await;
+    append_box_output(&box_store_dir(&state_path, web), PTY_TRANSCRIPT);
+
+    let raw = read_box_logs(&global, "web", true, false).await;
+    assert_eq!(raw, PTY_TRANSCRIPT);
 }
 
 /// Drives the create flow of `create_configured_session` with the task
@@ -15987,6 +16342,7 @@ async fn task_run_logs_wait_list_end_to_end() {
         let follow_args = BoxLogsArgs {
             target: "check".to_owned(),
             follow: true,
+            raw: false,
         };
         let followed = SharedOut::default();
         let follow = {
@@ -15999,6 +16355,7 @@ async fn task_run_logs_wait_list_end_to_end() {
                     args,
                     Some(boxes::TASK_BOX_TYPE),
                     "task logs",
+                    false,
                     &mut out,
                 )
                 .await
@@ -16761,6 +17118,104 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
     assert_eq!(format!("{error:#}"), format!("{expected:#}"));
 }
 
+/// The project file error that `min box spec` ends with.
+fn spec_project_error(error: &anyhow::Error) -> &mfile::Error {
+    &error
+        .downcast_ref::<crate::ProjectFileInvalid>()
+        .unwrap_or_else(|| panic!("not a project file error: {error:#}"))
+        .error
+}
+
+// BOX-171, BOX-172, BOX-173, BOX-175, BOX-181: `min box spec <entry>`
+// reads the box's loadout mode before any loadout, as `min box start`
+// does. A sealed entry refuses `--loadout` and reads no default loadout.
+// A loadout that sets `loadout_mode` and a contradicted constraint refuse
+// with exit 3.
+#[tokio::test]
+async fn box_spec_entry_gates_loadouts_as_start() {
+    let (_project, global) = spec_project(
+        "[sessions.locked]\nloadout_mode = 'sealed'\n\n\
+         [sessions.dev]\nloadout_mode = 'open'\n\n\
+         [box_types.ci]\nextends = 'session'\nconstraints = { loadout_mode = 'sealed' }\n\n\
+         [boxes.ci]\ntype = 'ci'\nloadout_mode = 'open'\n\n\
+         [tasks.lint]\necho = 'x'\n",
+    );
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(loadouts.join("default.toml"), "= not = toml =").unwrap();
+    std::fs::write(loadouts.join("dev.toml"), "packages = [\"helix\"]\n").unwrap();
+    std::fs::write(loadouts.join("moder.toml"), "loadout_mode = \"open\"\n").unwrap();
+
+    let error = box_spec_text(
+        &global,
+        &["min", "box", "spec", "locked", "--loadout", "dev"],
+    )
+    .await
+    .expect_err("a sealed entry refuses --loadout");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(invalid, mfile::Error::NamedLoadoutOnSealedBox { .. }),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    let toml = box_spec_text(&global, &["min", "box", "spec", "locked"])
+        .await
+        .expect("a sealed entry reads no default loadout");
+    assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
+
+    // A sealed task entry reads no default loadout, as `min task run` does.
+    let toml = box_spec_text(&global, &["min", "box", "spec", "lint"])
+        .await
+        .expect("a sealed task entry reads no default loadout");
+    assert!(toml.contains("\n# Loadouts: none.\n"), "{toml}");
+
+    let error = box_spec_text(
+        &global,
+        &["min", "box", "spec", "dev", "--loadout", "moder"],
+    )
+    .await
+    .expect_err("a loadout that sets loadout_mode refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::LoadoutSetsLoadoutMode { loadout: Some(name) } if name == "moder"
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    let error = box_spec_text(&global, &["min", "box", "spec", "ci"])
+        .await
+        .expect_err("a contradicted constraint refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(invalid, mfile::Error::ConstraintViolated { .. }),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+
+    // BOX-172: an open task entry takes its default loadouts, as
+    // `min task run` does, so one that sets `loadout_mode` refuses.
+    let (_project, global) = spec_project("[tasks.opened]\necho = 'x'\nloadout_mode = 'open'\n");
+    let loadouts = global.config_dir.clone().unwrap().join("minimal/loadouts");
+    std::fs::create_dir_all(&loadouts).unwrap();
+    std::fs::write(loadouts.join("default.toml"), "loadout_mode = \"open\"\n").unwrap();
+    let error = box_spec_text(&global, &["min", "box", "spec", "opened"])
+        .await
+        .expect_err("an open task entry refuses a loadout that sets loadout_mode");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::LoadoutSetsLoadoutMode { loadout: Some(name) } if name == "default"
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+}
+
 /// Creates a session box on the in-process daemon `server` from the
 /// project in `root`, named `name` when it is given, with its spec stamped
 /// on the request as a start stamps it. Gives the request and the box id.
@@ -17353,6 +17808,196 @@ async fn retained_box_management_end_to_end() {
             "a `{verb}` event in the span\n{log}\n{ran}"
         );
     }
+}
+
+/// A project with `minimal_toml` and a client config directory whose
+/// `loadouts` directory holds each `(file, text)` of `loadouts`, with
+/// `config_toml` as the client config. Returns both directories and the
+/// global flags that point at them.
+fn loadout_project(
+    minimal_toml: &str,
+    config_toml: &str,
+    loadouts: &[(&str, &str)],
+) -> (tempfile::TempDir, tempfile::TempDir, GlobalArgs) {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), minimal_toml).unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let dir = config.path().join("minimal");
+    std::fs::create_dir_all(dir.join("loadouts")).unwrap();
+    std::fs::write(dir.join("config.toml"), config_toml).unwrap();
+    for (file, text) in loadouts {
+        std::fs::write(dir.join("loadouts").join(file), text).unwrap();
+    }
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        config_dir: Some(config.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+    (project, config, global)
+}
+
+fn utf8(dir: &tempfile::TempDir) -> camino::Utf8PathBuf {
+    camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap()
+}
+
+// BOX-171: `min task run` of a sealed task skips the config's default
+// loadouts and prints nothing about them. The same task set to `open`
+// takes the default loadout and prints the line that names it.
+#[test]
+fn sealed_task_run_prints_nothing_about_loadouts() {
+    let (project, _config, global) = loadout_project(
+        "[tasks.lint]\necho = 'x'\n\n[tasks.opened]\necho = 'x'\nloadout_mode = 'open'\n",
+        "",
+        &[("default.toml", "packages = [\"zellij\"]\n")],
+    );
+    let root = utf8(&project);
+    for task in ["lint", "undeclared"] {
+        let inputs = task::task_activation_inputs(
+            &global,
+            &root,
+            task,
+            false,
+            false,
+            boxes::core::policy::UserPolicy::default(),
+        )
+        .unwrap_or_else(|e| panic!("{task}: {e:#}"));
+        assert!(
+            inputs.loadout_names.is_empty(),
+            "{task}: {:?}",
+            inputs.loadout_names
+        );
+        assert_eq!(inputs.loadouts_line(), None, "{task}");
+    }
+
+    let inputs = task::task_activation_inputs(
+        &global,
+        &root,
+        "opened",
+        false,
+        false,
+        boxes::core::policy::UserPolicy::default(),
+    )
+    .expect("an open task takes its default loadouts");
+    assert_eq!(
+        inputs.loadouts_line().as_deref(),
+        Some("Applying loadouts: default")
+    );
+}
+
+// BOX-175: a sealed box reads no loadout that `default_loadouts` names,
+// and not the `default` loadout either, so a broken or missing one does
+// not fail it. An open box reads them, and fails on the broken one.
+#[test]
+fn sealed_box_ignores_broken_default_loadout() {
+    let minimal_toml = "[tasks.lint]\necho = 'x'\n\n\
+                        [sessions.locked]\nloadout_mode = 'sealed'\n\n\
+                        [sessions.dev]\n";
+    let configs: [(&str, &[(&str, &str)]); 2] = [
+        // The `default` loadout applies, and its file does not parse.
+        ("", &[("default.toml", "= not = toml =")]),
+        // `default_loadouts` names a missing loadout and a broken one.
+        (
+            "[loadouts]\ndefault_loadouts = ['missing', 'broken']\n",
+            &[("broken.toml", "packages = 3\n")],
+        ),
+    ];
+    for (config_toml, files) in configs {
+        let (project, _config, global) = loadout_project(minimal_toml, config_toml, files);
+        let root = utf8(&project);
+        task::task_activation_inputs(
+            &global,
+            &root,
+            "lint",
+            false,
+            false,
+            boxes::core::policy::UserPolicy::default(),
+        )
+        .unwrap_or_else(|e| panic!("{config_toml:?}: a sealed task fails: {e:#}"));
+
+        let session = |entry: &str| -> anyhow::Result<loadouts::ActivationInputs> {
+            let mode = session_loadout_mode(&root, Some(entry), &[])?;
+            loadouts::prepare_activation_inputs(
+                &global,
+                &root,
+                loadouts::gate_selection(loadouts::LoadoutSelection::Defaults, mode),
+                loadouts::HookPrep::Disabled,
+                Some(boxes::core::policy::UserPolicy::default()),
+            )
+        };
+        let sealed = session("locked")
+            .unwrap_or_else(|e| panic!("{config_toml:?}: a sealed session fails: {e:#}"));
+        assert_eq!(sealed.loadouts_line(), None, "{config_toml:?}");
+        assert!(
+            session("dev").is_err(),
+            "{config_toml:?}: an open session reads the broken default"
+        );
+    }
+}
+
+// BOX-181: an entry of the built-in `build` type does not resolve as a
+// start, so the gate reads the built-in constraints of `build`. They hold
+// `loadout_mode` at `sealed`, so an entry that sets `open` fails with
+// exit 3 before any loadout is read: the broken default does not fail it.
+#[test]
+fn builtin_build_entry_setting_open_refused_exit3() {
+    let (project, _config, _global) = loadout_project(
+        "[boxes.b]\ntype = 'build'\nloadout_mode = 'open'\n",
+        "",
+        &[("default.toml", "= not = toml =")],
+    );
+    let error = session_loadout_mode(&utf8(&project), Some("b"), &[])
+        .expect_err("a build entry that sets open refuses");
+    let invalid = spec_project_error(&error);
+    assert!(
+        matches!(
+            invalid,
+            mfile::Error::ConstraintViolated { key, box_type, .. }
+                if key == "loadout_mode" && box_type.contains("`build`")
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.exit_code(), Some(3));
+}
+
+// BOX-175: a start whose session entry the pick cannot decide refuses with
+// exit 2 when it reads the loadout mode, before any loadout is read. It does
+// not fall back to the bare session entry, which is open.
+#[test]
+fn undecided_session_pick_refuses_before_loadouts() {
+    let (project, _config, _global) = loadout_project(
+        "[sessions.one]\n\n[sessions.two]\n",
+        "",
+        &[("default.toml", "= not = toml =")],
+    );
+    let error = session_loadout_mode(&utf8(&project), None, &[])
+        .expect_err("an undecided pick refuses the start");
+    assert!(
+        error
+            .downcast_ref::<crate::SessionEntryUndecided>()
+            .is_some(),
+        "{error:#}"
+    );
+}
+
+// BOX-181: an entry whose type name is not built in and does not resolve
+// refuses with exit 3. The gate does not decide the mode without the type
+// chain's constraints.
+#[test]
+fn unresolved_project_type_refuses_loadout_gate_exit3() {
+    let (project, _config, _global) =
+        loadout_project("[boxes.odd]\ntype = 'nosuchtype'\n", "", &[]);
+    let error = session_loadout_mode(&utf8(&project), Some("odd"), &[])
+        .expect_err("an unresolved type refuses the gate");
+    let invalid = error
+        .downcast_ref::<crate::ProjectFileInvalid>()
+        .unwrap_or_else(|| panic!("not a project file error: {error:#}"));
+    assert!(
+        matches!(invalid.error, mfile::Error::BoxType(_)),
+        "{:?}",
+        invalid.error
+    );
+    assert_eq!(invalid.error.exit_code(), Some(3));
 }
 
 /// A project whose `minimal.toml` declares two box types: `base` extends
@@ -18333,6 +18978,310 @@ async fn start_attach_resume_end_to_end() {
                     && line.contains(&format!("box_id={web}"))
                     && line.contains(&format!("outcome=\"{outcome}\""))),
             "a `{verb}` {outcome} event in the span\n{log}\n{ran}"
+        );
+    }
+}
+
+/// The `min init` arguments of `argv`, from the real clap parse.
+fn parsed_init(argv: &[&str]) -> InitArgs {
+    match Cli::try_parse_from(argv).expect("the init parses").command {
+        Some(Command::Init(args)) => args,
+        _ => panic!("not an init: {argv:?}"),
+    }
+}
+
+// T21 (S5): specs, types and entries inspected, end to end. Bare `min init`
+// scaffolds the entry shape, and `min init <entry> --type <type>` appends a
+// session entry and an entry of a type the project defines. `min type list`
+// and `min type show` name that type and the source of each value. `min box
+// spec <entry>` renders the entry's expanded spec with the layer and type of
+// each value. A box created from the entry on a test daemon renders its
+// stored spec with `min box spec <box>`. One span covers each render, so the
+// log shows the expansion it read. A failure prints each command run so far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spec_type_init_end_to_end() {
+    use tracing::Instrument as _;
+
+    let log = minimald::test_harness::captured_log();
+    let mut ran = Transcript::default();
+    let project = tempfile::tempdir().unwrap();
+    let toml_path = project.path().join(mfile::MFILE_NAME);
+    let root = camino::Utf8Path::from_path(project.path())
+        .expect("a UTF-8 path")
+        .to_owned();
+
+    // `min init`: the scaffold in the entry shape. The plan is the
+    // initializer's own output, as the scaffold test gives it.
+    let argv = ["min", "init"];
+    let request = cmd::init_request(&parsed_init(&argv));
+    assert_eq!(request, Ok(cmd::InitRequest::Scaffold), "{ran}");
+    let plan = op::InitPlan {
+        toml_path: toml_path.clone(),
+        content: "# Generated by `min init`\n\n\
+                  [defaults]\n\
+                  state_key = \"dev\"\n\n\
+                  [session] # min session attach\n\
+                  packages = [\"base\", \"git\"]\n"
+            .to_owned(),
+        matched: false,
+    };
+    let outcome = cmd::write_init_plan(plan, true, false);
+    ran.push(
+        &argv.join(" "),
+        match &outcome {
+            Ok(cmd::InitOutcome::Created(path)) => format!("Created {}\n", path.display()),
+            _ => String::new(),
+        }
+        .as_bytes(),
+        outcome
+            .as_ref()
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default()
+            .as_bytes(),
+        i32::from(outcome.is_err()),
+    );
+    assert!(
+        matches!(outcome, Ok(cmd::InitOutcome::Created(ref p)) if *p == toml_path),
+        "{ran}"
+    );
+
+    // The person defines a type of their own in the scaffold.
+    let mut text = std::fs::read_to_string(&toml_path).unwrap();
+    text.push_str(
+        "\n[box_types.rust-dev]\nextends = \"session\"\n\n\
+         [box_types.rust-dev.defaults]\ntimeout = \"30m\"\n",
+    );
+    std::fs::write(&toml_path, &text).unwrap();
+
+    // `min init <entry> --type <type>` appends one entry each time.
+    for (entry, box_type) in [
+        ("default", "session"),
+        ("build", "task"),
+        ("web", "rust-dev"),
+    ] {
+        let argv = ["min", "init", entry, "--type", box_type];
+        let request = cmd::init_request(&parsed_init(&argv));
+        let Ok(cmd::InitRequest::Append {
+            entry: ref name,
+            box_type: ref of_type,
+        }) = request
+        else {
+            panic!("an append: {request:?}\n{ran}");
+        };
+        let appended = cmd::append_entry_in(project.path(), false, name, of_type);
+        ran.push(
+            &argv.join(" "),
+            b"",
+            appended
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default()
+                .as_bytes(),
+            i32::from(appended.is_err()),
+        );
+        assert!(appended.is_ok(), "{ran}");
+    }
+    let doc: toml::Table = std::fs::read_to_string(&toml_path)
+        .unwrap()
+        .parse()
+        .expect("the file parses");
+    for (entry, box_type) in [
+        ("dev", "session"),
+        ("default", "session"),
+        ("build", "task"),
+        ("web", "rust-dev"),
+    ] {
+        assert_eq!(
+            doc["boxes"][entry]["type"].as_str(),
+            Some(box_type),
+            "{doc}\n{ran}"
+        );
+    }
+    mfile::File::from_dir(project.path())
+        .expect("the file loads")
+        .validate()
+        .expect("the file validates");
+
+    // `min type list` and `min type show rust-dev`.
+    let globals = type_globals(project.path());
+    let listed = type_list(&globals, None);
+    ran.push("min type list", listed.as_bytes(), b"", 0);
+    let rows: Vec<Vec<&str>> = listed
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    for builtin in mfile::box_types::BUILTIN_BOX_TYPES {
+        assert!(
+            rows.contains(&vec![builtin, "builtin", "-", builtin]),
+            "{ran}"
+        );
+    }
+    assert!(
+        rows.contains(&vec!["rust-dev", "project", "session", "session"]),
+        "{ran}"
+    );
+    let shown = type_show(&globals, "rust-dev", None);
+    ran.push(
+        "min type show rust-dev",
+        shown.as_deref().unwrap_or_default().as_bytes(),
+        shown
+            .as_ref()
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default()
+            .as_bytes(),
+        i32::from(shown.is_err()),
+    );
+    let shown = shown.unwrap_or_else(|_| panic!("the type shows\n{ran}"));
+    for line in [
+        "Name:           rust-dev\n",
+        "Source:         project\n",
+        "Extends:        session\n",
+        "Type chain:     session -> rust-dev\n",
+    ] {
+        assert!(shown.contains(line), "missing {line:?}\n{ran}");
+    }
+    // Each default and constraint names the type that sets it and that
+    // type's source. `write_values` pads the setting column, so match the
+    // trimmed setting and the `from <type> (<source>)` suffix.
+    for (setting, source) in [
+        ("timeout = \"30m\"", "from rust-dev (project)"),
+        ("pty_enabled = true", "from session (builtin)"),
+    ] {
+        assert!(
+            shown.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with(setting)
+                    && line.ends_with(source)
+                    && line[setting.len()..line.len() - source.len()]
+                        .trim()
+                        .is_empty()
+            }),
+            "missing {setting:?} {source:?}\n{ran}"
+        );
+    }
+
+    // `min box spec web` renders the expansion with the layer and the type
+    // of each value, inside one span.
+    let (_state, daemon_global, server) = show_network_daemon().await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        config_dir: Some(project.path().join("config")),
+        ..daemon_global.clone()
+    };
+    std::fs::create_dir_all(project.path().join("config")).unwrap();
+    // Interim: <https://github.com/gominimal/minimal/issues/3340> tracks the
+    // type-defaults layer. architecture.md puts the Box Type
+    // defaults layer in every expansion, but `expand_entry` in
+    // cmd/box_spec.rs and the start path build `Layers::default()` with no
+    // `type_defaults`. So `[box_types.rust-dev.defaults] timeout = "30m"`
+    // does not reach the render, and this test does not assert it.
+    // When that layer lands, add to the `web` needles the line
+    // "# timeout: from type rust-dev defaults\ntimeout = \"30m\"\n".
+    for (entry, needles) in [
+        (
+            "dev",
+            &[
+                "# The spec of entry dev (type session).",
+                "# type: from [boxes.dev]\ntype = \"session\"\n",
+                "# packages: from [defaults.session]\npackages = [\"base\", \"git\"]\n",
+                "# network.mode: from the default\n",
+            ][..],
+        ),
+        (
+            "web",
+            &[
+                "# The spec of entry web (type rust-dev).",
+                "# type: from [boxes.web]\ntype = \"rust-dev\"\n",
+                "# network.mode: from the default\n",
+            ][..],
+        ),
+    ] {
+        let span = tracing::info_span!("spec_type_init_end_to_end", entry);
+        let argv = ["min", "box", "spec", entry];
+        let rendered = box_spec_text(&global, &argv).instrument(span).await;
+        ran.push(
+            &argv.join(" "),
+            rendered.as_deref().unwrap_or_default().as_bytes(),
+            rendered
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default()
+                .as_bytes(),
+            i32::from(rendered.is_err()),
+        );
+        let rendered = rendered.unwrap_or_else(|_| panic!("the entry renders\n{ran}"));
+        for needle in needles {
+            assert!(rendered.contains(needle), "missing {needle:?}\n{ran}");
+        }
+        toml::from_str::<toml::Table>(&rendered).unwrap_or_else(|e| panic!("TOML: {e}\n{ran}"));
+    }
+
+    // A box created from an entry on the test daemon renders the spec
+    // stored with its record.
+    // The box comes from the session entry `default`: a start by name takes
+    // only that entry today (#3204), and an entry of a project type is
+    // refused (#3140).
+    let start = parsed_start(&["min", "session", "start", "default", "--network", "own_ip"]);
+    let entries = mfile::entry::read_entries(std::fs::read(&toml_path).unwrap().as_slice())
+        .expect("the entries read");
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &entries, true).unwrap_or_else(|e| panic!("the start: {e:#}\n{ran}"))
+    else {
+        panic!("default is a session box\n{ran}");
+    };
+    let request = planned_session_request(&args, &options, &root);
+    let id = create_box_from(&server, &request).await;
+    ran.push(
+        "min session start default --network own_ip",
+        format!("{id}\n").as_bytes(),
+        b"",
+        0,
+    );
+    let id_text = id.to_string();
+    let span = tracing::info_span!("spec_type_init_end_to_end", box_id = %id);
+    let argv = ["min", "box", "spec", id_text.as_str(), "-o", "json"];
+    let stored = box_spec_text(&global, &argv).instrument(span).await;
+    ran.push(
+        &argv.join(" "),
+        stored.as_deref().unwrap_or_default().as_bytes(),
+        stored
+            .as_ref()
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default()
+            .as_bytes(),
+        i32::from(stored.is_err()),
+    );
+    let stored = stored.unwrap_or_else(|_| panic!("the stored spec renders\n{ran}"));
+    let doc: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&stored).unwrap_or_else(|e| panic!("JSON: {e}\n{ran}"));
+    assert_eq!(
+        doc["schema"],
+        crate::output::ObjectType::Spec.schema(),
+        "{ran}"
+    );
+    assert_eq!(doc["box"], serde_json_lenient::json!(id_text), "{ran}");
+    assert_eq!(Some(doc["spec"].clone()), request.spec, "{ran}");
+
+    // Each render's span shows the expansion it read: the entry for the
+    // entry form, and the box for the box form.
+    let log = log.contents();
+    for (field, value) in [
+        ("entry", "dev".to_owned()),
+        ("entry", "web".to_owned()),
+        ("box_id", id_text.clone()),
+    ] {
+        assert!(
+            log.lines()
+                .any(|line| line.contains("spec_type_init_end_to_end{")
+                    && line.contains("verb=\"box spec\"")
+                    && line.contains(&format!("{field}={value}"))
+                    && line.contains("outcome=\"ok\"")),
+            "a `box spec` ok event for {field} {value} in the span\n{log}\n{ran}"
         );
     }
 }

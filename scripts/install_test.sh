@@ -3733,6 +3733,59 @@ case_answerer_source_installed() {
     PLAT_S=Linux; PLAT_M=x86_64
 }
 
+# --- inbox#1197: the profile installer on a host whose parser has no abi/4.0 --
+# The shipped loader decides by the kernel's switch, as `min finalize-install`
+# does: with the switch off it installs nothing and says so, with it on it
+# fails and names the remedy, and --check reports a skip either way. Driven
+# over a scratch policy directory and a stub apparmor_parser, under bash,
+# the loader's own shell.
+case_apparmor_profile_installer() {
+    aa_loader="$here/install-apparmor-profile.sh"
+    aa_stub="$root/aa-stub"; mkdir -p "$aa_stub"
+    # shellcheck disable=SC2016 # the $1 is the stub's own, read when it runs
+    printf '#!/bin/sh\ncase "$1" in --version) echo "AppArmor parser version 3.0.8";; esac\nexit 0\n' >"$aa_stub/apparmor_parser"
+    chmod +x "$aa_stub/apparmor_parser"
+    aa_old="$root/aa-old"; mkdir -p "$aa_old/abi"          # no abi/4.0
+    aa_new="$root/aa-new"; mkdir -p "$aa_new/abi"; : >"$aa_new/abi/4.0"
+    aa_sw="$root/aa-switch"
+    run_aa() {
+        _label="$1"; _d="$2"; _sw="$3"; shift 3
+        OUT="$root/out.$_label"
+        set +e
+        env -i PATH="$aa_stub:/usr/bin:/bin" HOME="$root" \
+            MINIMAL_APPARMOR_D="$_d" MINIMAL_APPARMOR_RESTRICT_FILE="$_sw" \
+            bash "$aa_loader" "$@" >"$OUT" 2>&1
+        rc=$?
+        set -e
+    }
+    # The switch off: nothing to install, said in sentences, exit 0, no root needed.
+    printf '0\n' >"$aa_sw"
+    run_aa aa_off "$aa_old" "$aa_sw"
+    check 0 "$rc" "an old parser on a kernel that does not restrict userns installs nothing and exits 0"
+    want_ok "the note says the kernel does not restrict user namespaces" \
+        grep -q "does not restrict unprivileged user namespaces" "$OUT"
+    want_ok "the note says nothing was installed" grep -q "Nothing was installed" "$OUT"
+    want_err "the note says nothing false about the parser mediating" grep -q "does not mediate" "$OUT"
+    # The switch on: the profile is needed and this parser cannot load it; fail, with the remedy.
+    printf '1\n' >"$aa_sw"
+    run_aa aa_on "$aa_old" "$aa_sw"
+    check 1 "$rc" "an old parser on a kernel that restricts userns fails"
+    want_ok "the failure names the switch and the remedy" \
+        grep -q "apparmor_restrict_unprivileged_userns=1" "$OUT"
+    want_ok "the failure names min finalize-install" grep -q "run min finalize-install again" "$OUT"
+    # The switch file absent (a kernel without the knob): as off.
+    run_aa aa_noknob "$aa_old" "$root/no-such-switch"
+    check 0 "$rc" "a kernel without the switch is one that does not restrict"
+    # --check on the old parser: a skip line, exit 0, whatever the switch says.
+    run_aa aa_check_old "$aa_old" "$aa_sw" --check
+    check 0 "$rc" "--check exits 0 on an old parser"
+    want_ok "--check says it skipped the parse" grep -q "Check skipped" "$OUT"
+    # --check with abi/4.0 present: the parser runs (the stub exits 0) and the profile parses.
+    run_aa aa_check_new "$aa_new" "$aa_sw" --check
+    check 0 "$rc" "--check parses with abi/4.0 present"
+    want_ok "--check reports the parse" grep -q "profile parses" "$OUT"
+}
+
 # --- Case dispatch -----------------------------------------------------------
 # Every scenario group above is one named case. No argument runs them all, in
 # the order the linear script used to have; one argument runs exactly that
@@ -3744,6 +3797,7 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
+        apparmor_profile_installer)         case_apparmor_profile_installer ;;
         finalize_install_uninstall)         case_finalize_install_uninstall ;;
         installer_offers_finalize_install_on_a_tty) case_installer_offers_finalize_install_on_a_tty ;;
         installer_prints_the_pointer_when_declined_or_without_tty)
@@ -3772,7 +3826,8 @@ case_for() {
 }
 case "${1:-}" in
     "")
-        for _c in install apparmor apparmor_uninstall finalize_install_uninstall \
+        for _c in install apparmor apparmor_uninstall apparmor_profile_installer \
+            finalize_install_uninstall \
             installer_offers_finalize_install_on_a_tty \
             installer_prints_the_pointer_when_declined_or_without_tty \
             installer_does_not_prompt_on_a_finished_host checksum_mismatch \
