@@ -12,6 +12,18 @@ set -eu
 # the caller's PATH, and a directory a user owns may be first on it.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
+# A label an administrator switched off (`launchctl disable`) stays off
+# across an uninstall, and launchd then refuses the postinstall's bootstrap
+# with "5: Input/output error", which names nothing. Stop here instead,
+# before anything on this Mac changes, and say which switch it is. Switching
+# it back on is the administrator's call, not an installer's.
+off="$(launchctl print-disabled system 2>/dev/null || true)"
+for job in dev.gominimal.zone dev.minimal.local-range; do
+    if printf '%s\n' "$off" | grep -Eq "\"$job\" => (disabled|true)"; then
+        echo "minimal: the service $job is switched off on this Mac (launchctl disable), so nothing was installed or changed. Switch it on with: sudo launchctl enable system/$job  then install again" >&2
+        exit 1
+    fi
+done
 for job in dev.gominimal.zone dev.minimal.local-range; do
     launchctl bootout "system/$job" 2>/dev/null || true
 done

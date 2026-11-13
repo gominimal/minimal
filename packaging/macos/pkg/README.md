@@ -90,8 +90,13 @@ What an MDM administrator should know:
   with nobody logged in has neither of). macOS shows each user a
   "Background Items Added" notice for them, under the name Minimal, and
   lets an administrator switch them off in System Settings > General >
-  Login Items; with the service off, box names would not resolve (not yet
-  measured on the farm). A fleet approves them
+  Login Items. With the service off (measured with `launchctl disable`
+  and `bootout`), a lookup of a box name hangs for 60 s and fails, other
+  names are unaffected, and `min finalize-install --show` reports the
+  names item as waiting on a daemon. A disabled label stays disabled
+  across an uninstall; an install or upgrade on such a Mac stops before
+  changing anything and names `sudo launchctl enable system/<label>`. A
+  fleet approves them
   ahead of the install with a Service Management profile
   (`com.apple.servicemanagement`), by the signing team:
 

@@ -267,7 +267,7 @@ PLIST
 chown root:wheel /Library/LaunchDaemons/dev.gominimal.zone.plist
 chmod 0644 /Library/LaunchDaemons/dev.gominimal.zone.plist
 launchctl bootstrap system /Library/LaunchDaemons/dev.gominimal.zone.plist \
-    || { echo "minimal: launchd did not load the DNS service" >&2; exit 1; }
+    || { echo "minimal: launchd did not load the DNS service (if it is switched off in System Settings > General > Login Items, switch it on there and install again)" >&2; exit 1; }
 # launchd makes the channel socket at bootstrap, before the program runs;
 # the service has started when launchd reports its process running.
 running() { launchctl print system/dev.gominimal.zone 2>/dev/null | grep -q 'state = running'; }
