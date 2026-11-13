@@ -322,12 +322,17 @@ pub(crate) async fn complete_own_ip_attach(
             )
         })
         .map(Arc::new);
+    // NET-163: a box with no policy still carries its name, so another box's
+    // `allow_dns_hosts` can name it. A task launch (no `own_address`) owns no
+    // name of its own, so its ungated relay carries none.
+    let ungated_name = own_address.map(|_| session_name);
     let relay = match (&control, &gate) {
         (ControlChannel::Unix(sock), Some(gate)) => {
             crate::net::switch::attach_to_switch(
                 tap_fd,
                 sock,
                 Some(Arc::clone(gate)),
+                None,
                 lease_ip,
                 subnet,
             )
@@ -339,17 +344,27 @@ pub(crate) async fn complete_own_ip_attach(
                 *cid,
                 *port,
                 Some(Arc::clone(gate)),
+                None,
                 lease_ip,
                 subnet,
             )
             .await?
         }
         (ControlChannel::Unix(sock), None) => {
-            crate::net::switch::attach_to_switch(tap_fd, sock, None, lease_ip, subnet).await?
+            crate::net::switch::attach_to_switch(tap_fd, sock, None, ungated_name, lease_ip, subnet)
+                .await?
         }
         (ControlChannel::Vsock { cid, port }, None) => {
-            crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, None, lease_ip, subnet)
-                .await?
+            crate::net::switch::attach_to_switch_vsock(
+                tap_fd,
+                *cid,
+                *port,
+                None,
+                ungated_name,
+                lease_ip,
+                subnet,
+            )
+            .await?
         }
     };
     finish_own_ip_attach(
