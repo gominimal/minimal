@@ -370,23 +370,12 @@ fn list_at(spec: &toml::Table, path: &[&str]) -> Json {
     }
 }
 
-/// The ports `network.ingress` admits, each `{ port, proto }`, in the
-/// spec's order. It reads the `box.toml` list of `{ proto, port }` and
-/// the `port_mappings` of a v0 spec, whose port in the box is
-/// `internal_port`.
+/// The ports `network.ingress` admits, each its port number in the box,
+/// in the spec's order (§6.3.2 `"ingress_ports": [8080]`). It reads the
+/// `box.toml` list of `{ proto, port }` and the `port_mappings` of a v0
+/// spec, whose port in the box is `internal_port`.
 fn ingress_ports(spec: &toml::Table) -> Json {
-    let port = |item: &toml::Table, key: &str| -> Json {
-        let mut out = BTreeMap::new();
-        out.insert(
-            "port".to_owned(),
-            item.get(key).map_or(Json::Null, Json::of_toml),
-        );
-        out.insert(
-            "proto".to_owned(),
-            item.get("proto").map_or(Json::Null, Json::of_toml),
-        );
-        Json::Object(out)
-    };
+    let port = |item: &toml::Table, key: &str| item.get(key).map_or(Json::Null, Json::of_toml);
     let ports = match at(spec, &["network", "ingress"]) {
         Some(toml::Value::Array(items)) => items
             .iter()
@@ -406,24 +395,66 @@ fn ingress_ports(spec: &toml::Table) -> Json {
     Json::List(ports)
 }
 
+/// The `[nesting]` bounds that §6.3.2 projects. Any other key of the
+/// table is not in the record.
+const NESTING_BOUNDS: [&str; 5] = [
+    "allowed",
+    "max_depth",
+    "types",
+    "providers",
+    "dynamic_providers",
+];
+
+/// The five `[nesting]` bounds, each `null` when the spec does not set it.
+fn nesting(spec: &toml::Table) -> Json {
+    let table = spec.get("nesting").and_then(toml::Value::as_table);
+    Json::Object(
+        NESTING_BOUNDS
+            .iter()
+            .map(|key| {
+                let value = table
+                    .and_then(|t| t.get(*key))
+                    .map_or(Json::Null, Json::of_toml);
+                ((*key).to_owned(), value)
+            })
+            .collect(),
+    )
+}
+
 /// The grants of `[secrets]`, one object for each entry in name order,
-/// each the entry's own keys with its `name`. A store reference carries
-/// the `upstream` and `inject` that expansion wrote into it.
+/// each built from the §6.3.2 key set of its kind, never from the entry's
+/// own keys. The entry's name is `env`. A `source = "store"` reference
+/// carries `env`, `source`, `store`, `id`, `upstream` (a list of
+/// authorities) and `inject`, as expansion wrote them. Every other grant
+/// is brokered and carries `env`, `scopes`, and `mode` when it is set or
+/// filled, and no `source`.
 fn secret_grants(spec: &toml::Table) -> Json {
     let Some(secrets) = spec.get("secrets").and_then(toml::Value::as_table) else {
         return Json::List(Vec::new());
     };
     let mut names: Vec<&String> = secrets.keys().collect();
     names.sort();
+    let empty = toml::Table::new();
     Json::List(
         names
             .into_iter()
             .map(|name| {
-                let mut grant = match Json::of_toml(&secrets[name.as_str()]) {
-                    Json::Object(map) => map,
-                    other => BTreeMap::from([("value".to_owned(), other)]),
-                };
-                grant.insert("name".to_owned(), Json::Str(name.clone()));
+                let entry = secrets[name.as_str()].as_table().unwrap_or(&empty);
+                let value = |key: &str| entry.get(key).map_or(Json::Null, Json::of_toml);
+                let list = |key: &str| entry.get(key).map_or(Json::List(Vec::new()), Json::of_toml);
+                let mut grant = BTreeMap::from([("env".to_owned(), Json::Str(name.clone()))]);
+                if entry.get("source").and_then(toml::Value::as_str) == Some("store") {
+                    grant.insert("source".to_owned(), Json::Str("store".to_owned()));
+                    for key in ["store", "id", "inject"] {
+                        grant.insert(key.to_owned(), value(key));
+                    }
+                    grant.insert("upstream".to_owned(), list("upstream"));
+                } else {
+                    grant.insert("scopes".to_owned(), list("scopes"));
+                    if let Some(mode) = entry.get("mode") {
+                        grant.insert("mode".to_owned(), Json::of_toml(mode));
+                    }
+                }
                 Json::Object(grant)
             })
             .collect(),
@@ -622,10 +653,6 @@ pub fn project(spec: &toml::Table, facts: &TypeFacts) -> Projection {
     )]);
 
     let commit = at(spec, &["upstream", "commit"]).and_then(toml::Value::as_str);
-    let nesting = match spec.get("nesting") {
-        Some(value @ toml::Value::Table(_)) => Json::of_toml(value),
-        _ => Json::Object(BTreeMap::new()),
-    };
 
     let record = obj(vec![
         ("v", Json::Int(PROJECTION_VERSION)),
@@ -649,7 +676,7 @@ pub fn project(spec: &toml::Table, facts: &TypeFacts) -> Projection {
             "lifetime",
             first_of(spec, &[&["lifetime"], &["box", "lifetime"]]),
         ),
-        ("nesting", nesting),
+        ("nesting", nesting(spec)),
         ("secret_grants", secret_grants(spec)),
     ]);
     Projection { record }
@@ -707,7 +734,7 @@ mod tests {
         source = "store"
         store = "keychain"
         id = "npm-token"
-        upstream = { hosts = ["registry.npmjs.org"] }
+        upstream = ["registry.npmjs.org"]
         inject = { header = "Authorization", prefix = "Bearer " }
     "#;
 
@@ -794,6 +821,65 @@ mod tests {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(jcs.as_bytes()))
         );
         assert_eq!(p.digest().len(), 43);
+
+        // Each admitted port is its number.
+        assert_eq!(
+            n.get("ingress_ports"),
+            Some(&Json::List(vec![Json::Int(8080)]))
+        );
+
+        // Each grant is the §6.3.2 key set of its kind, its name as `env`.
+        let Some(Json::List(grants)) = r.get("secret_grants") else {
+            panic!("secret_grants is a list: {r:?}");
+        };
+        let keys: Vec<Vec<&str>> = grants.iter().map(names).collect();
+        assert_eq!(
+            keys,
+            [
+                vec!["env", "mode", "scopes"],
+                vec!["env", "id", "inject", "source", "store", "upstream"],
+            ]
+        );
+        assert_eq!(grants[0].get("env"), Some(&s("GH")));
+        assert_eq!(grants[0].get("mode"), Some(&s("user")), "filled");
+        assert_eq!(grants[1].get("env"), Some(&s("NPM")));
+        assert_eq!(
+            grants[1].get("upstream"),
+            Some(&Json::List(vec![s("registry.npmjs.org")]))
+        );
+        // A key the entry sets outside its kind's set is not projected.
+        let mut extra = table(FULL);
+        extra["secrets"]["GH"]
+            .as_table_mut()
+            .unwrap()
+            .insert("note".to_owned(), toml::Value::String("x".to_owned()));
+        assert_eq!(project(&extra, &session()).digest(), p.digest());
+
+        // `nesting` is exactly the five bounds. Another key of `[nesting]`
+        // leaves the digest unchanged.
+        let mut bounds = names(r.get("nesting").unwrap());
+        bounds.sort_unstable();
+        assert_eq!(
+            bounds,
+            [
+                "allowed",
+                "dynamic_providers",
+                "max_depth",
+                "providers",
+                "types"
+            ]
+        );
+        assert_eq!(
+            r.get("nesting").unwrap().get("max_depth"),
+            Some(&Json::Int(2))
+        );
+        assert_eq!(r.get("nesting").unwrap().get("types"), Some(&Json::Null));
+        let mut extra = table(FULL);
+        extra["nesting"]
+            .as_table_mut()
+            .unwrap()
+            .insert("comment".to_owned(), toml::Value::String("x".to_owned()));
+        assert_eq!(project(&extra, &session()).digest(), p.digest());
 
         // A v0 spec states its ingress as the policy's port mappings.
         let v0 = table(

@@ -235,7 +235,7 @@ pub struct Layers {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoreRule {
     /// The upstream authorities the item's value is sent to, each `host`
-    /// or `host:port`. Written as the reference's `upstream.hosts`.
+    /// or `host:port`. Written as the reference's `upstream` list.
     pub upstream: Vec<String>,
     /// How the value is injected: the rule's `header`, `prefix` and
     /// `basic_auth`, as the rule sets them. Written as the reference's
@@ -245,9 +245,9 @@ pub struct StoreRule {
 
 /// Writes each store reference's authorities into the spec (BOX-071). A
 /// `[secrets]` entry with `source = "store"` takes the `upstream` and
-/// `inject` of the rule for its `id`. Any `upstream` or `inject` that a
-/// layer wrote into the reference is dropped first, so only the client's
-/// rules set them. A reference with no rule for its item keeps neither.
+/// `inject` of the rule for its `id`. [`refuse_store_authorities`] already
+/// refused a layer that sets either, so only the client's rules set them.
+/// A reference with no rule for its item has neither.
 fn write_store_authorities(spec: &mut toml::Table, rules: &BTreeMap<String, StoreRule>) {
     let Some(secrets) = spec.get_mut("secrets").and_then(toml::Value::as_table_mut) else {
         return;
@@ -256,8 +256,6 @@ fn write_store_authorities(spec: &mut toml::Table, rules: &BTreeMap<String, Stor
         if grant.get("source").and_then(toml::Value::as_str) != Some("store") {
             continue;
         }
-        grant.remove("upstream");
-        grant.remove("inject");
         let rule = grant
             .get("id")
             .and_then(toml::Value::as_str)
@@ -265,19 +263,13 @@ fn write_store_authorities(spec: &mut toml::Table, rules: &BTreeMap<String, Stor
         let Some(rule) = rule else {
             continue;
         };
-        let hosts = rule
+        let authorities = rule
             .upstream
             .iter()
             .cloned()
             .map(toml::Value::String)
             .collect();
-        grant.insert(
-            "upstream".to_owned(),
-            toml::Value::Table(toml::Table::from_iter([(
-                "hosts".to_owned(),
-                toml::Value::Array(hosts),
-            )])),
-        );
+        grant.insert("upstream".to_owned(), toml::Value::Array(authorities));
         grant.insert("inject".to_owned(), toml::Value::Table(rule.inject.clone()));
     }
 }
@@ -362,7 +354,9 @@ impl Expansion {
 /// a box setting or has a value of the wrong shape. It names the layer
 /// that set the bad value. Before any loadout applies, the errors of
 /// [`loadout_gate`]. On an open box, [`Error::LoadoutSetsLoadoutMode`]
-/// for a selected loadout that sets `loadout_mode`.
+/// for a selected loadout that sets `loadout_mode`. For a `source =
+/// "store"` reference that a layer gives an `upstream` or `inject`,
+/// [`Error::InvalidSpecKey`] that names `secrets.<name>.<key>`.
 pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     let upstream = upstream_layer(layers);
     let mut ordered = layers_to_entry(entry, layers, &upstream);
@@ -401,10 +395,47 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     // receives. The omitted values the digest binds are filled by the
     // projection itself (`projection::fill_effective`), in the client and
     // the daemon alike, so the spec bytes keep only what a layer set.
+    refuse_store_authorities(entry, &ordered, &expansion.spec)?;
     write_store_authorities(&mut expansion.spec, &layers.store_rules);
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
+}
+
+/// Refuses a `source = "store"` reference that a layer gives an
+/// `upstream` or `inject` (BOX-071). Only the client's
+/// `[secret-store-rules]` set them. The error names the secret, the key
+/// and the first layer, in layer order, that sets it. Exits 3.
+fn refuse_store_authorities(
+    entry: &BoxEntry,
+    ordered: &[(Origin, &toml::Table)],
+    spec: &toml::Table,
+) -> Result<(), Error> {
+    let Some(secrets) = spec.get("secrets").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (name, grant) in secrets {
+        if grant.get("source").and_then(toml::Value::as_str) != Some("store") {
+            continue;
+        }
+        for key in ["upstream", "inject"] {
+            let setter = ordered.iter().find(|(_, layer)| {
+                layer
+                    .get("secrets")
+                    .and_then(|s| s.get(name.as_str()))
+                    .and_then(|g| g.get(key))
+                    .is_some()
+            });
+            if let Some((origin, _)) = setter {
+                return Err(Error::InvalidSpecKey {
+                    key: format!("secrets.{name}.{key}"),
+                    layer: layer_words(entry, Some(origin)),
+                    problem: SpecKeyProblem::Unknown,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The one spec key `upstream` that the `[upstream]` table sets. It is the
@@ -3528,7 +3559,7 @@ mod tests {
         source = "store"
         store = "keychain"
         id = "npm-token"
-        upstream = { hosts = ["project.example"] }
+        upstream = ["project.example"]
 
         [sessions.dev.secrets.OTHER]
         source = "store"
@@ -3540,18 +3571,51 @@ mod tests {
         upstream = ["project.example"]
     "#;
 
+    /// [`STORE_FILE`] without the `upstream` and `inject` that the project
+    /// cannot set.
+    fn store_file_clean() -> String {
+        STORE_FILE
+            .replace("        upstream = [\"project.example\"]\n\n", "\n")
+            .replace("        inject = { header = \"X-Project\" }\n", "")
+    }
+
     // BOX-071: expansion writes each store reference's `upstream` and
     // `inject` from the client's `[secret-store-rules]`, never from the
     // project file, so the projection's `secret_grants` carry them.
     #[test]
     fn store_reference_upstream_and_inject_written_into_spec() {
-        let (e, digest) =
-            expand_projected(STORE_FILE, "dev", "", npm_rule(&["registry.npmjs.org"]));
+        // A project that sets a store reference's `upstream` or `inject`
+        // is refused, and the error names the secret and the key.
+        let entries = read_entries(STORE_FILE.as_bytes()).expect("entries read");
+        let dev = entries.iter().find(|e| e.name == "dev").expect("dev");
+        let layers = Layers {
+            store_rules: npm_rule(&["registry.npmjs.org"]),
+            ..Layers::default()
+        };
+        let err = expand(dev, &layers).expect_err("the project sets upstream");
+        assert!(
+            matches!(&err, Error::InvalidSpecKey { key, problem: SpecKeyProblem::Unknown, .. }
+                if key == "secrets.NPM.upstream"),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), Some(3));
+        let only_inject = STORE_FILE.replace("        upstream = [\"project.example\"]\n\n", "\n");
+        let entries = read_entries(only_inject.as_bytes()).expect("entries read");
+        let dev = entries.iter().find(|e| e.name == "dev").expect("dev");
+        let err = expand(dev, &layers).expect_err("the project sets inject");
+        assert!(
+            matches!(&err, Error::InvalidSpecKey { key, .. } if key == "secrets.OTHER.inject"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("`secrets.OTHER.inject`"), "{err}");
+
+        let file = store_file_clean();
+        let (e, digest) = expand_projected(&file, "dev", "", npm_rule(&["registry.npmjs.org"]));
         let npm = e.spec["secrets"]["NPM"].as_table().expect("the reference");
         assert_eq!(
             npm["upstream"],
-            toml::Value::Table(table("hosts = [\"registry.npmjs.org\"]")),
-            "the client's rule, not the project's value"
+            toml::Value::Array(vec![toml::Value::String("registry.npmjs.org".to_owned())]),
+            "the client's rule, as a list of authorities"
         );
         assert_eq!(
             npm["inject"],
@@ -3569,9 +3633,9 @@ mod tests {
         assert!(e.spec.get("secret-store-rules").is_none());
 
         // The digest binds where the secret is sent.
-        let (_, moved) = expand_projected(STORE_FILE, "dev", "", npm_rule(&["evil.example"]));
+        let (_, moved) = expand_projected(&file, "dev", "", npm_rule(&["evil.example"]));
         assert_ne!(digest, moved);
-        let (_, again) = expand_projected(STORE_FILE, "dev", "", npm_rule(&["registry.npmjs.org"]));
+        let (_, again) = expand_projected(&file, "dev", "", npm_rule(&["registry.npmjs.org"]));
         assert_eq!(digest, again);
     }
 
@@ -3632,8 +3696,18 @@ mod tests {
             };
             let grant = grants
                 .iter()
-                .find(|g| g.get("name") == Some(&Json::Str(name.to_owned())))
+                .find(|g| g.get("env") == Some(&Json::Str(name.to_owned())))
                 .expect("the grant is projected");
+            // A brokered grant is exactly `env`, `scopes` and `mode`.
+            let Json::Object(keys) = grant else {
+                panic!("a grant is an object: {grant:?}");
+            };
+            let keys: Vec<&str> = keys.keys().map(String::as_str).collect();
+            if grant.get("mode").is_some() {
+                assert_eq!(keys, ["env", "mode", "scopes"], "{name}");
+            } else {
+                assert_eq!(keys, ["env", "scopes"], "{name}");
+            }
             grant.get("mode").cloned()
         };
         let s = |v: &str| Some(Json::Str(v.to_owned()));
@@ -3738,6 +3812,7 @@ mod tests {
             overrides: table(overrides),
             host_vars: BTreeMap::new(),
             store_rules: store_rules.clone(),
+            ..Layers::default()
         }
         .with_file_defaults(&defaults, Some("session"), &BTreeSet::new())
     }
