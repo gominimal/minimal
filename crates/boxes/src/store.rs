@@ -2489,14 +2489,19 @@ mod tests {
             disk_stays_on_its_own_device_in_namespace();
             return;
         }
+        // The probe mounts a tmpfs, as the run in the namespace does. A
+        // host can allow the namespace and still refuse the mount.
+        let scratch = TempDir::new().unwrap();
         let probe = std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "true"])
+            .args(["--user", "--map-root-user", "--mount", "--"])
+            .args(["mount", "-t", "tmpfs", "none"])
+            .arg(scratch.path())
             .output();
         match probe {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
                 eprintln!(
-                    "skipped: this host cannot make a mount namespace: {}",
+                    "skipped: this host cannot mount in a mount namespace: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
                 return;
