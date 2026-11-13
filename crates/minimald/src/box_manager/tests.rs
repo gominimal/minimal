@@ -6447,7 +6447,7 @@ fn store_secret() -> serde_json_lenient::Value {
         "source": "store",
         "store": "keychain",
         "id": "npm-token",
-        "upstream": { "hosts": ["registry.npmjs.org"] },
+        "upstream": ["registry.npmjs.org"],
         "inject": { "header": "Authorization", "format": "Bearer {}" },
     })
 }
