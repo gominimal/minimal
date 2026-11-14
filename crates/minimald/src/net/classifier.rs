@@ -7230,6 +7230,126 @@ mod tests {
         );
     }
 
+    /// D2996, NET-068: a hostname-allowlist box's own loopback connect, such
+    /// as git's to 127.0.0.1, meets no refusing rule of the guest's table.
+    /// The declaration is not deny-all, so its verdict is allow. An own-IP
+    /// box runs in a network namespace of its own and is placed in no leaf.
+    /// Every refusing rule of the guest's table is reached only from a socket
+    /// of the boxes subtree, and the IPv4 rules that do not need the deny
+    /// subtree name a destination off the loopback. So the one refusal a
+    /// guest flow on `lo` can meet is `deny_out`, and in the guest the socket
+    /// that meets it there is the effect probe's, in its deny leaf.
+    #[test]
+    fn hostname_allowlist_box_loopback_connect_is_admitted() {
+        let hostname_allowlist = boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(
+                boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
+                    .iter()
+                    .map(|host| (*host).to_string())
+                    .collect(),
+            ),
+            deny_subnets: None,
+        };
+        assert_eq!(
+            verdict_of(Some(&hostname_allowlist)),
+            Verdict::Allow,
+            "a hostname allowlist admits destinations, so it is never placed in the deny subtree"
+        );
+
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+            .expect("the guest's render is text");
+        let slice = Path::new(sandbox::classifier::TREE_ROOT)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the tree root is a named slice");
+        let boxes_rel = format!("{slice}/{}", sandbox::classifier::BOXES_DIR);
+        let deny_rel = format!("{boxes_rel}/{}", sandbox::config::DENY_DIR);
+
+        // The chains that refuse, by the rules that reject in them.
+        let mut refusing = Vec::new();
+        let mut chain = None;
+        for line in ruleset.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("chain ") {
+                chain = rest.split_whitespace().next();
+            } else if line.contains("reject")
+                && let Some(name) = chain
+                && !refusing.contains(&name)
+            {
+                refusing.push(name);
+            }
+        }
+        assert_eq!(
+            refusing,
+            ["output", "proxy_lane", "deny_out", "ipv6_refuse"],
+            "the guest's table refuses in these chains and no other: {ruleset}"
+        );
+
+        // The base chains' rules that reject or jump to a refusing chain all
+        // match a socket of the boxes subtree. A socket in no leaf of it, as
+        // an own-IP box's is, never reaches a refusal.
+        for base in ["output", "ipv6_out"] {
+            for rule in chain_rules(&ruleset, base) {
+                if !(rule.contains("reject") || rule.contains("jump ")) {
+                    continue;
+                }
+                assert!(
+                    rule.contains("socket cgroupv2")
+                        && (rule.contains(&format!("\"{boxes_rel}"))
+                            || rule.contains(&format!("@{QUIC443_LEAF_SET}"))),
+                    "{base} refuses only a socket of the boxes subtree: {rule}"
+                );
+            }
+        }
+
+        // Of those, only the deny subtree's jump has no destination off the
+        // loopback: the proxy lane names the proxy's address, the IPv6
+        // refusal leaves `lo` out, and the QUIC rules are UDP to 443.
+        for rule in chain_rules(&ruleset, "output") {
+            if rule.ends_with("jump deny_out") {
+                assert!(
+                    rule.contains(&format!("\"{deny_rel}\"")),
+                    "only the deny subtree goes to deny_out: {rule}"
+                );
+            } else if rule.ends_with("jump proxy_lane") {
+                let proxy = guest_proxy_listener();
+                assert!(
+                    !proxy.ip().is_loopback()
+                        && rule.contains(&format!("ip daddr {} ", proxy.ip())),
+                    "the proxy lane's jump names the proxy's own address: {rule}"
+                );
+            } else if rule.contains("reject") {
+                assert!(
+                    rule.contains("udp dport 443"),
+                    "the other refusals of the output chain are QUIC's: {rule}"
+                );
+            }
+        }
+        assert!(
+            chain_rules(&ruleset, "ipv6_out")
+                .iter()
+                .all(|rule| rule.contains("oifname != \"lo\"")),
+            "the IPv6 refusal leaves the loopback out"
+        );
+
+        // The probe that a guest's boot runs connects to its own loopback
+        // listener from a leaf of the deny subtree. Its refusal is the
+        // `minimal-classifier: refused` line on `lo` a guest's boot log
+        // carries, and it is no box's.
+        let root = Path::new("/sys/fs/cgroup").join(slice);
+        assert_eq!(
+            probe_leaf(&root).parent(),
+            Some(
+                root.join(sandbox::classifier::BOXES_DIR)
+                    .join(sandbox::config::DENY_DIR)
+                    .as_path()
+            ),
+            "the effect probe connects out of the deny subtree"
+        );
+    }
+
     /// NET-079: the guest loads the installer's own render, not a second
     /// spelling of it kept in step. The daemon compiles the installer in
     /// from the one file — `include_str!`, never a copy staged anywhere a

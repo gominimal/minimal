@@ -155,6 +155,10 @@ struct Guest {
     control_sock: PathBuf,
     boot_log_path: PathBuf,
     boot_log_offset: usize,
+    /// Every `minimal-classifier: refused` line on `lo` that
+    /// [`Guest::tail_boot_log`] read, for the assertion that the guest table
+    /// refused no loopback flow while the toolchain ran.
+    lo_refusals: Vec<String>,
     /// The host gvproxy switch every `minvmd` call hands the supervisor.
     gvproxy: PathBuf,
     _state: TempDir,
@@ -240,6 +244,7 @@ impl Guest {
             control_sock,
             boot_log_path,
             boot_log_offset: 0,
+            lo_refusals: Vec::new(),
             gvproxy,
             _state: state,
         };
@@ -285,6 +290,16 @@ impl Guest {
             .unwrap_or_else(|e| format!("(no run.log at {}: {e})", path.display()))
     }
 
+    /// Move the boot-log offset to the end of the log, so the next tail holds
+    /// only what a tool's run appends. The boot's own lines stay out of it:
+    /// the guest's effect probe connects to its own loopback listener from a
+    /// deny leaf at boot, and the table logs that refusal on `lo`.
+    fn skip_boot_log(&mut self) {
+        if let Ok(meta) = std::fs::metadata(&self.boot_log_path) {
+            self.boot_log_offset = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+        }
+    }
+
     /// Return the lines appended to the guest boot log since the last call,
     /// so each tool failure is paired with the admissions/drops that happened
     /// while it ran. The tail is filtered to the DNS-gate and policy messages
@@ -310,6 +325,15 @@ impl Guest {
         };
         self.boot_log_offset = total_len;
         let tail = String::from_utf8_lossy(new_bytes);
+        // NET-068: the kernel's log of a refusal names the interface it left
+        // by, so a refused loopback flow reads `OUT=lo`.
+        self.lo_refusals.extend(
+            tail.lines()
+                .filter(|line| {
+                    line.contains("minimal-classifier: refused") && line.contains("OUT=lo")
+                })
+                .map(str::to_string),
+        );
         // Keep only the evidence the DNS gate and policy warnings emit; the
         // diagnostics requirement is to name the host that was not admitted.
         // Match on the message text alone ("admitted a resolved name's
@@ -412,6 +436,8 @@ async fn hostname_allowlist_toolchain_completes() {
         ),
     ];
 
+    // Only what the tools' runs append is read from here on.
+    guest.skip_boot_log();
     let mut failures = Vec::new();
     for (name, command) in &tools {
         let encoded = minimald_rpc::exec::ExecRequest::Shell((*command).to_string()).encode();
@@ -481,6 +507,13 @@ async fn hostname_allowlist_toolchain_completes() {
     assert!(
         failures.is_empty(),
         "hostname-only allowlist toolchain operations failed: {failures:?}"
+    );
+    // NET-068: the guest table refuses no box's own loopback traffic, so no
+    // refusal on `lo` is logged while the toolchain runs.
+    assert!(
+        guest.lo_refusals.is_empty(),
+        "the guest table refused a loopback flow while the toolchain ran: {:?}",
+        guest.lo_refusals
     );
 }
 
