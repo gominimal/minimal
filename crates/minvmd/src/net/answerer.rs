@@ -2625,12 +2625,12 @@ fn serve_channel(
                 // not arrived yet, and the connection would be dropped
                 // unanswered. The connection's reads are bounded by their
                 // own timeouts, so it is put back in blocking mode first.
-                if let Err(error) = stream.set_nonblocking(false) {
+                if let Err(error) = bound_connection(&stream) {
                     tracing::warn!(
                         component = COMPONENT,
                         %error,
-                        "could not put a channel connection into blocking mode; \
-                         dropped the connection"
+                        "could not put a channel connection into blocking mode with \
+                         bounded writes; dropped the connection"
                     );
                     continue;
                 }
@@ -2733,6 +2733,86 @@ fn serve_channel(
                 std::thread::sleep(CONNECTION_POLL);
             }
         }
+    }
+}
+
+/// Readies an accepted connection: blocking mode (see the accept loop),
+/// and every write to it bounded by [`CHANNEL_REPLY_TIMEOUT`]. A peer that
+/// stops reading fills its socket buffer, and an unbounded reply would
+/// then hold its thread, and the seat it counts against its user, for as
+/// long as the peer liked; the refusals written on the accept loop itself
+/// would hold the loop. A reply that times out ends the connection like
+/// any failed write.
+fn bound_connection(stream: &UnixStream) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(CHANNEL_REPLY_TIMEOUT))
+}
+
+/// How many log lines one connection's requests may write in one
+/// [`CONNECTION_LINES_WINDOW`]: well above what a daemon's boxes coming
+/// and going write, and a ceiling on what a member's loop of requests can
+/// add to the service's log.
+const CONNECTION_LINES_MAX: usize = 32;
+
+/// The window [`CONNECTION_LINES_MAX`] is counted over.
+const CONNECTION_LINES_WINDOW: Duration = Duration::from_secs(10);
+
+/// The most refused rows one publish's log line names; the reply to the
+/// node names every one.
+const REFUSED_NAMES_LOGGED: usize = 8;
+
+/// One connection's budget of log lines ([`CONNECTION_LINES_MAX`]). Every
+/// request is still answered in full; only the service's own log of it is
+/// bounded, and the first line of the next window says how many were left
+/// out.
+#[derive(Debug)]
+struct LineBudget {
+    window: Instant,
+    written: usize,
+    dropped: usize,
+}
+
+impl LineBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            window: now,
+            written: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Whether a line may be written at `now`, and how many lines the
+    /// window that just ended left out (to be reported once).
+    fn take(&mut self, now: Instant) -> (bool, usize) {
+        let mut left_out = 0;
+        if now.saturating_duration_since(self.window) >= CONNECTION_LINES_WINDOW {
+            left_out = self.dropped;
+            self.window = now;
+            self.written = 0;
+            self.dropped = 0;
+        }
+        if self.written < CONNECTION_LINES_MAX {
+            self.written = self.written.saturating_add(1);
+            (true, left_out)
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+            (false, left_out)
+        }
+    }
+
+    /// [`Self::take`], now, writing the left-out count when there is one.
+    fn allow(&mut self, node: &str) -> bool {
+        let (allowed, left_out) = self.take(Instant::now());
+        if left_out > 0 {
+            tracing::warn!(
+                component = COMPONENT,
+                node = %node,
+                left_out,
+                "this connection's requests wrote more log lines than one connection \
+                 may; that many were left out (every request was still answered)"
+            );
+        }
+        allowed
     }
 }
 
@@ -2859,6 +2939,7 @@ fn serve_registration(
         "a node connected to the zone answerer channel"
     );
     let mut partial = Vec::new();
+    let mut lines = LineBudget::new(Instant::now());
     if let Err(error) = stream.set_read_timeout(Some(CONNECTION_POLL)) {
         tracing::debug!(
             component = COMPONENT,
@@ -2880,6 +2961,7 @@ fn serve_registration(
                     &line,
                     &registered,
                     own.as_ref(),
+                    &mut lines,
                 ) {
                     break;
                 }
@@ -2935,6 +3017,7 @@ fn accept_publish(
     line: &str,
     registered: &RegisteredTables,
     own: Option<&Arc<BoxRegistry>>,
+    lines: &mut LineBudget,
 ) -> bool {
     let publish = match parse_node_line(line) {
         Ok(NodeLine::Publish(publish)) => Ok(publish),
@@ -2942,23 +3025,27 @@ fn accept_publish(
             let reply =
                 match registered.allocate(node, &box_zone_name(&request.allocate), request.keep) {
                     Ok(address) => {
-                        tracing::info!(
-                            component = COMPONENT,
-                            node = %node,
-                            name = %request.allocate,
-                            %address,
-                            "handed a box its published address"
-                        );
+                        if lines.allow(node) {
+                            tracing::info!(
+                                component = COMPONENT,
+                                node = %node,
+                                name = %request.allocate,
+                                %address,
+                                "handed a box its published address"
+                            );
+                        }
                         RegistrationReply::allocated(address)
                     }
                     Err(reason) => {
-                        tracing::warn!(
-                            component = COMPONENT,
-                            node = %node,
-                            name = %request.allocate,
-                            %reason,
-                            "could not hand a box a published address"
-                        );
+                        if lines.allow(node) {
+                            tracing::warn!(
+                                component = COMPONENT,
+                                node = %node,
+                                name = %request.allocate,
+                                %reason,
+                                "could not hand a box a published address"
+                            );
+                        }
                         RegistrationReply::refused(reason)
                     }
                 };
@@ -2967,6 +3054,7 @@ fn accept_publish(
         Ok(NodeLine::Release(request)) => {
             if let Some(address) =
                 registered.release_address(node, &box_zone_name(&request.release))
+                && lines.allow(node)
             {
                 tracing::info!(
                     component = COMPONENT,
@@ -2998,7 +3086,7 @@ fn accept_publish(
                     node = %node,
                     "a node published no rows"
                 );
-            } else {
+            } else if lines.allow(node) {
                 tracing::info!(
                     component = COMPONENT,
                     node = %node,
@@ -3006,13 +3094,25 @@ fn accept_publish(
                     "a node published its zone rows to the answerer"
                 );
             }
-            for refused in &outcome.refused {
+            // One line for the publish's refusals, however many rows it
+            // carried: a line a row was a member's to write by the
+            // thousand. The reply names every refused row to the node.
+            if let Some(first) = outcome.refused.first()
+                && lines.allow(node)
+            {
+                let names: Vec<&str> = outcome
+                    .refused
+                    .iter()
+                    .take(REFUSED_NAMES_LOGGED)
+                    .map(|row| row.name.as_str())
+                    .collect();
                 tracing::warn!(
                     component = COMPONENT,
                     node = %node,
-                    name = %refused.name,
-                    reason = %refused.reason,
-                    "refused a published zone row"
+                    refused = outcome.refused.len(),
+                    names = names.join(", "),
+                    first_reason = %first.reason,
+                    "refused published zone rows"
                 );
             }
             outcome
@@ -5275,6 +5375,36 @@ mod tests {
             "past the quarantine the name is anyone's: {:?}",
             bobs.refused
         );
+    }
+
+    /// An accepted connection's writes are bounded, so a peer that stops
+    /// reading cannot hold its thread (or the accept loop) in a reply.
+    #[test]
+    fn a_channel_connections_writes_are_bounded() {
+        let (ours, _theirs) = UnixStream::pair().expect("a socket pair");
+        ours.set_nonblocking(true).expect("as accept hands it over");
+        bound_connection(&ours).expect("the connection is readied");
+        assert_eq!(
+            ours.write_timeout().expect("its write timeout"),
+            Some(CHANNEL_REPLY_TIMEOUT)
+        );
+    }
+
+    /// One connection's log lines are budgeted per window: the lines past
+    /// the budget are left out and counted, and the next window reports
+    /// the count once and starts afresh.
+    #[test]
+    fn a_connections_log_lines_are_budgeted() {
+        let t0 = Instant::now();
+        let mut lines = LineBudget::new(t0);
+        for i in 0..CONNECTION_LINES_MAX {
+            assert_eq!(lines.take(t0), (true, 0), "line {i} is inside the budget");
+        }
+        assert_eq!(lines.take(t0), (false, 0));
+        assert_eq!(lines.take(t0), (false, 0));
+        let next = t0 + CONNECTION_LINES_WINDOW;
+        assert_eq!(lines.take(next), (true, 2), "the next window reports them");
+        assert_eq!(lines.take(next), (true, 0), "once");
     }
 
     /// The shared service's share of names per user: counted over all the
