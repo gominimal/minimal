@@ -1521,16 +1521,21 @@ enum ClientDigest {
 }
 
 impl ProjectionDigests {
+    /// The client's digest as the span and the log name it: the digest,
+    /// `malformed`, or `none`. A malformed value is never named as sent.
+    fn client_word(&self) -> &str {
+        match &self.client {
+            ClientDigest::Absent => "none",
+            ClientDigest::Malformed => "malformed",
+            ClientDigest::Digest(digest) => digest.as_str(),
+        }
+    }
+
     /// Records both digests on the create's span and writes them to the
     /// daemon log.
     fn record(&self, span: &tracing::Span, session_name: &str) {
-        let none = "none";
-        let client = match &self.client {
-            ClientDigest::Absent => none,
-            ClientDigest::Malformed => "malformed",
-            ClientDigest::Digest(digest) => digest.as_str(),
-        };
-        let daemon = self.daemon.as_deref().unwrap_or(none);
+        let client = self.client_word();
+        let daemon = self.daemon.as_deref().unwrap_or("none");
         span.record("client_projection_digest", client);
         span.record("daemon_projection_digest", daemon);
         match &self.unprojected {
@@ -1545,6 +1550,7 @@ impl ProjectionDigests {
                 session_name,
                 client_projection_digest = client,
                 daemon_projection_digest = daemon,
+                policy = PROJECTION_POLICY_NONE,
                 "computed the box spec's projection digest"
             ),
         }
@@ -1581,6 +1587,44 @@ fn projection_digests(
         unprojected,
     }
 }
+
+/// The refusal of a create whose client projection digest differs from
+/// the one the daemon recomputed from the spec it received (BOX-072).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectionDigestRefusal;
+
+impl std::fmt::Display for ProjectionDigestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "No box was created. minimald read different box settings from the box spec \
+             than the `min` that sent it. This can happen when `min` and minimald are \
+             different builds. Run `min stop --force` to stop minimald, then run the \
+             command again to start minimald from the same build as `min`.",
+        )
+    }
+}
+
+impl std::error::Error for ProjectionDigestRefusal {}
+
+impl ProjectionDigests {
+    /// Whether the create must be refused (BOX-072): the client sent a
+    /// digest, or a value that is not one, and it differs from the
+    /// daemon's. A client that sends no digest predates the key, and a
+    /// create with no spec has nothing to compare, so neither is refused.
+    fn mismatch(&self, has_spec: bool) -> bool {
+        has_spec
+            && match &self.client {
+                ClientDigest::Absent => false,
+                ClientDigest::Malformed => true,
+                ClientDigest::Digest(client) => self.daemon.as_deref() != Some(client.as_str()),
+            }
+    }
+}
+
+/// The policy that a create evaluates against the projection (BOX-073).
+/// No host this daemon runs on is enrolled, so the create evaluates no
+/// policy, and the span and the log say `none`.
+pub(crate) const PROJECTION_POLICY_NONE: &str = "none";
 
 /// Whether `digest` has the form of a projection digest: SHA-256 as
 /// base64url with no padding, 43 characters. A client value of any other
@@ -4294,6 +4338,9 @@ impl BoxManager {
             // BOX-071: the client's and the daemon's projection digests.
             client_projection_digest = tracing::field::Empty,
             daemon_projection_digest = tracing::field::Empty,
+            // BOX-073: the host is not enrolled, so no policy is evaluated
+            // against the projection.
+            policy = PROJECTION_POLICY_NONE,
         )
     )]
     async fn create_session(
@@ -4510,6 +4557,25 @@ impl BoxManager {
             );
         }
         digests.record(&span, session_name);
+        // BOX-072: a client that projected the spec to another digest
+        // read it otherwise. The refusal comes before the record exists,
+        // so it leaves no record, id or name behind.
+        if digests.mismatch(spec.is_some()) {
+            let refusal = ProjectionDigestRefusal;
+            span.record("refusal", "projection digest mismatch");
+            tracing::info!(
+                session_name,
+                client_projection_digest = digests.client_word(),
+                daemon_projection_digest = digests.daemon.as_deref().unwrap_or("none"),
+                "refused a create: the client's projection digest differs from the daemon's"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                refusal,
+            ));
+        }
+        // BOX-073: this host is not enrolled, so the create evaluates no
+        // policy against the projection. The span's `policy` field says so.
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
