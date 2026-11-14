@@ -6533,7 +6533,7 @@ fn store_secret() -> serde_json_lenient::Value {
         "source": "store",
         "store": "keychain",
         "id": "npm-token",
-        "upstream": { "hosts": ["registry.npmjs.org"] },
+        "upstream": ["registry.npmjs.org"],
         "inject": { "header": "Authorization", "format": "Bearer {}" },
     })
 }
@@ -7282,4 +7282,124 @@ async fn derived_task_type_refused_at_expansion_and_admission() {
             "the create span records it: {line}"
         );
     }
+}
+
+/// BOX-071: a created box's record holds the client's projection digest
+/// beside the one the daemon recomputed from the spec it received. The
+/// daemon's key is its own: a digest a client sends under it is dropped.
+/// The daemon log names both digests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_digests_stored_side_by_side() {
+    use minimald_rpc::{CLIENT_PROJECTION_DIGEST_ATTR, DAEMON_PROJECTION_DIGEST_ATTR};
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let spec = spec_with_secrets(
+        "digest",
+        serde_json_lenient::json!({ "npm": store_secret() }),
+    );
+    let expected =
+        mfile::projection::spec_digest(&spec, boxes::TASK_BOX_TYPE).expect("the spec projects");
+    let digests_of = |record: boxes::Record| {
+        (
+            record.attrs.get(CLIENT_PROJECTION_DIGEST_ATTR).cloned(),
+            record.attrs.get(DAEMON_PROJECTION_DIGEST_ATTR).cloned(),
+        )
+    };
+    let create = |config: minimald_rpc::BoxConfig| {
+        let mngr = mngr.clone();
+        let spec = spec.clone();
+        async move {
+            let id = mngr
+                .create_box_with_spec(as_task(config), Some(spec), None, None)
+                .await
+                .expect("the box is created");
+            let record = mngr
+                .get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .expect("the record is filed");
+            (id, record)
+        }
+    };
+
+    // A client that projected the same spec: both digests, equal.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    let (agreed, record) = create(config).await;
+    assert_eq!(
+        digests_of(record),
+        (Some(expected.clone()), Some(expected.clone()))
+    );
+
+    // A client digest that differs is stored as sent, beside the daemon's.
+    // Refusing that create is BOX-072's, not this record's.
+    let differing = "A".repeat(43);
+    assert_ne!(differing, expected);
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(differing.clone());
+    config.attrs.insert(
+        DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
+        "asserted-by-client".to_owned(),
+    );
+    let (_, record) = create(config).await;
+    assert_eq!(
+        digests_of(record),
+        (Some(differing), Some(expected.clone()))
+    );
+
+    // A client value that is not a digest in form is not stored.
+    for malformed in ["client-digest", "A\nB", &"A".repeat(44), &"A".repeat(4096)] {
+        let mut config = unnamed_config();
+        config.set_client_projection_digest(malformed);
+        let (_, record) = create(config).await;
+        assert_eq!(
+            digests_of(record),
+            (None, Some(expected.clone())),
+            "{malformed:?}"
+        );
+    }
+
+    // A client that predates the digest sends none: the daemon's alone.
+    let (_, record) = create(unnamed_config()).await;
+    assert_eq!(digests_of(record), (None, Some(expected.clone())));
+
+    // A create with no spec has no daemon digest, so the client's is not
+    // stored alone.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    let id = mngr
+        .create_box_with_spec(as_task(config), None, None, None)
+        .await
+        .expect("the box is created");
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is filed");
+    assert_eq!(digests_of(record), (None, None));
+
+    // The daemon log names both digests.
+    let logged = log.contents();
+    // A malformed client value logs as `malformed`, never as `none` and
+    // never as sent.
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains("client_projection_digest=\"malformed\"")
+        }),
+        "a log line names a malformed client digest:\n{logged}"
+    );
+    assert!(!logged.contains("client-digest"), "{logged}");
+    let line = logged
+        .lines()
+        .find(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains(&format!("client_projection_digest=\"{expected}\""))
+        })
+        .unwrap_or_else(|| panic!("a log line names both digests of {agreed}:\n{logged}"));
+    assert!(
+        line.contains(&format!("daemon_projection_digest=\"{expected}\"")),
+        "{line}"
+    );
 }
