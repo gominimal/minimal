@@ -1,5 +1,22 @@
 use super::*;
 
+/// Writes `content`, a box's default `minimal.toml`, to `toml_path` in the
+/// box's workspace `wsp` if no file is there yet. Under the lock `min
+/// init`/`add`/`update` take, and only if the file is still missing there,
+/// so a concurrent writer's file is never clobbered by the default. The
+/// write stays inside the workspace ([`mfile::File::edit_exclusively_within`]):
+/// the box controls it, so a link there that leads out of it is refused.
+pub(super) fn write_default_mfile(
+    wsp: &std::path::Path,
+    toml_path: &std::path::Path,
+    content: String,
+) -> Result<(), String> {
+    mfile::File::edit_exclusively_within::<mfile::Error>(wsp, toml_path, |existing| {
+        Ok(existing.is_none().then_some(content))
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// The daemon log's one line for an activation refused on a declared host
 /// port that something else holds (NET-144): the session, the port, the
 /// address and the holder (`box:<name>` or `host`).
@@ -1281,17 +1298,12 @@ impl BoxActor {
         if wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             return Ok(());
         }
-        match mfile::File::from_dir(wsp.as_utf8_path()) {
+        // Read beneath the workspace: the box controls it.
+        match mfile::File::from_dir_within(wsp.as_utf8_path()) {
             Ok(_) => Ok(()), // it exists
             Err(mfile::Error::NotFound) => {
                 let (toml_path, content) = self.default_mfile_plan(wsp)?;
-                // Under the lock `min init`/`add`/`update` take, and only if
-                // the file is still missing there, so a concurrent writer's
-                // file is never clobbered by the default.
-                mfile::File::edit_exclusively::<mfile::Error>(&toml_path, |existing| {
-                    Ok(existing.is_none().then_some(content))
-                })
-                .map_err(|e| e.to_string())
+                write_default_mfile(wsp.as_utf8_path().as_std_path(), &toml_path, content)
             }
             Err(e) => Err(e.to_string()),
         }
@@ -1324,7 +1336,9 @@ impl BoxActor {
             let config = self.workspace_config(wsp)?;
 
             use op::ProjectOp as _;
-            let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+            let root = wsp.as_utf8_path().as_std_path().to_path_buf();
+            let mut env =
+                mctx::ProjectSetup::for_init_within(config, root).map_err(|e| e.to_string())?;
             let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
 
             Ok((plan.toml_path, plan.content))
@@ -1358,12 +1372,17 @@ impl BoxActor {
                 _ => scaffold(),
             }?;
         }
-        let mut ctx =
-            mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())?;
-        // inbox#1245: the box controls everything under its workspace, so an
-        // edit of its minimal.toml (`min add` in the box) must not follow a
-        // link there to a file outside the workspace.
-        ctx.confine_mfile_edits_to(wsp.as_utf8_path().into());
+        // The box controls everything under its workspace, so a read of its
+        // minimal.toml, here and on every reload, and an edit of it (`min
+        // add` in the box) must not follow a link there to a file outside the
+        // workspace.
+        let root = wsp.as_utf8_path().as_std_path().to_path_buf();
+        let mut ctx = mctx::Context::new_with_strategy(
+            self.workspace_config(&wsp)?,
+            mctx::MFileSearchStrategy::Within(root.clone()),
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.confine_mfile_edits_to(root);
         // NET-155: an own-address box has no classifier leaf. Every package
         // build its context starts, the activation launch's among them,
         // attaches to a network of the box's own, under the box's egress

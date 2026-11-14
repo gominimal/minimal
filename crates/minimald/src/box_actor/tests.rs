@@ -18601,3 +18601,28 @@ async fn restart_argv_box_behind_hook_shell_with_host_row_fails_stopped() {
     assert_eq!(added, [BoxEventType::Exited], "{added:?}");
     assert_eq!(events[before].data["reason"], "stopped");
 }
+
+/// The default `minimal.toml` is written inside the box's workspace only:
+/// over a link that leads out of it, the scaffold is refused, the file
+/// outside is left as it was and the link is kept.
+#[test]
+fn a_scaffold_over_a_link_out_of_the_workspace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    let outside = dir.path().join("outside.toml");
+    std::fs::write(&outside, "# outside\n").unwrap();
+    let link = workspace.join(mfile::MFILE_NAME);
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let err = super::setup::write_default_mfile(
+        &workspace,
+        &link,
+        "[defaults.session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+    )
+    .unwrap_err();
+
+    assert!(err.contains("leads outside its workspace"), "error: {err}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# outside\n");
+    assert_eq!(std::fs::read_link(&link).unwrap(), outside);
+}
