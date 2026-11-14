@@ -4949,16 +4949,20 @@ mod tests {
             &first
         };
         // The loser's skip reason is whichever check it lost to: the
-        // reservation when both walks' probes passed, or a bind probe that
+        // reservation when both walks' probes passed, a bind probe that
         // collided with the winner's own probe — which holds the port
-        // momentarily. Both are the draw telling the host why it moved on;
-        // the invariant the test owns is the one above: the two walks never
-        // share a port, and the reservation (the test below) is what keeps
-        // it that way when the probes both pass.
+        // momentarily — or the loopback probe finding the winner's own
+        // listener answering in that same window. All three are the draw
+        // telling the host why it moved on; the invariant the test owns is
+        // the one above: the two walks never share a port, and the
+        // reservation (the test below) is what keeps it that way when the
+        // probes both pass.
         assert!(
             matches!(
                 loser.skipped,
-                Some(super::SKIP_RESERVED_BY_ANOTHER_VM) | Some(super::SKIP_BIND_REFUSED)
+                Some(super::SKIP_RESERVED_BY_ANOTHER_VM)
+                    | Some(super::SKIP_BIND_REFUSED)
+                    | Some(super::SKIP_LOOPBACK_ANSWERING)
             ),
             "the draw that moved on says why, got {:?}",
             loser.skipped
