@@ -1390,7 +1390,10 @@ mod tests {
         );
         assert!(PROJECT_ACKNOWLEDGEMENT_IGNORED.contains("in [defaults.session.secrets]."));
         // No refusal names a legacy table.
-        for text in [unenrolled.to_string(), PROJECT_ACKNOWLEDGEMENT_IGNORED.to_owned()] {
+        for text in [
+            unenrolled.to_string(),
+            PROJECT_ACKNOWLEDGEMENT_IGNORED.to_owned(),
+        ] {
             assert!(!text.contains("[session."), "{text}");
             assert!(!text.contains(" [network.bep]"), "{text}");
         }
