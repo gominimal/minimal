@@ -1,0 +1,51 @@
+# The example `minimal.toml` of the Box architecture, for the golden
+# vectors of BOX-145. `tests/golden.rs` expands its session and task
+# entries. The agent entry is declared for later and is not expanded
+# (gominimal/inbox#678).
+
+[upstream]
+repo_url = "https://github.com/gominimal/pkgs"
+branch = "main"
+commit = "0123456789abcdef0123456789abcdef01234567"
+
+[defaults]
+packages = ["git", "curl"]
+
+[defaults.session]
+timeout = "8h"
+packages = ["zsh"]
+
+[defaults.session.network]
+mode = "own_ip"
+egress_allow_dns = ["github.com", "crates.io"]
+
+[defaults.task]
+timeout = "30m"
+
+[defaults.task.network]
+mode = "host_ip"
+
+[sessions.dev]
+packages = ["rust", "nodejs"]
+
+[sessions.dev.network]
+mode = "own_ip"
+ingress = [8080]
+egress_allow_dns = ["github.com", "crates.io", "registry.npmjs.org"]
+egress_allow_subnets = ["10.0.0.0/8"]
+egress_deny_subnets = ["10.0.5.0/24"]
+
+[sessions.dev.secrets.gh]
+scopes = ["github:repo"]
+
+[tasks.test]
+packages = ["rust"]
+exec = ["cargo", "test"]
+
+[tasks.lint]
+packages = ["rust"]
+exec = "cargo clippy --all-targets"
+timeout = "10m"
+
+[agents.reviewer]
+packages = ["git"]
