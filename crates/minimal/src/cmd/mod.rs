@@ -72,6 +72,7 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -340,9 +341,18 @@ where
     };
     span.record("outcome", outcome);
     // A failed command marks its root span as an error, whether or not the
-    // failure was expected. A hand-off is not a failure.
-    if outcome == "error" {
+    // failure was expected, and says why in the status itself, so a trace
+    // filter on failed commands reads the cause without opening the span's
+    // events (gominimal/minimal#3223), never quoting a daemon reply that
+    // did not decode. A hand-off is not a failure.
+    if let Err(e) = &result
+        && outcome == "error"
+    {
         span.record("otel.status_code", "ERROR");
+        span.record(
+            "otel.status_description",
+            minimal_client::span_status_description(e).as_str(),
+        );
     }
     // Release every handle on the span, so it closes here.
     drop(slot);
@@ -2001,24 +2011,31 @@ mod handoff_tests {
         closed.0.lock().unwrap().clone()
     }
 
-    /// Records each span's `otel.status_code`, if it gets one, in the order
-    /// the spans are created.
+    /// Records each span's `otel.status_code` and `otel.status_description`,
+    /// each kept apart, in the order the spans are created.
     #[derive(Clone, Default)]
     struct Statuses(Arc<Mutex<StatusLog>>);
 
+    /// One span's status as recorded: its code and its description.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct Status {
+        code: Option<String>,
+        description: Option<String>,
+    }
+
     #[derive(Default)]
     struct StatusLog {
-        statuses: Vec<Option<String>>,
+        statuses: Vec<Status>,
         /// The index in `statuses` of each open span, by span id.
         by_id: std::collections::HashMap<u64, usize>,
     }
 
-    struct StatusField(Option<String>);
-
-    impl tracing::field::Visit for StatusField {
+    impl tracing::field::Visit for Status {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "otel.status_code" {
-                self.0 = Some(value.to_owned());
+            match field.name() {
+                "otel.status_code" => self.code = Some(value.to_owned()),
+                "otel.status_description" => self.description = Some(value.to_owned()),
+                _ => {}
             }
         }
 
@@ -2034,7 +2051,7 @@ mod handoff_tests {
         ) {
             let mut log = self.0.lock().unwrap();
             let at = log.statuses.len();
-            log.statuses.push(None);
+            log.statuses.push(Status::default());
             log.by_id.insert(id.into_u64(), at);
         }
 
@@ -2044,17 +2061,23 @@ mod handoff_tests {
             values: &tracing::span::Record<'_>,
             _: Context<'_, S>,
         ) {
-            let mut field = StatusField(None);
-            values.record(&mut field);
+            let mut recorded = Status::default();
+            values.record(&mut recorded);
             let mut log = self.0.lock().unwrap();
-            if let (Some(status), Some(&at)) = (field.0, log.by_id.get(&id.into_u64())) {
-                log.statuses[at] = Some(status);
+            if let Some(&at) = log.by_id.get(&id.into_u64()) {
+                let status = &mut log.statuses[at];
+                if recorded.code.is_some() {
+                    status.code = recorded.code;
+                }
+                if recorded.description.is_some() {
+                    status.description = recorded.description;
+                }
             }
         }
     }
 
     impl Statuses {
-        fn all(&self) -> Vec<Option<String>> {
+        fn all(&self) -> Vec<Status> {
             self.0.lock().unwrap().statuses.clone()
         }
     }
@@ -2172,7 +2195,13 @@ mod handoff_tests {
                 .with(closed.clone())
                 .with(statuses.clone()),
         );
-        let cmd = || tracing::info_span!("cmd", otel.status_code = tracing::field::Empty);
+        let cmd = || {
+            tracing::info_span!(
+                "cmd",
+                otel.status_code = tracing::field::Empty,
+                otel.status_description = tracing::field::Empty
+            )
+        };
         let ok = run_in_root(cmd(), async { Ok(()) }).await;
         assert!(matches!(ok, Ok(None)));
         let err = run_in_root(cmd(), async { Err(anyhow::anyhow!("no session found")) })
@@ -2184,6 +2213,15 @@ mod handoff_tests {
             .unwrap();
         assert!(matches!(handoff, Some(Handoff::Exit(1))), "{handoff:?}");
         assert_eq!(closed_names(&closed), ["cmd", "cmd", "cmd"]);
-        assert_eq!(statuses.all(), [None, Some("ERROR".to_owned()), None]);
+        // The failed command's span carries the ERROR code, and its status
+        // description the error's text (#3223); the others carry neither.
+        let failed = Status {
+            code: Some("ERROR".to_owned()),
+            description: Some("no session found".to_owned()),
+        };
+        assert_eq!(
+            statuses.all(),
+            [Status::default(), failed, Status::default()]
+        );
     }
 }

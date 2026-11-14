@@ -2777,17 +2777,27 @@ impl ActivationStep {
         let span = tracing::info_span!(
             "activation_step",
             step = self.name(),
-            otel.status_code = tracing::field::Empty
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty
         );
         let result = work.instrument(span.clone()).await;
         if let Err(error) = &result {
-            // The status, so a trace query for failed steps finds them; the
-            // event stays at INFO, since a failed step is often expected.
+            // The status, so a trace query for failed steps finds them, and
+            // its message, so the query reads why without the event
+            // (gominimal/minimal#3223); the event stays at INFO, since a
+            // failed step is often expected. A daemon reply that did not
+            // decode is named, never quoted, in the status.
             span.record("otel.status_code", "ERROR");
+            span.record(
+                "otel.status_description",
+                minimal_client::span_status_description(error).as_str(),
+            );
+            // The event is exported as a log record, so it takes the same
+            // text as the status: a reply that did not decode is not quoted.
             span.in_scope(|| {
                 tracing::info!(
                     step = self.name(),
-                    error = %format!("{error:#}"),
+                    error = %minimal_client::span_status_description(error),
                     "activation step failed"
                 );
             });
@@ -6909,13 +6919,15 @@ mod activation_step_tests {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     /// What the capture layer saw: each `activation_step` span's step, in
-    /// creation order, each failure record's step and error, and the step
-    /// of each span that recorded an ERROR status.
+    /// creation order, each failure record's step and error, the step of
+    /// each span that recorded an ERROR status, and the step and text of
+    /// each span that recorded a status description.
     #[derive(Default)]
     struct Seen {
         spans: Vec<String>,
         failures: Vec<(String, String)>,
         errored: Vec<String>,
+        described: Vec<(String, String)>,
         /// The step of each open `activation_step` span, by span id.
         by_id: std::collections::HashMap<u64, String>,
     }
@@ -6926,6 +6938,7 @@ mod activation_step_tests {
         error: Option<String>,
         message: Option<String>,
         status: Option<String>,
+        description: Option<String>,
     }
 
     impl tracing::field::Visit for Fields {
@@ -6935,6 +6948,7 @@ mod activation_step_tests {
                 "error" => self.error = Some(value.to_owned()),
                 "message" => self.message = Some(value.to_owned()),
                 "otel.status_code" => self.status = Some(value.to_owned()),
+                "otel.status_description" => self.description = Some(value.to_owned()),
                 _ => {}
             }
         }
@@ -6976,6 +6990,11 @@ mod activation_step_tests {
                 && let Some(step) = seen.by_id.get(&id.into_u64()).cloned()
             {
                 seen.errored.push(step);
+            }
+            if let Some(description) = fields.description
+                && let Some(step) = seen.by_id.get(&id.into_u64()).cloned()
+            {
+                seen.described.push((step, description));
             }
         }
 
@@ -7082,8 +7101,16 @@ mod activation_step_tests {
                 "Failed to upload project files".to_owned()
             )]
         );
-        // Only the failing step's span carries the ERROR status.
+        // Only the failing step's span carries the ERROR status, and its
+        // status description is the step's error (gominimal/minimal#3223).
         assert_eq!(seen.errored, ["upload_files"]);
+        assert_eq!(
+            seen.described,
+            [(
+                "upload_files".to_owned(),
+                "Failed to upload project files".to_owned()
+            )]
+        );
     }
 
     #[derive(clap::Parser)]
@@ -7120,5 +7147,12 @@ mod activation_step_tests {
             seen.failures[0].1
         );
         assert_eq!(seen.errored, ["check_arguments"]);
+        assert_eq!(seen.described.len(), 1);
+        assert_eq!(seen.described[0].0, "check_arguments");
+        assert!(
+            seen.described[0].1.starts_with(&expected),
+            "status description: {:?}",
+            seen.described[0].1
+        );
     }
 }

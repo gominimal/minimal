@@ -520,7 +520,7 @@ impl Client {
         self.oneshot_rpc_within::<R>(request, deadline).await
     }
 
-    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty))]
+    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty, otel.status_description = tracing::field::Empty))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -576,12 +576,14 @@ impl Client {
             }
 
             let response: R::Response = serde_json_lenient::from_slice(&resp_buf)
-                .with_context(|| decode_context(R::NAME, &resp_buf))?;
+                .map_err(|source| UndecodedReply::new(R::NAME, &resp_buf, source))?;
             // Most RPCs answer a refusal as `Errorable::Err` inside a decoded
             // response, and `SubmitVerdict` as a `Fault` step; the caller
             // still gets it as a response, and the span is marked failed.
             if daemon_refused(&resp_buf) {
-                tracing::Span::current().record("otel.status_code", "ERROR");
+                let span = tracing::Span::current();
+                span.record("otel.status_code", "ERROR");
+                span.record("otel.status_description", "the daemon refused the request");
             }
             Ok(response)
         };
@@ -590,10 +592,17 @@ impl Client {
             .await
             .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))
             .and_then(|r| r);
-        if result.is_err() {
+        if let Err(e) = &result {
             // A failed or timed-out RPC marks its span, so a daemon-side
-            // "rpc failed" has a failed client-side span to match.
-            tracing::Span::current().record("otel.status_code", "ERROR");
+            // "rpc failed" has a failed client-side span to match, and the
+            // status says what failed (gominimal/minimal#3223), without the
+            // reply's bytes when the reply did not decode.
+            let span = tracing::Span::current();
+            span.record("otel.status_code", "ERROR");
+            span.record(
+                "otel.status_description",
+                span_status_description(e).as_str(),
+            );
         }
         result
     }
@@ -1453,6 +1462,80 @@ fn decode_context(rpc: &str, body: &[u8]) -> String {
     format!("decode response for {rpc} (daemon replied: {excerpt})")
 }
 
+/// A daemon reply that did not decode. Its message is [`decode_context`]'s,
+/// quoting the reply, and its source is the decoder's error, so the error a
+/// person sees reads as it always has. The reply can hold user content (a
+/// terminal snapshot, a box record), and the decoder's error can quote a
+/// value from it, so neither goes into telemetry: [`span_status_description`]
+/// names the RPC, the reply's size and where the decode failed instead.
+#[derive(Debug)]
+struct UndecodedReply {
+    rpc: &'static str,
+    bytes: usize,
+    message: String,
+    source: serde_json_lenient::Error,
+}
+
+impl UndecodedReply {
+    fn new(rpc: &'static str, body: &[u8], source: serde_json_lenient::Error) -> Self {
+        Self {
+            rpc,
+            bytes: body.len(),
+            message: decode_context(rpc, body),
+            source,
+        }
+    }
+
+    /// What a span may say of this failure: no byte of the reply.
+    fn summary(&self) -> String {
+        let kind = match self.source.classify() {
+            serde_json_lenient::error::Category::Io => "an I/O",
+            serde_json_lenient::error::Category::Syntax => "a syntax",
+            serde_json_lenient::error::Category::Data => "a data",
+            serde_json_lenient::error::Category::Eof => "an end-of-input",
+        };
+        format!(
+            "decode response for {}: the daemon's reply ({} bytes) has {kind} error at line {} \
+             column {}",
+            self.rpc,
+            self.bytes,
+            self.source.line(),
+            self.source.column(),
+        )
+    }
+}
+
+impl std::fmt::Display for UndecodedReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UndecodedReply {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// The text for a failed span's `otel.status_description`: the error chain
+/// as `{:#}` prints it, except that a daemon reply that did not decode is
+/// named by its RPC, size and fault position and never quoted, nor is the
+/// decoder's error under it. A reply can carry user content, and a status
+/// description is exported as is (gominimal/minimal#3223). The error itself,
+/// what `min` prints, keeps the quote.
+#[must_use]
+pub fn span_status_description(error: &anyhow::Error) -> String {
+    let mut links = Vec::new();
+    for link in error.chain() {
+        if let Some(reply) = link.downcast_ref::<UndecodedReply>() {
+            links.push(reply.summary());
+            break;
+        }
+        links.push(link.to_string());
+    }
+    links.join(": ")
+}
+
 /// The wording, the override, and the placeholder for a daemon too old to
 /// report its build all live in the wire crate: the daemon produces the same
 /// message when it refuses a `CreateSession` whose `must_match_version` does
@@ -1959,6 +2042,39 @@ mod tests {
             rendered.contains("finalized_at"),
             "the reply must be quoted so the tripping field is identifiable, got: {rendered}"
         );
+    }
+
+    /// A reply that does not decode is quoted in the error a person sees,
+    /// but a span's status description names only the RPC, the reply's size
+    /// and where the decode failed, under any context added above it: the
+    /// reply, here a terminal line, can be user content, and the decoder's
+    /// own error quotes the value it rejected (gominimal/minimal#3223).
+    #[test]
+    fn a_span_status_never_quotes_an_undecodable_reply() {
+        use anyhow::Context as _;
+
+        // A terminal line where a count was expected: the decoder's error
+        // quotes the string it rejected.
+        let body = br#""$ export TOKEN=hunter2""#;
+        let source = serde_json_lenient::from_slice::<u32>(body).unwrap_err();
+        assert!(source.to_string().contains("hunter2"), "{source}");
+        let err = Err::<(), _>(super::UndecodedReply::new("GetSessionScreen", body, source))
+            .context("read the session's screen")
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("hunter2"), "{err:#}");
+        let status = super::span_status_description(&err);
+        assert!(!status.contains("hunter2"), "{status}");
+        let expected = format!(
+            "read the session's screen: decode response for GetSessionScreen: the daemon's \
+             reply ({} bytes) has a data error at line 1 column ",
+            body.len()
+        );
+        assert!(status.starts_with(&expected), "{status}");
+
+        // Any other error reads as `{:#}` prints it.
+        let other = anyhow::anyhow!("connection reset").context("open channel for X");
+        assert_eq!(super::span_status_description(&other), format!("{other:#}"));
     }
 
     /// A pathological body is quoted, but bounded — the excerpt must not
@@ -2900,24 +3016,42 @@ mod rpc_status_tests {
         }
     }
 
-    /// Records each `client.rpc` span's `otel.status_code`, if it gets one,
-    /// in the order the spans are created.
+    /// Records each `client.rpc` span's `otel.status_code` and
+    /// `otel.status_description`, each kept apart, in the order the spans
+    /// are created.
     #[derive(Clone, Default)]
     struct Statuses(Arc<Mutex<StatusLog>>);
 
+    /// One span's status as recorded: its code and its description.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct Status {
+        code: Option<String>,
+        description: Option<String>,
+    }
+
+    impl Status {
+        /// The status of a failed span that says `why`.
+        fn error(why: &str) -> Self {
+            Status {
+                code: Some("ERROR".to_owned()),
+                description: Some(why.to_owned()),
+            }
+        }
+    }
+
     #[derive(Default)]
     struct StatusLog {
-        statuses: Vec<Option<String>>,
+        statuses: Vec<Status>,
         /// The index in `statuses` of each open `client.rpc` span, by id.
         by_id: std::collections::HashMap<u64, usize>,
     }
 
-    struct StatusField(Option<String>);
-
-    impl tracing::field::Visit for StatusField {
+    impl tracing::field::Visit for Status {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "otel.status_code" {
-                self.0 = Some(value.to_owned());
+            match field.name() {
+                "otel.status_code" => self.code = Some(value.to_owned()),
+                "otel.status_description" => self.description = Some(value.to_owned()),
+                _ => {}
             }
         }
 
@@ -2934,7 +3068,7 @@ mod rpc_status_tests {
             if attrs.metadata().name() == "client.rpc" {
                 let mut log = self.0.lock().unwrap();
                 let at = log.statuses.len();
-                log.statuses.push(None);
+                log.statuses.push(Status::default());
                 log.by_id.insert(id.into_u64(), at);
             }
         }
@@ -2945,19 +3079,27 @@ mod rpc_status_tests {
             values: &tracing::span::Record<'_>,
             _: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            let mut field = StatusField(None);
-            values.record(&mut field);
+            let mut recorded = Status::default();
+            values.record(&mut recorded);
             let mut log = self.0.lock().unwrap();
-            if let (Some(status), Some(&at)) = (field.0, log.by_id.get(&id.into_u64())) {
-                log.statuses[at] = Some(status);
+            if let Some(&at) = log.by_id.get(&id.into_u64()) {
+                let status = &mut log.statuses[at];
+                if recorded.code.is_some() {
+                    status.code = recorded.code;
+                }
+                if recorded.description.is_some() {
+                    status.description = recorded.description;
+                }
             }
         }
     }
 
     /// A `client.rpc` span carries the ERROR status when the daemon refuses
     /// the call (`Errorable::Err` or a `SubmitVerdict` fault), when the
-    /// reply does not decode, and when the call times out; a successful
-    /// reply leaves it unset.
+    /// reply does not decode, and when the call times out, and its status
+    /// description says which (gominimal/minimal#3223): a refusal says the
+    /// daemon refused, a failure carries the error the caller gets. A
+    /// successful reply sets neither.
     #[tokio::test(flavor = "current_thread")]
     async fn a_refused_failed_or_timed_out_rpc_marks_its_span() {
         use boxes::wire::{errors::WireError, request::BoxStep};
@@ -3048,7 +3190,23 @@ mod rpc_status_tests {
         let undecodable = client
             .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
             .await;
-        assert!(undecodable.is_err());
+        let undecodable = undecodable.expect_err("the reply does not decode");
+        // The caller's error quotes the reply, for a bug report; the span's
+        // status names the RPC and the reply's size and quotes nothing, since
+        // a reply can carry user content.
+        assert!(
+            format!("{undecodable:#}").contains("not json"),
+            "{undecodable:#}"
+        );
+        let undecodable = super::span_status_description(&undecodable);
+        assert!(!undecodable.contains("not json"), "{undecodable}");
+        assert!(
+            undecodable.starts_with(&format!(
+                "decode response for {}: the daemon's reply (8 bytes) has a syntax error",
+                <SubmitVerdict as minimald_rpc::OneshotSshRpc>::NAME
+            )),
+            "{undecodable}"
+        );
 
         *reply.lock().unwrap() = Reply::Hang;
         let timed_out = client
@@ -3057,13 +3215,22 @@ mod rpc_status_tests {
                 std::time::Duration::from_millis(200),
             )
             .await;
-        let err = timed_out.expect_err("a call nobody answers times out");
-        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        let timed_out = format!(
+            "{:#}",
+            timed_out.expect_err("a call nobody answers times out")
+        );
+        assert!(timed_out.contains("timed out"), "{timed_out}");
 
-        let error = Some("ERROR".to_owned());
+        let refused = Status::error("the daemon refused the request");
         assert_eq!(
             statuses.0.lock().unwrap().statuses,
-            [None, error.clone(), error.clone(), error.clone(), error]
+            [
+                Status::default(),
+                refused.clone(),
+                refused,
+                Status::error(&undecodable),
+                Status::error(&timed_out),
+            ]
         );
         drop(client);
         server.abort();
