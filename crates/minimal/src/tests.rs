@@ -9997,8 +9997,15 @@ fn write_exec_event(
             .expect("the box's record");
     let mut event = boxes::events::BoxEvent::for_record(&record, kind);
     event.data.insert(exec_data::EXEC_ID.into(), exec_id.into());
-    let mode = if pty { "tty" } else { "detached" };
-    event.data.insert(exec_data::MODE.into(), mode.into());
+    // The mode as the daemon spells it in the event it writes.
+    let mode = if pty {
+        minimald_rpc::exec::ExecMode::Tty
+    } else {
+        minimald_rpc::exec::ExecMode::Detached
+    };
+    event
+        .data
+        .insert(exec_data::MODE.into(), mode.name().into());
     event.data.insert(exec_data::PTY.into(), pty.into());
     event.data.insert(
         exec_data::ARGV.into(),
@@ -10229,7 +10236,7 @@ async fn exec_attach_detach_key_returns_0_exec_keeps_running() {
         live_exec_rows(&text),
         [
             "Live execs:".to_owned(),
-            format!("  {AN_EXEC_ID}  terminal  sh -i"),
+            format!("  {AN_EXEC_ID}  tty       sh -i"),
         ],
         "{text}"
     );
@@ -14227,6 +14234,75 @@ async fn task_list_shows_exited_until_pruned() {
     assert_eq!(list(None).await, "No task boxes on this machine.\n");
 }
 
+// D3203: in a project that holds only a session box, a scoped
+// `min task list` names the task type in its empty line. It does not print
+// the `min box list` empty line, which says the project has no boxes at all.
+#[tokio::test]
+async fn task_list_in_a_session_only_project_says_no_task_boxes() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+
+    let list = async |box_type: &str| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        typed_list_on_hosts(
+            box_type,
+            local_hosts(&global).unwrap(),
+            Some(paths::HostAbsPath::try_new(project).unwrap()),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .expect("the typed list");
+        assert_eq!(String::from_utf8_lossy(&err), "", "nothing on stderr");
+        String::from_utf8(out).unwrap()
+    };
+
+    // The session box is in the project, so the project is not empty.
+    let sessions = list(boxes::SESSION_BOX_TYPE).await;
+    assert!(sessions.contains("  web  "), "{sessions}");
+
+    let tasks = list(boxes::TASK_BOX_TYPE).await;
+    assert_eq!(
+        tasks,
+        "This project has no task boxes. Run `min task list --all` to list the task boxes \
+         of every project.\n"
+    );
+    assert!(!tasks.contains(EMPTY_PROJECT_LIST), "{tasks}");
+
+    // `min box list` for the same project lists the session box, so it
+    // does not print its own empty line either.
+    let root = paths::HostAbsPath::try_new(project).unwrap();
+    let host = local_hosts(&global)
+        .unwrap()
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the native host is selected");
+    let mut client = connect_daemon(&global).await.unwrap();
+    let listed: Vec<cmd::ListedBox> = list_box_records(&mut client, Some(root.clone()))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| cmd::ListedBox {
+            provider: host.provider.to_string(),
+            host: host.host.clone(),
+            record,
+        })
+        .collect();
+    let mut box_list = Vec::new();
+    cmd::render_box_list(&mut box_list, &listed, true).unwrap();
+    let box_list = String::from_utf8(box_list).unwrap();
+    let rows: Vec<&str> = box_list.lines().collect();
+    assert_eq!(rows.len(), 2, "a header and the session box:\n{box_list}");
+    assert!(rows[1].contains("  web  "), "{box_list}");
+    assert!(rows[1].contains("  session  "), "{box_list}");
+    assert!(!box_list.contains(EMPTY_PROJECT_LIST), "{box_list}");
+}
+
 /// The typed listing of `min session list` and `min task list` over the
 /// local `hosts`, as the commands run it, with the table rendering.
 async fn typed_list_on_hosts(
@@ -16142,7 +16218,7 @@ const FIRST_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4b01";
 const SECOND_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4b02";
 
 // BCLI-067: `min box show <box>` lists each live exec of the box, one row
-// each, with its exec id, `terminal` or `detached`, and its command. An
+// each, with its exec id, `tty` or `detached`, and its command. An
 // exec that ends leaves the list, and a box with no live exec prints no
 // block.
 #[tokio::test]
@@ -16168,7 +16244,7 @@ async fn box_show_lists_live_execs() {
         live_exec_rows(&text),
         [
             "Live execs:".to_owned(),
-            format!("  {FIRST_EXEC_ID}  terminal  sh -i"),
+            format!("  {FIRST_EXEC_ID}  tty       sh -i"),
             format!("  {SECOND_EXEC_ID}  detached  sh -c 'sleep 600; echo done'"),
         ],
         "{text}"
@@ -16255,7 +16331,7 @@ async fn box_show_output_json_writes_box_with_execs() {
             {
                 "schema": "min/v1/exec",
                 "id": FIRST_EXEC_ID,
-                "mode": "terminal",
+                "mode": "tty",
                 "argv": ["sh", "-i"],
             },
             {
@@ -16267,6 +16343,53 @@ async fn box_show_output_json_writes_box_with_execs() {
         ]),
         "{json}"
     );
+}
+
+// BCLI-067, BCLI-033: one terminal exec has one mode word. The
+// `min box show` row, its `min/v1/exec` object and its `exec_started`
+// event in `min box events -o jsonl` all name it `tty`, the word
+// `min box exec --tty` takes.
+#[tokio::test]
+async fn exec_mode_is_one_word_in_show_and_events() {
+    use boxes::events::BoxEventType;
+
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    let _shell = alpha
+        .server
+        .list_running_exec(web, FIRST_EXEC_ID, &["sh", "-i"], true);
+    write_exec_event(&state, web, BoxEventType::ExecStarted, FIRST_EXEC_ID, true);
+
+    let text = box_show_text(&alpha.host, "web").await;
+    let rows = live_exec_rows(&text);
+    let row = rows
+        .iter()
+        .find(|row| row.contains(FIRST_EXEC_ID))
+        .unwrap_or_else(|| panic!("no row for the exec in {text}"));
+    let shown = row.split_whitespace().nth(1).expect("a mode on the row");
+
+    let json = box_show_rendered(&alpha.host, "web", Some(BoxShowOutputFormat::Json)).await;
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("one JSON doc");
+    let listed = doc["execs"][0]["mode"].clone();
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    box_events_on_hosts(
+        vec![alpha.host.clone()],
+        &events_args(Some("web"), None, false),
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("the events replay");
+    let lines = event_lines(&out);
+    let started = lines
+        .iter()
+        .find(|line| line["type"] == "exec_started")
+        .unwrap_or_else(|| panic!("no exec_started event in {lines:?}"));
+
+    assert_eq!(shown, "tty", "{text}");
+    assert_eq!(listed, "tty", "{json}");
+    assert_eq!(started["data"]["mode"], "tty", "{started}");
 }
 
 /// `value` with every `null` member of an object left out, as YAML and
@@ -17133,7 +17256,7 @@ async fn box_exec_show_logs_wait_stop_end_to_end() {
             live_exec_rows(&text),
             [
                 "Live execs:".to_owned(),
-                format!("  {TERMINAL_EXEC_ID}  terminal  sh -i"),
+                format!("  {TERMINAL_EXEC_ID}  tty       sh -i"),
                 format!("  {DETACHED_EXEC_ID}  detached  sh -c 'echo building; sleep 600'"),
             ],
             "{ran}"
