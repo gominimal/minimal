@@ -365,7 +365,7 @@ pub struct ProjectSecrets {
 
 /// The warning for a project that sets the acknowledgement.
 pub const PROJECT_ACKNOWLEDGEMENT_IGNORED: &str = "minimal.toml sets \
-     acknowledge_full_breadth_unenrolled in [session.secrets]. A project cannot set it, \
+     acknowledge_full_breadth_unenrolled in [defaults.session.secrets]. A project cannot set it, \
      so it is ignored. Set it in [secrets] in your own config.toml instead. \
      Run `min dirs` to find that file.";
 
@@ -672,8 +672,8 @@ impl BepRefusal {
                 Some("run `min auth login`, then create the box again".to_owned())
             }
             Self::UnenrolledNode { grants, .. } => Some(format!(
-                "to create the box without the grant, remove {} from [session.secrets] in \
-                 minimal.toml",
+                "to create the box without the grant, remove {} from \
+                 [defaults.session.secrets] in minimal.toml",
                 grants.join(", ")
             )),
             _ => None,
@@ -715,12 +715,15 @@ impl fmt::Display for BepRefusal {
             Self::NoNetworkWithGrant { grants } => write!(
                 f,
                 "This box declares the secret {} but has no network, so the secret \
-                 cannot reach anything. Use --network own_ip, or remove the secret.",
+                 cannot reach anything. Use --network own_ip, or remove {} from \
+                 [defaults.session.secrets] in minimal.toml.",
+                grants.join(", "),
                 grants.join(", ")
             ),
             Self::SteeringOffWithProxyEnv => write!(
                 f,
-                "This box sets steering = \"off\" and proxy_env = true in [network.bep]. \
+                "This box sets steering = \"off\" and proxy_env = true in \
+                 [defaults.session.network.bep] in minimal.toml. \
                  With steering off the box does not trust the proxy, so every HTTPS \
                  request through the proxy fails. Remove proxy_env, or set \
                  steering = \"proxy_env\"."
@@ -728,14 +731,16 @@ impl fmt::Display for BepRefusal {
             Self::NoResolver { steering } => write!(
                 f,
                 "This box declares a secret with steering = \"{}\", but this host has no \
-                 box DNS resolver. Set steering = \"proxy_env\" in [network.bep].",
+                 box DNS resolver. Set steering = \"proxy_env\" in \
+                 [defaults.session.network.bep] in minimal.toml.",
                 steering.word()
             ),
             Self::InstallationUnenrolled { grant } => write!(
                 f,
                 "The GitHub secret {grant} sets mode = \"installation\", but this host is \
                  not enrolled, so it cannot act as a GitHub App installation. \
-                 Set mode = \"user\"."
+                 Set mode = \"user\" for {grant} in [defaults.session.secrets] in \
+                 minimal.toml."
             ),
             Self::NarrowScopesUnenrolled { grant, scopes } => write!(
                 f,
@@ -767,15 +772,15 @@ impl fmt::Display for BepRefusal {
                 write!(
                     f,
                     " To create the box without the grant, remove {grants} from \
-                     [session.secrets] in minimal.toml."
+                     [defaults.session.secrets] in minimal.toml."
                 )
             }
             Self::StoreReferenceToSignIn { grant } => write!(
                 f,
                 "The secret {grant} names the item that holds your GitHub sign-in. Only \
-                 GitHub grants can use that item. To use your GitHub sign-in, set \
-                 source = \"broker\" and scopes = [\"github:user-token\"] for {grant}, \
-                 and remove its store and id."
+                 GitHub grants can use that item. To use your GitHub sign-in, go to {grant} in \
+                 [defaults.session.secrets] in minimal.toml. Set source = \"broker\" and \
+                 scopes = [\"github:user-token\"], and remove its store and id."
             ),
             Self::StoreHostsOutsideEgress { grant, missing } => write!(
                 f,
@@ -787,8 +792,9 @@ impl fmt::Display for BepRefusal {
                 f,
                 "The secret {grant} sets source = \"broker\" with the scope \"{scope}\". \
                  A grant with source = \"broker\" takes only github: scopes. For a secret \
-                 you stored with `min secret set`, write source = \"store\", \
-                 store = \"keychain\" and id = \"<id>\" in place of source and scopes."
+                 you stored with `min secret set`, go to {grant} in [defaults.session.secrets] \
+                 in minimal.toml. Write source = \"store\", store = \"keychain\" and \
+                 id = \"<id>\" in place of source and scopes."
             ),
         }
     }
@@ -1299,6 +1305,95 @@ mod tests {
 
     fn grants(grant: SecretGrant) -> SecretGrants {
         BTreeMap::from([("GH_TOKEN".to_string(), grant)])
+    }
+
+    // BCLI-021, BCLI-078: each refusal and hint that tells the person to edit
+    // the project names the table in minimal.toml where the setting lives.
+    #[test]
+    fn bep_refusals_name_the_minimal_toml_table() {
+        let grant = || "GH_TOKEN".to_owned();
+        let cases = [
+            (
+                BepRefusal::NoNetworkWithGrant {
+                    grants: vec![grant()],
+                },
+                "This box declares the secret GH_TOKEN but has no network, so the secret \
+                 cannot reach anything. Use --network own_ip, or remove GH_TOKEN from \
+                 [defaults.session.secrets] in minimal.toml.",
+            ),
+            (
+                BepRefusal::SteeringOffWithProxyEnv,
+                "This box sets steering = \"off\" and proxy_env = true in \
+                 [defaults.session.network.bep] in minimal.toml. With steering off the box \
+                 does not trust the proxy, so every HTTPS request through the proxy fails. \
+                 Remove proxy_env, or set steering = \"proxy_env\".",
+            ),
+            (
+                BepRefusal::NoResolver {
+                    steering: Steering::Dns,
+                },
+                "This box declares a secret with steering = \"dns\", but this host has no \
+                 box DNS resolver. Set steering = \"proxy_env\" in \
+                 [defaults.session.network.bep] in minimal.toml.",
+            ),
+            (
+                BepRefusal::InstallationUnenrolled { grant: grant() },
+                "The GitHub secret GH_TOKEN sets mode = \"installation\", but this host is \
+                 not enrolled, so it cannot act as a GitHub App installation. Set \
+                 mode = \"user\" for GH_TOKEN in [defaults.session.secrets] in minimal.toml.",
+            ),
+            (
+                BepRefusal::UnenrolledNode {
+                    grants: vec![grant()],
+                    stored: false,
+                    cause: ProxyAbsence::NotInstalled { path: None },
+                },
+                "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
+                 Box Egress Proxy, is not installed, so no proxy serves boxes on this machine. \
+                 To create the box without the grant, remove GH_TOKEN from \
+                 [defaults.session.secrets] in minimal.toml.",
+            ),
+            (
+                BepRefusal::StoreReferenceToSignIn { grant: grant() },
+                "The secret GH_TOKEN names the item that holds your GitHub sign-in. Only \
+                 GitHub grants can use that item. To use your GitHub sign-in, go to GH_TOKEN \
+                 in [defaults.session.secrets] in minimal.toml. Set source = \"broker\" and \
+                 scopes = [\"github:user-token\"], and remove its store and id.",
+            ),
+            (
+                BepRefusal::BrokerScopeNotGithub {
+                    grant: grant(),
+                    scope: "repo".into(),
+                },
+                "The secret GH_TOKEN sets source = \"broker\" with the scope \"repo\". A \
+                 grant with source = \"broker\" takes only github: scopes. For a secret you \
+                 stored with `min secret set`, go to GH_TOKEN in [defaults.session.secrets] \
+                 in minimal.toml. Write source = \"store\", store = \"keychain\" and \
+                 id = \"<id>\" in place of source and scopes.",
+            ),
+        ];
+        for (refusal, text) in cases {
+            assert_eq!(refusal.to_string(), text);
+        }
+        // The `-o json` hint of the un-enrolled refusal names the same table.
+        let unenrolled = BepRefusal::UnenrolledNode {
+            grants: vec![grant()],
+            stored: true,
+            cause: ProxyAbsence::NotServed,
+        };
+        assert_eq!(
+            unenrolled.next_step().as_deref(),
+            Some(
+                "to create the box without the grant, remove GH_TOKEN from \
+                 [defaults.session.secrets] in minimal.toml"
+            )
+        );
+        assert!(PROJECT_ACKNOWLEDGEMENT_IGNORED.contains("in [defaults.session.secrets]."));
+        // No refusal names a legacy table.
+        for text in [unenrolled.to_string(), PROJECT_ACKNOWLEDGEMENT_IGNORED.to_owned()] {
+            assert!(!text.contains("[session."), "{text}");
+            assert!(!text.contains(" [network.bep]"), "{text}");
+        }
     }
 
     // BEP-003: a GitHub grant with no sign-in held fails with the defined

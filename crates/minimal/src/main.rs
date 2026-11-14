@@ -1002,8 +1002,8 @@ mod tests {
         assert_eq!(failure.code(), "gatehouse_unenrolled_node");
         assert_eq!(
             failure.hint(),
-            "to create the box without the grant, remove GH_TOKEN from [session.secrets] \
-             in minimal.toml"
+            "to create the box without the grant, remove GH_TOKEN from \
+             [defaults.session.secrets] in minimal.toml"
         );
 
         // A refusal with no defined error stays `unspecified`.

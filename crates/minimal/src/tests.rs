@@ -6513,7 +6513,7 @@ mod mint_tests {
                 "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
                  Box Egress Proxy, is not installed at {}, so no proxy serves boxes on this \
                  machine. To create the box without the grant, remove GH_TOKEN from \
-                 [session.secrets] in minimal.toml.",
+                 [defaults.session.secrets] in minimal.toml.",
                 binary.display()
             )
         );
@@ -6533,7 +6533,7 @@ mod mint_tests {
             err.to_string(),
             "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the Box \
              Egress Proxy, is not installed, so no proxy serves boxes on this machine. To \
-             create the box without the grant, remove GH_TOKEN from [session.secrets] in \
+             create the box without the grant, remove GH_TOKEN from [defaults.session.secrets] in \
              minimal.toml."
         );
 
@@ -6560,7 +6560,7 @@ mod mint_tests {
             "Cannot create the box: it declares the GitHub grant GH_TOKEN, and MINVMD_BEP_BIN \
              sets `bep`, the Box Egress Proxy, to the relative path bin/bep, and no proxy \
              serves boxes on this machine. Set MINVMD_BEP_BIN to an absolute path. To create \
-             the box without the grant, remove GH_TOKEN from [session.secrets] in \
+             the box without the grant, remove GH_TOKEN from [defaults.session.secrets] in \
              minimal.toml."
         );
 
@@ -6590,7 +6590,7 @@ mod mint_tests {
                 "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
                  Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
                  serves boxes on this machine. To create the box without the grant, remove \
-                 GH_TOKEN from [session.secrets] in minimal.toml.",
+                 GH_TOKEN from [defaults.session.secrets] in minimal.toml.",
                 binary.display()
             )
         );
@@ -6619,7 +6619,7 @@ mod mint_tests {
                 "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
                  Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
                  serves boxes on this machine. The proxy's log is at {}. To create the box \
-                 without the grant, remove GH_TOKEN from [session.secrets] in minimal.toml.",
+                 without the grant, remove GH_TOKEN from [defaults.session.secrets] in minimal.toml.",
                 binary.display(),
                 log.display()
             )

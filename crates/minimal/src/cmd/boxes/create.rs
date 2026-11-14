@@ -1086,8 +1086,8 @@ impl std::fmt::Display for GrantNotDelivered {
         match self {
             Self::InvalidName { grant } => write!(
                 f,
-                "Cannot create the box: the secret {grant:?} in [session.secrets] in \
-                 {name} is not a valid environment variable name. A name uses only \
+                "Cannot create the box: the secret {grant:?} in [defaults.session.secrets] \
+                 in {name} is not a valid environment variable name. A name uses only \
                  capital letters, digits and underscores, and does not start with a \
                  digit. Rename the secret, then create the box again.",
                 name = mfile::MFILE_NAME,
@@ -1099,7 +1099,8 @@ impl std::fmt::Display for GrantNotDelivered {
             ),
             Self::NoStoreRule { grant, item } => write!(
                 f,
-                "Cannot create the box: the secret {grant} in [session.secrets] in {name} \
+                "Cannot create the box: the secret {grant} in [defaults.session.secrets] \
+                 in {name} \
                  reads the item {item} from the host's secret store, and no rule in \
                  [secret-store-rules] in your config.toml names that item. Add a rule for \
                  it, or remove the secret from {name}. Run `min dirs` to find config.toml.",
@@ -1107,7 +1108,8 @@ impl std::fmt::Display for GrantNotDelivered {
             ),
             Self::StoreReferenceDenied { grant, item } => write!(
                 f,
-                "Cannot create the box: the secret {grant} in [session.secrets] in {name} \
+                "Cannot create the box: the secret {grant} in [defaults.session.secrets] \
+                 in {name} \
                  reads the item {item} from the host's secret store, and the rule for that \
                  item in [secret-store-rules] denies it. Remove the secret from {name}.",
                 name = mfile::MFILE_NAME,
@@ -4983,8 +4985,8 @@ mod tests {
             check_github_grants(&secrets, Some(ProxyAbsence::NotServed), &keychain)
                 .unwrap_err()
                 .to_string(),
-            "Cannot create the box: the secret \"X=1; cmd #\" in [session.secrets] in \
-             minimal.toml is not a valid environment variable name. A name uses only \
+            "Cannot create the box: the secret \"X=1; cmd #\" in [defaults.session.secrets] \
+             in minimal.toml is not a valid environment variable name. A name uses only \
              capital letters, digits and underscores, and does not start with a digit. \
              Rename the secret, then create the box again."
         );
@@ -6157,7 +6159,8 @@ mod tests {
             assert_eq!(bep.resolved_steering() == Steering::Both, word == "both");
             let no_resolver = format!(
                 "This box declares a secret with steering = \"{word}\", but this host \
-                 has no box DNS resolver. Set steering = \"proxy_env\" in [network.bep]."
+                 has no box DNS resolver. Set steering = \"proxy_env\" in \
+                 [defaults.session.network.bep] in minimal.toml."
             );
 
             for (kind, network) in [
