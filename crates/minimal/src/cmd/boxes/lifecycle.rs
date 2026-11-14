@@ -1258,11 +1258,14 @@ fn age_label(age: std::time::Duration) -> String {
     format!("{n}{unit}")
 }
 
-/// The selectors a `min box prune` passed, as its lines name them: the
-/// `--older-than` and `--parent` values as the person wrote them.
+/// The selectors a `min box prune` passed, as its lines name them. The
+/// `--parent` value prints as the person wrote it. The `--older-than` age
+/// prints in the largest whole unit it takes, as [`age_label`] gives it and
+/// as the prune question names it: `--older-than 168h` prints as `7d`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PruneSelectors<'a> {
-    /// The `--older-than` age.
+    /// The `--older-than` age, which the flag's parser already turned into
+    /// a duration.
     pub older_than: Option<std::time::Duration>,
     /// The `--parent` box as the person wrote it.
     pub parent: Option<&'a str>,

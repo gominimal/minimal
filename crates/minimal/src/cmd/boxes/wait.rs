@@ -126,16 +126,27 @@ fn box_label(name: Option<&str>, id: &str) -> String {
     }
 }
 
+/// How long the lookup of a box's name can take after a wait ran out. The
+/// wait's own deadline already passed, so the lookup must not hold the exit.
+const NAME_LOOKUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The name the record of the box `id` on `host` holds. A host that does
-/// not answer gives `None`, and the line then names the box by its id.
+/// not answer, or does not answer inside [`NAME_LOOKUP_LIMIT`], gives
+/// `None`, and the line then names the box by its id.
 async fn box_name_on(host: &crate::cmd::list::LocalHost, id: boxes::SessionId) -> Option<String> {
     use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
 
-    let mut client = box_host_client(host).await.ok()?;
-    match client.oneshot_rpc::<ShowBox>(ShowBoxRequest { id }).await {
-        Ok(Errorable::Ok(shown)) => shown.record.name,
-        _ => None,
-    }
+    let lookup = async {
+        let mut client = box_host_client(host).await.ok()?;
+        match client.oneshot_rpc::<ShowBox>(ShowBoxRequest { id }).await {
+            Ok(Errorable::Ok(shown)) => shown.record.name,
+            _ => None,
+        }
+    };
+    tokio::time::timeout(NAME_LOOKUP_LIMIT, lookup)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// How the box `record` ended, as `min box wait` answers it, or `None`
