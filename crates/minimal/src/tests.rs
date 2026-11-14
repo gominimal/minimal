@@ -2425,8 +2425,25 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
         let out = tempfile::tempfile().unwrap();
         let err = tempfile::tempfile().unwrap();
         std::io::stdout().flush().unwrap();
-        let saved_out = nix::unistd::dup(std::io::stdout()).unwrap();
-        let saved_err = nix::unistd::dup(std::io::stderr()).unwrap();
+        // The guard puts fd 1 and fd 2 back when it drops, also when the
+        // start panics with them still redirected. Plain `cargo test` shares
+        // these fds across test threads. Under nextest, the lane this crate
+        // runs in, every test owns its process.
+        struct RestoreStdio {
+            out: std::os::fd::OwnedFd,
+            err: std::os::fd::OwnedFd,
+        }
+        impl Drop for RestoreStdio {
+            fn drop(&mut self) {
+                let _ = std::io::stdout().flush();
+                nix::unistd::dup2_stdout(&self.out).expect("restore stdout after capture");
+                nix::unistd::dup2_stderr(&self.err).expect("restore stderr after capture");
+            }
+        }
+        let restore = RestoreStdio {
+            out: nix::unistd::dup(std::io::stdout()).unwrap(),
+            err: nix::unistd::dup(std::io::stderr()).unwrap(),
+        };
         nix::unistd::dup2_stdout(&out).unwrap();
         nix::unistd::dup2_stderr(&err).unwrap();
         let result = match verb {
@@ -2457,9 +2474,7 @@ async fn start_with_a_box_for_the_path_prints_no_warning() {
                 .await
             }
         };
-        std::io::stdout().flush().unwrap();
-        nix::unistd::dup2_stdout(&saved_out).unwrap();
-        nix::unistd::dup2_stderr(&saved_err).unwrap();
+        drop(restore);
         let read = |mut file: std::fs::File| {
             let mut text = String::new();
             file.rewind().unwrap();

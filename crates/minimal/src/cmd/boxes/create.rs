@@ -2705,7 +2705,7 @@ pub(crate) enum ActivationStep {
     ResolveLoadouts,
     /// The upload root and whether the upload is skipped.
     PlanUpload,
-    /// The daemon connection and the duplicate-session advisory.
+    /// The daemon connection.
     ConnectDaemon,
     /// The box's registration with the VM host daemon.
     RegisterBox,
