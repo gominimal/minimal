@@ -1,0 +1,350 @@
+#!/bin/sh
+# postinstall: finish the install on this machine, with nobody logged in.
+# What `min finalize-install` does for a user after a curl install, done by
+# the package: DNS names for boxes (<box>.min.internal) in every program,
+# the box-name service under its own role account, the loopback range at
+# every boot. Runs as root; the payload is already in place: what users run
+# under /usr/local, the service's program under /Library/PrivilegedHelperTools.
+#
+# Nothing here reads /usr/local. On a Mac where a user owns /usr/local/bin
+# or /usr/local/share (Homebrew's Intel layout, and Macs migrated from one),
+# that user can change those files between the payload and this script, and
+# what this script reads it acts on as root. What it needs comes from the
+# package's own scripts directory and from /Library, which are root's.
+set -eu
+# Only the base system's tools, wherever this was started from: sudo keeps
+# the caller's PATH, and a directory a user owns may be first on it.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+# Set by build-pkg.sh when it packs this script. As written here they are
+# the released values, so the script unchanged requires minimal's Developer
+# ID on the service program.
+bundle_signing=developer-id
+channel=stable
+test_build=0
+
+here="$(cd "$(dirname "$0")" && pwd)"
+role=_minimal
+helpers=/Library/PrivilegedHelperTools
+bundle="$helpers/Minimal.app"
+support="/Library/Application Support/minimal"
+run="$support/run"
+new_user=0
+new_group=0
+
+# The preinstall stopped the two services and moved an earlier install's
+# program aside (Minimal.app.old). Should this script fail:
+# - on an upgrade, the earlier program goes back and the services start
+#   again, so a failed upgrade leaves the previous service running, not a
+#   resolver file pointing at a dead port;
+# - on a first install, what this script made that runs or redirects is
+#   undone (the two services, the program, the resolver file, the account
+#   when this run made it), so a failed install leaves nothing of root's
+#   running. The files under /usr/local stay, as Installer placed them and
+#   kept no receipt; the uninstaller, installed first below, removes them.
+restore() {
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        rm -rf "$bundle.old"
+        exit 0
+    fi
+    rm -f /Library/LaunchDaemons/dev.gominimal.zone.plist.new
+    if [ -d "$bundle.old" ]; then
+        rm -rf "$bundle"
+        mv "$bundle.old" "$bundle" || true
+        for job in dev.gominimal.zone dev.minimal.local-range; do
+            if [ -f "/Library/LaunchDaemons/$job.plist" ]; then
+                launchctl bootstrap system "/Library/LaunchDaemons/$job.plist" 2>/dev/null || true
+            fi
+        done
+        # Still loaded (the preinstall leaves it so): back on the earlier
+        # program, on the port launchd kept for it.
+        launchctl kickstart -k system/dev.gominimal.zone >/dev/null 2>&1 || true
+        # The resolver file may have gone above with the failure. It comes
+        # back only when the earlier service is seen running again, on the
+        # port launchd holds for it.
+        sleep 2
+        if launchctl print system/dev.gominimal.zone 2>/dev/null | grep -q 'state = running' \
+            && /usr/sbin/lsof -nP -iUDP:7656 2>/dev/null | awk 'NR > 1 && $3 != "root" && $3 != "'"$role"'" { bad = 1 } NR > 1 { held = 1 } END { exit (bad || !held) }'; then
+            printf 'nameserver 127.0.0.1\nport 7656\n' > /etc/resolver/min.internal
+            chmod 0644 /etc/resolver/min.internal
+        fi
+    else
+        for job in dev.gominimal.zone dev.minimal.local-range; do
+            launchctl bootout "system/$job" 2>/dev/null || true
+            rm -f "/Library/LaunchDaemons/$job.plist"
+        done
+        rm -f /etc/resolver/min.internal
+        rm -rf "$bundle" "$run"
+        # Deleting an account needs Full Disk Access even as root; where
+        # this session lacks it the account stays, and the uninstaller
+        # reports it.
+        if [ "$new_user" = 1 ]; then dscl . -delete "/Users/$role" 2>/dev/null || true; fi
+        if [ "$new_group" = 1 ] && ! dscl . -read "/Users/$role" >/dev/null 2>&1; then
+            dscl . -delete "/Groups/$role" 2>/dev/null || true
+        fi
+        echo "minimal: the install failed and its services are removed again; the files it placed are removed with: sudo \"$support/uninstall.sh\"" >&2
+    fi
+    exit "$status"
+}
+trap restore EXIT
+
+# 0. The uninstaller, before anything can fail: macOS has no command to
+#    remove a package, and a first install that fails leaves no receipt, so
+#    the uninstaller and the list of files the payload placed go where only
+#    root writes.
+install -d -m 0755 -o root -g wheel "$support"
+install -m 0755 -o root -g wheel "$here/uninstall.sh" "$support/uninstall.sh"
+install -m 0644 -o root -g wheel "$here/payload-files" "$support/payload-files"
+
+# 1. The DNS service's program: the bundle, placed by the payload under
+#    $helpers (root's), checked there before anything names it. A released
+#    bundle must carry minimal's Developer ID; a test build's (build-pkg.sh
+#    --with) must carry a valid signature. Which of the two was decided when
+#    the package was built, and is part of this script.
+[ -x "$bundle/Contents/MacOS/minzoned" ] && [ ! -L "$bundle" ] \
+    || { echo "minimal: the DNS service program is not at $bundle" >&2; exit 1; }
+chown -R root:wheel "$bundle"
+chmod -R go-w "$bundle"
+if [ "$bundle_signing" = ad-hoc ]; then
+    codesign --verify --strict "$bundle" \
+        || { echo "minimal: the DNS service program has no valid signature" >&2; exit 1; }
+else
+    codesign --verify --strict -R '=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "3G47C5HY64" and identifier "dev.minimal.minzoned"' "$bundle" \
+        || { echo "minimal: the DNS service program failed its Developer ID check" >&2; exit 1; }
+fi
+
+# 2. The resolver file (*.min.internal to the box-name service on
+#    127.0.0.1:7656) is written last, in step 5, once the service holds that
+#    port: the port is unprivileged, so a resolver file with nothing of ours
+#    behind it sends every user's box names to whichever program binds it.
+mkdir -p /etc/resolver /Library/LaunchDaemons
+
+# 3. The role account the box-name service runs as: no home, no shell, no
+#    password, hidden, with a uid and gid below 500 (hidden from the login
+#    window) and from 400 up (Apple's own role accounts sit below). The
+#    group and the user are each made when missing, on their own: an
+#    uninstall that macOS let delete the group but not the user (Full Disk
+#    Access) leaves the user, and the next install must still have both.
+#    dscl, not sysadminctl: sysadminctl -addUser -UID ignores the UID on
+#    macOS 27.
+free_id() {
+    # Each listing on its own, with its status: a directory that did not
+    # answer (opendirectoryd still starting) must not read as "nothing is
+    # taken", which would hand out an id Apple already uses.
+    users="$(dscl . -list /Users UniqueID)" \
+        || { echo "minimal: could not list this Mac's accounts" >&2; exit 1; }
+    groups="$(dscl . -list /Groups PrimaryGroupID)" \
+        || { echo "minimal: could not list this Mac's groups" >&2; exit 1; }
+    used="$(printf '%s\n%s\n' "$users" "$groups" | awk '{print $2}' | sort -un)"
+    id=400
+    while echo "$used" | grep -qx "$id"; do id=$((id + 1)); done
+    [ "$id" -lt 500 ] || { echo "minimal: no free system account id in 400..499 for $role" >&2; exit 1; }
+    echo "$id"
+}
+if ! dscl . -read "/Groups/$role" >/dev/null 2>&1; then
+    gid="$(free_id)"
+    dscl . -create "/Groups/$role"
+    dscl . -create "/Groups/$role" PrimaryGroupID "$gid"
+    dscl . -create "/Groups/$role" RealName "Minimal DNS service"
+    new_group=1
+fi
+gid="$(dscl . -read "/Groups/$role" PrimaryGroupID | awk '{print $2}')"
+case "$gid" in ''|*[!0-9]*) echo "minimal: the $role group's id could not be read" >&2; exit 1 ;; esac
+if ! dscl . -read "/Users/$role" >/dev/null 2>&1; then
+    uid="$(free_id)"
+    dscl . -create "/Users/$role"
+    new_user=1
+    dscl . -create "/Users/$role" UniqueID "$uid"
+    dscl . -create "/Users/$role" PrimaryGroupID "$gid"
+    dscl . -create "/Users/$role" UserShell /usr/bin/false
+    dscl . -create "/Users/$role" RealName "Minimal DNS service"
+    dscl . -create "/Users/$role" NFSHomeDirectory /var/empty
+    dscl . -create "/Users/$role" IsHidden 1
+    dscl . -create "/Users/$role" Password '*'
+fi
+uid="$(dscl . -read "/Users/$role" UniqueID | awk '{print $2}')"
+case "$uid" in ''|*[!0-9]*) echo "minimal: the $role account's id could not be read" >&2; exit 1 ;; esac
+# A group made again after an uninstall that kept the account has a new
+# gid; the account's primary group follows it.
+dscl . -create "/Users/$role" PrimaryGroupID "$gid"
+# The role account's group is also who may register box names with the
+# service (its channel socket is the group's, and the service admits the
+# group's members and root): every administrator of this Mac, when the
+# group is new or has no member at all (a first install that failed after
+# making the group, run again), so an administrator's later removal of a
+# user holds across upgrades. Every member can publish any box name on
+# this Mac: the group is for users who trust each other. A user is added
+# with: dseditgroup -o edit -a USER -t user _minimal
+# dscl exits 0 for a missing attribute ("No such key"): the members are read
+# from its output.
+has_members() { dscl . -read "/Groups/$role" GroupMembership 2>/dev/null | grep -q '^GroupMembership: *[^ ]'; }
+if [ "$new_group" = 1 ] || ! has_members; then
+    dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership://' | tr ' ' '\n' | while IFS= read -r admin; do
+        case "$admin" in ''|root|_*) continue ;; esac
+        dseditgroup -o edit -a "$admin" -t user "$role" \
+            || echo "minimal: $admin was not added to the group $role; an administrator adds them with: dseditgroup -o edit -a $admin -t user $role" >&2
+    done
+fi
+
+# 4. The local range: a boot-time job, root's, adding 127.0.64.0/24 to lo0
+#    now and at every boot.
+cat > /Library/LaunchDaemons/dev.minimal.local-range.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.minimal.local-range</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned</string>
+        <string>reserve-local-range</string>
+    </array>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>dev.minimal.minzoned</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+chown root:wheel /Library/LaunchDaemons/dev.minimal.local-range.plist
+chmod 0644 /Library/LaunchDaemons/dev.minimal.local-range.plist
+launchctl bootout system/dev.minimal.local-range 2>/dev/null || true
+launchctl bootstrap system /Library/LaunchDaemons/dev.minimal.local-range.plist
+
+# 5. The box-name service: launchd holds its UDP listener on 127.0.0.1:7656
+#    and its channel socket; the program runs as the role account. It keeps
+#    no state: a restart holds nothing until the users' daemons reconnect.
+zone=/Library/LaunchDaemons/dev.gominimal.zone.plist
+install -d -m 0755 -o root -g wheel "$run"
+# The job's definition, written beside its place first: whether it changed
+# decides how the service is brought onto the new program.
+cat > "$zone.new" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.gominimal.zone</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned</string>
+        <string>--admit-group</string>
+        <string>$role</string>
+    </array>
+    <key>UserName</key>
+    <string>$role</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>dev.minimal.minzoned</string>
+    </array>
+    <key>Sockets</key>
+    <dict>
+        <key>Listener</key>
+        <dict>
+            <key>SockFamily</key>
+            <string>IPv4</string>
+            <key>SockType</key>
+            <string>dgram</string>
+            <key>SockProtocol</key>
+            <string>UDP</string>
+            <key>SockNodeName</key>
+            <string>127.0.0.1</string>
+            <key>SockServiceName</key>
+            <string>7656</string>
+        </dict>
+        <key>Channel</key>
+        <dict>
+            <key>SockFamily</key>
+            <string>Unix</string>
+            <key>SockPathName</key>
+            <string>$run/answerer.sock</string>
+            <key>SockPathOwner</key>
+            <integer>$uid</integer>
+            <key>SockPathGroup</key>
+            <integer>$gid</integer>
+            <key>SockPathMode</key>
+            <integer>432</integer>
+        </dict>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+chown root:wheel "$zone.new"
+chmod 0644 "$zone.new"
+if launchctl print system/dev.gominimal.zone >/dev/null 2>&1 \
+    && [ -f "$zone" ] && [ ! -L "$zone" ] && cmp -s "$zone" "$zone.new"; then
+    # An upgrade with the same definition: the job stays loaded and launchd
+    # keeps both sockets, so the port is never free for another program to
+    # take. Only the process is replaced, by the new program at the same
+    # path.
+    rm -f "$zone.new"
+    launchctl kickstart -k system/dev.gominimal.zone >/dev/null \
+        || { echo "minimal: launchd did not restart the DNS service" >&2; exit 1; }
+else
+    # A first install, or a definition that changed: the job is loaded
+    # anew, and for that moment the port is free. Nothing may point at it
+    # meanwhile, so an earlier install's resolver file goes first; it is
+    # written again below once the service holds the port.
+    rm -f /etc/resolver/min.internal
+    launchctl bootout system/dev.gominimal.zone 2>/dev/null || true
+    rm -f "$run/answerer.sock"
+    mv -f "$zone.new" "$zone"
+    launchctl bootstrap system "$zone" \
+        || { echo "minimal: launchd did not load the DNS service (if it is switched off in System Settings > General > Login Items, switch it on there and install again)" >&2; exit 1; }
+fi
+# launchd makes the channel socket at bootstrap, before the program runs;
+# the service has started when launchd reports its process running.
+running() { launchctl print system/dev.gominimal.zone 2>/dev/null | grep -q 'state = running'; }
+i=0
+while [ "$i" -lt 20 ]; do
+    if [ -S "$run/answerer.sock" ] && running; then break; fi
+    sleep 0.25
+    i=$((i + 1))
+done
+if ! { [ -S "$run/answerer.sock" ] && running; }; then
+    # The service is not answering, so nothing may point at its port: an
+    # earlier install's resolver file goes, and this install fails. With the
+    # file in place, whichever program holds the port (any user can bind it)
+    # would answer every user's box names. The admin is told which program
+    # holds it, when one does; installing again, with the port free, sets
+    # it up.
+    rm -f /etc/resolver/min.internal
+    holder="$(/usr/sbin/lsof -nP -iUDP:7656 2>/dev/null \
+        | awk 'NR > 1 && $1 != "launchd" { print $1 " (pid " $2 ", user " $3 ")"; exit }')"
+    if [ -n "$holder" ]; then
+        echo "minimal: $holder holds UDP port 7656, which the DNS service for boxes answers on. Stop that program and install again: until then box names (<box>.min.internal) do not resolve" >&2
+    else
+        echo "minimal: the DNS service did not start within 5 s (launchctl print system/dev.gominimal.zone)" >&2
+    fi
+    exit 1
+fi
+# Only now: the service holds the port the file names.
+printf 'nameserver 127.0.0.1\nport 7656\n' > /etc/resolver/min.internal
+chmod 0644 /etc/resolver/min.internal
+
+# 6. Users who installed with curl keep an older min at ~/.local/bin/min,
+#    which their shell finds before /usr/local/bin. Nothing here touches a
+#    user's home (not even as a check that follows a link; `-e` on a path
+#    reads, it never writes); the admin is told, by user, with the command
+#    that user runs to remove theirs. Other homes (/var/empty, role
+#    accounts) have no .local/bin.
+case "$channel" in stable|unstable) ;; *) channel=stable ;; esac
+dscl . -list /Users NFSHomeDirectory 2>/dev/null | while read -r user home; do
+    case "$home" in /Users/*) ;; *) continue ;; esac
+    if [ -e "$home/.local/bin/min" ]; then
+        echo "minimal: $user has an older min at ~/.local/bin/min from the curl installer, which their shell finds before /usr/local/bin/min; they remove it with: curl --proto '=https' --tlsv1.2 -fsSL https://go.minimal.dev/$channel | sh -s -- --uninstall (an older uninstaller may then print root commands about the host DNS setup: those are not to be run, that setup is this package's now)"
+    fi
+done
+if [ "$test_build" = 1 ]; then
+    echo "minimal: TEST BUILD: the DNS service program carries no Developer ID, only a valid signature" >&2
+fi
+echo "minimal: installed under /usr/local; DNS names for boxes (<box>.min.internal) are set up on this machine"

@@ -1678,7 +1678,7 @@ fn refuse_replacing_the_shared(step: AnswererStep, shared: &SharedService) -> An
 /// it, never `min finalize-install`.
 pub(crate) const SHARED_SERVICE_REMEDY: &str = "A newer minimal package upgrades it \
     (sudo installer -pkg minimal-VERSION.pkg -target /), and its uninstaller removes it \
-    (sudo /usr/local/share/minimal/uninstall.sh)";
+    (sudo \"/Library/Application Support/minimal/uninstall.sh\")";
 
 /// Whether the account of `uid` is in the group `gid`, by the service's
 /// own definition ([`minvmd::net::answerer::uid_in_group`]), so `--show`
@@ -4325,6 +4325,152 @@ pub(crate) fn shared_service_undo_refusal(unit_text: &str) -> Option<String> {
     ))
 }
 
+/// What `min finalize-install --show` says of the names item when no daemon
+/// reports a port and nothing answers on the one the host's hook names,
+/// on a host whose installed answerer unit is a shared service's (the
+/// minimal package's): that service is the one not running, and an
+/// administrator is who looks. "No daemon is reachable" sends a user to
+/// their own daemons, which a package install does not use for names; the
+/// commonest cause is a service an administrator switched off. `None`
+/// when no unit is installed, it cannot be read, or it is one operator's:
+/// the caller keeps its own wording.
+pub(crate) fn shared_service_not_running_on_this_host() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let path = ANSWERER_PLIST_PATH;
+    #[cfg(not(target_os = "macos"))]
+    let path = ANSWERER_UNIT_SERVICE_PATH;
+    match read_installed_unit(path) {
+        UnitRead::Text(text) => shared_service_not_running(&text),
+        UnitRead::Absent | UnitRead::Unreadable(_) => None,
+    }
+}
+
+/// [`shared_service_not_running_on_this_host`] over a unit's text. Pure.
+pub(crate) fn shared_service_not_running(unit_text: &str) -> Option<String> {
+    let group = unit_admit_group(unit_text)?;
+    #[cfg(target_os = "macos")]
+    let look = format!(
+        "an administrator sees why with `sudo launchctl print system/{ANSWERER_LAUNCHD_LABEL}`; \
+         when it was switched off (System Settings > General > Login Items, or `launchctl \
+         disable`), they switch it on and install the package again"
+    );
+    #[cfg(not(target_os = "macos"))]
+    let look = "an administrator sees why with `systemctl status` on the service".to_string();
+    Some(format!(
+        "the DNS service the minimal package installed for the group {group} is not \
+         answering on this machine, so box names do not resolve: {look}"
+    ))
+}
+
+/// What the service manager says of the job the installed shared service
+/// runs under. launchd makes that job's UDP listener and holds it for as
+/// long as the job is loaded, whether or not the program is running
+/// (measured on a package install: a user's bind of the port is refused
+/// with every reuse option, the program stopped or not). So on a host
+/// with a shared service, a reply on the port is the service's only
+/// while the job is loaded; with it booted out, the port is any local
+/// program's to take, and a DNS reply from there proves nothing.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedServiceJob {
+    /// No shared service is installed here (no unit, one operator's, or
+    /// one that could not be read): there is no job to tie the port to.
+    NotShared,
+    /// The job is loaded: the port is the service manager's.
+    Loaded,
+    /// The service manager has no such job.
+    NotLoaded,
+    /// The service manager did not say.
+    Unread,
+}
+
+/// `launchctl print`'s status for a job that is not loaded ("Could not
+/// find service"), measured as root and as a standard user.
+#[cfg(any(test, target_os = "macos"))]
+const LAUNCHCTL_NO_SUCH_JOB: i32 = 113;
+
+/// [`SharedServiceJob`] from a `launchctl print system/<label>` of the
+/// shared service's job: `None` when the call did not run or outlived
+/// its bound, else its exit status (`None` again when a signal ended
+/// it). Only launchd's own "no such job" reads as not loaded: a call
+/// that could not look is not a job that is gone. Pure.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn shared_service_job_from(print: Option<Option<i32>>) -> SharedServiceJob {
+    match print {
+        Some(Some(0)) => SharedServiceJob::Loaded,
+        Some(Some(LAUNCHCTL_NO_SUCH_JOB)) => SharedServiceJob::NotLoaded,
+        Some(_) | None => SharedServiceJob::Unread,
+    }
+}
+
+/// [`SharedServiceJob`] on this host: the root-owned unit says whether a
+/// shared service is installed, and one read-only `launchctl print` of
+/// the system's own tool, with an empty environment and bounded by
+/// [`LAUNCHCTL_BOUND`], says whether its job is loaded. A standard user
+/// may ask. macOS only: a systemd socket unit holds the port the same
+/// way, but that has not been measured, so Linux judges nothing here.
+#[cfg(target_os = "macos")]
+async fn shared_service_job_on_this_host() -> SharedServiceJob {
+    let shared = match read_installed_unit(ANSWERER_PLIST_PATH) {
+        UnitRead::Text(text) => unit_admit_group(&text).is_some(),
+        UnitRead::Absent | UnitRead::Unreadable(_) => false,
+    };
+    if !shared {
+        return SharedServiceJob::NotShared;
+    }
+    let print = tokio::time::timeout(
+        LAUNCHCTL_BOUND,
+        tokio::process::Command::new("/bin/launchctl")
+            .arg("print")
+            .arg(format!("system/{ANSWERER_LAUNCHD_LABEL}"))
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(|status| status.code());
+    shared_service_job_from(print)
+}
+
+/// [`port_not_the_shared_services`] over this host's own job read: what
+/// the names item says instead of "done" when a reply on `port` is not
+/// the installed shared service's to give.
+#[cfg(target_os = "macos")]
+pub(crate) async fn answer_not_the_shared_services(port: u16) -> Option<String> {
+    port_not_the_shared_services(port, shared_service_job_on_this_host().await)
+}
+
+/// What the names item says when something answers DNS on `port` and the
+/// shared service's job is not what holds it (`job` is
+/// [`SharedServiceJob::NotLoaded`] or [`SharedServiceJob::Unread`]):
+/// whose answer it is not, and what an administrator runs. `None` for a
+/// job that is loaded or a host with no shared service, where the reply
+/// stands. Pure.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn port_not_the_shared_services(port: u16, job: SharedServiceJob) -> Option<String> {
+    match job {
+        SharedServiceJob::NotShared | SharedServiceJob::Loaded => None,
+        SharedServiceJob::NotLoaded => Some(format!(
+            "a program is answering DNS on 127.0.0.1:{port}, and it is not the service the \
+             minimal package installed (launchd has no job {ANSWERER_LAUNCHD_LABEL} loaded), \
+             so what box names resolve to on this machine is that program's say: an \
+             administrator finds it with `sudo lsof -nP -iUDP:{port}`, stops it, and \
+             installs the package again"
+        )),
+        SharedServiceJob::Unread => Some(format!(
+            "launchd did not say whether the DNS service the minimal package installed is \
+             loaded, so what answers on 127.0.0.1:{port} is unconfirmed: `launchctl print \
+             system/{ANSWERER_LAUNCHD_LABEL}` shows the job, and `min finalize-install \
+             --show` reads it again"
+        )),
+    }
+}
+
 /// [`other_operator_refusal`] over this host's installed answerer unit and
 /// the operator this CLI runs as.
 pub(crate) fn other_operator_refusal_on_this_host() -> Option<String> {
@@ -6116,6 +6262,52 @@ pub(crate) mod tests {
         );
     }
 
+    /// Only launchd's own "no such job" says the shared service's job is
+    /// gone; a print that did not run, timed out, was killed or failed
+    /// some other way is unread, and neither lets a reply on the port
+    /// stand as the service's.
+    #[test]
+    fn a_reply_on_the_port_is_the_shared_services_only_while_its_job_is_loaded() {
+        assert_eq!(
+            shared_service_job_from(Some(Some(0))),
+            SharedServiceJob::Loaded
+        );
+        assert_eq!(
+            shared_service_job_from(Some(Some(113))),
+            SharedServiceJob::NotLoaded
+        );
+        for unread in [None, Some(None), Some(Some(1)), Some(Some(64))] {
+            assert_eq!(
+                shared_service_job_from(unread),
+                SharedServiceJob::Unread,
+                "{unread:?}"
+            );
+        }
+        assert_eq!(
+            port_not_the_shared_services(7656, SharedServiceJob::Loaded),
+            None
+        );
+        assert_eq!(
+            port_not_the_shared_services(7656, SharedServiceJob::NotShared),
+            None
+        );
+        let foreign = port_not_the_shared_services(7656, SharedServiceJob::NotLoaded)
+            .expect("a reply with no job loaded is named");
+        assert!(
+            foreign.contains("it is not the service the minimal package installed"),
+            "{foreign}"
+        );
+        assert!(foreign.contains("sudo lsof -nP -iUDP:7656"), "{foreign}");
+        assert!(foreign.contains("dev.gominimal.zone"), "{foreign}");
+        let unread = port_not_the_shared_services(7656, SharedServiceJob::Unread)
+            .expect("an unread job is named");
+        assert!(unread.contains("is unconfirmed"), "{unread}");
+        assert!(
+            unread.contains("launchctl print system/dev.gominimal.zone"),
+            "{unread}"
+        );
+    }
+
     /// The liveness query's negative arms, the ones a unit test can pin
     /// without the answerer: a port nothing answers — held by a silent
     /// process, or free — is not a bound answerer, whatever the status
@@ -7588,6 +7780,17 @@ exit 0
                 None
             );
             assert_eq!(unit_admit_group(&shared), Some("_minimal"));
+            // The status line for a shared service that does not answer
+            // names the service and who looks, and says nothing for one
+            // operator's unit.
+            let stopped = shared_service_not_running(&shared)
+                .expect("a shared service's unit has its own status wording");
+            assert!(
+                stopped.contains("the minimal package installed for the group _minimal"),
+                "{stopped}"
+            );
+            assert!(stopped.contains("an administrator sees why"), "{stopped}");
+            assert_eq!(shared_service_not_running(text), None);
             assert_eq!(
                 unit_admit_group("ExecStart=/x/minzoned --admit-group minimal --bindings /f"),
                 Some("minimal")

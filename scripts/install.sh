@@ -505,6 +505,26 @@ maybe_remove_finalize_install() {
     else
         _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
     fi
+    # On macOS the same setup may be the system package's (the receipt
+    # dev.minimal.min: `packaging/macos/pkg`), installed with root for every
+    # user of the Mac. Then it is not this user's to remove, and the remedy
+    # below would take the service away from everyone else on the Mac. The
+    # package's own uninstaller removes it, receipt and all.
+    if [ "$os" = darwin ] && pkgutil --pkg-info dev.minimal.min >/dev/null 2>&1; then
+        for _ns_p in $_ns_paths; do
+            [ -e "$_fi_root$_ns_p" ] || continue
+            if [ "$dry_run" -eq 1 ]; then
+                say "  would leave the host DNS setup ($_ns_p) alone: it is the minimal package's (dev.minimal.min)"
+            else
+                say ""
+                say "note: the host DNS setup ($_ns_p) is the minimal package's (dev.minimal.min), installed for"
+                say "  every user of this Mac; it stays. To remove the package: sudo \"/Library/Application Support/minimal/uninstall.sh\""
+            fi
+            return 0
+        done
+        return 0
+    fi
+
     # What is found, as a list for the prompt; what `min finalize-install
     # --undo` removes; the manual remedy, one root command line per item.
     _fi_list=
