@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 use crate::ca::CaKey;
 use crate::keys::{HeldKey, KeyError, KeyStore, Role, Slot, StoreReach, UnreadStore, missing_in};
 use crate::seal::ProxyPublicKey;
-use crate::secret_service::{SecretService, SecretServiceKey};
+use crate::secret_service::{SECRET_TOOL, SecretService, SecretServiceKey};
 use crate::tpm::{TpmKey, TpmStore};
 
 /// The log name of the TPM store.
@@ -127,20 +127,29 @@ impl<T: KeyStore, S: KeyStore> LinuxStore<T, S> {
     }
 
     /// The answer of a Secret Service lookup, or `None` when Secret
-    /// Service did not answer. That store is then marked unread.
-    fn secret_service_answer<V>(&self, role: Role, answer: Result<V, KeyError>) -> Option<V> {
-        match answer {
-            Ok(value) => Some(value),
+    /// Service did not answer. That store is then marked unread. A locked
+    /// keyring and a Secret Service that this session cannot reach did
+    /// not answer. Any other error means a keyring answered and can hold
+    /// the key, so it is returned and the start stops.
+    fn secret_service_answer<V>(
+        &self,
+        role: Role,
+        answer: Result<V, KeyError>,
+    ) -> Result<Option<V>, KeyError> {
+        let unread = match &answer {
+            Ok(_) => return answer.map(Some),
+            Err(KeyError::Locked { .. }) => UnreadStore::SecretServiceLocked,
+            Err(err) if secret_service_is_absent(err) => UnreadStore::SecretServiceUnreachable,
             Err(err) => {
-                let unread = match err {
-                    KeyError::Locked { .. } => UnreadStore::SecretServiceLocked,
-                    _ => UnreadStore::SecretServiceUnreachable,
-                };
-                tracing::warn!(role = %role, store = SECRET_SERVICE, error = %err, "Secret Service did not answer a proxy key lookup");
-                self.mark_unread(unread);
-                None
+                tracing::warn!(role = %role, store = SECRET_SERVICE, error = %err, "Secret Service failed a proxy key lookup");
+                return answer.map(Some);
             }
+        };
+        if let Err(err) = &answer {
+            tracing::warn!(role = %role, store = SECRET_SERVICE, error = %err, "Secret Service did not answer a proxy key lookup");
         }
+        self.mark_unread(unread);
+        Ok(None)
     }
 
     /// Whether either store holds a key for `role` in `slot`. A Secret
@@ -151,7 +160,7 @@ impl<T: KeyStore, S: KeyStore> LinuxStore<T, S> {
             return Ok(true);
         }
         Ok(self
-            .secret_service_answer(role, self.secret_service.holds_in(role, slot))
+            .secret_service_answer(role, self.secret_service.holds_in(role, slot))?
             .unwrap_or(false))
     }
 
@@ -166,8 +175,21 @@ impl<T: KeyStore, S: KeyStore> LinuxStore<T, S> {
                 self.mark_unread(UnreadStore::SecretServiceLocked);
                 Err(err)
             }
-            answer => Ok(self.secret_service_answer(role, answer).unwrap_or(false)),
+            answer => Ok(self.secret_service_answer(role, answer)?.unwrap_or(false)),
         }
+    }
+}
+
+/// Whether `err` says that this session has no Secret Service: it cannot
+/// reach one, or `secret-tool` is not installed. Such a host is the
+/// headless host that BEP-088 starts on its TPM.
+fn secret_service_is_absent(err: &KeyError) -> bool {
+    match err {
+        KeyError::Unreachable { .. } => true,
+        KeyError::Store { detail, .. } => {
+            detail.starts_with(&format!("`{SECRET_TOOL}` is not installed"))
+        }
+        _ => false,
     }
 }
 
@@ -190,7 +212,7 @@ impl<T: KeyStore, S: KeyStore> KeyStore for LinuxStore<T, S> {
             }
             Err(err) => return Err(err),
         }
-        let found = self.secret_service_answer(role, self.secret_service.find(role));
+        let found = self.secret_service_answer(role, self.secret_service.find(role))?;
         match found.flatten() {
             Some(key) => {
                 tracing::info!(role = %role, store = SECRET_SERVICE, "found the proxy key");
@@ -255,7 +277,7 @@ impl<T: KeyStore, S: KeyStore> KeyStore for LinuxStore<T, S> {
             return Ok(Some(kid));
         }
         Ok(self
-            .secret_service_answer(role, self.secret_service.kid_in(role, slot))
+            .secret_service_answer(role, self.secret_service.kid_in(role, slot))?
             .flatten())
     }
 
@@ -297,6 +319,8 @@ mod tests {
     const ANSWERS: u8 = 0;
     const LOCKED: u8 = 1;
     const UNREACHABLE: u8 = 2;
+    const FAILED: u8 = 3;
+    const NOT_INSTALLED: u8 = 4;
 
     /// A memory store that can stop answering, as a locked or unreachable
     /// Secret Service does.
@@ -316,6 +340,11 @@ mod tests {
             match self.state.load(Ordering::SeqCst) {
                 LOCKED => Err(KeyError::Locked { role, detail }),
                 UNREACHABLE => Err(KeyError::Unreachable { role, detail }),
+                FAILED => Err(KeyError::Store { role, detail }),
+                NOT_INSTALLED => Err(KeyError::Store {
+                    role,
+                    detail: format!("`{SECRET_TOOL}` is not installed. Install it"),
+                }),
                 _ => Ok(()),
             }
         }
@@ -403,10 +432,12 @@ mod tests {
 
         // A host with no Secret Service in this session still starts on
         // its TPM.
-        let headless = store();
-        headless.secret_service.set(UNREACHABLE);
-        let keys = load(&headless, &[]).expect("a first start");
-        assert_eq!(stores(&keys), [TPM; 3]);
+        for state in [UNREACHABLE, NOT_INSTALLED] {
+            let headless = store();
+            headless.secret_service.set(state);
+            let keys = load(&headless, &[]).expect("a first start");
+            assert_eq!(stores(&keys), [TPM; 3]);
+        }
     }
 
     // BEP-088
@@ -440,6 +471,15 @@ mod tests {
         );
         assert!(!err.to_string().contains("--replace-key"));
         assert_eq!(locked.tpm.generated(), 0);
+
+        // A keyring that answered with a failure can hold the keys too, so
+        // the start stops and the TPM makes none.
+        let failed = self::store();
+        failed.secret_service.set(FAILED);
+        load(&failed, &[]).expect_err("a keyring that failed a lookup");
+        assert_eq!(failed.tpm.generated(), 0);
+        assert!(failed.generate_in(Role::Sealing, Slot::New).is_err());
+        assert_eq!(failed.tpm.generated(), 0);
     }
 
     // BEP-089
