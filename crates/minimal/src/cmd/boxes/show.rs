@@ -77,7 +77,7 @@ pub(crate) struct ShownBoxDoc {
 }
 
 /// One live exec of a box, as a `min/v1/exec` object (BCLI-033, BCLI-053).
-/// `mode` is `terminal`, `detached` or `attached`, as the text form says.
+/// `mode` is `tty`, `detached` or `attached`, as the text form says.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct ShownExecDoc {
     schema: &'static str,
@@ -86,10 +86,12 @@ pub(crate) struct ShownExecDoc {
     argv: Vec<String>,
 }
 
-/// How an exec meets its client, in the words `min box show` prints.
+/// How an exec meets its client, in the words `min box show` prints. A
+/// terminal exec is `tty`, the word its `exec_started` event stores and
+/// `min box exec --tty` takes (BCLI-067).
 fn exec_mode_word(mode: &minimald_rpc::exec::ExecMode) -> &'static str {
     match mode {
-        minimald_rpc::exec::ExecMode::Tty => "terminal",
+        minimald_rpc::exec::ExecMode::Tty => "tty",
         minimald_rpc::exec::ExecMode::Detached => "detached",
         minimald_rpc::exec::ExecMode::Attached => "attached",
     }
@@ -333,7 +335,7 @@ pub(crate) fn not_found_remedy(host: &str, several_hosts: bool) -> String {
 /// Writes one box record as `Label: value` lines, with the `provider`
 /// and `host` it came from. A value the record does not carry prints as
 /// `-`. A `Live execs:` block follows when the box runs execs, with one
-/// row for each: its exec id, `terminal`, `detached` or `attached`, and its
+/// row for each: its exec id, `tty`, `detached` or `attached`, and its
 /// command.
 pub(crate) fn render_box_show(
     out: &mut impl std::io::Write,
