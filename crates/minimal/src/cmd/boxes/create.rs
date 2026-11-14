@@ -2033,7 +2033,7 @@ fn refuse_unhonourable_grants(
     box_zone_resolver: bool,
     spec_env: &[String],
 ) -> Result<Vec<boxes::core::bep::BepWarning>, anyhow::Error> {
-    use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
+    use boxes::core::bep::{ActivationSpec, BepTables, HostFacts, check_activation};
     let hosts: Vec<&str> = bep::module::GITHUB
         .hosts
         .iter()
@@ -2044,6 +2044,9 @@ fn refuse_unhonourable_grants(
         egress,
         bep: settings,
         secrets,
+        // `min box start` reads the grants and the proxy settings from
+        // `[defaults.session]`, so its refusals name those tables.
+        tables: BepTables::SESSION,
     };
     // BEP-057: the client configuration's acknowledgement, the same one
     // `min box spec` reads, so the preview and the start agree.
@@ -6344,6 +6347,7 @@ mod tests {
                         box_zone_resolver: resolver,
                         github_hosts: &github_hosts,
                         store_rules: &rules,
+                        tables: boxes::core::bep::BepTables::SESSION,
                     },
                     &mut out,
                 );
@@ -6419,6 +6423,7 @@ mod tests {
                             box_zone_resolver: spec_resolver,
                             github_hosts: &github_hosts,
                             store_rules: &rules,
+                            tables: boxes::core::bep::BepTables::SESSION,
                         },
                         &mut out,
                     );

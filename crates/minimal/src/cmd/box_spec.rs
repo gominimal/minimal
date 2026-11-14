@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use boxes::core::bep::{
-    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals, store_references,
+    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepTables, BepWarning, HostFacts,
+    Quic443, SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals,
+    store_references,
 };
 
 use crate::output::ObjectType;
@@ -51,6 +52,9 @@ pub(crate) struct SpecInputs<'a> {
     /// The client's `[secret-store-rules]`, merged and with refused rules
     /// left out.
     pub store_rules: &'a StoreRules,
+    /// The minimal.toml tables that set [`Self::secrets`] and
+    /// [`Self::bep`], which a refusal names.
+    pub tables: BepTables<'a>,
 }
 
 /// Writes the `min box spec` rows for `inputs`.
@@ -86,6 +90,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         egress,
         bep: inputs.bep,
         secrets: inputs.secrets,
+        tables: inputs.tables,
     };
     let narrow: Vec<BepRefusal> = refusals(&spec, host, inputs.github_hosts)
         .into_iter()
@@ -401,7 +406,16 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
     });
     tracing::debug!(project = %project.display(), "rendering min box spec");
     let (network, _) = preview_host(crate::daemon_host_kind(global), args);
-    proxy_rows(global, &bep, quic443, &secrets, network, out)
+    // This path reads `[defaults.session]`, as `min box start` does.
+    proxy_rows(
+        global,
+        &bep,
+        quic443,
+        &secrets,
+        network,
+        BepTables::SESSION,
+        out,
+    )
 }
 
 /// Writes the Box Egress Proxy rows for `secrets` (BEP-038) to `out`, for
@@ -412,6 +426,7 @@ fn proxy_rows(
     quic443: Option<Quic443>,
     secrets: &SecretGrants,
     network: boxes::NetworkMode,
+    tables: BepTables<'_>,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     let acknowledged = crate::config::full_breadth_acknowledged(global)?;
@@ -440,6 +455,7 @@ fn proxy_rows(
             box_zone_resolver,
             github_hosts: &github_hosts,
             store_rules: &store_rules,
+            tables,
         },
         out,
     )
@@ -482,6 +498,32 @@ fn origin_label(origin: &mfile::expand::Origin, entry: &mfile::entry::BoxEntry) 
         Layer::Entry => format!("[{}.{}]", entry.table.key(), entry.name),
         Layer::Loadouts => "loadouts".to_owned(),
         Layer::Overrides => COMMAND_LINE.to_owned(),
+    }
+}
+
+/// The minimal.toml table at `path` under the layer that set `key` of
+/// `entry`'s expansion, for a refusal that names where to edit the value
+/// (BCLI-021). A table replaces the one a lower layer sets, so a value
+/// that no table of the file sets names the table where an edit takes
+/// effect: the entry's own table, or `[defaults.<type>]` for the implicit
+/// default entry.
+fn setting_table(
+    report: &mfile::expand::ExpansionReport,
+    entry: &mfile::entry::BoxEntry,
+    key: &str,
+    path: &str,
+) -> String {
+    use mfile::expand::{Layer, ValueOrigin};
+    let box_type = entry.box_type.as_deref().unwrap_or(boxes::SESSION_BOX_TYPE);
+    let layer = match report.values.get(key) {
+        Some(ValueOrigin::Value(origin)) => Some(origin.layer),
+        _ => None,
+    };
+    match layer {
+        Some(Layer::Defaults) => format!("[defaults.{path}]"),
+        Some(Layer::DefaultsType) => format!("[defaults.{box_type}.{path}]"),
+        _ if entry.implicit => format!("[defaults.{box_type}.{path}]"),
+        _ => format!("[{}.{}.{path}]", entry.table.key(), entry.name),
     }
 }
 
@@ -640,6 +682,10 @@ fn expand_entry(
     for (key, origin) in &expansion.report.values {
         sources.insert(key.clone(), origin_labels(origin, entry));
     }
+    // The tables a refusal names: the layer that set `secrets`, and the
+    // layer that set `network`, whose `bep` table the proxy reads.
+    let secrets_table = setting_table(&expansion.report, entry, "secrets", "secrets");
+    let bep_table = setting_table(&expansion.report, entry, "network", "network.bep");
     let box_type = entry
         .box_type
         .clone()
@@ -830,7 +876,11 @@ fn expand_entry(
             .transpose()
             .map_err(|e| invalid(mfile::Error::Format(e)))?;
         let mut rows = Vec::new();
-        proxy_rows(global, &bep, quic443, &grants, mode, &mut rows)?;
+        let tables = BepTables {
+            secrets: &secrets_table,
+            network_bep: &bep_table,
+        };
+        proxy_rows(global, &bep, quic443, &grants, mode, tables, &mut rows)?;
         rows_text = String::from_utf8_lossy(&rows)
             .lines()
             .map(str::to_owned)
@@ -1142,6 +1192,7 @@ mod tests {
                 box_zone_resolver: true,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )?;
@@ -1178,6 +1229,7 @@ mod tests {
                     box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
+                    tables: BepTables::SESSION,
                 },
                 &mut out,
             )
@@ -1241,6 +1293,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -1269,6 +1322,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -1281,6 +1335,7 @@ mod tests {
             vec![BepRefusal::BrokerScopeNotGithub {
                 grant: "OLD".into(),
                 scope: "claude".into(),
+                table: "[defaults.session.secrets]".into(),
             }]
         );
         assert!(out.is_empty(), "no rows before the refusal");
@@ -1320,6 +1375,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -1386,6 +1442,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
