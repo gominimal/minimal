@@ -399,7 +399,89 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     write_store_authorities(&mut expansion.spec, &layers.store_rules);
     expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
+    check_file_exports(entry, &expansion)?;
     Ok(expansion)
+}
+
+/// The path of one `[[file_exports]]` item: its `path` key, or the item
+/// itself when it is a bare string. `None` for an item that names no
+/// path.
+#[must_use]
+pub fn file_export_path(item: &toml::Value) -> Option<&str> {
+    match item {
+        toml::Value::String(path) => Some(path),
+        toml::Value::Table(table) => table.get("path").and_then(toml::Value::as_str),
+        _ => None,
+    }
+}
+
+/// The paths that an expanded spec's `[[file_exports]]` declares, in
+/// list order. Each one is relative to the project root (BOX-185).
+#[must_use]
+pub fn file_export_paths(spec: &toml::Table) -> Vec<String> {
+    spec.get("file_exports")
+        .and_then(toml::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(file_export_path)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether an export path stays inside the project root and names
+/// something below it: not absolute, no `..` component, and not the root
+/// itself (BOX-189).
+#[must_use]
+pub fn export_path_in_project(path: &str) -> bool {
+    use std::path::{Component, Path};
+    let mut below_root = false;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(_) => below_root = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    below_root
+}
+
+/// Refuses a `[[file_exports]]` path that is absolute, has a `..`
+/// component, or names the project root itself (BOX-189), so the box is
+/// never created. Exits 3.
+fn check_file_exports(entry: &BoxEntry, expansion: &Expansion) -> Result<(), Error> {
+    let Some(items) = expansion
+        .spec
+        .get("file_exports")
+        .and_then(toml::Value::as_array)
+    else {
+        return Ok(());
+    };
+    let origins = match expansion.report.values.get("file_exports") {
+        Some(ValueOrigin::List(origins)) => Some(origins),
+        _ => None,
+    };
+    for (i, item) in items.iter().enumerate() {
+        let Some(path) = file_export_path(item) else {
+            continue;
+        };
+        if !export_path_in_project(path) {
+            let origin = origins.and_then(|o| o.get(i)).or_else(|| {
+                expansion
+                    .report
+                    .values
+                    .get("file_exports")
+                    .and_then(ValueOrigin::first)
+            });
+            return Err(Error::ExportOutsideProject {
+                path: path.to_owned(),
+                layer: layer_words(entry, origin),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a `source = "store"` reference that a layer gives an
@@ -3864,5 +3946,60 @@ mod tests {
             };
             prop_assert_eq!(run(HostFacts::Unenrolled), run(HostFacts::Enrolled));
         }
+    }
+
+    // BOX-189: an export path that is absolute, has a `..` component, or
+    // names the project root fails the expansion with exit 3, quoting the
+    // path. A path inside the project expands.
+    #[test]
+    fn export_path_outside_project_refused_exit3() {
+        for bad in [
+            "/etc/passwd",
+            "../out",
+            "out/../../x",
+            "a/..",
+            "",
+            ".",
+            "./",
+        ] {
+            let file = format!(
+                "[tasks.build]\nexec = \"make\"\n[[tasks.build.file_exports]]\npath = {bad:?}\n"
+            );
+            let err = expand_in(&file, "build", Layers::default())
+                .expect_err("an export outside the project is refused");
+            assert!(
+                matches!(&err, Error::ExportOutsideProject { path, .. } if path == bad),
+                "{bad}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), Some(3), "{bad}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`[tasks.build]` in minimal.toml exports `{bad}`, which points \
+                     outside the folder that holds minimal.toml or names that \
+                     folder itself. Give the path of a file or folder inside \
+                     that folder."
+                )
+            );
+        }
+
+        // A `[defaults]` layer that sets the bad path is the one named.
+        let file = "[defaults]\nfile_exports = [{ path = \"/abs\" }]\n\
+                    [tasks.build]\nexec = \"make\"\n";
+        let err = expand_in(file, "build", Layers::default()).expect_err("refused");
+        assert!(
+            err.to_string()
+                .starts_with("`[defaults]` in minimal.toml exports `/abs`"),
+            "{err}"
+        );
+
+        let file = "[tasks.build]\nexec = \"make\"\n\
+                    [[tasks.build.file_exports]]\npath = \"dist/out.txt\"\n\
+                    [[tasks.build.file_exports]]\npath = \"./reports\"\n";
+        let ok = expand_in(file, "build", Layers::default()).expect("paths inside expand");
+        assert_eq!(
+            file_export_paths(&ok.spec),
+            vec!["dist/out.txt".to_owned(), "./reports".to_owned()]
+        );
     }
 }

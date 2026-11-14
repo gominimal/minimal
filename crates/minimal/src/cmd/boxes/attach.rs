@@ -1488,6 +1488,29 @@ where
         }
         _ => BoxAfterAttach::Unread,
     };
+    // BOX-185: an attach that saw the box end copies its declared exports,
+    // whatever code the entrypoint ended with. A detach leaves the box
+    // running, and copies nothing (BOX-186). An entrypoint's own nonzero
+    // code is not read above, so the box is read here for the copy only.
+    let ended = match &after {
+        BoxAfterAttach::Unread => {
+            box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await
+        }
+        _ => after.clone(),
+    };
+    if let BoxAfterAttach::Listed(entry) = &ended
+        && matches!(entry.state.as_str(), "stopped" | "exited")
+    {
+        let root = entry.project_root.as_ref();
+        copy_box_exports_on_host(
+            &target.host,
+            target.box_id,
+            &target.label,
+            root.map(|root| std::path::Path::new(root.as_str())),
+            &mut std::io::stderr(),
+        )
+        .await;
+    }
     match attach_ending(&target, code, &after) {
         Ok(ending) => {
             tracing::info!(

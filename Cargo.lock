@@ -4195,6 +4195,7 @@ dependencies = [
  "ratatui",
  "reqwest",
  "russh",
+ "russh-sftp",
  "serde",
  "serde_json_lenient",
  "sha2 0.11.1",

@@ -17,6 +17,8 @@ mod create;
 mod events;
 #[path = "boxes/exec.rs"]
 mod exec;
+#[path = "boxes/exports.rs"]
+mod exports;
 #[path = "boxes/hooks.rs"]
 mod hooks;
 #[path = "boxes/lifecycle.rs"]
@@ -40,6 +42,7 @@ pub use create::*;
 pub use events::BoxFileRefusal;
 pub(crate) use events::*;
 pub(crate) use exec::*;
+pub(crate) use exports::*;
 pub(crate) use hooks::*;
 pub(crate) use lifecycle::*;
 pub use lifecycle::{BoxRenameRefusal, BoxRunningRefusal, PruneNeedsYes};
