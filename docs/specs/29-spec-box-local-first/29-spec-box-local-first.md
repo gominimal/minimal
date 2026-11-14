@@ -623,13 +623,13 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal exports_not_copied_from_another_project
 
-- **BOX-200** IF the client's report of an export to the daemon fails THEN THE SYSTEM SHALL print on stderr one line that names the export's path and says that the client could not confirm that the box's record holds an entry for it, and leave the command's exit code as BOX-193 and BOX-194 set it. The claim BOX-198 recorded stays for those exports while the command's connection lasts, so no later command copies them again; BOX-202 covers a connection that ends first.
-  <!-- unwanted; decided 2026-11-13: the copied files are what a caller needs, and the record is the audit trail; a lost report does not change the result -->
+- **BOX-200** IF the client's report of an export to the daemon fails THEN THE SYSTEM SHALL print on stderr one line that names the export's path and says that the client could not confirm that the box's record holds an entry for it, and leave the command's exit code as BOX-193 and BOX-194 set it. The export has no report, so BOX-202 releases its claim when the command's connection ends, and a later command that waits for that end may copy it again.
+  <!-- unwanted; decided 2026-11-13: the copied files are what a caller needs, and the record is the audit trail; a lost report does not change the result; decided 2026-11-14: the daemon cannot tell a lost report from a crash, so the release of BOX-202 wins, at worst a second copy of the same end and never a lost export -->
   tier:     T0
   verify:   cargo nextest run -p minimal lost_export_report_named_exit_unchanged
 
 
-- **BOX-201** IF the daemon grants a command none of an end's exports, because other commands hold or reported every one THEN THE SYSTEM SHALL copy no export of that end, print on stderr one line that names the box and says that another command claimed its exports for that end, and leave the command's exit code as it is without exports.
+- **BOX-201** IF the daemon refuses a command one or more of an end's exports, because other commands hold or reported them THEN THE SYSTEM SHALL copy none of the refused exports, print on stderr one line for each that names the box and the export's path and says that another command claimed it, and leave the command's exit code as it is without exports.
   <!-- unwanted; decided 2026-11-13: the claim of BOX-198 makes "once for each end" hold; a refused claim is not a failure of the command -->
   tier:     T0
   verify:   cargo nextest run -p minimal refused_export_claim_copies_nothing
