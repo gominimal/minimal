@@ -43,15 +43,15 @@ impl BoxTimedOut {
         }
     }
 
-    /// The wait for `target` stopped after `after`, before the box ended.
-    /// `id` is the box id the wait resolved, so that a script can
-    /// address the box by it.
+    /// The wait stopped after `after`, before the box ended. `name` is the
+    /// name the box's record holds, and `id` is the box id the wait
+    /// resolved, so that a script can address the box by it.
     #[must_use]
-    pub fn waited(target: &str, id: &str, after: &str) -> Self {
+    pub fn waited(name: Option<&str>, id: &str, after: &str) -> Self {
+        let named = box_label(name, id);
         Self {
             code: "wait_timeout",
-            // The `diagnostics:` wording, with the id, split into two sentences.
-            message: format!("Stopped waiting after {after}. {target} ({id}) has not ended."),
+            message: format!("Stopped waiting after {after}. Box {named} has not ended."),
             hint: format!(
                 "Run `min box wait {id}` to wait again, or `min box stop {id}` to stop it."
             ),
@@ -59,16 +59,17 @@ impl BoxTimedOut {
         }
     }
 
-    /// The wait for the exec `exec_id` in `target` stopped after `after`,
-    /// before the exec ended (BCLI-057). `id` is the box id the wait
-    /// resolved. The hint gives the `--exec` forms, so that neither
-    /// command acts on the whole box.
+    /// The wait for the exec `exec_id` stopped after `after`, before the
+    /// exec ended (BCLI-057). `name` is the name the box's record holds,
+    /// and `id` is the box id the wait resolved. The hint gives the
+    /// `--exec` forms, so that neither command acts on the whole box.
     #[must_use]
-    pub fn waited_exec(target: &str, id: &str, exec_id: &str, after: &str) -> Self {
+    pub fn waited_exec(name: Option<&str>, id: &str, exec_id: &str, after: &str) -> Self {
+        let named = box_label(name, id);
         Self {
             code: "wait_timeout",
             message: format!(
-                "Stopped waiting after {after}. Exec {exec_id} in {target} has not ended."
+                "Stopped waiting after {after}. Exec {exec_id} in box {named} has not ended."
             ),
             hint: format!(
                 "Run `min box wait {id} --exec {exec_id}` to wait again, \
@@ -115,6 +116,27 @@ impl std::fmt::Display for BoxTimedOut {
 }
 
 impl std::error::Error for BoxTimedOut {}
+
+/// The box as a wait-timeout line names it after the word box:
+/// `<name> (<id>)`, or `<id>` when its record holds no name.
+fn box_label(name: Option<&str>, id: &str) -> String {
+    match name {
+        Some(name) if !name.is_empty() => format!("{name} ({id})"),
+        _ => id.to_owned(),
+    }
+}
+
+/// The name the record of the box `id` on `host` holds. A host that does
+/// not answer gives `None`, and the line then names the box by its id.
+async fn box_name_on(host: &crate::cmd::list::LocalHost, id: boxes::SessionId) -> Option<String> {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let mut client = box_host_client(host).await.ok()?;
+    match client.oneshot_rpc::<ShowBox>(ShowBoxRequest { id }).await {
+        Ok(Errorable::Ok(shown)) => shown.record.name,
+        _ => None,
+    }
+}
 
 /// How the box `record` ended, as `min box wait` answers it, or `None`
 /// while the box has not ended. `target` is the box as the user named it.
@@ -210,9 +232,12 @@ pub(crate) async fn box_wait_on_hosts(
             let now = tokio::time::Instant::now();
             if now >= at {
                 tracing::info!(verb = "box wait", box_id = %id, outcome = "wait timeout");
-                return Err(
-                    BoxTimedOut::waited(target, &id.to_string(), &wait_label(after)).into(),
-                );
+                return Err(BoxTimedOut::waited(
+                    shown.record.name.as_deref(),
+                    &id.to_string(),
+                    &wait_label(after),
+                )
+                .into());
             }
             pause = pause.min(at - now);
         }
@@ -250,7 +275,9 @@ where
             Some(after) => match tokio::time::timeout(after, waited).await {
                 Ok(waited) => waited,
                 Err(_) => Err(BoxTimedOut::waited_exec(
-                    target,
+                    box_name_on(&resolved.host, resolved.box_id)
+                        .await
+                        .as_deref(),
                     &resolved.box_id.to_string(),
                     exec_id.as_str(),
                     &wait_label(after),
