@@ -1789,6 +1789,41 @@ mod tests {
         assert_eq!(failure_exit_code(&e), 3);
     }
 
+    /// BCLI-034: the real `failure_exit_code` maps each refusal that once
+    /// ended with exit 1 to the table's code, through added context. The
+    /// codes are literals, so a wrong constant fails here too.
+    #[test]
+    fn refusals_exit_with_the_table_code_through_failure_exit_code() {
+        let message = || "refused".to_owned();
+        let cases: [(&str, anyhow::Error, u8); 4] = [
+            (
+                "network flag",
+                anyhow::Error::new(minimal::NetworkFlagRefusal { message: message() }),
+                2,
+            ),
+            (
+                "no minimal.toml",
+                anyhow::Error::new(minimal::task::ProjectFileNotFound { message: message() }),
+                4,
+            ),
+            (
+                "no loadout file",
+                anyhow::Error::new(minimal::loadouts::LoadoutNotFound { message: message() }),
+                4,
+            ),
+            (
+                "no local host",
+                anyhow::Error::new(minimal::hosts::LocalHostNotFound { message: message() }),
+                4,
+            ),
+        ];
+        for (what, error, code) in cases {
+            assert_eq!(failure_exit_code(&error), code, "{what}, bare");
+            let wrapped = error.context("running the command");
+            assert_eq!(failure_exit_code(&wrapped), code, "{what}, with context");
+        }
+    }
+
     /// An invalid project `minimal.toml` that does not parse prints its TOML
     /// parse error once, and the run ends with exit 3.
     #[test]

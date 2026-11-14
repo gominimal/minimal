@@ -20000,6 +20000,9 @@ async fn box_rename_native_host_prints_no_vm_host_warning() {
 
 /// The exit code `main`'s `failure_exit_code` gives the refusals that
 /// `refusals_exit_with_the_table_code` checks, and 1 for anything else.
+/// This crate cannot call `failure_exit_code`, which lives in the `min`
+/// binary. `main.rs`'s `refusals_exit_with_the_table_code_through_failure_exit_code`
+/// checks the real mapping for each of these types.
 fn table_refusal_code(error: &anyhow::Error) -> u8 {
     if error.downcast_ref::<NetworkFlagRefusal>().is_some() {
         return NetworkFlagRefusal::EXIT_CODE;
