@@ -457,6 +457,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_box_on = asserts",
             // Not a client path: the mint unit tests' create-request fixture.
             "tests.rs::create_request = asserts",
+            // A test's request, sent only to the in-process test daemon,
+            // which is this build: it checks the stored projection digests.
+            "tests.rs::create_stores_client_digest_equal_to_daemon_digest = asserts nothing",
             // Two unit test requests, never sent: they check the name a
             // start's `--name` and entry give the box (BCLI-069).
             "tests.rs::create_verbs_name_flag_overrides_box_name = asserts nothing",
