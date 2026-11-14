@@ -3317,6 +3317,68 @@ fn foreign_channel_connect(error: io::Error) -> io::Error {
     }
 }
 
+/// Whether the account holding the listening end of a channel is one this
+/// node may publish its table to. The path alone does not say: where a
+/// channel's directory is another user's to make (the interim's
+/// `/tmp/minimal-<uid>` fallback), that user can listen at the path, and a
+/// node that published to it would hand them its box names and take their
+/// word for the addresses. Three holders are this node's to trust: the
+/// service manager (root: launchd and systemd make an installed service's
+/// socket and are the peer the kernel names), this node's own account (the
+/// interim one of its daemons hosts), and the account that owns the
+/// socket's node when root alone could have put it there (`custodied`: a
+/// service that binds its own socket in a root-only directory). Pure.
+fn channel_holder_trusted(peer: u32, own: u32, node_owner: Option<u32>, custodied: bool) -> bool {
+    peer == 0 || peer == own || (custodied && node_owner == Some(peer))
+}
+
+/// The owner of the socket node at `sock`, and whether root alone decides
+/// what sits at that path: its directory is root's and neither group nor
+/// other may write it. `(None, false)` when either does not read: an
+/// unread fact vouches for nobody.
+fn channel_node_custody(sock: &Path) -> (Option<u32>, bool) {
+    use std::os::unix::fs::MetadataExt as _;
+    let owner = std::fs::symlink_metadata(sock).ok().map(|node| node.uid());
+    let custodied = sock
+        .parent()
+        .and_then(|dir| std::fs::symlink_metadata(dir).ok())
+        .is_some_and(|dir| dir.is_dir() && dir.uid() == 0 && dir.mode() & 0o022 == 0);
+    (owner, custodied)
+}
+
+/// Refuses a channel whose listening end another user holds
+/// ([`channel_holder_trusted`]), before a byte of this node's table is
+/// written to it. The kernel names the holder, as it names a publisher to
+/// the answerer ([`peer_uid`]); a holder it cannot name is refused too.
+/// `PermissionDenied`, so the acquisition loop surfaces it and never
+/// takes it for a channel that is nobody's.
+fn refuse_foreign_holder(stream: &UnixStream, sock: &Path) -> io::Result<()> {
+    let peer = peer_uid(stream).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "who holds the DNS channel at {} could not be read ({error}); nothing was \
+                 published to it",
+                sock.display()
+            ),
+        )
+    })?;
+    // SAFETY: geteuid only reads the process's own uid.
+    let own = unsafe { libc::geteuid() };
+    let (node_owner, custodied) = channel_node_custody(sock);
+    if channel_holder_trusted(peer, own, node_owner, custodied) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "the DNS channel at {} is held by uid {peer}, which is neither the system's \
+             service manager nor this account; nothing was published to it",
+            sock.display()
+        ),
+    ))
+}
+
 /// One node's first publish: connect to the answerer channel, say the
 /// hello — the node's id, the protocol version this copy speaks — wait
 /// for the answerer's ack, then publish `rows` and wait for the ack that
@@ -3328,9 +3390,9 @@ fn foreign_channel_connect(error: io::Error) -> io::Error {
 /// way (a hello that never gets its ack or gets it refused) is a distinct
 /// error the loop surfaces, never a reason to host.
 fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io::Result<Published> {
-    let mut registration = Registration {
-        stream: UnixStream::connect(sock).map_err(foreign_channel_connect)?,
-    };
+    let stream = UnixStream::connect(sock).map_err(foreign_channel_connect)?;
+    refuse_foreign_holder(&stream, sock)?;
+    let mut registration = Registration { stream };
     // The hello and its reply are bounded like a publish's: a service
     // manager starts a socket-activated answerer at the connect, so the
     // bound only has to cover the start, and an answerer that never
@@ -7140,6 +7202,57 @@ mod tests {
         };
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
         assert_eq!(refused.to_string(), FOREIGN_CHANNEL_CONNECT);
+    }
+
+    /// Who may hold the listening end of a channel this node publishes
+    /// to: the service manager, this account, and the node's owner only
+    /// where root alone decides what sits at the path. Any other account
+    /// listening there is refused, whoever owns the node.
+    #[test]
+    fn a_channel_another_user_holds_is_not_trusted() {
+        assert!(channel_holder_trusted(0, 501, Some(450), true), "root");
+        assert!(channel_holder_trusted(0, 501, None, false), "root");
+        assert!(
+            channel_holder_trusted(501, 501, None, false),
+            "this account"
+        );
+        assert!(
+            channel_holder_trusted(450, 501, Some(450), true),
+            "the owner of a node in a root-only directory"
+        );
+        assert!(
+            !channel_holder_trusted(502, 501, Some(502), false),
+            "the owner of a node in a directory root does not keep"
+        );
+        assert!(
+            !channel_holder_trusted(502, 501, Some(450), true),
+            "an account that is not the node's owner"
+        );
+        assert!(
+            !channel_holder_trusted(502, 501, None, true),
+            "an owner that did not read vouches for nobody"
+        );
+    }
+
+    /// A temp directory is the test user's own, so it vouches for no
+    /// owner; the test's own listener is still this account's and its
+    /// publish goes through. A path with nothing at it reads no owner.
+    #[test]
+    fn a_channel_in_the_users_own_directory_is_trusted_by_its_holder_alone() {
+        // SAFETY: geteuid only reads the process's own uid.
+        let own = unsafe { libc::geteuid() };
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        assert_eq!(channel_node_custody(&channel).0, None);
+        let listener = UnixListener::bind(&channel).expect("the channel binds");
+        let (owner, custodied) = channel_node_custody(&channel);
+        assert_eq!(owner, Some(own));
+        if own != 0 {
+            assert!(!custodied, "a user's directory is not root's to keep");
+        }
+        let client = UnixStream::connect(&channel).expect("the channel accepts");
+        let _server = listener.accept().expect("the connect is accepted");
+        refuse_foreign_holder(&client, &channel).expect("this account's own channel is trusted");
     }
 
     /// A burst of foreign connects is one line's worth of news: every
