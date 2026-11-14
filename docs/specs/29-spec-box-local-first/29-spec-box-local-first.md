@@ -613,7 +613,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal skipped_export_leaves_record_exit_code
 
-- **BOX-198** WHEN a command that waits is about to copy the exports of a box's end THE SYSTEM SHALL first claim them from the daemon, and the daemon SHALL grant the command each export of that end that no other command holds or has reported, record the claim on the box's record before the copy starts, and refuse the rest, so that each export of an end is copied by one command.
+- **BOX-198** WHEN a command that waits is about to copy the exports of a box's end THE SYSTEM SHALL first claim them from the daemon, and the daemon SHALL grant the command each export of that end that no other command holds or has reported, record the claim on the box's record before the copy starts, and refuse the rest, so that no two commands hold the claim on one export of an end at the same time.
   <!-- event-driven; gominimal/arch#180 ruling 2: one copy for each end; decided 2026-11-13: the claim is recorded before the copy, so two commands that wait on one end never hold the claim on one export at the same time, and a later `min box wait` cannot replace a newer file; decided 2026-11-14: a lost report (BOX-200) or a dropped connection (BOX-202) releases the claim, so the next waiting command may copy that export again from the same end; `min box cp` gets a file again on request; a resumed PTY box copies again at its next end -->
   tier:     T0
   verify:   cargo nextest run -p minimald export_claim_granted_once_for_each_end
