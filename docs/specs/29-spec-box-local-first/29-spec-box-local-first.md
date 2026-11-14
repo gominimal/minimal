@@ -613,7 +613,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal skipped_export_leaves_record_exit_code
 
-- **BOX-198** WHEN a command that waits is about to copy the exports of a box's end THE SYSTEM SHALL first claim that end from the daemon, and the daemon SHALL grant one claim for each end of a box and record it on the box's record before the copy starts, so that only one command copies the exports of an end.
+- **BOX-198** WHEN a command that waits is about to copy the exports of a box's end THE SYSTEM SHALL first claim them from the daemon, and the daemon SHALL grant the command each export of that end that no other command holds or has reported, record the claim on the box's record before the copy starts, and refuse the rest, so that each export of an end is copied by one command.
   <!-- event-driven; gominimal/arch#180 ruling 2: one copy for each end; decided 2026-11-13: the claim is recorded before the copy, so two commands that wait on one end, or a lost report (BOX-200), never copy twice and a later `min box wait` cannot replace a newer file; `min box cp` gets a file again on request; a resumed PTY box copies again at its next end -->
   tier:     T0
   verify:   cargo nextest run -p minimald export_claim_granted_once_for_each_end
@@ -629,13 +629,13 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p minimal lost_export_report_named_exit_unchanged
 
 
-- **BOX-201** IF the daemon refuses a command's claim because another command already claimed that end THEN THE SYSTEM SHALL copy no export of that end, print on stderr one line that names the box and says that another command claimed its exports for that end, and leave the command's exit code as it is without exports.
+- **BOX-201** IF the daemon grants a command none of an end's exports, because other commands hold or reported every one THEN THE SYSTEM SHALL copy no export of that end, print on stderr one line that names the box and says that another command claimed its exports for that end, and leave the command's exit code as it is without exports.
   <!-- unwanted; decided 2026-11-13: the claim of BOX-198 makes "once for each end" hold; a refused claim is not a failure of the command -->
   tier:     T0
   verify:   cargo nextest run -p minimal refused_export_claim_copies_nothing
 
 
-- **BOX-202** IF the connection of a command that holds BOX-198's claim ends before the command has reported every export of that end THEN THE SYSTEM SHALL release the claim for each export with no report, so that the next command that waits for that end copies those exports, and keep the claim on each export already reported.
+- **BOX-202** IF the connection of a command that holds BOX-198's claim ends before the command has reported every export of that end THEN THE SYSTEM SHALL release the claim for each export with no report, so that the next command that waits for that end is granted and copies those exports under BOX-198, and keep the claim on each export already reported. The command whose connection ended SHALL stop copying and rename no further file into place.
   <!-- unwanted; decided 2026-11-14: a command that dies mid-copy (Ctrl-C, a closed terminal, a crash) must not leave the rest of an end uncopied for good; an export already reported is not copied again, so no file is replaced twice -->
   tier:     T0
   verify:   cargo nextest run -p minimald export_claim_released_for_unreported_exports_on_disconnect
