@@ -1598,7 +1598,7 @@ impl std::fmt::Display for ProjectionDigestRefusal {
         f.write_str(
             "No box was created. minimald read different box settings from the box spec \
              than the `min` that sent it. This can happen when `min` and minimald are \
-             different builds. Run `min stop --force` to stop minimald, then run the \
+             different builds. Run `min stop` to stop minimald, then run the \
              command again to start minimald from the same build as `min`.",
         )
     }
