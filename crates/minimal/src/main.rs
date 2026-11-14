@@ -998,16 +998,19 @@ mod tests {
             grants,
             stored: false,
             cause: ProxyAbsence::NotInstalled { path: None },
+            table: "[defaults.session.secrets]".into(),
         });
         assert_eq!(failure.code(), "gatehouse_unenrolled_node");
         assert_eq!(
             failure.hint(),
-            "to create the box without the grant, remove GH_TOKEN from [session.secrets] \
-             in minimal.toml"
+            "to create the box without the grant, remove GH_TOKEN from \
+             [defaults.session.secrets] in minimal.toml"
         );
 
         // A refusal with no defined error stays `unspecified`.
-        let failure = answer(BepRefusal::SteeringOffWithProxyEnv);
+        let failure = answer(BepRefusal::SteeringOffWithProxyEnv {
+            table: "[defaults.session.network.bep]".into(),
+        });
         assert_eq!(failure.code(), "unspecified");
         assert!(failure.hint().is_empty());
     }

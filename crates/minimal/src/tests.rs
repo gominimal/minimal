@@ -6515,7 +6515,7 @@ mod mint_tests {
                 "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
                  Box Egress Proxy, is not installed at {}, so no proxy serves boxes on this \
                  machine. To create the box without the grant, remove GH_TOKEN from \
-                 [session.secrets] in minimal.toml.",
+                 [defaults.session.secrets] in minimal.toml.",
                 binary.display()
             )
         );
@@ -6535,7 +6535,7 @@ mod mint_tests {
             err.to_string(),
             "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the Box \
              Egress Proxy, is not installed, so no proxy serves boxes on this machine. To \
-             create the box without the grant, remove GH_TOKEN from [session.secrets] in \
+             create the box without the grant, remove GH_TOKEN from [defaults.session.secrets] in \
              minimal.toml."
         );
 
@@ -6562,7 +6562,7 @@ mod mint_tests {
             "Cannot create the box: it declares the GitHub grant GH_TOKEN, and MINVMD_BEP_BIN \
              sets `bep`, the Box Egress Proxy, to the relative path bin/bep, and no proxy \
              serves boxes on this machine. Set MINVMD_BEP_BIN to an absolute path. To create \
-             the box without the grant, remove GH_TOKEN from [session.secrets] in \
+             the box without the grant, remove GH_TOKEN from [defaults.session.secrets] in \
              minimal.toml."
         );
 
@@ -6592,7 +6592,7 @@ mod mint_tests {
                 "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
                  Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
                  serves boxes on this machine. To create the box without the grant, remove \
-                 GH_TOKEN from [session.secrets] in minimal.toml.",
+                 GH_TOKEN from [defaults.session.secrets] in minimal.toml.",
                 binary.display()
             )
         );
@@ -6621,7 +6621,7 @@ mod mint_tests {
                 "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
                  Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
                  serves boxes on this machine. The proxy's log is at {}. To create the box \
-                 without the grant, remove GH_TOKEN from [session.secrets] in minimal.toml.",
+                 without the grant, remove GH_TOKEN from [defaults.session.secrets] in minimal.toml.",
                 binary.display(),
                 log.display()
             )
@@ -17685,6 +17685,37 @@ async fn box_spec_entry_network_flags_match_start() {
             )
         );
     }
+}
+
+// BCLI-021, BCLI-078: `min box spec <entry>` previews a refused grant of
+// a task entry, and the refusal names the entry's own table, the one that
+// set the grant, not `[defaults.session.secrets]`.
+#[tokio::test]
+async fn box_spec_task_entry_refusal_names_the_task_secrets_table() {
+    let file = "[tasks.ci]\n\
+                echo = 'x'\n\
+                [tasks.ci.secrets.OLD]\n\
+                source = \"broker\"\n\
+                scopes = [\"claude\"]\n";
+    let (_project, global) = spec_project(file);
+    let error = box_spec_text(&global, &["min", "box", "spec", "ci"])
+        .await
+        .expect_err("the grant is refused");
+    let refused = error
+        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+        .expect("an activation refusal");
+    assert_eq!(refused.exit_code(), 3);
+    let text = refused.to_string();
+    assert!(
+        text.lines().any(|line| line
+            == "The secret OLD sets source = \"broker\" with the scope \"claude\". A grant \
+                with source = \"broker\" takes only github: scopes. For a secret you stored \
+                with `min secret set`, go to OLD in [tasks.ci.secrets] in minimal.toml. \
+                Write source = \"store\", store = \"keychain\" and id = \"<id>\" in place \
+                of source and scopes."),
+        "{text}"
+    );
+    assert!(!text.contains("[defaults.session."), "{text}");
 }
 
 // BCLI-021: `min box spec <entry>` selects the loadouts `min box start`

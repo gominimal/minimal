@@ -18800,7 +18800,7 @@ proof_bep_ahm_missing_proxy_refused() {
     fail
   fi
   mp_want="it declares the GitHub grant GH_TOKEN, and \`bep\`, the Box Egress Proxy, is not installed at $mp_bin, so no proxy serves boxes on this machine."
-  mp_next="To create the box without the grant, remove GH_TOKEN from [session.secrets] in minimal.toml."
+  mp_next="To create the box without the grant, remove GH_TOKEN from [defaults.session.secrets] in minimal.toml."
   if ! grep -qF -- "$mp_want" <<<"$mp_err" || ! grep -qF -- "$mp_next" <<<"$mp_err"; then
     echo "::error::the refusal of a grant box with no proxy does not name where bep is not installed and the next step"
     echo "  want: $mp_want $mp_next"
