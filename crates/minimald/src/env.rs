@@ -5142,31 +5142,67 @@ exit $rc
         )
         .unwrap();
         std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let Ok(out) = std::process::Command::new("bash")
-            .arg(rootfs.join("usr/bin/min"))
-            .args(["task", "run", "lint"])
-            .current_dir(rootfs)
-            .env_remove("TRACEPARENT")
-            .env("PWD", rootfs)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .output()
-        else {
+        let run = |stdin: std::process::Stdio| {
+            std::process::Command::new("bash")
+                .arg(rootfs.join("usr/bin/min"))
+                .args(["task", "run", "lint"])
+                .current_dir(rootfs)
+                .env_remove("TRACEPARENT")
+                .env("PWD", rootfs)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .stdin(stdin)
+                .output()
+        };
+        let check = |what: &str, out: std::process::Output| {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(125), "{what}: {stderr}");
+            assert!(stdout.contains("task output"), "{what}: {stdout}");
+            assert!(!stderr.contains("exiting on signal"), "{what}: {stderr}");
+            assert!(
+                !stderr.contains("the connection closed"),
+                "{what}: {stderr}"
+            );
+        };
+
+        // A stdin that is not a terminal: the helper forwards it to the task.
+        let Ok(out) = run(std::process::Stdio::null()) else {
             eprintln!("no bash to run the min helper with — skipping");
             return;
         };
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(125), "{stderr}");
-        assert!(stdout.contains("task output"), "{stdout}");
-        assert!(!stderr.contains("exiting on signal"), "{stderr}");
-        assert!(!stderr.contains("the connection closed"), "{stderr}");
+        check("forwarded stdin", out);
+
+        // A terminal on stdin: the helper keeps it and sends only the request.
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: valid out-pointers for both descriptors, and NULL for the
+        // optional name, termios and window size.
+        let ret = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: `openpty` succeeded, so both descriptors are open and ours.
+        let (_master, slave) = unsafe {
+            use std::os::fd::FromRawFd as _;
+            (
+                std::os::fd::OwnedFd::from_raw_fd(master),
+                std::os::fd::OwnedFd::from_raw_fd(slave),
+            )
+        };
+        check("terminal stdin", run(slave.into()).unwrap());
 
         // The same stream with no signal still prints the line.
         let Some((_, stderr, got, _)) = run_min_against(

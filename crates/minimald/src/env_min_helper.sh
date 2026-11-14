@@ -157,9 +157,15 @@ __min_rpc() {
         exec {sock_out}<&"${__MIN_SOCK[0]}" {sock_in}>&"${__MIN_SOCK[1]}" {stdin_fd}<&0
         eval "exec ${__MIN_SOCK[0]}<&- ${__MIN_SOCK[1]}>&-"
         printf '%s\n' "$request" >&"$sock_in"
-    else
+    elif [[ "$method" == "run" ]]; then
+        # A `run` reports its own broken stream below, so socat's warning
+        # about a signal that ended it is noise.
         exec {sock_out}< <(printf '%s\n' "$request" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock 2>/dev/null)
         sock_pid=$!
+    else
+        # Other methods print no line of their own when the connection
+        # fails, so socat's error stays on stderr.
+        exec {sock_out}< <(printf '%s\n' "$request" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
     fi
 
     while IFS= read -r line; do
