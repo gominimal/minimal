@@ -143,6 +143,34 @@ mod user_agent_tests {
     }
 }
 
+/// Walks `err`'s source chain for a TLS certificate-verification failure,
+/// which rustls surfaces as `"invalid peer certificate: <reason>"` (for
+/// example `UnknownIssuer`). Returns the matched message, with `host`
+/// appended when it is known, or `None` for every other error.
+///
+/// It matches by message rather than by downcasting to a `rustls` type so
+/// that `common` need not depend on `rustls` or track its version. The
+/// result is a human-readable diagnostic, not a value anything branches on
+/// for security, so a message heuristic is appropriate here.
+pub fn tls_cert_cause(
+    err: &(dyn std::error::Error + 'static),
+    host: Option<&str>,
+) -> Option<String> {
+    const MARKER: &str = "invalid peer certificate";
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        let msg = e.to_string();
+        if msg.contains(MARKER) {
+            return Some(match host {
+                Some(host) => format!("{msg} (from {host})"),
+                None => msg,
+            });
+        }
+        current = e.source();
+    }
+    None
+}
+
 /// The response to an RPC for some resource.
 pub trait FetchResponse: std::fmt::Debug + Sized {
     type Error: std::fmt::Debug;
@@ -161,6 +189,18 @@ pub trait FetchResponse: std::fmt::Debug + Sized {
     /// return `None` via the default impl. Used by writers to do
     /// compare-and-swap on subsequent writes.
     fn generation(&self) -> Option<i64> {
+        None
+    }
+
+    /// Classifies a backend error as a TLS certificate-verification failure,
+    /// returning `Some(cause)` with a human-readable cause (naming the host
+    /// when known) or `None` for every other error. Such a failure is
+    /// deterministic — it recurs identically until the trust path is fixed —
+    /// so callers treat it as non-transient and surface the cause rather than
+    /// retrying it or reporting it as a connectivity failure. The usual cause
+    /// is a TLS-inspecting proxy re-signing traffic with a CA the client does
+    /// not trust. Only backends that terminate TLS override the default.
+    fn tls_cert_error(_err: &Self::Error) -> Option<String> {
         None
     }
 }
@@ -187,6 +227,10 @@ impl FetchResponse for Response {
 
     fn chunk(&mut self) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> {
         Response::chunk(self)
+    }
+
+    fn tls_cert_error(err: &Self::Error) -> Option<String> {
+        tls_cert_cause(err, err.url().and_then(UpstreamReqwestUrl::host_str))
     }
 }
 
@@ -479,6 +523,13 @@ impl FetchResponse for AnyResponse {
             AnyResponse::Gcs(r) => FetchResponse::generation(r),
         }
     }
+
+    fn tls_cert_error(err: &Self::Error) -> Option<String> {
+        match err {
+            AnyRespError::Https(e) => <Response as FetchResponse>::tls_cert_error(e),
+            AnyRespError::Gcs(_) | AnyRespError::InvalidUrl(_) => None,
+        }
+    }
 }
 
 /// A request for either backend. Both variants are boxed so the enum stays
@@ -629,5 +680,55 @@ mod transport_error_tests {
         assert!(!FetchResponse::is_success(&resp));
         assert_eq!(FetchResponse::status_code(&resp), 0);
         assert!(FetchResponse::error_for_status(resp).is_err());
+    }
+
+    #[derive(Debug)]
+    struct StubError {
+        message: String,
+        source: Option<Box<StubError>>,
+    }
+
+    impl std::fmt::Display for StubError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for StubError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|s| s as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// The rustls certificate reason, surfaced several layers down an error's
+    /// source chain (as it is under a reqwest connect error), is found and
+    /// annotated with the host.
+    #[test]
+    fn tls_cert_cause_finds_marker_in_source_chain() {
+        let err = StubError {
+            message: "error sending request for url (https://cache.minimal.dev/index.shisha)"
+                .into(),
+            source: Some(Box::new(StubError {
+                message: "invalid peer certificate: UnknownIssuer".into(),
+                source: None,
+            })),
+        };
+
+        let cause = tls_cert_cause(&err, Some("cache.minimal.dev")).expect("a cert cause");
+        assert!(cause.contains("UnknownIssuer"), "{cause}");
+        assert!(cause.contains("cache.minimal.dev"), "{cause}");
+    }
+
+    /// A transport failure that is not a certificate problem is not matched,
+    /// so it keeps its normal (transient, retried) handling.
+    #[test]
+    fn tls_cert_cause_ignores_non_cert_errors() {
+        let err = StubError {
+            message: "connection reset by peer".into(),
+            source: None,
+        };
+        assert!(tls_cert_cause(&err, Some("cache.minimal.dev")).is_none());
     }
 }
