@@ -492,9 +492,7 @@ impl russh::server::Handler for ConnectionHandler {
                 .attach(conn_username, channel, config, attacher)
                 .await
             {
-                let _ = hnd
-                    .data(id, format!("Error attaching to session: {e}\r\n"))
-                    .await;
+                let _ = hnd.data(id, attach_refusal_line(&e)).await;
                 // A refusal with its own exit status (a refused resume,
                 // BOX-025) ends the client's attach with it, not 255.
                 if let Some(code) = e.exit_code() {
@@ -1033,8 +1031,22 @@ where
     }
 }
 
+/// The line a refused attach writes to the client's terminal (BCLI-068).
+fn attach_refusal_line(cause: &impl std::fmt::Display) -> String {
+    format!("Cannot attach to the box: {cause}\r\n")
+}
+
 #[cfg(test)]
 mod tests {
+    /// A refused attach names the box and its cause, not the session.
+    #[test]
+    fn attach_refusal_line_names_the_box() {
+        assert_eq!(
+            super::attach_refusal_line(&"the box is stopping"),
+            "Cannot attach to the box: the box is stopping\r\n"
+        );
+    }
+
     /// A direct-tcpip open from the native client carries the CLI's
     /// traceparent as its originator address; an OpenSSH client's address
     /// there is not a context, so the forward starts a fresh trace as before.
