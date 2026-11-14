@@ -636,6 +636,38 @@ pub struct BoxConfig {
     pub host_ip_registration: Option<String>,
 }
 
+/// The [`BoxConfig::attrs`] key that carries the client's projection
+/// digest of the spec it sends: the base64url SHA-256 of the spec's
+/// Gatehouse §6.3.2 projection (BOX-071). The daemon stores it in the
+/// box's record under the same key, beside its own digest under
+/// [`DAEMON_PROJECTION_DIGEST_ATTR`]. A client that predates the key
+/// sends none, and the record then holds the daemon's digest alone.
+pub const CLIENT_PROJECTION_DIGEST_ATTR: &str = "projection_digest.client";
+
+/// The record `attrs` key under which the daemon stores the digest it
+/// recomputed from the spec it received (BOX-071). Daemon-owned: a
+/// client that sends this key has it stripped at creation.
+pub const DAEMON_PROJECTION_DIGEST_ATTR: &str = "projection_digest.daemon";
+
+impl BoxConfig {
+    /// The projection digest the client computed for the spec it sends,
+    /// [`CLIENT_PROJECTION_DIGEST_ATTR`] (BOX-071). `None` when the client
+    /// sent none.
+    #[must_use]
+    pub fn client_projection_digest(&self) -> Option<&str> {
+        self.attrs
+            .get(CLIENT_PROJECTION_DIGEST_ATTR)
+            .map(String::as_str)
+    }
+
+    /// Sets the projection digest the client computed for the spec it
+    /// sends (BOX-071).
+    pub fn set_client_projection_digest(&mut self, digest: impl Into<String>) {
+        self.attrs
+            .insert(CLIENT_PROJECTION_DIGEST_ATTR.to_owned(), digest.into());
+    }
+}
+
 /// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
 /// A closed set: a value outside it does not deserialize.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

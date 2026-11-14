@@ -27,6 +27,8 @@ pub mod handle;
 pub mod http;
 pub mod inject;
 pub mod keys;
+#[cfg(target_os = "linux")]
+pub mod linux_store;
 pub mod listener;
 pub mod module;
 pub mod proxy;

@@ -176,18 +176,31 @@ fn main() -> ExitCode {
     {
         run(&keys::Keychain, &args)
     }
-    #[cfg(not(target_os = "macos"))]
+    // BEP-088, BEP-089: on Linux the keys live in the TPM or in Secret
+    // Service, for `bep`, `bep serve` and `bep --replace-key` alike.
+    #[cfg(target_os = "linux")]
     {
-        // OQ4: v1 binds the macOS Keychain alone.
+        match bep::linux_store::LinuxStore::at_home() {
+            Some(store) => run(&store, &args),
+            None => {
+                eprintln!(
+                    "bep did not start, because it did not find your home directory. bep keeps its key files there."
+                );
+                ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
         let _ = &args;
         eprintln!(
-            "bep runs only on macOS, because it keeps its keys in the macOS Keychain. Neither `bep` nor `bep --replace-key` can run on this host."
+            "bep runs only on macOS and Linux, because it keeps its keys in the macOS Keychain, a TPM or Secret Service. Neither `bep` nor `bep --replace-key` can run on this host."
         );
         ExitCode::FAILURE
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn run<S: KeyStore>(store: &S, args: &Args) -> ExitCode
 where
     S::Key: CaKey + Send + Sync + 'static,
@@ -4021,5 +4034,87 @@ mod tests {
             "the store keeps its keys"
         );
         assert!(!path.exists());
+    }
+
+    /// A fake `secret-tool` that keeps each item in a file under `dir`.
+    #[cfg(target_os = "linux")]
+    fn fake_secret_tool(dir: &Path) -> bep::secret_service::SecretService {
+        let script = dir.join("secret-tool");
+        let body = format!(
+            r#"dir='{dir}'
+cmd=$1; shift
+[ "$cmd" = store ] && shift
+name=$2
+case "$cmd" in
+  store) cat > "$dir/item.$name" ;;
+  lookup) [ -f "$dir/item.$name" ] || exit 1; cat "$dir/item.$name" ;;
+  search) [ -f "$dir/item.$name" ] && printf '[/org/freedesktop/secrets/collection/login/1]\nlabel = %s\n' "$name"; exit 0 ;;
+  clear) rm -f "$dir/item.$name" ;;
+  *) echo "unknown command $cmd" >&2; exit 2 ;;
+esac
+"#,
+            dir = dir.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        bep::secret_service::SecretService::with_program("/bin/sh", [script])
+    }
+
+    // BEP-088, BEP-089: on Linux, `bep` and `bep --replace-key` run on the
+    // Linux key store. With no TPM, the keys go to Secret Service.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_start_runs_on_the_linux_key_store() {
+        use bep::linux_store::LinuxStore;
+        use bep::tpm::TpmStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let items = tmp.path().join("secret-service");
+        std::fs::create_dir(&items).unwrap();
+        let path = tmp.path().join("identity.json");
+        let store = || {
+            LinuxStore::new(
+                TpmStore::new(tmp.path().join("tpm"), "device:/nonexistent/tpm"),
+                fake_secret_tool(&items),
+            )
+        };
+        let identity = path.to_str().unwrap();
+        let count_items = || {
+            std::fs::read_dir(&items)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("item.")
+                })
+                .count()
+        };
+
+        let args = Args::try_parse_from(["bep", "--identity", identity]).unwrap();
+        assert_eq!(run(&store(), &args), ExitCode::SUCCESS);
+        assert!(path.exists(), "the start publishes the identity");
+        assert_eq!(count_items(), 3, "one key in Secret Service for each role");
+        let kids = || {
+            let identity: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            Role::ALL.map(|role| identity[role.as_str()]["kid"].as_str().unwrap().to_owned())
+        };
+        let first = kids();
+
+        // The next start loads the same keys.
+        assert_eq!(run(&store(), &args), ExitCode::SUCCESS);
+        assert_eq!(kids(), first);
+        assert_eq!(count_items(), 3);
+
+        let replace =
+            Args::try_parse_from(["bep", "--identity", identity, "--replace-key", "sealing"])
+                .unwrap();
+        assert_eq!(run(&store(), &replace), ExitCode::SUCCESS);
+        let replaced = kids();
+        assert_ne!(replaced[0], first[0]);
+        assert_eq!(replaced[1..], first[1..]);
+        assert_eq!(count_items(), 3);
     }
 }
