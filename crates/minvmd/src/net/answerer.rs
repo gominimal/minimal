@@ -1000,6 +1000,9 @@ struct RegisteredTables {
     /// the group's trust, and spec 18 says so. Locked after `rows`, never
     /// before.
     released_names: Mutex<BTreeMap<String, (u32, Instant)>>,
+    /// The most names one user's nodes may hold, on the shared service
+    /// ([`PER_USER_NAMES`]); `None` caps nothing.
+    per_user_names: Option<usize>,
 }
 
 /// What one publish left in the tables: the rows the connection now holds,
@@ -1019,9 +1022,13 @@ impl RegisteredTables {
 
     /// The shared service's tables: one user's nodes may hold at most
     /// [`PER_USER_ADDRESSES`] of the box range, so no member takes the
-    /// range from the others.
+    /// range from the others, and at most [`PER_USER_NAMES`] names, so no
+    /// member fills the zone.
     fn shared() -> Self {
-        let tables = Self::default();
+        let tables = Self {
+            per_user_names: Some(PER_USER_NAMES),
+            ..Self::default()
+        };
         tables.book().per_user_cap = Some(PER_USER_ADDRESSES);
         tables
     }
@@ -1082,6 +1089,22 @@ impl RegisteredTables {
         // first's holder record, so its release would free an address the
         // first box still answers at.
         let mut claimed: Vec<(Ipv4Addr, String)> = Vec::new();
+        // The names this user's other connections hold: with the names this
+        // publish has been granted so far, what the per-user cap counts. A
+        // re-publish replaces this connection's own table, so that is not
+        // in it.
+        let names_elsewhere = match (self.per_user_names, uid) {
+            (Some(_), Some(uid)) => held
+                .iter()
+                .filter(|(other, held)| {
+                    **other != connection
+                        && node_uid(&held.node).is_some_and(|(_, held_by)| held_by == uid)
+                })
+                .map(|(_, held)| held.rows.iter().filter(|row| !row.address_only).count())
+                .sum::<usize>(),
+            _ => 0,
+        };
+        let mut names_granted = 0_usize;
         for row in rows {
             let name = canonical(&row.name);
             // An address-only row holds no name, so the name rules below
@@ -1099,6 +1122,23 @@ impl RegisteredTables {
                     reason: "not a name in the zone's form: one root dot at most, and no \
                              empty label"
                         .to_string(),
+                });
+                continue;
+            }
+            // Then the user's share of names, before any rule that reads
+            // the held rows: a publish far past the cap costs one refusal
+            // a row, not a scan of the zone a row.
+            if !row.address_only
+                && let (Some(cap), Some(uid)) = (self.per_user_names, uid)
+                && names_elsewhere.saturating_add(names_granted) >= cap
+            {
+                refused.push(RefusedRow {
+                    name: row.name,
+                    reason: format!(
+                        "the nodes of uid {uid} hold {cap} names, the most one user may on \
+                         the host's shared answerer service; a name of theirs must go \
+                         before another is held"
+                    ),
                 });
                 continue;
             }
@@ -1184,7 +1224,12 @@ impl RegisteredTables {
                     }
                 };
                 match claimed {
-                    Ok(()) => accepted.push(row),
+                    Ok(()) => {
+                        if !row.address_only {
+                            names_granted = names_granted.saturating_add(1);
+                        }
+                        accepted.push(row);
+                    }
                     Err(reason) => refused.push(RefusedRow {
                         name: row.name,
                         reason,
@@ -1231,6 +1276,9 @@ impl RegisteredTables {
                     continue;
                 }
                 claimed.push((address, name));
+            }
+            if !row.address_only {
+                names_granted = names_granted.saturating_add(1);
             }
             accepted.push(row);
         }
@@ -2273,6 +2321,15 @@ pub(crate) const PER_USER_CONNECTIONS: usize = 32;
 /// member's runaway daemon) take the whole range from the others. A
 /// single-operator answerer caps nothing: the range is its one user's.
 pub(crate) const PER_USER_ADDRESSES: usize = 64;
+
+/// The most names one user's nodes may hold on the shared service, over
+/// all their connections: four for each address of their share. A name
+/// needs no address of the box range (a row may answer at the host
+/// loopback), so without a cap of its own one member could hold names by
+/// the tens of thousands, each a name no other member can then use, and
+/// every publish compares its rows with every held one under the lock the
+/// lookups take. A single-operator answerer caps nothing.
+pub(crate) const PER_USER_NAMES: usize = 4 * PER_USER_ADDRESSES;
 
 /// The command that adds `user` to `group` on this platform: the line a
 /// refusal ends with, so it reads the same at the channel and in the
@@ -5218,6 +5275,54 @@ mod tests {
             "past the quarantine the name is anyone's: {:?}",
             bobs.refused
         );
+    }
+
+    /// The shared service's share of names per user: counted over all the
+    /// user's connections, a name past it is refused naming the cap, a
+    /// re-publish of the same table still holds, another user is
+    /// unaffected, and the single-operator tables cap nothing.
+    #[test]
+    fn a_users_names_are_capped_on_the_shared_service() {
+        fn names(prefix: &str, count: usize) -> Vec<RegisteredRow> {
+            (0..count)
+                .map(|i| RegisteredRow {
+                    name: format!("{prefix}{i}.{}", zone_answer::ZONE_APEX),
+                    address: Some(Ipv4Addr::LOCALHOST),
+                    live: true,
+                    address_only: false,
+                    node_address: false,
+                })
+                .collect()
+        }
+        let tables = RegisteredTables::shared();
+        let alice = qualified_node("vm-a", 501);
+        let alice_too = qualified_node("vm-a2", 501);
+        let bob = qualified_node("vm-b", 502);
+        let half = PER_USER_NAMES / 2;
+        let first = tables.install_validated(1, &alice, names("a", half), &[]);
+        assert!(first.refused.is_empty(), "{:?}", first.refused);
+        // A second connection of the same user: the share is the user's.
+        let second = tables.install_validated(2, &alice_too, names("b", half + 3), &[]);
+        assert_eq!(second.held.len(), half);
+        assert_eq!(second.refused.len(), 3);
+        assert!(
+            second.refused.iter().all(|row| row
+                .reason
+                .contains(&format!("uid 501 hold {PER_USER_NAMES} names"))),
+            "{:?}",
+            second.refused
+        );
+        // The same table again replaces itself: nothing new is refused.
+        let again = tables.install_validated(1, &alice, names("a", half), &[]);
+        assert!(again.refused.is_empty(), "{:?}", again.refused);
+        let theirs = tables.install_validated(3, &bob, names("c", 2), &[]);
+        assert!(
+            theirs.refused.is_empty(),
+            "another user's share is their own"
+        );
+        let single = RegisteredTables::new();
+        let all = single.install_validated(1, &alice, names("a", PER_USER_NAMES + 1), &[]);
+        assert!(all.refused.is_empty(), "one operator is not capped");
     }
 
     /// The shared service's share of the range per user: a fresh address
