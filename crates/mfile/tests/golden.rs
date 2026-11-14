@@ -88,15 +88,18 @@ fn file_vectors(name: &str, out: &mut Vec<(String, Json)>) {
 /// The definition of each built-in type: its root, its defaults and its
 /// constraints, as canonical TOML.
 fn builtin_vectors(out: &mut Vec<(String, Json)>) {
+    // A file without `[box_types]` has only the built-in types, so its
+    // root lookup is the one every entry of such a file goes through.
+    let types = BoxTypes::default();
     for name in BUILTIN_BOX_TYPES {
+        let root = types
+            .root(name)
+            .unwrap_or_else(|| panic!("the built-in type {name} has a root"));
         let toml_of = |t: toml::Table| toml::to_string(&t).expect("the table serialises");
         out.push((
             format!("builtin/{name}"),
             Json::Object(BTreeMap::from([
-                (
-                    "root".to_owned(),
-                    Json::Str(mfile::box_types::builtin(name).unwrap_or("").to_owned()),
-                ),
+                ("root".to_owned(), Json::Str(root.to_owned())),
                 (
                     "defaults".to_owned(),
                     Json::Str(toml_of(builtin_defaults(name))),
