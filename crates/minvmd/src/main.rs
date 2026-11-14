@@ -94,6 +94,9 @@ enum ConfigAction {
         /// Guest RAM in MiB.
         #[arg(long)]
         ram_mib: Option<u32>,
+        /// Most connections one box can hold open to the Box Egress Proxy at once.
+        #[arg(long)]
+        bep_per_box_cap: Option<u32>,
     },
 }
 
@@ -183,9 +186,11 @@ fn dispatch(command: Command, root: tracing::Span) -> Result<i32> {
         Command::Status { json, row } => Ok(minvmd::cmd::status::run(json, row)?.code()),
         Command::Config { action } => match action {
             ConfigAction::Show { json } => minvmd::cmd::config::run_show(json).map(|()| 0),
-            ConfigAction::Set { vcpus, ram_mib } => {
-                minvmd::cmd::config::run_set(vcpus, ram_mib).map(|()| 0)
-            }
+            ConfigAction::Set {
+                vcpus,
+                ram_mib,
+                bep_per_box_cap,
+            } => minvmd::cmd::config::run_set(vcpus, ram_mib, bep_per_box_cap).map(|()| 0),
         },
         Command::Stop => {
             // No stop line here (NET-055): the one-per-stop line belongs to

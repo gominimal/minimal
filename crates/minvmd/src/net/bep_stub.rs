@@ -673,6 +673,7 @@ mod tests {
             .expect("the supervisor hands the start facts over the channel");
 
         let wire = BepWire::new(proxy_sock, token);
+        let cap = wire.per_source_cap();
         assert_eq!(
             wire.per_source_cap(),
             DEFAULT_PER_SOURCE_CAP,
@@ -716,7 +717,7 @@ mod tests {
         drive(&mut lane, 2).await;
         assert_eq!(
             lane.pool_len(),
-            2 * DEFAULT_PER_SOURCE_CAP,
+            2 * cap,
             "the two boxes' rows hold one share each; the node's adds none"
         );
 
@@ -796,7 +797,7 @@ mod tests {
         );
         assert_eq!(
             lane.pool_len(),
-            2 * DEFAULT_PER_SOURCE_CAP,
+            2 * cap,
             "the refused connection took no share away from the boxes"
         );
     }
@@ -869,6 +870,7 @@ mod tests {
             .expect("the supervisor hands the start facts over the channel");
 
         let wire = BepWire::new(proxy_sock, token);
+        let cap = wire.per_source_cap();
         let boxes = Arc::new(crate::box_registry::RegisteredBoxes::new(
             registry.table(),
             attachments.clone(),
@@ -877,7 +879,7 @@ mod tests {
         drive(&mut lane, 2).await;
         assert_eq!(
             lane.pool_len(),
-            DEFAULT_PER_SOURCE_CAP,
+            cap,
             "the cohort row holds a share like a box's; the node's adds none"
         );
         assert_eq!(
@@ -979,6 +981,7 @@ mod tests {
             .expect("the supervisor hands the start facts over the channel");
 
         let wire = BepWire::new(proxy_sock, token);
+        let cap = wire.per_source_cap();
         let boxes = Arc::new(crate::box_registry::RegisteredBoxes::new(
             registry.table(),
             attachments.clone(),
@@ -1033,7 +1036,7 @@ mod tests {
         drive(&mut lane, 2).await;
         assert_eq!(
             lane.pool_len(),
-            DEFAULT_PER_SOURCE_CAP,
+            cap,
             "the box's share arrives after its attachment, by its row"
         );
 

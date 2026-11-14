@@ -202,10 +202,11 @@ pub const DELIVERY_HEADER_LEN: usize = 1 + 16 + 4 + 2 + 4 + 2;
 
 /// The per-source connection cap: the share each registered box's row holds
 /// in the listener pool, and the number of connections a box may hold at
-/// once before the pool aborts the next. A proposed working value (16), the
-/// one the spec records with the pool partition, tuned by the integration
-/// run.
-pub const DEFAULT_PER_SOURCE_CAP: usize = 16;
+/// once before the pool aborts the next. The tuned value (128), the one the
+/// spec records with the pool partition: one Pulumi preview opens dozens of
+/// parallel CONNECTs and must not hit it, where the earlier working value
+/// (16) reset them. `minvmd` can override it per Box Host from its config.
+pub const DEFAULT_PER_SOURCE_CAP: usize = 128;
 
 /// The receive and transmit buffer length of every pool socket. The receive
 /// buffer is the TCP window the box sees — the brake the flow runs under
@@ -846,7 +847,8 @@ impl BepWire {
     }
 
     /// The wiring with each box's share at `cap` instead of the default —
-    /// the tests drive small caps, the supervisor names the recorded default.
+    /// the tests drive small caps, the supervisor names the effective cap
+    /// its config resolves (the recorded default when nothing sets one).
     #[must_use]
     pub fn with_per_source_cap(mut self, cap: usize) -> Self {
         self.per_source_cap = cap;
