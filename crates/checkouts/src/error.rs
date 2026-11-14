@@ -26,6 +26,27 @@ pub enum Error {
     #[error("invalid path")]
     InvalidPath,
 
+    /// A repository URL or ref that starts with `-`. Git would read it as
+    /// an option.
+    #[error(
+        "The {what} {value:?} starts with \"-\". Git reads it as an option. \
+         Change the {what} in minimal.toml or in --upstream."
+    )]
+    OptionLike {
+        /// `"repository URL"` or `"ref"`.
+        what: &'static str,
+        /// The refused value; a URL without its userinfo, query or fragment,
+        /// as `scrubbed_remote` gives it.
+        value: String,
+    },
+
+    /// An empty repository URL or ref.
+    #[error("The {what} is empty. Set the {what} in minimal.toml or in --upstream.")]
+    EmptyValue {
+        /// `"repository URL"` or `"ref"`.
+        what: &'static str,
+    },
+
     /// A generic error with a custom message.
     #[error("other: {0}")]
     Other(String),
