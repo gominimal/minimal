@@ -1857,13 +1857,22 @@ impl BoxChannel {
     /// The name is passed through to the shell helper verbatim, where bash
     /// evaluates a `declare`d name for array subscripts — a crafted one runs
     /// commands in the user's live shell. Invalid names are refused here
-    /// rather than recorded or sent.
+    /// rather than recorded or sent. A value opening with `(` is refused
+    /// too: the helpers refuse it, so recording it would leave the daemon
+    /// holding a variable the shell never exported.
     fn announce_env(&self, stream: &mut UnixStream, key: &str, value: &str) {
         if !graph::is_valid_env_var_name(key) {
             let _ = writeln!(
                 stream,
                 "msg:min: refusing to export environment variable with an invalid name: {}",
                 one_line(key)
+            );
+            return;
+        }
+        if value.starts_with('(') {
+            let _ = writeln!(
+                stream,
+                "msg:min: refusing to export {key}: a value starting with ( would be read as an array"
             );
             return;
         }
@@ -4565,6 +4574,8 @@ mod tests {
     /// variable. The helper must write and export the global whatever the
     /// name. And since `declare` reads a value opening with `(` as an array
     /// list when the global is an array, such a value is refused, not run.
+    /// The protocol reader's own `line` is one such local: were it the
+    /// global, the next read would overwrite a `set_env:line:` assignment.
     /// The mctx helper has the same test.
     #[cfg(unix)]
     #[test]
@@ -4587,7 +4598,7 @@ mod tests {
         std::fs::write(
             &socat,
             format!(
-                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'done:\\n'\n",
+                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'set_env:line:/state/line\\n'\nprintf 'done:\\n'\n",
                 marker.display()
             ),
         )
@@ -4603,11 +4614,12 @@ mod tests {
             .arg("-c")
             .arg(format!(
                 "LIST=(one); . '{}'; __min_rpc status; rc=$?; \
-                 echo \"global=$varname exported=$(printenv varname) list=$LIST\"; exit $rc",
+                 echo \"global=$varname exported=$(printenv varname) list=$LIST line=$line exported_line=$(printenv line)\"; exit $rc",
                 helper.display()
             ))
             .env("PATH", &path)
             .env_remove("varname")
+            .env_remove("line")
             .output();
         let Ok(out) = out else {
             eprintln!("no bash to run the min helper with — skipping");
@@ -4623,6 +4635,10 @@ mod tests {
         assert!(
             stdout.contains("list=one"),
             "a refused value must leave the global as it was, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("line=/state/line exported_line=/state/line"),
+            "the reader's own `line` must not take or overwrite the shell's, got: {stdout}"
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -7205,6 +7221,30 @@ exit $rc
             "a refused name must not start a line of its own"
         );
         assert!(chan.runtime_env.snapshot().is_empty());
+    }
+
+    /// The helpers refuse a value opening with `(`, so the daemon must
+    /// refuse it too: a recorded value the shell never exported would reach
+    /// later injections and disagree with the session's own shell.
+    #[tokio::test]
+    async fn a_value_the_helpers_refuse_is_not_recorded() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "LIST", "(one two)");
+        drop(ours);
+
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "msg:min: refusing to export LIST: a value starting with ( would be read as an array"
+            ],
+            "a refused value must be explained and nothing else sent"
+        );
+        assert!(
+            chan.runtime_env.snapshot().is_empty(),
+            "a value the shell refuses must not reach the daemon's environment"
+        );
     }
 
     #[tokio::test]

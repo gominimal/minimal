@@ -122,6 +122,8 @@ impl SetupForPackages {
                     // let a value forge protocol lines. The nickel contract
                     // already rejects these shapes; this re-check keeps the
                     // helpers safe from any writer that bypasses it.
+                    // Both values are escaped in the errors, which reach the
+                    // helper as a single `error:` line.
                     if !is_valid_env_var_name(&env_var) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -129,7 +131,8 @@ impl SetupForPackages {
                                 "package `{}` declares `env_state_wiring` with env_var `{}` \
                                  which is not a valid environment variable name (letters, \
                                  digits and underscore, not starting with a digit)",
-                                b.name, env_var,
+                                b.name,
+                                env_var.escape_debug(),
                             ),
                         ));
                     }
@@ -140,7 +143,8 @@ impl SetupForPackages {
                                 "package `{}` declares `env_state_wiring` with prefix `{}` \
                                  which is not one plain path component (not `.` or `..`, no \
                                  '/', ':' or control character)",
-                                b.name, prefix,
+                                b.name,
+                                prefix.escape_debug(),
                             ),
                         ));
                     }
@@ -457,12 +461,33 @@ mod tests {
             "the error must name the package, got {err}"
         );
 
+        // The errors quote the refused value. A newline in it would end
+        // the `error:` line the helper reads, so it is escaped.
+        for (env_var, prefix) in [("A\nB", "gocache"), ("GOCACHE", "a\nb")] {
+            let mut g = Graph::new();
+            let evil = g.insert_build(BuildSpec {
+                name: "evil".into(),
+                attrs: IndexMap::from_iter([(
+                    "env_state_wiring".to_string(),
+                    wiring(env_var, prefix),
+                )]),
+                ..Default::default()
+            });
+            let err = SetupForPackages::build(&g, [&evil])
+                .expect_err("a value with a newline must fail the whole setup");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains('\n') && msg.contains("\\n"),
+                "the refused value must be escaped onto one line, got {msg:?}"
+            );
+        }
+
         // the rule itself, at its edges
         for ok in ["gocache", "go-mod_cache.v2", "..."] {
             assert!(is_valid_state_prefix(ok), "{ok}");
         }
         for bad in [
-            "", ".", "..", "a/b", "a:b", "a\nb", "a\rb", "a\tb", "a\u{7f}b",
+            "", ".", "..", "a/b", "a:b", "a\nb", "a\rb", "a\tb", "a\u{7f}b", "a\u{85}b", "a\u{9f}b",
         ] {
             assert!(!is_valid_state_prefix(bad), "{bad:?}");
         }

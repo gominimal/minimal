@@ -8,6 +8,9 @@ __min_rpc() {
     local error="false"
     local env_pairs=()
 
+    # Local, so a `set_env:line:...` writes the shell's `line` and the next
+    # read does not overwrite it.
+    local line
     while IFS= read -r line; do
         local tag="${line%%:*}"
         local rest="${line#*:}"

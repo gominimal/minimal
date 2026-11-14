@@ -20,13 +20,15 @@ in
 # A prefix is one plain path component under /state: it names a directory,
 # never a path (`/`, `.`, `..`), and must carry none of the characters that
 # would let it forge daemon-to-helper framing (`:`, any control character).
-# The daemon applies the same rule again (graph::is_valid_state_prefix).
+# A control character is any of Unicode category Cc (C0, DEL and C1), as
+# Rust's char::is_control has it: the daemon applies the same rule again
+# (graph::is_valid_state_prefix), and `[:cntrl:]` here would be ASCII only.
 let state_prefix = std.contract.custom (fun _ value =>
     if !(std.typeof value == 'String) then
         'Error { message = "env_state_wiring's prefix must be a string" }
     else if value == "." || value == ".." then
         'Error { message = "env_state_wiring's prefix must name a directory under /state, not `.` or `..`" }
-    else if !(std.string.is_match m%"^[^/:[:cntrl:]]+$"% value) then
+    else if !(std.string.is_match m%"^[^/:\p{Cc}]+$"% value) then
         'Error { message = "env_state_wiring's prefix must be one plain path component: non-empty, and containing no '/', ':' or control character" }
     else
         'Ok value

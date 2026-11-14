@@ -160,6 +160,9 @@ __min_rpc() {
         exec {sock_out}< <(printf '%s\n' "$request" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
     fi
 
+    # Local, so a `set_env:line:...` writes the shell's `line` and the next
+    # read does not overwrite it.
+    local line
     while IFS= read -r line; do
         local tag="${line%%:*}"
         local rest="${line#*:}"

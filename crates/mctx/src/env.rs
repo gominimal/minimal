@@ -2584,6 +2584,8 @@ mod tests {
     /// variable. The helper must write and export the global whatever the
     /// name. And since `declare` reads a value opening with `(` as an array
     /// list when the global is an array, such a value is refused, not run.
+    /// The protocol reader's own `line` is one such local: were it the
+    /// global, the next read would overwrite a `set_env:line:` assignment.
     /// The minimald helper has the same test.
     #[cfg(unix)]
     #[test]
@@ -2606,7 +2608,7 @@ mod tests {
         std::fs::write(
             &socat,
             format!(
-                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'done:\\n'\n",
+                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'set_env:line:/state/line\\n'\nprintf 'done:\\n'\n",
                 marker.display()
             ),
         )
@@ -2622,11 +2624,12 @@ mod tests {
             .arg("-c")
             .arg(format!(
                 "LIST=(one); . '{}'; __min_rpc status; rc=$?; \
-                 echo \"global=$varname exported=$(printenv varname) list=$LIST\"; exit $rc",
+                 echo \"global=$varname exported=$(printenv varname) list=$LIST line=$line exported_line=$(printenv line)\"; exit $rc",
                 helper.display()
             ))
             .env("PATH", &path)
             .env_remove("varname")
+            .env_remove("line")
             .output();
         let Ok(out) = out else {
             eprintln!("no bash to run the min helper with — skipping");
@@ -2642,6 +2645,10 @@ mod tests {
         assert!(
             stdout.contains("list=one"),
             "a refused value must leave the global as it was, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("line=/state/line exported_line=/state/line"),
+            "the reader's own `line` must not take or overwrite the shell's, got: {stdout}"
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(

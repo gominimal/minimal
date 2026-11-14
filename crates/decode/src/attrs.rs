@@ -497,6 +497,12 @@ mod tests {
         assert!(!wiring(
             "{ env_var = \"GOCACHE\", prefix = \"cache\tartifacts\" }"
         ));
+        // A C1 control character too, as the graph's re-check has it; other
+        // non-ASCII characters are fine.
+        assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"cache\u{85}artifacts\" }"
+        ));
+        assert!(wiring("{ env_var = \"GOCACHE\", prefix = \"cach\u{e9}\" }"));
         assert!(!wiring("{ env_var = \"GOCACHE\", prefix = \"..\" }"));
         assert!(!wiring("{ env_var = \"GOCACHE\", prefix = \".\" }"));
         // Missing fields, an extra field, or a non-record entry.
