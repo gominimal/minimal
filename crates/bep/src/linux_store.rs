@@ -145,6 +145,7 @@ impl<T: KeyStore, S: KeyStore> LinuxStore<T, S> {
 
     /// Whether either store holds a key for `role` in `slot`. A Secret
     /// Service that does not answer holds none here, and is marked unread.
+    /// A start reads that mark through [`KeyStore::reach`].
     fn held_anywhere(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
         if self.tpm.holds_in(role, slot)? {
             return Ok(true);
@@ -152,6 +153,21 @@ impl<T: KeyStore, S: KeyStore> LinuxStore<T, S> {
         Ok(self
             .secret_service_answer(role, self.secret_service.holds_in(role, slot))
             .unwrap_or(false))
+    }
+
+    /// Whether Secret Service holds a key for `role` in `slot`, for a
+    /// change to the stores. A locked keyring can hold the key, so its
+    /// error stops the change. A Secret Service that this session cannot
+    /// reach holds none here, as on a headless host (BEP-088).
+    fn secret_service_holds(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+        match self.secret_service.holds_in(role, slot) {
+            Err(err @ KeyError::Locked { .. }) => {
+                tracing::warn!(role = %role, store = SECRET_SERVICE, error = %err, "Secret Service did not answer a proxy key lookup");
+                self.mark_unread(UnreadStore::SecretServiceLocked);
+                Err(err)
+            }
+            answer => Ok(self.secret_service_answer(role, answer).unwrap_or(false)),
+        }
     }
 }
 
@@ -189,7 +205,7 @@ impl<T: KeyStore, S: KeyStore> KeyStore for LinuxStore<T, S> {
 
     fn generate_in(&self, role: Role, slot: Slot) -> Result<Self::Key, KeyError> {
         // BEP-089: a key another store holds is never made again elsewhere.
-        if self.held_anywhere(role, slot)? {
+        if self.tpm.holds_in(role, slot)? || self.secret_service_holds(role, slot)? {
             return Err(KeyError::Store {
                 role,
                 detail: "a key store already holds this key".into(),
@@ -224,10 +240,7 @@ impl<T: KeyStore, S: KeyStore> KeyStore for LinuxStore<T, S> {
 
     fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
         self.tpm.remove_in(role, slot)?;
-        if self
-            .secret_service_answer(role, self.secret_service.holds_in(role, slot))
-            .unwrap_or(false)
-        {
+        if self.secret_service_holds(role, slot)? {
             self.secret_service.remove_in(role, slot)?;
         }
         Ok(())
@@ -251,10 +264,7 @@ impl<T: KeyStore, S: KeyStore> KeyStore for LinuxStore<T, S> {
         if self.tpm.holds_in(role, from)? {
             return self.tpm.relabel(role, from, to);
         }
-        if self
-            .secret_service_answer(role, self.secret_service.holds_in(role, from))
-            .unwrap_or(false)
-        {
+        if self.secret_service_holds(role, from)? {
             return self.secret_service.relabel(role, from, to);
         }
         if from == Slot::Held {
@@ -402,19 +412,33 @@ mod tests {
     // BEP-088
     #[test]
     fn no_tpm_and_no_secret_service_refuses_start() {
-        for state in [LOCKED, UNREACHABLE] {
-            let store = store();
-            store.tpm.fail_generation();
-            store.secret_service.set(state);
-            let err = load(&store, &[]).expect_err("nowhere to keep a key");
-            assert_eq!(err, StartError::NoStore(Role::Sealing));
-            assert_eq!(
-                err.to_string(),
-                "The proxy did not start: this host has no usable TPM and no unlocked Secret Service keyring, so the proxy has nowhere to keep its keys."
-            );
-            assert!(!err.to_string().contains("only on macOS"));
-            assert_eq!(store.tpm.generated(), 0);
-        }
+        let store = store();
+        store.tpm.fail_generation();
+        store.secret_service.set(UNREACHABLE);
+        let err = load(&store, &[]).expect_err("nowhere to keep a key");
+        assert_eq!(err, StartError::NoStore(Role::Sealing));
+        assert_eq!(
+            err.to_string(),
+            "The proxy did not start: this host has no usable TPM and no unlocked Secret Service keyring, so the proxy has nowhere to keep its keys."
+        );
+        assert!(!err.to_string().contains("only on macOS"));
+        assert_eq!(store.tpm.generated(), 0);
+
+        // A locked keyring can hold the keys, so the start makes none and
+        // says which store it cannot read.
+        let locked = self::store();
+        locked.tpm.fail_generation();
+        locked.secret_service.set(LOCKED);
+        let err = load(&locked, &[]).expect_err("a locked keyring");
+        assert_eq!(
+            err,
+            StartError::Kept {
+                missing: Role::ALL.to_vec(),
+                store: UnreadStore::SecretServiceLocked,
+            }
+        );
+        assert!(!err.to_string().contains("--replace-key"));
+        assert_eq!(locked.tpm.generated(), 0);
     }
 
     // BEP-089
@@ -448,6 +472,30 @@ mod tests {
             next.secret_service.set(ANSWERS);
             store = next;
         }
+
+        // With no identity file, a locked keyring that holds every key
+        // looks like a first start. The TPM makes no key to hide them.
+        store.secret_service.set(LOCKED);
+        let next = restart(store);
+        let err = load(&next, &[]).expect_err("keys it cannot read");
+        assert!(matches!(err, StartError::Kept { .. }), "{err:?}");
+        assert!(!err.to_string().contains("--replace-key"));
+        assert_eq!(next.tpm.generated(), 0);
+        // A change to the stores does not read a locked keyring as empty.
+        let err = next
+            .generate_in(Role::Sealing, Slot::New)
+            .expect_err("locked");
+        assert!(matches!(err, KeyError::Locked { .. }), "{err:?}");
+        assert!(next.remove_in(Role::Sealing, Slot::Held).is_err());
+        assert!(next.relabel(Role::Sealing, Slot::Held, Slot::Old).is_err());
+        assert_eq!(next.tpm.generated(), 0);
+        next.secret_service.set(ANSWERS);
+        assert!(
+            next.secret_service
+                .inner
+                .holds_in(Role::Sealing, Slot::Held)
+                .unwrap()
+        );
 
         // Keys made in the TPM stay there when the TPM stops making keys.
         let tpm = self::store();

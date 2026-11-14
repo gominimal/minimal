@@ -204,6 +204,17 @@ pub enum UnreadStore {
     TpmUnreachable,
 }
 
+impl UnreadStore {
+    /// Whether the store can hold a proxy key that the proxy did not see. A
+    /// locked keyring and a TPM store that did not answer can. A Secret
+    /// Service that this session cannot reach is the headless host that
+    /// BEP-088 starts on its TPM, so a first start does not wait for it.
+    #[must_use]
+    pub fn can_hide_a_key(self) -> bool {
+        !matches!(self, Self::SecretServiceUnreachable)
+    }
+}
+
 impl fmt::Display for UnreadStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -888,6 +899,23 @@ pub fn load_with<S: KeyStore>(
     }
     if !refused.is_empty() || !missing.is_empty() {
         return Err(StartError::Unusable { refused, missing });
+    }
+    // BEP-089: a store that did not answer can hold the keys that look
+    // missing. A key made now in another store would hide each of them.
+    let to_make: Vec<Role> = found
+        .iter()
+        .filter(|(_, key)| key.is_none())
+        .map(|(role, _)| *role)
+        .collect();
+    if !to_make.is_empty()
+        && let StoreReach::Unread(unread) = store.reach()
+        && unread.can_hide_a_key()
+    {
+        tracing::error!(roles = ?to_make, store = %unread, "did not make proxy keys while a key store that can hold them did not answer");
+        return Err(StartError::Kept {
+            missing: to_make,
+            store: unread,
+        });
     }
     // Generate only after every role is known to be usable, so a start that
     // refuses leaves the store as it was.
