@@ -12521,6 +12521,508 @@ async fn events_parent_merges_children() {
     );
 }
 
+// Issue 3024: `min box events --parent <box> --follow` adds the stream of
+// a box that becomes a child of the parent after the follow starts.
+#[tokio::test]
+async fn events_parent_follow_picks_up_new_children() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let parent =
+        minimald::test_harness::create_configured_session(&mut daemon, "lead", project).await;
+    let first =
+        minimald::test_harness::create_configured_session(&mut daemon, "one", project).await;
+    let mut stopped = Vec::new();
+    stop_box_on_hosts(local_hosts(&global).unwrap(), &mut stopped, "one", false)
+        .await
+        .expect("the first child stops");
+    set_record_parent(&state_path, first, parent);
+
+    let shared = SharedOut::default();
+    let args = events_args(None, Some("lead"), true);
+    let follow = async {
+        let (mut out, mut err) = (shared.clone(), Vec::new());
+        box_events_on_hosts(local_hosts(&global).unwrap(), &args, &mut out, &mut err).await
+    };
+    let drive = async {
+        let before = shared.more_than(0).await;
+        assert!(
+            before.iter().all(|line| line["box"] == first.to_string()),
+            "only the first child is followed yet: {before:?}"
+        );
+        let second =
+            minimald::test_harness::create_configured_session(&mut daemon, "two", project).await;
+        let mut stopped = Vec::new();
+        stop_box_on_hosts(local_hosts(&global).unwrap(), &mut stopped, "two", false)
+            .await
+            .expect("the second child stops");
+        set_record_parent(&state_path, second, parent);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let lines = shared.lines();
+            let types: Vec<&str> = lines
+                .iter()
+                .filter(|line| line["box"] == second.to_string())
+                .filter_map(|line| line["type"].as_str())
+                .collect();
+            if types.len() > 1 {
+                assert_eq!(types.first(), Some(&"created"), "{lines:?}");
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the new child's events never joined the follow: {lines:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::select! {
+            followed = follow => panic!("the follow ended while the parent exists: {followed:?}"),
+            () = drive => {}
+        }
+    })
+    .await
+    .expect("the new child's events arrive in time");
+}
+
+/// One scripted open of a child's read on a [`FakeChildHost`].
+enum FakeOpen {
+    /// The open fails.
+    Fails,
+    /// The open succeeds, and the daemon refuses the read before its first
+    /// event, as it does for a box removed after the listing.
+    RefusedFirst,
+    /// The open succeeds, and the read gives one event of the box.
+    Event,
+}
+
+/// The host state behind a [`FakeChildHost`].
+#[derive(Default)]
+struct FakeChildHostState {
+    listing: Vec<minimald_rpc::BoxListingEntry>,
+    /// The listing fails while this is set.
+    list_fails: bool,
+    /// The listing never answers while this is set.
+    list_hangs: bool,
+    /// What each next open of a box does. With none left, it gives one
+    /// event.
+    opens: std::collections::HashMap<boxes::BoxId, std::collections::VecDeque<FakeOpen>>,
+    /// How many times each box's read was opened.
+    opened: std::collections::HashMap<boxes::BoxId, u32>,
+}
+
+/// A stand-in for the parent's host under `--parent --follow`.
+#[derive(Clone, Default)]
+struct FakeChildHost(std::sync::Arc<std::sync::Mutex<FakeChildHostState>>);
+
+impl FakeChildHost {
+    fn with<T>(&self, f: impl FnOnce(&mut FakeChildHostState) -> T) -> T {
+        f(&mut self.0.lock().unwrap())
+    }
+
+    fn list_box(&self, id: boxes::BoxId, parent: Option<boxes::BoxId>) {
+        self.with(|state| state.listing.push(fake_listed(id, parent)));
+    }
+
+    fn remove_box(&self, id: boxes::BoxId) {
+        self.with(|state| state.listing.retain(|entry| entry.box_id != id));
+    }
+
+    fn opened(&self, id: boxes::BoxId) -> u32 {
+        self.with(|state| state.opened.get(&id).copied().unwrap_or(0))
+    }
+}
+
+impl ChildSource for FakeChildHost {
+    type Lines = FakeLines;
+
+    async fn list(&mut self) -> Result<Vec<minimald_rpc::BoxListingEntry>, anyhow::Error> {
+        let (hangs, fails, listing) =
+            self.with(|state| (state.list_hangs, state.list_fails, state.listing.clone()));
+        if hangs {
+            std::future::pending::<()>().await;
+        }
+        if fails {
+            anyhow::bail!("the daemon is busy");
+        }
+        Ok(listing)
+    }
+
+    async fn open(&mut self, id: boxes::BoxId, label: &str) -> Result<FakeLines, anyhow::Error> {
+        let next = self.with(|state| {
+            *state.opened.entry(id).or_insert(0) += 1;
+            state
+                .opens
+                .get_mut(&id)
+                .and_then(std::collections::VecDeque::pop_front)
+        });
+        let (lines, tx) = FakeLines::new();
+        match next.unwrap_or(FakeOpen::Event) {
+            FakeOpen::Fails => anyhow::bail!("Could not read the events of box {label}."),
+            FakeOpen::RefusedFirst => tx.send(Err(format!("no box {id}"))).unwrap(),
+            FakeOpen::Event => tx.send(Ok(Some(fake_event_line(id)))).unwrap(),
+        }
+        Ok(lines)
+    }
+}
+
+/// The sender of the lines of a [`FakeLines`].
+type FakeLineTx = tokio::sync::mpsc::UnboundedSender<Result<Option<String>, String>>;
+
+/// The lines of a fake read: each line sent on its channel, and then
+/// nothing more, as a followed read waits for the next event.
+struct FakeLines(tokio::sync::mpsc::UnboundedReceiver<Result<Option<String>, String>>);
+
+impl FakeLines {
+    fn new() -> (Self, FakeLineTx) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self(rx), tx)
+    }
+}
+
+impl EventLines for FakeLines {
+    async fn next_line(&mut self) -> Result<Option<String>, anyhow::Error> {
+        match self.0.recv().await {
+            Some(line) => line.map_err(|e| anyhow::anyhow!(e)),
+            None => std::future::pending().await,
+        }
+    }
+}
+
+fn fake_listed(id: boxes::BoxId, parent: Option<boxes::BoxId>) -> minimald_rpc::BoxListingEntry {
+    minimald_rpc::BoxListingEntry {
+        box_id: id,
+        name: None,
+        box_type: None,
+        parent,
+        project_root: None,
+        state: "running".to_owned(),
+        reason: None,
+        exit_code: None,
+        signal: None,
+        pty_enabled: false,
+        lifetime: None,
+    }
+}
+
+/// One `event` line of the read of box `id`.
+fn fake_event_line(id: boxes::BoxId) -> String {
+    serde_json_lenient::to_string(&minimald_rpc::ReadEventsUpdate::Event {
+        event: boxes::events::BoxEvent {
+            box_id: id,
+            parent: None,
+            ts: 1,
+            kind: boxes::events::BoxEventType::Created,
+            data: boxes::events::EventData::default(),
+        },
+    })
+    .unwrap()
+}
+
+/// A `--parent --follow` of `parent` on `host`, which starts with the
+/// stream of `child` and runs in its own task on the current `LocalSet`.
+/// Returns the task, its output, and the sender of `child`'s stream.
+fn fake_follow(
+    host: &FakeChildHost,
+    parent: boxes::BoxId,
+    child: boxes::BoxId,
+) -> (
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    SharedOut,
+    FakeLineTx,
+) {
+    let (lines, child_tx) = FakeLines::new();
+    let watch = ChildWatch::new(host.clone(), parent, "lead".to_owned(), [child]);
+    let out = SharedOut::default();
+    let mut task_out = out.clone();
+    let task = tokio::task::spawn_local(async move {
+        follow_events(
+            vec![("one".to_owned(), lines)],
+            Some(watch),
+            crate::output::OutputMode::Jsonl,
+            &mut task_out,
+        )
+        .await
+    });
+    (task, out, child_tx)
+}
+
+/// The boxes of the events `out` holds.
+fn boxes_in(out: &SharedOut) -> Vec<String> {
+    out.lines()
+        .iter()
+        .map(|line| line["box"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A host with the parent and its first child, as the follow starts.
+fn fake_family() -> (FakeChildHost, boxes::BoxId, boxes::BoxId) {
+    let host = FakeChildHost::default();
+    let (parent, child) = (boxes::BoxId::mint(), boxes::BoxId::mint());
+    host.list_box(parent, None);
+    host.list_box(child, Some(parent));
+    (host, parent, child)
+}
+
+// Issue 3346: a new child whose read the daemon refuses before its first
+// event, as for a child removed right after a listing, does not end the
+// follow. It is opened again while the listings show it.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_retries_a_child_refused_before_its_first_event() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let late = boxes::BoxId::mint();
+            host.list_box(late, Some(parent));
+            host.with(|state| {
+                state.opens.insert(late, [FakeOpen::RefusedFirst].into());
+            });
+            let (task, out, _child) = fake_follow(&host, parent, child);
+
+            tokio::time::sleep(CHILD_POLL * 3 + CHILD_POLL / 2).await;
+            assert!(!task.is_finished(), "the refusal ended the follow");
+            assert_eq!(host.opened(late), 2, "the refused read is opened again");
+            assert_eq!(boxes_in(&out), [late.to_string()]);
+            task.abort();
+        })
+        .await;
+}
+
+// Issue 3346: a new child that is refused before its first event and then
+// leaves the listing is dropped, and the follow goes on.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_drops_a_refused_child_that_is_gone() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let gone = boxes::BoxId::mint();
+            host.list_box(gone, Some(parent));
+            host.with(|state| {
+                state.opens.insert(gone, [FakeOpen::RefusedFirst].into());
+            });
+            let (task, out, child_tx) = fake_follow(&host, parent, child);
+
+            tokio::time::sleep(CHILD_POLL + CHILD_POLL / 2).await;
+            assert_eq!(host.opened(gone), 1);
+            host.remove_box(gone);
+            tokio::time::sleep(CHILD_POLL * (CHILD_OPEN_TRIES + 2)).await;
+            assert!(!task.is_finished(), "the gone child ended the follow");
+            assert_eq!(
+                host.opened(gone),
+                1,
+                "a child gone from the listing is not opened"
+            );
+            child_tx.send(Ok(Some(fake_event_line(child)))).unwrap();
+            tokio::time::sleep(CHILD_POLL / 10).await;
+            assert_eq!(boxes_in(&out), [child.to_string()]);
+            task.abort();
+        })
+        .await;
+}
+
+// Issue 3346: a new child whose read never opens, while the listings keep
+// showing it, ends the follow with the open error after CHILD_OPEN_TRIES.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_stops_on_a_child_that_never_opens() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let stuck = boxes::BoxId::mint();
+            host.list_box(stuck, Some(parent));
+            let tries = usize::try_from(CHILD_OPEN_TRIES).unwrap();
+            host.with(|state| {
+                let fails = std::iter::repeat_with(|| FakeOpen::Fails).take(tries);
+                state.opens.insert(stuck, fails.collect());
+            });
+            let (task, _out, _child) = fake_follow(&host, parent, child);
+
+            tokio::time::sleep(CHILD_POLL * (CHILD_OPEN_TRIES - 1) + CHILD_POLL / 2).await;
+            assert!(
+                !task.is_finished(),
+                "the follow stopped before the last try"
+            );
+            tokio::time::sleep(CHILD_POLL).await;
+            assert!(task.is_finished(), "the follow goes on after the last try");
+            let err = task
+                .await
+                .unwrap()
+                .expect_err("the open error ends the follow");
+            assert!(
+                err.to_string()
+                    .starts_with("Could not read the events of box "),
+                "{err:#}"
+            );
+            assert_eq!(host.opened(stuck), CHILD_OPEN_TRIES);
+        })
+        .await;
+}
+
+// Issue 3346: a new child whose read opens on its last try joins the
+// follow, and its earlier failed opens do not end the follow.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_adds_a_child_that_opens_on_its_last_try() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let slow = boxes::BoxId::mint();
+            host.list_box(slow, Some(parent));
+            let tries = usize::try_from(CHILD_OPEN_TRIES - 1).unwrap();
+            host.with(|state| {
+                let fails = std::iter::repeat_with(|| FakeOpen::Fails).take(tries);
+                state.opens.insert(slow, fails.collect());
+            });
+            let (task, out, _child) = fake_follow(&host, parent, child);
+
+            tokio::time::sleep(CHILD_POLL * (CHILD_OPEN_TRIES + 2)).await;
+            assert!(!task.is_finished(), "the failed opens ended the follow");
+            assert_eq!(host.opened(slow), CHILD_OPEN_TRIES);
+            assert_eq!(boxes_in(&out), [slow.to_string()]);
+            task.abort();
+        })
+        .await;
+}
+
+// Issue 3346: a listing that works after a short outage starts the count
+// of failed listings again, so a second short outage keeps the follow.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_resets_the_list_count_after_a_listing_works() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let (task, _out, _child) = fake_follow(&host, parent, child);
+            let short = CHILD_POLL * (CHILD_LIST_TRIES - 1);
+
+            tokio::time::sleep(CHILD_POLL / 2).await;
+            host.with(|state| state.list_fails = true);
+            tokio::time::sleep(short).await;
+            host.with(|state| state.list_fails = false);
+            tokio::time::sleep(CHILD_POLL).await;
+            host.with(|state| state.list_fails = true);
+            tokio::time::sleep(short).await;
+            assert!(
+                !task.is_finished(),
+                "a working listing starts the count again"
+            );
+            host.with(|state| state.list_fails = false);
+            tokio::time::sleep(CHILD_POLL * 3).await;
+            assert!(!task.is_finished(), "the follow ended after the outage");
+            task.abort();
+        })
+        .await;
+}
+
+// Issue 3346: CHILD_LIST_TRIES failed listings in a row end the follow
+// with the list error, and one fewer does not.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_stops_after_the_list_tries() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let (task, _out, _child) = fake_follow(&host, parent, child);
+
+            tokio::time::sleep(CHILD_POLL / 2).await;
+            host.with(|state| state.list_fails = true);
+            tokio::time::sleep(CHILD_POLL * (CHILD_LIST_TRIES - 1)).await;
+            assert!(
+                !task.is_finished(),
+                "the follow stopped before the last try"
+            );
+
+            tokio::time::sleep(CHILD_POLL).await;
+            assert!(task.is_finished(), "the outage outlasted the tries");
+            let err = task
+                .await
+                .unwrap()
+                .expect_err("the list error ends the follow");
+            assert!(
+                err.to_string()
+                    .starts_with("Could not find the new child boxes of box lead."),
+                "{err:#}"
+            );
+        })
+        .await;
+}
+
+// Issue 3346: a listing that never answers holds back no event of a stream
+// already in the follow, and it counts as a failed listing.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_prints_while_a_listing_hangs() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            host.with(|state| state.list_hangs = true);
+            let (task, out, child_tx) = fake_follow(&host, parent, child);
+
+            tokio::time::sleep(CHILD_POLL * 2).await;
+            child_tx.send(Ok(Some(fake_event_line(child)))).unwrap();
+            tokio::time::sleep(CHILD_POLL / 10).await;
+            assert_eq!(
+                boxes_in(&out),
+                [child.to_string()],
+                "the event waits on the listing"
+            );
+
+            let outage = (CHILD_POLL + CHILD_CALL_TIMEOUT) * CHILD_LIST_TRIES;
+            tokio::time::sleep(outage).await;
+            let err = task
+                .await
+                .unwrap()
+                .expect_err("the hung listings end the follow");
+            assert!(
+                err.to_string()
+                    .starts_with("Could not find the new child boxes of box lead."),
+                "{err:#}"
+            );
+        })
+        .await;
+}
+
+// Issue 3346: the follow ends on its own once the parent is removed and
+// every followed stream ended, and not before the parent is removed.
+#[tokio::test(start_paused = true)]
+async fn events_parent_follow_ends_when_the_parent_is_removed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host, parent, child) = fake_family();
+            let (task, out, child_tx) = fake_follow(&host, parent, child);
+            let reaped =
+                serde_json_lenient::to_string(&minimald_rpc::ReadEventsUpdate::Reaped).unwrap();
+            child_tx.send(Ok(Some(fake_event_line(child)))).unwrap();
+            child_tx.send(Ok(Some(reaped))).unwrap();
+            host.remove_box(child);
+
+            tokio::time::sleep(CHILD_POLL * 3).await;
+            assert!(
+                !task.is_finished(),
+                "the follow ended while the parent exists"
+            );
+            host.remove_box(parent);
+            tokio::time::sleep(CHILD_POLL * 2).await;
+            assert!(
+                task.is_finished(),
+                "the follow goes on after the parent is removed"
+            );
+            task.await
+                .unwrap()
+                .expect("the follow ends without an error");
+            assert_eq!(boxes_in(&out), [child.to_string()]);
+        })
+        .await;
+}
+
 /// A session record carrying `mode` and `box_addresses`, with everything
 /// else at its default.
 fn hold_record(
