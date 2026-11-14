@@ -57,8 +57,9 @@
 #                    instead of requiring minimal's Developer ID.
 #   --sign IDENTITY  Sign the product archive with a Developer ID Installer
 #                    identity (productbuild --sign, timestamped). Without it
-#                    the package is unsigned: Gatekeeper refuses it on a
-#                    double-click, `installer -pkg` as root takes it. Refused
+#                    the package is unsigned and named
+#                    minimal-<version>-unsigned.pkg: Gatekeeper refuses it on
+#                    a double-click, `installer -pkg` as root takes it. Refused
 #                    on a test build: a signed package carries released code
 #                    or nothing.
 #   --notarize PROF  After signing, submit the package to Apple's notary
@@ -189,6 +190,7 @@ prefix_dir() {
     esac
 }
 rows=0
+links=""
 while read -r comp os arch _ want kind dest src; do
     [ -n "$comp" ] || continue
     [ "$os" = darwin ] && [ "$arch" = arm64 ] || continue
@@ -206,19 +208,33 @@ while read -r comp os arch _ want kind dest src; do
             case "$dest" in bin/*) chmod 0755 "$target" ;; *) chmod 0644 "$target" ;; esac
             ;;
         symlink)
+            # A link's target is a path beside it in the payload, never one
+            # that leaves it: the package would otherwise put a link to
+            # anywhere on the Mac under /usr/local, on the manifest's word.
+            case "$src" in
+                ''|/*|..|../*|*/..|*/../*) die "component $comp is a symlink to '$src', which is not a path inside the payload" ;;
+            esac
             echo "==> $comp -> /usr/local/${target#"$root"/usr/local/} (symlink to $src)"
             ln -sfn "$src" "$target"
+            links="$links$comp	$target
+"
             ;;
         *) die "component $comp has an unknown kind '$kind'" ;;
     esac
     rows=$((rows + 1))
 done <"$manifest"
 [ "$rows" -gt 0 ] || die "the manifest for $VERSION has no darwin/arm64 rows"
+# Every link leads to a file the same manifest staged.
+printf '%s' "$links" | while IFS='	' read -r comp target; do
+    [ -n "$comp" ] || continue
+    [ -f "$target" ] || die "component $comp is a symlink to '$(readlink "$target")', which the manifest stages no file at"
+done || exit 1
 # The bundle's program is the only executable inside it; the rest are data.
 chmod 0755 "$root/usr/local/bin/Minimal.app/Contents/MacOS/minzoned" 2>/dev/null || true
 
 # --- 2. Local replacements: a test build of this tree ----------------------
 test_build=0
+min_replaced=0
 for pair in ${WITH[@]+"${WITH[@]}"}; do
     dest="${pair%%=*}"
     path="${pair#*=}"
@@ -232,6 +248,7 @@ for pair in ${WITH[@]+"${WITH[@]}"}; do
     subpath="${dest#*/}"
     target="$(prefix_dir "$prefix")/$subpath"
     echo "==> replacing $dest with $path"
+    [ "$dest" != bin/min ] || min_replaced=1
     rm -rf "$target"
     if [ -d "$path" ]; then
         cp -R "$path" "$target"
@@ -271,6 +288,17 @@ bundle="$root/Library/PrivilegedHelperTools/Minimal.app"
 # --- 3. What the package adds: completions, pkg-info, the scripts ----------
 min="$root/usr/local/bin/min"
 [ -x "$min" ] || die "the payload has no executable at bin/min"
+# This script runs the payload's min, on the machine that holds the signing
+# identity. A downloaded min matched the manifest's checksum, but the
+# manifest came from the same bucket: whoever could change one could change
+# both. A Developer ID signature is what they could not make, so a
+# downloaded min runs only with minimal's. A min given with --with is the
+# builder's own.
+team_requirement='=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "3G47C5HY64"'
+if [ "$min_replaced" -eq 0 ]; then
+    codesign --verify --strict -R "$team_requirement" "$min" 2>/dev/null \
+        || die "the downloaded bin/min does not carry minimal's Developer ID (team 3G47C5HY64); refusing to run it here"
+fi
 version="$("$min" --version 2>/dev/null | sed -n 's/^min //p')"
 [ -n "$version" ] || die "the payload's min --version said nothing (a build for another machine?)"
 mkdir -p "$root/usr/local/share/zsh/site-functions" \
@@ -337,6 +365,10 @@ if [ "$test_build" -eq 1 ]; then
     # signed would say more than is true.
     pkg="$OUT/minimal-$version-test.pkg"
     [ -z "$SIGN" ] || die "refusing to sign a TEST BUILD (its service program is ad-hoc signed); sign a release build"
+elif [ -z "$SIGN" ]; then
+    # Nor does an unsigned build of a release take the release's name: only
+    # the package Gatekeeper accepts is minimal-<version>.pkg.
+    pkg="$OUT/minimal-$version-unsigned.pkg"
 fi
 # The bundles stay where the payload puts them. pkgbuild's own analysis
 # marks every bundle relocatable, and Installer would then follow an older
