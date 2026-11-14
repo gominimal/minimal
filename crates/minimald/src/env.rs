@@ -4870,7 +4870,15 @@ exit $rc
         let bin = rootfs.join("fakebin");
         std::fs::create_dir_all(&bin).unwrap();
         let socat = bin.join("socat");
-        std::fs::write(&socat, "#!/bin/sh\necho RPC-CALLED >&2\n").unwrap();
+        // The helper sends socat's stderr to /dev/null, so the fake marks
+        // the call in a file, and the marker is added to stderr below.
+        let marker = rootfs.join("rpc-called");
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(
+            &socat,
+            format!("#!/bin/sh\necho RPC-CALLED > '{}'\n", marker.display()),
+        )
+        .unwrap();
         std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
         let script = rootfs.join("usr/bin/min");
         let out = std::process::Command::new("bash")
@@ -4887,9 +4895,11 @@ exit $rc
             .output()
             .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
             .ok()?;
+        let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        stderr.push_str(&std::fs::read_to_string(&marker).unwrap_or_default());
         Some((
             String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr,
             out.status.code().unwrap_or(-1),
         ))
     }
