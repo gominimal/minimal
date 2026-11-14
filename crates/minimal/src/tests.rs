@@ -13636,15 +13636,15 @@ async fn box_wait_timeout_flag_returns_124_box_runs_on() {
     assert_eq!(timed_out.code(), "wait_timeout");
     assert_eq!(
         timed_out.to_string(),
-        format!("Stopped waiting after 300ms. web ({id}) has not ended.")
+        format!("Stopped waiting after 300ms. Box web ({id}) has not ended.")
     );
     assert_eq!(
         timed_out.hint(),
         format!("Run `min box wait {id}` to wait again, or `min box stop {id}` to stop it.")
     );
     assert_eq!(
-        BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s").to_string(),
-        "Stopped waiting after 30s. web (0190a3c4-0000-7000-8000-000000000000) has not ended."
+        BoxTimedOut::waited(Some("web"), "0190a3c4-0000-7000-8000-000000000000", "30s").to_string(),
+        "Stopped waiting after 30s. Box web (0190a3c4-0000-7000-8000-000000000000) has not ended."
     );
 
     let record = shown_record(&alpha.host, id).await;
@@ -13725,7 +13725,7 @@ async fn run_verbs_and_wait_timeout_return_124_with_code_timeout() {
     assert_eq!(BoxTimedOut::EXIT_CODE, 124);
     assert_eq!(timed_out.code(), "timeout");
     assert_eq!(
-        BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s").code(),
+        BoxTimedOut::waited(Some("web"), "0190a3c4-0000-7000-8000-000000000000", "30s").code(),
         "wait_timeout"
     );
 }
@@ -16772,7 +16772,9 @@ async fn box_wait_exec_returns_exec_code() {
     assert_eq!(timed_out.code(), "wait_timeout");
     assert_eq!(
         timed_out.to_string(),
-        format!("Stopped waiting after 300ms. Exec {SECOND_EXEC_ID} in web has not ended.")
+        format!(
+            "Stopped waiting after 300ms. Exec {SECOND_EXEC_ID} in box web ({web}) has not ended."
+        )
     );
     assert_eq!(
         timed_out.hint(),
@@ -18208,7 +18210,8 @@ async fn retained_box_management_end_to_end() {
         // `min box rename web front`.
         let mut client = box_host_client(&host).await.unwrap();
         let mut out = Vec::new();
-        let renamed = rename_listed_box(&mut client, &mut out, web, "web", "front").await;
+        let renamed =
+            rename_listed_box(&mut client, &mut out, web, "web", Some("web"), "front").await;
         ran.push(
             "min box rename web front",
             &out,
@@ -18218,7 +18221,7 @@ async fn retained_box_management_end_to_end() {
         renamed.unwrap_or_else(|e| panic!("the rename: {e:#}\n{ran}"));
         assert_eq!(
             String::from_utf8_lossy(&out),
-            "Renamed web to front.\n",
+            format!("Renamed box web ({web}) to front.\n"),
             "{ran}"
         );
         let names = listed_ids_and_names(&host).await;
@@ -19975,12 +19978,22 @@ async fn box_rename_native_host_prints_no_vm_host_warning() {
         record.network
     );
     let mut out = Vec::new();
-    cmd::rename_listed_box(&mut client, &mut out, web, "web", "front")
-        .await
-        .unwrap_or_else(|e| panic!("the rename: {e:#}"));
+    cmd::rename_listed_box(
+        &mut client,
+        &mut out,
+        web,
+        "web",
+        record.name.as_deref(),
+        "front",
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the rename: {e:#}"));
     cmd::rename_box_with_vm_host(control_sock, &record, "front").await;
 
-    assert_eq!(String::from_utf8_lossy(&out), "Renamed web to front.\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        format!("Renamed box web ({web}) to front.\n")
+    );
     let names = listed_ids_and_names(&host).await;
     assert!(
         names.contains(&(web, Some("front".to_owned()))),
@@ -19995,6 +20008,153 @@ async fn box_rename_native_host_prints_no_vm_host_warning() {
         warnings.is_empty(),
         "a native rename warns about no VM host daemon:\n{}",
         warnings.join("\n")
+    );
+}
+
+// BCLI-013, BCLI-058, BCLI-061, BCLI-002, BCLI-064: the wait-timeout,
+// rename, ambiguous-id-start and prune lines name the box, and each
+// gives the next step. An empty box address is a usage error, exit 2.
+#[tokio::test]
+async fn box_messages_name_the_box_and_the_next_step() {
+    // `min box wait --timeout`: the line names the box by the name its
+    // record holds and its id, whatever address the person typed.
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let id = alpha.create("web", None).await;
+    let err = box_wait_on_hosts(
+        vec![alpha.host.clone()],
+        &id.to_string(),
+        Some(std::time::Duration::from_millis(200)),
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect_err("the box runs past the wait's timeout");
+    let timed_out = err
+        .downcast_ref::<BoxTimedOut>()
+        .unwrap_or_else(|| panic!("not a timeout: {err:#}"));
+    assert_eq!(
+        timed_out.to_string(),
+        format!("Stopped waiting after 200ms. Box web ({id}) has not ended.")
+    );
+    assert_eq!(
+        timed_out.hint(),
+        format!("Run `min box wait {id}` to wait again, or `min box stop {id}` to stop it.")
+    );
+    // A box with no name is `Box <id>`.
+    const UNNAMED: &str = "0190a3c4-0000-7000-8000-000000000000";
+    assert_eq!(
+        BoxTimedOut::waited(None, UNNAMED, "1s").to_string(),
+        format!("Stopped waiting after 1s. Box {UNNAMED} has not ended.")
+    );
+    assert_eq!(
+        BoxTimedOut::waited_exec(None, UNNAMED, "e1", "1s").to_string(),
+        format!("Stopped waiting after 1s. Exec e1 in box {UNNAMED} has not ended.")
+    );
+    assert_eq!(
+        BoxTimedOut::waited_exec(Some("web"), UNNAMED, "e1", "1s").to_string(),
+        format!("Stopped waiting after 1s. Exec e1 in box web ({UNNAMED}) has not ended.")
+    );
+
+    // `min box rename <id> <new>`: the line names the old name from the
+    // record, not the address the person typed.
+    let mut client = box_host_client(&alpha.host).await.unwrap();
+    let old = shown_record(&alpha.host, id).await.name;
+    let mut out = Vec::new();
+    rename_listed_box(
+        &mut client,
+        &mut out,
+        id,
+        &id.to_string(),
+        old.as_deref(),
+        "front",
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the rename: {e:#}"));
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!("Renamed box web ({id}) to front.\n")
+    );
+    let mut out = Vec::new();
+    rename_listed_box(&mut client, &mut out, id, &id.to_string(), None, "back")
+        .await
+        .unwrap_or_else(|e| panic!("the rename: {e:#}"));
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!("Renamed box {id} to back.\n")
+    );
+
+    // An empty box address is refused before any lookup, with exit 2.
+    for argv in [
+        &["min", "box", "show", ""][..],
+        &["min", "box", "wait", ""],
+        &["min", "box", "rename", "", "front"],
+        &["min", "box", "stop", ""],
+        &["min", "box", "prune", "--yes", "--parent", ""],
+        &["min", "box", "events", "--parent", ""],
+    ] {
+        let Err(err) = Cli::try_parse_from(argv) else {
+            panic!("{argv:?} must be refused");
+        };
+        assert_eq!(err.exit_code(), 2, "{argv:?}: {err}");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::InvalidValue,
+            "{argv:?}: {err}"
+        );
+    }
+
+    // An id start that more than one box has lists each of them.
+    let alpha_host = address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true);
+    let beta_host = address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", false);
+    let named = address_entry("0199f000-0000-7000-8000-000000000001", "web", "running");
+    let unnamed = minimald_rpc::BoxListingEntry {
+        name: None,
+        ..address_entry("0199f000-0000-7000-8000-000000000002", "", "running")
+    };
+    let listings = [
+        answered(alpha_host.clone(), vec![named.clone(), unnamed.clone()]),
+        answered(beta_host, Vec::new()),
+    ];
+    let expected = |start: &str| {
+        format!(
+            "More than one box has an id that starts with `{start}`:\n  \
+             {}  web  running  local-minvmd/alpha.local-minvmd0\n  \
+             {}  -  running  local-minvmd/alpha.local-minvmd0\n\
+             Give more of the id.",
+            named.box_id, unnamed.box_id
+        )
+    };
+    let (text, code) = refused("0199f0", &listings);
+    assert_eq!(code, 2);
+    assert_eq!(text, expected("0199f0"));
+    let (text, code) = refused("local-minvmd/alpha.local-minvmd0/0199f0", &listings);
+    assert_eq!(code, 2);
+    assert_eq!(text, expected("0199f0"));
+
+    // A prune that matches nothing names the selectors it passed.
+    let none = PruneTally::default();
+    let line = |selectors: PruneSelectors<'_>| {
+        let mut out = Vec::new();
+        finish_prune(&none, selectors, &mut out, &mut Vec::new()).expect("nothing failed");
+        String::from_utf8(out).unwrap()
+    };
+    assert_eq!(
+        line(PruneSelectors {
+            older_than: Some(std::time::Duration::from_secs(7 * 86_400)),
+            parent: Some("web"),
+        }),
+        "No stopped or exited box matched --older-than 7d and --parent web, \
+         so nothing was removed.\n"
+    );
+    assert_eq!(
+        line(PruneSelectors {
+            older_than: Some(std::time::Duration::from_secs(90 * 60)),
+            parent: None,
+        }),
+        "No stopped or exited box matched --older-than 90m, so nothing was removed.\n"
+    );
+    assert_eq!(
+        line(PruneSelectors::default()),
+        "No stopped or exited box matched, so nothing was removed.\n"
     );
 }
 
