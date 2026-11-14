@@ -3406,7 +3406,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("gate-web".to_string()),
             path: Some(project.path().to_str().unwrap().to_string()),
-            network: CliNetworkMode::OwnIp,
+            network: Some(CliNetworkMode::OwnIp),
             sync: Some(SyncMode::None),
             no_loadouts: true,
             no_prompt: true,
@@ -3493,7 +3493,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("web".to_string()),
             path: Some(project.path().to_str().unwrap().to_string()),
-            network: CliNetworkMode::OwnIp,
+            network: Some(CliNetworkMode::OwnIp),
             no_prompt: true,
             attach: false,
             ..bare_activate_args()
