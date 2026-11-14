@@ -592,6 +592,9 @@ pub enum StartError {
     /// No key store the proxy can read holds these keys, and a store that
     /// can hold them did not answer. The keys can be there (BEP-089).
     Kept {
+        /// The keys the store holds and refused. Their refusal names the
+        /// replacement, as [`StartError::Unusable`] does.
+        refused: Vec<Role>,
         /// The keys that no store the proxy read holds.
         missing: Vec<Role>,
         /// The store that did not answer.
@@ -730,15 +733,24 @@ impl fmt::Display for StartError {
             Self::NoStore(_) => f.write_str(
                 "The proxy did not start: this host has no usable TPM and no unlocked Secret Service keyring, so the proxy has nowhere to keep its keys.",
             ),
-            Self::Kept { missing, store } => {
-                let lines: Vec<String> = missing
-                    .iter()
-                    .map(|role| {
-                        format!(
-                            "The proxy did not start: no key store it can read holds the proxy's {role} key, and {store}. The key may be there, so it is kept."
-                        )
-                    })
-                    .collect();
+            Self::Kept {
+                refused,
+                missing,
+                store,
+            } => {
+                let mut lines = Vec::new();
+                // A refused key is refused whether or not the other store
+                // answered, so its refusal and its next step print too.
+                for role in refused {
+                    lines.push(format!(
+                        "The keychain refused the proxy its {role} key. Run `bep --replace-key {role}` to make a new one; boxes created before then must be re-created."
+                    ));
+                }
+                for role in missing {
+                    lines.push(format!(
+                        "The proxy did not start: no key store it can read holds the proxy's {role} key, and {store}. The key may be there, so it is kept."
+                    ));
+                }
                 f.write_str(&lines.join("\n"))
             }
             Self::Lost(missing) => {
@@ -889,6 +901,7 @@ pub fn load_with<S: KeyStore>(
             StoreReach::Unread(unread) => {
                 tracing::error!(roles = ?missing, store = %unread, "a missing proxy key can be in a key store that did not answer");
                 return Err(StartError::Kept {
+                    refused,
                     missing,
                     store: unread,
                 });
@@ -913,6 +926,7 @@ pub fn load_with<S: KeyStore>(
     {
         tracing::error!(roles = ?to_make, store = %unread, "did not make proxy keys while a key store that can hold them did not answer");
         return Err(StartError::Kept {
+            refused: Vec::new(),
             missing: to_make,
             store: unread,
         });

@@ -433,6 +433,7 @@ mod tests {
         assert_eq!(
             err,
             StartError::Kept {
+                refused: Vec::new(),
                 missing: Role::ALL.to_vec(),
                 store: UnreadStore::SecretServiceLocked,
             }
@@ -571,6 +572,21 @@ mod tests {
             );
             assert_eq!(store.tpm.generated(), 2);
         }
+        // A key the TPM refuses is reported beside the key that is kept,
+        // with its own next step.
+        let store = store();
+        store.tpm.fail_generation_of(Role::Root);
+        load(&store, &[]).expect("a first start");
+        store.tpm.clear_generation_failure();
+        store.tpm.refuse(Role::Sealing);
+        store.secret_service.set(LOCKED);
+        let store = restart(store);
+        let err = load(&store, &[]).expect_err("a refused key and a key it cannot read");
+        assert_eq!(
+            err.to_string(),
+            "The keychain refused the proxy its sealing key. Run `bep --replace-key sealing` to make a new one; boxes created before then must be re-created.\n\
+             The proxy did not start: no key store it can read holds the proxy's root key, and Secret Service is locked. The key may be there, so it is kept."
+        );
         assert_eq!(
             UnreadStore::TpmUnreachable.to_string(),
             "the TPM cannot be reached"
