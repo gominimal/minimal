@@ -292,12 +292,13 @@ pub(crate) fn resolve_active_loadouts(
             // `LoadError`'s Display already embeds its I/O source, so flatten
             // it to a leaf before adding context; otherwise anyhow re-renders
             // the underlying error a second time from the chain.
-            // BCLI-034: a `--loadout` name with no loadout file is not
-            // found (exit 4). The text is the same as before.
+            // BCLI-034: a loadout name with no loadout file is not found
+            // (exit 4), from `--loadout` and `default_loadouts` alike. The
+            // text is the same as before.
             boxes::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name)
                 .map(|(loadout, _layout)| loadout)
                 .map_err(|e| match e {
-                    boxes::client::disk::LoadError::NotFound { .. } if source == "--loadout" => {
+                    boxes::client::disk::LoadError::NotFound { .. } => {
                         anyhow::Error::new(LoadoutNotFound {
                             message: e.to_string(),
                         })
@@ -314,8 +315,9 @@ pub(crate) fn resolve_active_loadouts(
     })
 }
 
-/// A `--loadout` name that no loadout file carries. The run ends with
-/// exit 4 (`main.rs`), the architecture's code for a thing not found.
+/// A loadout name, from `--loadout` or `default_loadouts`, that no loadout
+/// file carries. The run ends with exit 4 (`main.rs`), the architecture's
+/// code for a thing not found.
 #[derive(Debug)]
 pub struct LoadoutNotFound {
     /// The loader's own text, which names the paths it looked at.

@@ -20128,6 +20128,21 @@ fn refusals_exit_with_the_table_code() {
         "{err:#}"
     );
 
+    // A `default_loadouts` name with no loadout file: not found (4) too.
+    let mut cfg = boxes::client::config::Config::default();
+    cfg.loadouts.default_loadouts = vec!["missing".to_owned()];
+    let err =
+        loadouts::resolve_active_loadouts(loadouts::LoadoutSelection::Defaults, &cfg, &global)
+            .expect_err("no loadout file");
+    assert!(
+        err.downcast_ref::<loadouts::LoadoutNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").starts_with("default_loadouts `missing`: "),
+        "{err:#}"
+    );
+
     // A bad `--allow-dns-hosts` value: clap refuses it as a usage error (2)
     // before anything runs, and quotes the value.
     let Err(err) = Cli::try_parse_from([

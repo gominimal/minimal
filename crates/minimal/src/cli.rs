@@ -1958,12 +1958,6 @@ pub(crate) const START_NETWORK_LONG_HELP: &str = concat!(
      prints a one-line hint naming the current spelling."
 );
 
-/// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
-/// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
-/// rename to the underscore forms and still parse to the same modes, each
-/// printing a one-line hint naming the current spelling, so scripts and
-/// muscle memory keep working through the rename window. Anything else is
-/// a clap error.
 /// The value of one `--allow-dns-hosts`: a DNS hostname, checked as the
 /// egress policy checks it, so a bad host is a usage error (exit 2) before
 /// anything runs (BCLI-034). Clap quotes the value in front of this text.
@@ -1978,6 +1972,12 @@ pub(crate) fn parse_dns_host(raw: &str) -> Result<String, String> {
     )
 }
 
+/// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
+/// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
+/// rename to the underscore forms and still parse to the same modes, each
+/// printing a one-line hint naming the current spelling, so scripts and
+/// muscle memory keep working through the rename window. Anything else is
+/// a clap error.
 pub(crate) fn parse_network_mode(raw: &str) -> Result<CliNetworkMode, String> {
     let mode = match raw {
         "none" | "no-net" => CliNetworkMode::NoNet,
