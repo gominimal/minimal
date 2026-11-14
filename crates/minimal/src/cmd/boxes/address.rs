@@ -86,6 +86,8 @@ pub enum BoxAddressRefusal {
     AmbiguousIdStart {
         /// The start as the caller wrote it.
         start: String,
+        /// Each box whose id starts with it.
+        candidates: Vec<AddressCandidate>,
     },
     /// A host did not answer while an unqualified address resolved, so no
     /// box was chosen (BCLI-002). Exit 7.
@@ -159,10 +161,19 @@ impl std::fmt::Display for BoxAddressRefusal {
                 }
                 write!(f, "Name one as provider/host/name.")
             }
-            Self::AmbiguousIdStart { start } => write!(
-                f,
-                "More than one box has an id that starts with `{start}`. Give more of the id."
-            ),
+            Self::AmbiguousIdStart { start, candidates } => {
+                writeln!(f, "More than one box has an id that starts with `{start}`:")?;
+                for c in candidates {
+                    // A box with no name lists `-` in the name column.
+                    let name = if c.name.is_empty() { "-" } else { &c.name };
+                    writeln!(
+                        f,
+                        "  {}  {name}  {}  {}/{}",
+                        c.box_id, c.state, c.provider, c.host
+                    )?;
+                }
+                write!(f, "Give more of the id.")
+            }
             Self::Unreachable { address, hosts } => {
                 // A qualified address names its host, so the only next step
                 // is to ask that host again.
@@ -243,9 +254,17 @@ pub(crate) fn resolve_box_address(
             .map_err(|_| unreachable(vec![listing.host.host.clone()]))?;
         return match match_on_host(boxes, name) {
             HostMatch::One(id) => Ok(resolved(listing, id)),
-            HostMatch::SeveralIdStarts => Err(BoxAddressRefusal::AmbiguousIdStart {
-                start: name.to_owned(),
-            }),
+            HostMatch::SeveralIdStarts => {
+                let start = id_start(name);
+                Err(BoxAddressRefusal::AmbiguousIdStart {
+                    start: name.to_owned(),
+                    candidates: boxes
+                        .iter()
+                        .filter(|e| id_starts_with(e, &start))
+                        .map(|e| candidate(listing, e))
+                        .collect(),
+                })
+            }
             HostMatch::None => Err(not_found()),
         };
     }
@@ -299,13 +318,7 @@ pub(crate) fn resolve_box_address(
                 matches
                     .iter()
                     .filter(move |e| !only_running || e.state == "running")
-                    .map(|e| AddressCandidate {
-                        provider: l.host.provider.to_owned(),
-                        host: l.host.host.clone(),
-                        name: e.name.clone().unwrap_or_default(),
-                        state: box_state_label(e),
-                        box_id: e.box_id,
-                    })
+                    .map(|e| candidate(l, e))
             })
             .collect::<Vec<_>>()
     };
@@ -337,22 +350,37 @@ pub(crate) fn resolve_box_address(
 
     if is_id_prefix(address) {
         let start = id_start(address);
-        let mut matches = answered().flat_map(|(l, boxes)| {
-            boxes
-                .iter()
-                .filter(|e| id_starts_with(e, &start))
-                .map(move |e| (l, e.box_id))
-        });
-        if let Some((listing, id)) = matches.next() {
-            if matches.next().is_some() {
+        let matches: Vec<_> = answered()
+            .flat_map(|(l, boxes)| {
+                boxes
+                    .iter()
+                    .filter(|e| id_starts_with(e, &start))
+                    .map(move |e| (l, e))
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => {}
+            [(listing, entry)] => return Ok(resolved(listing, entry.box_id)),
+            several => {
                 return Err(BoxAddressRefusal::AmbiguousIdStart {
                     start: address.to_owned(),
+                    candidates: several.iter().map(|(l, e)| candidate(l, e)).collect(),
                 });
             }
-            return Ok(resolved(listing, id));
         }
     }
     Err(not_found())
+}
+
+/// The box `entry` on the host of `listing`, as a refusal lists it.
+fn candidate(listing: &HostListing, entry: &minimald_rpc::BoxListingEntry) -> AddressCandidate {
+    AddressCandidate {
+        provider: listing.host.provider.to_owned(),
+        host: listing.host.host.clone(),
+        name: entry.name.clone().unwrap_or_default(),
+        state: box_state_label(entry),
+        box_id: entry.box_id,
+    }
 }
 
 /// What one host's listing holds for an id, a name or the start of an id.
