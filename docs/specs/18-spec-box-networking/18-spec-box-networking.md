@@ -1565,7 +1565,26 @@ refusal holds only inside the VM, below the escape boundary.
   the resolver hook routes a zone to one port. A second is one service that
   admits a set of users, which needs a name space per user or box-address
   arbitration across users. The third is one host DNS user per machine, the
-  current behaviour.]
+  current behaviour.
+  Taken, for the macOS system install: option 2, as `minzoned --admit-group
+  GROUP` under a role account. The channel admits the service's own uid, root
+  and the group's members, judged by the account database once per connection
+  and off the accept loop; a node is the pair of its hello's id and its peer's
+  uid, so one user's rows are never replaced or released by another's. Box
+  addresses are arbitrated across users as before, and each user's nodes may
+  hold at most a quarter of the range, four names for each address of that
+  share, and a bounded number of channel connections. Box names stay one space for the host: a name is its first
+  publisher's while its row is up and for the answer TTL after it goes (the
+  same quarantine an address has, so a daemon restart or a laptop's sleep
+  never loses a name to another member, and a cached answer never reaches
+  another user's box); after that any member may take it. The service
+  remembers nothing across its own restart, so in the window before the
+  nodes reconnect a member can take another member's name: the group is
+  users who trust each other with names, which the package's documentation
+  and `minzoned --help` say. A refusal names another user's node by uid, never
+  by its state directory. Out of scope, same text: any local user can bind an
+  unused port on another user's loopback address before that user's forward
+  does.]
 - [NEEDS CLARIFICATION (MEDIUM): on a native host, which component forwards a
   non-deny-all host-address box's upstream name queries under the box's rules
   (NET-066, NET-079), or are native host-address allow lists CIDR-only until one
