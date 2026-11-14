@@ -1913,7 +1913,29 @@ impl BoxChannel {
     }
 
     /// Record and transmit a newly-acquired variable to the session shell.
+    ///
+    /// The name is passed through to the shell helper verbatim, where bash
+    /// evaluates a `declare`d name for array subscripts — a crafted one runs
+    /// commands in the user's live shell. Invalid names are refused here
+    /// rather than recorded or sent. A value opening with `(` is refused
+    /// too: the helpers refuse it, so recording it would leave the daemon
+    /// holding a variable the shell never exported.
     fn announce_env(&self, stream: &mut UnixStream, key: &str, value: &str) {
+        if !graph::is_valid_env_var_name(key) {
+            let _ = writeln!(
+                stream,
+                "msg:min: refusing to export environment variable with an invalid name: {}",
+                one_line(key)
+            );
+            return;
+        }
+        if value.starts_with('(') {
+            let _ = writeln!(
+                stream,
+                "msg:min: refusing to export {key}: a value starting with ( would be read as an array"
+            );
+            return;
+        }
         self.runtime_env.record(key, value);
         let _ = writeln!(stream, "set_env:{key}:{value}");
     }
@@ -4534,6 +4556,154 @@ mod tests {
         assert_eq!(
             send_with(Some(tp), Some("on")),
             format!("traceparent%{tp}%net-expose%8770")
+        );
+    }
+
+    /// A `set_env:` line hands the helper a variable name that began as
+    /// package metadata. Bash evaluates the name of a `declare`d variable
+    /// for array subscripts, so a crafted one — `X[$(touch /tmp/pwned)]` —
+    /// runs the command in the user's live shell. The helper must refuse
+    /// such a name without evaluating it, while still exporting the valid
+    /// names around it. Regression guard for the env_state_wiring path.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_with_a_crafted_name_is_refused_not_evaluated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // The payload's marker: the crafted name would `touch` it if bash
+        // evaluated the subscript. Under the fix it must stay absent.
+        let marker = tmp.path().join("pwned");
+
+        // A socat stand-in that answers a request with three `set_env:`
+        // lines — a crafted name, a valid one after it, then `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:X[$(touch {})]:/state/gocache\\n'\nprintf 'set_env:GOCACHE:/state/gocache\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'; __min_rpc status; rc=$?; echo \"GOCACHE=$GOCACHE\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("GOCACHE")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        assert!(!marker.exists(), "the crafted name ran its payload");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("min: refusing to export environment variable with an invalid name"),
+            "the refusal must say so in plain words, got: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GOCACHE=/state/gocache"),
+            "a valid name alongside must still export, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("pwned"),
+            "the crafted name must not join the export summary, got: {stdout}"
+        );
+    }
+
+    /// A valid name can still match a local of `__min_rpc` or of its
+    /// caller, and an assignment by name writes that local, not the shell's
+    /// variable. The helper must write and export the global whatever the
+    /// name. And since `declare` reads a value opening with `(` as an array
+    /// list when the global is an array, such a value is refused, not run.
+    /// The protocol reader's own `line` is one such local: were it the
+    /// global, the next read would overwrite a `set_env:line:` assignment.
+    /// The mctx helper has the same test.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_writes_the_global_even_when_a_local_shares_its_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // Created only if the parenthesised value were expanded.
+        let marker = tmp.path().join("ran");
+
+        // A socat stand-in that answers with a name the helper also uses
+        // for a local, a parenthesised value for an array global, then
+        // `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'set_env:line:/state/line\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "LIST=(one); . '{}'; __min_rpc status; rc=$?; \
+                 echo \"global=$varname exported=$(printenv varname) list=$LIST line=$line exported_line=$(printenv line)\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("varname")
+            .env_remove("line")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("global=/state/varname exported=/state/varname"),
+            "a name shared with a local must still set and export the global, got: {stdout}"
+        );
+        assert!(!marker.exists(), "a parenthesised value was expanded");
+        assert!(
+            stdout.contains("list=one"),
+            "a refused value must leave the global as it was, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("line=/state/line exported_line=/state/line"),
+            "the reader's own `line` must not take or overwrite the shell's, got: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("would be read as an array"),
+            "the refusal must say so, got: {stderr}"
         );
     }
 
@@ -7165,6 +7335,77 @@ exit $rc
                 .get("PYTHONPATH")
                 .map(String::as_str),
             Some("/second")
+        );
+    }
+
+    /// A variable name from package metadata is handed to the shell helper
+    /// verbatim, where bash evaluates a `declare`d name for array subscripts —
+    /// `X[$(touch /tmp/pwned)]` would run the command. An invalid name is
+    /// refused: not recorded, not sent as a `set_env:` line, only explained.
+    #[tokio::test]
+    async fn a_var_with_an_invalid_name_is_refused() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "X[$(touch /tmp/pwned)]", "/state/gocache");
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(
+            lines,
+            vec![
+                "msg:min: refusing to export environment variable with an invalid name: X[$(touch /tmp/pwned)]"
+            ],
+            "an invalid name must be explained and nothing else sent"
+        );
+        assert!(
+            chan.runtime_env.snapshot().is_empty(),
+            "an invalid name must not reach the daemon's environment"
+        );
+    }
+
+    /// The refusal echoes the name, so a name carrying a newline would add a
+    /// protocol line of its own, such as a `set_env:` the helper acts on.
+    /// The echo escapes control characters and stays one `msg:` line.
+    #[tokio::test]
+    async fn a_refused_name_is_echoed_on_one_line() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "A\nset_env:B", "/state/gocache");
+        drop(ours);
+
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "msg:min: refusing to export environment variable with an invalid name: A\\nset_env:B"
+            ],
+            "a refused name must not start a line of its own"
+        );
+        assert!(chan.runtime_env.snapshot().is_empty());
+    }
+
+    /// The helpers refuse a value opening with `(`, so the daemon must
+    /// refuse it too: a recorded value the shell never exported would reach
+    /// later injections and disagree with the session's own shell.
+    #[tokio::test]
+    async fn a_value_the_helpers_refuse_is_not_recorded() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "LIST", "(one two)");
+        drop(ours);
+
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "msg:min: refusing to export LIST: a value starting with ( would be read as an array"
+            ],
+            "a refused value must be explained and nothing else sent"
+        );
+        assert!(
+            chan.runtime_env.snapshot().is_empty(),
+            "a value the shell refuses must not reach the daemon's environment"
         );
     }
 

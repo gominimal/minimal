@@ -197,7 +197,7 @@ pub use env_mapping::{
 };
 
 mod env_setup;
-pub use env_setup::SetupForPackages;
+pub use env_setup::{SetupForPackages, is_valid_env_var_name, is_valid_state_prefix};
 
 // Re-exported so downstream crates can inspect the `Stack` a
 // `Graph::stack(name)` lookup returns without pulling in `decode`
