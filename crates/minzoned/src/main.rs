@@ -172,8 +172,26 @@ fn main() -> Result<()> {
         }
         #[cfg(target_os = "macos")]
         Some(Command::ReserveLocalRange) => reserve_local_range(),
-        None => minvmd::cmd::answerer::run(cli.protocol_version, cli.admit_group.as_deref()),
+        None => {
+            exit_on_panic();
+            minvmd::cmd::answerer::run(cli.protocol_version, cli.admit_group.as_deref())
+        }
     }
+}
+
+/// Makes a panic on any of the service's threads end the process, after
+/// the panic's own message. The service is threads around shared tables: a
+/// panic on one thread alone would leave the process up with a table lock
+/// poisoned or the answering thread gone, so launchd or systemd would see
+/// a running service that answers nothing and never start it again. The
+/// service keeps no state (its nodes reconnect and publish again), so
+/// ending is the recovery: the service manager starts it afresh.
+fn exit_on_panic() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        std::process::abort();
+    }));
 }
 
 #[cfg(test)]
