@@ -261,8 +261,11 @@ impl<T: KeyStore, S: KeyStore> KeyStore for LinuxStore<T, S> {
     }
 
     fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
+        // Ask Secret Service first. A locked keyring then stops the removal
+        // before the TPM loses its key, so no removal is half done.
+        let in_secret_service = self.secret_service_holds(role, slot)?;
         self.tpm.remove_in(role, slot)?;
-        if self.secret_service_holds(role, slot)? {
+        if in_secret_service {
             self.secret_service.remove_in(role, slot)?;
         }
         Ok(())
@@ -556,6 +559,11 @@ mod tests {
             .expect_err("held");
         assert!(matches!(err, KeyError::Store { .. }), "{err:?}");
         assert_eq!(tpm.secret_service.inner.generated(), 0);
+
+        // A locked keyring stops a removal before the TPM key goes.
+        tpm.secret_service.set(LOCKED);
+        assert!(tpm.remove_in(Role::Sealing, Slot::Held).is_err());
+        assert!(tpm.tpm.holds_in(Role::Sealing, Slot::Held).unwrap());
     }
 
     // BEP-089
