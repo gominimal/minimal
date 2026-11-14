@@ -311,6 +311,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     {
         return minimal::hosts::LocalHostNotFound::EXIT_CODE;
     }
+    // BCLI-078: a task's `minimal.toml` that does not load exits 3.
+    if e.downcast_ref::<minimal::task::TaskFileInvalid>().is_some() {
+        return minimal::task::TaskFileInvalid::EXIT_CODE;
+    }
     // BCLI-058: `min box rename` to a name BOX-010 refuses.
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
         return minimal::BoxRenameRefusal::EXIT_CODE;
@@ -1789,39 +1793,68 @@ mod tests {
         assert_eq!(failure_exit_code(&e), 3);
     }
 
-    /// BCLI-034: the real `failure_exit_code` maps each refusal that once
-    /// ended with exit 1 to the table's code, through added context. The
-    /// codes are literals, so a wrong constant fails here too.
+    /// BCLI-034: `--ingress`, `--dynamic-ingress` or `--network none`
+    /// refused for the box's network mode ends with exit 2, through context.
     #[test]
-    fn refusals_exit_with_the_table_code_through_failure_exit_code() {
-        let message = || "refused".to_owned();
-        let cases: [(&str, anyhow::Error, u8); 4] = [
-            (
-                "network flag",
-                anyhow::Error::new(minimal::NetworkFlagRefusal { message: message() }),
-                2,
-            ),
-            (
-                "no minimal.toml",
-                anyhow::Error::new(minimal::task::ProjectFileNotFound { message: message() }),
-                4,
-            ),
-            (
-                "no loadout file",
-                anyhow::Error::new(minimal::loadouts::LoadoutNotFound { message: message() }),
-                4,
-            ),
-            (
-                "no local host",
-                anyhow::Error::new(minimal::hosts::LocalHostNotFound { message: message() }),
-                4,
-            ),
-        ];
-        for (what, error, code) in cases {
-            assert_eq!(failure_exit_code(&error), code, "{what}, bare");
-            let wrapped = error.context("running the command");
-            assert_eq!(failure_exit_code(&wrapped), code, "{what}, with context");
-        }
+    fn network_flag_refusal_exits_2() {
+        let e = anyhow::Error::new(minimal::NetworkFlagRefusal {
+            message: "refused".to_owned(),
+        })
+        .context("starting the box");
+        assert_eq!(failure_exit_code(&e), 2);
+    }
+
+    /// BCLI-034: `min task run` with no `minimal.toml` ends with exit 4,
+    /// through context.
+    #[test]
+    fn project_file_not_found_exits_4() {
+        let e = anyhow::Error::new(minimal::task::ProjectFileNotFound {
+            message: "refused".to_owned(),
+        })
+        .context("running the task");
+        assert_eq!(failure_exit_code(&e), 4);
+    }
+
+    /// BCLI-034: a `--loadout` name with no loadout file ends with exit 4,
+    /// through context.
+    #[test]
+    fn loadout_not_found_exits_4() {
+        let e = anyhow::Error::new(minimal::loadouts::LoadoutNotFound {
+            message: "refused".to_owned(),
+        })
+        .context("starting the box");
+        assert_eq!(failure_exit_code(&e), 4);
+    }
+
+    /// BCLI-034: `min host start` or `stop` of a name no local host has
+    /// ends with exit 4, through context.
+    #[test]
+    fn local_host_not_found_exits_4() {
+        let e = anyhow::Error::new(minimal::hosts::LocalHostNotFound {
+            message: "refused".to_owned(),
+        })
+        .context("starting the host");
+        assert_eq!(failure_exit_code(&e), 4);
+    }
+
+    /// BCLI-078: `min task run` with a `minimal.toml` that does not load
+    /// ends with exit 3, through context, and prints the task text.
+    #[test]
+    fn task_file_invalid_exits_3() {
+        let e = anyhow::Error::new(minimal::task::TaskFileInvalid {
+            error: mfile::Error::HarnessTable(None),
+        })
+        .context("running the task");
+        assert_eq!(failure_exit_code(&e), 3);
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(
+            printed.contains("found a broken minimal.toml while resolving tasks: "),
+            "{printed}"
+        );
+        assert!(!printed.contains("Cannot start the box"), "{printed}");
     }
 
     /// An invalid project `minimal.toml` that does not parse prints its TOML

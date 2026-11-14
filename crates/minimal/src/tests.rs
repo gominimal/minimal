@@ -19998,36 +19998,11 @@ async fn box_rename_native_host_prints_no_vm_host_warning() {
     );
 }
 
-/// The exit code `main`'s `failure_exit_code` gives the refusals that
-/// `refusals_exit_with_the_table_code` checks, and 1 for anything else.
-/// This crate cannot call `failure_exit_code`, which lives in the `min`
-/// binary. `main.rs`'s `refusals_exit_with_the_table_code_through_failure_exit_code`
-/// checks the real mapping for each of these types.
-fn table_refusal_code(error: &anyhow::Error) -> u8 {
-    if error.downcast_ref::<NetworkFlagRefusal>().is_some() {
-        return NetworkFlagRefusal::EXIT_CODE;
-    }
-    if error.downcast_ref::<task::ProjectFileNotFound>().is_some() {
-        return task::ProjectFileNotFound::EXIT_CODE;
-    }
-    if error.downcast_ref::<loadouts::LoadoutNotFound>().is_some() {
-        return loadouts::LoadoutNotFound::EXIT_CODE;
-    }
-    if error.downcast_ref::<hosts::LocalHostNotFound>().is_some() {
-        return hosts::LocalHostNotFound::EXIT_CODE;
-    }
-    if error.downcast_ref::<BoxRenameRefusal>().is_some() {
-        return BoxRenameRefusal::EXIT_CODE;
-    }
-    if error.downcast_ref::<ProjectFileInvalid>().is_some() {
-        return 3;
-    }
-    1
-}
-
 /// BCLI-034, BCLI-058, BCLI-078: each refusal that ended with exit 1 ends
 /// with the code the exit-code table gives its outcome, and keeps its
-/// text. The rename refusal says box, not session.
+/// text. The rename refusal says box, not session. Each refusal carries
+/// the type that `main.rs`'s `failure_exit_code` maps to the code, and
+/// `main.rs`'s tests pin that mapping.
 #[test]
 fn refusals_exit_with_the_table_code() {
     use clap::Parser as _;
@@ -20036,7 +20011,11 @@ fn refusals_exit_with_the_table_code() {
     let empty = tempfile::tempdir().unwrap();
     let empty_dir = camino::Utf8Path::from_path(empty.path()).unwrap();
     let err = task::declared_task(empty_dir, "build").expect_err("no minimal.toml");
-    assert_eq!(table_refusal_code(&err), 4, "{err:#}");
+    assert!(
+        err.downcast_ref::<task::ProjectFileNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(task::ProjectFileNotFound::EXIT_CODE, 4);
     assert_eq!(
         format!("{err:#}"),
         format!(
@@ -20050,16 +20029,24 @@ fn refusals_exit_with_the_table_code() {
     std::fs::write(broken.path().join("minimal.toml"), "[tasks.build\n").unwrap();
     let broken_dir = camino::Utf8Path::from_path(broken.path()).unwrap();
     let err = task::declared_task(broken_dir, "build").expect_err("a broken minimal.toml");
-    assert_eq!(table_refusal_code(&err), 3, "{err:#}");
     assert!(
-        format!("{err:#}").contains("the project's minimal.toml does not load"),
+        err.downcast_ref::<task::TaskFileInvalid>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(task::TaskFileInvalid::EXIT_CODE, 3);
+    assert!(
+        format!("{err:#}").starts_with("found a broken minimal.toml while resolving tasks: "),
         "{err:#}"
     );
 
     // `--ingress` off `--network own_ip`: usage (2), text unchanged.
     let err = refuse_ingress_off_own_ip(crate::cli::CliNetworkMode::HostNet, true)
         .expect_err("--ingress needs own_ip");
-    assert_eq!(table_refusal_code(&err), 2, "{err:#}");
+    assert!(
+        err.downcast_ref::<NetworkFlagRefusal>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(NetworkFlagRefusal::EXIT_CODE, 2);
     assert_eq!(
         format!("{err:#}"),
         "--ingress needs --network own_ip: only a box with its own IP address can publish ports"
@@ -20068,7 +20055,11 @@ fn refusals_exit_with_the_table_code() {
     // `--dynamic-ingress` off `--network own_ip`: usage (2), text unchanged.
     let err = refuse_dynamic_ingress_off_own_ip(boxes::NetworkMode::HostNet, None, Some((1, 2)))
         .expect_err("--dynamic-range needs own_ip");
-    assert_eq!(table_refusal_code(&err), 2, "{err:#}");
+    assert!(
+        err.downcast_ref::<NetworkFlagRefusal>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(NetworkFlagRefusal::EXIT_CODE, 2);
     assert_eq!(
         format!("{err:#}"),
         "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with its own \
@@ -20082,7 +20073,11 @@ fn refusals_exit_with_the_table_code() {
     };
     let err = task::refuse_egress_on_none(boxes::NetworkMode::NoNet, true, &flags, None, true)
         .expect_err("--network none refuses egress");
-    assert_eq!(table_refusal_code(&err), 2, "{err:#}");
+    assert!(
+        err.downcast_ref::<NetworkFlagRefusal>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(NetworkFlagRefusal::EXIT_CODE, 2);
     assert!(
         format!("{err:#}").ends_with(
             "The box's egress rules come from --deny-all-egress. Run it with --network \
@@ -20094,13 +20089,18 @@ fn refusals_exit_with_the_table_code() {
     // `min box rename` to a name the store refuses: usage (2), says box.
     let daemon = "invalid box name: must be a single DNS label";
     let err = anyhow::Error::from(BoxRenameRefusal::from_error(daemon).expect("a refusal"));
-    assert_eq!(table_refusal_code(&err), 2, "{err:#}");
+    assert!(err.downcast_ref::<BoxRenameRefusal>().is_some(), "{err:#}");
+    assert_eq!(BoxRenameRefusal::EXIT_CODE, 2);
     assert_eq!(format!("{err:#}"), daemon);
     assert!(BoxRenameRefusal::from_error("some other failure").is_none());
 
     // `min host start` or `stop` of a name no local host has: not found (4).
     let err = hosts::named_host(&[], "nope").expect_err("no such host");
-    assert_eq!(table_refusal_code(&err), 4, "{err:#}");
+    assert!(
+        err.downcast_ref::<hosts::LocalHostNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(hosts::LocalHostNotFound::EXIT_CODE, 4);
     assert_eq!(
         format!("{err:#}"),
         "no local host is named 'nope'. Run `min host list` to see the local hosts."
@@ -20118,7 +20118,11 @@ fn refusals_exit_with_the_table_code() {
         &global,
     )
     .expect_err("no loadout file");
-    assert_eq!(table_refusal_code(&err), 4, "{err:#}");
+    assert!(
+        err.downcast_ref::<loadouts::LoadoutNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(loadouts::LoadoutNotFound::EXIT_CODE, 4);
     assert!(
         format!("{err:#}").starts_with("--loadout `missing`: "),
         "{err:#}"

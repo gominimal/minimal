@@ -645,6 +645,35 @@ impl std::fmt::Display for ProjectFileNotFound {
 
 impl std::error::Error for ProjectFileNotFound {}
 
+/// `min task run` or `min box run` with a `minimal.toml` that does not
+/// load. The run ends with exit 3 (`main.rs`), the code the architecture
+/// gives an invalid project file, as for `crate::ProjectFileInvalid`.
+#[derive(Debug)]
+pub struct TaskFileInvalid {
+    /// Why the file did not load.
+    pub error: mfile::Error,
+}
+
+impl TaskFileInvalid {
+    /// The architecture's exit code for an invalid project file.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for TaskFileInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cause is in this text and `source()` returns none, so the
+        // printer's `{:#}` shows it once.
+        write!(
+            f,
+            "found a broken {name} while resolving tasks: {error}",
+            name = mfile::MFILE_NAME,
+            error = self.error,
+        )
+    }
+}
+
+impl std::error::Error for TaskFileInvalid {}
+
 /// Look up `task` in the project's `minimal.toml`, walking up from `dir`
 /// like the activate config discovery does, and return its declaration.
 /// Errors name the fix: untrimmed name → the whitespace rejection; no
@@ -676,8 +705,10 @@ pub(crate) fn declared_task(
             }
             .into());
         }
-        // BCLI-078: a project file that does not load exits 3.
-        Err(error) => return Err(crate::ProjectFileInvalid { error }.into()),
+        // BCLI-078: a project file that does not load exits 3. This path
+        // also serves `min task run`, which starts no box, so the refusal
+        // keeps its own text.
+        Err(error) => return Err(TaskFileInvalid { error }.into()),
     };
     match file.task(task) {
         Some(t) => Ok(t),
