@@ -9109,7 +9109,7 @@ fn unknown_box_address_exit4_names_address() {
             message,
             format!(
                 "No box named {address}. \
-                 Run `min box list --all` to see the boxes on every host."
+                 Run `min box list --all` to see the boxes of every project."
             )
         );
     }
