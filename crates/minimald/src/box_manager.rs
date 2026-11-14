@@ -1761,9 +1761,10 @@ fn builtin_root_refusal(
 /// The Box Spec sections that a spec can carry and that this daemon does
 /// not enforce (BOX-076): the top-level key, the key inside it when the
 /// section is one key of a table, and the section as the log names it.
-const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
+/// `[[file_exports]]` is not one: the command that waits for the box
+/// copies it on the client (BOX-185).
+const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 4] = [
     ("file_imports", None, "[[file_imports]]"),
-    ("file_exports", None, "[[file_exports]]"),
     ("github_imports", None, "[[github_imports]]"),
     ("otel", None, "[otel]"),
     (

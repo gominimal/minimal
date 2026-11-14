@@ -3822,6 +3822,8 @@ fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
 /// BOX-076: a spec with sections the daemon does not enforce is stored
 /// whole, the box is created, and the daemon log warns once for each such
 /// section, naming it. A spec with none of them warns nothing.
+/// `[[file_exports]]` is stored and warns nothing, since the client
+/// copies it (BOX-185).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unenforced_sections_warn_once_each_naming_section() {
     let log = crate::test_harness::captured_log();
@@ -3882,7 +3884,6 @@ async fn unenforced_sections_warn_once_each_naming_section() {
     let warned = warnings(id);
     for section in [
         "[[file_imports]]",
-        "[[file_exports]]",
         "[[github_imports]]",
         "[otel]",
         "[network] vpn_network_names",
@@ -3893,7 +3894,11 @@ async fn unenforced_sections_warn_once_each_naming_section() {
             .count();
         assert_eq!(naming, 1, "one warning names {section}:\n{logged}");
     }
-    assert_eq!(warned.len(), 5, "one warning per section:\n{logged}");
+    assert!(
+        !warned.iter().any(|line| line.contains("[[file_exports]]")),
+        "the client copies [[file_exports]], so no warning names it:\n{logged}"
+    );
+    assert_eq!(warned.len(), 4, "one warning per section:\n{logged}");
     assert!(
         warnings(plain).is_empty(),
         "a spec with no unenforced section warns nothing:\n{logged}"
