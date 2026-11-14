@@ -227,6 +227,9 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// forever. Generous — a healthy daemon answers in milliseconds, so this
 /// only bounds the pathological case.
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+/// Deadline for `ConfigureLoadout`, whose synchronous graph resolution can
+/// take longer than an ordinary RPC when a project needs a cold checkout.
+pub const LOADOUT_COMPOSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// The leash a caller is expected to run a [`Client::probe`] under: the
 /// probe's connect, its handshake, and the one RPC the caller makes on it,
 /// end to end. The retry ([`CONNECT_RETRIES`]), the handshake deadline and
@@ -1885,6 +1888,11 @@ pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
 mod tests {
     use super::{Client, resolve_host_dir, resolve_socket_path};
     use std::path::Path;
+
+    #[test]
+    fn loadout_compose_deadline_exceeds_generic_rpc_deadline() {
+        assert!(super::LOADOUT_COMPOSE_TIMEOUT > super::RPC_TIMEOUT);
+    }
 
     /// An `Errorable::Err` body is a refusal, which marks the RPC's span
     /// failed; a successful response, one with an `error` field among

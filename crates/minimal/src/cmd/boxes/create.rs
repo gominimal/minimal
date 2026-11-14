@@ -4442,10 +4442,13 @@ pub(crate) async fn activate_box(
             // project config out of the session's workspace, not from a path
             // on this machine.
             let configured = client
-                .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
-                    session_id: id,
-                    contribution,
-                })
+                .oneshot_rpc_with_deadline::<ConfigureLoadout>(
+                    ConfigureLoadoutRequest {
+                        session_id: id,
+                        contribution,
+                    },
+                    minimal_client::LOADOUT_COMPOSE_TIMEOUT,
+                )
                 .instrument(entry_span.clone())
                 .await;
             let configured = match configured {
