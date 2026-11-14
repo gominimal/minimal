@@ -1484,8 +1484,26 @@ impl<'a> Env<'a> {
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
+    /// Starts each invocation of a later [`Env::run`] in `dir`, an absolute
+    /// path inside the sandbox. `None` keeps the sandbox's own start
+    /// directory.
+    #[cfg(target_os = "linux")]
+    pub fn set_start_dir(&mut self, dir: Option<PathBuf>) {
+        self.sandbox.set_run_dir(dir);
+    }
+
+    /// Gives the first invocation of the next [`Env::run`] a stdin pipe, and
+    /// hands that pipe to `hook` once the invocation starts. The later
+    /// invocations get no stdin.
+    #[cfg(target_os = "linux")]
+    pub fn set_first_stdin(&mut self, hook: sandbox::FirstStdin) {
+        self.sandbox.set_first_stdin(hook);
+    }
+
     /// Runs a sequence of invocations inside the sandbox, optionally streaming
-    /// stdout and stderr to the provided async writers.
+    /// stdout and stderr to the provided async writers. Each invocation starts
+    /// in the directory [`Env::set_start_dir`] set, and the first one gets the
+    /// stdin [`Env::set_first_stdin`] set.
     pub async fn run<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,

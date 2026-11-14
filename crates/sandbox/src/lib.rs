@@ -97,8 +97,35 @@ pub struct Sandbox<C: Channel = ()> {
     keep_dir: bool,
     stdout: Option<fs::File>,
     stderr: Option<fs::File>,
+    /// Where each command of a run starts, as an absolute path inside the
+    /// sandbox. `None` keeps the configured working directory.
+    run_dir: Option<PathBuf>,
+    /// Gets the stdin pipe of the next run's first invocation.
+    first_stdin: Option<FirstStdin>,
 
     listener: Option<listener::Listener<C>>,
+}
+
+/// A hook that gets the stdin pipe of a run's first invocation, after the
+/// invocation starts and before the run reads its output. An error from the
+/// hook stops the invocation and fails the run.
+pub struct FirstStdin(Box<dyn FnOnce(fs::File) -> std::io::Result<()> + Send>);
+
+impl FirstStdin {
+    pub fn new(hook: impl FnOnce(fs::File) -> std::io::Result<()> + Send + 'static) -> Self {
+        Self(Box::new(hook))
+    }
+
+    /// Hands `pipe` to the hook.
+    pub fn call(self, pipe: fs::File) -> std::io::Result<()> {
+        (self.0)(pipe)
+    }
+}
+
+impl std::fmt::Debug for FirstStdin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FirstStdin")
+    }
 }
 
 impl<C: Channel> Drop for Sandbox<C> {
@@ -441,6 +468,8 @@ impl<C: Channel> Sandbox<C> {
             keep_dir: false,
             stdout: Some(stdout),
             stderr: Some(stderr),
+            run_dir: None,
+            first_stdin: None,
             listener: Some(listener),
         })
     }
@@ -465,6 +494,18 @@ impl<C: Channel> Sandbox<C> {
     /// Configures the sandbox to not delete itself when dropped.
     pub fn keep_dir(&mut self, keep_dir: bool) {
         self.keep_dir = keep_dir;
+    }
+
+    /// Starts each command of a later run in `dir`, an absolute path inside
+    /// the sandbox. `None` keeps the configured working directory.
+    pub fn set_run_dir(&mut self, dir: Option<PathBuf>) {
+        self.run_dir = dir;
+    }
+
+    /// Gives the next run's first invocation a stdin pipe, and hands that
+    /// pipe to `hook`. The later invocations get no stdin.
+    pub fn set_first_stdin(&mut self, hook: FirstStdin) {
+        self.first_stdin = Some(hook);
     }
 
     /// Path to the rootfs of the sandbox.
@@ -2603,6 +2644,7 @@ impl<C: Channel> Sandbox<C> {
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
+        let mut first_stdin = self.first_stdin.take();
         for (i, exec) in invocations.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Execution(ExecutionError::Cancelled));
@@ -2614,6 +2656,13 @@ impl<C: Channel> Sandbox<C> {
             let container = self.new_container(planned.plan())?;
 
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
+            if let Some(dir) = &self.run_dir {
+                cmd.current_dir(dir);
+            }
+            let stdin_hook = if i == 0 { first_stdin.take() } else { None };
+            if stdin_hook.is_some() {
+                cmd.stdin(hakoniwa::Stdio::piped());
+            }
             cmd.stderr(hakoniwa::Stdio::MakePipe);
             cmd.stdout(hakoniwa::Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
@@ -2635,6 +2684,25 @@ impl<C: Channel> Sandbox<C> {
                     return Err(e);
                 }
             };
+
+            if let Some(hook) = stdin_hook {
+                let passed = match child.stdin.take() {
+                    Some(pipe) => hook.call(fs::File::from(std::os::fd::OwnedFd::from(pipe))),
+                    None => Err(std::io::Error::other("the invocation has no stdin pipe")),
+                };
+                if let Err(e) = passed {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(net_guard) = net_guard {
+                        net_guard.teardown().await;
+                    }
+                    return Err(Error::IO(
+                        "passing stdin to the task",
+                        Default::default(),
+                        e,
+                    ));
+                }
+            }
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
             // files, as well as to the caller-provided writers if applicable.
@@ -8412,5 +8480,101 @@ int main(int argc, char **argv) {
         // owes the real tree both of the leaves it made in it.
         classifier::remove_box_leaf(&leaf).expect("removing the box's leaf");
         classifier::remove_box_leaf(&sibling).expect("removing the sibling's leaf");
+    }
+
+    /// A program for the run tests: prints `cwd:<dir>`, then, with the
+    /// argument `read`, copies its stdin to its stdout.
+    #[cfg(target_os = "linux")]
+    const CWD_PROBE_C: &str = r#"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    char dir[4096];
+    if (!getcwd(dir, sizeof dir)) return 3;
+    printf("cwd:%s\n", dir);
+    if (argc > 1 && strcmp(argv[1], "read") == 0) {
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, stdin)) > 0) fwrite(buf, 1, n, stdout);
+    }
+    return 0;
+}
+"#;
+
+    /// `run_with_cancel` starts every invocation in the run directory, gives
+    /// only the first one a stdin pipe through the hook, and keeps the run's
+    /// output in the sandbox's stdout file as well as in the writer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_with_cancel_starts_in_the_given_dir() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping run_with_cancel_starts_in_the_given_dir: this host \
+                 denies the unprivileged user namespace every sandbox starts \
+                 by unsharing: {reason}"
+            );
+            return;
+        }
+
+        let name = "run-dir";
+        let base_dir = box_base_dir(name);
+        let build = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let src = build.path().join("cwd_probe.c");
+        let bin = build.path().join("cwd_probe");
+        std::fs::write(&src, CWD_PROBE_C).expect("writing the cwd probe source");
+        let status = std::process::Command::new("gcc")
+            .args(["-static", "-o"])
+            .arg(&bin)
+            .arg(&src)
+            .status()
+            .expect("spawning gcc to compile the cwd probe");
+        assert!(
+            status.success(),
+            "gcc failed to compile the cwd probe: {status:?}"
+        );
+        let source = build.path().join("rootfs-src");
+        probe_rootfs(&source, &bin);
+        let sandbox_home = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let sandbox_dir = sandbox_home.path().join("sandbox");
+        let mut sandbox = Config::new(name)
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+            .with_dns(false)
+            .build(sandbox_dir.clone(), ())
+            .await
+            .expect("building the box");
+
+        sandbox.set_run_dir(Some(PathBuf::from("/etc")));
+        let (hooked_tx, hooked_rx) = std::sync::mpsc::channel();
+        sandbox.set_first_stdin(FirstStdin::new(move |mut pipe| {
+            use std::io::Write as _;
+            hooked_tx.send(()).expect("recording the hook call");
+            pipe.write_all(b"from the hook\n")
+        }));
+        let invocation = |arg: &str| Invocation {
+            executable: "/usr/bin/probe".to_string(),
+            args: vec![arg.to_string()],
+            envs: Default::default(),
+        };
+        let mut out = Vec::new();
+        sandbox
+            .run(
+                vec![invocation("read"), invocation("once")],
+                Some(&mut out),
+                None::<tokio::io::Sink>,
+            )
+            .await
+            .expect("running the probes");
+
+        let out = String::from_utf8(out).expect("utf-8 output");
+        assert_eq!(out, "cwd:/etc\nfrom the hook\ncwd:/etc\n");
+        assert!(hooked_rx.try_recv().is_ok(), "the hook ran");
+        assert!(hooked_rx.try_recv().is_err(), "the hook ran only once");
+        let saved = std::fs::read_to_string(sandbox.base_dir.join("stdout"))
+            .expect("reading the saved stdout");
+        assert_eq!(saved, out);
+        drop(sandbox);
     }
 }
