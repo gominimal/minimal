@@ -3420,6 +3420,54 @@ pub(crate) fn start_loadout_selection(args: &ActivateArgs) -> loadouts::LoadoutS
     loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts)
 }
 
+/// The expander version of this `min` (BOX-074), from the same `mfile`
+/// constants the daemon reports its own from.
+pub(crate) fn client_expander_version() -> String {
+    minimald_rpc::expander_version(
+        mfile::spec::BOX_SPEC_VERSION,
+        mfile::projection::PROJECTION_VERSION,
+    )
+}
+
+/// The line `min` prints before the create when the daemon's expander
+/// version, `daemon`, differs from this `min`'s (BOX-074), or `None` when
+/// they match. A report, never a refusal: the daemon's digest comparison
+/// (BOX-072) and admission check (BOX-160) are the checks that refuse.
+pub(crate) fn expander_skew_report(daemon: Option<&str>) -> Option<String> {
+    minimald_rpc::expander_skew_message(&client_expander_version(), daemon)
+        .map(|message| format!("warning: {message}"))
+}
+
+/// Reports a skew between this `min`'s expander version and the daemon's
+/// before the create, and goes on whatever the answer (BOX-074).
+///
+/// It asks only under the version skew override. Without it, the create
+/// carries `must_match_version`, and a daemon of another build refuses
+/// the create. One build has one expander version, so a matched pair
+/// has nothing to report, and the activation path pays no round trip.
+async fn report_expander_skew(client: &mut client::Client) {
+    if version_assertion().is_some() {
+        return;
+    }
+    match client.oneshot_rpc::<minimald_rpc::GetVersion>(()).await {
+        Ok(reply) => {
+            let daemon = reply.expander_version.as_deref();
+            tracing::info!(
+                client_expander_version = %client_expander_version(),
+                daemon_expander_version = daemon.unwrap_or("none"),
+                "compared the expander versions before the create"
+            );
+            if let Some(report) = expander_skew_report(daemon) {
+                eprintln!("{report}");
+            }
+        }
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "could not read minimald's expander version; the create goes ahead"
+        ),
+    }
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     mut args: ActivateArgs,
@@ -3766,6 +3814,8 @@ pub(crate) async fn activate_box(
             Ok::<_, anyhow::Error>(client)
         })
         .await?;
+    // BOX-074: a skewed expander is reported, and the create goes on.
+    report_expander_skew(&mut client).await;
 
     // T66: an own-address box on a VM-backed host registers with the VM host
     // daemon just before the create — the host allocates the box's switch
