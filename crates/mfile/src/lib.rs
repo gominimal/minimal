@@ -1901,12 +1901,52 @@ impl File {
         OsString::from_vec(out)
     }
 
+    /// Encodes a path component for [`Self::state_dir_under`]'s flat
+    /// directory name, injectively: `-` becomes `%2D` and `%` becomes `%25`,
+    /// so a `-` in the result is always a separator. [`Self::encode_component`]
+    /// is not injective across separators (`a-`,`b` and `a`,`-b` both give
+    /// `a---b`); it stays as it is so native `state_dir` keeps its names.
+    /// Non-UTF8 bytes are preserved as-is.
+    fn encode_component_escaped(s: &OsStr) -> OsString {
+        let mut out = Vec::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            match b {
+                b'-' => out.extend_from_slice(b"%2D"),
+                b'%' => out.extend_from_slice(b"%25"),
+                _ => out.push(b),
+            }
+        }
+        OsString::from_vec(out)
+    }
+
     /// Helper method for state_dir to simplify unit testing
     fn state_dir_from_path<P: AsRef<Path>>(
         state_key: &str,
         env_base_dir: P,
         home_dir: Option<&Path>,
         mfile_dir: &Path,
+    ) -> PathBuf {
+        Self::state_dir_encoded(
+            state_key,
+            env_base_dir,
+            home_dir,
+            mfile_dir,
+            Self::encode_component,
+            None,
+        )
+    }
+
+    /// [`Self::state_dir_from_path`] with the component encoder chosen, and
+    /// what a `..` component becomes: `None` drops it, as the native names
+    /// always have; `Some(text)` keeps it as `text`, so that two paths that
+    /// differ only by a `..` get two directories.
+    fn state_dir_encoded<P: AsRef<Path>>(
+        state_key: &str,
+        env_base_dir: P,
+        home_dir: Option<&Path>,
+        mfile_dir: &Path,
+        encode: fn(&OsStr) -> OsString,
+        parent_dir: Option<&str>,
     ) -> PathBuf {
         let (start_marker, components) = home_dir
             .map(|home| mfile_dir.strip_prefix(home))
@@ -1917,7 +1957,8 @@ impl File {
         let mut tail = OsString::new();
         for (i, c) in components
             .filter_map(|c| match c {
-                Component::Normal(s) => Some(Self::encode_component(s)),
+                Component::Normal(s) => Some(encode(s)),
+                Component::ParentDir => parent_dir.map(OsString::from),
                 _ => None,
             })
             .enumerate()
@@ -1958,6 +1999,33 @@ impl File {
                 mfile_dir,
             )
         })
+    }
+
+    /// Returns the path to the durable state directory for the given key,
+    /// keyed on `project_dir` instead of where this minimal file sits on disk.
+    ///
+    /// For a daemon that reads every box's project from a tree laid out
+    /// afresh each session, native or VM, whose path changes every time, so
+    /// the caller supplies the stable host path. The `~` prefix is never
+    /// used: the host's home is not this machine's. Components are encoded
+    /// with [`Self::encode_component_escaped`], so two project paths never
+    /// share a directory.
+    pub fn state_dir_under<P: AsRef<Path>>(
+        &self,
+        state_key: &str,
+        env_base_dir: P,
+        project_dir: &Path,
+    ) -> PathBuf {
+        Self::state_dir_encoded(
+            state_key,
+            env_base_dir,
+            None,
+            project_dir,
+            Self::encode_component_escaped,
+            // A `..` the caller did not resolve stays in the key, escaped
+            // like a name would be, so `/work/a/../b` and `/work/b` differ.
+            Some("%2E%2E"),
+        )
     }
 
     /// Resolves how the remote-cache reader should locate its index:
@@ -2830,6 +2898,71 @@ mod tests {
             Path::new("/home/user/project"),
         );
         assert_eq!(result, Path::new("/tmp/state/~project/env"));
+    }
+
+    #[test]
+    fn state_dir_under_ignores_where_the_mfile_sits() {
+        let at = |p: &str| File {
+            mfile_path: Some(PathBuf::from(p)),
+            ..Default::default()
+        };
+        let project = Path::new("/home/user/src/my-project");
+        let a = at("/var/lib/minimal/sessions/aaaa/tree/minimal.toml");
+        let b = at("/var/lib/minimal/sessions/bbbb/tree/.minimal/minimal.toml");
+        let dir_a = a.state_dir_under("env", "/tmp/state", project);
+        let dir_b = b.state_dir_under("env", "/tmp/state", project);
+        assert_eq!(dir_a, dir_b);
+        // Never `~`: the project's home is another machine's.
+        assert_eq!(
+            dir_a,
+            Path::new("/tmp/state/-home-user-src-my%2Dproject/env")
+        );
+    }
+
+    /// `encode_component` aliases `/work/a-/b` and `/work/a/-b` (both
+    /// `a---b`); `state_dir_under` must give two projects two directories.
+    #[test]
+    fn state_dir_under_never_aliases_two_projects() {
+        let f = File {
+            mfile_path: Some(PathBuf::from("/tree/minimal.toml")),
+            ..Default::default()
+        };
+        let one = f.state_dir_under("env", "/tmp/state", Path::new("/work/a-/b"));
+        let two = f.state_dir_under("env", "/tmp/state", Path::new("/work/a/-b"));
+        assert_ne!(one, two);
+        assert_eq!(one, Path::new("/tmp/state/-work-a%2D-b/env"));
+        assert_eq!(two, Path::new("/tmp/state/-work-a-%2Db/env"));
+        // `%` is escaped too, so a literal `%2D` cannot pose as an escaped `-`.
+        let three = f.state_dir_under("env", "/tmp/state", Path::new("/work/a%2D/b"));
+        assert_eq!(three, Path::new("/tmp/state/-work-a%252D-b/env"));
+        assert_ne!(three, one);
+        // A `..` the caller left in the path is kept, so it cannot pose as
+        // the path it would resolve to.
+        let up = f.state_dir_under("env", "/tmp/state", Path::new("/work/a/../b"));
+        let flat = f.state_dir_under("env", "/tmp/state", Path::new("/work/b"));
+        assert_ne!(up, flat);
+        assert_eq!(up, Path::new("/tmp/state/-work-a-%2E%2E-b/env"));
+        // The native names drop it, as they always have: `/work/a/../b` and
+        // `/work/a/b` share one directory there, the aliasing this encoder
+        // is for.
+        assert_eq!(
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/work/a/../b")),
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/work/a/b"))
+        );
+    }
+
+    #[test]
+    fn encode_component_escaped_escapes_dash_and_percent() {
+        assert_eq!(File::encode_component_escaped(OsStr::new("foo")), "foo");
+        assert_eq!(
+            File::encode_component_escaped(OsStr::new("my-pro%ject")),
+            "my%2Dpro%25ject"
+        );
+        let input = OsStr::from_bytes(b"a\x80-b");
+        assert_eq!(
+            File::encode_component_escaped(input).as_bytes(),
+            b"a\x80%2Db"
+        );
     }
 
     #[test]
