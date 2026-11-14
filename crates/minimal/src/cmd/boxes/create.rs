@@ -3003,7 +3003,63 @@ pub(crate) fn put_spec(
     spec: &mfile::spec::BoxSpec,
 ) -> Result<(), anyhow::Error> {
     request.spec = Some(serde_json_lenient::to_value(spec).context("Cannot encode the box spec")?);
+    stamp_client_projection_digest(request, spec);
     Ok(())
+}
+
+/// Sets the client's projection digest of `spec` on `request` (BOX-071).
+/// The digest is over the client's own spec, read as a TOML table. It is
+/// not over the JSON the request sends. The daemon computes its digest from
+/// the JSON it receives, so the two digests differ when the spec changes on
+/// the way. A spec that names no type is of the creating verb's type, as
+/// the daemon reads it.
+///
+/// The two sides convert the spec in different ways: the client through
+/// `toml::Table::try_from`, the daemon through `spec_digest`. Both drop a
+/// null, and both refuse an integer that TOML cannot hold.
+///
+/// Gap: the typed spec has no `[secrets]` table, so this digest binds no
+/// secret grants or store rules (BOX-071 says the projection holds the
+/// requested secret scopes). It binds them when the create sends the
+/// expanded spec in place of the typed one, which #2410 tracks.
+///
+/// A spec that does not project carries no client digest. The daemon then
+/// stores none.
+pub(crate) fn stamp_client_projection_digest(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    spec: &mfile::spec::BoxSpec,
+) {
+    request
+        .config
+        .attrs
+        .remove(minimald_rpc::CLIENT_PROJECTION_DIGEST_ATTR);
+    let verb_type = match request.config.creating_verb {
+        minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
+        minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
+    };
+    let table = match toml::Table::try_from(spec) {
+        Ok(table) => table,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "computed no projection digest for the box spec; the create carries none"
+            );
+            return;
+        }
+    };
+    let Some(facts) = mfile::projection::TypeFacts::of_spec(&table, verb_type) else {
+        tracing::warn!(
+            "computed no projection digest for the box spec: it does not name its type's \
+             built-in root; the create carries none"
+        );
+        return;
+    };
+    let digest = mfile::projection::project(&table, &facts).digest();
+    tracing::info!(
+        client_projection_digest = %digest,
+        "computed the box spec's projection digest"
+    );
+    request.config.set_client_projection_digest(digest);
 }
 
 /// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
@@ -3049,6 +3105,8 @@ pub(crate) fn add_vpn_network_names(
             list.push(value);
         }
     }
+    // `network.vpn_network_names` is outside the projection, so the
+    // client digest that `put_spec` set stays the digest of this spec.
     Ok(())
 }
 
