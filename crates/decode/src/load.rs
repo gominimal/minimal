@@ -239,10 +239,14 @@ fn unescape_import(raw: &str) -> String {
 /// Packages import their siblings as `../<name>/build.ncl`, so `..` itself
 /// is not refused: where the path lands is what counts.
 ///
-/// The scan is lexical and can miss an import (see [Loader::new], whose check
-/// after loading backs it up), and it can over-match: an `import "…"` inside
-/// a comment or a string is checked too.
-fn confine_imports(entries: &[PathBuf], root: &Path, lib_path: &Path) -> Result<(), Error> {
+/// The scan is lexical and can miss an import (the check after loading,
+/// [confine_files_read], backs it up), and it can over-match: an
+/// `import "…"` inside a comment or a string is checked too.
+///
+/// Public so that a caller building its own Nickel program over a layer's
+/// files confines it the same way: this before the program reads anything,
+/// [confine_files_read] after it has typechecked and compiled.
+pub fn confine_imports(entries: &[PathBuf], root: &Path, lib_path: &Path) -> Result<(), Error> {
     let lib = lib_path.canonicalize().ok();
     let outside = |file: &Path, import: &str| Error::ImportOutside {
         file: Some(file.to_path_buf()),
@@ -319,6 +323,37 @@ fn confine_imports(entries: &[PathBuf], root: &Path, lib_path: &Path) -> Result<
         }
     }
     Ok(())
+}
+
+/// The canonical root a layer at `layer_dir` is confined to (see
+/// [LoadOptions::confine_to]). A layer directory that does not exist has no
+/// files to confine; its normalized path stands in as the root.
+pub fn layer_root(layer_dir: &Path) -> Result<PathBuf, Error> {
+    match layer_dir.canonicalize() {
+        Ok(root) => Ok(root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(normalize_path(layer_dir)?),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Refuses a Nickel program that has read a file from disk outside `root`
+/// (canonical, see [layer_root]) and the minimal library at `lib_path`.
+///
+/// This is the check after loading that backs up [confine_imports]. Run it
+/// once the program has typechecked and compiled, and also when either
+/// fails, before reporting that failure: then a foreign file is reported as
+/// outside the layer rather than quoted in a diagnostic. The refusal is an
+/// [Error::ImportOutside] naming the file, never its content.
+pub fn confine_files_read(files: &Files, root: &Path, lib_path: &Path) -> Result<(), Error> {
+    let lib = lib_path.canonicalize().ok();
+    match first_file_outside(files, root, lib.as_deref()) {
+        Some(path) => Err(Error::ImportOutside {
+            file: None,
+            import: path.to_string_lossy().into_owned(),
+            root: root.to_path_buf(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Returns the first file in `files` read from disk outside `root` and the
@@ -410,17 +445,9 @@ impl Loader {
         // escaped quote or a string form its pattern does not match. It runs
         // on the failure paths too, so a foreign file that fails to parse is
         // reported as outside the layer rather than quoted.
-        let lib = opts.minimal_lib_path.canonicalize().ok();
         let confine = |program: &Program<CacheImpl>| -> Result<(), Error> {
-            let Some(root) = opts.confine_to.as_deref() else {
-                return Ok(());
-            };
-            match first_file_outside(&program.files(), root, lib.as_deref()) {
-                Some(path) => Err(Error::ImportOutside {
-                    file: None,
-                    import: path.to_string_lossy().into_owned(),
-                    root: root.to_path_buf(),
-                }),
+            match opts.confine_to.as_deref() {
+                Some(root) => confine_files_read(&program.files(), root, &opts.minimal_lib_path),
                 None => Ok(()),
             }
         };
@@ -530,15 +557,8 @@ impl Loader {
         src.push('}');
 
         // The layer's own files may import each other and the minimal
-        // library, and nothing else. A layer directory that does not exist
-        // has no files to confine; its normalized path stands in as the root.
-        let root = match layer_dir.as_ref().canonicalize() {
-            Ok(root) => root,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                normalize_path(layer_dir.as_ref())?
-            }
-            Err(e) => return Err(e.into()),
-        };
+        // library, and nothing else.
+        let root = layer_root(layer_dir.as_ref())?;
         confine_imports(&entries, &root, &opts.minimal_lib_path)?;
 
         let confined = LoadOptions {

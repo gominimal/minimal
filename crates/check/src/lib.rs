@@ -473,8 +473,19 @@ pub fn run_checks(
         .collect::<FuturesUnordered<_>>())
 }
 
+/// The layer directory holding `dir`, a layer's `packages` or `stacks`
+/// directory. Checks that evaluate Nickel themselves confine it to this
+/// layer, as [decode] does when it loads the layer.
+pub(crate) fn layer_dir_of(dir: &Path) -> PathBuf {
+    match dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => dir.join(".."),
+    }
+}
+
 #[tracing::instrument(skip_all, err)]
 fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
+    let layer_dir = layer_dir_of(&packages_dir);
     let package_dirs: Vec<_> = match decode::build_decls_in_dir(&packages_dir) {
         Ok(i) => i,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -510,6 +521,7 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
         .into_iter()
         .map::<CheckFuture, _>(move |(pkg, dir)| {
             let ctx = ctx.clone();
+            let layer_dir = layer_dir.clone();
             Box::pin(async move {
                 let _permit = tokio::select! {
                     biased;
@@ -520,7 +532,7 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
                     }
                     permit = ctx.semaphore.clone().acquire_owned() => permit.unwrap(),
                 };
-                let result = check_package(pkg.clone(), dir, ctx).await;
+                let result = check_package(pkg.clone(), dir, layer_dir, ctx).await;
                 (CheckObj::Package(pkg), result)
             })
         })
@@ -584,6 +596,7 @@ fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFu
 async fn check_package(
     pkg: String,
     package_dir: PathBuf,
+    layer_dir: PathBuf,
     ctx: CheckCtx,
 ) -> Result<Vec<CheckResult>, Error> {
     let check_op = OpTracker::new_with_root(&ctx.ot).with_op(Operation::Check {
@@ -647,7 +660,7 @@ async fn check_package(
         tokio::task::spawn_blocking(move || {
             let _enter = span.enter();
             let file_based: Vec<Box<dyn FileBasedChecker>> = vec![
-                Box::new(ParseCheck),
+                Box::new(ParseCheck { layer_dir }),
                 Box::new(ImportLineCheck),
                 Box::new(ImportsCheck),
                 Box::new(FmtCheck),
@@ -709,7 +722,14 @@ pub(crate) trait GraphBasedChecker {
 }
 
 /// A [FileBasedChecker] that check the build.ncl file parses.
-struct ParseCheck;
+///
+/// It evaluates the package with a Nickel program of its own, confined to
+/// `layer_dir` and the minimal library the way [decode] confines a layer it
+/// loads: no file outside them is read, and a refusal names the file, never
+/// its content.
+struct ParseCheck {
+    layer_dir: PathBuf,
+}
 
 impl FileBasedChecker for ParseCheck {
     fn check(
@@ -759,13 +779,31 @@ impl FileBasedChecker for ParseCheck {
             ),
         ]));
 
-        let build_ncl = pkg_dir.join("build.ncl");
-        let build_ncl = build_ncl.to_str().ok_or_else(|| {
+        let build_ncl_path = pkg_dir.join("build.ncl");
+        let build_ncl = build_ncl_path.to_str().ok_or_else(|| {
             Error::Other(anyhow!(
                 "package build file path is not valid UTF-8: {}",
-                build_ncl.display()
+                build_ncl_path.display()
             ))
         })?;
+
+        // Refuse an import that leaves the layer before Nickel reads anything,
+        // and check every file it read once it has (see [decode::confine_imports]).
+        let root = match decode::layer_root(&self.layer_dir).and_then(|root| {
+            decode::confine_imports(
+                std::slice::from_ref(&build_ncl_path),
+                &root,
+                &ctx.stdlib_dir,
+            )
+            .map(|()| root)
+        }) {
+            Ok(root) => root,
+            Err(e) => return Ok(CheckResult::parse_failure(e.to_string())),
+        };
+        let confine = |program: &Program<CacheImpl>| {
+            decode::confine_files_read(&program.files(), &root, &ctx.stdlib_dir)
+                .map_err(|e| CheckResult::parse_failure(e.to_string()))
+        };
         let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
             .add_source(
                 std::io::Cursor::new(format!("import \"{build_ncl}\"")),
@@ -796,6 +834,9 @@ impl FileBasedChecker for ParseCheck {
         };
 
         if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
+            if let Err(refused) = confine(&program) {
+                return Ok(refused);
+            }
             return Ok(CheckResult {
                 check: "parse".into(),
                 verdict: CheckVerdict::Fail,
@@ -807,6 +848,9 @@ impl FileBasedChecker for ParseCheck {
             });
         }
         if let Err(e) = program.compile() {
+            if let Err(refused) = confine(&program) {
+                return Ok(refused);
+            }
             return Ok(CheckResult {
                 check: "parse".into(),
                 verdict: CheckVerdict::Fail,
@@ -816,6 +860,9 @@ impl FileBasedChecker for ParseCheck {
                     nickel_lang_core::error::report::ColorOpt::Never,
                 )],
             });
+        }
+        if let Err(refused) = confine(&program) {
+            return Ok(refused);
         }
 
         Ok(CheckResult {
@@ -1495,6 +1542,155 @@ mod tests {
 
         assert_eq!(seen.len(), 2, "expected one check per object, got {seen:?}");
         std::fs::remove_dir_all(&dir).expect("cleanup test tmp dir");
+    }
+
+    const SECRET: &str = "secret-marker-xyz";
+
+    /// A layer at `<dir>/layer` with package `p` (`build.ncl` = `build`) and
+    /// stack `s` (`stack.ncl` = `stack`), a minimal library directory of its
+    /// own at `<dir>/stdlib`, and a file outside both holding [SECRET] at
+    /// `<dir>/secret.ncl`. Returns the layer directory and a context for it.
+    fn confined_layer(dir: &Path, build: &str, stack: &str) -> (PathBuf, CheckCtx) {
+        let layer = dir.join("layer");
+        let pkg = layer.join("packages").join("p");
+        let stk = layer.join("stacks").join("s");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(&stk).unwrap();
+        std::fs::write(pkg.join("build.ncl"), build).unwrap();
+        std::fs::write(stk.join("stack.ncl"), stack).unwrap();
+        std::fs::write(
+            dir.join("secret.ncl"),
+            format!("{{ leaked = \"{SECRET}\" }}"),
+        )
+        .unwrap();
+        let stdlib = dir.join("stdlib");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&stdlib).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let ctx = CheckCtx::new(
+            vec![],
+            vec![],
+            false,
+            None,
+            stdlib,
+            Cache::at_dir(&cache).expect("Cache::at_dir"),
+            None,
+            None,
+        );
+        (layer, ctx)
+    }
+
+    /// Runs `mip check`'s package and stack checks over `layer` (without a
+    /// graph, so each evaluates its own Nickel program) and returns the
+    /// `parse` results of package `p` and of stack `s`, each with every
+    /// message from all of that object's results.
+    async fn parse_results(
+        layer: &Path,
+        ctx: CheckCtx,
+    ) -> (CheckResult, String, CheckResult, String) {
+        let mut stream = run_checks(
+            Some(layer.join("packages")),
+            Some(layer.join("stacks")),
+            ctx,
+        )
+        .expect("run_checks enumerates the layer");
+        let (mut pkg, mut stk) = (None, None);
+        while let Some((obj, result)) = stream.next().await {
+            let results = result.unwrap_or_else(|e| panic!("{obj}: {e}"));
+            let text = results
+                .iter()
+                .flat_map(|r| r.err.iter().cloned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let parse = results
+                .into_iter()
+                .find(|r| r.check == "parse")
+                .unwrap_or_else(|| panic!("{obj}: no parse result"));
+            match obj {
+                CheckObj::Package(_) => pkg = Some((parse, text)),
+                CheckObj::Stack(_) => stk = Some((parse, text)),
+            }
+        }
+        let (pkg, pkg_text) = pkg.expect("a result for package p");
+        let (stk, stk_text) = stk.expect("a result for stack s");
+        (pkg, pkg_text, stk, stk_text)
+    }
+
+    fn assert_refused(result: &CheckResult, text: &str) {
+        assert!(matches!(result.verdict, CheckVerdict::Fail), "{text}");
+        assert!(
+            result.err.iter().any(|e| e.contains("outside the layer")),
+            "{text}"
+        );
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    #[tokio::test]
+    async fn check_refuses_an_absolute_import_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.ncl");
+        let src = format!(
+            "let leak = import \"{}\" in {{ name = leak.leaked }}\n",
+            secret.to_str().unwrap()
+        );
+        let (layer, ctx) = confined_layer(dir.path(), &src, &src);
+
+        let (pkg, pkg_text, stk, stk_text) = parse_results(&layer, ctx).await;
+        assert_refused(&pkg, &pkg_text);
+        assert_refused(&stk, &stk_text);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn check_refuses_an_import_through_a_symlink_out_of_the_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = "let leak = import \"./lib/secret.ncl\" in { name = leak.leaked }\n";
+        let (layer, ctx) = confined_layer(dir.path(), src, src);
+        std::os::unix::fs::symlink(dir.path(), layer.join("packages/p/lib")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), layer.join("stacks/s/lib")).unwrap();
+
+        let (pkg, pkg_text, stk, stk_text) = parse_results(&layer, ctx).await;
+        assert_refused(&pkg, &pkg_text);
+        assert_refused(&stk, &stk_text);
+    }
+
+    /// A helper inside the package and a sibling package reached with `..`
+    /// still evaluate.
+    #[tokio::test]
+    async fn check_still_evaluates_imports_inside_the_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (layer, ctx) = confined_layer(
+            dir.path(),
+            "let helper = import \"./lib/helper.ncl\" in\n\
+             let q = import \"../q/build.ncl\" in\n\
+             { name = helper.name, sibling = q.name }\n",
+            "{ name = \"s\" }\n",
+        );
+        let lib = layer.join("packages/p/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("helper.ncl"), "{ name = \"p\" }\n").unwrap();
+        let q = layer.join("packages/q");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join("build.ncl"), "{ name = \"q\" }\n").unwrap();
+
+        let ctx = CheckCtx {
+            filter_names: vec!["p".into()],
+            ..ctx
+        };
+        let mut stream = run_checks(Some(layer.join("packages")), None, ctx)
+            .expect("run_checks enumerates the layer");
+        let (obj, result) = stream.next().await.expect("one package result");
+        let results = result.unwrap_or_else(|e| panic!("{obj}: {e}"));
+        let parse = results
+            .iter()
+            .find(|r| r.check == "parse")
+            .expect("a parse result");
+        assert!(
+            matches!(parse.verdict, CheckVerdict::Pass),
+            "{:?}",
+            parse.err
+        );
+        assert!(stream.next().await.is_none(), "only package p is checked");
     }
 }
 
