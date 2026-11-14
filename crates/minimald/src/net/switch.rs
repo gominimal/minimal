@@ -1076,7 +1076,7 @@ where
                 // flow, outside the VM: reported only when the drop line
                 // fires, so under the same rate limit, never per frame.
                 if gate.limiter.warn(
-                    &gate.label,
+                    gate.offender(),
                     Direction::Egress,
                     remote,
                     transport,
@@ -1735,6 +1735,9 @@ pub struct BoxGate {
     /// against it, so the name rule reads the name the target holds and
     /// not the source's lookups. `None` for a gate built with no name.
     zone_name: Option<String>,
+    /// The box's name as it was given, for the lines that name the box
+    /// (gominimal/inbox#1228). `None` for a gate built with no name.
+    name: Option<String>,
 }
 
 /// What the gate holds for one flow to a host exposure.
@@ -2129,6 +2132,7 @@ impl BoxGate {
             host_flows: Mutex::new(HashMap::new()),
             box_names: named_boxes(policy),
             zone_name: box_name.map(box_zone_name),
+            name: box_name.map(str::to_owned),
         }
     }
 
@@ -2162,6 +2166,22 @@ impl BoxGate {
         self.names_box(&target)
     }
 
+    /// The box's own name for a log line, as the box was named, so a reader
+    /// sees what `min box list` shows (the zone name folds its case).
+    /// `None` for a gate built with no name.
+    fn box_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The box as a violation line names it ([`super::policy::Offender`]):
+    /// its switch address and its own name.
+    fn offender(&self) -> super::policy::Offender<'_> {
+        super::policy::Offender {
+            session_id: &self.label,
+            box_name: self.box_name(),
+        }
+    }
+
     /// The name rule's verdict on `target` for a box that names boxes:
     /// `Some(Ok(()))` when [`Self::box_names`] lists the zone name the
     /// target holds, `Some(Err(name))` otherwise, and `None` for a box that
@@ -2191,6 +2211,7 @@ impl BoxGate {
         }
         tracing::warn!(
             session_id = %self.label,
+            box = self.box_name(),
             direction = %Direction::Egress,
             remote_addr = %destination,
             %proto,
@@ -2362,6 +2383,7 @@ impl BoxGate {
         {
             tracing::warn!(
                 session_id = %self.label,
+                box = self.box_name(),
                 %direction,
                 remote_addr = %SocketAddrV4::new(self.host_alias, port),
                 proto = %Proto::from_ipproto(match proto {
@@ -2756,7 +2778,7 @@ impl BoxGate {
         // audit's line below, which stays the reset channel's account.
         if class == refusal::UNPUBLISHED_PORT {
             self.limiter.warn(
-                &self.label,
+                self.offender(),
                 Direction::Ingress,
                 Some(SocketAddr::V4(pkt.src)),
                 Proto::Tcp,
@@ -2969,7 +2991,7 @@ impl BoxGate {
         // source box and rule per minute (R2.7), whichever leg said it, so
         // the two legs' says of one violation can never be two lines.
         peer.limiter.warn(
-            &peer.label,
+            peer.offender(),
             Direction::Egress,
             Some(SocketAddr::V4(pkt.dst)),
             Proto::Tcp,
@@ -3219,7 +3241,7 @@ impl BoxGate {
                 // Rate-limited per flow (R2.7): one refused flow is one line,
                 // naming the client whose connect was refused.
                 self.limiter.warn(
-                    &self.label,
+                    self.offender(),
                     Direction::Ingress,
                     Some(SocketAddr::V4(pkt.src)),
                     Proto::from_ipv4_number(pkt.proto),
@@ -4410,7 +4432,7 @@ where
                 // count for the refusal audit's line to carry — its audit is
                 // the drop limiter's, with the drop's own vocabulary.
                 gate.limiter.warn(
-                    &gate.label,
+                    gate.offender(),
                     Direction::Ingress,
                     Some(SocketAddr::V4(src)),
                     Proto::from_ipproto(proto),
@@ -6428,12 +6450,19 @@ pub(crate) mod tests {
 
     /// NET-062's warning: every drop is logged once per box per rule per
     /// minute — a flood of identical drops says one line, a different rule is
-    /// still heard — and the line carries the box, the direction, the
-    /// destination and the protocol (R2.7).
+    /// still heard — and the line carries the box's address and name, the
+    /// direction, the destination and the protocol (R2.7; the name since
+    /// gominimal/inbox#1228, so a reader need not map an address that
+    /// means nothing once the box is gone).
     #[tokio::test]
     async fn egress_drop_logged_rate_limited() {
         let capture = crate::test_harness::captured_log();
-        let mut harness = spawn_test_relay(&undeclared_destination_egress());
+        let mut harness = spawn_named_relay_for(
+            LEASE,
+            Some("drop-1228"),
+            Some(&undeclared_destination_egress()),
+            |_| {},
+        );
 
         // Three identical drops, then the sentinel.
         let denied = egress_tcp_frame(LEASE, Ipv4Addr::new(203, 0, 113, 7), 443);
@@ -6461,6 +6490,7 @@ pub(crate) mod tests {
         for expected in [
             "network policy violation",
             "session_id=\"100.64.0.9\"",
+            "box=\"drop-1228\"",
             "direction=egress",
             "remote_addr=203.0.113.7:443",
             "proto=tcp",
