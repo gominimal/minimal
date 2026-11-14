@@ -1802,6 +1802,18 @@ pub(crate) async fn run_entry(
                                 for line in kept_box_lines(why, &session_name) {
                                     eprintln!("{line}");
                                 }
+                                // BOX-185: an attached run copies the box's
+                                // declared exports once the box ended. A
+                                // `--detach` run returned above and copies
+                                // nothing (BOX-186).
+                                crate::cmd::copy_box_exports(
+                                    &mut client,
+                                    id,
+                                    &session_name,
+                                    Some(std::path::Path::new(abs_path.as_str())),
+                                    &mut std::io::stderr(),
+                                )
+                                .await;
                             }
                             TaskBoxEnd::Remove => {
                                 tracing::info!(

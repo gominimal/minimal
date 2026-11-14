@@ -155,8 +155,9 @@ fn wait_label(after: std::time::Duration) -> String {
     }
 }
 
-/// Waits until the box `target` names on `hosts` ends, and returns its exit
-/// code as [`wait_exit`] gives it. With `timeout`, the wait stops when the
+/// Waits until the box `target` names on `hosts` ends, copies its declared
+/// file exports into its project, and returns its exit code as
+/// [`wait_exit`] gives it. With `timeout`, the wait stops when the
 /// box still runs after it, with a [`BoxTimedOut`], and leaves the box
 /// running. The record is read again every `poll`.
 pub(crate) async fn box_wait_on_hosts(
@@ -194,6 +195,17 @@ pub(crate) async fn box_wait_on_hosts(
             }
         };
         if let Some(ended) = wait_exit(&shown.record, target) {
+            // BOX-185: the wait copies the box's declared exports, on
+            // every end, before it gives back the box's code.
+            let root = shown.record.project_root.as_ref();
+            copy_box_exports(
+                &mut client,
+                id,
+                target,
+                root.map(|root| std::path::Path::new(root.as_str())),
+                &mut std::io::stderr(),
+            )
+            .await;
             return match ended {
                 Ok(code) => {
                     tracing::info!(verb = "box wait", box_id = %id, exit_code = code, outcome = "ended");
