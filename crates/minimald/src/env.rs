@@ -5221,6 +5221,53 @@ exit $rc
         );
     }
 
+    // T48: only a run hides socat's stderr. A call that prints no line of
+    // its own, as `min net expose` does, keeps socat's connect error.
+    #[test]
+    fn min_helper_expose_keeps_socat_connect_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let bin = rootfs.join("refusedbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let socat = bin.join("socat");
+        // What socat prints when /run/minenv_sock is not there.
+        std::fs::write(
+            &socat,
+            "#!/bin/sh\necho 'socat[1] E connect(5, AF=1 \"/run/minenv_sock\", 18): \
+             No such file or directory' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Ok(out) = std::process::Command::new("bash")
+            .arg(rootfs.join("usr/bin/min"))
+            .args(["net", "expose", "8080"])
+            .current_dir(rootfs)
+            .env_remove("TRACEPARENT")
+            .env("PWD", rootfs)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdin(std::process::Stdio::null())
+            .output()
+        else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("No such file or directory"),
+            "socat's connect error must reach stderr: {stderr}"
+        );
+    }
+
     /// The real `socat` on this host's `PATH`, or `None` when it has none.
     fn host_socat() -> Option<PathBuf> {
         std::env::var_os("PATH")
