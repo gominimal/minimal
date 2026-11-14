@@ -8,6 +8,7 @@ use nickel_lang_core::files::Files;
 use nickel_lang_core::position::TermPos;
 use nickel_lang_core::program::Program;
 use std::fmt;
+use std::path::PathBuf;
 
 /// Errors that can occur when decoding nickel layers.
 #[derive(Debug)]
@@ -83,6 +84,57 @@ pub enum Error {
     /// would otherwise abort the process with an uncatchable stack overflow
     /// during evaluation instead of surfacing a recoverable error.
     AttrTooDeep { max_depth: usize },
+    /// The `file` of a `Local` input or a file `Source` could not be used.
+    ///
+    /// Such a file must sit in the package directory (the directory of the
+    /// `.ncl` file that names it). The message names the path and the reason,
+    /// never the file's content.
+    LocalInput {
+        files: Files,
+        pos: TermPos,
+        /// What named the file: "local input" or "source file".
+        what: &'static str,
+        path: PathBuf,
+        why: LocalInputWhy,
+    },
+    /// A Nickel file in a layer imports a file outside the layer.
+    ///
+    /// A layer's files may import each other and the minimal library, and
+    /// nothing else: the message names the importing file, the import string
+    /// and the layer root, never the imported file's content.
+    ImportOutside {
+        /// The importing file, when known. The check before loading knows it;
+        /// the check after loading sees only the files Nickel read, so there
+        /// `import` is the offending file's path and `file` is `None`.
+        file: Option<PathBuf>,
+        import: String,
+        root: PathBuf,
+    },
+}
+
+/// Why a package-relative `file` was refused (see [Error::LocalInput]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalInputWhy {
+    /// The path is absolute, climbs out with `..`, or resolves (through a
+    /// symlink) outside the package directory.
+    Outside,
+    /// No file exists at the path.
+    NotFound,
+    /// The path names a directory or another non-regular file.
+    NotAFile,
+    /// The file exists but could not be read.
+    Unreadable(std::io::ErrorKind),
+}
+
+impl fmt::Display for LocalInputWhy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LocalInputWhy::Outside => write!(f, "it is outside the package directory"),
+            LocalInputWhy::NotFound => write!(f, "it does not exist"),
+            LocalInputWhy::NotAFile => write!(f, "it is not a regular file"),
+            LocalInputWhy::Unreadable(kind) => write!(f, "it could not be read ({})", kind),
+        }
+    }
 }
 
 impl Error {
@@ -181,6 +233,32 @@ impl fmt::Display for Error {
                 f,
                 "attribute value nested too deeply: exceeds the maximum depth of {}",
                 max_depth
+            ),
+            Error::LocalInput {
+                what, path, why, ..
+            } => {
+                write!(f, "{} {} refused: {}", what, path.display(), why)
+            }
+            Error::ImportOutside {
+                file: Some(file),
+                import,
+                root,
+            } => write!(
+                f,
+                "{} imports \"{}\", which is outside the layer at {}",
+                file.display(),
+                import,
+                root.display()
+            ),
+            Error::ImportOutside {
+                file: None,
+                import,
+                root,
+            } => write!(
+                f,
+                "the layer loads {}, which is outside the layer at {}",
+                import,
+                root.display()
             ),
         }
     }
@@ -392,6 +470,38 @@ impl Error {
                 max_depth
             )
             .unwrap(),
+            Error::LocalInput {
+                files,
+                pos,
+                what,
+                path,
+                why,
+            } => {
+                let mut files = files.clone();
+                let diagnostic = Diagnostic::error().with_message(format!(
+                    "{} {} refused: {}",
+                    what,
+                    path.display(),
+                    why
+                ));
+                let diagnostic = if let Some(pos) = pos.into_opt() {
+                    diagnostic.with_label(primary(&pos))
+                } else {
+                    diagnostic
+                };
+                let diagnostic = diagnostic.with_note(
+                    "the file must be inside the package directory, \
+                     without `..` or a leading `/`",
+                );
+
+                report_with(
+                    writer,
+                    &mut files,
+                    diagnostic,
+                    nickel_lang_core::error::report::ErrorFormat::Text,
+                );
+            }
+            Error::ImportOutside { .. } => writeln!(writer, "Error: {}", self).unwrap(),
         }
     }
 

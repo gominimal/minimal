@@ -1,10 +1,11 @@
 //! Build specification objects.
 
-use crate::{Error, ObjTy, attrs::AttrValue, deserialize_field, eval_if_closure, read_ty};
+use crate::{
+    Error, LocalInputWhy, ObjTy, attrs::AttrValue, deserialize_field, eval_if_closure, read_ty,
+};
 use crate::{StrPos, cmds_from_cmd_term, cmds_from_cmds_term};
 use common::Target;
 use nickel_lang_core::eval::value::NickelValue;
-use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
 use nickel_lang_core::term::{IndexMap, RuntimeContract};
@@ -163,7 +164,7 @@ pub struct SourceInput {
 
 impl SourceInput {
     fn from_term(rt: &NickelValue, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
-        let mut filename: Option<(String, FileId)> = None;
+        let mut filename: Option<(String, TermPos)> = None;
 
         let mut url: Option<(String, Option<TermPos>)> = None;
         let mut sha256: Option<(String, Option<TermPos>)> = None;
@@ -179,13 +180,7 @@ impl SourceInput {
                             if let Some(rt) = field.value.as_ref() {
                                 filename = Some((
                                     deserialize_field("source `file`", "a string", rt, program)?,
-                                    field
-                                        .value
-                                        .as_ref()
-                                        .unwrap()
-                                        .pos(program.pos_table())
-                                        .src_id()
-                                        .unwrap(),
+                                    rt.pos(program.pos_table()),
                                 ));
                             }
                             Ok(())
@@ -235,26 +230,9 @@ impl SourceInput {
                 })?;
         }
 
-        let from = if let Some((file, file_id)) = filename {
-            if file.contains("..") {
-                return Err(Error::Other(format!(
-                    "{}: file sources cannot contain '..'",
-                    file
-                )));
-            }
-
-            let full_path = Path::new(program.files().name(file_id))
-                .parent()
-                .unwrap()
-                .join(&file);
-
-            let file_hash = blake3::hash(&std::fs::read(&full_path).unwrap_or_else(|err| {
-                panic!(
-                    "Source input could not be read: {} (file: {})",
-                    err,
-                    full_path.display()
-                )
-            }));
+        let from = if let Some((file, file_pos)) = filename {
+            let (full_path, file_hash) =
+                read_package_file(program, "source file", &file, file_pos)?;
 
             SourceFetch::Local {
                 full_path,
@@ -472,35 +450,26 @@ impl BuildDep {
         rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<(PathBuf, String, blake3::Hash), Error> {
-        let mut file: Option<(String, FileId)> = None;
+        let mut file: Option<(String, TermPos)> = None;
         if let Some(r) = crate::record_data_from_val(rt) {
             r.fields
                 .iter()
                 .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
                     match ident_and_loc.label() {
                         "file" => {
-                            file = Some((
-                                deserialize_field(
-                                    "local `file`",
-                                    "a string",
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                )?,
-                                field
-                                    .value
-                                    .as_ref()
-                                    .unwrap()
-                                    .pos(program.pos_table())
-                                    .src_id()
-                                    .unwrap(),
-                            ));
+                            if let Some(value) = field.value.as_ref() {
+                                file = Some((
+                                    deserialize_field("local `file`", "a string", value, program)?,
+                                    value.pos(program.pos_table()),
+                                ));
+                            }
                             Ok(())
                         }
                         _ => Ok(()), // TODO: Should we error if we see an unknown field?
                     }
                 })?;
         }
-        let (file, src_id) = match file {
+        let (file, file_pos) = match file {
             Some(file) => file,
             None => {
                 return Err(Error::MissingField {
@@ -512,21 +481,76 @@ impl BuildDep {
             }
         };
 
-        let full_path = Path::new(program.files().name(src_id))
-            .parent()
-            .unwrap()
-            .join(&file);
-
-        let file_hash = blake3::hash(&std::fs::read(&full_path).unwrap_or_else(|err| {
-            panic!(
-                "Local input could not be read: {} (file: {})",
-                err,
-                full_path.display()
-            )
-        }));
+        let (full_path, file_hash) = read_package_file(program, "local input", &file, file_pos)?;
 
         Ok((full_path, file, file_hash))
     }
+}
+
+/// Reads a file that package content names relative to its package directory.
+///
+/// The package directory is the directory of the `.ncl` file holding the
+/// string at `pos`. `file` must be a plain relative path: names and
+/// subdirectories only, no `..`, no root and no prefix. Once symlinks are
+/// resolved it must still lie inside the package directory, and it must be a
+/// regular file that can be read. Every failure is an [Error::LocalInput]
+/// naming the path and the reason, never the content.
+///
+/// Returns the joined (not canonicalized) path and the hash of the content.
+fn read_package_file(
+    program: &Program<CacheImpl>,
+    what: &'static str,
+    file: &str,
+    pos: TermPos,
+) -> Result<(PathBuf, blake3::Hash), Error> {
+    use std::path::Component;
+
+    let refuse = |path: PathBuf, why: LocalInputWhy| Error::LocalInput {
+        files: program.files(),
+        pos,
+        what,
+        path,
+        why,
+    };
+    let why_io = |e: &std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => LocalInputWhy::NotFound,
+        kind => LocalInputWhy::Unreadable(kind),
+    };
+
+    let rel = Path::new(file);
+    let plain = rel
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    // A string with no source file has no package directory to sit in.
+    let root = match pos.src_id() {
+        Some(src_id) if plain => Path::new(program.files().name(src_id))
+            .parent()
+            .map(Path::to_path_buf),
+        _ => None,
+    };
+    let Some(root) = root else {
+        return Err(refuse(rel.to_path_buf(), LocalInputWhy::Outside));
+    };
+    let full_path = root.join(rel);
+
+    // Canonicalizing both sides resolves symlinks, so a link inside the
+    // package that points out of it is refused like an explicit path would be.
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| refuse(full_path.clone(), why_io(&e)))?;
+    let canon = full_path
+        .canonicalize()
+        .map_err(|e| refuse(full_path.clone(), why_io(&e)))?;
+    if !canon.starts_with(&canon_root) {
+        return Err(refuse(full_path, LocalInputWhy::Outside));
+    }
+    let meta = std::fs::metadata(&canon).map_err(|e| refuse(full_path.clone(), why_io(&e)))?;
+    if !meta.is_file() {
+        return Err(refuse(full_path, LocalInputWhy::NotAFile));
+    }
+    let content = std::fs::read(&canon).map_err(|e| refuse(full_path.clone(), why_io(&e)))?;
+
+    Ok((full_path, blake3::hash(&content)))
 }
 
 /// An output from a build.
@@ -1280,6 +1304,155 @@ mod tests {
             source,
             BuildDep::Local{ full_path, .. } if full_path.ends_with("testdata/local_input.txt"),
         ));
+    }
+
+    /// Writes `<dir>/pkg/input.ncl` declaring `decl` (a `Local` or `Source`
+    /// record whose `file` is `file`), loads it and decodes the input.
+    fn decode_file_input(dir: &Path, ty: &str, file: &str) -> Result<BuildDep, Error> {
+        let pkg = dir.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let ncl = pkg.join("input.ncl");
+        std::fs::write(
+            &ncl,
+            format!("let {{{ty}, ..}} = import \"minimal.ncl\" in\n{{file = \"{file}\"}} | {ty}\n"),
+        )
+        .unwrap();
+
+        let (term, mut program, _origin, _target) = Loader::new(
+            format!("import \"{}\"", ncl.to_str().unwrap()),
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        BuildDep::from_term(&term, &mut program, &mut ())
+    }
+
+    /// The reason a decoded file input was refused, and everything the
+    /// refusal prints (its `Display` and its rendered diagnostic).
+    fn refusal(res: Result<BuildDep, Error>) -> (LocalInputWhy, String) {
+        let err = match res {
+            Ok(dep) => panic!("expected the file input to be refused, got {dep:?}"),
+            Err(err) => err,
+        };
+        let why = match &err {
+            Error::LocalInput { why, .. } => *why,
+            other => panic!("expected Error::LocalInput, got {other:?}"),
+        };
+        let mut buf = codespan_reporting::term::termcolor::Buffer::no_color();
+        err.report_to(&mut buf);
+        let text = format!("{err}\n{}", String::from_utf8_lossy(buf.as_slice()));
+        (why, text)
+    }
+
+    const SECRET: &str = "secret-marker-xyz";
+
+    /// A host file outside the package, holding [SECRET].
+    fn host_secret(dir: &Path) -> PathBuf {
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, SECRET).unwrap();
+        secret
+    }
+
+    #[test]
+    fn local_input_in_a_subdirectory_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("pkg").join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("a.patch"), "patch").unwrap();
+
+        let dep = decode_file_input(dir.path(), "Local", "files/a.patch").unwrap();
+        assert!(matches!(
+            dep,
+            BuildDep::Local { full_path, filename, .. }
+                if full_path.ends_with("pkg/files/a.patch") && filename == "files/a.patch"
+        ));
+    }
+
+    #[test]
+    fn local_input_absolute_path_is_refused_without_its_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = host_secret(dir.path());
+
+        let (why, text) = refusal(decode_file_input(
+            dir.path(),
+            "Local",
+            secret.to_str().unwrap(),
+        ));
+        assert_eq!(why, LocalInputWhy::Outside, "{text}");
+        assert!(!text.contains(SECRET), "{text}");
+        assert!(text.contains("outside the package directory"), "{text}");
+    }
+
+    #[test]
+    fn local_input_parent_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        host_secret(dir.path());
+
+        let (why, text) = refusal(decode_file_input(
+            dir.path(),
+            "Local",
+            "../outside/secret.txt",
+        ));
+        assert_eq!(why, LocalInputWhy::Outside, "{text}");
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_input_symlink_out_of_the_package_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = host_secret(dir.path());
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::os::unix::fs::symlink(&secret, pkg.join("link.txt")).unwrap();
+
+        let (why, text) = refusal(decode_file_input(dir.path(), "Local", "link.txt"));
+        assert_eq!(why, LocalInputWhy::Outside, "{text}");
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    #[test]
+    fn local_input_directory_is_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pkg").join("sub")).unwrap();
+
+        let (why, text) = refusal(decode_file_input(dir.path(), "Local", "sub"));
+        assert_eq!(why, LocalInputWhy::NotAFile, "{text}");
+    }
+
+    #[test]
+    fn local_input_missing_file_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (why, text) = refusal(decode_file_input(dir.path(), "Local", "missing.txt"));
+        assert_eq!(why, LocalInputWhy::NotFound, "{text}");
+        assert!(text.contains("missing.txt"), "{text}");
+    }
+
+    #[test]
+    fn source_file_absolute_path_is_refused_without_its_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = host_secret(dir.path());
+
+        let (why, text) = refusal(decode_file_input(
+            dir.path(),
+            "Source",
+            secret.to_str().unwrap(),
+        ));
+        assert_eq!(why, LocalInputWhy::Outside, "{text}");
+        assert!(!text.contains(SECRET), "{text}");
+        assert!(text.contains("source file"), "{text}");
     }
 
     #[test]
