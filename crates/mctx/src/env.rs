@@ -347,6 +347,19 @@ impl EnvChannel<'_> {
             }
             Some((t, g)) => (t, g),
         };
+        // The same `[patches]` gate `mip run <task>` applies, before the
+        // task's patches reach `make_env` (inbox#1128): a nested `run` is
+        // another way to run a project task by name, and without the gate a
+        // task with no patches could run one that has them, past the policy.
+        let task = match crate::gate_task_patches(&build_ctx, task_name, task) {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(gated) => {
+                if let Some(notice) = gated.ignored_notice(task_name) {
+                    writeln!(stream, "msg:{notice}").ok();
+                }
+                gated.task
+            }
+        };
         let parsed_args = if !task.args.is_empty() {
             Some(match task.args.parse(args) {
                 Err(e) => {
@@ -1592,7 +1605,7 @@ impl tokio::io::AsyncWrite for StreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConfigBuilder;
+    use crate::{ConfigBuilder, TaskPatchPolicy};
     use sandbox::Channel;
     use std::io::{BufRead, BufReader};
     use tempfile::tempdir;
@@ -2391,6 +2404,147 @@ mod tests {
             .expect("set_nonblocking failed");
         let reader = BufReader::new(stream);
         reader.lines().map_while(|l| l.ok()).collect()
+    }
+
+    /// A stand-in for `mip`'s user-policy gate (which lives in `mip`, behind
+    /// the [`crate::TaskPatchGate`] hook): it refuses a task that declares
+    /// the entry `deny`, drops the entry `ignore`, and lets the rest through.
+    #[derive(Debug)]
+    struct TestGate {
+        deny: &'static str,
+        ignore: &'static str,
+    }
+
+    impl crate::TaskPatchGate for TestGate {
+        fn gate(
+            &self,
+            _ctx: &Context,
+            task_name: &str,
+            mut task: mfile::Task,
+        ) -> Result<crate::GatedTask, Error> {
+            let declares =
+                |p: &EnvPatches, e: &str| p.dir.contains_key(e) || p.file.contains_key(e);
+            if declares(&task.patch, self.deny) {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "task `{task_name}` declares `{}`: policy denied it (test gate)",
+                    self.deny
+                )));
+            }
+            let mut ignored = Vec::new();
+            if declares(&task.patch, self.ignore) {
+                task.patch.dir.remove(self.ignore);
+                task.patch.file.remove(self.ignore);
+                ignored.push(self.ignore.to_owned());
+            }
+            Ok(crate::GatedTask { task, ignored })
+        }
+    }
+
+    /// The fixture's denied entry, which task `peek-denied` declares.
+    const DENIED: &str = "/min-test-1128-denied";
+
+    /// A [`TestGate`] that denies `deny` and ignores `ignore`.
+    fn test_gate(deny: &'static str, ignore: &'static str) -> TaskPatchPolicy {
+        TaskPatchPolicy::Gated(std::sync::Arc::new(TestGate { deny, ignore }))
+    }
+
+    /// Helper: a Context over the `patchrepo` fixture, whose task
+    /// `peek-denied` declares `patch.dir."/min-test-1128-denied"`, built with
+    /// `policy` (inbox#1128). Returns the state dir, which must outlive the
+    /// context.
+    fn setup_patchrepo_ctx(policy: TaskPatchPolicy) -> (TempDir, Context) {
+        let state = tempdir().unwrap();
+        let manifest_dir =
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).to_path_buf();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(manifest_dir.join("testdata").join("patchrepo"))
+            .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+            .with_no_fetch(true)
+            .with_task_patch_policy(policy)
+            .build()
+            .unwrap();
+        (state, Context::new(config).unwrap())
+    }
+
+    /// The nested-run path to inbox#1128: a sandbox sends `run%<task>` over
+    /// `/run/minenv_sock` for a project task whose patch the context's gate
+    /// refuses. The channel passes the task through the same hook `mip run
+    /// <task>` does and reports the refusal, before any environment is built
+    /// for it. `mip`'s tests cover the user-policy gate itself.
+    #[test]
+    fn env_channel_nested_run_refuses_a_denied_patch() {
+        let (state_dir, mut ctx) = setup_patchrepo_ctx(test_gate(DENIED, ""));
+        let mut graph = ctx.graph_from_all_packages().unwrap();
+        graph.top_levels = vec![];
+        let mut chan = EnvChannel {
+            graph: &mut graph,
+            ctx: &mut ctx,
+            task_name: "outer".to_string(),
+            state_dir: state_dir.path().to_path_buf(),
+            has_packages: HashSet::new(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let rootfs = tempdir().unwrap();
+        chan.handle(&mut ours, "run%peek-denied", rootfs.path());
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("policy denied"),
+            "unexpected output: {lines:?}"
+        );
+        assert!(text.contains(DENIED), "unexpected output: {lines:?}");
+        assert!(
+            lines.last().is_some_and(|l| l.starts_with("error:")),
+            "the channel reports a failure: {lines:?}"
+        );
+    }
+
+    /// The hook both paths call: under the daemon's default, `Ungated`, the
+    /// task comes back with its patches as declared (inbox#602 is the
+    /// daemon's); under `Gated` the context's gate decides, refusing an entry
+    /// or dropping one as ignored. A task without patches passes either way,
+    /// without reaching the gate.
+    #[test]
+    fn the_task_patch_gate_follows_the_context_policy() {
+        for (policy, refused) in [
+            (TaskPatchPolicy::Ungated, false),
+            (test_gate(DENIED, ""), true),
+        ] {
+            let (_state, mut ctx) = setup_patchrepo_ctx(policy.clone());
+            let graph = ctx.graph_from_all_packages().unwrap();
+            let (task, graph) = ctx.task(graph, "peek-denied").unwrap().unwrap();
+            let declared = task.patch.clone();
+            match crate::gate_task_patches(&ctx, "peek-denied", task) {
+                Ok(gated) => {
+                    assert!(!refused, "{policy:?} let a denied patch through");
+                    assert_eq!(gated.task.patch, declared);
+                    assert!(gated.ignored.is_empty());
+                }
+                Err(e) => {
+                    assert!(refused, "{policy:?} refused: {e}");
+                    assert!(format!("{e}").contains("policy denied"), "{e}");
+                }
+            }
+            let (task, _) = ctx.task(graph, "no-patches").unwrap().unwrap();
+            let gated = crate::gate_task_patches(&ctx, "no-patches", task).unwrap();
+            assert!(gated.task.patch.dir.is_empty() && gated.task.patch.file.is_empty());
+        }
+
+        // An entry the gate ignores is dropped from the task and reported.
+        let (_state, mut ctx) = setup_patchrepo_ctx(test_gate("", DENIED));
+        let graph = ctx.graph_from_all_packages().unwrap();
+        let (task, _) = ctx.task(graph, "peek-denied").unwrap().unwrap();
+        let gated = crate::gate_task_patches(&ctx, "peek-denied", task).unwrap();
+        assert!(!gated.task.patch.dir.contains_key(DENIED));
+        assert_eq!(gated.ignored, vec![DENIED.to_owned()]);
+        let notice = gated.ignored_notice("peek-denied").unwrap();
+        assert!(notice.contains(DENIED), "{notice}");
     }
 
     #[test]

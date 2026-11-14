@@ -21,11 +21,16 @@ use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWr
 mod error;
 pub use error::{Error, remote_cache_setup_error};
 mod config;
-pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET};
+pub use config::{
+    Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET, TaskPatchPolicy,
+};
 mod env;
+// The hook a task run by name has its `[patches]` judged through (inbox#1128).
+mod patch_hook;
 use graph::Error as GraphError;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
+pub use patch_hook::{GatedTask, TaskPatchGate, gate_task_patches};
 pub use sandbox::config::Invocation;
 
 mod mfile_search_strategy;
