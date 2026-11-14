@@ -321,6 +321,13 @@ missing read-only source is an error naming the task and the patch declaration.
 Mapped paths must be absolute or start with `~/`, in which case the tilde is expanded to the user's
 home directory.
 
+`mip run <task>` checks each entry against the `[patches]` section of your
+[user policy](./user-policy.md) before it builds the sandbox, and so does a `min run <task>` from
+inside that sandbox. A denied entry, or a directory that holds a path a `deny` rule names, refuses the run
+with `policy denied`. An ignored entry is left out, with a warning. An entry that no rule allows
+refuses the run and prints the `[patches] allow` snippet that would approve it, since `mip` does not
+prompt.
+
 In a task the daemon runs in the session layout, `~/` expands to the session home. The daemon
 mounts a mapping inside that home or the project tree at the matching path under `/home` or
 `/workbench`. It mounts the mapping on top of the read-write session mounts, so a read-only mapping
