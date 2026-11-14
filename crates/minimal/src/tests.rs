@@ -857,122 +857,6 @@ fn bare_status_renders_a_cwd_session_verbatim() {
     );
 }
 
-/// A session already tracked for the target path warns with that
-/// session's handle and the `attach` reuse hint; a path with no session
-/// stays silent.
-#[test]
-fn duplicate_session_warning_flags_only_a_matching_path() {
-    let entries = vec![twin_entry(
-        "019f5d0f-0a99-78b1-9165-0809440f0052",
-        Some("web"),
-        Some("/w"),
-        boxes::BoxState::Active,
-    )];
-
-    let taken = paths::HostAbsPath::try_new("/w").unwrap();
-    let warning = duplicate_session_warning(&entries, &taken)
-        .expect("a session on the target path must warn");
-    assert!(warning.contains("web"), "warning names the existing handle");
-    assert!(
-        warning.contains("min session attach web"),
-        "warning points at attach for reuse"
-    );
-
-    let free = paths::HostAbsPath::try_new("/elsewhere").unwrap();
-    assert!(
-        duplicate_session_warning(&entries, &free).is_none(),
-        "an untaken path does not warn"
-    );
-}
-
-/// An unnamed existing session must still be reusable: the reuse hint must
-/// carry the full id, which `SessionLookup::parse` resolves back to an id.
-/// The short unnamed handle would parse as a nonexistent name, so the attach
-/// lookup would miss.
-#[test]
-fn duplicate_session_warning_reuses_unnamed_session_by_id() {
-    let id = "019f5d0f-0a99-78b1-9165-0809440f0052";
-    let entries = vec![twin_entry(id, None, Some("/w"), boxes::BoxState::Active)];
-
-    let taken = paths::HostAbsPath::try_new("/w").unwrap();
-    let warning = duplicate_session_warning(&entries, &taken)
-        .expect("a session on the target path must warn");
-    assert!(
-        warning.contains(&format!("min session attach {id}")),
-        "unnamed reuse hint carries the full id, got: {warning}"
-    );
-    // The id the hint prints must resolve through the attach lookup path.
-    assert!(
-        matches!(SessionLookup::parse(id), SessionLookup::Id(_)),
-        "the full id resolves as an id, not a name"
-    );
-}
-
-/// Attach refuses a `Materializing` session, so the warning's reuse step
-/// must not point at it yet: the guidance says to wait for `min ls` to
-/// report the session active and only then attach. The attach command shows
-/// its argument as a placeholder, so no printed command names the session
-/// attach would refuse right now.
-#[test]
-fn duplicate_session_warning_waits_before_attach_for_materializing() {
-    let entries = vec![twin_entry(
-        "019f5d0f-0a99-78b1-9165-0809440f0052",
-        Some("web"),
-        Some("/w"),
-        boxes::BoxState::Materializing,
-    )];
-
-    let taken = paths::HostAbsPath::try_new("/w").unwrap();
-    let warning = duplicate_session_warning(&entries, &taken)
-        .expect("a session on the target path must warn");
-    assert!(
-        warning.contains("run `min ls` until its status is running"),
-        "the wait guidance names the command to watch, got: {warning}"
-    );
-    assert!(
-        warning.contains("then attach to it with `min session attach <session>`"),
-        "attach is the step after the wait and shows its argument, got: {warning}"
-    );
-    assert!(
-        !warning.contains("min session attach web"),
-        "no command names a session attach would refuse, got: {warning}"
-    );
-    assert!(
-        !warning.contains("To reuse it instead"),
-        "no attach hint to take now for a non-attachable session, got: {warning}"
-    );
-}
-
-/// When several sessions track the target path with mixed statuses, the
-/// warning must recommend the `Active` one — the only status `attach`
-/// accepts — even when a non-active match sorts first in the listing.
-#[test]
-fn duplicate_session_warning_prefers_active_over_pending_match() {
-    let pending_id = "019f5d0f-0a99-78b1-9165-0809440f0052";
-    let active_id = "019f5d0f-0a99-78b1-9165-0809440f0053";
-    let entries = vec![
-        twin_entry(
-            pending_id,
-            Some("mzing"),
-            Some("/w"),
-            boxes::BoxState::Materializing,
-        ),
-        twin_entry(active_id, Some("live"), Some("/w"), boxes::BoxState::Active),
-    ];
-
-    let taken = paths::HostAbsPath::try_new("/w").unwrap();
-    let warning = duplicate_session_warning(&entries, &taken)
-        .expect("a session on the target path must warn");
-    assert!(
-        warning.contains("min session attach live"),
-        "warning points at the active match for reuse, got: {warning}"
-    );
-    assert!(
-        !warning.contains("still being created"),
-        "an attachable active match must not print the wait guidance, got: {warning}"
-    );
-}
-
 /// No sessions anywhere and no blueprint: the report says so and the
 /// `Next:` lines become the create-and-attach pair — every line verbatim.
 #[test]
@@ -2483,6 +2367,121 @@ async fn start_off_tty_exit2_names_detach() {
         listed.sessions.is_empty(),
         "the refused starts created no box"
     );
+}
+
+// BCLI-029, BCLI-070: a start for a path that already has a box creates
+// another box and prints only its id. It lists no boxes first and prints no
+// warning about the box that the path already has, with or without `--new`.
+// The attached start runs the same `activate_box` path, and this test cannot
+// attach off a terminal, so the source check below covers that half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_with_a_box_for_the_path_prints_no_warning() {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).unwrap();
+    let body = function_body(&text, "activate_box").expect("create.rs defines activate_box");
+    assert!(
+        !body.contains("list_sessions_version_gated"),
+        "a start lists no boxes before it creates one"
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    // Sealed, so that the start applies no loadout and prints no
+    // "Applying loadouts" line (BOX-171): stderr holds only what this test
+    // is about.
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        b"[sessions.dev]\nloadout_mode = 'sealed'\n",
+    )
+    .unwrap();
+    let project_path = project.path().to_str().unwrap().to_owned();
+    let state = tempfile::tempdir().unwrap();
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    // The box that the path already has.
+    let existing = minimald::test_harness::create_configured_session(
+        &mut server.connect().await,
+        "other",
+        &project_path,
+    )
+    .await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        minimal_dir: Some(state.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+
+    // `min box start --detach`, `min session start --new --detach` and
+    // `min box start --new --detach`.
+    for (verb, new) in [
+        (StartVerb::Box, false),
+        (StartVerb::Session, true),
+        (StartVerb::Box, true),
+    ] {
+        let out = tempfile::tempfile().unwrap();
+        let err = tempfile::tempfile().unwrap();
+        std::io::stdout().flush().unwrap();
+        let saved_out = nix::unistd::dup(std::io::stdout()).unwrap();
+        let saved_err = nix::unistd::dup(std::io::stderr()).unwrap();
+        nix::unistd::dup2_stdout(&out).unwrap();
+        nix::unistd::dup2_stderr(&err).unwrap();
+        let result = match verb {
+            StartVerb::Box => {
+                cmd_box_start(
+                    &global,
+                    BoxStartArgs {
+                        entry: None,
+                        name: None,
+                        new,
+                        detach: true,
+                        overrides: StartOverrideArgs::default(),
+                    },
+                )
+                .await
+            }
+            StartVerb::Session => {
+                cmd_session_start(
+                    &global,
+                    SessionStartArgs {
+                        entry: None,
+                        name: None,
+                        new,
+                        detach: true,
+                        overrides: StartOverrideArgs::default(),
+                    },
+                )
+                .await
+            }
+        };
+        std::io::stdout().flush().unwrap();
+        nix::unistd::dup2_stdout(&saved_out).unwrap();
+        nix::unistd::dup2_stderr(&saved_err).unwrap();
+        let read = |mut file: std::fs::File| {
+            let mut text = String::new();
+            file.rewind().unwrap();
+            file.read_to_string(&mut text).unwrap();
+            text
+        };
+        let (stdout, stderr) = (read(out), read(err));
+        result.unwrap_or_else(|e| panic!("{verb:?} new={new}: the start fails: {e:#}\n{stderr}"));
+        assert_eq!(
+            stderr, "",
+            "{verb:?} new={new}: the start prints nothing on stderr"
+        );
+        let id = stdout
+            .strip_suffix('\n')
+            .unwrap_or_else(|| panic!("{verb:?} new={new}: stdout is one line: {stdout:?}"));
+        let id = boxes::SessionId::parse_str(id)
+            .unwrap_or_else(|_| panic!("{verb:?} new={new}: stdout holds only the id: {stdout:?}"));
+        assert_ne!(
+            id, existing,
+            "{verb:?} new={new}: the start creates another box"
+        );
+    }
 }
 
 // BCLI-029: a start that returns unattached from a box with no terminal

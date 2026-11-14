@@ -3574,50 +3574,7 @@ pub(crate) async fn activate_box(
     // Activation is the hot path #1251's gate landed on, and it must not pay a
     // round trip for a check its own first RPC can make.
     let mut client = ActivationStep::ConnectDaemon
-        .run(async {
-            let mut client = connect_daemon_unchecked(global).await?;
-
-            // Warn before minting a second session for a path that already has one:
-            // the duplicate leaves bare `min` from this directory ambiguous between
-            // them. Advisory only — a listing failure (ordinary transport or
-            // daemon-side error) must not block activation, so the duplicate check is
-            // skipped on error. But `oneshot_rpc` reuses one `russh` handle, and a
-            // transport-level listing failure can close the shared connection, which
-            // would then break the `CreateSession` channel below; so on any listing
-            // error, reconnect before creation. A benign daemon-side error leaves the
-            // old connection usable and the reconnect is merely a no-op cost on the
-            // rare failure path — the happy path still pays no extra round trip. The
-            // hard version gate is unaffected: `CreateSession` below carries its own
-            // `must_match_version`, so a version-skewed daemon is still refused there
-            // even when this enumeration is skipped.
-            match list_sessions_version_gated(&mut client).await {
-                Ok(existing_sessions) => {
-                    if let Some(warning) = duplicate_session_warning(
-                        &existing_sessions.sessions,
-                        &request.config.project_path,
-                    ) {
-                        eprintln!("{warning}");
-                    }
-                }
-                Err(_) => {
-                    // The listing failed. A transport-level closure can leave the
-                    // shared `russh` handle unusable, which would then break the
-                    // `CreateSession` channel below, so try to reconnect. But a
-                    // daemon-side listing error closes only the RPC channel and leaves
-                    // the SSH connection intact — so if the reconnect itself fails,
-                    // keep the original client and let `CreateSession` proceed on it
-                    // rather than aborting activation outright. `CreateSession` carries
-                    // its own hard version gate and surfaces a clear error if the
-                    // connection really is dead, so retaining the original client can
-                    // only help the daemon-side-error case and never regresses the
-                    // transport-closure case.
-                    if let Ok(reconnected) = connect_daemon_unchecked(global).await {
-                        client = reconnected;
-                    }
-                }
-            }
-            Ok::<_, anyhow::Error>(client)
-        })
+        .run(connect_daemon_unchecked(global))
         .await?;
 
     // T66: an own-address box on a VM-backed host registers with the VM host
