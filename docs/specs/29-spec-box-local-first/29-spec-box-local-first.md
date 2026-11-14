@@ -623,7 +623,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal exports_not_copied_from_another_project
 
-- **BOX-200** IF the client's report of an export to the daemon fails THEN THE SYSTEM SHALL print on stderr one line that names the export's path and says that the client could not confirm that the box's record holds an entry for it, and leave the command's exit code as BOX-193 and BOX-194 set it. The claim BOX-198 recorded stays, so no later command copies those exports again.
+- **BOX-200** IF the client's report of an export to the daemon fails THEN THE SYSTEM SHALL print on stderr one line that names the export's path and says that the client could not confirm that the box's record holds an entry for it, and leave the command's exit code as BOX-193 and BOX-194 set it. The claim BOX-198 recorded stays for those exports while the command's connection lasts, so no later command copies them again; BOX-202 covers a connection that ends first.
   <!-- unwanted; decided 2026-11-13: the copied files are what a caller needs, and the record is the audit trail; a lost report does not change the result -->
   tier:     T0
   verify:   cargo nextest run -p minimal lost_export_report_named_exit_unchanged
@@ -633,6 +633,12 @@ After this ships, a developer on a stock install with no identity plane runs ses
   <!-- unwanted; decided 2026-11-13: the claim of BOX-198 makes "once for each end" hold; a refused claim is not a failure of the command -->
   tier:     T0
   verify:   cargo nextest run -p minimal refused_export_claim_copies_nothing
+
+
+- **BOX-202** IF the connection of a command that holds BOX-198's claim ends before the command has reported every export of that end THEN THE SYSTEM SHALL release the claim for each export with no report, so that the next command that waits for that end copies those exports, and keep the claim on each export already reported.
+  <!-- unwanted; decided 2026-11-14: a command that dies mid-copy (Ctrl-C, a closed terminal, a crash) must not leave the rest of an end uncopied for good; an export already reported is not copied again, so no file is replaced twice -->
+  tier:     T0
+  verify:   cargo nextest run -p minimald export_claim_released_for_unreported_exports_on_disconnect
 
 
 ### O3 One grammar
@@ -716,7 +722,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 - The default `loadout_mode` of the `agent`, `service`, `build` and `container-build` types. gominimal/inbox#678 defines those types.
 - Changing a running box's spec: `min add` and any other runtime change, with the `package_added`, `port_exposed` and `file_exported` events it writes: a follow-up spec, not yet filed. A box here resumes from its creation-time spec (BOX-025).
 - Organization Box Types: resolving a type from an organization registry, and refusing a project type that redefines an organization type's name: the Gatehouse directory work, gominimal/inbox#579. Until it lands, BOX-059 resolves only built-in and project types, and `type.source` in the projection (BOX-071) is `builtin` or `project`.
-- Spec sections this spec accepts and carries but does not enforce, each warned of at creation (BOX-076): `[[file_imports]]`, whose copy at creation stays with gominimal/arch#163 and whose schema validation the Agent Box epic gominimal/inbox#678 owns; `[[github_imports]]`, unowned, a follow-up (the clone is the broker's creation-time mint under Gatehouse §6.3); `[otel]`, the observability epic gominimal/inbox#515 and the Agent Box epic gominimal/inbox#678's telemetry receiver; and `[network] vpn_network_names`, the mesh spec MRF (gominimal/minimal#1420). `[[file_exports]]` is no longer on this list: BOX-185 to BOX-201 copy it, and its schema validation stays with gominimal/inbox#678. A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are not carried: BOX-076 leaves them out with a warning, as BEP-037 does for the first.
+- Spec sections this spec accepts and carries but does not enforce, each warned of at creation (BOX-076): `[[file_imports]]`, whose copy at creation stays with gominimal/arch#163 and whose schema validation the Agent Box epic gominimal/inbox#678 owns; `[[github_imports]]`, unowned, a follow-up (the clone is the broker's creation-time mint under Gatehouse §6.3); `[otel]`, the observability epic gominimal/inbox#515 and the Agent Box epic gominimal/inbox#678's telemetry receiver; and `[network] vpn_network_names`, the mesh spec MRF (gominimal/minimal#1420). `[[file_exports]]` is no longer on this list: BOX-185 to BOX-202 copy it, and its schema validation stays with gominimal/inbox#678. A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are not carried: BOX-076 leaves them out with a warning, as BEP-037 does for the first.
 - Nesting, the `local-box` provider, and running `min` inside a box, including `min box spec self`: gominimal/inbox#568.
 - Memory and resource declaration, admission, the per-box cgroup limit, OOM handling and `enforced`/`advisory` reporting (epic story S15): the resources spec (gominimal/inbox#698; BRES), written from that epic.
 - The dash (epic story S14: type, state, provider and host columns; resume, reap and start from the list; the create form over entries): an amendment to `docs/specs/07-spec-min-dash-tui`, filed as a follow-up issue on that spec when this merges.
