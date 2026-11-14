@@ -469,7 +469,7 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::init_scaffolds_entry_shape_loads_and_starts_with_its_packages = asserts nothing",
             // A test's request, sent only to the in-process test daemon,
             // which is this build: it checks the start's override flags.
-            "tests.rs::planned_session_request = asserts nothing",
+            "tests.rs::planned_session_request_checked = asserts nothing",
             // A unit test's request, never sent: it checks the fresh instance.
             "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
             // A unit test's request, never sent: it checks the run path's
