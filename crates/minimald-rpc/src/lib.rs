@@ -111,6 +111,44 @@ pub struct GetVersionResponse {
     pub version: String,
     pub long_version: String,
     pub stdlib_version: String,
+    /// The version of the expansion the daemon applies to a box spec, as
+    /// [`expander_version`] forms it (BOX-074). `None` from a daemon that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expander_version: Option<String>,
+}
+
+/// The expander version of a build: the Box Spec shape version and the
+/// projection version, joined by a dot (BOX-074). The client and the
+/// daemon each pass their own `mfile` constants, so two builds that
+/// expand and project a spec the same way report the same version.
+#[must_use]
+pub fn expander_version(spec_version: u32, projection_version: i64) -> String {
+    format!("{spec_version}.{projection_version}")
+}
+
+/// What the client prints when its expander version differs from the
+/// daemon's (BOX-074), or `None` when the two match. `daemon` is `None`
+/// when the daemon reports no expander version. The create goes ahead:
+/// the daemon's digest comparison and admission check are the checks
+/// that refuse it.
+#[must_use]
+pub fn expander_skew_message(cli: &str, daemon: Option<&str>) -> Option<String> {
+    let first = match daemon {
+        Some(daemon) if daemon == cli => return None,
+        Some(daemon) => format!(
+            "This `min` uses minimal.toml expansion version {cli}, \
+             and minimald uses expansion version {daemon}."
+        ),
+        None => format!(
+            "This `min` uses minimal.toml expansion version {cli}, \
+             and minimald does not report its expansion version."
+        ),
+    };
+    Some(format!(
+        "{first} The command continues. minimald refuses to create the box \
+         if it reads the box settings differently from this `min`."
+    ))
 }
 
 impl OneshotSshRpc for GetVersion {

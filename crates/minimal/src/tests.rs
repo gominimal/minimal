@@ -20180,3 +20180,61 @@ async fn session_entry_network_mode_and_ingress() {
     assert_eq!(invalid.error.exit_code(), Some(3), "{error}");
     assert!(error.to_string().contains("network.ingress"), "{error}");
 }
+
+/// BOX-074: when the daemon's expander version differs from this `min`'s,
+/// the activation prints both versions before the create and goes on. A
+/// matched pair prints nothing. The report is never an error: the call in
+/// `activate_box` has no `?`, and the reporter returns nothing to refuse
+/// with.
+#[test]
+fn expander_skew_reports_and_continues() {
+    let cli = client_expander_version();
+    assert_eq!(
+        cli,
+        format!(
+            "{}.{}",
+            mfile::spec::BOX_SPEC_VERSION,
+            mfile::projection::PROJECTION_VERSION
+        )
+    );
+    assert_eq!(
+        expander_skew_report(Some(&cli)),
+        None,
+        "a match prints nothing"
+    );
+
+    let report = expander_skew_report(Some("99.1")).expect("a skew is reported");
+    assert_eq!(
+        report,
+        format!(
+            "warning: This `min` uses minimal.toml expansion version {cli}, and minimald uses \
+             expansion version 99.1. The command continues. minimald refuses to create the box \
+             if it reads the box settings differently from this `min`."
+        )
+    );
+    let report = expander_skew_report(None).expect("an unreported version is a skew");
+    assert!(report.contains(&cli), "{report}");
+    assert!(
+        report.contains("does not report its expansion version"),
+        "{report}"
+    );
+
+    // The activation reports before the create, and goes on.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text =
+        std::fs::read_to_string(manifest.join("src/cmd/boxes/create.rs")).expect("readable source");
+    let body = function_body(&text, "activate_box").expect("create.rs defines activate_box");
+    let report_at = body
+        .find("report_expander_skew(&mut client).await;")
+        .expect("activate_box reports the expander skew, with no `?`");
+    let create_at = body
+        .find("oneshot_rpc::<CreateSession>")
+        .expect("activate_box sends the create");
+    assert!(report_at < create_at, "the report comes before the create");
+    let reporter =
+        function_body(&text, "report_expander_skew").expect("create.rs defines the reporter");
+    assert!(
+        reporter.contains("async fn report_expander_skew(client: &mut client::Client) {"),
+        "the reporter returns nothing, so it cannot stop the create: {reporter}"
+    );
+}

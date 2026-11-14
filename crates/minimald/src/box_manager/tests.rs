@@ -7332,12 +7332,9 @@ async fn projection_digests_stored_side_by_side() {
         (Some(expected.clone()), Some(expected.clone()))
     );
 
-    // A client digest that differs is stored as sent, beside the daemon's.
-    // Refusing that create is BOX-072's, not this record's.
-    let differing = "A".repeat(43);
-    assert_ne!(differing, expected);
+    // A digest a client sends under the daemon's key is dropped.
     let mut config = unnamed_config();
-    config.set_client_projection_digest(differing.clone());
+    config.set_client_projection_digest(expected.clone());
     config.attrs.insert(
         DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
         "asserted-by-client".to_owned(),
@@ -7345,19 +7342,17 @@ async fn projection_digests_stored_side_by_side() {
     let (_, record) = create(config).await;
     assert_eq!(
         digests_of(record),
-        (Some(differing), Some(expected.clone()))
+        (Some(expected.clone()), Some(expected.clone()))
     );
 
-    // A client value that is not a digest in form is not stored.
-    for malformed in ["client-digest", "A\nB", &"A".repeat(44), &"A".repeat(4096)] {
+    // A client digest that differs, or a client value that is not a
+    // digest in form, refuses the create (BOX-072), so nothing is stored.
+    for client in [&"A".repeat(43), "client-digest", "A\nB", &"A".repeat(44)] {
         let mut config = unnamed_config();
-        config.set_client_projection_digest(malformed);
-        let (_, record) = create(config).await;
-        assert_eq!(
-            digests_of(record),
-            (None, Some(expected.clone())),
-            "{malformed:?}"
-        );
+        config.set_client_projection_digest(client);
+        mngr.create_box_with_spec(as_task(config), Some(spec.clone()), None, None)
+            .await
+            .expect_err("a differing client digest refuses the create");
     }
 
     // A client that predates the digest sends none: the daemon's alone.
@@ -7401,5 +7396,138 @@ async fn projection_digests_stored_side_by_side() {
     assert!(
         line.contains(&format!("daemon_projection_digest=\"{expected}\"")),
         "{line}"
+    );
+}
+
+/// BOX-072: for every pair of specs, one standing for the client's and one
+/// for the spec the daemon receives, the create is refused iff their
+/// projection digests differ. A refused create leaves no record, the
+/// reply says how to recover, and the daemon log and the create span name
+/// both digests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_digest_mismatch_refuses_create() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let other_upstream = {
+        let mut secret = store_secret();
+        secret["upstream"] = serde_json_lenient::json!(["npm.example.com"]);
+        secret
+    };
+    let unprojected_note = {
+        let mut secret = store_secret();
+        secret["note"] = serde_json_lenient::json!("outside the projection");
+        secret
+    };
+    // The specs differ pairwise. The last one differs from the second
+    // only outside the projection, so its digest is the second's.
+    let specs = [
+        task_spec("x72", None),
+        spec_with_secrets("x72", serde_json_lenient::json!({ "npm": store_secret() })),
+        spec_with_secrets("x72", serde_json_lenient::json!({ "npm": other_upstream })),
+        spec_with_secrets(
+            "x72",
+            serde_json_lenient::json!({ "npm": unprojected_note }),
+        ),
+    ];
+    let digest = |spec: &serde_json_lenient::Value| {
+        mfile::projection::spec_digest(spec, boxes::TASK_BOX_TYPE).expect("the spec projects")
+    };
+    assert_eq!(digest(&specs[1]), digest(&specs[3]));
+    assert_ne!(digest(&specs[0]), digest(&specs[1]));
+    assert_ne!(digest(&specs[1]), digest(&specs[2]));
+
+    let mut refused = 0;
+    for (c, client_spec) in specs.iter().enumerate() {
+        for (d, sent) in specs.iter().enumerate() {
+            let client = digest(client_spec);
+            let daemon = digest(sent);
+            let mut config = unnamed_config();
+            config.set_client_projection_digest(client.clone());
+            let before = mngr.list_boxes(None).await.unwrap().len();
+            let created = mngr
+                .create_box_with_spec(as_task(config), Some(sent.clone()), None, None)
+                .await;
+            let after = mngr.list_boxes(None).await.unwrap().len();
+            if client == daemon {
+                created.unwrap_or_else(|e| panic!("({c}, {d}): equal digests create: {e}"));
+                assert_eq!(after, before + 1, "({c}, {d}): the create files a record");
+                continue;
+            }
+            refused += 1;
+            let error = created.expect_err("differing digests refuse the create");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "({c}, {d})");
+            assert_eq!(
+                error.to_string(),
+                "No box was created. minimald read different box settings from the box spec \
+                 than the `min` that sent it. This can happen when `min` and minimald are \
+                 different builds. Run `min stop` to stop minimald, then run the \
+                 command again to start minimald from the same build as `min`."
+            );
+            assert_eq!(
+                after, before,
+                "({c}, {d}): a refused create files no record"
+            );
+            let logged = log.contents();
+            let line = logged
+                .lines()
+                .find(|line| {
+                    line.contains("the client's projection digest differs from the daemon's")
+                        && line.contains(&format!("client_projection_digest=\"{client}\""))
+                        && line.contains(&format!("daemon_projection_digest=\"{daemon}\""))
+                })
+                .unwrap_or_else(|| panic!("({c}, {d}): the log names both digests:\n{logged}"));
+            assert!(
+                line.contains("refusal=\"projection digest mismatch\"")
+                    || line.contains("refusal=projection digest mismatch"),
+                "the create span records the refusal: {line}"
+            );
+        }
+    }
+    assert!(refused > 0, "the pairs include differing digests");
+
+    // A client that sends no digest predates the key, so its create is
+    // not compared and goes ahead.
+    mngr.create_box_with_spec(
+        as_task(unnamed_config()),
+        Some(specs[2].clone()),
+        None,
+        None,
+    )
+    .await
+    .expect("a create without a client digest goes ahead");
+}
+
+/// BOX-073: this host is not enrolled, so a create evaluates no policy
+/// against the projection: a spec any policy could refuse still creates
+/// its box, and the daemon log and the create span say the policy is
+/// `none`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unenrolled_evaluates_no_policy() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let spec = spec_with_secrets("x73", serde_json_lenient::json!({ "npm": store_secret() }));
+    let expected =
+        mfile::projection::spec_digest(&spec, boxes::TASK_BOX_TYPE).expect("the spec projects");
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    mngr.create_box_with_spec(as_task(config), Some(spec), None, None)
+        .await
+        .expect("an un-enrolled host creates the box with no policy check");
+
+    let logged = log.contents();
+    let line = logged
+        .lines()
+        .find(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains(&format!("daemon_projection_digest=\"{expected}\""))
+        })
+        .unwrap_or_else(|| panic!("a log line names the digest:\n{logged}"));
+    assert!(
+        line.contains("policy=\"none\""),
+        "no policy is evaluated: {line}"
+    );
+    assert!(
+        !logged.contains("evaluated policy"),
+        "nothing says a policy was evaluated:\n{logged}"
     );
 }
