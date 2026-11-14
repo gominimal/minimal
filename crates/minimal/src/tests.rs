@@ -15191,6 +15191,125 @@ async fn finalize_from_entry(
     }
 }
 
+/// A loadout named `name`, from the loadout file `body`.
+fn named_loadout(name: &str, body: &str) -> boxes::core::loadout::Loadout {
+    toml::from_str(&format!("name = \"{name}\"\n{body}"))
+        .unwrap_or_else(|e| panic!("loadout {name} parses: {e}"))
+}
+
+// BOX-179: a box with a project hook and a loadout hook keeps both in its
+// expanded spec, each with its declarer. The project's names no path. The
+// daemon gets the project's hook as the project wrote it, and composes the
+// box from it. The loadout's hook travels on the contribution.
+#[tokio::test]
+async fn stored_spec_keeps_each_hook_with_its_declarer() {
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        r#"
+[sessions.default]
+loadout_mode = "open"
+lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo project" } }]
+"#,
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    let selected = crate::SelectedLoadouts {
+        loadouts: vec![named_loadout(
+            "rust",
+            "[[lifecycle_hooks]]\non_activate = { type = \"inline\", value = \"echo rust\" }\n",
+        )],
+        ignore: None,
+    };
+    let expanded = crate::session_box_expansion(root, None, true, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+
+    let hooks = expanded.spec["lifecycle_hooks"]
+        .as_array()
+        .expect("the spec has hooks");
+    let declared: Vec<(String, toml::Value)> = hooks
+        .iter()
+        .map(|hook| {
+            (
+                hook["on_activate"]["value"].as_str().unwrap().to_owned(),
+                hook["declared_by"].clone(),
+            )
+        })
+        .collect();
+    let table = |src: &str| toml::Value::Table(toml::from_str(src).unwrap());
+    assert_eq!(
+        declared,
+        [
+            ("echo project".to_owned(), table("kind = \"project\"")),
+            (
+                "echo rust".to_owned(),
+                table("kind = \"loadout\"\nname = \"rust\"")
+            ),
+        ]
+    );
+
+    // With hooks off (`--no-hooks`), the expanded spec keeps no hook, and
+    // the daemon gets none.
+    let unhooked = crate::session_box_expansion(root, None, false, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+    assert!(
+        !unhooked.spec.contains_key("lifecycle_hooks"),
+        "{:?}",
+        unhooked.spec
+    );
+    assert!(unhooked.wire.lifecycle_hooks.is_none());
+
+    // The daemon gets only the project's hook, without `declared_by`, and
+    // composes the box from it.
+    let sent = expanded.wire.lifecycle_hooks.clone().expect("hooks are on");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let server = minimald::test_harness::TestServer::new().await;
+    let mut daemon = server.connect().await;
+    let (_vars, composed) =
+        start_from_entry(&mut daemon, "dev", project.path(), expanded.wire).await;
+    assert_eq!(composed.len(), 1, "{composed:?}");
+    assert!(composed[0].contains("echo project"), "{composed:?}");
+}
+
+// BOX-183: a selected loadout that sets a project variable to another
+// value refuses the start with exit 3 when the client expands the entry.
+// The start expands it before it sends the create request, so no record
+// exists. The policy's `ignore` list drops the loadout's value.
+#[test]
+fn conflicting_loadout_var_refused_before_create() {
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        "[sessions.default]\nvars = { EDITOR = \"hx\" }\n",
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    // No `loadout_mode` in the file: the `session` type opens the box.
+    let mut selected = crate::SelectedLoadouts {
+        loadouts: vec![named_loadout("ed", "vars = { EDITOR = \"vi\" }\n")],
+        ignore: None,
+    };
+    let error = crate::session_box_expansion(root, None, true, &selected)
+        .expect_err("the loadout conflicts with the entry");
+    let refusal = spec_project_error(&error);
+    assert_eq!(refusal.exit_code(), Some(3));
+    assert_eq!(
+        refusal.to_string(),
+        "The variable `EDITOR` has two different values. `[sessions.default]` in \
+         minimal.toml sets one value, and the loadout `ed` sets the other. A loadout \
+         cannot change a variable that is already set. Remove `EDITOR` from one of \
+         them, or add `EDITOR` to the `ignore` list under `[vars]` in \
+         user_policy.toml to drop every value of `EDITOR`."
+    );
+
+    // The same value, or an ignored name, is no conflict.
+    selected.ignore = Some(boxes::core::policy::VarNameGlobs::try_new(["EDITOR"]).expect("a glob"));
+    crate::session_box_expansion(root, None, true, &selected)
+        .expect("an ignored name does not conflict");
+}
+
 /// BOX-068 with BOX-048 and BOX-050: one `minimal.toml` declares a session
 /// and a task entry that share `[defaults]`. The client expands each entry
 /// and sends it, and the daemon composes and starts each box from its own

@@ -45,6 +45,7 @@ use crate::box_types::{
 };
 use crate::entry::{BoxEntry, EntryTable};
 use crate::error::{EntryHeader, SpecKeyProblem};
+use crate::spec::{DECLARED_BY, HookDeclarer};
 
 /// The built-in Box Types. A `[defaults.<name>]` table for one of these,
 /// or for a project type, is that type's defaults, not a `[defaults]` key.
@@ -127,6 +128,9 @@ pub struct Origin {
     /// For [`Layer::TypeDefaults`], the type whose defaults set the value.
     /// `None` for every other layer.
     pub box_type: Option<String>,
+    /// For [`Layer::Loadouts`], the name of the loadout that set the value.
+    /// `None` for every other layer.
+    pub loadout: Option<String>,
 }
 
 impl Origin {
@@ -136,6 +140,17 @@ impl Origin {
         Self {
             layer,
             box_type: None,
+            loadout: None,
+        }
+    }
+
+    /// The origin of a value set by the selected loadout `name`.
+    #[must_use]
+    pub fn loadout(name: &str) -> Self {
+        Self {
+            layer: Layer::Loadouts,
+            box_type: None,
+            loadout: Some(name.to_owned()),
         }
     }
 
@@ -145,6 +160,7 @@ impl Origin {
         Self {
             layer: Layer::TypeDefaults,
             box_type: Some(box_type.to_owned()),
+            loadout: None,
         }
     }
 }
@@ -201,8 +217,10 @@ pub struct Layers {
     pub defaults: toml::Table,
     /// `[defaults.<type>]` for the entry's type.
     pub defaults_type: toml::Table,
-    /// The selected loadouts' layer.
-    pub loadouts: toml::Table,
+    /// The layer of each selected loadout, with the loadout's name, in
+    /// selection order. Each one is a layer of its own, so the report and
+    /// each hook's `declared_by` name the loadout (BOX-179).
+    pub loadouts: Vec<(String, toml::Table)>,
     /// The constraints of each type in the entry's type chain, the built-in
     /// root first and the entry's own type last, each with its type name.
     /// The order of [`crate::box_types::ResolvedType::constraints`].
@@ -363,31 +381,37 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     // BOX-166, BOX-167, BOX-170: the layers up to and including the entry
     // set `loadout_mode`, and the mode alone decides whether the selected
     // loadouts apply. A loadout cannot open the gate that admits it.
-    let sealed = toml::Table::new();
     let loadouts = match gate(entry, layers, &ordered)? {
         LoadoutMode::Open => {
             // BOX-172: a loadout cannot set the mode. The gate read it
             // before this layer, so the loadout's value would do nothing.
-            let in_table = layers.loadouts.contains_key("loadout_mode")
-                || layers
-                    .loadouts
-                    .get("box")
-                    .and_then(toml::Value::as_table)
-                    .is_some_and(|b| b.contains_key("loadout_mode"));
+            let in_table = layers.loadouts.iter().find(|(_, t)| {
+                t.contains_key("loadout_mode")
+                    || t.get("box")
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|b| b.contains_key("loadout_mode"))
+            });
             if let Some(name) = layers.loadouts_setting_mode.first() {
                 return Err(Error::LoadoutSetsLoadoutMode {
                     loadout: Some(name.clone()),
                 });
             }
-            if in_table {
-                return Err(Error::LoadoutSetsLoadoutMode { loadout: None });
+            if let Some((name, _)) = in_table {
+                return Err(Error::LoadoutSetsLoadoutMode {
+                    loadout: Some(name.clone()),
+                });
             }
-            &layers.loadouts
+            layers.loadouts.as_slice()
         }
-        LoadoutMode::Sealed => &sealed,
+        LoadoutMode::Sealed => &[],
     };
-    ordered.push((Origin::of(Layer::Loadouts), loadouts));
+    // BOX-179: one layer for each loadout, so each hook it declares, and
+    // each value it sets, carries its name.
+    for (name, table) in loadouts {
+        ordered.push((Origin::loadout(name), table));
+    }
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
+    check_project_declarers(entry, &ordered)?;
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
     // BOX-071: the store references carry the client's authorities, so
@@ -744,6 +768,11 @@ fn fold(ordered: &[(Origin, &toml::Table)]) -> Expansion {
                 ignored_sections.push((key.clone(), origin.clone()));
                 continue;
             }
+            if key == HOOKS_KEY {
+                let declared = declared_hooks(value, origin);
+                merge_value(&mut spec, &mut report, key, &declared, origin);
+                continue;
+            }
             merge_value(&mut spec, &mut report, key, value, origin);
         }
     }
@@ -752,6 +781,83 @@ fn fold(ordered: &[(Origin, &toml::Table)]) -> Expansion {
         report,
         ignored_sections,
     }
+}
+
+/// The key of the spec's lifecycle hooks.
+const HOOKS_KEY: &str = "lifecycle_hooks";
+
+/// `value`, a layer's `lifecycle_hooks`, with a `declared_by` table written
+/// into each hook table (BOX-179): the loadout's name for a selected
+/// loadout's hook, and the project for a hook of any other layer. The
+/// expansion writes it, so a `declared_by` that a loadout sets is replaced.
+/// [`check_project_declarers`] refuses one that a project layer sets.
+/// Two declarers of one hook give two tables, so the union keeps both. A
+/// value that is not a list, or an item that is not a table, stays as it
+/// is, for [`check_keys`] and the client to refuse.
+fn declared_hooks(value: &toml::Value, origin: &Origin) -> toml::Value {
+    let toml::Value::Array(items) = value else {
+        return value.clone();
+    };
+    let declarer = match (origin.layer, &origin.loadout) {
+        (Layer::Loadouts, Some(name)) => HookDeclarer::Loadout { name: name.clone() },
+        _ => HookDeclarer::Project,
+    };
+    let items = items
+        .iter()
+        .map(|item| match item {
+            toml::Value::Table(hook) => {
+                let mut hook = hook.clone();
+                hook.insert(DECLARED_BY.to_owned(), declarer.to_value());
+                toml::Value::Table(hook)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    toml::Value::Array(items)
+}
+
+/// Refuses a `declared_by` key that a project layer writes in one of its
+/// own lifecycle hooks (BOX-179). Only the expansion writes the declarer.
+/// A loadout's `declared_by` is replaced by [`declared_hooks`].
+fn check_project_declarers(
+    entry: &BoxEntry,
+    ordered: &[(Origin, &toml::Table)],
+) -> Result<(), Error> {
+    for (origin, layer) in ordered {
+        if origin.layer == Layer::Loadouts {
+            continue;
+        }
+        let Some(toml::Value::Array(hooks)) = layer.get(HOOKS_KEY) else {
+            continue;
+        };
+        for (index, hook) in hooks.iter().enumerate() {
+            let Some(hook) = hook.as_table() else {
+                continue;
+            };
+            if !hook.contains_key(DECLARED_BY) {
+                continue;
+            }
+            let events: Vec<String> = hook
+                .keys()
+                .filter(|k| k.as_str() != DECLARED_BY)
+                .map(|k| format!("`{k}`"))
+                .collect();
+            let hook = match events.as_slice() {
+                [] => format!("lifecycle hook {} of `{HOOKS_KEY}`", index + 1),
+                events => format!(
+                    "the {} hook at position {} of `{HOOKS_KEY}`",
+                    events.join(" and "),
+                    index + 1
+                ),
+            };
+            return Err(Error::InvalidSpecKey {
+                key: DECLARED_BY.to_owned(),
+                layer: layer_words(entry, Some(origin)),
+                problem: SpecKeyProblem::DeclarerSet { hook },
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The keys that hold variables. [`fold`] leaves them out, and
@@ -785,13 +891,13 @@ struct MergedVar {
 /// puts the values it finds in [`Layers::host_vars`].
 #[must_use]
 pub fn inherited_var_names(entry: &BoxEntry, layers: &Layers) -> BTreeSet<String> {
-    let tables = layers.type_defaults.iter().map(|(_, t)| t).chain([
-        &layers.defaults,
-        &layers.defaults_type,
-        &entry.body,
-        &layers.loadouts,
-        &layers.overrides,
-    ]);
+    let tables = layers
+        .type_defaults
+        .iter()
+        .map(|(_, t)| t)
+        .chain([&layers.defaults, &layers.defaults_type, &entry.body])
+        .chain(layers.loadouts.iter().map(|(_, t)| t))
+        .chain([&layers.overrides]);
     let mut names = BTreeSet::new();
     for table in tables {
         for (name, kind, item) in layer_vars(table) {
@@ -893,10 +999,9 @@ fn resolve_var(
 /// # Errors
 ///
 /// [`Error::LoadoutVarConflict`] when a loadout gives a set name another
-/// resolved value (BOX-183). [`Error::DuplicateVar`] when one layer, other
-/// than the loadouts, sets a name twice to different resolved values
-/// (BOX-184). In the loadouts' layer, that is two loadouts that disagree,
-/// so it is [`Error::LoadoutVarConflict`].
+/// resolved value, or two loadouts disagree (BOX-183). [`Error::DuplicateVar`]
+/// when one layer, one loadout included, sets a name twice to different
+/// resolved values (BOX-184).
 fn merge_vars(
     entry: &BoxEntry,
     ordered: &[(Origin, &toml::Table)],
@@ -945,17 +1050,12 @@ fn merge_vars(
                     layer = %words,
                     "one layer sets a variable twice to different values"
                 );
-                return Err(if loadouts {
-                    Error::LoadoutVarConflict {
-                        name: name.to_owned(),
-                        first: words,
-                        second: "another selected loadout".to_owned(),
-                    }
-                } else {
-                    Error::DuplicateVar {
-                        name: name.to_owned(),
-                        layer: words,
-                    }
+                // Each loadout is a layer of its own, so this is one
+                // loadout, or one layer of the project, that sets the name
+                // twice.
+                return Err(Error::DuplicateVar {
+                    name: name.to_owned(),
+                    layer: words,
                 });
             }
             this_layer.insert(name, resolved.clone());
@@ -1377,7 +1477,10 @@ fn layer_words(entry: &BoxEntry, origin: Option<&Origin>) -> String {
             "`{}` in minimal.toml",
             EntryHeader(entry.table.key(), &entry.name)
         ),
-        Layer::Loadouts => "a selected loadout".to_owned(),
+        Layer::Loadouts => match &origin.loadout {
+            Some(name) => format!("the loadout `{name}`"),
+            None => "a selected loadout".to_owned(),
+        },
         Layer::Overrides => "a command-line flag".to_owned(),
     }
 }
@@ -1390,6 +1493,16 @@ mod tests {
 
     fn table(src: &str) -> toml::Table {
         toml::from_str(src).expect("test TOML parses")
+    }
+
+    /// The selected loadouts of a test: `t` as the one loadout `l`, or no
+    /// loadout when `t` is empty.
+    fn one(t: toml::Table) -> Vec<(String, toml::Table)> {
+        if t.is_empty() {
+            Vec::new()
+        } else {
+            vec![("l".to_owned(), t)]
+        }
     }
 
     /// Expands the entry `name` of `file`, with the file's `[defaults]` and
@@ -1629,7 +1742,7 @@ mod tests {
                     table("packages = [\"t2\"]\ntimeout = \"6s\""),
                 ),
             ],
-            loadouts: table("packages = [\"l\", \"u\"]\ntimeout = \"7s\""),
+            loadouts: one(table("packages = [\"l\", \"u\"]\ntimeout = \"7s\"")),
             overrides: table("timeout = \"8s\"\nmachine = { memory = \"1G\" }"),
             ..Layers::default()
         };
@@ -1663,7 +1776,7 @@ mod tests {
         let e = expand_in(file, "dev", l.clone()).expect("expands");
         assert_eq!(e.spec["timeout"].as_str(), Some("7s"));
         assert_eq!(e.spec["machine"], toml::Value::Table(table("cpus = 3")));
-        l.loadouts = toml::Table::new();
+        l.loadouts = one(toml::Table::new());
         let e = expand_in(file, "dev", l.clone()).expect("expands");
         assert_eq!(e.spec["timeout"].as_str(), Some("3s"));
         let file_no_entry_timeout = file.replace("timeout = \"3s\"", "");
@@ -1742,7 +1855,7 @@ mod tests {
                 "session".to_owned(),
                 crate::box_types::builtin_defaults("session"),
             )],
-            loadouts: table("packages = [\"zellij\"]"),
+            loadouts: one(table("packages = [\"zellij\"]")),
             overrides: table("timeout = \"30m\""),
             ..Layers::default()
         }
@@ -2054,7 +2167,7 @@ mod tests {
                 Origin::of(Layer::Defaults),
                 Origin::of(Layer::DefaultsType),
                 Origin::of(Layer::Entry),
-                Origin::of(Layer::Loadouts),
+                Origin::loadout("l"),
             ])
         );
 
@@ -2247,7 +2360,7 @@ mod tests {
         let layers = Layers {
             type_defaults: resolved.defaults,
             type_constraints: resolved.constraints,
-            loadouts,
+            loadouts: one(loadouts),
             ..Layers::default()
         }
         .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
@@ -2466,7 +2579,7 @@ mod tests {
             .unwrap_or_default();
         let layers = Layers {
             type_defaults: resolved.defaults.clone(),
-            loadouts: table(loadouts),
+            loadouts: one(table(loadouts)),
             overrides: table(overrides),
             ..Layers::default()
         }
@@ -2591,7 +2704,7 @@ mod tests {
         let (_, checked) = expand_checked(&open, "ok-open", "packages = [\"jq\"]", "");
         let msg = checked.expect_err("loadout adds jq").to_string();
         assert!(
-            msg.starts_with("a selected loadout adds `\"jq\"` to `packages`"),
+            msg.starts_with("the loadout `l` adds `\"jq\"` to `packages`"),
             "{msg}"
         );
 
@@ -2711,7 +2824,7 @@ mod tests {
                 let words = [
                     "`[defaults.inner]` in minimal.toml",
                     "`[boxes.dev]` in minimal.toml",
-                    "a selected loadout",
+                    "the loadout `l`",
                     "a command-line flag",
                 ][layer];
                 prop_assert!(msg.starts_with(&format!("{words} sets `restart`")), "{}", msg);
@@ -2926,7 +3039,7 @@ mod tests {
                 "agent".to_owned(),
                 crate::box_types::builtin_defaults("agent"),
             )],
-            loadouts: whole_loadout(),
+            loadouts: one(whole_loadout()),
             ..Layers::default()
         };
         let e = expand_in(file, "helper", helper).expect("expands");
@@ -3031,7 +3144,7 @@ mod tests {
         let mut setting = whole_loadout();
         setting.insert("loadout_mode".to_owned(), "sealed".into());
         let (entry, layers) = typed_layers(file, "dev", |l| {
-            l.loadouts = setting.clone();
+            l.loadouts = one(setting.clone());
             l.loadouts_setting_mode = vec!["mine".to_owned()];
         });
         assert!(matches!(
@@ -3050,24 +3163,24 @@ mod tests {
              `loadout_mode`. Remove `loadout_mode` from loadout `mine`."
         );
 
-        // The `[box]` spelling in a loadouts layer that names no loadout.
+        // The `[box]` spelling in a loadout's layer names that loadout.
         let mut nested = whole_loadout();
         nested.insert(
             "box".to_owned(),
             toml::Value::Table(table("loadout_mode = \"open\"")),
         );
-        let (entry, layers) = typed_layers(file, "dev", |l| l.loadouts = nested);
+        let (entry, layers) = typed_layers(file, "dev", |l| l.loadouts = one(nested));
         let err = expand(&entry, &layers).expect_err("a loadout cannot set the mode");
         assert_eq!(err.exit_code(), Some(3));
         assert_eq!(
             err.to_string(),
-            "a selected loadout sets `loadout_mode`, but a loadout cannot set \
-             `loadout_mode`. Remove `loadout_mode` from that loadout."
+            "loadout `l` sets `loadout_mode`, but a loadout cannot set \
+             `loadout_mode`. Remove `loadout_mode` from loadout `l`."
         );
 
         // A sealed box reads no loadout, so the check does not run.
         let (entry, layers) = typed_layers(file, "lint", |l| {
-            l.loadouts = setting;
+            l.loadouts = one(setting);
             l.loadouts_setting_mode = vec!["mine".to_owned()];
         });
         let e = expand(&entry, &layers).expect("a sealed box takes no loadout");
@@ -3142,7 +3255,7 @@ mod tests {
         ];
         for (name, named, msg) in cases {
             let (entry, layers) = typed_layers(file, name, |l| {
-                l.loadouts = whole_loadout();
+                l.loadouts = one(whole_loadout());
                 l.named_loadouts = named.iter().map(|n| (*n).to_owned()).collect();
             });
             // The creation and `min box spec <entry>` both expand, and the
@@ -3160,7 +3273,7 @@ mod tests {
 
         // An open box takes the loadout a flag names.
         let (entry, layers) = typed_layers(file, "dev", |l| {
-            l.loadouts = whole_loadout();
+            l.loadouts = one(whole_loadout());
             l.named_loadouts = vec!["dev".to_owned()];
         });
         let e = expand(&entry, &layers).expect("an open box takes a named loadout");
@@ -3210,7 +3323,7 @@ mod tests {
             let (entry, layers) = typed_layers(file, name, |l| {
                 let mut setting = whole_loadout();
                 setting.insert("loadout_mode".to_owned(), "open".into());
-                l.loadouts = setting;
+                l.loadouts = one(setting);
                 l.loadouts_setting_mode = vec!["mine".to_owned()];
                 l.named_loadouts = vec!["mine".to_owned()];
             });
@@ -3226,7 +3339,7 @@ mod tests {
         }
 
         // A value the constraint admits expands.
-        let (entry, layers) = typed_layers(file, "ok", |l| l.loadouts = whole_loadout());
+        let (entry, layers) = typed_layers(file, "ok", |l| l.loadouts = one(whole_loadout()));
         assert!(matches!(
             loadout_gate(&entry, &layers),
             Ok(LoadoutMode::Sealed)
@@ -3239,7 +3352,7 @@ mod tests {
     /// sets `host`.
     fn vars_layers(loadouts: &str, host: &[(&str, &str)]) -> Layers {
         Layers {
-            loadouts: table(loadouts),
+            loadouts: one(table(loadouts)),
             host_vars: host
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -3399,43 +3512,25 @@ mod tests {
                 "a literal against the entry",
                 "vars = { A = \"loadout\" }",
                 vec![],
-                conflict(
-                    "A",
-                    "`[sessions.dev]` in minimal.toml",
-                    "a selected loadout",
-                ),
+                conflict("A", "`[sessions.dev]` in minimal.toml", "the loadout `l`"),
             ),
             (
                 "a lenient item against [defaults]",
                 "vars_lenient = [{ name = \"D\", value = \"loadout\" }]",
                 vec![],
-                conflict("D", "`[defaults]` in minimal.toml", "a selected loadout"),
+                conflict("D", "`[defaults]` in minimal.toml", "the loadout `l`"),
             ),
             (
                 "a literal against the entry's resolved inherit",
                 "vars = { I = \"loadout\" }",
                 vec![("I", "host")],
-                conflict(
-                    "I",
-                    "`[sessions.dev]` in minimal.toml",
-                    "a selected loadout",
-                ),
+                conflict("I", "`[sessions.dev]` in minimal.toml", "the loadout `l`"),
             ),
             (
                 "an inherit that resolves to another value",
                 "vars = { A = { inherit = true } }",
                 vec![("A", "host")],
-                conflict(
-                    "A",
-                    "`[sessions.dev]` in minimal.toml",
-                    "a selected loadout",
-                ),
-            ),
-            (
-                "two loadouts",
-                "vars = { N = \"one\" }\nvars_lenient = [{ name = \"N\", value = \"two\" }]",
-                vec![],
-                conflict("N", "a selected loadout", "another selected loadout"),
+                conflict("A", "`[sessions.dev]` in minimal.toml", "the loadout `l`"),
             ),
         ];
         for (what, loadouts, host, msg) in cases {
@@ -3447,6 +3542,28 @@ mod tests {
             assert_eq!(err.exit_code(), Some(3), "{what}");
             assert_eq!(err.to_string(), msg, "{what}");
         }
+        // Two loadouts that disagree name both loadouts. One loadout that
+        // sets a name twice is one layer, so BOX-184 names that loadout.
+        let mut two = vars_layers("", &[]);
+        two.loadouts = vec![
+            ("rust".to_owned(), table("vars = { N = \"one\" }")),
+            (
+                "ai".to_owned(),
+                table("vars_lenient = [{ name = \"N\", value = \"two\" }]"),
+            ),
+        ];
+        let err = expand_in(file, "dev", two).expect_err("two loadouts disagree");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(
+            err.to_string(),
+            conflict("N", "the loadout `rust`", "the loadout `ai`")
+        );
+        let twice = "vars = { N = \"one\" }\nvars_lenient = [{ name = \"N\", value = \"two\" }]";
+        let err = expand_in(file, "dev", vars_layers(twice, &[])).expect_err("one loadout, twice");
+        assert!(
+            matches!(&err, Error::DuplicateVar { layer, .. } if layer == "the loadout `l`"),
+            "{err:?}"
+        );
         // The same values pass, and a sealed entry checks nothing.
         expand_in(
             file,
@@ -3461,6 +3578,150 @@ mod tests {
             vars_layers("vars = { A = \"loadout\" }", &[]),
         )
         .expect("a sealed entry takes no loadout");
+    }
+
+    // BOX-179: each hook of the expanded spec carries a `declared_by`
+    // table. A project hook of any layer names the project and no path. A
+    // loadout hook names its loadout. A hook that the project and a loadout
+    // both declare appears once for each, and the report keeps the layer
+    // of each hook.
+    #[test]
+    fn expanded_lifecycle_hooks_carry_declared_by() {
+        let file = r#"
+            [defaults]
+            lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo shared" } }]
+            [sessions.dev]
+            loadout_mode = "open"
+            lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo entry" } }]
+        "#;
+        let hook = |run: &str| {
+            format!(
+                "lifecycle_hooks = [{{ on_activate = {{ type = \"inline\", value = \"{run}\" }} }}]"
+            )
+        };
+        let layers = Layers {
+            loadouts: vec![
+                ("rust".to_owned(), table(&hook("echo rust"))),
+                ("ai".to_owned(), table(&hook("echo entry"))),
+            ],
+            ..Layers::default()
+        };
+        let e = expand_in(file, "dev", layers).expect("the entry expands");
+        let hooks = e.spec["lifecycle_hooks"].as_array().expect("a list");
+        let declared: Vec<(String, Option<crate::spec::HookDeclarer>)> = hooks
+            .iter()
+            .map(|h| {
+                let script = h
+                    .get("on_activate")
+                    .or_else(|| h.get("on_attach"))
+                    .and_then(|s| s.get("value"))
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                (script, crate::spec::HookDeclarer::of(h))
+            })
+            .collect();
+        let project = Some(crate::spec::HookDeclarer::Project);
+        let loadout = |name: &str| {
+            Some(crate::spec::HookDeclarer::Loadout {
+                name: name.to_owned(),
+            })
+        };
+        assert_eq!(
+            declared,
+            [
+                ("echo shared".to_owned(), project.clone()),
+                ("echo entry".to_owned(), project.clone()),
+                ("echo rust".to_owned(), loadout("rust")),
+                ("echo entry".to_owned(), loadout("ai")),
+            ]
+        );
+        // The project's table is `{ kind = "project" }`, with no path.
+        assert_eq!(hooks[0]["declared_by"], table("kind = \"project\"").into());
+        assert_eq!(
+            hooks[2]["declared_by"],
+            table("kind = \"loadout\"\nname = \"rust\"").into()
+        );
+        // The hook as written comes back without its declarer.
+        assert_eq!(
+            crate::spec::hook_without_declarer(&hooks[3]),
+            table(&hook("echo entry"))["lifecycle_hooks"][0]
+        );
+        // The report records the layer, and the loadout, of each hook.
+        let Some(ValueOrigin::List(origins)) = e.report.values.get("lifecycle_hooks") else {
+            panic!(
+                "a list origin: {:?}",
+                e.report.values.get("lifecycle_hooks")
+            );
+        };
+        assert_eq!(
+            origins,
+            &[
+                Origin::of(Layer::Defaults),
+                Origin::of(Layer::Entry),
+                Origin::loadout("rust"),
+                Origin::loadout("ai"),
+            ]
+        );
+        // The spec's bytes carry each declarer, so `min box spec` shows it.
+        let bytes = e.spec_bytes().expect("the spec writes");
+        assert!(bytes.contains("kind = \"loadout\""), "{bytes}");
+        assert!(bytes.contains("name = \"ai\""), "{bytes}");
+    }
+
+    // BOX-179: only the expansion writes a hook's declarer. A project hook
+    // that sets `declared_by` fails with exit 3, naming the hook and the
+    // key. A loadout's `declared_by` is replaced, as the test above shows
+    // for the loadout layers.
+    #[test]
+    fn project_hook_declared_by_refused_exit3() {
+        let file = r#"
+            [sessions.dev]
+            lifecycle_hooks = [
+                { on_activate = { type = "inline", value = "echo entry" } },
+                { declared_by = { kind = "loadout", name = "forged" }, on_attach = { type = "inline", value = "echo forged" } },
+            ]
+        "#;
+        let err = expand_in(file, "dev", Layers::default()).expect_err("a forged declarer");
+        assert!(matches!(err, Error::InvalidSpecKey { .. }), "{err:?}");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(
+            err.to_string(),
+            "`[sessions.dev]` in minimal.toml sets `declared_by` in the `on_attach` \
+             hook at position 2 of `lifecycle_hooks`. A project cannot set the declarer \
+             of its own hook. Remove `declared_by` from that hook."
+        );
+
+        let defaults = r#"
+            [defaults]
+            lifecycle_hooks = [{ declared_by = { kind = "project" }, on_activate = { type = "inline", value = "echo shared" } }]
+            [sessions.dev]
+        "#;
+        let err = expand_in(defaults, "dev", Layers::default()).expect_err("a project declarer");
+        assert_eq!(err.exit_code(), Some(3));
+        assert!(
+            err.to_string()
+                .starts_with("`[defaults]` in minimal.toml sets `declared_by`"),
+            "{err}"
+        );
+
+        let loadout = Layers {
+            loadouts: vec![(
+                "rust".to_owned(),
+                table(
+                    "lifecycle_hooks = [{ declared_by = { kind = \"project\" }, on_activate = { type = \"inline\", value = \"echo rust\" } }]",
+                ),
+            )],
+            ..Layers::default()
+        };
+        let open = "[sessions.dev]\nloadout_mode = \"open\"\n";
+        let e = expand_in(open, "dev", loadout).expect("a loadout's declarer is replaced");
+        assert_eq!(
+            crate::spec::HookDeclarer::of(&e.spec["lifecycle_hooks"][0]),
+            Some(crate::spec::HookDeclarer::Loadout {
+                name: "rust".to_owned()
+            })
+        );
     }
 
     // BOX-184: one layer that sets a name twice, in `vars_lenient` or in
