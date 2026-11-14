@@ -280,15 +280,16 @@ __min_rpc() {
     fi
     # A `run` always ends with an `exit:` line. A stream that ends without
     # one is a failure of min, not of the task, so it exits 125.
-    # A signal that ends socat, as Ctrl-C does, also ends the stream. That
-    # is not a failure of min, so it prints no line, and the helper exits
-    # with 128 + signal, as the shell does.
+    # SIGINT or SIGTERM that ends socat, as Ctrl-C does, also ends the
+    # stream. That is not a failure of min, so it prints no line, and the
+    # helper exits with 128 + signal, as the shell does. Another signal,
+    # such as SIGKILL or SIGPIPE, is a broken stream like any other.
     if [[ "$method" == "run" ]]; then
         if [[ "$forward" -eq 0 && -n "$sock_pid" ]]; then
             wait "$sock_pid" 2>/dev/null
             sock_status=$?
         fi
-        if (( sock_status > 128 )); then
+        if (( sock_status == 130 || sock_status == 143 )); then
             return "$sock_status"
         fi
         if [[ "$error" != "true" ]]; then

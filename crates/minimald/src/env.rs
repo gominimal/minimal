@@ -5122,8 +5122,8 @@ exit $rc
         ))
     }
 
-    // T48, BCLI-010, BCLI-014: a run whose socat a signal ends, as Ctrl-C
-    // does, prints neither socat's warning nor the broken-stream line, and
+    // T48, BCLI-010, BCLI-014: a run whose socat SIGINT or SIGTERM ends,
+    // as Ctrl-C does, prints neither socat's warning nor the broken-stream line, and
     // exits with 128 + signal.
     #[test]
     fn min_helper_run_ended_by_signal_prints_no_connection_line() {
@@ -5203,6 +5203,21 @@ exit $rc
             )
         };
         check("terminal stdin", run(slave.into()).unwrap());
+
+        // A signal that neither Ctrl-C nor a stop sends, as SIGKILL, is a
+        // broken stream: it prints the line and exits 125.
+        std::fs::write(
+            &socat,
+            "#!/bin/sh\nIFS= read -r line\nprintf 'msg:task output\\n'\nkill -KILL $$\n",
+        )
+        .unwrap();
+        let out = run(std::process::Stdio::null()).unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(125), "SIGKILL: {stderr}");
+        assert!(
+            stderr.contains("the connection closed before the task reported its exit status"),
+            "SIGKILL: {stderr}"
+        );
 
         // The same stream with no signal still prints the line.
         let Some((_, stderr, got, _)) = run_min_against(
