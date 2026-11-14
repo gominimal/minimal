@@ -114,7 +114,9 @@ What an MDM administrator should know:
 
   A rule by label needs both: `dev.gominimal.zone` and
   `dev.minimal.local-range`. The team rule matches a released package
-  only; a test build's program carries no team.
+  only; a test build's program carries no team. Apple lists this
+  payload for delivery by MDM alone (device channel, user-approved MDM,
+  no manual install); installing it by hand is not measured here.
 - **Who may register box names** is the `_minimal` group. The first install
   puts the Mac's administrators in it, which on a managed Mac is often the
   management account alone; add standard users afterwards with
