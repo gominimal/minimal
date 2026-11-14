@@ -4870,7 +4870,15 @@ exit $rc
         let bin = rootfs.join("fakebin");
         std::fs::create_dir_all(&bin).unwrap();
         let socat = bin.join("socat");
-        std::fs::write(&socat, "#!/bin/sh\necho RPC-CALLED >&2\n").unwrap();
+        // The helper sends socat's stderr to /dev/null, so the fake marks
+        // the call in a file, and the marker is added to stderr below.
+        let marker = rootfs.join("rpc-called");
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(
+            &socat,
+            format!("#!/bin/sh\necho RPC-CALLED > '{}'\n", marker.display()),
+        )
+        .unwrap();
         std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
         let script = rootfs.join("usr/bin/min");
         let out = std::process::Command::new("bash")
@@ -4887,9 +4895,11 @@ exit $rc
             .output()
             .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
             .ok()?;
+        let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        stderr.push_str(&std::fs::read_to_string(&marker).unwrap_or_default());
         Some((
             String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr,
             out.status.code().unwrap_or(-1),
         ))
     }
@@ -5110,6 +5120,167 @@ exit $rc
             out.status.code().unwrap_or(-1),
             std::fs::read_to_string(&capture).unwrap_or_default(),
         ))
+    }
+
+    // T48, BCLI-010, BCLI-014: a run whose socat SIGINT or SIGTERM ends,
+    // as Ctrl-C does, prints neither socat's warning nor the broken-stream line, and
+    // exits with 128 + signal.
+    #[test]
+    fn min_helper_run_ended_by_signal_prints_no_connection_line() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let bin = rootfs.join("signalbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            "#!/bin/sh\nIFS= read -r line\nprintf 'msg:task output\\n'\n\
+             echo 'socat[1] W exiting on signal 15' >&2\nkill -TERM $$\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |stdin: std::process::Stdio| {
+            std::process::Command::new("bash")
+                .arg(rootfs.join("usr/bin/min"))
+                .args(["task", "run", "lint"])
+                .current_dir(rootfs)
+                .env_remove("TRACEPARENT")
+                .env("PWD", rootfs)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .stdin(stdin)
+                .output()
+        };
+        let check = |what: &str, out: std::process::Output| {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(143), "{what}: {stderr}");
+            assert!(stdout.contains("task output"), "{what}: {stdout}");
+            assert!(!stderr.contains("exiting on signal"), "{what}: {stderr}");
+            assert!(
+                !stderr.contains("the connection closed"),
+                "{what}: {stderr}"
+            );
+        };
+
+        // A stdin that is not a terminal: the helper forwards it to the task.
+        let Ok(out) = run(std::process::Stdio::null()) else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+        check("forwarded stdin", out);
+
+        // A terminal on stdin: the helper keeps it and sends only the request.
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: valid out-pointers for both descriptors, and NULL for the
+        // optional name, termios and window size.
+        let ret = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: `openpty` succeeded, so both descriptors are open and ours.
+        let (_master, slave) = unsafe {
+            use std::os::fd::FromRawFd as _;
+            (
+                std::os::fd::OwnedFd::from_raw_fd(master),
+                std::os::fd::OwnedFd::from_raw_fd(slave),
+            )
+        };
+        check("terminal stdin", run(slave.into()).unwrap());
+
+        // A signal that neither Ctrl-C nor a stop sends, as SIGKILL, is a
+        // broken stream: it prints the line and exits 125.
+        std::fs::write(
+            &socat,
+            "#!/bin/sh\nIFS= read -r line\nprintf 'msg:task output\\n'\nkill -KILL $$\n",
+        )
+        .unwrap();
+        let out = run(std::process::Stdio::null()).unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(125), "SIGKILL: {stderr}");
+        assert!(
+            stderr.contains("the connection closed before the task reported its exit status"),
+            "SIGKILL: {stderr}"
+        );
+
+        // The same stream with no signal still prints the line.
+        let Some((_, stderr, got, _)) = run_min_against(
+            rootfs,
+            rootfs,
+            &["task", "run", "lint"],
+            &[],
+            "msg:task output\n",
+        ) else {
+            return;
+        };
+        assert_eq!(got, 125, "{stderr}");
+        assert!(
+            stderr.contains("the connection closed before the task reported its exit status"),
+            "{stderr}"
+        );
+    }
+
+    // T48: only a run hides socat's stderr. A call that prints no line of
+    // its own, as `min net expose` does, keeps socat's connect error.
+    #[test]
+    fn min_helper_expose_keeps_socat_connect_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let bin = rootfs.join("refusedbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let socat = bin.join("socat");
+        // What socat prints when /run/minenv_sock is not there.
+        std::fs::write(
+            &socat,
+            "#!/bin/sh\necho 'socat[1] E connect(5, AF=1 \"/run/minenv_sock\", 18): \
+             No such file or directory' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Ok(out) = std::process::Command::new("bash")
+            .arg(rootfs.join("usr/bin/min"))
+            .args(["net", "expose", "8080"])
+            .current_dir(rootfs)
+            .env_remove("TRACEPARENT")
+            .env("PWD", rootfs)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdin(std::process::Stdio::null())
+            .output()
+        else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("No such file or directory"),
+            "socat's connect error must reach stderr: {stderr}"
+        );
     }
 
     /// The real `socat` on this host's `PATH`, or `None` when it has none.
