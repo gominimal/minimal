@@ -148,16 +148,18 @@ __min_rpc() {
     # the stdin ends. The daemon reads and drops what the task leaves
     # unread until this side closes, so a write here never fails.
     local forward=0 sock_out sock_in="" sock_pid="" stdin_fd="" feeder=""
+    local sock_status=0
     if [[ "$method" == "run" && ! -t 0 ]]; then
         forward=1
         request+=$'\x1e'stdin
-        coproc __MIN_SOCK { exec socat -t 2000000000 - UNIX-CONNECT:/run/minenv_sock; }
+        coproc __MIN_SOCK { exec socat -t 2000000000 - UNIX-CONNECT:/run/minenv_sock 2>/dev/null; }
         sock_pid="$__MIN_SOCK_PID"
         exec {sock_out}<&"${__MIN_SOCK[0]}" {sock_in}>&"${__MIN_SOCK[1]}" {stdin_fd}<&0
         eval "exec ${__MIN_SOCK[0]}<&- ${__MIN_SOCK[1]}>&-"
         printf '%s\n' "$request" >&"$sock_in"
     else
-        exec {sock_out}< <(printf '%s\n' "$request" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+        exec {sock_out}< <(printf '%s\n' "$request" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock 2>/dev/null)
+        sock_pid=$!
     fi
 
     while IFS= read -r line; do
@@ -252,6 +254,7 @@ __min_rpc() {
         fi
         exec {stdin_fd}<&- {sock_out}<&-
         wait "$sock_pid" 2>/dev/null
+        sock_status=$?
     else
         exec {sock_out}<&-
     fi
@@ -271,8 +274,14 @@ __min_rpc() {
     fi
     # A `run` always ends with an `exit:` line. A stream that ends without
     # one is a failure of min, not of the task, so it exits 125.
+    # A signal that ends socat, as Ctrl-C or the run's timeout does, also
+    # ends the stream. That is not a failure of min, so it prints no line.
     if [[ "$method" == "run" ]]; then
-        if [[ "$error" != "true" ]]; then
+        if [[ "$forward" -eq 0 && -n "$sock_pid" ]]; then
+            wait "$sock_pid" 2>/dev/null
+            sock_status=$?
+        fi
+        if [[ "$error" != "true" ]] && (( sock_status <= 128 )); then
             echo "error: the connection closed before the task reported its exit status" >&2
         fi
         return 125

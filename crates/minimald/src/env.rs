@@ -5112,6 +5112,69 @@ exit $rc
         ))
     }
 
+    // T48, BCLI-010, BCLI-014: a run whose socat a signal ends, as Ctrl-C
+    // or the run's timeout does, prints neither socat's warning nor the
+    // broken-stream line, and exits 125 as before.
+    #[test]
+    fn min_helper_run_ended_by_signal_prints_no_connection_line() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+        let bin = rootfs.join("signalbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            "#!/bin/sh\nIFS= read -r line\nprintf 'msg:task output\\n'\n\
+             echo 'socat[1] W exiting on signal 15' >&2\nkill -TERM $$\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Ok(out) = std::process::Command::new("bash")
+            .arg(rootfs.join("usr/bin/min"))
+            .args(["task", "run", "lint"])
+            .current_dir(rootfs)
+            .env_remove("TRACEPARENT")
+            .env("PWD", rootfs)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+        else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(125), "{stderr}");
+        assert!(stdout.contains("task output"), "{stdout}");
+        assert!(!stderr.contains("exiting on signal"), "{stderr}");
+        assert!(!stderr.contains("the connection closed"), "{stderr}");
+
+        // The same stream with no signal still prints the line.
+        let Some((_, stderr, got, _)) = run_min_against(
+            rootfs,
+            rootfs,
+            &["task", "run", "lint"],
+            &[],
+            "msg:task output\n",
+        ) else {
+            return;
+        };
+        assert_eq!(got, 125, "{stderr}");
+        assert!(
+            stderr.contains("the connection closed before the task reported its exit status"),
+            "{stderr}"
+        );
+    }
+
     /// The real `socat` on this host's `PATH`, or `None` when it has none.
     fn host_socat() -> Option<PathBuf> {
         std::env::var_os("PATH")
