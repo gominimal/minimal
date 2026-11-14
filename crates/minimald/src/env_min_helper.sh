@@ -280,14 +280,18 @@ __min_rpc() {
     fi
     # A `run` always ends with an `exit:` line. A stream that ends without
     # one is a failure of min, not of the task, so it exits 125.
-    # A signal that ends socat, as Ctrl-C or the run's timeout does, also
-    # ends the stream. That is not a failure of min, so it prints no line.
+    # A signal that ends socat, as Ctrl-C does, also ends the stream. That
+    # is not a failure of min, so it prints no line, and the helper exits
+    # with 128 + signal, as the shell does.
     if [[ "$method" == "run" ]]; then
         if [[ "$forward" -eq 0 && -n "$sock_pid" ]]; then
             wait "$sock_pid" 2>/dev/null
             sock_status=$?
         fi
-        if [[ "$error" != "true" ]] && (( sock_status <= 128 )); then
+        if (( sock_status > 128 )); then
+            return "$sock_status"
+        fi
+        if [[ "$error" != "true" ]]; then
             echo "error: the connection closed before the task reported its exit status" >&2
         fi
         return 125

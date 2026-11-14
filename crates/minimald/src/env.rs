@@ -5123,8 +5123,8 @@ exit $rc
     }
 
     // T48, BCLI-010, BCLI-014: a run whose socat a signal ends, as Ctrl-C
-    // or the run's timeout does, prints neither socat's warning nor the
-    // broken-stream line, and exits 125 as before.
+    // does, prints neither socat's warning nor the broken-stream line, and
+    // exits with 128 + signal.
     #[test]
     fn min_helper_run_ended_by_signal_prints_no_connection_line() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5163,7 +5163,7 @@ exit $rc
         let check = |what: &str, out: std::process::Output| {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            assert_eq!(out.status.code(), Some(125), "{what}: {stderr}");
+            assert_eq!(out.status.code(), Some(143), "{what}: {stderr}");
             assert!(stdout.contains("task output"), "{what}: {stdout}");
             assert!(!stderr.contains("exiting on signal"), "{what}: {stderr}");
             assert!(
