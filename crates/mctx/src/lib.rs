@@ -277,6 +277,10 @@ pub struct Context {
     /// network attaches to it, so the box's egress verdict decides the
     /// build's connections.
     pub(crate) box_network: Option<op::BuildNetwork>,
+    /// The project directory a task's durable state is keyed on, if not the
+    /// directory the mfile was read from (gominimal/minimal#1373). `None`
+    /// keys it on the mfile's own directory.
+    pub(crate) state_root: Option<PathBuf>,
 }
 
 impl fmt::Display for Context {
@@ -437,6 +441,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            state_root: None,
         })
     }
 
@@ -461,6 +466,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            state_root: None,
         }
     }
 
@@ -475,6 +481,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            state_root: None,
         }
     }
 
@@ -503,6 +510,22 @@ impl Context {
     /// The box network this context's package builds attach to, if any.
     pub fn box_network(&self) -> Option<&op::BuildNetwork> {
         self.box_network.as_ref()
+    }
+
+    /// Keys every task's durable state on `dir` rather than on the
+    /// directory the mfile was read from (gominimal/minimal#1373). For a
+    /// daemon that parses every box's mfile from a tree laid out afresh
+    /// each session, native or VM, and so has a stable host path to key on
+    /// and no stable mfile directory.
+    #[must_use]
+    pub fn with_state_root(mut self, dir: PathBuf) -> Self {
+        self.state_root = Some(dir);
+        self
+    }
+
+    /// The project directory task state is keyed on, if one was set.
+    pub fn state_root(&self) -> Option<&Path> {
+        self.state_root.as_deref()
     }
 
     /// Returns a clone of the shared daemon-scoped context. Cheap —
@@ -541,6 +564,7 @@ impl Context {
         Ok(Self {
             classifier_leaf: self.classifier_leaf.clone(),
             box_network: self.box_network.clone(),
+            state_root: self.state_root.clone(),
             ..Self::from_daemon(Arc::clone(&self.daemon), mfile)
         })
     }
@@ -1105,14 +1129,18 @@ impl Context {
             self.repo_dir()?.to_path_buf()
         };
         let state_base_dir = match state_key {
-            Some(name) if !name.is_empty() => mfile
-                .state_dir(name, self.daemon.config.state_base_dir())
-                .ok_or_else(|| {
-                    Error::Other(anyhow!(
-                        "cannot determine state directory for state key {name:?}: \
-                         the location of the minimal file on disk is unknown"
-                    ))
-                })?,
+            Some(name) if !name.is_empty() => durable_state_dir(
+                mfile,
+                name,
+                self.daemon.config.state_base_dir(),
+                self.state_root(),
+            )
+            .ok_or_else(|| {
+                Error::Other(anyhow!(
+                    "cannot determine state directory for state key {name:?}: \
+                     the location of the minimal file on disk is unknown"
+                ))
+            })?,
             _ => {
                 let tmp = self.daemon.cache.temp_dir().map_err(|e| {
                     Error::Other(
@@ -1626,6 +1654,21 @@ fn detach_array_close(arr: &mut Array) -> String {
     tail[..i].trim_end().to_owned()
 }
 
+/// The durable state directory for `state_key`: keyed on `state_root` when
+/// one is set, else on the directory `mfile` was read from. `None` when
+/// neither is known.
+fn durable_state_dir(
+    mfile: &mfile::File,
+    state_key: &str,
+    base: PathBuf,
+    state_root: Option<&Path>,
+) -> Option<PathBuf> {
+    match state_root {
+        Some(root) => Some(mfile.state_dir_under(state_key, base, root)),
+        None => mfile.state_dir(state_key, base),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1697,6 +1740,30 @@ mod tests {
             &ctx_a.daemon_context(),
             &ctx_b.daemon_context()
         ));
+    }
+
+    /// gominimal/minimal#1373: a state root keys a task's durable state on
+    /// the project, not on where this daemon's copy of the mfile sits.
+    /// Without one, the key stays the mfile's own directory.
+    #[test]
+    fn state_root_keys_durable_state_on_the_project() {
+        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata")
+            .join("fakerepo");
+        let mfile = MFileSearchStrategy::Override(repo)
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+        let base = PathBuf::from("/state");
+
+        assert_eq!(
+            durable_state_dir(&mfile, "env", base.clone(), None),
+            mfile.state_dir("env", base.clone())
+        );
+        let root = Path::new("/home/user/src/my-project");
+        assert_eq!(
+            durable_state_dir(&mfile, "env", base.clone(), Some(root)),
+            Some(PathBuf::from("/state/-home-user-src-my%2Dproject/env"))
+        );
     }
 
     /// NET-155: a context made for a box carries the box's classifier leaf,
