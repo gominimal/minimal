@@ -680,7 +680,17 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
             // script at yet: the item waits on a daemon, and never blocks the
             // items the script can carry without one.
             match detection.0.port {
-                Some(port) if crate::resolver::answerer_bound_at(port).await => (port, true),
+                Some(port) if crate::resolver::answerer_bound_at(port).await => {
+                    // A reply on the port is the package's service only
+                    // while launchd holds the job; with it booted out, any
+                    // local program can take the port and answer.
+                    #[cfg(target_os = "macos")]
+                    if let Some(cause) = crate::resolver::answer_not_the_shared_services(port).await
+                    {
+                        return Item::cannot(NAMES_ID, NAMES_LABEL, cause);
+                    }
+                    (port, true)
+                }
                 _ => {
                     let cause = match held_no_channel {
                         Some(port) => crate::resolver::port_held_no_channel_warning(port),
