@@ -1107,6 +1107,12 @@ impl Context {
         let state_base_dir = match state_key {
             Some(name) if !name.is_empty() => mfile
                 .state_dir(name, self.daemon.config.state_base_dir())
+                .map_err(|reason| {
+                    Error::Other(anyhow!(
+                        "refusing to use state key {name:?}: {reason}. Choose a state key \
+                         that is a single directory name"
+                    ))
+                })?
                 .ok_or_else(|| {
                     Error::Other(anyhow!(
                         "cannot determine state directory for state key {name:?}: \
