@@ -3003,7 +3003,43 @@ pub(crate) fn put_spec(
     spec: &mfile::spec::BoxSpec,
 ) -> Result<(), anyhow::Error> {
     request.spec = Some(serde_json_lenient::to_value(spec).context("Cannot encode the box spec")?);
+    stamp_client_projection_digest(request);
     Ok(())
+}
+
+/// Sets the client's projection digest of the spec on `request` (BOX-071).
+/// The digest is over the spec JSON the request sends, read as the daemon
+/// reads it, so the daemon recomputes the same digest and stores it beside
+/// this one. A spec that names no type is of the creating verb's type, as
+/// the daemon reads it.
+///
+/// A request with no spec, or a spec that does not project, carries no
+/// client digest. The daemon then stores none.
+pub(crate) fn stamp_client_projection_digest(request: &mut minimald_rpc::CreateSessionRequest) {
+    request
+        .config
+        .attrs
+        .remove(minimald_rpc::CLIENT_PROJECTION_DIGEST_ATTR);
+    let Some(spec) = request.spec.as_ref() else {
+        return;
+    };
+    let verb_type = match request.config.creating_verb {
+        minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
+        minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
+    };
+    match mfile::projection::spec_digest(spec, verb_type) {
+        Ok(digest) => {
+            tracing::info!(
+                client_projection_digest = %digest,
+                "computed the box spec's projection digest"
+            );
+            request.config.set_client_projection_digest(digest);
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "computed no projection digest for the box spec; the create carries none"
+        ),
+    }
 }
 
 /// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
@@ -3049,6 +3085,9 @@ pub(crate) fn add_vpn_network_names(
             list.push(value);
         }
     }
+    // The digest is over the spec the request sends, so it follows the
+    // change.
+    stamp_client_projection_digest(request);
     Ok(())
 }
 

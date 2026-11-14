@@ -20057,3 +20057,136 @@ async fn session_entry_network_mode_and_ingress() {
     assert_eq!(invalid.error.exit_code(), Some(3), "{error}");
     assert!(error.to_string().contains("network.ingress"), "{error}");
 }
+
+// BOX-071: a create carries the client's projection digest of the spec it
+// sends. The daemon recomputes its own from the spec it receives, and the
+// box's record holds the two side by side, equal. A session create and a
+// task create both carry it. A `--vpn-network-names` change to the spec
+// leaves the digest the one of the spec that is sent.
+#[tokio::test]
+async fn create_stores_client_digest_equal_to_daemon_digest() {
+    use minimald_rpc::{CLIENT_PROJECTION_DIGEST_ATTR, DAEMON_PROJECTION_DIGEST_ATTR};
+
+    let toml = "[sessions.default.network.egress]\n\
+                allow_dns_hosts = [\"a.example\"]\n\n\
+                [tasks.lint]\nexec = [\"true\"]\n";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let (_state, global, server) = show_network_daemon().await;
+    let mut daemon = server.connect().await;
+    let mut client = connect_daemon(&global).await.expect("the daemon answers");
+
+    // A session box, as `min box start --network own_ip` plans it.
+    let start = parsed_start(&["min", "box", "start", "--network", "own_ip"]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+    else {
+        panic!("the default entry is a session");
+    };
+    let mut session = planned_session_request(&args, &options, root);
+    add_vpn_network_names(&mut session, &["corp".to_owned()]).unwrap();
+
+    // A task box, as `min task run lint` builds it.
+    let mut task = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        boxes::NetworkMode::NoNet,
+        boxes::BoxPolicy::default(),
+    );
+    task.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    request_fresh_instance(&mut task);
+    let file = mfile::File::from_dir_recursive(project.path()).expect("the project loads");
+    let spec = mfile::spec::BoxSpec::for_task("lint", &file.tasks["lint"], spec_flags(&task))
+        .expect("a task that is not interactive has a spec");
+    put_spec(&mut task, &spec).unwrap();
+
+    for (what, request, box_type) in [
+        ("session", session, boxes::SESSION_BOX_TYPE),
+        ("task", task, boxes::TASK_BOX_TYPE),
+    ] {
+        let sent = request.spec.clone().expect("the create carries a spec");
+        let expected = mfile::projection::spec_digest(&sent, box_type).expect("the spec projects");
+        assert_eq!(
+            request.config.client_projection_digest(),
+            Some(expected.as_str()),
+            "{what}: the client digest is the one of the spec it sends"
+        );
+        let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+            minimald_rpc::Errorable::Ok(created) => created.id,
+            minimald_rpc::Errorable::Err { error } => panic!("{what}: the create failed: {error}"),
+        };
+        let record = stored_box_record(&mut client, id)
+            .await
+            .expect("the record is read")
+            .expect("the box has a record");
+        let client_digest = record.attrs.get(CLIENT_PROJECTION_DIGEST_ATTR);
+        let daemon_digest = record.attrs.get(DAEMON_PROJECTION_DIGEST_ATTR);
+        assert_eq!(client_digest, Some(&expected), "{what}: {:?}", record.attrs);
+        assert_eq!(daemon_digest, client_digest, "{what}: {:?}", record.attrs);
+    }
+}
+
+// BOX-071: `min box spec <entry>` writes each store reference's
+// `upstream` and `inject` from the client's `[secret-store-rules]`, as
+// the spec a create sends carries them, and names that table as their
+// source. A store reference with no rule for its item has neither.
+#[tokio::test]
+async fn box_spec_render_carries_client_store_rules() {
+    let (_project, global) = spec_project(
+        "[sessions.default.secrets.NPM]\nsource = \"store\"\nstore = \"keychain\"\n\
+         id = \"npm-token\"\n\n\
+         [sessions.default.secrets.OTHER]\nsource = \"store\"\nstore = \"keychain\"\n\
+         id = \"no-rule\"\n\n\
+         [sessions.default.network.bep]\nsteering = \"proxy_env\"\n",
+    );
+    let config = global.config_dir.as_ref().unwrap().join("minimal");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[secret-store-rules.npm-token]\nstore = \"keychain\"\n\
+         upstream = [\"registry.npmjs.org\"]\nheader = \"Authorization\"\n\
+         prefix = \"Bearer \"\n",
+    )
+    .unwrap();
+    let argv = ["min", "box", "spec", "default", "--network", "own_ip"];
+
+    let toml = box_spec_text(&global, &argv)
+        .await
+        .expect("the entry renders");
+    assert!(
+        toml.contains("# secrets.NPM.upstream: from [secret-store-rules]\n"),
+        "{toml}"
+    );
+    assert!(
+        toml.contains("# secrets.NPM.inject: from [secret-store-rules]\n"),
+        "{toml}"
+    );
+    assert!(!toml.contains("secrets.OTHER.upstream"), "{toml}");
+    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
+    let npm = &parsed["secrets"]["NPM"];
+    assert_eq!(
+        npm["upstream"],
+        toml::Value::Array(vec!["registry.npmjs.org".into()])
+    );
+    assert_eq!(npm["inject"]["header"].as_str(), Some("Authorization"));
+    assert_eq!(npm["inject"]["prefix"].as_str(), Some("Bearer "));
+    let other = parsed["secrets"]["OTHER"].as_table().unwrap();
+    assert!(!other.contains_key("upstream"), "{toml}");
+    assert!(!other.contains_key("inject"), "{toml}");
+
+    let mut json_argv = argv.to_vec();
+    json_argv.extend(["-o", "json"]);
+    let json = box_spec_text(&global, &json_argv)
+        .await
+        .expect("the entry renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&json).expect("JSON");
+    assert_eq!(
+        doc["spec"]["secrets"]["NPM"]["upstream"],
+        serde_json_lenient::json!(["registry.npmjs.org"])
+    );
+    assert_eq!(
+        doc["sources"]["secrets.NPM.upstream"],
+        serde_json_lenient::json!(["[secret-store-rules]"])
+    );
+}
