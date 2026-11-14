@@ -628,6 +628,9 @@ async fn a_refused_task_attach_stops_the_task() {
         fn kill_and_reap(&mut self) {
             self.reaped = true;
         }
+        fn has_ended(&mut self) -> bool {
+            false
+        }
     }
 
     let planned = sandbox::PlannedLaunch::begin(Arc::new(Refuses))
@@ -645,6 +648,61 @@ async fn a_refused_task_attach_stops_the_task() {
         err.to_string().contains("switch refused the client"),
         "the provider's reason must reach the caller, got: {err}",
     );
+}
+
+/// A task that exits while its network is being attached takes its
+/// namespace with it. The refused attach is no network failure then: the
+/// process is not killed, so its own exit status stays for the task's wait,
+/// and no network guard is owed.
+#[tokio::test]
+async fn a_task_that_ended_during_its_attach_reports_its_exit() {
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct GoneNamespace;
+    impl sandbox::Network for GoneNamespace {
+        fn plan(&self) -> sandbox::PlanFuture<'_> {
+            Box::pin(std::future::ready(Ok(sandbox::NetPlan::isolated())))
+        }
+        fn attach(&self, _: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
+            Box::pin(std::future::ready(Err(sandbox::NetworkError::new(
+                std::io::Error::other("no such namespace"),
+            ))))
+        }
+    }
+
+    /// A process that already exited with `status`.
+    struct Child {
+        status: Option<i32>,
+        reaped: bool,
+    }
+    impl super::Reapable for Child {
+        fn kill_and_reap(&mut self) {
+            self.reaped = true;
+            self.status = None;
+        }
+        fn has_ended(&mut self) -> bool {
+            self.status.is_some()
+        }
+    }
+
+    let planned = sandbox::PlannedLaunch::begin(Arc::new(GoneNamespace))
+        .await
+        .expect("planning succeeds; the process ends before its attach");
+    let mut child = Child {
+        status: Some(3),
+        reaped: false,
+    };
+    let attached = super::attach_or_reap(planned, sandbox::Spawned::new(1), &mut child)
+        .await
+        .expect("an ended task's attach is no network failure");
+    assert!(attached.is_none(), "no network guard is owed");
+    assert!(!child.reaped, "the ended task keeps its exit status");
+    assert_eq!(child.status, Some(3), "the task reports its own exit");
+
+    // Nothing to release: the release returns at once.
+    let mut net = super::NetRelease::new(attached);
+    net.release().await;
 }
 
 /// A guard whose teardown blocks until told to finish, then counts.
@@ -682,7 +740,7 @@ async fn a_dropped_wait_still_releases_the_network_once() {
     };
 
     // The first `wait` is dropped mid-release, as `select!` does.
-    let mut net = super::NetRelease::new(guard());
+    let mut net = super::NetRelease::new(Some(guard()));
     let dropped = tokio::time::timeout(std::time::Duration::from_millis(20), net.release())
         .await
         .is_err();
@@ -697,7 +755,7 @@ async fn a_dropped_wait_still_releases_the_network_once() {
     assert_eq!(done.load(Ordering::SeqCst), 1, "released exactly once");
 
     // Dropped before any `wait`: `Drop` spawns the release; let it run.
-    drop(super::NetRelease::new(guard()));
+    drop(super::NetRelease::new(Some(guard())));
     go.notify_one();
     tokio::task::yield_now().await;
     assert_eq!(

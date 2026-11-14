@@ -237,6 +237,9 @@ pub(crate) async fn ensure_task_rows_stand(
 pub(super) trait Reapable {
     /// Kill the process and wait for it, so it does not outlive its sandbox.
     fn kill_and_reap(&mut self);
+    /// Whether the process has exited. An exited process is not reaped here,
+    /// so its status stays for the task's own wait.
+    fn has_ended(&mut self) -> bool;
 }
 
 impl Reapable for hakoniwa::Child {
@@ -245,17 +248,28 @@ impl Reapable for hakoniwa::Child {
         let _ = self.kill();
         let _ = self.wait();
     }
+
+    fn has_ended(&mut self) -> bool {
+        matches!(self.try_wait(), Ok(Some(_)))
+    }
 }
 
 /// Step 3 of a task launch: wire the process's namespace, or kill and reap the
 /// process so it does not run on with the network it failed to get — as
 /// `sandbox::run_with_cancel` does. `PlannedLaunch`'s drop releases the plan.
+///
+/// A process that exited before its attach finished took its namespace with
+/// it. That is no network failure: `None` comes back, no guard is owed, and
+/// the task's wait reports the process's own exit status.
 pub(super) async fn attach_or_reap<P: Reapable>(
     planned: sandbox::PlannedLaunch,
     spawned: sandbox::Spawned,
     child: &mut P,
-) -> io::Result<Box<dyn sandbox::NetGuard>> {
-    match planned.attach(spawned).await {
+) -> io::Result<Option<Box<dyn sandbox::NetGuard>>> {
+    match planned
+        .attach_unless_ended(spawned, || child.has_ended())
+        .await
+    {
         Ok(guard) => Ok(guard),
         Err(e) => {
             child.kill_and_reap();
@@ -669,9 +683,11 @@ impl Drop for NetRelease {
 }
 
 impl NetRelease {
-    pub(super) fn new(guard: Box<dyn sandbox::NetGuard>) -> Self {
+    /// `None` for a task that ended before its network was attached: there
+    /// is nothing to release.
+    pub(super) fn new(guard: Option<Box<dyn sandbox::NetGuard>>) -> Self {
         Self {
-            guard: Some(guard),
+            guard,
             running: None,
         }
     }
@@ -710,7 +726,10 @@ pub(super) enum WaitState {
 }
 
 impl HakoniwaProcess {
-    pub(super) fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox::NetGuard>) -> Self {
+    pub(super) fn new(
+        child: hakoniwa::Child,
+        net_guard: Option<Box<dyn sandbox::NetGuard>>,
+    ) -> Self {
         Self {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
