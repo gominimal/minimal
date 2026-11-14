@@ -1818,7 +1818,7 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     let invalid = |msg: &str| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("invalid session name: {msg}"),
+            format!("invalid box name: {msg}"),
         )
     };
     if name.trim().is_empty() {
@@ -3158,6 +3158,19 @@ mod tests {
                 Some(ErrorKind::InvalidInput),
                 "expected `{bad:?}` to be rejected",
             );
+        }
+    }
+
+    /// BCLI-058: the refusal of a name says box, not session, and keeps
+    /// the reason. `min box rename` reads this lead to exit 2.
+    #[test]
+    fn invalid_box_name_refusal_says_box() {
+        for bad in ["My_Box", "", "dot.ted"] {
+            let text = validate_session_name(bad)
+                .expect_err("the name is refused")
+                .to_string();
+            assert!(text.starts_with("invalid box name: "), "{text}");
+            assert!(!text.contains("session"), "{text}");
         }
     }
 
