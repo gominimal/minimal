@@ -23,6 +23,7 @@
 //! [`replace`].
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use zeroize::Zeroizing;
@@ -146,6 +147,23 @@ pub enum KeyError {
         role: Role,
         /// What the store said.
         detail: String,
+    },
+    /// The TPM did not load the key now, and the key still exists
+    /// (BEP-089).
+    #[error("the TPM did not load the proxy's {role} key, which is kept: {case}")]
+    TpmKept {
+        /// The role of the key.
+        role: Role,
+        /// Why the TPM did not load it.
+        case: TpmKept,
+    },
+    /// No TPM can load the key any more (BEP-089).
+    #[error("the TPM cannot load the proxy's {role} key any more: {case}")]
+    TpmLost {
+        /// The role of the key.
+        role: Role,
+        /// Why the key is lost.
+        case: TpmLost,
     },
     /// The store made a key, the keychain made it exportable, and the
     /// build refused it. `removed` says whether the store then removed it.
@@ -379,6 +397,94 @@ impl<K: HeldKey> ProxyKeys<K> {
     }
 }
 
+/// Why the TPM did not load a key that still exists (BEP-089). A later
+/// start can load it, so the proxy never replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TpmKept {
+    /// The TPM cannot be reached, or it answered with a response that does
+    /// not say the key is lost, such as `TPM_RC_OBJECT_MEMORY` or
+    /// `TPM_RC_RETRY`.
+    Unavailable {
+        /// The TPM's response, or why the TPM did not answer.
+        response: String,
+    },
+    /// The proxy's user cannot read a file of the key.
+    Unreadable {
+        /// The file.
+        path: PathBuf,
+    },
+}
+
+impl TpmKept {
+    /// The TPM's response, when the TPM or its tools answered.
+    pub fn response(&self) -> &str {
+        match self {
+            Self::Unavailable { response } => response,
+            Self::Unreadable { .. } => "none",
+        }
+    }
+}
+
+impl fmt::Display for TpmKept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable { response } => write!(f, "the TPM cannot load it now ({response})"),
+            Self::Unreadable { path } => write!(f, "this user cannot read {}", path.display()),
+        }
+    }
+}
+
+/// Why no TPM can load a key any more (BEP-089). The remedy is a
+/// replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TpmLost {
+    /// The key file is missing.
+    MissingKeyFile {
+        /// Where the key file was.
+        path: PathBuf,
+    },
+    /// The authorization file is missing.
+    MissingAuthFile {
+        /// Where the authorization file was.
+        path: PathBuf,
+    },
+    /// The TPM refused the key file as not its own, with an integrity or a
+    /// hierarchy error.
+    NotThisTpm {
+        /// The TPM's response.
+        response: String,
+    },
+}
+
+impl TpmLost {
+    /// The TPM's response, when the TPM answered.
+    pub fn response(&self) -> &str {
+        match self {
+            Self::NotThisTpm { response } => response,
+            Self::MissingKeyFile { .. } | Self::MissingAuthFile { .. } => "none",
+        }
+    }
+}
+
+impl fmt::Display for TpmLost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingKeyFile { path } => {
+                write!(f, "the key file is missing: {}", path.display())
+            }
+            Self::MissingAuthFile { path } => {
+                write!(f, "the authorization file is missing: {}", path.display())
+            }
+            Self::NotThisTpm { response } => {
+                write!(
+                    f,
+                    "the TPM refused the key file as not its own ({response})"
+                )
+            }
+        }
+    }
+}
+
 /// Why the proxy did not start.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StartError {
@@ -401,12 +507,27 @@ pub enum StartError {
     /// Secret Service, which holds the role's key, cannot be reached from
     /// this session (BEP-089).
     Unreachable(Role),
+    /// The TPM did not load the role's key now, and the key still exists
+    /// (BEP-089).
+    TpmKept {
+        /// The role of the key.
+        role: Role,
+        /// Why the TPM did not load it.
+        case: TpmKept,
+    },
+    /// No TPM can load the role's key any more (BEP-089).
+    TpmLost {
+        /// The role of the key.
+        role: Role,
+        /// Why the key is lost.
+        case: TpmLost,
+    },
 }
 
 impl StartError {
     /// The start refusal for a store error. A locked or unreachable Secret
     /// Service keeps its keys, so its refusal names no replacement.
-    fn from_store(err: KeyError) -> Self {
+    pub(crate) fn from_store(err: KeyError) -> Self {
         match err {
             KeyError::Locked { role, detail } => {
                 tracing::error!(role = %role, detail = %detail, "the login keyring that holds a proxy key is locked");
@@ -415,6 +536,28 @@ impl StartError {
             KeyError::Unreachable { role, detail } => {
                 tracing::error!(role = %role, detail = %detail, "Secret Service, which holds a proxy key, cannot be reached");
                 Self::Unreachable(role)
+            }
+            KeyError::TpmKept { role, case } => {
+                tracing::error!(
+                    role = %role,
+                    store = "tpm",
+                    response = %case.response(),
+                    key = "kept",
+                    detail = %case,
+                    "the TPM did not load a proxy key"
+                );
+                Self::TpmKept { role, case }
+            }
+            KeyError::TpmLost { role, case } => {
+                tracing::error!(
+                    role = %role,
+                    store = "tpm",
+                    response = %case.response(),
+                    key = "lost",
+                    detail = %case,
+                    "the TPM did not load a proxy key"
+                );
+                Self::TpmLost { role, case }
             }
             err => Self::Store(err),
         }
@@ -453,6 +596,44 @@ impl fmt::Display for StartError {
                 f,
                 "The proxy did not start: Secret Service cannot be reached from this session, and it holds the proxy's {role} key. Start the proxy from the desktop session that holds the login keyring."
             ),
+            // BEP-089: the wording is fixed by the task's diagnostics line.
+            Self::TpmKept {
+                role,
+                case: TpmKept::Unavailable { response },
+            } => write!(
+                f,
+                "The proxy did not start: the TPM cannot load the proxy's {role} key now ({response}). The key is kept; start the proxy again when the TPM is available."
+            ),
+            Self::TpmKept {
+                role,
+                case: TpmKept::Unreadable { path },
+            } => write!(
+                f,
+                "The proxy did not start: this user cannot read {}, which holds the proxy's {role} key. The key is kept.",
+                path.display()
+            ),
+            Self::TpmLost { role, case } => {
+                match case {
+                    TpmLost::MissingKeyFile { path } => write!(
+                        f,
+                        "The proxy did not start: the key file of the proxy's {role} key is missing: {}.",
+                        path.display()
+                    )?,
+                    TpmLost::MissingAuthFile { path } => write!(
+                        f,
+                        "The proxy did not start: the authorization file of the proxy's {role} key is missing: {}.",
+                        path.display()
+                    )?,
+                    TpmLost::NotThisTpm { .. } => write!(
+                        f,
+                        "The proxy did not start: this TPM no longer holds the proxy's {role} key."
+                    )?,
+                }
+                write!(
+                    f,
+                    " Run `bep --replace-key {role}` to make a new one. Boxes created before then must be re-created."
+                )
+            }
         }
     }
 }
@@ -538,7 +719,9 @@ pub fn load_with<S: KeyStore>(
                     err @ (KeyError::Store { .. }
                     | KeyError::Exportable { .. }
                     | KeyError::Locked { .. }
-                    | KeyError::Unreachable { .. }),
+                    | KeyError::Unreachable { .. }
+                    | KeyError::TpmKept { .. }
+                    | KeyError::TpmLost { .. }),
                 ) => {
                     return Err(StartError::from_store(err));
                 }
@@ -556,7 +739,9 @@ pub fn load_with<S: KeyStore>(
                 err @ (KeyError::Store { .. }
                 | KeyError::Exportable { .. }
                 | KeyError::Locked { .. }
-                | KeyError::Unreachable { .. }),
+                | KeyError::Unreachable { .. }
+                | KeyError::TpmKept { .. }
+                | KeyError::TpmLost { .. }),
             ) => {
                 return Err(StartError::from_store(err));
             }
@@ -825,8 +1010,19 @@ pub fn replace_outcome<S: KeyStore>(
     // move back. It comes back too.
     // A store that does not say whether `Slot::New` holds a key stops the
     // replacement, so the cleanup never removes an old key it can recover.
-    let mut held = true;
-    if matches!(store.find(role), Ok(None)) {
+    // BEP-089: a key whose key file is gone leaves the label as empty as
+    // `Ok(None)` does, so it takes the same path. Any other lost key is
+    // still under the label, but no key is in use.
+    let found = store.find(role);
+    let mut held = !matches!(found, Err(KeyError::TpmLost { .. }));
+    if matches!(
+        found,
+        Ok(None)
+            | Err(KeyError::TpmLost {
+                case: TpmLost::MissingKeyFile { .. },
+                ..
+            })
+    ) {
         held = match recover_interrupted(store, role, published) {
             Ok(recovered) => recovered,
             Err(Interrupted::Check(err)) => {
