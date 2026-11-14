@@ -19877,15 +19877,16 @@ async fn box_rename_native_host_prints_no_vm_host_warning() {
 
 // #3238: a session entry's `network.mode` and `network.ingress` reach the
 // box that `min session start`, `min box start` and `min session activate`
-// create. `--network` and `--ingress` still replace them, and `min box spec`
-// shows what the start sends, with the entry's table as the source.
+// create. `--network` still replaces the mode, each `--ingress` adds a
+// mapping after the entry's, and `min box spec` shows what the start sends,
+// with the layer of each value as its source.
 #[tokio::test]
 async fn session_entry_network_mode_and_ingress() {
     let file = "[sessions.default.network]\n\
                 mode = \"own_ip\"\n\
                 ingress = [\n  \
                   { proto = \"tcp\", port = 8080 },\n  \
-                  { external_port = 9090, internal_port = 90, proto = \"udp\" },\n\
+                  { external_port = 9090, internal_port = 90, proto = \"UDP\" },\n\
                 ]\n";
     let (project, global) = spec_project(file);
     let root = camino::Utf8Path::from_path(project.path()).unwrap();
@@ -19906,6 +19907,8 @@ async fn session_entry_network_mode_and_ingress() {
         internal_port: 70,
         proto: boxes::IpProto::Tcp,
     }];
+    // BCLI-024: a list flag adds to the list, after the entry's items.
+    let union_mappings: Vec<_> = file_mappings.iter().chain(&flag_mapping).cloned().collect();
     let mappings_of = |request: &PlannedRequest| {
         request
             .config
@@ -19939,16 +19942,19 @@ async fn session_entry_network_mode_and_ingress() {
     assert_eq!(request.config.network, boxes::NetworkMode::OwnIp);
     assert_eq!(mappings_of(&request), Some(file_mappings.clone()));
 
-    // `--ingress` replaces the entry's mappings, and the mode stays.
+    // `--ingress` adds its mapping after the entry's, and the mode stays.
     let request = planned(&["--ingress", "7000:70"]).expect("the flag applies");
     assert_eq!(request.config.network, boxes::NetworkMode::OwnIp);
-    assert_eq!(mappings_of(&request), Some(flag_mapping.clone()));
+    assert_eq!(mappings_of(&request), Some(union_mappings.clone()));
+    // A flag mapping the entry already has is not added twice.
+    let request = planned(&["--ingress", "8080:8080"]).expect("the flag applies");
+    assert_eq!(mappings_of(&request), Some(file_mappings.clone()));
 
-    // `--network own_ip --ingress` gives both from the command line.
+    // `--network own_ip --ingress` gives the mode from the command line.
     let request =
         planned(&["--network", "own_ip", "--ingress", "7000:70"]).expect("the flags apply");
     assert_eq!(request.config.network, boxes::NetworkMode::OwnIp);
-    assert_eq!(mappings_of(&request), Some(flag_mapping.clone()));
+    assert_eq!(mappings_of(&request), Some(union_mappings.clone()));
 
     // `--network host_ip` replaces the mode, so the entry's ingress has no
     // address to publish on, and the start is refused before any create.
@@ -19987,7 +19993,8 @@ async fn session_entry_network_mode_and_ingress() {
             "{key}: {json}"
         );
     }
-    // With the flags, the spec shows the command line as the source.
+    // With the flags, the mode is from the command line, and the mappings
+    // are from both layers.
     let json = box_spec_text(
         &global,
         &[
@@ -20009,14 +20016,17 @@ async fn session_entry_network_mode_and_ingress() {
     let ingress: boxes::IngressPolicy =
         serde_json_lenient::from_value(doc["spec"]["network"]["ingress"].clone())
             .expect("the ingress");
-    assert_eq!(ingress.port_mappings, flag_mapping, "{json}");
-    for key in ["network.mode", "network.ingress"] {
-        assert_eq!(
-            doc["sources"][key],
-            serde_json_lenient::json!(["the command line"]),
-            "{key}: {json}"
-        );
-    }
+    assert_eq!(ingress.port_mappings, union_mappings, "{json}");
+    assert_eq!(
+        doc["sources"]["network.mode"],
+        serde_json_lenient::json!(["the command line"]),
+        "{json}"
+    );
+    assert_eq!(
+        doc["sources"]["network.ingress"],
+        serde_json_lenient::json!(["[sessions.default]", "the command line"]),
+        "{json}"
+    );
 
     // An entry with ingress and no mode is host_ip, and the refusal names
     // the key that fixes it.

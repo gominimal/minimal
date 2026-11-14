@@ -247,9 +247,10 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 
 Each override flag changes only the key it names. The other
 `network.egress` keys of the entry stay as the entry declares them. With no
-`--network`, the box takes the entry's `network.mode`, else `host_ip`. With no
-`--ingress`, a session box takes the entry's `network.ingress`, a list such as
+`--network`, the box takes the entry's `network.mode`, else `host_ip`. A
+session box takes the entry's `network.ingress`, a list such as
 `[{ port = 8080 }]` or `[{ external_port = 8080, internal_port = 80, proto = "tcp" }]`.
+Each `--ingress` adds one mapping after the entry's mappings.
 Ingress needs an `own_ip` box, so a start refuses `network.ingress` on any
 other mode. The box keeps the
 result: `min box show <box> --network` prints the `[network]` section that

@@ -727,11 +727,9 @@ fn expand_entry(
         let (port_mappings, flags) = super::box_verbs::flag_network_overrides(&activate)?;
         let mut project_egress = super::box_verbs::project_egress(&root, Some(&entry.name))?;
         // #3238: as `min box start` sends them, the entry's `network.mode`
-        // and `network.ingress` apply when no flag replaces them.
-        let file_ingress = project_egress
-            .ingress
-            .take()
-            .filter(|_| overrides.ingress.is_empty());
+        // applies when no `--network` replaces it, and each `--ingress` adds
+        // a mapping after the entry's `network.ingress`.
+        let file_ingress = project_egress.ingress.take();
         let (mode, source) = match (overrides.network, project_egress.mode) {
             (Some(flag), _) => (flag.into(), vec![COMMAND_LINE.to_owned()]),
             (None, Some(mode)) => (mode, network_label.clone().unwrap_or_default()),
@@ -740,12 +738,17 @@ fn expand_entry(
                 vec![DEFAULT_SOURCE.to_owned()],
             ),
         };
-        let ingress_source = if file_ingress.is_some() {
-            network_label.clone().unwrap_or_default()
-        } else {
-            vec![COMMAND_LINE.to_owned()]
+        let mut ingress_source = Vec::new();
+        if file_ingress.is_some() {
+            ingress_source.extend(network_label.clone().unwrap_or_default());
+        }
+        if file_ingress.is_none() || !overrides.ingress.is_empty() {
+            ingress_source.push(COMMAND_LINE.to_owned());
+        }
+        let port_mappings = match file_ingress {
+            Some(file_mappings) => super::box_verbs::union_ingress(file_mappings, port_mappings),
+            None => port_mappings,
         };
-        let port_mappings = file_ingress.unwrap_or(port_mappings);
         let egress = super::box_verbs::effective_egress(
             project_egress.policy,
             flags,

@@ -113,8 +113,9 @@ fn refuse_file_ingress_off_own_ip(
 }
 
 /// The network mode and the static port mappings of a session box (#3238).
-/// `--network` replaces the entry's `network.mode`, and `--ingress`
-/// (`flag_mappings`) replaces its `network.ingress`. The refusals run
+/// `--network` replaces the entry's `network.mode`. Each `--ingress`
+/// (`flag_mappings`) adds a mapping to its `network.ingress`, as BCLI-024
+/// says a list flag adds to the list. The refusals run
 /// before anything is created: a dynamic or static ingress needs an
 /// `own_ip` box.
 ///
@@ -126,7 +127,7 @@ pub(crate) fn session_box_network(
     project: &mut ProjectEgress,
     flag_mappings: Vec<boxes::PortMapping>,
 ) -> anyhow::Result<(crate::cli::CliNetworkMode, Vec<boxes::PortMapping>)> {
-    let file_ingress = project.ingress.take().filter(|_| args.ingress.is_empty());
+    let file_ingress = project.ingress.take();
     let network_flagged = args.network.is_some();
     let network = args
         .network
@@ -138,22 +139,38 @@ pub(crate) fn session_box_network(
     // A static mapping needs an own-IP box too: only it has a published
     // address a static forwarder could apply to.
     refuse_ingress_off_own_ip(network, !args.ingress.is_empty())?;
-    let Some(mappings) = file_ingress else {
+    let Some(file_mappings) = file_ingress else {
         return Ok((network, flag_mappings));
     };
     refuse_file_ingress_off_own_ip(
         network,
         network_flagged,
-        !mappings.is_empty(),
+        !file_mappings.is_empty(),
         project.layer.as_deref(),
     )?;
     tracing::debug!(
         network = boxes::NetworkMode::from(network).word(),
-        mappings = mappings.len(),
+        file_mappings = file_mappings.len(),
+        flag_mappings = flag_mappings.len(),
         layer = ?project.layer,
-        "the session box takes the entry's network.ingress"
+        "the session box takes the entry's network.ingress and the --ingress mappings"
     );
-    Ok((network, mappings))
+    Ok((network, union_ingress(file_mappings, flag_mappings)))
+}
+
+/// The entry's `network.ingress` mappings followed by the `--ingress`
+/// mappings, as BOX-064 unions lists. A flag mapping equal to one the entry
+/// already has is not added twice.
+pub(crate) fn union_ingress(
+    mut file_mappings: Vec<boxes::PortMapping>,
+    flag_mappings: Vec<boxes::PortMapping>,
+) -> Vec<boxes::PortMapping> {
+    for mapping in flag_mappings {
+        if !file_mappings.contains(&mapping) {
+            file_mappings.push(mapping);
+        }
+    }
+    file_mappings
 }
 
 /// The `--network` value of a `network.mode` that `minimal.toml` sets.
@@ -1287,8 +1304,8 @@ pub(crate) struct ProjectEgress {
     /// Every box-creating command reads it when `--network` is not given.
     pub(crate) mode: Option<boxes::NetworkMode>,
     /// The `network.ingress` port mappings of the expanded entry, when a
-    /// layer sets the key. A session box takes them when no `--ingress` is
-    /// given (#3238).
+    /// layer sets the key. A session box takes them, and each `--ingress`
+    /// adds one mapping after them (#3238).
     pub(crate) ingress: Option<Vec<boxes::PortMapping>>,
     /// The table whose `network` the expanded entry holds, as the file
     /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
@@ -1627,10 +1644,10 @@ fn file_port_mappings(ingress: &toml::Value) -> anyhow::Result<Vec<boxes::PortMa
                 (None, Some(external), Some(internal)) => (external, internal),
                 _ => return Err(invalid().into()),
             };
+        // The same spellings `--ingress` takes, in any case.
         let proto = match item.proto.as_deref() {
-            None | Some("tcp") => boxes::IpProto::Tcp,
-            Some("udp") => boxes::IpProto::Udp,
-            Some(_) => return Err(invalid().into()),
+            None => boxes::IpProto::Tcp,
+            Some(proto) => crate::cli::parse_ingress_proto(proto).map_err(|_| invalid())?,
         };
         if internal_port == 0 {
             return Err(invalid().into());
