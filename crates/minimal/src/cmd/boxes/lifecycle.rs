@@ -946,7 +946,8 @@ pub(crate) async fn rm_listed_box(
 }
 
 /// The daemon's refusal of a rename (BOX-010): a running box on the host
-/// holds the name, or the name is reserved. The text is the daemon's, and
+/// holds the name, the name is reserved, or the name is not a valid box
+/// name. The text is the daemon's, and
 /// names the holder. `min box rename` ends with exit 2 on it (BCLI-058).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxRenameRefusal {
@@ -961,12 +962,18 @@ impl BoxRenameRefusal {
     /// `boxes::box_name::RenameRefusal::HeldByRunning` spells it.
     const HELD_LEAD: &'static str = "The running session `";
 
+    /// The lead of the daemon's text when the name is not a valid box name,
+    /// as `boxes::store`'s name check spells it.
+    const INVALID_LEAD: &'static str = "invalid box name: ";
+
     /// The refusal a `RenameSession` error carries, or `None` when the
     /// error is any other failure.
-    fn from_error(error: &str) -> Option<Self> {
+    pub(crate) fn from_error(error: &str) -> Option<Self> {
         let reserved = boxes::box_name::RenameRefusal::Reserved.to_string();
         let held = error.starts_with(Self::HELD_LEAD) && error.contains(" holds the name `");
-        (held || error == reserved).then(|| Self {
+        // BCLI-058: a name the store refuses is a usage error too.
+        let invalid = error.starts_with(Self::INVALID_LEAD);
+        (held || invalid || error == reserved).then(|| Self {
             message: error.to_owned(),
         })
     }

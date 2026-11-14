@@ -57,10 +57,12 @@ pub(crate) fn refuse_dynamic_ingress_off_own_ip(
     range: Option<(u16, u16)>,
 ) -> Result<(), anyhow::Error> {
     if network.into() != boxes::NetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
-        anyhow::bail!(
-            "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with \
-             its own IP address can publish ports"
-        );
+        return Err(NetworkFlagRefusal {
+            message: "--dynamic-ingress and --dynamic-range need --network own_ip: only a box \
+                      with its own IP address can publish ports"
+                .to_owned(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -70,18 +72,43 @@ pub(crate) fn refuse_dynamic_ingress_off_own_ip(
 /// a mapping on a `host_ip` or `none` box would be recorded and shown with
 /// no publish surface to honour it. The CLI reference documents the flag as
 /// requiring `--network own_ip`.
-fn refuse_ingress_off_own_ip(
+pub(crate) fn refuse_ingress_off_own_ip(
     network: crate::cli::CliNetworkMode,
     has_ingress: bool,
 ) -> Result<(), anyhow::Error> {
     if network != crate::cli::CliNetworkMode::OwnIp && has_ingress {
-        anyhow::bail!(
-            "--ingress needs --network own_ip: only a box with its own IP address can \
-             publish ports"
-        );
+        return Err(NetworkFlagRefusal {
+            message: "--ingress needs --network own_ip: only a box with its own IP address can \
+                      publish ports"
+                .to_owned(),
+        }
+        .into());
     }
     Ok(())
 }
+
+/// A network flag that the box's network mode refuses: `--ingress`,
+/// `--dynamic-ingress` or `--dynamic-range` off `--network own_ip`, or
+/// egress rules on a `--network none` box. It is a usage error, and the run
+/// ends with exit 2 (`main.rs`).
+#[derive(Debug)]
+pub struct NetworkFlagRefusal {
+    /// The refusal, with the flag that answers it.
+    pub message: String,
+}
+
+impl NetworkFlagRefusal {
+    /// The architecture's exit code for a usage error.
+    pub const EXIT_CODE: u8 = 2;
+}
+
+impl std::fmt::Display for NetworkFlagRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NetworkFlagRefusal {}
 
 /// Refuses a `network.ingress` from `minimal.toml` on a box that is not
 /// `own_ip`, as [`refuse_ingress_off_own_ip`] refuses `--ingress`. `layer`

@@ -1797,7 +1797,7 @@ pub struct EgressArgs {
     /// Repeatable. Adds to the `allow_dns_hosts` that minimal.toml declares
     /// for the box. Given without `--allow-subnets`, the box reaches the
     /// named hosts by name and no address directly; see `--allow-subnets`.
-    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
+    #[arg(long = "allow-dns-hosts", value_name = "HOST", value_parser = parse_dns_host)]
     pub allow_dns_hosts: Vec<String>,
     /// Allow this outbound transport protocol: tcp, udp, or icmp.
     /// Repeatable; unset allows every protocol. Replaces the
@@ -1957,6 +1957,20 @@ pub(crate) const START_NETWORK_LONG_HELP: &str = concat!(
     "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
      prints a one-line hint naming the current spelling."
 );
+
+/// The value of one `--allow-dns-hosts`: a DNS hostname, checked as the
+/// egress policy checks it, so a bad host is a usage error (exit 2) before
+/// anything runs (BCLI-034). Clap quotes the value in front of this text.
+pub(crate) fn parse_dns_host(raw: &str) -> Result<String, String> {
+    if boxes::is_valid_dns_host(raw) {
+        return Ok(raw.to_owned());
+    }
+    Err(
+        "not a valid DNS hostname. Wildcards are not supported. Write an \
+         internationalized name in its punycode xn-- form."
+            .to_owned(),
+    )
+}
 
 /// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
 /// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the

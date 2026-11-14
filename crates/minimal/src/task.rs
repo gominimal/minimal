@@ -281,11 +281,15 @@ pub(crate) fn refuse_egress_on_none(
     if file_layer.is_none() {
         remedy.push_str(&format!(", or without {}", and_list(&given)));
     }
-    bail!(
-        "{refusal}. The box's egress rules come from {sources}. {remedy}.",
-        refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
-        sources = and_list(&sources),
-    );
+    // BCLI-034: a usage error, exit 2.
+    Err(crate::NetworkFlagRefusal {
+        message: format!(
+            "{refusal}. The box's egress rules come from {sources}. {remedy}.",
+            refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
+            sources = and_list(&sources),
+        ),
+    }
+    .into())
 }
 
 /// The egress flags `flags` holds, by name.
@@ -619,6 +623,79 @@ pub(crate) async fn detach_run(
     Ok(())
 }
 
+/// `min task run` or `min box run` in a directory with no `minimal.toml`
+/// in it or above it. The run ends with exit 4 (`main.rs`), the
+/// architecture's code for a thing not found.
+#[derive(Debug)]
+pub struct ProjectFileNotFound {
+    /// The refusal, with the command that creates the file.
+    pub message: String,
+}
+
+impl ProjectFileNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for ProjectFileNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProjectFileNotFound {}
+
+/// `min task run` or `min box run` with a task name that the project's
+/// `minimal.toml` does not declare. The run ends with exit 4 (`main.rs`),
+/// the architecture's code for a thing not found.
+#[derive(Debug)]
+pub struct TaskNotFound {
+    /// The refusal, with the tasks the file declares.
+    pub message: String,
+}
+
+impl TaskNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for TaskNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TaskNotFound {}
+
+/// `min task run` or `min box run` with a `minimal.toml` that does not
+/// load. The run ends with exit 3 (`main.rs`), the code the architecture
+/// gives an invalid project file, as for `crate::ProjectFileInvalid`.
+#[derive(Debug)]
+pub struct TaskFileInvalid {
+    /// Why the file did not load.
+    pub error: mfile::Error,
+}
+
+impl TaskFileInvalid {
+    /// The architecture's exit code for an invalid project file.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for TaskFileInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cause is in this text and `source()` returns none, so the
+        // printer's `{:#}` shows it once.
+        write!(
+            f,
+            "found a broken {name} while resolving tasks: {error}",
+            name = mfile::MFILE_NAME,
+            error = self.error,
+        )
+    }
+}
+
+impl std::error::Error for TaskFileInvalid {}
+
 /// Look up `task` in the project's `minimal.toml`, walking up from `dir`
 /// like the activate config discovery does, and return its declaration.
 /// Errors name the fix: untrimmed name → the whitespace rejection; no
@@ -639,19 +716,30 @@ pub(crate) fn declared_task(
     }
     let file = match mfile::File::from_dir_recursive(dir.as_std_path()) {
         Ok(f) => f,
-        Err(mfile::Error::NotFound) => bail!(
-            "no {name} found at {dir} (or any parent directory); \
-             run `min init` to create one",
-            name = mfile::MFILE_NAME,
-        ),
-        Err(e) => bail!(
-            "found a broken {name} while resolving tasks: {e}",
-            name = mfile::MFILE_NAME,
-        ),
+        // BCLI-034: no project file is a thing not found (exit 4).
+        Err(mfile::Error::NotFound) => {
+            return Err(ProjectFileNotFound {
+                message: format!(
+                    "no {name} found at {dir} (or any parent directory); \
+                     run `min init` to create one",
+                    name = mfile::MFILE_NAME,
+                ),
+            }
+            .into());
+        }
+        // BCLI-078: a project file that does not load exits 3. This path
+        // also serves `min task run`, which starts no box, so the refusal
+        // keeps its own text.
+        Err(error) => return Err(TaskFileInvalid { error }.into()),
     };
     match file.task(task) {
         Some(t) => Ok(t),
-        None => bail!(unknown_task_message(&file, task)),
+        // BCLI-034: a task name the file does not declare is a thing not
+        // found (exit 4). The text is the same as before.
+        None => Err(TaskNotFound {
+            message: unknown_task_message(&file, task),
+        }
+        .into()),
     }
 }
 

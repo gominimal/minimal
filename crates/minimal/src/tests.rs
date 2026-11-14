@@ -19998,6 +19998,201 @@ async fn box_rename_native_host_prints_no_vm_host_warning() {
     );
 }
 
+/// BCLI-034, BCLI-058, BCLI-078: each refusal that ended with exit 1 ends
+/// with the code the exit-code table gives its outcome, and keeps its
+/// text. The rename refusal says box, not session. Each refusal carries
+/// the type that `main.rs`'s `failure_exit_code` maps to the code, and
+/// `main.rs`'s tests pin that mapping.
+#[test]
+fn refusals_exit_with_the_table_code() {
+    use clap::Parser as _;
+
+    // `min task run` with no minimal.toml: not found (4).
+    let empty = tempfile::tempdir().unwrap();
+    let empty_dir = camino::Utf8Path::from_path(empty.path()).unwrap();
+    let err = task::declared_task(empty_dir, "build").expect_err("no minimal.toml");
+    assert!(
+        err.downcast_ref::<task::ProjectFileNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(task::ProjectFileNotFound::EXIT_CODE, 4);
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "no minimal.toml found at {empty_dir} (or any parent directory); \
+             run `min init` to create one"
+        )
+    );
+
+    // `min task run` of a task the minimal.toml does not declare: not
+    // found (4), text unchanged.
+    let declared = tempfile::tempdir().unwrap();
+    std::fs::write(
+        declared.path().join("minimal.toml"),
+        "[tasks.lint]\necho = 'x'\n",
+    )
+    .unwrap();
+    let declared_dir = camino::Utf8Path::from_path(declared.path()).unwrap();
+    let err = task::declared_task(declared_dir, "build").expect_err("no such task");
+    assert!(
+        err.downcast_ref::<task::TaskNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(task::TaskNotFound::EXIT_CODE, 4);
+    assert!(
+        format!("{err:#}").starts_with("unknown task 'build';"),
+        "{err:#}"
+    );
+
+    // `min task run` with a minimal.toml that does not load: invalid (3).
+    let broken = tempfile::tempdir().unwrap();
+    std::fs::write(broken.path().join("minimal.toml"), "[tasks.build\n").unwrap();
+    let broken_dir = camino::Utf8Path::from_path(broken.path()).unwrap();
+    let err = task::declared_task(broken_dir, "build").expect_err("a broken minimal.toml");
+    assert!(
+        err.downcast_ref::<task::TaskFileInvalid>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(task::TaskFileInvalid::EXIT_CODE, 3);
+    assert!(
+        format!("{err:#}").starts_with("found a broken minimal.toml while resolving tasks: "),
+        "{err:#}"
+    );
+
+    // `--ingress` off `--network own_ip`: usage (2), text unchanged.
+    let err = refuse_ingress_off_own_ip(crate::cli::CliNetworkMode::HostNet, true)
+        .expect_err("--ingress needs own_ip");
+    assert!(
+        err.downcast_ref::<NetworkFlagRefusal>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(NetworkFlagRefusal::EXIT_CODE, 2);
+    assert_eq!(
+        format!("{err:#}"),
+        "--ingress needs --network own_ip: only a box with its own IP address can publish ports"
+    );
+
+    // `--dynamic-ingress` off `--network own_ip`: usage (2), text unchanged.
+    let err = refuse_dynamic_ingress_off_own_ip(boxes::NetworkMode::HostNet, None, Some((1, 2)))
+        .expect_err("--dynamic-range needs own_ip");
+    assert!(
+        err.downcast_ref::<NetworkFlagRefusal>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(NetworkFlagRefusal::EXIT_CODE, 2);
+    assert_eq!(
+        format!("{err:#}"),
+        "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with its own \
+         IP address can publish ports"
+    );
+
+    // `--network none` with an egress flag: usage (2), text unchanged.
+    let flags = EgressArgs {
+        deny_all_egress: true,
+        ..EgressArgs::default()
+    };
+    let err = task::refuse_egress_on_none(boxes::NetworkMode::NoNet, true, &flags, None, true)
+        .expect_err("--network none refuses egress");
+    assert!(
+        err.downcast_ref::<NetworkFlagRefusal>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(NetworkFlagRefusal::EXIT_CODE, 2);
+    assert!(
+        format!("{err:#}").ends_with(
+            "The box's egress rules come from --deny-all-egress. Run it with --network \
+             host_ip or --network own_ip, or without --deny-all-egress."
+        ),
+        "{err:#}"
+    );
+
+    // `min box rename` to a name the store refuses: usage (2), says box.
+    let daemon = "invalid box name: must be a single DNS label";
+    let err = anyhow::Error::from(BoxRenameRefusal::from_error(daemon).expect("a refusal"));
+    assert!(err.downcast_ref::<BoxRenameRefusal>().is_some(), "{err:#}");
+    assert_eq!(BoxRenameRefusal::EXIT_CODE, 2);
+    assert_eq!(format!("{err:#}"), daemon);
+    assert!(BoxRenameRefusal::from_error("some other failure").is_none());
+
+    // `min host start` or `stop` of a name no local host has: not found (4).
+    let err = hosts::named_host(&[], "nope").expect_err("no such host");
+    assert!(
+        err.downcast_ref::<hosts::LocalHostNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(hosts::LocalHostNotFound::EXIT_CODE, 4);
+    assert_eq!(
+        format!("{err:#}"),
+        "no local host is named 'nope'. Run `min host list` to see the local hosts."
+    );
+
+    // `--loadout` with no loadout file: not found (4), text unchanged.
+    let config = tempfile::tempdir().unwrap();
+    let global = GlobalArgs {
+        config_dir: Some(config.path().to_path_buf()),
+        ..Default::default()
+    };
+    let err = loadouts::resolve_active_loadouts(
+        loadouts::LoadoutSelection::Cli(vec!["missing".to_owned()]),
+        &boxes::client::config::Config::default(),
+        &global,
+    )
+    .expect_err("no loadout file");
+    assert!(
+        err.downcast_ref::<loadouts::LoadoutNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(loadouts::LoadoutNotFound::EXIT_CODE, 4);
+    assert!(
+        format!("{err:#}").starts_with("--loadout `missing`: "),
+        "{err:#}"
+    );
+
+    // A `default_loadouts` name with no loadout file: not found (4) too.
+    let mut cfg = boxes::client::config::Config::default();
+    cfg.loadouts.default_loadouts = vec!["missing".to_owned()];
+    let err =
+        loadouts::resolve_active_loadouts(loadouts::LoadoutSelection::Defaults, &cfg, &global)
+            .expect_err("no loadout file");
+    assert!(
+        err.downcast_ref::<loadouts::LoadoutNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").starts_with("default_loadouts `missing`: "),
+        "{err:#}"
+    );
+
+    // A bad `--allow-dns-hosts` value: clap refuses it as a usage error (2)
+    // before anything runs, and quotes the value.
+    let Err(err) = Cli::try_parse_from([
+        "min",
+        "box",
+        "run",
+        "--allow-dns-hosts",
+        "bad host",
+        "default",
+    ]) else {
+        panic!("a bad host is refused");
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert_eq!(err.exit_code(), 2);
+    let text = err.to_string();
+    assert!(text.contains("'bad host'"), "{text}");
+    assert!(text.contains("not a valid DNS hostname"), "{text}");
+    assert!(
+        Cli::try_parse_from([
+            "min",
+            "box",
+            "run",
+            "--allow-dns-hosts",
+            "github.com",
+            "default"
+        ])
+        .is_ok()
+    );
+}
+
 // #3238: a session entry's `network.mode` and `network.ingress` reach the
 // box that `min session start`, `min box start` and `min session activate`
 // create. `--network` still replaces the mode, each `--ingress` adds a
