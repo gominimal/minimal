@@ -52,6 +52,7 @@ cgroups
 charset
 chezmoi
 chrono
+CIDRs
 cleanroom
 CLI
 clippy
@@ -87,6 +88,7 @@ Crossterm
 crosvm
 CString
 ctx_id
+cutover
 cwd
 darwin
 Daytona
@@ -132,8 +134,8 @@ endian
 enum
 enums
 Env
-env_vars
 envp
+env_vars
 errno
 errored
 erroring
@@ -144,6 +146,7 @@ exfiltrate
 exfiltrates
 fd
 featureful
+fetchable
 filterset
 Filtersets
 flagless
@@ -307,6 +310,8 @@ PTask
 PTasks
 pty
 PTYs
+purl
+purls
 pytest
 queryable
 quiesces
@@ -352,11 +357,16 @@ rustup
 rw
 Sandboxed
 Sandboxing
+sbom
+SBOM
+SBOMs
 sccache
 scrollback
 semconv
 serde
 serde_json
+serializer
+serializers
 setsid
 settleable
 setuid
@@ -374,6 +384,8 @@ SIGTERMs
 snake_case
 socat
 sos
+spdx
+SPDX
 state_key
 statvfs
 stderr
@@ -399,6 +411,7 @@ sysctls
 sysinfo
 systemd
 Tailscale
+tarball
 taskspec
 Teardown
 tempfile
@@ -415,8 +428,8 @@ toolsets
 traceparent
 triaging
 trimodal
-try_fold
 trycmd
+try_fold
 tty
 TUI
 tunables
@@ -429,8 +442,10 @@ umask
 uname
 unconfigured
 unconstructable
+undeclarable
 undecompressed
 Undersize
+unfetchable
 ungating
 unicast
 unioning
@@ -481,6 +496,7 @@ VMs
 Vsock
 wakeups
 wasmtime
+webapp
 webproxy
 webserver
 wireguard
