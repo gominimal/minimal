@@ -2808,6 +2808,14 @@ STUB
 
     run_hc unenrolled "$root/mi-on" --user "$me"
     check 0 "$rc" "install exits 0 with neither identity"
+    want_ok "a parent with no memory controller is noted, and the install goes on" \
+        grep -q "parent offers it no memory controller" "$OUT"
+    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+    want_ok "no controller is enabled on the slice over such a parent (no file, or no +memory in it)" \
+        sh -c '[ ! -e "$1" ] || ! grep -q "+memory" "$1"' _ "$tree/cgroup.subtree_control"
+    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+    want_ok "nor on the box cohort below it" \
+        sh -c '[ ! -e "$1" ] || ! grep -q "+memory" "$1"' _ "$tree/boxes/cgroup.subtree_control"
     want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
     want_ok "the un-enrolled install lays out the QUIC block leaf" \
         test -d "$tree/boxes/quic443-blocked"
@@ -2833,6 +2841,10 @@ STUB
     # The QUIC block helper and its sudoers rule go under the scratch root,
     # through the step's own override knobs: a rehearsal writes nothing to
     # /usr/local or /etc.
+    # The stand-in mount root now offers the memory controller, as a systemd
+    # host's does: the step enables it on the slice, the one cgroup the
+    # daemon cannot enable it on itself.
+    printf 'cpuset cpu io memory pids\n' >"$cg/cgroup.subtree_control"
     HC_HELPER="$root/hclib/quic443-leaf"
     HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
     run_hc install "$root/mi-on" --user "$me" \
@@ -2846,6 +2858,21 @@ STUB
     want_ok "the host-address QUIC block leaf exists" test -d "$tree/boxes/quic443-blocked"
     want_ok "the table's marker exists once the transaction succeeded" \
         test -d "$tree/classifier-table"
+    want_ok "the memory controller is enabled on the slice for the leaves below" \
+        grep -q "^+memory$" "$tree/cgroup.subtree_control"
+    want_ok "install says it enabled the memory controller on the slice" \
+        grep -q "enabled the memory controller on the slice" "$OUT"
+    # The cohort and its two subtrees too, top down after the slice: a daemon that started before the
+    # slice offered the controller does not repeat its own cascade until its next start.
+    for _cg in boxes boxes/deny boxes/allow; do
+        want_ok "the memory controller is enabled on $_cg for the leaves below" \
+            grep -q "^+memory$" "$tree/$_cg/cgroup.subtree_control"
+    done
+    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+    want_ok "the QUIC block leaf, a leaf, gets no controller for children it does not have" \
+        sh -c '! grep -q "+memory" "$1"' _ "$tree/boxes/quic443-blocked/cgroup.subtree_control"
+    want_ok "install names the cohort's subtrees among the cgroups it enabled the controller on" \
+        grep -q "enabled the memory controller on the slice, .*/boxes/allow\. Boxes can read" "$OUT"
     want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
     want_ok "install names the delegated account" grep -q "delegated to" "$OUT"
     want_ok "install names the contract it delegated" grep -q "v2 contract" "$OUT"
@@ -3016,6 +3043,87 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
     want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
     want_ok "check reports the recorded ct-mark mask" grep -q "ct-mark:  0x30000000" "$OUT"
+
+    # The write to the slice's cgroup.subtree_control fails for one of two kinds of reason, and the
+    # rehearsal stages both by making the file unwritable. With nothing in the slice's cgroup.procs, the
+    # note names the write's own error and no standing process. With a pid planted there (a sleep this
+    # rehearsal owns), the note names that pid and its command and the condition to rerun on, and
+    # claims no daemon by name: the step cannot tell whose process it is. The planted pid is taken out
+    # again before the next run, so the tree the later runs read is the first install's. After the
+    # section's own checks, so the print-ruleset and --check runs read that tree too. (Root ignores
+    # file modes, so neither case can be staged there.)
+    if [ "$(id -u)" -ne 0 ]; then
+        HC_HELPER="$root/hclib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        chmod 0444 "$tree/cgroup.subtree_control"
+        run_hc install-unwritable "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        check 0 "$rc" "install exits 0 when the slice's write fails"
+        # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+        want_ok "an unexplained failure is named as the write's own error, not as a standing process" \
+            sh -c 'grep -q "The write failed (" "$1" && ! grep -q "A process stands in the slice" "$1"' _ "$OUT"
+        want_err "an unexplained failure promises no rerun that would fail the same way" \
+            grep -q "The write failed (.*min finalize-install" "$OUT"
+
+        sleep 300 &
+        standing_pid=$!
+        procs_before=$(cat "$tree/cgroup.procs")
+        printf '%s\n' "$standing_pid" >"$tree/cgroup.procs"
+        run_hc install-standing "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        printf '%s' "$procs_before" >"$tree/cgroup.procs"
+        kill "$standing_pid" 2>/dev/null || :
+        wait "$standing_pid" 2>/dev/null || :
+        chmod 0644 "$tree/cgroup.subtree_control"
+        unset HC_HELPER HC_SUDOERS
+        check 0 "$rc" "install exits 0 when a process stands in the slice"
+        want_ok "a process standing in the slice is named by its pid" \
+            grep -q "A process stands in the slice itself rather than in a leaf: pid $standing_pid (" "$OUT"
+        if [ -d /proc/self ]; then
+            want_ok "and by the command it runs, read from /proc" grep -q "pid $standing_pid (sleep)" "$OUT"
+        fi
+        want_ok "the note says what to do: rerun once the slice's cgroup.procs is empty" \
+            grep -q "Once .*/cgroup.procs is empty (stop each of those processes, or move it into a leaf), run min finalize-install again\." "$OUT"
+        want_err "the note names no daemon or host it cannot prove" grep -q "min host stop" "$OUT"
+        want_err "a standing process is not reported as an unexplained write failure" \
+            grep -q "The write failed (" "$OUT"
+
+        # A refusal on one verdict subtree takes nothing from its sibling: the cohort above both
+        # has the controller, so the allow subtree is still tried after the deny subtree refuses,
+        # and each is reported. A refusal on the cohort itself still stops the walk, both
+        # subtrees below it unwritten.
+        HC_HELPER="$root/hclib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        : >"$tree/boxes/allow/cgroup.subtree_control"
+        chmod 0444 "$tree/boxes/deny/cgroup.subtree_control"
+        run_hc install-deny-refuses "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        chmod 0644 "$tree/boxes/deny/cgroup.subtree_control"
+        check 0 "$rc" "install exits 0 when the deny subtree refuses the controller"
+        want_ok "the deny subtree's refusal is reported with the path that refused" \
+            grep -q "could not enable it on $tree/boxes/deny/cgroup.subtree_control\. The write failed (" "$OUT"
+        want_ok "the allow subtree is still enabled after its sibling refuses" \
+            grep -q "^+memory$" "$tree/boxes/allow/cgroup.subtree_control"
+        want_ok "and reported as enabled on its own" \
+            grep -q "enabled the memory controller on $tree/boxes/allow too\." "$OUT"
+        want_err "a partial install claims no boxes read memory.max across the tree" \
+            grep -q "Boxes can read their own memory.max" "$OUT"
+
+        : >"$tree/boxes/deny/cgroup.subtree_control"
+        : >"$tree/boxes/allow/cgroup.subtree_control"
+        chmod 0444 "$tree/boxes/cgroup.subtree_control"
+        run_hc install-cohort-refuses "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        chmod 0644 "$tree/boxes/cgroup.subtree_control"
+        unset HC_HELPER HC_SUDOERS
+        check 0 "$rc" "install exits 0 when the cohort refuses the controller"
+        want_ok "the cohort's refusal is reported with the path that refused" \
+            grep -q "could not enable it on $tree/boxes/cgroup.subtree_control\. The write failed (" "$OUT"
+        # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+        want_ok "neither subtree is tried below a cohort that refused" \
+            sh -c '! grep -q "+memory" "$1" && ! grep -q "+memory" "$2"' _ \
+            "$tree/boxes/deny/cgroup.subtree_control" "$tree/boxes/allow/cgroup.subtree_control"
+    fi
 
     # --user takes an account name too, resolved to the same uid and group;
     # only when the caller's uid has a passwd entry to name it by (a cross
