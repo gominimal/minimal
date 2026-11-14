@@ -437,7 +437,7 @@ pub async fn cmd_host_show(
 }
 
 /// The local host named `name`, or the refusal that names `min host list`.
-fn named_host<'a>(hosts: &'a [LocalHost], name: &str) -> anyhow::Result<&'a LocalHost> {
+pub(crate) fn named_host<'a>(hosts: &'a [LocalHost], name: &str) -> anyhow::Result<&'a LocalHost> {
     if let Some(host) = hosts.iter().find(|h| h.name == name) {
         return Ok(host);
     }
@@ -447,8 +447,30 @@ fn named_host<'a>(hosts: &'a [LocalHost], name: &str) -> anyhow::Result<&'a Loca
         msg.push('\n');
         msg.push_str(&note);
     }
-    anyhow::bail!(msg)
+    Err(LocalHostNotFound { message: msg }.into())
 }
+
+/// `min host start` or `min host stop` of a name that no local host has.
+/// The run ends with exit 4 (`main.rs`), the architecture's code for a
+/// thing not found.
+#[derive(Debug)]
+pub struct LocalHostNotFound {
+    /// The refusal, with the next step and any unread VM notes.
+    pub message: String,
+}
+
+impl LocalHostNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for LocalHostNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LocalHostNotFound {}
 
 /// The line `min host stop` prints once the boxes and the daemon of `host`
 /// are stopped. `vm` is true for a VM host, whose VM stops with its daemon.

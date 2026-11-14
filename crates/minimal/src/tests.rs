@@ -19861,3 +19861,156 @@ async fn box_rename_native_host_prints_no_vm_host_warning() {
         warnings.join("\n")
     );
 }
+
+/// The exit code `main`'s `failure_exit_code` gives the refusals that
+/// `refusals_exit_with_the_table_code` checks, and 1 for anything else.
+fn table_refusal_code(error: &anyhow::Error) -> u8 {
+    if error.downcast_ref::<NetworkFlagRefusal>().is_some() {
+        return NetworkFlagRefusal::EXIT_CODE;
+    }
+    if error.downcast_ref::<task::ProjectFileNotFound>().is_some() {
+        return task::ProjectFileNotFound::EXIT_CODE;
+    }
+    if error.downcast_ref::<loadouts::LoadoutNotFound>().is_some() {
+        return loadouts::LoadoutNotFound::EXIT_CODE;
+    }
+    if error.downcast_ref::<hosts::LocalHostNotFound>().is_some() {
+        return hosts::LocalHostNotFound::EXIT_CODE;
+    }
+    if error.downcast_ref::<BoxRenameRefusal>().is_some() {
+        return BoxRenameRefusal::EXIT_CODE;
+    }
+    if error.downcast_ref::<ProjectFileInvalid>().is_some() {
+        return 3;
+    }
+    1
+}
+
+/// BCLI-034, BCLI-058, BCLI-078: each refusal that ended with exit 1 ends
+/// with the code the exit-code table gives its outcome, and keeps its
+/// text. The rename refusal says box, not session.
+#[test]
+fn refusals_exit_with_the_table_code() {
+    use clap::Parser as _;
+
+    // `min task run` with no minimal.toml: not found (4).
+    let empty = tempfile::tempdir().unwrap();
+    let empty_dir = camino::Utf8Path::from_path(empty.path()).unwrap();
+    let err = task::declared_task(empty_dir, "build").expect_err("no minimal.toml");
+    assert_eq!(table_refusal_code(&err), 4, "{err:#}");
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "no minimal.toml found at {empty_dir} (or any parent directory); \
+             run `min init` to create one"
+        )
+    );
+
+    // `min task run` with a minimal.toml that does not load: invalid (3).
+    let broken = tempfile::tempdir().unwrap();
+    std::fs::write(broken.path().join("minimal.toml"), "[tasks.build\n").unwrap();
+    let broken_dir = camino::Utf8Path::from_path(broken.path()).unwrap();
+    let err = task::declared_task(broken_dir, "build").expect_err("a broken minimal.toml");
+    assert_eq!(table_refusal_code(&err), 3, "{err:#}");
+    assert!(
+        format!("{err:#}").contains("the project's minimal.toml does not load"),
+        "{err:#}"
+    );
+
+    // `--ingress` off `--network own_ip`: usage (2), text unchanged.
+    let err = refuse_ingress_off_own_ip(crate::cli::CliNetworkMode::HostNet, true)
+        .expect_err("--ingress needs own_ip");
+    assert_eq!(table_refusal_code(&err), 2, "{err:#}");
+    assert_eq!(
+        format!("{err:#}"),
+        "--ingress needs --network own_ip: only a box with its own IP address can publish ports"
+    );
+
+    // `--dynamic-ingress` off `--network own_ip`: usage (2), text unchanged.
+    let err = refuse_dynamic_ingress_off_own_ip(boxes::NetworkMode::HostNet, None, Some((1, 2)))
+        .expect_err("--dynamic-range needs own_ip");
+    assert_eq!(table_refusal_code(&err), 2, "{err:#}");
+    assert_eq!(
+        format!("{err:#}"),
+        "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with its own \
+         IP address can publish ports"
+    );
+
+    // `--network none` with an egress flag: usage (2), text unchanged.
+    let flags = EgressArgs {
+        deny_all_egress: true,
+        ..EgressArgs::default()
+    };
+    let err = task::refuse_egress_on_none(boxes::NetworkMode::NoNet, true, &flags, None, true)
+        .expect_err("--network none refuses egress");
+    assert_eq!(table_refusal_code(&err), 2, "{err:#}");
+    assert!(
+        format!("{err:#}").ends_with(
+            "The box's egress rules come from --deny-all-egress. Run it with --network \
+             host_ip or --network own_ip, or without --deny-all-egress."
+        ),
+        "{err:#}"
+    );
+
+    // `min box rename` to a name the store refuses: usage (2), says box.
+    let daemon = "invalid box name: must be a single DNS label";
+    let err = anyhow::Error::from(BoxRenameRefusal::from_error(daemon).expect("a refusal"));
+    assert_eq!(table_refusal_code(&err), 2, "{err:#}");
+    assert_eq!(format!("{err:#}"), daemon);
+    assert!(BoxRenameRefusal::from_error("some other failure").is_none());
+
+    // `min host start` or `stop` of a name no local host has: not found (4).
+    let err = hosts::named_host(&[], "nope").expect_err("no such host");
+    assert_eq!(table_refusal_code(&err), 4, "{err:#}");
+    assert_eq!(
+        format!("{err:#}"),
+        "no local host is named 'nope'. Run `min host list` to see the local hosts."
+    );
+
+    // `--loadout` with no loadout file: not found (4), text unchanged.
+    let config = tempfile::tempdir().unwrap();
+    let global = GlobalArgs {
+        config_dir: Some(config.path().to_path_buf()),
+        ..Default::default()
+    };
+    let err = loadouts::resolve_active_loadouts(
+        loadouts::LoadoutSelection::Cli(vec!["missing".to_owned()]),
+        &boxes::client::config::Config::default(),
+        &global,
+    )
+    .expect_err("no loadout file");
+    assert_eq!(table_refusal_code(&err), 4, "{err:#}");
+    assert!(
+        format!("{err:#}").starts_with("--loadout `missing`: "),
+        "{err:#}"
+    );
+
+    // A bad `--allow-dns-hosts` value: clap refuses it as a usage error (2)
+    // before anything runs, and quotes the value.
+    let Err(err) = Cli::try_parse_from([
+        "min",
+        "box",
+        "run",
+        "--allow-dns-hosts",
+        "bad host",
+        "default",
+    ]) else {
+        panic!("a bad host is refused");
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert_eq!(err.exit_code(), 2);
+    let text = err.to_string();
+    assert!(text.contains("'bad host'"), "{text}");
+    assert!(text.contains("not a valid DNS hostname"), "{text}");
+    assert!(
+        Cli::try_parse_from([
+            "min",
+            "box",
+            "run",
+            "--allow-dns-hosts",
+            "github.com",
+            "default"
+        ])
+        .is_ok()
+    );
+}

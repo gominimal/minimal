@@ -281,11 +281,15 @@ pub(crate) fn refuse_egress_on_none(
     if file_layer.is_none() {
         remedy.push_str(&format!(", or without {}", and_list(&given)));
     }
-    bail!(
-        "{refusal}. The box's egress rules come from {sources}. {remedy}.",
-        refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
-        sources = and_list(&sources),
-    );
+    // BCLI-034: a usage error, exit 2.
+    Err(crate::NetworkFlagRefusal {
+        message: format!(
+            "{refusal}. The box's egress rules come from {sources}. {remedy}.",
+            refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
+            sources = and_list(&sources),
+        ),
+    }
+    .into())
 }
 
 /// The egress flags `flags` holds, by name.
@@ -619,6 +623,28 @@ pub(crate) async fn detach_run(
     Ok(())
 }
 
+/// `min task run` or `min box run` in a directory with no `minimal.toml`
+/// in it or above it. The run ends with exit 4 (`main.rs`), the
+/// architecture's code for a thing not found.
+#[derive(Debug)]
+pub struct ProjectFileNotFound {
+    /// The refusal, with the command that creates the file.
+    pub message: String,
+}
+
+impl ProjectFileNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for ProjectFileNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProjectFileNotFound {}
+
 /// Look up `task` in the project's `minimal.toml`, walking up from `dir`
 /// like the activate config discovery does, and return its declaration.
 /// Errors name the fix: untrimmed name → the whitespace rejection; no
@@ -639,15 +665,19 @@ pub(crate) fn declared_task(
     }
     let file = match mfile::File::from_dir_recursive(dir.as_std_path()) {
         Ok(f) => f,
-        Err(mfile::Error::NotFound) => bail!(
-            "no {name} found at {dir} (or any parent directory); \
-             run `min init` to create one",
-            name = mfile::MFILE_NAME,
-        ),
-        Err(e) => bail!(
-            "found a broken {name} while resolving tasks: {e}",
-            name = mfile::MFILE_NAME,
-        ),
+        // BCLI-034: no project file is a thing not found (exit 4).
+        Err(mfile::Error::NotFound) => {
+            return Err(ProjectFileNotFound {
+                message: format!(
+                    "no {name} found at {dir} (or any parent directory); \
+                     run `min init` to create one",
+                    name = mfile::MFILE_NAME,
+                ),
+            }
+            .into());
+        }
+        // BCLI-078: a project file that does not load exits 3.
+        Err(error) => return Err(crate::ProjectFileInvalid { error }.into()),
     };
     match file.task(task) {
         Some(t) => Ok(t),
