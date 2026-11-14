@@ -1687,11 +1687,12 @@ pub struct ActivateArgs {
         long,
         value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
-        default_value = NETWORK_DEFAULT,
         help = NETWORK_HELP,
         long_help = NETWORK_LONG_HELP
     )]
-    pub network: CliNetworkMode,
+    // `None` when `--network` is not typed, so the entry's `network.mode`
+    // can apply (#3238). [`ActivateArgs::network_mode`] gives the mode.
+    pub network: Option<CliNetworkMode>,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
@@ -1771,6 +1772,13 @@ impl ActivateArgs {
         Unflagged::try_parse_from(["activate"])
             .expect("every activation flag has a default")
             .args
+    }
+
+    /// The `--network` mode, else [`NETWORK_DEFAULT`]. An activation sets
+    /// `network` to the entry's `network.mode` before it reads this.
+    #[must_use]
+    pub fn network_mode(&self) -> CliNetworkMode {
+        self.network.unwrap_or_else(default_network_mode)
     }
 }
 
@@ -1879,15 +1887,21 @@ pub(crate) const NETWORK_VALUE_NAME: &str = "none|host_ip|own_ip";
 /// spec`, so a preview with no flag is of a box created with no flag.
 pub(crate) const NETWORK_DEFAULT: &str = "host_ip";
 
+/// The mode of [`NETWORK_DEFAULT`].
+pub(crate) fn default_network_mode() -> CliNetworkMode {
+    parse_network_mode(NETWORK_DEFAULT).expect("the default network mode parses")
+}
+
 /// The first paragraph of the `--network` help, as a literal so that
 /// [`NETWORK_LONG_HELP`] can extend it.
 macro_rules! network_help {
     () => {
         "Network mode for the session: `none` gives the session no network (every socket it \
          opens to a destination outside itself fails), `host_ip` shares the host's network \
-         namespace (the default), and `own_ip` gives the session its own IP address, so \
-         `--ingress` can publish ports; unless the host opts out, an `own_ip` session with no \
-         egress rules can reach no external address"
+         namespace, and `own_ip` gives the session its own IP address, so `--ingress` can \
+         publish ports; unless the host opts out, an `own_ip` session with no egress rules can \
+         reach no external address. With no flag, the session takes the `network.mode` \
+         minimal.toml declares for it, else `host_ip`"
     };
 }
 
@@ -1938,9 +1952,8 @@ macro_rules! start_network_help {
         "Network mode for the box: `none` gives the box no network (every socket it opens to a \
          destination outside itself fails), `host_ip` shares the host's network namespace, and \
          `own_ip` gives the box its own IP address, so `--ingress` can publish ports. The flag \
-         replaces the entry's `network.mode`. With no flag, a task entry's box takes the \
-         `network.mode` minimal.toml declares for it, else `host_ip`, and a session box is \
-         `host_ip`"
+         replaces the entry's `network.mode`. With no flag, the box takes the \
+         `network.mode` minimal.toml declares for the entry, else `host_ip`"
     };
 }
 
