@@ -1,51 +1,106 @@
-# The example `minimal.toml` of the Box architecture, for the golden
-# vectors of BOX-145. `tests/golden.rs` expands its session and task
-# entries. The agent entry is declared for later and is not expanded
-# (gominimal/inbox#678).
+# Byte copy of example-minimal.toml from gominimal/arch at 15b603e6afb8df404fb9cbe246322052c4731998.
+# example-minimal.toml — canonical example of the minimal.toml layout.
+# Reference: architecture.md "minimal.toml layout". Each entry below expands,
+# together with its Box Type, [defaults] and [upstream], into a full Box Spec
+# (box.toml).
+# (This is documentation; the minimal.toml at this repo's root is the live one
+# used to create this project's dev box.)
 
 [upstream]
 repo_url = "https://github.com/gominimal/pkgs"
 branch = "main"
-commit = "0123456789abcdef0123456789abcdef01234567"
+commit = "defad31c69130df153e9263cb1e4dca96b3e2994"
+build_cache_url = "https://cache.gominimal.dev"
 
 [defaults]
-packages = ["git", "curl"]
+# Merged into every entry: lists union (entry values appended), scalars and
+# tables are overridden by the entry.
+packages = ["base"]
+network = { mode = "none" }
 
-[defaults.session]
-timeout = "8h"
-packages = ["zsh"]
+# ---- a Box Type defined by this project -------------------------------------
+# Types are named bundles of defaults and constraints. `defaults` join expansion
+# and may be overridden by an entry; `constraints` join enforcement and only
+# narrow — a type can never grant what another layer denies.
 
-[defaults.session.network]
-mode = "own_ip"
-egress_allow_dns = ["github.com", "crates.io"]
+[box_types.batch-agent]
+description = "Headless agent run: no PTY, bounded, no nesting"
+extends = "agent"
 
-[defaults.task]
-timeout = "30m"
+  [box_types.batch-agent.defaults]
+  timeout = "30m"
+  github_token_mode = "installation"   # this type's GitHub grants default to app-attributed tokens (Gatehouse §6.4)
+  network = { mode = "own_ip" }   # a starting value, not a guarantee: [defaults]
+                                  # outranks type defaults, so in *this* file the
+                                  # tighter mode = "none" wins and an entry that
+                                  # wants the network must say so itself
 
-[defaults.task.network]
-mode = "host_ip"
+  [box_types.batch-agent.constraints]
+  pty_enabled = false             # narrows agent's default, which an entry could set true
+  nesting = { allowed = false }   # narrows the true inherited from `agent`
+
+# ---- interactive sessions (PTY) ---------------------------------------------
 
 [sessions.dev]
-packages = ["rust", "nodejs"]
+description = "Everyday interactive dev shell"
+packages = ["mermaid-cli", "emacs", "emacs-config-dev1", "kittyview", "claude-code", "less"]
+exec = "bash --noprofile -l"
+loadout_mode = "open"
+volumes = ["dev"]
+network = { mode = "own_ip", egress = { allow_dns_hosts = ["github.com", "api.anthropic.com"] } }
 
-[sessions.dev.network]
-mode = "own_ip"
-ingress = [8080]
-egress_allow_dns = ["github.com", "crates.io", "registry.npmjs.org"]
-egress_allow_subnets = ["10.0.0.0/8"]
-egress_deny_subnets = ["10.0.5.0/24"]
+# ---- non-interactive tasks (run to completion) ------------------------------
 
-[sessions.dev.secrets.gh]
-scopes = ["github:repo"]
+[tasks.render-diagrams]
+description = "Render the mermaid diagrams in architecture.md to SVG"
+packages = ["mermaid-cli"]
+exec = "mmdc -i architecture.md -o out/"
+file_imports = [{ path = "architecture.md" }]
+file_exports = [{ path = "out/" }]
 
-[tasks.test]
-packages = ["rust"]
-exec = ["cargo", "test"]
-
-[tasks.lint]
-packages = ["rust"]
-exec = "cargo clippy --all-targets"
-timeout = "10m"
+# ---- agent boxes (long-lived, may nest, brokered credentials) ---------------
 
 [agents.reviewer]
-packages = ["git"]
+description = "Claude Code reviewing this repo"
+packages = ["git", "claude-code"]
+exec = "claude -p 'review the open PRs'"
+github_imports = [{ repo = "https://github.com/user-name/repo-name", ref = "main" }]
+network = { mode = "own_ip", egress = { allow_dns_hosts = ["api.anthropic.com", "github.com", "api.github.com", "uploads.github.com", "codeload.github.com"] } }
+# Agents default to user-mode GitHub tokens: repo/permission-narrowed,
+# attributed to the developer (Gatehouse §6.4; scope grammar §5.8). A GitHub
+# broker grant requires the module's full host set in egress (§6.10).
+secrets = { GITHUB_TOKEN = { source = "broker", scopes = ["github:repo:user-name/repo-name:contents:ro"] } }
+nesting = { allowed = true, max_depth = 2, providers = ["local-box"] }
+
+# ---- a box of a project-defined type ----------------------------------------
+# [boxes.<name>] is the general form; [agents.<name>] above is sugar for it with
+# type = "agent". A user-defined type has no CLI noun, so this one is driven with
+# `min box start nightly`.
+
+[boxes.nightly]
+type = "batch-agent"
+description = "Nightly repo triage; inherits the batch-agent bounds"
+packages = ["git", "jq", "claude-code"]
+github_imports = [{ repo = "https://github.com/user-name/repo-name", ref = "main" }]
+# Memory (architecture "Box Resources", [proposed]): omitted, `ram` is "auto", the
+# host's default box size. Write a size only when the workload needs one — the box
+# then gets exactly that limit or is refused on a host that cannot hold it:
+# ram = "12GiB"
+# Tables are replaced, not merged, so this entry restates `mode` — without it the
+# box would expand with [defaults]'s mode = "none" and reach nothing.
+network = { mode = "own_ip", egress = { allow_dns_hosts = ["api.anthropic.com", "github.com"] } }
+# `inference:invoke` is a tenant-defined audience scope (Gatehouse §5.8): the broker
+# mints a Gatehouse-issued, audience-bound token via re-audience exchange — not the
+# third party's native credential (that is outbound XAA, reserved). Requires the tenant
+# to have registered an `inference` Audience; brokering rides the ExchangeToken baseline
+# (Gatehouse §7.3), and no `mode` applies (that is a GitHub-only distinction).
+secrets = { ANTHROPIC_API_KEY = { source = "broker", scopes = ["inference:invoke"] } }
+file_exports = [{ path = "out/triage.json" }]
+
+# ---- services (run until stopped, may expose ingress) -----------------------
+
+[services.docs-preview]
+description = "Serve the rendered docs on :8080"
+packages = ["caddy"]
+exec = "caddy file-server --root out --listen :8080"
+network = { mode = "own_ip", ingress = [{ proto = "tcp", port = 8080 }] }

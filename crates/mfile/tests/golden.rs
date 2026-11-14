@@ -1,7 +1,8 @@
 //! Golden vectors for the Box Spec expansion (BOX-145).
 //!
-//! The session and task entries of the example `minimal.toml`, and the
-//! implicit `default` entry of a file that declares only
+//! `tests/golden/example.toml` is a byte copy of the design's example,
+//! `example-minimal.toml` in gominimal/arch. Its session and task
+//! entries, and the implicit `default` entry of a file that declares only
 //! `[defaults.session]`, expand to the spec bytes and projection digests
 //! pinned in `tests/golden/vectors.json`. The six built-in types render
 //! their definitions equal to theirs.
@@ -149,16 +150,21 @@ fn example_expansion_matches_golden_vectors() {
     let names: Vec<&str> = vectors.iter().map(|(n, _)| n.as_str()).collect();
     for expected in [
         "example/dev",
-        "example/lint",
-        "example/test",
+        "example/render-diagrams",
         "defaults_session_only/default",
     ] {
         assert!(names.contains(&expected), "no vector {expected}: {names:?}");
     }
-    assert!(
-        !names.iter().any(|n| n.ends_with("/reviewer")),
-        "the agent entry is not expanded: {names:?}"
-    );
+    for not_expanded in [
+        "example/reviewer",
+        "example/nightly",
+        "example/docs-preview",
+    ] {
+        assert!(
+            !names.contains(&not_expanded),
+            "{not_expanded} is not a session or task entry and is not expanded: {names:?}"
+        );
+    }
 
     let actual = render(&vectors);
     let path = golden_dir().join("vectors.json");
