@@ -20,6 +20,7 @@ pub mod error;
 pub mod guest_telemetry;
 pub mod image;
 pub mod lifecycle;
+pub(crate) mod loggable;
 pub mod metrics;
 pub mod net;
 pub(crate) mod rpc_client;
