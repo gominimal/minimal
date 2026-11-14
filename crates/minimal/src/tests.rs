@@ -20184,11 +20184,12 @@ async fn session_entry_network_mode_and_ingress() {
     assert!(error.to_string().contains("network.ingress"), "{error}");
 }
 
-// BOX-071: a create carries the client's projection digest of the spec it
-// sends. The daemon recomputes its own from the spec it receives, and the
-// box's record holds the two side by side, equal. A session create and a
-// task create both carry it. A `--vpn-network-names` change to the spec
-// leaves the digest the one of the spec that is sent.
+// BOX-071: a create carries the client's projection digest of its own spec.
+// The daemon recomputes its own from the spec it receives, and the box's
+// record holds the two side by side, equal. A session create and a task
+// create both carry it. A `--vpn-network-names` change to the spec leaves
+// the digest the one of the spec that is sent. A spec that changes after
+// the client computed its digest gives two different digests in the record.
 #[tokio::test]
 async fn create_stores_client_digest_equal_to_daemon_digest() {
     use minimald_rpc::{CLIENT_PROJECTION_DIGEST_ATTR, DAEMON_PROJECTION_DIGEST_ATTR};
@@ -20251,12 +20252,50 @@ async fn create_stores_client_digest_equal_to_daemon_digest() {
         assert_eq!(client_digest, Some(&expected), "{what}: {:?}", record.attrs);
         assert_eq!(daemon_digest, client_digest, "{what}: {:?}", record.attrs);
     }
+
+    // The client digest is of the client's spec, not of the JSON on the
+    // wire. A projected value that changes after `put_spec` reaches only
+    // the daemon's digest.
+    let mut changed = planned_session_request(&args, &options, root);
+    let client_spec = changed.spec.clone().expect("the create carries a spec");
+    let hosts = changed
+        .spec
+        .as_mut()
+        .and_then(|spec| spec.pointer_mut("/network/egress/allow_dns_hosts"))
+        .and_then(serde_json_lenient::Value::as_array_mut)
+        .expect("the spec lists its egress DNS hosts");
+    hosts.push("b.example".into());
+    let received = changed.spec.clone().expect("the create carries a spec");
+    let client_expected =
+        mfile::projection::spec_digest(&client_spec, boxes::SESSION_BOX_TYPE).unwrap();
+    let daemon_expected =
+        mfile::projection::spec_digest(&received, boxes::SESSION_BOX_TYPE).unwrap();
+    assert_ne!(client_expected, daemon_expected, "the change is projected");
+    let id = match daemon.call::<minimald_rpc::CreateSession>(&changed).await {
+        minimald_rpc::Errorable::Ok(created) => created.id,
+        minimald_rpc::Errorable::Err { error } => panic!("changed: the create failed: {error}"),
+    };
+    let record = stored_box_record(&mut client, id)
+        .await
+        .expect("the record is read")
+        .expect("the box has a record");
+    assert_eq!(
+        record.attrs.get(CLIENT_PROJECTION_DIGEST_ATTR),
+        Some(&client_expected),
+        "{:?}",
+        record.attrs
+    );
+    assert_eq!(
+        record.attrs.get(DAEMON_PROJECTION_DIGEST_ATTR),
+        Some(&daemon_expected),
+        "{:?}",
+        record.attrs
+    );
 }
 
 // BOX-071: `min box spec <entry>` writes each store reference's
-// `upstream` and `inject` from the client's `[secret-store-rules]`, as
-// the spec a create sends carries them, and names that table as their
-// source. A store reference with no rule for its item has neither.
+// `upstream` and `inject` from the client's `[secret-store-rules]` into
+// the expanded spec, and names that table as their source. A store reference with no rule for its item has neither.
 #[tokio::test]
 async fn box_spec_render_carries_client_store_rules() {
     let (_project, global) = spec_project(

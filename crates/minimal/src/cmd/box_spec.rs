@@ -401,24 +401,29 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
     });
     tracing::debug!(project = %project.display(), "rendering min box spec");
     let (network, _) = preview_host(crate::daemon_host_kind(global), args);
-    proxy_rows(global, &bep, quic443, &secrets, network, out)
+    proxy_rows(global, &bep, quic443, &secrets, network, None, out)
 }
 
 /// Writes the Box Egress Proxy rows for `secrets` (BEP-038) to `out`, for
-/// a box of `network` on this host.
+/// a box of `network` on this host. `read_rules` holds the client's
+/// `[secret-store-rules]` when the caller already read them, and the rows
+/// then do not read them again.
 fn proxy_rows(
     global: &GlobalArgs,
     bep: &BepSettings,
     quic443: Option<Quic443>,
     secrets: &SecretGrants,
     network: boxes::NetworkMode,
+    read_rules: Option<&StoreRules>,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     let acknowledged = crate::config::full_breadth_acknowledged(global)?;
-    let store_rules = if boxes::core::bep::store_references(secrets).next().is_some() {
-        crate::config::read_client_config_and_store_rules(global)?.1
-    } else {
-        StoreRules::new()
+    let store_rules = match read_rules {
+        Some(rules) => rules.clone(),
+        None if boxes::core::bep::store_references(secrets).next().is_some() => {
+            crate::config::read_client_config_and_store_rules(global)?.1
+        }
+        None => StoreRules::new(),
     };
     let root = root_fingerprint(identity_path().as_deref());
     tracing::debug!(root_found = root.is_some(), "rendering the proxy rows");
@@ -690,14 +695,19 @@ fn expand_entry(
     );
     let mut expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
     // BOX-071: the client's `[secret-store-rules]` write each store
-    // reference's `upstream` and `inject`, as they do for the spec a create
-    // sends. They are read only for a spec with a store reference, the
-    // same condition the proxy rows read them on.
+    // reference's `upstream` and `inject` into the expanded spec. They are
+    // read once, only for a spec with a store reference, and the proxy rows
+    // below use the same read.
+    // Gap: the v0 spec that a create sends has no `[secrets]` table, so
+    // these values do not reach the daemon yet. #2410 moves the wire to the
+    // expanded spec.
     let store_ids = store_reference_ids(&expansion.spec);
+    let mut read_rules = None;
     if !store_ids.is_empty() {
         let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
         layers.store_rules = expansion_store_rules(&rules);
         expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
+        read_rules = Some(rules);
     }
     let mut spec = expansion.spec;
     let mut sources = std::collections::BTreeMap::new();
@@ -916,7 +926,15 @@ fn expand_entry(
             .transpose()
             .map_err(|e| invalid(mfile::Error::Format(e)))?;
         let mut rows = Vec::new();
-        proxy_rows(global, &bep, quic443, &grants, mode, &mut rows)?;
+        proxy_rows(
+            global,
+            &bep,
+            quic443,
+            &grants,
+            mode,
+            read_rules.as_ref(),
+            &mut rows,
+        )?;
         rows_text = String::from_utf8_lossy(&rows)
             .lines()
             .map(str::to_owned)
