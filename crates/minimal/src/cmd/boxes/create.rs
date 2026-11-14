@@ -3014,6 +3014,15 @@ pub(crate) fn put_spec(
 /// the way. A spec that names no type is of the creating verb's type, as
 /// the daemon reads it.
 ///
+/// The two sides convert the spec in different ways: the client through
+/// `toml::Table::try_from`, the daemon through `spec_digest`. Both drop a
+/// null, and both refuse an integer that TOML cannot hold.
+///
+/// Gap: the typed spec has no `[secrets]` table, so this digest binds no
+/// secret grants or store rules (BOX-071 says the projection holds the
+/// requested secret scopes). It binds them when the create sends the
+/// expanded spec in place of the typed one, which #2410 tracks.
+///
 /// A spec that does not project carries no client digest. The daemon then
 /// stores none.
 pub(crate) fn stamp_client_projection_digest(
