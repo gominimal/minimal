@@ -203,66 +203,6 @@ pub(crate) fn entry_handle(entry: &minimald_rpc::ListSessionsEntry) -> String {
     }
 }
 
-/// Warn when the daemon already tracks a session for `target`.
-///
-/// Activating a path that already has a session mints a second, independent
-/// one; bare `min` from that directory is then ambiguous between them. The
-/// activation still proceeds — this only surfaces the foot-gun the caller
-/// would otherwise hit silently, and points at `attach` as the way to reuse
-/// the existing session. Pure, so the message is unit-testable.
-pub(crate) fn duplicate_session_warning(
-    entries: &[minimald_rpc::ListSessionsEntry],
-    target: &paths::HostAbsPath,
-) -> Option<String> {
-    // When several sessions track the same path, prefer an `Active` one: it is
-    // the only status `attach` accepts, so recommending it (rather than the
-    // first match, which may be `Pending`/`Materializing`) points the user at a
-    // session they can actually reuse. Fall back to the first match when none is
-    // active, so the "still being created; wait" guidance still fires.
-    let existing = entries
-        .iter()
-        .filter(|e| e.project_path.as_ref() == Some(target))
-        .find(|e| e.status == boxes::BoxState::Active)
-        .or_else(|| {
-            entries
-                .iter()
-                .find(|e| e.project_path.as_ref() == Some(target))
-        })?;
-    let handle = entry_handle(existing);
-    let lead = format!(
-        "warning: a session already exists for this path ({handle}); activating \
-         creates a second one, leaving bare `min` here ambiguous between them."
-    );
-    // Only point at `attach` as the step to take now for a session it will
-    // actually accept. Attach refuses anything not yet `Active` (see
-    // `boxes::BoxState`), so for a `Pending`/`Materializing`
-    // duplicate the reuse command would fail immediately — say to wait
-    // first, and show the later attach with a `<session>` placeholder so no
-    // printed command names a session attach would refuse right now. When
-    // we do suggest it, use a key `SessionLookup::parse` can resolve: a name
-    // matches by name and the full id parses as a UUID, but the short
-    // unnamed handle would parse as a nonexistent name and the attach lookup
-    // would miss.
-    match existing.status {
-        boxes::BoxState::Active => {
-            let key = existing
-                .name
-                .clone()
-                .unwrap_or_else(|| existing.id.to_string());
-            Some(format!(
-                "{lead} To reuse it instead: min session attach {key}"
-            ))
-        }
-        boxes::BoxState::Pending | boxes::BoxState::Materializing => Some(format!(
-            "{lead} The existing session is still being created; run `min ls` \
-             until its status is running, then attach to it with `min session \
-             attach <session>` instead of creating a second."
-        )),
-        // An ended session is not one attach accepts, so no reuse command.
-        boxes::BoxState::Stopped | boxes::BoxState::Exited => Some(lead),
-    }
-}
-
 /// Abbreviate a home-prefixed path to `~`/`~/...` for display; any other
 /// path renders absolute, unchanged.
 pub(crate) fn display_with_home_tilde(
