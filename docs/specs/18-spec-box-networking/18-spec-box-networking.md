@@ -1572,8 +1572,8 @@ refusal holds only inside the VM, below the escape boundary.
   and off the accept loop; a node is the pair of its hello's id and its peer's
   uid, so one user's rows are never replaced or released by another's. Box
   addresses are arbitrated across users as before, and each user's nodes may
-  hold at most a quarter of the range and a bounded number of channel
-  connections. Box names stay one space for the host: a name is its first
+  hold at most a quarter of the range, four names for each address of that
+  share, and a bounded number of channel connections. Box names stay one space for the host: a name is its first
   publisher's while its row is up and for the answer TTL after it goes (the
   same quarantine an address has, so a daemon restart or a laptop's sleep
   never loses a name to another member, and a cached answer never reaches
