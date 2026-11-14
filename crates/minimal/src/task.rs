@@ -645,6 +645,28 @@ impl std::fmt::Display for ProjectFileNotFound {
 
 impl std::error::Error for ProjectFileNotFound {}
 
+/// `min task run` or `min box run` with a task name that the project's
+/// `minimal.toml` does not declare. The run ends with exit 4 (`main.rs`),
+/// the architecture's code for a thing not found.
+#[derive(Debug)]
+pub struct TaskNotFound {
+    /// The refusal, with the tasks the file declares.
+    pub message: String,
+}
+
+impl TaskNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for TaskNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TaskNotFound {}
+
 /// `min task run` or `min box run` with a `minimal.toml` that does not
 /// load. The run ends with exit 3 (`main.rs`), the code the architecture
 /// gives an invalid project file, as for `crate::ProjectFileInvalid`.
@@ -712,7 +734,12 @@ pub(crate) fn declared_task(
     };
     match file.task(task) {
         Some(t) => Ok(t),
-        None => bail!(unknown_task_message(&file, task)),
+        // BCLI-034: a task name the file does not declare is a thing not
+        // found (exit 4). The text is the same as before.
+        None => Err(TaskNotFound {
+            message: unknown_task_message(&file, task),
+        }
+        .into()),
     }
 }
 

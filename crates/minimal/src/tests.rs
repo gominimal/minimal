@@ -20024,6 +20024,26 @@ fn refusals_exit_with_the_table_code() {
         )
     );
 
+    // `min task run` of a task the minimal.toml does not declare: not
+    // found (4), text unchanged.
+    let declared = tempfile::tempdir().unwrap();
+    std::fs::write(
+        declared.path().join("minimal.toml"),
+        "[tasks.lint]\necho = 'x'\n",
+    )
+    .unwrap();
+    let declared_dir = camino::Utf8Path::from_path(declared.path()).unwrap();
+    let err = task::declared_task(declared_dir, "build").expect_err("no such task");
+    assert!(
+        err.downcast_ref::<task::TaskNotFound>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(task::TaskNotFound::EXIT_CODE, 4);
+    assert!(
+        format!("{err:#}").starts_with("unknown task 'build';"),
+        "{err:#}"
+    );
+
     // `min task run` with a minimal.toml that does not load: invalid (3).
     let broken = tempfile::tempdir().unwrap();
     std::fs::write(broken.path().join("minimal.toml"), "[tasks.build\n").unwrap();

@@ -291,8 +291,8 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
         return minimal::task::RunFlagMisplaced::EXIT_CODE;
     }
     // BCLI-034: a network flag the box's network mode refuses is a usage
-    // error (2). A project file, a `--loadout` name or a local host that
-    // is not there is a thing not found (4).
+    // error (2). A project file, a task name, a loadout name or a local
+    // host that is not there is a thing not found (4).
     if e.downcast_ref::<minimal::NetworkFlagRefusal>().is_some() {
         return minimal::NetworkFlagRefusal::EXIT_CODE;
     }
@@ -300,6 +300,9 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
         .is_some()
     {
         return minimal::task::ProjectFileNotFound::EXIT_CODE;
+    }
+    if e.downcast_ref::<minimal::task::TaskNotFound>().is_some() {
+        return minimal::task::TaskNotFound::EXIT_CODE;
     }
     if e.downcast_ref::<minimal::loadouts::LoadoutNotFound>()
         .is_some()
@@ -1809,6 +1812,17 @@ mod tests {
     #[test]
     fn project_file_not_found_exits_4() {
         let e = anyhow::Error::new(minimal::task::ProjectFileNotFound {
+            message: "refused".to_owned(),
+        })
+        .context("running the task");
+        assert_eq!(failure_exit_code(&e), 4);
+    }
+
+    /// BCLI-034: `min task run` of a task name that `minimal.toml` does
+    /// not declare ends with exit 4, through context.
+    #[test]
+    fn task_not_found_exits_4() {
+        let e = anyhow::Error::new(minimal::task::TaskNotFound {
             message: "refused".to_owned(),
         })
         .context("running the task");
