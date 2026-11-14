@@ -277,6 +277,10 @@ pub struct Context {
     /// network attaches to it, so the box's egress verdict decides the
     /// build's connections.
     pub(crate) box_network: Option<op::BuildNetwork>,
+    /// The workspace a box's `minimal.toml` edits must stay inside, for a
+    /// context the daemon builds for a box (inbox#1245). `None` for a
+    /// context whose caller chose the project itself, as the host CLI does.
+    pub(crate) mfile_edit_root: Option<PathBuf>,
 }
 
 impl fmt::Display for Context {
@@ -437,6 +441,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
         })
     }
 
@@ -461,6 +466,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
         }
     }
 
@@ -475,6 +481,7 @@ impl Context {
             mfile,
             classifier_leaf: None,
             box_network: None,
+            mfile_edit_root: None,
         }
     }
 
@@ -503,6 +510,15 @@ impl Context {
     /// The box network this context's package builds attach to, if any.
     pub fn box_network(&self) -> Option<&op::BuildNetwork> {
         self.box_network.as_ref()
+    }
+
+    /// Confines every edit this context makes to its `minimal.toml` to the
+    /// directory `root`, the workspace of the box the daemon built it for
+    /// (inbox#1245). The box controls that directory, so a link there must
+    /// not carry the edit to a file outside it; see
+    /// [`mfile::File::edit_exclusively_within`].
+    pub fn confine_mfile_edits_to(&mut self, root: PathBuf) {
+        self.mfile_edit_root = Some(root);
     }
 
     /// Returns a clone of the shared daemon-scoped context. Cheap —
@@ -541,6 +557,7 @@ impl Context {
         Ok(Self {
             classifier_leaf: self.classifier_leaf.clone(),
             box_network: self.box_network.clone(),
+            mfile_edit_root: self.mfile_edit_root.clone(),
             ..Self::from_daemon(Arc::clone(&self.daemon), mfile)
         })
     }
@@ -1329,10 +1346,11 @@ impl Context {
 
         // The whole read-edit-write runs under `File::edit_exclusively`'s
         // lock so a concurrent `min` command cannot interleave between our read
-        // and our write (the write itself is an atomic replace).
+        // and our write (the write itself is an atomic replace). A context
+        // built for a box keeps the edit inside the box's workspace.
         let mut did_edit = false;
         let mut added = None;
-        mfile::File::edit_exclusively(&mfile_path, |content| {
+        let edit = |content: Option<&str>| -> Result<Option<String>, Error> {
             let toml = content.ok_or_else(|| {
                 Error::IO(
                     "reading minimal.toml for add",
@@ -1424,7 +1442,11 @@ impl Context {
 
             did_edit = edited;
             Ok(if edited { Some(doc.to_string()) } else { None })
-        })?;
+        };
+        match self.mfile_edit_root.as_deref() {
+            Some(root) => mfile::File::edit_exclusively_within(root, &mfile_path, edit),
+            None => mfile::File::edit_exclusively(&mfile_path, edit),
+        }?;
 
         // Printed only once the write has succeeded.
         if let Some(added) = added {
@@ -2073,6 +2095,64 @@ mod tests {
                 .unwrap()
                 .contains("[session]")
         );
+    }
+
+    /// inbox#1245: a context confined to a box's workspace refuses to edit a
+    /// `minimal.toml` that links out of it, and leaves both files as they
+    /// were.
+    #[test]
+    fn add_deps_refuses_a_confined_mfile_that_links_out() {
+        let state = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_path = outside.path().join("minimal.toml");
+        let content = format!(
+            indoc! {
+                "
+                [upstream]
+                dir = \"{}\"
+
+                [stack]
+                use = \"fake-stack\"
+                "
+            },
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("testdata")
+                .join("fakerepo-with-stack")
+                .to_str()
+                .unwrap()
+        );
+        std::fs::write(&outside_path, &content).unwrap();
+        let link = workspace.path().join("minimal.toml");
+        std::os::unix::fs::symlink(&outside_path, &link).unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(workspace.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let mut ctx = Context::new(config).unwrap();
+        ctx.confine_mfile_edits_to(workspace.path().to_path_buf());
+        let graph = ctx.graph_from_all_packages().unwrap();
+
+        let err = ctx
+            .add_deps(&graph, ["uroot"], AddDepMode::BuildPackages)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                Error::MFile(mfile::Error::IO(_, _, io))
+                    if io.to_string().contains("leads outside its workspace")
+            ),
+            "error: {err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside_path).unwrap(), content);
+        assert_eq!(std::fs::read_link(&link).unwrap(), outside_path);
     }
 
     #[test]
