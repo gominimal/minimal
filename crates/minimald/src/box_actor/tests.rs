@@ -391,7 +391,7 @@ async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding(
     let mut channel = client.open_shell(session_id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "expected an attach refusal, got: {refusal:?}"
     );
     assert!(
@@ -2307,7 +2307,7 @@ async fn a_mint_whose_host_dies_before_attach_reports_a_spawn_failure() {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
@@ -2330,7 +2330,7 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
@@ -4840,7 +4840,7 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
     let mut second = client.open_shell(id).await;
     let refusal = collect_to_close(&mut second).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
@@ -4872,7 +4872,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:")
+        refusal.contains("Cannot attach to the box:")
             && refusal.contains("the VM host daemon released this session's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
