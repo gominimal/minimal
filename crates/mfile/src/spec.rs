@@ -207,8 +207,7 @@ impl BoxSpec {
     }
 
     /// The spec of a task box, from the `[tasks.<name>]` entry and the
-    /// flags. A task's spec carries the request's box policy, which a task
-    /// leaves at the default.
+    /// flags. A task's spec carries the request's box policy.
     ///
     /// `None` for an interactive task. The `task` Box Type denies a
     /// terminal, so no `task` spec has `pty_enabled = true`.
@@ -642,6 +641,19 @@ const SECTIONS: &[SectionKey] = &[
     ("nesting", KeyShape::Keys(NESTING_KEYS)),
     ("network", KeyShape::Keys(NETWORK_KEYS)),
 ];
+
+/// The section that also carries the flat top-level setting `key`, such
+/// as `io` for `pty_enabled` or `install` for `packages`. `None` when
+/// `key` is not a flat setting of the spec, or no section carries it.
+pub(crate) fn flat_key_section(key: &str) -> Option<&'static str> {
+    if !crate::expand::is_spec_key(key) {
+        return None;
+    }
+    SECTIONS.iter().find_map(|(section, shape)| match shape {
+        KeyShape::Keys(keys) if keys.iter().any(|(k, _)| *k == key) => Some(*section),
+        _ => None,
+    })
+}
 
 /// A key inside a Box Spec section that the spec cannot carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1102,7 +1114,7 @@ mod tests {
             type = "session"
             name = "dev"
             lifetime = "until_stopped"
-            loadout_mode = "merge"
+            loadout_mode = "open"
             volumes = ["cache"]
 
             [sessions.dev.io]

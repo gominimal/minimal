@@ -496,7 +496,13 @@ pub(crate) async fn handle_exec(
         }
         ExecRequest::ExecAttach(exec_id) => {
             session.channel_success(id)?;
-            spawn(serve_exec_attach(channel, session_handle, session_id, exec_id).instrument(span));
+            // The keys the client negotiated, as a box attach reads them
+            // (BCLI-068). A client that sent none gets the default keys.
+            let keys = boxes::keys::SessionKeys::from_env(&config.env_vars).validated_or_default();
+            spawn(
+                serve_exec_attach(channel, session_handle, session_id, exec_id, keys)
+                    .instrument(span),
+            );
         }
         ExecRequest::ExecOutput(exec_id) => {
             session.channel_success(id)?;
@@ -575,6 +581,7 @@ async fn run_attached_exec(
             exec_id.clone(),
             exec_box.record.id,
             ExecMode::Attached,
+            facts.argv.clone(),
             transcript,
             None,
         ));
@@ -796,7 +803,7 @@ pub(crate) struct AdoptedTrace {
 /// the daemon handed the box a `TRACEPARENT` whose span id was spooled and
 /// exported nowhere, so a `min` run inside parented itself to an orphan. A
 /// trace nobody can follow is worse than a fresh one: hand the box nothing.
-fn box_traceparent(adopted: &AdoptedTrace) -> Option<String> {
+pub(crate) fn box_traceparent(adopted: &AdoptedTrace) -> Option<String> {
     adopted.recorded.then(|| adopted.ctx.traceparent())
 }
 

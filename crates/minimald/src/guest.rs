@@ -1384,6 +1384,19 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
         std::io::Error::new(e.kind(), format!("open_tap({TAP}) [/dev/net/tun]: {e}"))
     })?;
 
+    // The switch's Box Egress Proxy leg answers an ARP claim and admits a
+    // connection only from an address's switch-derived MAC, as a box's tap
+    // carries. Every host-address box reaches the proxy through this tap, so
+    // it takes the daemon address's derived MAC before it comes up. Only
+    // those boxes need it, so a refusal keeps the kernel's MAC and the
+    // daemon's own egress comes up all the same.
+    if let Err(error) = set_interface_mac(TAP, crate::net::MacAddr::for_switch_ip(ip).0) {
+        tracing::warn!(
+            %error,
+            "the guest's eth0 keeps its kernel-assigned MAC; host-address boxes \
+             cannot reach the Box Egress Proxy through it"
+        );
+    }
     // Configure the interface directly via ioctls — the generic guest rootfs
     // ships no `ip`/iproute2 binary, so shelling out is not an option.
     configure_interface_v4(TAP, ip, DEFAULT_SUBNET.prefix(), Some(gateway))?;
@@ -1451,6 +1464,62 @@ fn install_resolv_conf(nameserver: std::net::Ipv4Addr) -> std::io::Result<()> {
 /// agree however often the boot runs them.
 pub fn bring_up_loopback() -> std::io::Result<()> {
     configure_interface_v4("lo", std::net::Ipv4Addr::LOCALHOST, 8, None)
+}
+
+/// Sets the Ethernet address of the down interface `ifname` to `mac`
+/// through the `SIOCSIFHWADDR` ioctl, for the same reason as
+/// [`configure_interface_v4`]: the guest rootfs carries no `ip` binary.
+fn set_interface_mac(ifname: &str, mac: [u8; 6]) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // The hardware-address variant of `ifreq`: a `sockaddr` in the union,
+    // padded to the full 40-byte `ifreq` size the kernel expects.
+    #[repr(C)]
+    struct IfReqHwAddr {
+        name: [libc::c_char; libc::IFNAMSIZ],
+        addr: libc::sockaddr,
+        _pad: [u8; 8],
+    }
+    const _: () = assert!(std::mem::size_of::<IfReqHwAddr>() == 40);
+
+    // SAFETY: sockaddr is plain old data; zeroing then filling is valid.
+    let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
+    addr.sa_family = libc::ARPHRD_ETHER;
+    for (dst, b) in addr.sa_data.iter_mut().zip(mac) {
+        *dst = b as libc::c_char;
+    }
+    let mut ifr = IfReqHwAddr {
+        name: [0; libc::IFNAMSIZ],
+        addr,
+        _pad: [0; 8],
+    };
+    for (dst, b) in ifr.name.iter_mut().zip(ifname.bytes()) {
+        *dst = b as libc::c_char;
+    }
+
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh, valid, owned socket fd.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: the fd is open; &mut ifr is a correctly-sized ifreq for the
+    // hardware-address ioctl.
+    let rc = unsafe {
+        libc::ioctl(
+            sock.as_raw_fd(),
+            libc::SIOCSIFHWADDR as _,
+            std::ptr::from_mut(&mut ifr).cast::<libc::c_void>(),
+        )
+    };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("setting the MAC address of {ifname}: {error}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Assigns `ip`/`prefix` to `ifname`, brings it up, and (when `gateway` is set)

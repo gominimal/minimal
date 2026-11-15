@@ -84,40 +84,30 @@ impl crate::net::classifier::CgroupMoves for HostMoves {
     }
 
     fn add_blocked_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
-        run_quic443_leaf_helper(
-            std::path::Path::new("sudo"),
-            std::path::Path::new(QUIC443_LEAF_HELPER),
-            "add",
-            leaf,
-        )
+        change_leaf_set("add", leaf)
     }
 
     fn remove_blocked_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
-        run_quic443_leaf_helper(
-            std::path::Path::new("sudo"),
-            std::path::Path::new(QUIC443_LEAF_HELPER),
-            "remove",
-            leaf,
-        )
+        change_leaf_set("remove", leaf)
     }
 
     // BEP-083: the lane set changes through the helper's lane verbs.
     fn add_lane_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
-        change_lane_set("lane-add", leaf)
+        change_leaf_set("lane-add", leaf)
     }
 
     fn remove_lane_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
-        change_lane_set("lane-remove", leaf)
+        change_leaf_set("lane-remove", leaf)
     }
 }
 
-/// Changes the guest table's lane set for the box leaf `leaf` (BEP-083):
-/// `verb` is the helper's `lane-add` or `lane-remove`. A daemon that does
-/// not run as root runs the helper through `sudo -n`, as it does for the
-/// blocked-leaves set. A daemon that runs as root, as the VM guest's does,
-/// has no helper and no `sudo` to run, so it hands `nft` the element the
-/// helper would.
-fn change_lane_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
+/// Changes one of the table's leaf sets for the box leaf `leaf`: `verb` is
+/// the helper's `add` or `remove` for the blocked-leaves set (BEP-018), or
+/// its `lane-add` or `lane-remove` for the lane set (BEP-083). A daemon
+/// that does not run as root runs the helper through `sudo -n`. A daemon
+/// that runs as root, as the VM guest's does, has no helper and no `sudo`
+/// to run, so it hands `nft` the element the helper would.
+fn change_leaf_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         return run_quic443_leaf_helper(
@@ -127,7 +117,7 @@ fn change_lane_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
             leaf,
         );
     }
-    run_lane_nft(
+    run_leaf_set_nft(
         std::path::Path::new(crate::net::classifier::GUEST_NFT),
         std::path::Path::new(sandbox::classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT),
         verb,
@@ -135,24 +125,27 @@ fn change_lane_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
     )
 }
 
-/// The root daemon's half of [`change_lane_set`]: runs `nft` to add or
+/// The root daemon's half of [`change_leaf_set`]: runs `nft` to add or
 /// delete the element for `leaf`, spelled as its path below the cgroup2
-/// mount `mount`, in the table's lane set. A refusal is logged with what
-/// `nft` said, and returned.
-fn run_lane_nft(
+/// mount `mount`, in the set the helper's `verb` names. A refusal is logged
+/// with what `nft` said, and returned.
+fn run_leaf_set_nft(
     nft: &std::path::Path,
     mount: &std::path::Path,
     verb: &str,
     leaf: &std::path::Path,
 ) -> std::io::Result<()> {
     // The helper refuses a verb it does not know, and so does this path.
-    let nft_verb = match verb {
-        "lane-add" => "add",
-        "lane-remove" => "delete",
+    use crate::net::classifier::{PROXY_LANE_SET, QUIC443_LEAF_SET};
+    let (nft_verb, set) = match verb {
+        "add" => ("add", QUIC443_LEAF_SET),
+        "remove" => ("delete", QUIC443_LEAF_SET),
+        "lane-add" => ("add", PROXY_LANE_SET),
+        "lane-remove" => ("delete", PROXY_LANE_SET),
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("{other} is not a lane verb"),
+                format!("{other} is not a leaf-set verb"),
             ));
         }
     };
@@ -162,12 +155,20 @@ fn run_lane_nft(
             format!("{} is not below {}", leaf.display(), mount.display()),
         )
     })?;
+    // The helper adds only a leaf that is a real directory, and so does
+    // this path. A remove still runs for a leaf that is gone.
+    if nft_verb == "add" && !leaf.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", leaf.display()),
+        ));
+    }
     let ran = std::process::Command::new(nft)
         .arg(nft_verb)
         .arg("element")
         .arg("inet")
         .arg(crate::net::classifier::TABLE_NAME)
-        .arg(crate::net::classifier::PROXY_LANE_SET)
+        .arg(set)
         .arg(format!("{{ \"{}\" }}", rel.display()))
         .stdin(std::process::Stdio::null())
         .output();
@@ -187,8 +188,9 @@ fn run_lane_nft(
     tracing::warn!(
         leaf = %leaf.display(),
         verb,
+        set,
         %error,
-        "nft refused a change to the set of leaves that can connect to the proxy's address"
+        "nft refused a change to a set of box leaves in the guest table"
     );
     Err(error)
 }
@@ -1757,6 +1759,100 @@ impl BoxActor {
         Ok(host)
     }
 
+    /// Starts the box's entrypoint again for a restart (BOX-176), with no
+    /// client attached. The restart already set the record to `running`
+    /// from the stored spec.
+    ///
+    /// A host that the restart launched for `on_activate` (BOX-028) is kept
+    /// when the box starts its shell, and the shell starts when a client
+    /// attaches, as after an activation. It is replaced when the box starts
+    /// an argv, or the entrypoint never starts. A box that holds a host-side
+    /// row keeps its host, as an attach keeps it. The launch runs no
+    /// lifecycle hook (BOX-177).
+    pub(super) async fn restart_launch(
+        &mut self,
+        session_hnd: BoxHandle,
+        conn_username: String,
+    ) -> Result<(), AttachError> {
+        let holds_host_row = self
+            .record
+            .record()
+            .await
+            .map_err(AttachError::LoadoutFailed)?
+            .box_addresses
+            .is_some();
+        let live_hooks_host = matches!(
+            &self.inner,
+            BoxInner::Active { host: Some((h, _)), .. } if h.is_alive()
+        ) && self.host_origin == HostOrigin::Hooks;
+        if live_hooks_host {
+            let starts_argv = self.starts_argv().await;
+            if holds_host_row && starts_argv {
+                // As `ensure_host` refuses it: replacing the hook shell would
+                // end the box's host-side row, and keeping it never starts
+                // the entrypoint (BOX-176, BOX-178).
+                // Known gap: a restart of such a box fails closed. Tracked by
+                // https://github.com/gominimal/minimal/issues/3231. It flips
+                // when the hook shell can be replaced without ending the
+                // host-side row (#3042).
+                tracing::warn!(
+                    box_id = %self.record.id(),
+                    "restart: refused the start: replacing the hook-launched shell would end \
+                     the box's host-side row, so the box's entrypoint cannot start"
+                );
+                return Err(AttachError::SpawnFailed(std::io::Error::other(
+                    EntrypointBehindHookShell,
+                )));
+            }
+            if !starts_argv {
+                tracing::info!(
+                    box_id = %self.record.id(),
+                    "restart: keeping the host launched for on_activate"
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                box_id = %self.record.id(),
+                "restart: replacing the host launched for on_activate with the box's entrypoint"
+            );
+        }
+        // A host left in the slot runs nothing the restart keeps.
+        if let BoxInner::Active {
+            host: slot @ Some(_),
+            ..
+        } = &mut self.inner
+        {
+            let (handle, mut join) = slot.take().expect("matched on Some");
+            Self::kill_and_stop_loop(&handle, &mut join, false).await;
+        }
+        #[cfg(test)]
+        if restart_launch_seam::fails(self.record.id()) {
+            return Err(AttachError::SpawnFailed(std::io::Error::other(
+                "the test failed this launch",
+            )));
+        }
+        let (_, launched) = self
+            .launch_host(
+                session_hnd,
+                conn_username,
+                UNATTACHED_WIN_SIZE,
+                box_runtime::AttachEnv::default(),
+                None,
+                LaunchPhase::Attached,
+                false,
+            )
+            .await?;
+        let BoxInner::Active { host: slot, .. } = &mut self.inner else {
+            return Err(AttachError::SessionPending);
+        };
+        *slot = Some(launched);
+        // No client attached: a later attach reuses this host, as it reuses
+        // one an exec launched.
+        self.host_origin = HostOrigin::Exec;
+        self.publish_host();
+        Ok(())
+    }
+
     /// Clears the record's `ends_with_run` mark once a task run started
     /// the box's entrypoint (T43, NET-131). Until then a daemon restart
     /// destroys the box, so a client lost before the task starts strands
@@ -3040,12 +3136,14 @@ mod quic443_cohort_tests {
         plain_task.abort();
     }
 
-    /// BEP-083 on the root daemon's path: `run_lane_nft` hands `nft` the
-    /// element for the leaf's path below the mount, in the table's lane set.
-    /// It refuses a leaf that is not below the mount, and a verb that is not
-    /// a lane verb, without running `nft`.
+    /// BEP-018 and BEP-083 on the root daemon's path: `run_leaf_set_nft`
+    /// hands `nft` the element for the leaf's path below the mount, in the
+    /// lane set for a lane verb and in the blocked-leaves set for `add` and
+    /// `remove`. It refuses a leaf that is not below the mount, a verb the
+    /// helper does not know, and an add of a leaf that is not a directory,
+    /// without running `nft`.
     #[test]
-    fn root_lane_change_runs_nft_on_the_lane_set() {
+    fn root_leaf_set_change_runs_nft_on_the_named_set() {
         use crate::net::classifier::{nft_calls, recording_nft};
         let stub = tempfile::tempdir().unwrap();
         let nft = recording_nft(stub.path(), &[]);
@@ -3053,48 +3151,95 @@ mod quic443_cohort_tests {
         let id = BoxId::mint().to_string();
         let root = mount.path().join("minimald.slice");
         let leaf = sandbox::classifier::box_leaf(&root, &id, Verdict::Allow);
+        std::fs::create_dir_all(&leaf).unwrap();
         let element = format!("{{ \"minimald.slice/boxes/allow/{id}\" }}");
-        let argv = |verb: &str| -> Vec<String> {
-            [
-                verb,
-                "element",
-                "inet",
-                "minimal_class",
-                "bep_lane_leaves",
-                &element,
-            ]
-            .iter()
-            .map(|arg| arg.to_string())
-            .collect()
+        let argv = |verb: &str, set: &str| -> Vec<String> {
+            [verb, "element", "inet", "minimal_class", set, &element]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect()
         };
 
-        super::run_lane_nft(&nft, mount.path(), "lane-add", &leaf).expect("lane-add runs nft");
-        super::run_lane_nft(&nft, mount.path(), "lane-remove", &leaf)
+        super::run_leaf_set_nft(&nft, mount.path(), "lane-add", &leaf).expect("lane-add runs nft");
+        super::run_leaf_set_nft(&nft, mount.path(), "lane-remove", &leaf)
             .expect("lane-remove runs nft");
+        super::run_leaf_set_nft(&nft, mount.path(), "add", &leaf).expect("add runs nft");
+        super::run_leaf_set_nft(&nft, mount.path(), "remove", &leaf).expect("remove runs nft");
         let calls: Vec<Vec<String>> = nft_calls(stub.path())
             .into_iter()
             .map(|(argv, _)| argv)
             .collect();
-        assert_eq!(calls, vec![argv("add"), argv("delete")]);
+        assert_eq!(
+            calls,
+            vec![
+                argv("add", "bep_lane_leaves"),
+                argv("delete", "bep_lane_leaves"),
+                argv("add", "quic443_blocked_leaves"),
+                argv("delete", "quic443_blocked_leaves"),
+            ]
+        );
 
         let elsewhere = tempfile::tempdir().unwrap();
         let outside = sandbox::classifier::box_leaf(elsewhere.path(), &id, Verdict::Allow);
-        let refused = super::run_lane_nft(&nft, mount.path(), "lane-add", &outside)
+        let refused = super::run_leaf_set_nft(&nft, mount.path(), "lane-add", &outside)
             .expect_err("a leaf outside the mount is refused");
         assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             nft_calls(stub.path()).len(),
-            2,
+            4,
             "no nft call for the refusal"
         );
 
-        let unknown = super::run_lane_nft(&nft, mount.path(), "lane-flush", &leaf)
+        let unknown = super::run_leaf_set_nft(&nft, mount.path(), "lane-flush", &leaf)
             .expect_err("an unknown verb is refused");
         assert_eq!(unknown.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             nft_calls(stub.path()).len(),
-            2,
+            4,
             "no nft call for the unknown verb"
         );
+
+        let missing = sandbox::classifier::box_leaf(&root, "no-such-box", Verdict::Allow);
+        for verb in ["add", "lane-add"] {
+            let refused = super::run_leaf_set_nft(&nft, mount.path(), verb, &missing)
+                .expect_err("an add of a leaf that is not a directory is refused");
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            nft_calls(stub.path()).len(),
+            4,
+            "no nft call for an add of a missing leaf"
+        );
+    }
+}
+
+/// Test-only: fails the launch of a restart of a box (BOX-176), once,
+/// before it starts anything, so a test can see what a failed start leaves.
+/// Keyed by box id, so tests running beside each other keep their own.
+#[cfg(test)]
+pub(crate) mod restart_launch_seam {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+
+    static SEEDED: Mutex<Option<HashSet<SessionId>>> = Mutex::new(None);
+
+    /// Makes the next restart launch of `id` fail.
+    pub(crate) fn fail_next(id: SessionId) {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashSet::new)
+            .insert(id);
+    }
+
+    /// Whether this restart launch of `id` fails. Takes the seed.
+    pub(super) fn fails(id: &SessionId) -> bool {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .is_some_and(|seeded| seeded.remove(id))
     }
 }

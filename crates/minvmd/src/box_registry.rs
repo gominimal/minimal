@@ -188,6 +188,19 @@ pub const HOST_IP_IDS_FILE: &str = "box-host-ip-ids.json";
 /// version is set aside and reloads no id, like one that does not parse.
 const HOST_IP_IDS_FILE_VERSION: u32 = 1;
 
+/// The file the registry persists each held `host_ip` box's declared egress
+/// policy and credentialed lane to ([`BoxRegistry::admit_host_ip_box`]),
+/// beside [`HOST_IP_IDS_FILE`]. It holds every box whose rules are held,
+/// resident or set aside. A restart reloads them as set-aside rules, so a
+/// box the guest reports running gets its egress back from the next
+/// reconcile, with no client admit. A file of its own, for the same reason
+/// as [`HELD_NAMES_FILE`].
+pub const HOST_IP_RULES_FILE: &str = "box-host-ip-rules.json";
+
+/// The persisted `host_ip` rules' format version. A file of any other
+/// version is set aside and reloads no rules, like one that does not parse.
+const HOST_IP_RULES_FILE_VERSION: u32 = 1;
+
 /// How long a hold reloaded from [`HELD_NAMES_FILE`] stands unconfirmed
 /// before it is dropped ([`BoxRegistry::expire_unconfirmed_holds`]). Only
 /// a host client re-makes a hold, over the host's control socket: the
@@ -406,7 +419,13 @@ type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 /// stay comparable for the record's life.
 #[derive(Debug)]
 pub struct BoxRecord {
-    name: String,
+    /// The box's name. The one row dimension a client changes after the
+    /// registration: its creator's rename moves the row to the session's
+    /// new name ([`BoxRegistry::rename_client_box`], #1116), so the zone,
+    /// the gate's name rules and every lookup by name follow the session.
+    /// Behind its own lock, never the row lock, and held only for the
+    /// clone of the [`Arc`]: no reader keeps it across another lock.
+    name: RwLock<Arc<str>>,
     box_id: BoxId,
     switch_addr: Ipv4Addr,
     loopback_addr: Ipv4Addr,
@@ -516,7 +535,7 @@ struct RowLiveness {
 /// compared.
 impl PartialEq for BoxRecord {
     fn eq(&self, other: &Self) -> bool {
-        if !(self.name == other.name
+        if !(self.name() == other.name()
             && self.box_id == other.box_id
             && self.switch_addr == other.switch_addr
             && self.loopback_addr == other.loopback_addr
@@ -575,10 +594,26 @@ struct RuntimePort {
 }
 
 impl BoxRecord {
-    /// The namespace's name — what a diagnostic names a row by.
+    /// The namespace's name — what a diagnostic names a row by. The name
+    /// as it is now: a rename re-keys it in place ([`Self::rename`]).
     #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn name(&self) -> Arc<str> {
+        Arc::clone(
+            &self
+                .name
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Re-keys the row to `name` (#1116). Only the registry's rename
+    /// calls this, under the write of the row lock that checked the name
+    /// is free.
+    fn rename(&self, name: &str) {
+        *self
+            .name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::from(name);
     }
 
     /// Whether a frame of the box ever crossed the gate under this row
@@ -1164,6 +1199,27 @@ struct HostIpIdsFile {
     credentialed: Vec<boxes::BoxId>,
 }
 
+/// The persisted `host_ip` rules ([`HOST_IP_RULES_FILE`]): its format
+/// version, then one entry per box whose rules are held.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostIpRulesFile {
+    version: u32,
+    boxes: Vec<HostIpRulesEntry>,
+}
+
+/// One held `host_ip` box in [`HOST_IP_RULES_FILE`]: its session, the
+/// policy its client declared, and whether it declares a credentialed
+/// upstream. The policy is the declared one, not the effective one, so a
+/// reload fills it under this run's egress default, as an admit does.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostIpRulesEntry {
+    session: boxes::SessionId,
+    declared: Option<EgressPolicy>,
+    credentialed_upstream: bool,
+}
+
 /// Writes `file` to `path` the one way any of the registry's persisted
 /// files — the box registry ([`REGISTRY_FILE`]), its held names
 /// ([`HELD_NAMES_FILE`]) and its `host_ip` ids ([`HOST_IP_IDS_FILE`]) — is
@@ -1436,6 +1492,50 @@ fn read_host_ip_ids_file(path: &std::path::Path) -> HostIpIds {
         ),
     }
     HostIpIds::default()
+}
+
+/// Reads the `host_ip` rules persisted at `path`: none when there is no
+/// file yet. A file that cannot be read, does not parse, or is of another
+/// version than [`HOST_IP_RULES_FILE_VERSION`] reloads no rules and is
+/// renamed aside under the same `.unusable-<unix seconds>` suffix, said as
+/// an error line. Losing them costs only the egress of a box the guest
+/// still runs, until a client admits it again: the fail-closed reading.
+fn read_host_ip_rules_file(path: &std::path::Path) -> Vec<HostIpRulesEntry> {
+    let why = match std::fs::read(path) {
+        Ok(bytes) => match serde_json_lenient::from_slice::<HostIpRulesFile>(&bytes) {
+            Ok(file) if file.version == HOST_IP_RULES_FILE_VERSION => return file.boxes,
+            Ok(file) => format!(
+                "version {}, this build reads {HOST_IP_RULES_FILE_VERSION}",
+                file.version
+            ),
+            Err(error) => error.to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => error.to_string(),
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unusable-{stamp}"));
+    let aside = std::path::PathBuf::from(aside);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::error!(
+            path = %path.display(),
+            aside = %aside.display(),
+            why,
+            "the persisted host_ip box rules are unusable; they are set aside and no rules \
+             are reloaded"
+        ),
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            why,
+            %error,
+            "the persisted host_ip box rules are unusable and could not be set aside; \
+             no rules are reloaded and the next change writes over them"
+        ),
+    }
+    Vec::new()
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -2040,6 +2140,55 @@ pub enum WithdrawError {
         held_box_id: BoxId,
         /// The id the withdrawal named.
         asked_box_id: BoxId,
+    },
+}
+
+/// Why a renamed session's re-key of its box was refused
+/// ([`BoxRegistry::rename_client_box`], #1116). A refused rename changes
+/// nothing: the box stays under the name the host held it by.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenameError {
+    /// The row at the switch address is another box's: the renaming
+    /// client is not its creator.
+    #[error(
+        "the row at switch address {switch_addr} is box id {}, not the {} the rename named",
+        crate::bep_attach::BoxIdText(held_box_id),
+        crate::bep_attach::BoxIdText(asked_box_id)
+    )]
+    NotTheBoxId {
+        /// The switch address the rename named.
+        switch_addr: Ipv4Addr,
+        /// The id the published row holds.
+        held_box_id: BoxId,
+        /// The id the rename named.
+        asked_box_id: BoxId,
+    },
+    /// The box the id names was handed another pair than the one the
+    /// rename presented.
+    #[error(
+        "box id {} was handed switch address {held_switch} and loopback address \
+         {held_loopback}, not the {asked_switch} and {asked_loopback} the rename presented",
+        crate::bep_attach::BoxIdText(box_id)
+    )]
+    NotTheHandedPair {
+        /// The id the rename named.
+        box_id: BoxId,
+        /// The switch address the box holds.
+        held_switch: Ipv4Addr,
+        /// The loopback address the box holds.
+        held_loopback: Ipv4Addr,
+        /// The switch address the rename presented.
+        asked_switch: Ipv4Addr,
+        /// The loopback address the rename presented.
+        asked_loopback: Ipv4Addr,
+    },
+    /// Another box's row holds the new name on this host.
+    #[error("box {holder:?} holds the name {name:?} on the VM host")]
+    NameHeld {
+        /// The name the rename asked for.
+        name: String,
+        /// The name of the row that holds it, in its own spelling.
+        holder: String,
     },
 }
 
@@ -3736,7 +3885,7 @@ impl BoxRegistry {
         let generations = self.generations();
         let row_holds = rows
             .values()
-            .any(|record| canonical_box_name(record.name()) == key);
+            .any(|record| canonical_box_name(&record.name()) == key);
         let others_in_flight = generations
             .get(key)
             .map_or(0, |entry| entry.in_flight.saturating_sub(own));
@@ -3847,6 +3996,30 @@ impl BoxRegistry {
                 "reloaded the persisted host_ip box ids"
             );
             *self.host_ip_id_set() = reloaded;
+        }
+        {
+            // A host_ip box's rules come back set aside: they admit nothing
+            // until a reconcile finds the guest runs the box again
+            // ([`Self::reconcile_host_ip_boxes`]), and a reconcile that finds
+            // the guest no longer lists it forgets them.
+            let reloaded = read_host_ip_rules_file(&path.with_file_name(HOST_IP_RULES_FILE));
+            let mut resident = self
+                .host_ip_boxes
+                .write()
+                .expect("the resident host_ip boxes' lock is never held across a panic");
+            for entry in reloaded {
+                let rules = self.host_ip_box_rules(
+                    entry.session,
+                    entry.declared,
+                    entry.credentialed_upstream,
+                );
+                resident.dormant.insert(entry.session, Arc::new(rules));
+            }
+            tracing::info!(
+                set_aside = resident.dormant.len(),
+                "reloaded the persisted host_ip box rules; each rejoins the union when the VM \
+                 runs its box"
+            );
         }
         self.persisted_at = Some(Arc::new(path));
         let mut held_loopbacks = std::collections::BTreeMap::new();
@@ -4104,6 +4277,61 @@ impl BoxRegistry {
         }
     }
 
+    /// Writes every held `host_ip` box's declared policy and lane, resident
+    /// or set aside, to [`HOST_IP_RULES_FILE`]. Call it with no lock on the
+    /// resident set held.
+    fn persist_host_ip_rules(&self) {
+        let Some(path) = &self.persisted_at else {
+            return;
+        };
+        let path = path.with_file_name(HOST_IP_RULES_FILE);
+        let _turn = self
+            .persist_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file = {
+            let resident = self
+                .host_ip_boxes
+                .read()
+                .expect("the resident host_ip boxes' lock is never held across a panic");
+            let mut held: BTreeMap<boxes::SessionId, &HostIpBoxRules> = BTreeMap::new();
+            for (session, rules) in resident.dormant.iter().chain(resident.boxes.iter()) {
+                held.insert(*session, rules);
+            }
+            HostIpRulesFile {
+                version: HOST_IP_RULES_FILE_VERSION,
+                boxes: held
+                    .into_iter()
+                    .map(|(session, rules)| HostIpRulesEntry {
+                        session,
+                        declared: rules.declared.clone(),
+                        credentialed_upstream: rules.credentialed_upstream,
+                    })
+                    .collect(),
+            }
+        };
+        if let Err(error) = write_registry_file(&path, &file) {
+            // Fail closed: an earlier file can still list a box a client
+            // retired since, and a restart must not reload it. With no file,
+            // the next start reloads no rules.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => {}
+                Err(remove) => tracing::error!(
+                    path = %path.display(),
+                    error = %remove,
+                    "could not remove the stale host_ip box rules file"
+                ),
+            }
+            tracing::error!(
+                path = %path.display(),
+                %error,
+                "could not persist the host_ip box rules; the rules file is removed and the \
+                 next start reloads no rules"
+            );
+        }
+    }
+
     /// Marks `record`'s creation dormant, when the record is the
     /// creation's row: its row is gone, and its addresses stay reserved
     /// for it ([`Creation`]). Called
@@ -4111,7 +4339,7 @@ impl BoxRegistry {
     /// changed.
     fn creation_rowless(&self, record: &BoxRecord) -> bool {
         let mut creations = self.creations();
-        match creations.get_mut(&canonical_box_name(record.name())) {
+        match creations.get_mut(&canonical_box_name(&record.name())) {
             Some(creation) if creation.id() == record.box_id && creation.standing => {
                 creation.standing = false;
                 true
@@ -4336,7 +4564,7 @@ impl BoxRegistry {
             .iter()
             .map(|&task_addr| {
                 Arc::new(BoxRecord {
-                    name: registration.name.clone(),
+                    name: RwLock::new(Arc::from(registration.name.as_str())),
                     box_id,
                     switch_addr: task_addr,
                     loopback_addr: registration.loopback_addr,
@@ -4363,7 +4591,7 @@ impl BoxRegistry {
             })
             .collect();
         let record = Arc::new(BoxRecord {
-            name: registration.name,
+            name: RwLock::new(Arc::from(registration.name)),
             box_id,
             // The lease the compiled rules check is the row's own switch
             // address: the one source its frames may carry. The resolver the
@@ -4442,7 +4670,7 @@ impl BoxRegistry {
             );
             return Err(AllocationError::RevocationPending { addr });
         }
-        if generation.is_some_and(|read| read != self.withdrawal_generation(record.name())) {
+        if generation.is_some_and(|read| read != self.withdrawal_generation(&record.name())) {
             drop(rows);
             return Err(AllocationError::WithdrawnWhileAllocating);
         }
@@ -4450,7 +4678,7 @@ impl BoxRegistry {
             && record.switch_addr != self.subnet.daemon_ip()
         {
             attachments.issue(
-                record.name(),
+                &record.name(),
                 record.box_id(),
                 record.switch_addr,
                 record.loopback_addr,
@@ -4614,7 +4842,7 @@ impl BoxRegistry {
         let mut rowless = false;
         let mut task_rows = Vec::new();
         if let Some(record) = removed.as_deref().filter(|record| !record.is_task_row()) {
-            self.bump_withdrawal_generation(record.name());
+            self.bump_withdrawal_generation(&record.name());
             rowless = self.creation_rowless(record);
             task_rows = self.remove_task_rows(&mut rows, record);
         }
@@ -4638,7 +4866,7 @@ impl BoxRegistry {
         // mirrored binds end with it (NET-138's node end).
         if removed
             .as_deref()
-            .is_some_and(|record| record.name() == NODE_NAMESPACE && !record.is_task_row())
+            .is_some_and(|record| &*record.name() == NODE_NAMESPACE && !record.is_task_row())
         {
             self.node_mirror.end_node();
         }
@@ -5217,7 +5445,7 @@ impl BoxRegistry {
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned")
             .values()
-            .find(|record| canonical_box_name(record.name()) == asked)
+            .find(|record| canonical_box_name(&record.name()) == asked)
             .map(|record| record.name().to_string())
     }
 
@@ -5373,7 +5601,7 @@ impl BoxRegistry {
         // The row's own id proves its creator whatever the session is
         // named now (#1116); without it the name must be the row's.
         let id_proves = box_id.is_some_and(|asked| asked == record.box_id);
-        if !id_proves && canonical_box_name(record.name()) != canonical_box_name(name) {
+        if !id_proves && canonical_box_name(&record.name()) != canonical_box_name(name) {
             return Err(WithdrawError::NotTheCreatorsRow {
                 switch_addr,
                 held_name: record.name().to_string(),
@@ -5416,7 +5644,7 @@ impl BoxRegistry {
         // when the row is the creation's.
         let ended = removed.as_deref().is_some_and(|record| {
             let mut creations = self.creations();
-            let key = canonical_box_name(record.name());
+            let key = canonical_box_name(&record.name());
             creations
                 .get(&key)
                 .is_some_and(|creation| creation.id() == record.box_id)
@@ -5448,6 +5676,164 @@ impl BoxRegistry {
             self.persist();
         }
         Ok((removed, held))
+    }
+
+    /// Moves the client box `box_id` to `new_name` (#1116): a session
+    /// renamed in the in-VM daemon, whose creator presents the pair and the
+    /// id its registration handed back. Its row, its task rows and its
+    /// creation are re-keyed to the new name under one write of the row
+    /// lock, the creations are persisted, and the table pings its
+    /// subscribers: the zone then answers the box's address under the new
+    /// name and nothing under the old one, the gate's name rules read the
+    /// new name, and a later withdrawal or resume finds the box under it.
+    /// The row's identity (its id, its addresses, its liveness and its
+    /// runtime ports) is untouched: a rename is not a re-registration.
+    ///
+    /// The id is the proof, with the pair: a row at the switch address
+    /// under another id is refused ([`RenameError::NotTheBoxId`]), as is a
+    /// creation of the id at another pair. A row of another box under the
+    /// new name refuses the rename ([`RenameError::NameHeld`]); a dormant
+    /// creation of another box under it is superseded, as a registration
+    /// under its name supersedes it (BOX-004), and keeps its addresses and
+    /// its id. A box with no row stands only as its creation, which is
+    /// re-keyed alone.
+    ///
+    /// Answers the name the host held the box under before, or `None`
+    /// when the host holds neither a row at the pair nor a creation of the
+    /// id: the box is not this host's, or not any more, and nothing moves.
+    pub fn rename_client_box(
+        &self,
+        new_name: &str,
+        switch_addr: Ipv4Addr,
+        loopback_addr: Ipv4Addr,
+        box_id: BoxId,
+    ) -> Result<Option<String>, RenameError> {
+        #[expect(
+            clippy::unwrap_in_result,
+            reason = "the expect is the lock's poison guard, not this function's error \
+                      handling: the row lock is never held across a panic, so it cannot be \
+                      poisoned"
+        )]
+        let rows = self
+            .rows
+            .write()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let new_key = canonical_box_name(new_name);
+        let row = rows
+            .get(&switch_addr.octets())
+            .filter(|record| !record.is_task_row())
+            .map(Arc::clone);
+        if let Some(record) = &row {
+            if record.box_id != box_id {
+                return Err(RenameError::NotTheBoxId {
+                    switch_addr,
+                    held_box_id: record.box_id,
+                    asked_box_id: box_id,
+                });
+            }
+            if record.loopback_addr() != loopback_addr {
+                return Err(RenameError::NotTheHandedPair {
+                    box_id,
+                    held_switch: record.switch_addr(),
+                    held_loopback: record.loopback_addr(),
+                    asked_switch: switch_addr,
+                    asked_loopback: loopback_addr,
+                });
+            }
+        }
+        if let Some(holder) = rows.values().find(|other| {
+            !other.is_task_row()
+                && other.box_id != box_id
+                && canonical_box_name(&other.name()) == new_key
+        }) {
+            return Err(RenameError::NameHeld {
+                name: new_name.to_string(),
+                holder: holder.name().to_string(),
+            });
+        }
+        let mut creations = self.creations();
+        // The box's own creation, found by its id wherever it is kept: the
+        // name's own, or superseded (BOX-004).
+        let own_key = creations
+            .iter()
+            .find(|(_, creation)| creation.id() == box_id)
+            .map(|(key, _)| key.clone());
+        let own_superseded = creations
+            .superseded
+            .iter()
+            .position(|creation| creation.id() == box_id);
+        let own = own_key
+            .as_ref()
+            .and_then(|key| creations.get(key))
+            .or_else(|| own_superseded.and_then(|at| creations.superseded.get(at)));
+        if let Some(creation) = own
+            && (creation.switch_address != switch_addr
+                || creation.loopback_address != loopback_addr)
+        {
+            return Err(RenameError::NotTheHandedPair {
+                box_id,
+                held_switch: creation.switch_address,
+                held_loopback: creation.loopback_address,
+                asked_switch: switch_addr,
+                asked_loopback: loopback_addr,
+            });
+        }
+        let Some(held) = row
+            .as_deref()
+            .map(|record| record.name().to_string())
+            .or_else(|| own.map(|creation| creation.name.clone()))
+        else {
+            return Ok(None);
+        };
+        if let Some(other) = creations.get(&new_key)
+            && other.id() != box_id
+        {
+            if other.standing {
+                // A standing creation's row holds the name; the check above
+                // found none, so the two disagree. Refuse rather than guess.
+                return Err(RenameError::NameHeld {
+                    name: new_name.to_string(),
+                    holder: other.name.clone(),
+                });
+            }
+            if let Some(superseded) = creations.remove(&new_key) {
+                tracing::info!(
+                    box = %superseded.name,
+                    by = %crate::bep_attach::BoxIdText(&box_id),
+                    "a renamed box took over a stopped box's name; the stopped box keeps its \
+                     creation and its addresses"
+                );
+                creations.superseded.push(superseded);
+            }
+        }
+        let moved = match (own_key, own_superseded) {
+            (Some(key), _) => creations.remove(&key),
+            (None, Some(at)) => Some(creations.superseded.remove(at)),
+            (None, None) => None,
+        };
+        let persist = moved.is_some();
+        if let Some(mut creation) = moved {
+            creation.name = new_name.to_string();
+            creations.insert(new_key, creation);
+        }
+        drop(creations);
+        if let Some(record) = &row {
+            record.rename(new_name);
+            for addr in &record.task_addrs {
+                if let Some(task) = rows.get(&addr.octets())
+                    && task.task_row_of == Some(record.switch_addr)
+                    && task.box_id == record.box_id
+                {
+                    task.rename(new_name);
+                }
+            }
+        }
+        drop(rows);
+        if persist {
+            self.persist();
+        }
+        self.ping();
+        Ok(Some(held))
     }
 
     /// The creation a resume presenting `(name, switch_addr, loopback_addr)`
@@ -6001,7 +6387,7 @@ impl BoxRegistry {
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         rows.values()
-            .filter(|record| !record.is_task_row() && canonical_box_name(record.name()) == asked)
+            .filter(|record| !record.is_task_row() && canonical_box_name(&record.name()) == asked)
             .max_by_key(|record| record.box_id())
             .cloned()
     }
@@ -6260,7 +6646,7 @@ impl BoxRegistry {
         // A task row publishes no name: its box's row holds the box's.
         for record in rows.values().filter(|record| !record.is_task_row()) {
             view.hold(
-                zone_name(record.name()),
+                zone_name(&record.name()),
                 zone_answer::ZoneRow {
                     address: is_host_answerable(record.loopback_addr())
                         .then_some(record.loopback_addr()),
@@ -6421,8 +6807,8 @@ impl BoxRegistry {
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                     for record in registry.withdraw_expired_detached() {
-                        registry.release_withdrawn_unless_owned(record.name(), || {
-                            release_address(record.name());
+                        registry.release_withdrawn_unless_owned(&record.name(), || {
+                            release_address(&record.name());
                         });
                     }
                     registry.expire_unconfirmed_holds();
@@ -6489,10 +6875,15 @@ impl BoxRegistry {
     /// (BOX-154), or a box an attach left `stopped` or `exited` through
     /// Keep. Until that reconcile runs, the union can include a box that is
     /// not live. A box the VM runs again (BOX-025) rejoins the union with
-    /// the rules the reconcile set aside. After a VM host daemon restart
-    /// nothing is set aside, so a resumed `host_ip` box gets no egress
-    /// until a client admits it again.
-    /// <https://github.com/gominimal/minimal/issues/3015> owns that case.
+    /// the rules the reconcile set aside.
+    ///
+    /// Each held box's declared policy and lane persist to
+    /// [`HOST_IP_RULES_FILE`] beside [`HOST_IP_IDS_FILE`]
+    /// ([`Self::persisting_to`]). A VM host daemon restart reloads them as
+    /// set-aside rules, so a resumed `host_ip` box the guest reports
+    /// running rejoins the union at the next reconcile, with no client
+    /// admit. Rules a client retired are not persisted, and a box the guest
+    /// no longer lists is forgotten.
     pub fn admit_host_ip_box(
         &self,
         session_id: boxes::SessionId,
@@ -6512,30 +6903,7 @@ impl BoxRegistry {
         declared: Option<&EgressPolicy>,
         credentialed_upstream: bool,
     ) -> bool {
-        let policy = match boxes::effective_egress(
-            declared,
-            boxes::NetworkMode::HostNet,
-            self.egress_default_phase,
-            self.egress_deny_all_opt_out,
-        ) {
-            boxes::EffectiveEgress::Declared(policy) => Some(policy),
-            boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
-            boxes::EffectiveEgress::AllowAll => None,
-        };
-        let node = self.subnet.daemon_ip().octets();
-        let resolver = self.subnet.dns_server().octets();
-        let rules = HostIpBoxRules {
-            session_id,
-            credentialed_upstream,
-            egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
-            dns_hosts: policy
-                .as_ref()
-                .and_then(|policy| policy.allow_dns_hosts.clone())
-                .unwrap_or_default(),
-            allow_subnets: policy
-                .as_ref()
-                .and_then(|policy| policy.allow_subnets.clone()),
-        };
+        let rules = self.host_ip_box_rules(session_id, declared.cloned(), credentialed_upstream);
         let mut resident = self
             .host_ip_boxes
             .write()
@@ -6588,6 +6956,7 @@ impl BoxRegistry {
         if credentialed_changed {
             self.persist_host_ip_ids();
         }
+        self.persist_host_ip_rules();
         // The first box since the last one ended binds the ports the guest
         // still holds as listening (NET-138).
         if !was_published {
@@ -6613,6 +6982,43 @@ impl BoxRegistry {
              address are decided by the resident boxes' rules"
         );
         true
+    }
+
+    /// A `host_ip` box's rules from its client's declared policy, filled
+    /// under this registry's egress default the way the guest daemon fills
+    /// it, and compiled with the node's own address as its lease
+    /// ([`Self::admit_host_ip_box`], and a reload in [`Self::persisting_to`]).
+    fn host_ip_box_rules(
+        &self,
+        session_id: boxes::SessionId,
+        declared: Option<EgressPolicy>,
+        credentialed_upstream: bool,
+    ) -> HostIpBoxRules {
+        let policy = match boxes::effective_egress(
+            declared.as_ref(),
+            boxes::NetworkMode::HostNet,
+            self.egress_default_phase,
+            self.egress_deny_all_opt_out,
+        ) {
+            boxes::EffectiveEgress::Declared(policy) => Some(policy),
+            boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
+            boxes::EffectiveEgress::AllowAll => None,
+        };
+        let node = self.subnet.daemon_ip().octets();
+        let resolver = self.subnet.dns_server().octets();
+        HostIpBoxRules {
+            session_id,
+            credentialed_upstream,
+            egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
+            dns_hosts: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_dns_hosts.clone())
+                .unwrap_or_default(),
+            allow_subnets: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_subnets.clone()),
+            declared,
+        }
     }
 
     /// Drops the egress [`Self::admit_host_ip_box`] holds for a session:
@@ -6655,6 +7061,9 @@ impl BoxRegistry {
                 .set_published(resident.boxes.keys().copied().collect());
         }
         drop(resident);
+        if removed || dormant_rules.is_some() {
+            self.persist_host_ip_rules();
+        }
         // The box ended, so its registration name no longer answers a mint
         // ask: a later box under the name is a new creation. The id stays
         // for the collision check (BEP-082).
@@ -6881,10 +7290,16 @@ impl BoxRegistry {
                 spawn_revocation(path.clone(), id, BoxEnd::HostIpGuestDestroy);
             }
         }
+        // A box the guest destroyed leaves the persisted rules. A box set
+        // aside or admitted again keeps its entry.
+        let rules_changed = !ended.is_empty();
         if outcome.is_empty() {
             drop(resident);
             if ids_changed {
                 self.persist_host_ip_ids();
+            }
+            if rules_changed {
+                self.persist_host_ip_rules();
             }
             return outcome;
         }
@@ -6898,6 +7313,9 @@ impl BoxRegistry {
         drop(resident);
         if ids_changed {
             self.persist_host_ip_ids();
+        }
+        if rules_changed {
+            self.persist_host_ip_rules();
         }
         for session in &outcome.dropped {
             tracing::info!(
@@ -7954,6 +8372,9 @@ pub struct HostIpBoxRules {
     egress: EgressRules,
     dns_hosts: Vec<String>,
     allow_subnets: Option<Vec<String>>,
+    /// The policy the box's client declared, before the egress default
+    /// filled it: what [`HOST_IP_RULES_FILE`] persists.
+    declared: Option<EgressPolicy>,
 }
 
 impl HostIpBoxRules {
@@ -8135,7 +8556,7 @@ impl HostIpBoxes {
             deny_subnets: None,
         };
         Some(Arc::new(BoxRecord {
-            name: HOST_IP_COHORT_NAME.to_string(),
+            name: RwLock::new(Arc::from(HOST_IP_COHORT_NAME)),
             box_id: crate::bep_attach::mint_box_id(),
             switch_addr: node,
             loopback_addr: node,
@@ -8768,12 +9189,12 @@ mod tests {
             ],
             "every published namespace holds a row, in switch-address order"
         );
-        assert_eq!(web.name(), "web");
+        assert_eq!(&*web.name(), "web");
         assert_eq!(web.loopback_addr(), Ipv4Addr::LOCALHOST);
         assert_eq!(web.admitted_ports(), [8080]);
-        assert_eq!(db.name(), "db");
+        assert_eq!(&*db.name(), "db");
         assert_eq!(db.admitted_ports(), [5432, 5433]);
-        assert_eq!(node.name(), "minimald");
+        assert_eq!(&*node.name(), "minimald");
         assert_eq!(node.switch_addr(), SUBNET.daemon_ip());
         assert_eq!(
             node.admitted_ports(),
@@ -9554,7 +9975,7 @@ mod tests {
         assert!(
             registry
                 .withdraw_client_box(
-                    row.name(),
+                    &row.name(),
                     row.switch_addr(),
                     row.loopback_addr(),
                     Some(row.box_id())
@@ -10654,7 +11075,7 @@ mod tests {
                 claim.generation(),
             )
             .expect("the id finds the creation");
-        assert_eq!(resumed.name(), "web", "under the creation's own name");
+        assert_eq!(&*resumed.name(), "web", "under the creation's own name");
         assert_eq!(resumed.box_id(), web.box_id());
     }
 
@@ -11675,6 +12096,207 @@ mod tests {
         );
     }
 
+    /// #1116: a rename re-keys the host side. The renamed creator's
+    /// request, by the row's own id and pair, moves the row and its
+    /// creation to the new name: the zone answers the box's address under
+    /// the new name and nothing under the old, a lookup by the new name
+    /// finds the same row (its id and pair untouched), the persisted
+    /// registry names the new name, and the box is withdrawn later under
+    /// the new name with no id at all. Another box's id, another pair, and
+    /// a name another box's row holds (in any folded spelling) are refused
+    /// and move nothing.
+    #[test]
+    fn a_rename_re_keys_the_row_and_its_creation_by_box_id() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let registry = persisted_registry(&dir);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let api = registry
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for the box");
+        let answer = |name: &str| {
+            registry
+                .zone_view()
+                .rows()
+                .find(|(held, _)| *held == zone_name(name))
+                .map(|(_, row)| row.address)
+        };
+        let before = answer("web").expect("the box's name answers");
+
+        assert_eq!(
+            registry.rename_client_box(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                api.box_id()
+            ),
+            Err(RenameError::NotTheBoxId {
+                switch_addr: web.switch_addr(),
+                held_box_id: web.box_id(),
+                asked_box_id: api.box_id(),
+            }),
+            "another box's id proves nothing of this row"
+        );
+        assert!(
+            matches!(
+                registry.rename_client_box(
+                    "front",
+                    web.switch_addr(),
+                    api.loopback_addr(),
+                    web.box_id()
+                ),
+                Err(RenameError::NotTheHandedPair { .. })
+            ),
+            "another pair proves nothing of this row"
+        );
+        assert_eq!(
+            registry.rename_client_box("API", web.switch_addr(), web.loopback_addr(), web.box_id()),
+            Err(RenameError::NameHeld {
+                name: "API".to_string(),
+                holder: "api".to_string(),
+            }),
+            "a name another box's row holds is refused"
+        );
+        assert_eq!(answer("web"), Some(before), "the refusals moved nothing");
+        assert_eq!(answer("front"), None);
+
+        assert_eq!(
+            registry.rename_client_box(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                web.box_id()
+            ),
+            Ok(Some("web".to_string())),
+            "the row's own id and pair move it; the answer names the old name"
+        );
+        assert_eq!(
+            answer("front"),
+            Some(before),
+            "the new name answers the box"
+        );
+        assert_eq!(answer("web"), None, "the old name answers nothing");
+        let row = registry
+            .row_by_name("front")
+            .expect("the row is found by its new name");
+        assert!(Arc::ptr_eq(&row, &web), "the same row, re-keyed in place");
+        assert_eq!(&*web.name(), "front");
+        assert!(registry.row_by_name("web").is_none());
+        let persisted: Vec<_> = persisted_box_names(dir.path())
+            .into_iter()
+            .map(|persisted| persisted.name)
+            .collect();
+        assert!(
+            persisted.contains(&"front".to_string()) && !persisted.contains(&"web".to_string()),
+            "the persisted registry names the new name: {persisted:?}"
+        );
+        assert!(
+            registry.release_withdrawn_unless_owned("web", || {}),
+            "nothing owns the old name any more"
+        );
+        assert_eq!(
+            registry.rename_client_box(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                web.box_id()
+            ),
+            Ok(Some("front".to_string())),
+            "a repeated rename is answered and moves nothing"
+        );
+
+        assert_eq!(
+            registry.withdraw_client_box_held(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                None
+            ),
+            Ok((Some(Arc::clone(&web)), "front".to_string())),
+            "the row is the new name's: no id is needed to withdraw it"
+        );
+        assert!(
+            registry.release_withdrawn_unless_owned("front", || {}),
+            "the creation ended with the row"
+        );
+        registry
+            .register_client_box(client_spec("web"))
+            .expect("the old name takes a new box");
+        assert!(
+            registry.row_by_name("api").is_some(),
+            "the other box stands"
+        );
+    }
+
+    /// #1116 for a stopped box: the drainer withdrew the row and the
+    /// creation stays dormant under the name it was registered by. The
+    /// renamed creator's request moves the creation by its id: the
+    /// address-only row the answerer keeps claimed travels under the new
+    /// name, the old name is free, the new one is owned, and a resume by
+    /// the new name finds the box.
+    #[test]
+    fn a_rename_re_keys_a_dormant_creation_by_box_id() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches");
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the row is withdrawn",
+        );
+
+        assert!(
+            registry
+                .rename_client_box(
+                    "front",
+                    web.switch_addr(),
+                    web.loopback_addr(),
+                    crate::bep_attach::mint_box_id()
+                )
+                .is_ok_and(|held| held.is_none()),
+            "an id the host holds nothing for moves nothing"
+        );
+        assert_eq!(
+            registry.rename_client_box(
+                "front",
+                web.switch_addr(),
+                web.loopback_addr(),
+                web.box_id()
+            ),
+            Ok(Some("web".to_string())),
+            "the id finds the dormant creation under its old name"
+        );
+        assert_eq!(
+            registry.dormant_creation_rows(),
+            vec![(zone_name("front"), web.loopback_addr())],
+            "the dormant creation's claimed address travels under the new name"
+        );
+        assert!(
+            registry.release_withdrawn_unless_owned("web", || {}),
+            "nothing owns the old name any more"
+        );
+        assert!(
+            !registry.release_withdrawn_unless_owned("front", || {}),
+            "the dormant creation owns the new name"
+        );
+        assert!(
+            registry
+                .resumable(
+                    "front",
+                    web.switch_addr(),
+                    web.loopback_addr(),
+                    Some(web.box_id())
+                )
+                .is_ok(),
+            "the box resumes under its new name"
+        );
+    }
+
     /// NET-133, NET-138, design §7.1: the drainer's withdrawal of a client
     /// box — a box whose shuttle closed, once its detach grace passed —
     /// leaves its published address with the answerer: the dormant
@@ -12430,7 +13052,7 @@ mod tests {
             .admit_runtime_port(web.switch_addr(), 3000, IpProto::Tcp, now)
             .expect("a report within the grant records");
         assert_eq!(
-            recorded.name(),
+            &*recorded.name(),
             "web",
             "the report is answered with the row it recorded into"
         );
@@ -12619,7 +13241,7 @@ mod tests {
             "the live row is the live box's, untouched by the refusal"
         );
         assert_eq!(
-            registry
+            &*registry
                 .row_by_name("WEB")
                 .expect("the name resolves in every folded spelling")
                 .name(),
@@ -12841,7 +13463,7 @@ mod tests {
         let refused = registry
             .admit_runtime_port(allow.switch_addr(), 3001, IpProto::Tcp, Instant::now())
             .expect("the refusals above did not spend the row's rate");
-        assert_eq!(refused.name(), "allow-box");
+        assert_eq!(&*refused.name(), "allow-box");
     }
 
     /// A re-admit of a port the row already holds — the retry after a lost
@@ -13059,7 +13681,7 @@ mod tests {
         let row = registry
             .withdraw_runtime_port(web.switch_addr(), 3000, IpProto::Tcp)
             .expect("the withdrawal is answered with the row it named");
-        assert_eq!(row.name(), "web");
+        assert_eq!(&*row.name(), "web");
         assert_eq!(
             web.runtime_port_numbers(),
             [3001, 3000],
@@ -13088,7 +13710,7 @@ mod tests {
         let removed = registry
             .withdraw(web.switch_addr())
             .expect("the row's withdrawal answers with the row it removed");
-        assert_eq!(removed.name(), "web");
+        assert_eq!(&*removed.name(), "web");
         assert!(
             registry.row_by_name("web").is_none(),
             "a withdrawn row is gone, not archived"
@@ -14375,6 +14997,142 @@ mod tests {
         assert!(
             file.credentialed.is_empty(),
             "the destroyed box's id leaves the credentialed set"
+        );
+    }
+
+    // NET-085: a host_ip box's declared policy and lane persist beside the
+    // id file. After a VM host daemon restart they come back set aside, and
+    // the first reconcile that finds the guest runs the box puts its rules
+    // back in the union with no client admit. A box the guest does not list
+    // is forgotten, and a box a client retired does not come back.
+    #[test]
+    fn host_ip_box_rules_survive_a_restart_and_rejoin_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = persisted_registry(&dir);
+        let policy = EgressPolicy {
+            allow_protocols: Some(vec![IpProto::Tcp]),
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: Some(vec!["example.com".to_string()]),
+            deny_subnets: None,
+        };
+        let resumed = boxes::SessionId::from_bytes(
+            before
+                .register_host_ip_box_as("resumed", [0x7a; 16])
+                .expect("no record holds the id"),
+        );
+        let destroyed = boxes::SessionId::from_bytes(
+            before
+                .register_host_ip_box_as("destroyed", [0x7b; 16])
+                .expect("no record holds the id"),
+        );
+        let retired = boxes::SessionId::from_bytes(
+            before
+                .register_host_ip_box_as("retired", [0x7c; 16])
+                .expect("no record holds the id"),
+        );
+        assert!(before.admit_host_ip_box_with_lane(resumed, Some(&policy), true));
+        assert!(before.admit_host_ip_box(destroyed, None));
+        assert!(before.admit_host_ip_box(retired, None));
+        assert!(before.retire_host_ip_box(retired, HostIpBoxEnd::Stopped));
+        let held = before.table().host_ip_boxes();
+        let expected = held
+            .iter()
+            .find(|rules| rules.session_id() == resumed)
+            .expect("the resumed box is resident")
+            .clone();
+        drop(held);
+        drop(before);
+
+        let after = persisted_registry(&dir);
+        assert!(
+            after.table().host_ip_boxes().is_empty(),
+            "a reloaded box admits nothing until the VM runs it"
+        );
+        assert!(after.holds_host_ip_boxes(), "the reloaded rules are held");
+        let mark = after.host_ip_admit_mark();
+        let guest = BTreeMap::from([
+            (resumed, boxes::BoxState::Active),
+            (retired, boxes::BoxState::Active),
+        ]);
+        let outcome = after.reconcile_host_ip_boxes(&guest, mark, HostIpReconcileTrigger::Timer);
+        assert_eq!(
+            outcome.admitted,
+            vec![resumed],
+            "the resumed box rejoins the union, and the retired box does not"
+        );
+        assert_eq!(
+            after.host_ip_admit_mark(),
+            mark,
+            "no client admitted the box again"
+        );
+        let union = after.table().host_ip_boxes();
+        assert_eq!(union.len(), 1);
+        assert_eq!(
+            *union[0], *expected,
+            "the reloaded rules equal the admitted ones, lane included"
+        );
+        assert!(union[0].declares_credentialed_upstream());
+
+        let file: HostIpRulesFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(HOST_IP_RULES_FILE)).expect("the rules file reads"),
+        )
+        .expect("the rules file parses");
+        let sessions: Vec<_> = file.boxes.iter().map(|entry| entry.session).collect();
+        assert_eq!(
+            sessions,
+            vec![resumed],
+            "the box the guest no longer lists is forgotten"
+        );
+        assert_eq!(file.boxes[0].declared.as_ref(), Some(&policy));
+
+        let path = dir.path().join(HOST_IP_RULES_FILE);
+        std::fs::write(&path, b"not json").unwrap();
+        let unusable = persisted_registry(&dir);
+        let outcome = unusable.reconcile_host_ip_boxes(
+            &BTreeMap::from([(resumed, boxes::BoxState::Active)]),
+            unusable.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert!(
+            outcome.admitted.is_empty(),
+            "an unusable rules file reloads no rules"
+        );
+        assert!(!path.exists(), "the unusable file is moved");
+    }
+
+    // NET-085: a failed write of the rules fails closed. The earlier file
+    // still lists a box a client retired since, so it is removed, and a
+    // restart does not bring the retired box back.
+    #[test]
+    fn host_ip_box_rules_write_failure_on_retire_reloads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = persisted_registry(&dir);
+        let retired = boxes::SessionId::from_bytes(
+            before
+                .register_host_ip_box_as("retired", [0x7d; 16])
+                .expect("no record holds the id"),
+        );
+        assert!(before.admit_host_ip_box(retired, None));
+        let path = dir.path().join(HOST_IP_RULES_FILE);
+        assert!(path.exists(), "the admit persists the rules");
+        // A directory where the write puts its temporary file makes the
+        // write fail.
+        let blocker = path.with_extension("json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(before.retire_host_ip_box(retired, HostIpBoxEnd::Stopped));
+        assert!(!path.exists(), "a failed write removes the stale file");
+        drop(before);
+        std::fs::remove_dir(&blocker).unwrap();
+
+        let after = persisted_registry(&dir);
+        let outcome = after.reconcile_host_ip_boxes(
+            &BTreeMap::from([(retired, boxes::BoxState::Active)]),
+            after.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert!(
+            outcome.admitted.is_empty(),
+            "a retired box does not come back after a failed write"
         );
     }
 

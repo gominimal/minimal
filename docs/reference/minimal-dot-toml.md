@@ -126,8 +126,8 @@ set `state_key`.
 
 ### `[defaults.session]` - What every contributor's session gets {#session}
 
-Contributes to [sessions](../concepts/sessions.md) activated
-on this project (`min session activate`). It carries the same primitives as a
+Contributes to [sessions](../concepts/sessions.md) started
+on this project (`min session start`). It carries the same primitives as a
 [loadout](./loadouts.md) (packages, vars, patches, lifecycle hooks), scoped to
 the project rather than the developer: where a loadout says "what this
 developer wants everywhere", the session block says "what every session
@@ -168,7 +168,7 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
   the variable set, activation fails rather than proceeding without it.
 
   ```console
-  $ min session activate
+  $ min session start
   error: Composition gating failed: could not resolve pending var
   `GITHUB_TOKEN`: environment variable not found
   ```
@@ -223,8 +223,8 @@ disagree about everything else:
 Two things narrow the task row. An `echo` task never builds an environment,
 so it never reads — or fails over — an `env_vars` declaration. And
 `min run <task>` from inside a session resolves `inherit` against the
-daemon's environment rather than your shell; `min session run` resolves it
-against your shell, as `min task run` does. Both are covered in
+daemon's environment rather than your shell. `min task run` resolves it
+against your shell. Both are covered in
 [Tasks](./tasks.md#env_vars).
 
 

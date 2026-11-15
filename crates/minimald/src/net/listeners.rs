@@ -2120,7 +2120,7 @@ impl WatchState {
         let Some(leader) = self.resolve_leader() else {
             return;
         };
-        let listening = match listening_ports(leader, self.plan.lease) {
+        let listening = match box_listening_ports(leader, self.plan.lease) {
             Ok(listening) => listening,
             Err(e) => {
                 // The leader's entry is gone or unreadable — the box's
@@ -3137,6 +3137,101 @@ fn listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     listening_ports_in(&Path::new("/proc").join(leader.to_string()), lease)
 }
 
+/// The box's listening ports as the watcher's poll reads them: the
+/// leader's table ([`listening_ports`]).
+#[cfg(not(test))]
+fn box_listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
+    listening_ports(leader, lease)
+}
+
+/// The box's listening ports as the watcher's poll reads them under test:
+/// the leader's table ([`listening_ports`]), kept to the listeners this test
+/// process holds itself. A unit test's box has no network namespace of its
+/// own — its leader is a plain host child, so the leader's table is the
+/// host's — and a listener that another process on the machine opens inside
+/// the test's port range (another lane's daemon, or another test under a
+/// process-per-test runner such as nextest, which `just test` uses) would
+/// otherwise be the box's listener too, published and moved beside the
+/// test's own. The test's listeners are the sockets it binds in its own
+/// process, so the box's surface is exactly those, and an assertion over
+/// all of the box's rows is an assertion over the test's.
+///
+/// The read is by process, not by test: under plain `cargo test` the
+/// binary's tests are threads of one process, their sockets are in this
+/// `/proc/self/fd` too, and a sibling test's listener in the range is kept.
+/// The filter only ever drops ports. A future in-crate test whose box
+/// listener is held by another process — a child the test spawns, or a real
+/// box in its own network namespace — will see no listeners through this
+/// read; such a test must read [`listening_ports`] directly or hold the
+/// socket in the test process.
+#[cfg(test)]
+fn box_listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
+    let own = listening_ports_held_by(Path::new("/proc/self"), lease)?;
+    Ok(listening_ports(leader, lease)?
+        .into_iter()
+        .filter(|port| own.contains(port))
+        .collect())
+}
+
+/// The listening sockets of the network namespace whose `net/tcp` and
+/// `net/tcp6` tables sit under `dir` (a `/proc` root, or one `/proc/<pid>`
+/// entry): every row a forward dialing `lease` can deliver to
+/// ([`listen_port`]), keyed by the socket's inode, the table's tenth column.
+/// A missing `tcp6` table reads as no v6 listeners, as in
+/// [`listening_ports_in`].
+fn listening_inodes(dir: &Path, lease: Ipv4Addr) -> io::Result<HashMap<u64, u16>> {
+    let mut by_inode = HashMap::new();
+    for (table, v6) in [("net/tcp", false), ("net/tcp6", true)] {
+        let text = match std::fs::read_to_string(dir.join(table)) {
+            Ok(text) => text,
+            Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for line in text.lines().skip(1) {
+            let inode = line
+                .split_whitespace()
+                .nth(9)
+                .and_then(|word| word.parse().ok());
+            if let (Some(port), Some(inode)) = (listen_port(line, v6, lease), inode) {
+                by_inode.insert(inode, port);
+            }
+        }
+    }
+    Ok(by_inode)
+}
+
+/// The socket inodes a process holds a descriptor for: the `socket:[<inode>]`
+/// links under its `fd` directory. Fails only when the directory itself
+/// cannot be read; a link that cannot be read, or is not a socket, is passed
+/// over.
+fn socket_inodes(fd_dir: &Path) -> io::Result<Vec<u64>> {
+    Ok(std::fs::read_dir(fd_dir)?
+        .flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .filter_map(|target| {
+            target
+                .to_str()?
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        })
+        .collect())
+}
+
+/// The listening ports of `entry`'s network namespace whose socket `entry`'s
+/// own process holds a descriptor for: its [`listening_inodes`] matched
+/// against its [`socket_inodes`].
+#[cfg(test)]
+fn listening_ports_held_by(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
+    let held = socket_inodes(&entry.join("fd"))?;
+    let listening = listening_inodes(entry, lease)?;
+    Ok(held
+        .iter()
+        .filter_map(|inode| listening.get(inode).copied())
+        .collect())
+}
+
 /// [`listening_ports`] for one `/proc` entry.
 fn listening_ports_in(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     let mut ports = read_listening(&entry.join("net/tcp"), false, lease)?;
@@ -3260,23 +3355,7 @@ pub(crate) fn host_address_listening_ports(
     own_pid: u32,
     lease: Ipv4Addr,
 ) -> io::Result<BTreeSet<u16>> {
-    let mut by_inode: HashMap<u64, u16> = HashMap::new();
-    for (table, v6) in [("net/tcp", false), ("net/tcp6", true)] {
-        let text = match std::fs::read_to_string(proc_root.join(table)) {
-            Ok(text) => text,
-            Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for line in text.lines().skip(1) {
-            let inode = line
-                .split_whitespace()
-                .nth(9)
-                .and_then(|word| word.parse().ok());
-            if let (Some(port), Some(inode)) = (listen_port(line, v6, lease), inode) {
-                by_inode.insert(inode, port);
-            }
-        }
-    }
+    let by_inode = listening_inodes(proc_root, lease)?;
     // Per listening socket: whether a box process holds it, and whether
     // anything that is not a box process holds it too.
     let mut held: HashMap<u64, (bool, bool)> = HashMap::new();
@@ -3288,20 +3367,11 @@ pub(crate) fn host_address_listening_ports(
         else {
             continue;
         };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+        let Ok(inodes) = socket_inodes(&entry.path().join("fd")) else {
             continue;
         };
-        let inodes: Vec<u64> = fds
-            .flatten()
-            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
-            .filter_map(|target| {
-                target
-                    .to_str()?
-                    .strip_prefix("socket:[")?
-                    .strip_suffix(']')?
-                    .parse()
-                    .ok()
-            })
+        let inodes: Vec<u64> = inodes
+            .into_iter()
             .filter(|inode| by_inode.contains_key(inode))
             .collect();
         if inodes.is_empty() {
@@ -6094,6 +6164,54 @@ mod tests {
         assert_eq!(
             listening_ports_in(entry.path(), LEASE).expect("no tcp6 table reads as empty"),
             HashSet::from([8080])
+        );
+    }
+
+    /// The test-only read the watcher polls under test keeps a namespace's
+    /// listeners to the ones the entry's own process holds: a listener
+    /// another process on the machine opened is in the same table and is
+    /// not the test's box's. Proved on a fake entry whose fd links name one
+    /// of two listening sockets, and on this process's own entry, where a
+    /// listener the test binds is held and leaves when it closes.
+    #[test]
+    fn under_test_the_box_reads_only_the_listeners_its_test_holds() {
+        let entry = tempfile::tempdir().expect("a scratch /proc entry");
+        std::fs::create_dir_all(entry.path().join("net")).expect("its net directory");
+        std::fs::create_dir_all(entry.path().join("fd")).expect("its fd directory");
+        std::fs::write(
+            entry.path().join("net/tcp"),
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   \
+             uid  timeout inode\n\
+             0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  \
+             1000        0 123 1 0000000000000000 100 0 0 10 0\n\
+             1: 00000000:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000  \
+             1000        0 456 1 0000000000000000 100 0 0 10 0\n",
+        )
+        .expect("its tcp table");
+        std::os::unix::fs::symlink("socket:[123]", entry.path().join("fd/3"))
+            .expect("a fake socket fd");
+        std::os::unix::fs::symlink("/dev/null", entry.path().join("fd/4"))
+            .expect("a fake non-socket fd");
+        assert_eq!(
+            listening_ports_held_by(entry.path(), LEASE).expect("the fake entry reads"),
+            HashSet::from([8080]),
+            "only the listener the entry's process holds is read; 8081 is another's"
+        );
+
+        let own = listening_socket();
+        let own_port = port_of(&own);
+        assert!(
+            listening_ports_held_by(Path::new("/proc/self"), LEASE)
+                .expect("this process's entry is readable")
+                .contains(&own_port),
+            "a listener this process binds is one it holds"
+        );
+        drop(own);
+        assert!(
+            !listening_ports_held_by(Path::new("/proc/self"), LEASE)
+                .expect("this process's entry is readable")
+                .contains(&own_port),
+            "a closed listener is held no longer"
         );
     }
 

@@ -987,8 +987,8 @@ pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<
     let hosts = crate::cmd::list::local_hosts(global)?;
     let resolved = resolve_box_on_hosts(hosts, &args.target, "box rename").await?;
     let mut client = gated_box_host_client(&resolved.host).await?;
-    // The record says whether the box holds its name in the VM host's zone,
-    // which the hold then moves to the new name.
+    // The record says how the box holds its name on the VM host (a zone
+    // hold or a host row), which then moves to the new name (#1116).
     let record = get_session_record(&mut client, &resolved.box_id.to_string())
         .await
         .ok()
@@ -999,30 +999,27 @@ pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<
         &mut out,
         resolved.box_id,
         &args.target,
+        record.as_ref().and_then(|r| r.name.as_deref()),
         &args.new_name,
     )
     .await?;
-    if let Some(record) = record.filter(holds_name) {
+    if let Some(record) = record {
         let control_sock = box_host_control_sock(&resolved.host);
-        move_held_box_name(
-            control_sock,
-            record.id,
-            record.name.as_deref(),
-            &args.new_name,
-        )
-        .await;
+        rename_box_with_vm_host(control_sock, &record, &args.new_name).await;
     }
     Ok(())
 }
 
 /// Renames the box `id`, which the address `target` resolved to, to
-/// `new_name`, as BOX-010 defines. Writes one line to `out`. The daemon's
-/// refusal returns as a [`BoxRenameRefusal`].
+/// `new_name`, as BOX-010 defines. Writes one line to `out`, which names
+/// the box by `old_name`, the name its record held, and its id. The
+/// daemon's refusal returns as a [`BoxRenameRefusal`].
 pub(crate) async fn rename_listed_box(
     client: &mut client::Client,
     out: &mut impl std::io::Write,
     id: boxes::SessionId,
     target: &str,
+    old_name: Option<&str>,
     new_name: &str,
 ) -> Result<(), anyhow::Error> {
     use minimald_rpc::{Errorable, RenameSession, RenameSessionRequest};
@@ -1038,7 +1035,12 @@ pub(crate) async fn rename_listed_box(
     match answer {
         Errorable::Ok(_) => {
             tracing::info!(verb = "box rename", box_id = %id, outcome = "renamed");
-            writeln!(out, "Renamed {target} to {new_name}.")?;
+            match old_name {
+                Some(old) if !old.is_empty() => {
+                    writeln!(out, "Renamed box {old} ({id}) to {new_name}.")?;
+                }
+                _ => writeln!(out, "Renamed box {id} to {new_name}.")?,
+            }
             Ok(())
         }
         Errorable::Err { error } => {
@@ -1047,6 +1049,123 @@ pub(crate) async fn rename_listed_box(
                 Some(refusal) => Err(refusal.into()),
                 None => Err(box_rpc_error(target, error)),
             }
+        }
+    }
+}
+
+/// `min box restart <box>`: stops a box whose spec sets
+/// `lifetime = "until_stopped"`, if it runs, and starts it again from its
+/// stored spec under the same id and name (BCLI-074, BOX-176). A refusal
+/// returns as a [`minimald_rpc::RestartRefusal`], and the process exits
+/// with the code it carries.
+pub async fn cmd_box_restart(
+    global: &GlobalArgs,
+    args: BoxRestartArgs,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    restart_box_on_hosts(hosts, &mut out, &args.target).await?;
+    Ok(())
+}
+
+/// Resolves the address `target` over `hosts` and restarts that box on
+/// the host that keeps it, as BOX-176 defines. Returns the box
+/// and its host.
+pub(crate) async fn restart_box_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    out: &mut impl std::io::Write,
+    target: &str,
+) -> Result<ResolvedBox, anyhow::Error> {
+    restart_box_on_hosts_with(hosts, out, target, async |client, request| {
+        client
+            .oneshot_rpc::<minimald_rpc::RestartBox>(request)
+            .await
+    })
+    .await
+}
+
+/// [`restart_box_on_hosts`], with `send` to put the `RestartBox` request
+/// to the host that keeps the box.
+pub(crate) async fn restart_box_on_hosts_with(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    out: &mut impl std::io::Write,
+    target: &str,
+    send: impl AsyncFnOnce(
+        &mut client::Client,
+        minimald_rpc::RestartBoxRequest,
+    ) -> Result<RestartBoxAnswer, anyhow::Error>,
+) -> Result<ResolvedBox, anyhow::Error> {
+    let resolved = resolve_box_on_hosts(hosts, target, "box restart").await?;
+    let mut client = gated_box_host_client(&resolved.host).await?;
+    crate::output::record_box_id(&resolved.box_id.to_string());
+    let request = minimald_rpc::RestartBoxRequest {
+        id: resolved.box_id,
+    };
+    let answer = send(&mut client, request)
+        .await
+        .context("RestartBox RPC failed")?;
+    finish_restart(out, resolved.box_id, target, answer)?;
+    Ok(resolved)
+}
+
+/// The daemon's answer to a `RestartBox` request.
+pub(crate) type RestartBoxAnswer = minimald_rpc::Errorable<minimald_rpc::RestartBoxResponse>;
+
+/// The refusal `min box restart` prints when the daemon answers
+/// `Lifetime` (BCLI-074): the box's stored spec does not set
+/// `lifetime = "until_stopped"`. That includes a box with no stored spec,
+/// so the text claims no more than that. It names `min box run`, the hint
+/// BCLI-009 chooses by `lifetime`.
+pub(crate) fn restart_lifetime_refusal(target: &str) -> minimald_rpc::RestartRefusal {
+    minimald_rpc::RestartRefusal {
+        kind: minimald_rpc::RestartRefusalKind::Lifetime,
+        exit_code: 2,
+        message: format!(
+            "The spec of {target} does not set lifetime = \"until_stopped\", \
+             so min box restart cannot restart it. \
+             Run it again with min box run <entry>."
+        ),
+    }
+}
+
+/// Ends a restart of the box `id`, which the address `target` resolved
+/// to, on the daemon's `answer` (BOX-176). Writes one line to `out` when
+/// the box runs again. A refusal returns as a
+/// [`minimald_rpc::RestartRefusal`]: the lifetime refusal with the
+/// client's hint, any other refusal as the daemon wrote it.
+fn finish_restart(
+    out: &mut impl std::io::Write,
+    id: boxes::SessionId,
+    target: &str,
+    answer: RestartBoxAnswer,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::{Errorable, RestartBoxResponse};
+
+    match answer {
+        Errorable::Ok(RestartBoxResponse::Restarted { was_running }) => {
+            tracing::info!(verb = "box restart", box_id = %id, was_running, outcome = "restarted");
+            writeln!(out, "Restarted {target}.")?;
+            Ok(())
+        }
+        Errorable::Ok(RestartBoxResponse::Refused(refusal)) => {
+            tracing::info!(
+                verb = "box restart",
+                box_id = %id,
+                outcome = "refused",
+                refusal = refusal.kind.name(),
+                "{refusal}"
+            );
+            match refusal.kind {
+                minimald_rpc::RestartRefusalKind::Lifetime => {
+                    Err(restart_lifetime_refusal(target).into())
+                }
+                _ => Err(refusal.into()),
+            }
+        }
+        Errorable::Err { error } => {
+            tracing::info!(verb = "box restart", box_id = %id, outcome = "failed", "{error}");
+            Err(box_rpc_error(target, error))
         }
     }
 }
@@ -1120,15 +1239,49 @@ pub(crate) fn prune_question(
         None => "box".to_owned(),
     };
     match older_than {
-        Some(age) => {
-            let secs = age.as_secs();
-            let (n, unit) = [(86_400, 'd'), (3_600, 'h'), (60, 'm')]
-                .into_iter()
-                .find(|(size, _)| secs > 0 && secs % size == 0)
-                .map_or((secs, 's'), |(size, unit)| (secs / size, unit));
-            format!("Remove every {what} that stopped or exited at least {n}{unit} ago?")
-        }
+        Some(age) => format!(
+            "Remove every {what} that stopped or exited at least {} ago?",
+            age_label(age)
+        ),
         None => format!("Remove every stopped or exited {what}?"),
+    }
+}
+
+/// `age` in the largest whole unit `--older-than` takes: `7d`, `12h`,
+/// `30m`, else seconds.
+fn age_label(age: std::time::Duration) -> String {
+    let secs = age.as_secs();
+    let (n, unit) = [(86_400, 'd'), (3_600, 'h'), (60, 'm')]
+        .into_iter()
+        .find(|(size, _)| secs > 0 && secs.is_multiple_of(*size))
+        .map_or((secs, 's'), |(size, unit)| (secs / size, unit));
+    format!("{n}{unit}")
+}
+
+/// The selectors a `min box prune` passed, as its lines name them. The
+/// `--parent` value prints as the person wrote it. The `--older-than` age
+/// prints in the largest whole unit it takes, as [`age_label`] gives it and
+/// as the prune question names it: `--older-than 168h` prints as `7d`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PruneSelectors<'a> {
+    /// The `--older-than` age, which the flag's parser already turned into
+    /// a duration.
+    pub older_than: Option<std::time::Duration>,
+    /// The `--parent` box as the person wrote it.
+    pub parent: Option<&'a str>,
+}
+
+impl PruneSelectors<'_> {
+    /// The flags and their values, as `--older-than 7d and --parent web`,
+    /// or `None` when the prune passed neither.
+    fn flags(&self) -> Option<String> {
+        let flags: Vec<String> = self
+            .older_than
+            .map(|age| format!("--older-than {}", age_label(age)))
+            .into_iter()
+            .chain(self.parent.map(|parent| format!("--parent {parent}")))
+            .collect();
+        (!flags.is_empty()).then(|| flags.join(" and "))
     }
 }
 
@@ -1191,7 +1344,11 @@ pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<()
         failed_hosts = tally.failed_hosts.len(),
         outcome = "pruned"
     );
-    finish_prune(&tally, &mut out, &mut err)
+    let selectors = PruneSelectors {
+        older_than: args.older_than,
+        parent: args.parent.as_deref(),
+    };
+    finish_prune(&tally, selectors, &mut out, &mut err)
 }
 
 /// Whether `min box prune` removes the boxes that match or, under
@@ -1280,9 +1437,11 @@ pub(crate) async fn prune_hosts(
 
 /// Ends `min box prune` from its `tally`: one line on `err` for each host it
 /// could not prune, then an error that counts the boxes and the hosts that
-/// failed. With no failure and nothing removed, it says so on `out`.
+/// failed. With no failure and nothing removed, it says so on `out`, and
+/// names the `selectors` the prune passed.
 pub(crate) fn finish_prune(
     tally: &PruneTally,
+    selectors: PruneSelectors<'_>,
     out: &mut impl std::io::Write,
     err: &mut impl std::io::Write,
 ) -> Result<(), anyhow::Error> {
@@ -1314,10 +1473,16 @@ pub(crate) fn finish_prune(
         bail!("{}", summary.join(" "));
     }
     if tally.reaped == 0 {
-        writeln!(
-            out,
-            "No stopped or exited box matched, so nothing was removed."
-        )?;
+        match selectors.flags() {
+            Some(flags) => writeln!(
+                out,
+                "No stopped or exited box matched {flags}, so nothing was removed."
+            )?,
+            None => writeln!(
+                out,
+                "No stopped or exited box matched, so nothing was removed."
+            )?,
+        }
     }
     Ok(())
 }
@@ -1720,10 +1885,13 @@ mod tests {
 
         let web = listed_id(&mut client, "web").await;
         let mut out = Vec::new();
-        rename_listed_box(&mut client, &mut out, web, "web", "front")
+        rename_listed_box(&mut client, &mut out, web, "web", Some("web"), "front")
             .await
             .expect("the rename succeeds");
-        assert_eq!(String::from_utf8(out).unwrap(), "Renamed web to front.\n");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Renamed box web ({web}) to front.\n")
+        );
         assert_eq!(listed_state(&mut client, "web").await, None);
         assert_eq!(listed_id(&mut client, "front").await, web);
         assert!(
@@ -1735,7 +1903,7 @@ mod tests {
         // The running box `front` holds the name, so `api` cannot take it.
         let api = listed_id(&mut client, "api").await;
         let mut out = Vec::new();
-        let err = rename_listed_box(&mut client, &mut out, api, "api", "front")
+        let err = rename_listed_box(&mut client, &mut out, api, "api", Some("api"), "front")
             .await
             .expect_err("a held name is refused");
         let refusal = err
@@ -1749,9 +1917,16 @@ mod tests {
         assert_eq!(listed_id(&mut client, "api").await, api);
 
         // `self` is reserved.
-        let err = rename_listed_box(&mut client, &mut Vec::new(), api, "api", "self")
-            .await
-            .expect_err("`self` is refused");
+        let err = rename_listed_box(
+            &mut client,
+            &mut Vec::new(),
+            api,
+            "api",
+            Some("api"),
+            "self",
+        )
+        .await
+        .expect_err("`self` is refused");
         assert!(err.downcast_ref::<BoxRenameRefusal>().is_some(), "{err:#}");
 
         // Any other daemon error is not the refusal.
@@ -1934,7 +2109,8 @@ mod tests {
         );
 
         let mut err = Vec::new();
-        let summary = finish_prune(&tally, &mut out, &mut err).expect_err("a host failed");
+        let summary = finish_prune(&tally, PruneSelectors::default(), &mut out, &mut err)
+            .expect_err("a host failed");
         let err = String::from_utf8(err).unwrap();
         assert!(err.starts_with("Could not prune host broken0: "), "{err}");
         assert_eq!(err.lines().count(), 1, "{err}");
@@ -1946,8 +2122,13 @@ mod tests {
             pruned_hosts: 1,
             ..PruneTally::default()
         };
-        let summary =
-            finish_prune(&one_failed, &mut Vec::new(), &mut Vec::new()).expect_err("a box failed");
+        let summary = finish_prune(
+            &one_failed,
+            PruneSelectors::default(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .expect_err("a box failed");
         assert_eq!(summary.to_string(), "Prune could not remove 1 of 1 box.");
     }
 

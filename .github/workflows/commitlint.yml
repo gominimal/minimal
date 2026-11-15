@@ -23,3 +23,7 @@ jobs:
           persist-credentials: false
       - name: Lint PR commits
         uses: wagoid/commitlint-github-action@b948419dd99f3fd78a6548d48f94e3df7f6bf3ed # v6
+        with:
+          # The action looks for .mjs and silently falls back to
+          # config-conventional, so this repo's config never loaded.
+          configFile: commitlint.config.cjs

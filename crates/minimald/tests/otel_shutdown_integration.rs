@@ -8,6 +8,11 @@
 //! `MINIMAL_*`, `DO_NOT_TRACK` and `RUST_LOG` variable removed, asks it to
 //! shut down over its socket, and reads what a stub collector received.
 #![cfg(target_os = "linux")]
+// The answerer's channel-socket and install-marker path overrides (the
+// `MINIMAL_ANSWERER_*` variables set below) are honoured by debug builds
+// only, so a release-profile `minimald` would ignore them and register with
+// the machine-global answerer. These tests run only where the overrides hold.
+#![cfg(debug_assertions)]
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
@@ -97,9 +102,19 @@ impl russh::client::Handler for Accept {
 
 /// A `minimald run` on a fresh state dir, exporting to `endpoint` with the
 /// spool off (so what reaches the collector is the export's alone).
+///
+/// The daemon is kept off the host's own name services: a native `run`
+/// starts the hostname proxy at the documented 7654 when that port is free,
+/// and the zone answerer's acquisition publishes into the machine-global
+/// channel or hosts the interim at 7656. So the proxy is pinned to an
+/// OS-picked port, the answerer's hook port is one this test holds (the
+/// acquisition finds it held and binds nothing), and its channel and install
+/// marker are paths in the test's own dir (honoured by test and debug builds
+/// only, which is what this test runs).
 struct Daemon {
     child: Child,
     sock: PathBuf,
+    _hook_port: std::net::UdpSocket,
     _dir: tempfile::TempDir,
 }
 
@@ -109,12 +124,15 @@ impl Daemon {
             .prefix("mdot")
             .tempdir_in("/tmp")
             .unwrap();
+        let hook_port = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let hook = hook_port.local_addr().unwrap().port().to_string();
         let mut c = Command::new(env!("CARGO_BIN_EXE_minimald"));
         c.arg("--minimal-state-dir")
             .arg(dir.path().join("s"))
             .arg("--minimal-cache-dir")
             .arg(dir.path().join("c"))
-            .arg("run");
+            .arg("run")
+            .args(["--hostname-proxy-port", "0", "--zone-answerer-port", &hook]);
         for (k, _) in std::env::vars_os() {
             let name = k.to_string_lossy();
             if name.starts_with("OTEL_")
@@ -128,6 +146,14 @@ impl Daemon {
         c.env("MINIMAL_TELEMETRY", "1")
             .env("MINIMAL_OTEL_SPOOL", "0")
             .env("MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
+            .env(
+                "MINIMAL_ANSWERER_CHANNEL_SOCK",
+                dir.path().join("answerer.sock"),
+            )
+            .env(
+                "MINIMAL_ANSWERER_INSTALL_MARKER",
+                dir.path().join("no-minzoned.socket"),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -136,6 +162,7 @@ impl Daemon {
         let mut d = Self {
             child,
             sock,
+            _hook_port: hook_port,
             _dir: dir,
         };
         let deadline = Instant::now() + Duration::from_secs(20);

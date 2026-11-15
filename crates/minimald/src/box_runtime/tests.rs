@@ -2131,6 +2131,15 @@ fn daemon_enters_its_own_leaf() {
         "+memory\n",
         "the leaf must carry the limit a reader would look for in it"
     );
+    // The tree root was there before the entry (the installer's), so the
+    // entry asks nothing of it: natively this process is still a member of
+    // the root until it is placed, and a controller enabled on a cgroup
+    // that holds a process makes its children `domain invalid`. The
+    // installer enables it there, as root, before anything is placed.
+    assert!(
+        !root.join("cgroup.subtree_control").exists(),
+        "the entry leaves a root it found made to the installer"
+    );
 
     // The two identities: a box's leaf lives in its verdict's subtree inside
     // the cohort, never beside it and never in the daemon's leaf, so no box
@@ -2219,6 +2228,26 @@ fn daemon_enters_its_own_leaf() {
         sandbox::classifier::daemon_leaf(&root).is_dir(),
         "the pid-1 entry builds its own leaf where it has the privilege to"
     );
+    // The root this entry made holds nothing, so the memory controller is
+    // asked for on it and on the cgroup above it (the guest's mount root,
+    // which the kernel exempts from the internal-process rule): without
+    // both, the cohort's own `+memory` below is refused and a box leaf in
+    // the guest carries no `memory.max`. Over the stand-in the ask is a
+    // plain file.
+    for (dir, level) in [
+        (bare.path(), "the cgroup above the root the entry made"),
+        (root.as_path(), "the root the entry made"),
+        (cohort.as_path(), "the cohort"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.subtree_control"))
+                .ok()
+                .as_deref(),
+            Some("+memory\n"),
+            "the pid-1 entry asks for the memory controller on {level}: {}",
+            dir.display()
+        );
+    }
 }
 
 /// Which undecided host-address boxes a launch refuses, and with what words
@@ -2366,6 +2395,22 @@ fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
         "the native ProbeUnreadable refusal names the unreadable effect it \
          refused on: {unreadable}"
     );
+    // A probe cause re-spelled DaemonNotPlaced still refuses a box that was
+    // placed after all: the re-spelling never turns a refusal into a run.
+    let unplaced_daemon = refused_unenforced_host_address_box(
+        false,
+        NetworkMode::HostNet,
+        Verdict::Deny,
+        true,
+        Some(&Decision::undecidable(Cause::DaemonNotPlaced)),
+    )
+    .expect("a placed deny-all box over an unplaced daemon's cause is refused");
+    assert!(
+        unplaced_daemon.contains("not in its classifier leaf")
+            && unplaced_daemon.contains(&sandbox::classifier::install_hint()),
+        "the DaemonNotPlaced refusal names the daemon's placement and its \
+         command: {unplaced_daemon}"
+    );
     // The rest of the native matrix keeps NET-079's advisory posture: the
     // causes this host can still fix from itself, the unplaced box (nothing
     // decided-looking to refuse), and the decided host — all run, enforced
@@ -2388,6 +2433,7 @@ fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
         (Cause::ProbeUnreadable, false, false, "the unplaced box"),
         (Cause::StepNotInstalled, false, false, "the unplaced box"),
         (Cause::CannotConfine, false, false, "the unplaced box"),
+        (Cause::DaemonNotPlaced, false, false, "the unplaced box"),
         (Cause::GuestTableNotLoaded, true, true, "the decided host"),
     ] {
         let decision = if decided {

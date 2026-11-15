@@ -20,6 +20,12 @@ pub struct BoxManagerHandle {
     pub(super) sender: crate::traced::Sender<ManagerMessage>,
     /// The actor's [`BoxManager::in_shutdown`](super::BoxManager::in_shutdown).
     pub(super) in_shutdown: CancellationToken,
+    /// The ids of the manager's `sessions.manager` root: the trace a message
+    /// the daemon sends by itself joins, when no request's span is current
+    /// ([`Self::enqueue_resume_active_sessions`]), instead of starting a
+    /// trace of its own.
+    #[cfg(target_os = "linux")]
+    pub(super) lifetime: crate::traced::Caller,
     /// A clone of the actor's shared PTask hostname registry, handed to the
     /// host-side proxies so they resolve `Host:` headers without a round-trip
     /// through the actor mainloop.
@@ -49,6 +55,10 @@ pub struct WeakBoxManagerHandle {
     pub(super) sender: crate::traced::WeakSender<ManagerMessage>,
     /// Mirrors [`BoxManagerHandle::in_shutdown`].
     pub(super) in_shutdown: CancellationToken,
+    /// Mirrors [`BoxManagerHandle::lifetime`], so an
+    /// [`upgrade`](Self::upgrade) keeps the manager root's trace.
+    #[cfg(target_os = "linux")]
+    pub(super) lifetime: crate::traced::Caller,
     /// Mirrors [`BoxManagerHandle::hostnames`]; the registry `Arc` is held so an
     /// [`upgrade`](Self::upgrade) can reconstruct a full handle. This does not
     /// keep the actor alive (only live senders do).
@@ -71,6 +81,8 @@ impl WeakBoxManagerHandle {
         Some(BoxManagerHandle {
             sender: self.sender.upgrade()?,
             in_shutdown: self.in_shutdown.clone(),
+            #[cfg(target_os = "linux")]
+            lifetime: self.lifetime,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(target_os = "linux")]
@@ -149,6 +161,8 @@ impl BoxManagerHandle {
         WeakBoxManagerHandle {
             sender: self.sender.downgrade(),
             in_shutdown: self.in_shutdown.clone(),
+            #[cfg(target_os = "linux")]
+            lifetime: self.lifetime,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(target_os = "linux")]
@@ -293,12 +307,18 @@ impl BoxManagerHandle {
         &self,
     ) -> impl Future<Output = Result<usize, BoxManagerError>> + Send + 'static {
         let (send, recv) = Responder::channel();
+        // At daemon start no request's span is current: the resume is the
+        // manager's own work and joins its root's trace.
+        let caller = crate::traced::caller_context().or(self.lifetime);
         #[expect(
             clippy::let_underscore_must_use,
             reason = "a closed manager is the one way the send can fail, and the recv \
                       reports it — the send's own receipt has nothing to add"
         )]
-        let _ = self.sender.send(ManagerMessage::ResumeActive(send)).await;
+        let _ = self
+            .sender
+            .send_from(ManagerMessage::ResumeActive(send), caller)
+            .await;
         async move { recv.await.expect("corresponding sessions manager is dead") }
     }
 

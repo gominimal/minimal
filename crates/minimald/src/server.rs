@@ -1555,9 +1555,10 @@ mod reap_seam {
         (on_parked, release)
     }
 
-    /// Parks for each of `ids` a test holds, until that test releases it.
-    pub(super) async fn park(ids: &[SessionId]) {
-        for id in ids {
+    /// Parks for each of `created` a test holds, until that test releases
+    /// it.
+    pub(super) async fn park(created: &[(SessionId, crate::traced::Caller)]) {
+        for (id, _) in created {
             let held = HELD
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1573,8 +1574,9 @@ mod reap_seam {
 
 /// Reap sessions a now-closed connection created but never finalized.
 ///
-/// `ids` are the sessions [`CreateSession`](crate::rpc) allocated over
-/// the connection. Only those still `Pending` (never got a
+/// `created` are the sessions [`CreateSession`](crate::rpc) allocated over
+/// the connection, each with the trace context of the request that created
+/// it. Only those still `Pending` (never got a
 /// `SubmitVerdict`) or `Materializing` (never got a `FinalizeSession`)
 /// are deleted — a client that dropped mid-activation (Ctrl-C at the
 /// gating prompt, a crash, a network blip) would otherwise strand a
@@ -1582,9 +1584,17 @@ mod reap_seam {
 /// restart. A finalized (`Active`) session is long-lived and must
 /// survive the connection that created it, so it is left untouched.
 /// Best-effort and never fatal: minimald is pid-1 in the guest.
-#[tracing::instrument(level = "info", name = "sessions.reap_unfinalized", skip_all, fields(count = ids.len()))]
-async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::SessionId>) {
-    if ids.is_empty() {
+///
+/// Each reap is that request's cleanup, so it runs in a span of the
+/// request's trace (TEL-022): a child of the connection's `conn` span in the
+/// file log, as the request's `rpc` span is, and of the request's span in
+/// the export. Under `conn` alone it was a trace of its own, outside the
+/// client's (a stray trace in every lab run that created a session).
+async fn reap_unfinalized_sessions(
+    state: &ServerStateHandle,
+    created: Vec<(::boxes::SessionId, crate::traced::Caller)>,
+) {
+    if created.is_empty() {
         return;
     }
     let mngr = state.sessions_manager().await;
@@ -1595,52 +1605,72 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
     // VM can publish the row again, so here a finished session is reaped as
     // an unfinished one is. A native daemon has no such row, and keeps it.
     let keep_finished = !state.in_microvm().await;
-    for id in ids {
-        // Re-read the status at teardown: a clean client abort already
-        // deleted the record (`get_record` → `None`), and a finalized
-        // session is `Active` — neither should be reaped here.
-        let status = match mngr.get_record(box_manager::BoxKeyPredicate::Id(id)).await {
-            Ok(Some(record)) => record.status,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %id,
-                    error = %e,
-                    "could not read session status while reaping after connection close"
-                );
-                continue;
-            }
-        };
-        if !matches!(
-            status,
-            ::boxes::BoxState::Pending | ::boxes::BoxState::Materializing
-        ) {
-            continue;
-        }
-        // Only if still unfinished when the session gets to it: a finalize
-        // already in flight ends first, and a session it finished is kept
-        // (inbox#690's reap half) — on a native daemon; see above.
-        let reaped = if keep_finished {
-            mngr.delete_session_if_unfinalized(id).await
-        } else {
-            mngr.delete_session(id).await.map(Some)
-        };
-        match reaped {
-            Ok(Some(_)) => tracing::info!(
-                session_id = %id,
-                ?status,
-                "reaped unfinalized session after its connection closed"
-            ),
-            Ok(None) => tracing::info!(
-                session_id = %id,
-                "kept a session whose connection closed: it finished activating first"
-            ),
-            Err(e) => tracing::warn!(
+    for (id, creator) in created {
+        let span = tracing::info_span!(
+            "sessions.reap_unfinalized",
+            session_id = %id,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            parent_span_id = tracing::field::Empty,
+        );
+        crate::exec::adopt_trace(&span, creator);
+        reap_if_unfinalized(&mngr, id, keep_finished)
+            .instrument(span)
+            .await;
+    }
+}
+
+/// The reap of one session for [`reap_unfinalized_sessions`]: `keep_finished`
+/// keeps a session that finished activating.
+async fn reap_if_unfinalized(
+    mngr: &box_manager::BoxManagerHandle,
+    id: ::boxes::SessionId,
+    keep_finished: bool,
+) {
+    // Re-read the status at teardown: a clean client abort already
+    // deleted the record (`get_record` → `None`), and a finalized
+    // session is `Active` — neither should be reaped here.
+    let status = match mngr.get_record(box_manager::BoxKeyPredicate::Id(id)).await {
+        Ok(Some(record)) => record.status,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
                 session_id = %id,
                 error = %e,
-                "failed to reap unfinalized session after connection close"
-            ),
+                "could not read session status while reaping after connection close"
+            );
+            return;
         }
+    };
+    if !matches!(
+        status,
+        ::boxes::BoxState::Pending | ::boxes::BoxState::Materializing
+    ) {
+        return;
+    }
+    // Only if still unfinished when the session gets to it: a finalize
+    // already in flight ends first, and a session it finished is kept
+    // (inbox#690's reap half) — on a native daemon; see above.
+    let reaped = if keep_finished {
+        mngr.delete_session_if_unfinalized(id).await
+    } else {
+        mngr.delete_session(id).await.map(Some)
+    };
+    match reaped {
+        Ok(Some(_)) => tracing::info!(
+            session_id = %id,
+            ?status,
+            "reaped unfinalized session after its connection closed"
+        ),
+        Ok(None) => tracing::info!(
+            session_id = %id,
+            "kept a session whose connection closed: it finished activating first"
+        ),
+        Err(e) => tracing::warn!(
+            session_id = %id,
+            error = %e,
+            "failed to reap unfinalized session after connection close"
+        ),
     }
 }
 

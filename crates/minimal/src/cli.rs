@@ -65,9 +65,12 @@ pub enum Command {
     /// List sessions
     //
     // Deliberate exception to the `<noun> <verb>` convention (documented in
-    // docs/reference/cli.md): `min session list` is the canonical spelling,
-    // and `min ls` — the highest-traffic command in the CLI — keeps this bare
-    // top-level form as its visible alias. Not an oversight — do not remove it.
+    // docs/reference/cli.md): `min ls` — the highest-traffic command in the
+    // CLI — keeps this bare top-level form, with its `--raw` and `--json`
+    // flags, for the scripts that read it. It is not an alias of
+    // `min session list`, which is `min box list` filtered to session boxes
+    // (BCLI-030) and takes the `min box list` flags. Not an oversight — do
+    // not remove it.
     Ls(LsArgs),
     /// Shut down the minimald daemon
     //
@@ -87,6 +90,7 @@ pub enum Command {
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
     /// Box subcommands: show what a box will get
+    #[command(visible_alias = "boxes")]
     Box(BoxArgs),
     /// Host subcommands: the daemons on this machine that run boxes
     #[command(visible_alias = "hosts")]
@@ -94,6 +98,9 @@ pub enum Command {
     /// Provider subcommands: the kinds of local host this machine runs
     #[command(visible_alias = "providers")]
     Provider(ProviderArgs),
+    /// Type subcommands: the box types this project can use
+    #[command(visible_alias = "types")]
+    Type(TypeArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Print important directories and file paths for debugging
@@ -129,6 +136,7 @@ pub enum Command {
     /// Sign in to GitHub, and show the sign-in that boxes use
     Auth(AuthArgs),
     /// Store, list and remove the secrets that boxes reference by name
+    #[command(visible_alias = "secrets")]
     Secret(SecretArgs),
     // NET-109: `min login` is the alias for `min auth login`, so it takes
     // the same arguments and runs the same sign-in.
@@ -221,12 +229,20 @@ pub struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
-    /// List sessions
+    // BCLI-030: `min box list`, filtered to session boxes.
+    /// List the session boxes of the current project, in any state, as
+    /// `min box list` lists boxes. `--all` lists the session boxes of every
+    /// project
     #[command(visible_alias = "ls")]
-    List(LsArgs),
+    List(BoxListArgs),
     /// Activate (create) a new session
     Activate(ActivateArgs),
-    /// Attach to an existing session
+    /// Create a box from a session entry of the project and attach this
+    /// terminal to it. `--detach` creates the box, prints its id and returns
+    Start(SessionStartArgs),
+    /// Attach this terminal to a session box's terminal. With no box named,
+    /// attach to this project's running session box that has a terminal,
+    /// else to its only stopped or exited one, which starts again
     Attach(AttachArgs),
     /// Execute a command in an existing session
     Exec(ExecArgs),
@@ -271,12 +287,21 @@ pub enum SessionCommand {
     /// showing new output until the session is removed or the command is
     /// interrupted
     Logs(BoxLogsArgs),
+    // BCLI-030: `min box stop`, filtered to session boxes.
+    /// Stop a running session box and keep it, as `min box stop` does.
+    /// `--force` kills every process in the box at once, with no grace
+    /// period
+    Stop(BoxStopArgs),
+    // BCLI-030: `min box rm`, filtered to session boxes.
+    /// Remove a stopped or exited session box, as `min box rm` does. A
+    /// running box is refused unless `--force` is given
+    Rm(BoxRmArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct SetupZedArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Zed settings file to edit (default: `~/.config/zed/settings.json`)
     #[arg(long, value_name = "FILE")]
@@ -290,7 +315,7 @@ pub struct SetupZedArgs {
 #[derive(Debug, Args)]
 pub struct HooksArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Emit the raw JSON the daemon returned instead of a table
     #[arg(long)]
@@ -300,7 +325,7 @@ pub struct HooksArgs {
 #[derive(Debug, Args)]
 pub struct ExecArgs {
     /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Command to execute in the session context
     ///
@@ -315,7 +340,7 @@ pub struct ExecArgs {
 #[derive(Debug, Args)]
 pub struct SessionRunArgs {
     /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Name of a task declared in the session project's minimal.toml
     pub task: String,
@@ -324,7 +349,7 @@ pub struct SessionRunArgs {
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Write one JSON document instead of text (the default)
     #[arg(short = 'o', long = "output", value_enum)]
@@ -442,8 +467,11 @@ pub struct BoxArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum BoxCommand {
-    /// Show how a project's box reaches GitHub through the local proxy:
-    /// the proxy's root certificate fingerprint, each secret with its hosts,
+    /// Show the spec of an entry of the project before a start, or the
+    /// spec a box was created with. An entry's spec names the minimal.toml
+    /// table or flag that set each value. With no entry or box named, show
+    /// how the project's box reaches GitHub through the local proxy: the
+    /// proxy's root certificate fingerprint, each secret with its hosts,
     /// the steering mode and the UDP 443 stance
     Spec(BoxSpecArgs),
     /// Show what the local proxy recorded for one box: each request it
@@ -456,7 +484,8 @@ pub enum BoxCommand {
     /// lists the boxes of every project
     List(BoxListArgs),
     /// Show one box: its id, name, type, parent, project, state, how it
-    /// ended, the identity it runs under, and its provider and host
+    /// ended, the identity it runs under, and its provider and host.
+    /// `--network` shows the box's network section in its place
     Show(BoxShowArgs),
     /// Stop a running box and keep it: its record, its events and its
     /// files stay until `min box rm` removes them. `--force` kills every
@@ -466,18 +495,42 @@ pub enum BoxCommand {
     /// files. A running box is refused unless `--force` is given, which
     /// stops the box at once and then removes it
     Rm(BoxRmArgs),
+    /// Stop a box that runs until it is stopped, if it runs, and start it
+    /// again from the settings it was created with. The box keeps its id,
+    /// its name and its files. A box that runs to completion cannot
+    /// restart: run it again with `min box run`
+    Restart(BoxRestartArgs),
     /// Attach this terminal to a box's terminal. With no box named, attach
     /// to this project's running box that has a terminal, else to its only
     /// stopped or exited one, which starts again
     Attach(BoxAttachArgs),
+    /// Start a stopped or exited box that has a terminal again, from the
+    /// spec it was created with, and attach this terminal to it. A box that
+    /// is not stopped or exited is refused. Attach to a running box with
+    /// `min box attach`
+    Resume(BoxResumeArgs),
+    /// Create a box from an entry of the project. A box with a terminal
+    /// attaches this terminal to it, unless `--detach` is given. Any other
+    /// box starts with no input, and the command prints its id and returns
+    Start(BoxStartArgs),
     /// Create a box from an entry of the project, run it without a terminal
     /// and exit with its exit code. This command's stdin, stdout and stderr
     /// are the box's. `--detach` starts the box, prints its id and returns
+    ///
+    /// The box's network and egress come from `--network`, the egress flags
+    /// and the entry's `network` keys in minimal.toml, as for `min task
+    /// run`. This command's flags go before the entry's own arguments. A
+    /// network or egress flag after an entry argument is refused. An
+    /// argument that shares a flag's name goes after `--`.
     Run(BoxRunArgs),
     /// Run a command in a running box and exit with the command's exit
     /// code. `-t` gives the command a terminal, and `--detach` starts it
     /// and returns its exec id
     Exec(BoxExecArgs),
+    /// Wait until a box ends and exit with its exit code. A box that ended
+    /// already returns at once. A box stopped by a signal exits with 128
+    /// plus the signal, and a box that ran past its own timeout with 124
+    Wait(BoxWaitArgs),
     /// Show what happened to a box: each event the daemon recorded for
     /// it, such as its creation, each start and stop, each exec and its
     /// exit, oldest first. A stopped or exited box keeps its events until
@@ -495,8 +548,9 @@ pub enum BoxCommand {
     Prune(BoxPruneArgs),
     /// Show what a box printed, from its start. A stopped or exited box
     /// keeps its output until `min box rm` removes it. `-f` keeps showing
-    /// new output until the box is removed or the command is interrupted
-    Logs(BoxLogsArgs),
+    /// new output until the box is removed or the command is interrupted.
+    /// `--exec` shows what one command that `min box exec` started printed
+    Logs(BoxLogsExecArgs),
 }
 
 // BOX-155 (BCLI-012): `min session logs`, `min task logs` and
@@ -505,11 +559,35 @@ pub enum BoxCommand {
 pub struct BoxLogsArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Show the output so far, then keep showing new output as the box
     /// writes it, until the box is removed or the command is interrupted
     #[arg(short = 'f', long)]
     pub follow: bool,
+    /// Write the box's own output byte for byte, with its terminal control
+    /// codes. Without `--raw`, the codes are removed from the output of a
+    /// box with a terminal when stdout is not a terminal. `--exec` output is
+    /// always written unchanged, so `--exec` does not take `--raw`
+    #[arg(long)]
+    pub raw: bool,
+}
+
+// BCLI-012, BCLI-056: `min box logs <box> [-f | --exec <id>]`. Only the box
+// noun takes `--exec`, so `min session logs` and `min task logs` keep
+// `BoxLogsArgs` alone.
+#[derive(Debug, Args)]
+pub struct BoxLogsExecArgs {
+    #[command(flatten)]
+    pub logs: BoxLogsArgs,
+    /// Show what one command printed, by the exec id that `min box exec`
+    /// printed for it. The command can be running or ended
+    #[arg(
+        long = "exec",
+        value_name = "EXEC_ID",
+        conflicts_with_all = ["follow", "raw"]
+    )]
+    pub exec: Option<String>,
 }
 
 // BOX-162 (BCLI-016): `min box events <box> | --parent <box> [-o jsonl] [--follow]`.
@@ -518,10 +596,11 @@ pub struct BoxLogsArgs {
 pub struct BoxEventsArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Show the events of every child box of this box together, in time
     /// order, each event naming its box
-    #[arg(long, value_name = "BOX")]
+    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Write each event as one JSON object on its own line
     #[arg(short = 'o', long = "output", value_enum)]
@@ -614,6 +693,53 @@ pub struct ProviderListArgs {
     pub all: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct TypeArgs {
+    #[command(subcommand)]
+    pub command: TypeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TypeCommand {
+    /// List the box types: the built-in types and the types this
+    /// project's minimal.toml defines, each with where it comes from
+    #[command(visible_alias = "ls")]
+    List(TypeListArgs),
+    /// Show one box type: the type it extends, and its defaults and
+    /// constraints, each with the type that sets it
+    Show(TypeShowArgs),
+}
+
+// BCLI-019: `min type list [-o json|yaml|toml]`.
+#[derive(Debug, Default, Args)]
+pub struct TypeListArgs {
+    /// Write the types in this format instead of a table
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<TypeOutputFormat>,
+}
+
+// BCLI-020: `min type show <name> [-o json|yaml|toml]`.
+#[derive(Debug, Args)]
+pub struct TypeShowArgs {
+    /// The type, as `min type list` prints it (`session`, `task`, or a
+    /// type of this project)
+    pub name: String,
+    /// Write the type in this format instead of text
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<TypeOutputFormat>,
+}
+
+/// The formats `min type list` and `min type show` write, beside text.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum TypeOutputFormat {
+    /// JSON: one object for each type
+    Json,
+    /// YAML: one mapping for each type
+    Yaml,
+    /// TOML: one table for each type
+    Toml,
+}
+
 // BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
 #[derive(Debug, Args)]
 pub struct BoxListArgs {
@@ -634,23 +760,59 @@ pub enum BoxListOutputFormat {
     Json,
 }
 
-// BOX-159 (BCLI-003): `min box show <box>`.
+// BOX-159 (BCLI-003): `min box show <box>`, and BCLI-025's `--network`.
 #[derive(Debug, Args)]
 pub struct BoxShowArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
+    /// Show only the box's `[network]` section, as the box was created
+    /// with it: its network mode, ingress and egress, with the flags of
+    /// the command that created it applied
+    #[arg(long)]
+    pub network: bool,
+    /// Write the box and its running commands in this format instead of
+    /// text
+    #[arg(short = 'o', long = "output", value_enum, conflicts_with = "network")]
+    pub output: Option<BoxShowOutputFormat>,
 }
 
-// BOX-013 (BCLI-059): `min box stop <box> [--force]`.
+/// The formats `min box show` writes, beside text.
+// BCLI-033: each format carries one `min/v1/box` object, its execs as
+// `min/v1/exec` objects.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxShowOutputFormat {
+    /// JSON: one object for the box
+    Json,
+    /// YAML: one mapping for the box
+    Yaml,
+}
+
+// BOX-013 (BCLI-059), BOX-151 (BCLI-055):
+// `min box stop <box> [--force | --exec <id>]`.
 #[derive(Debug, Args)]
 pub struct BoxStopArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Kill every process in the box at once, with no grace period
     #[arg(long)]
     pub force: bool,
+    /// Stop only one command, by the exec id that `min box exec` printed
+    /// for it. The box and its other commands keep running
+    #[arg(long = "exec", value_name = "EXEC_ID", conflicts_with = "force")]
+    pub exec: Option<String>,
+}
+
+// BOX-176 (BCLI-074): `min box restart <box>`.
+#[derive(Debug, Args)]
+pub struct BoxRestartArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub target: String,
 }
 
 // BCLI-068: `min box attach [<box>] [--exec <id>]`.
@@ -659,6 +821,7 @@ pub struct BoxAttachArgs {
     /// The box: its id, the start of its id, its name, or
     /// provider/host/name, as `min box list` prints them. Omit it to attach
     /// to this project's box
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Attach to a command that `min box exec -t` started in the box, by the
     /// exec id it printed. Needs a box
@@ -666,15 +829,45 @@ pub struct BoxAttachArgs {
     pub exec: Option<String>,
 }
 
+// BCLI-007, BCLI-009: `min box resume <box>`.
+#[derive(Debug, Args)]
+pub struct BoxResumeArgs {
+    /// The box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min box list` prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub target: String,
+}
+
 // BOX-019 (BCLI-060, BCLI-004): `min box rm <box> [--force]`.
 #[derive(Debug, Args)]
 pub struct BoxRmArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Remove a running box too: stop it at once, then remove it
     #[arg(long)]
     pub force: bool,
+}
+
+// BCLI-013, BCLI-014, BCLI-057:
+// `min box wait <box> [--timeout <d>] [--exec <id>]`.
+#[derive(Debug, Args)]
+pub struct BoxWaitArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub target: String,
+    /// Stop waiting after this long: a number of seconds, or a number
+    /// followed by s, m or h, such as 30s, 5m or 1h. The box keeps running,
+    /// and the command exits with code 124
+    #[arg(long, value_name = "DURATION", value_parser = mfile::duration::parse_timeout_secs)]
+    pub timeout: Option<u64>,
+    /// Wait for one command, by the exec id that `min box exec` printed for
+    /// it, and exit with that command's exit code. The command can be
+    /// running or ended
+    #[arg(long = "exec", value_name = "EXEC_ID")]
+    pub exec: Option<String>,
 }
 
 // BOX-149 (BCLI-053): `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`.
@@ -682,6 +875,7 @@ pub struct BoxRmArgs {
 pub struct BoxExecArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Give the command a terminal and connect this terminal to it. The
     /// command's exec id is printed on stderr
@@ -783,6 +977,80 @@ impl std::fmt::Display for BoxExecRefusal {
 
 impl std::error::Error for BoxExecRefusal {}
 
+/// A refusal of `min box stop`, `min box logs` or `min box wait` with
+/// `--exec <id>` (BCLI-055, BCLI-056, BCLI-057): the text is not an exec
+/// id, or the box's host knows no exec of that id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxExecIdRefusal {
+    /// The text is not an exec id. Exit 2.
+    NotAnId {
+        /// The box as the user named it.
+        target: String,
+        /// The exec id as the user typed it.
+        exec_id: String,
+    },
+    /// The box has no exec of this id, running or ended. Exit 4.
+    Unknown {
+        /// The box as the user named it.
+        target: String,
+        /// The exec id.
+        exec_id: String,
+    },
+    /// The box's host has no running exec of this id, and the box's events
+    /// record no end for one, so no exit code is known. Exit 4.
+    NoExitCode {
+        /// The box as the user named it.
+        target: String,
+        /// The exec id.
+        exec_id: String,
+    },
+}
+
+impl BoxExecIdRefusal {
+    /// The exit code the command ends with: 2 for text that is not an exec
+    /// id, 4 for an exec that is not found.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::NotAnId { .. } => 2,
+            Self::Unknown { .. } | Self::NoExitCode { .. } => 4,
+        }
+    }
+
+    /// The outcome the command's tracing event records.
+    #[must_use]
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Self::NotAnId { .. } => "not an exec id",
+            Self::Unknown { .. } => "no such exec",
+            Self::NoExitCode { .. } => "no exit code",
+        }
+    }
+}
+
+impl std::fmt::Display for BoxExecIdRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hint = |target: &str| {
+            format!("Run `min box show {target}` to see the commands that run in the box now.")
+        };
+        match self {
+            Self::NotAnId { target, exec_id } => {
+                write!(f, "`{exec_id}` is not an exec id. {}", hint(target))
+            }
+            Self::Unknown { target, exec_id } => {
+                write!(f, "{target} has no exec {exec_id}. {}", hint(target))
+            }
+            Self::NoExitCode { target, exec_id } => write!(
+                f,
+                "No exit code is known for exec {exec_id} in {target}. {}",
+                hint(target)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoxExecIdRefusal {}
+
 /// A command in a box that ran past its own timeout and was stopped
 /// (BOX-149, BCLI-053). `min box exec` and the wait for an exec end with
 /// exit 124 on it, and a machine-mode run answers it with `code =
@@ -843,6 +1111,7 @@ impl std::error::Error for BoxExecTimedOut {}
 pub struct BoxRenameArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// The new name for the box
     pub new_name: String,
@@ -859,7 +1128,7 @@ pub struct BoxPruneArgs {
     pub older_than: Option<std::time::Duration>,
     /// Remove only the child boxes of this box: its id, the start of its
     /// id, or its name
-    #[arg(long, value_name = "BOX")]
+    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Remove the boxes without asking first
     #[arg(long, short)]
@@ -897,10 +1166,11 @@ pub struct BoxAuditArgs {
     /// The box: its id, or its name. A name reads the running box of that
     /// name, else the newest box created under it. `self` is the box this
     /// command runs in
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Show the records of every child box of this box (an id, a name or
     /// `self`) together, each record naming its box
-    #[arg(long, value_name = "BOX")]
+    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Write each record as one JSON line, as the proxy wrote it
     #[arg(short = 'o', long = "output", value_enum)]
@@ -918,22 +1188,34 @@ pub enum BoxAuditOutputFormat {
     Jsonl,
 }
 
+// BCLI-021, BCLI-022, BCLI-023 and BEP-038:
+// `min box spec [<entry>|<box>] [-o toml|json|yaml]`, with the override
+// flags of `min box start`. The project form keeps only `--network`.
 #[derive(Debug, Args)]
 pub struct BoxSpecArgs {
-    /// The project directory whose minimal.toml declares the box
-    /// (default: --repo-dir, or the current directory)
-    pub path: Option<PathBuf>,
-    // The same flag as `min session activate --network`, from the same
-    // definition, so the preview is of the box that activation creates.
-    #[arg(
-        long,
-        value_name = NETWORK_VALUE_NAME,
-        value_parser = parse_network_mode,
-        default_value = NETWORK_DEFAULT,
-        help = NETWORK_HELP,
-        long_help = NETWORK_LONG_HELP
-    )]
-    pub network: CliNetworkMode,
+    /// An entry of the project's minimal.toml, else a box: its id, the
+    /// start of its id, or its name, as `min box list` prints them. With
+    /// none, show the project's proxy rows. Use --repo-dir to name another
+    /// project
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub target: Option<String>,
+    /// The format of an entry's or a box's spec (default: toml)
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxSpecOutputFormat>,
+    #[command(flatten)]
+    pub overrides: StartOverrideArgs,
+}
+
+/// The format `min box spec` writes an entry's or a box's spec in.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+pub enum BoxSpecOutputFormat {
+    /// TOML, with a comment that names the source of each value
+    #[default]
+    Toml,
+    /// One JSON object
+    Json,
+    /// One YAML document
+    Yaml,
 }
 
 #[derive(Debug, Args)]
@@ -985,25 +1267,46 @@ pub enum TaskCommand {
     /// command exits 130. For a task declared with `interactive = true`,
     /// Ctrl-C destroys its box instead. Use `min session attach` for
     /// interactive work.
+    ///
+    /// The box's network mode is `--network`, else the `network.mode`
+    /// minimal.toml declares for the task, else host_ip. Its egress rules
+    /// are the `network.egress` keys minimal.toml declares for the task, in
+    /// `[defaults]`, `[defaults.task]` or the task's own entry.
+    /// `--allow-subnets`, `--allow-dns-hosts` and `--deny-subnets` add to
+    /// the file's lists, and `--allow-protocols` replaces its list.
+    /// `--deny-all-egress` drops the file's `allow_subnets` and
+    /// `allow_dns_hosts`, and cannot be combined with `--allow-subnets` or
+    /// `--allow-dns-hosts`. On a host that runs boxes in a VM, which every
+    /// macOS host is, `own_ip` is refused.
+    ///
+    /// This command's flags go before the task's own arguments. A network
+    /// or egress flag after a task argument is refused. A task argument
+    /// that shares a flag's name goes after `--`.
     Run(TaskRunArgs),
-    /// List the task boxes of the current project, in any state. A task
-    /// that ended shows its exit code, as `exited (exit 3)`, until
-    /// `min box prune` removes it. `--all` lists the tasks of every project
-    List(TaskListArgs),
+    // BCLI-015, BCLI-030: `min box list`, filtered to task boxes.
+    /// List the task boxes of the current project, in any state, as
+    /// `min box list` lists boxes. A task that ended shows its exit code,
+    /// as `exited (exit 3)`, until `min box prune` removes it. `--all`
+    /// lists the tasks of every project
+    List(BoxListArgs),
     /// Show what a task printed, from its start. `-f` keeps showing new
     /// output until the task's box is removed or the command is interrupted
     Logs(BoxLogsArgs),
+    // BCLI-030: `min box stop`, filtered to task boxes.
+    /// Stop a running task box and keep it, as `min box stop` does.
+    /// `--force` kills every process in the box at once, with no grace
+    /// period
+    Stop(BoxStopArgs),
+    // BCLI-030: `min box rm`, filtered to task boxes.
+    /// Remove a stopped or exited task box, as `min box rm` does. A running
+    /// box is refused unless `--force` is given
+    Rm(BoxRmArgs),
 }
 
-// BCLI-015: `min task list [--all]`.
-#[derive(Debug, Args)]
-pub struct TaskListArgs {
-    /// List the tasks of every project, not only the tasks of the current
-    /// project
-    #[arg(long)]
-    pub all: bool,
-}
-
+// BCLI-069 gives `--name` to `min task run` too. It is not here yet: the
+// run path's `RunEntry` takes no box name, and the daemon names every run's
+// box `<entry>-<n>`. The start half is gominimal/minimal#3196. Add the flag
+// here and on `BoxRunArgs` when `RunEntry` takes a name.
 #[derive(Debug, Args)]
 pub struct TaskRunArgs {
     /// Name of a task declared in the project's minimal.toml
@@ -1014,6 +1317,21 @@ pub struct TaskRunArgs {
     /// task name is a task argument, never a project path.
     #[arg(long)]
     pub path: Option<String>,
+    // The same values and parser as `min session activate --network`, with
+    // help worded for a task box. With no flag, the box takes the task's
+    // `network.mode` from minimal.toml, else `NETWORK_DEFAULT`.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        help = TASK_NETWORK_HELP,
+        long_help = TASK_NETWORK_LONG_HELP
+    )]
+    pub network: Option<CliNetworkMode>,
+    #[command(flatten)]
+    pub egress: EgressArgs,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
     /// Start the box, print its id and return. The task gets no input.
     #[arg(long)]
     pub detach: bool,
@@ -1023,6 +1341,7 @@ pub struct TaskRunArgs {
 }
 
 // BCLI-010, BCLI-035, BCLI-070: `min box run <entry> [--detach] [-- <args>…]`.
+// BCLI-069's `--name` is not here yet. See the comment on `TaskRunArgs`.
 #[derive(Debug, Args)]
 pub struct BoxRunArgs {
     /// Name of an entry declared in the project's minimal.toml: a task
@@ -1034,9 +1353,175 @@ pub struct BoxRunArgs {
     /// Start the box, print its id and return. The box gets no input
     #[arg(long)]
     pub detach: bool,
+    // `min task run`'s network flags, from the same definitions: both verbs
+    // run a declared task through one run path.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        help = TASK_NETWORK_HELP,
+        long_help = TASK_NETWORK_LONG_HELP
+    )]
+    pub network: Option<CliNetworkMode>,
+    #[command(flatten)]
+    pub egress: EgressArgs,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
     /// Arguments to the entry, passed through to its declared `args`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
+}
+
+// BCLI-029, BCLI-069, BCLI-070, BCLI-072, and the override flags of
+// BCLI-024 and BCLI-073:
+// `min box start [<entry>] [--name <name>] [--new] [--detach]`.
+#[derive(Debug, Args)]
+pub struct BoxStartArgs {
+    /// Name of an entry declared in the project's minimal.toml. With none,
+    /// the entry named `default`, else the project's only entry
+    pub entry: Option<String>,
+    /// Name the box. With `--new`, the box is named `<name>-<n>`
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Create another box from the entry, named `<name>-<n>`, even when a
+    /// running box holds the entry's name
+    #[arg(long)]
+    pub new: bool,
+    /// Create the box, print its id and return. This terminal is not
+    /// attached to the box
+    #[arg(long)]
+    pub detach: bool,
+    #[command(flatten)]
+    pub overrides: StartOverrideArgs,
+}
+
+// BCLI-029, BCLI-069, BCLI-070, BCLI-071, and the override flags of
+// BCLI-024 and BCLI-073:
+// `min session start [<entry>] [--name <name>] [--new] [--detach]`.
+#[derive(Debug, Args)]
+pub struct SessionStartArgs {
+    /// Name of a session entry declared in the project's minimal.toml. With
+    /// none, the session entry named `default`, else the project's only
+    /// session entry
+    pub entry: Option<String>,
+    /// Name the box. With `--new`, the box is named `<name>-<n>`
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Create another box from the entry, named `<name>-<n>`, even when a
+    /// running box holds the entry's name
+    #[arg(long)]
+    pub new: bool,
+    /// Create the box, print its id and return. This terminal is not
+    /// attached to the box
+    #[arg(long)]
+    pub detach: bool,
+    #[command(flatten)]
+    pub overrides: StartOverrideArgs,
+}
+
+// The override flags of `min box start` and `min session start` (BCLI-024,
+// BCLI-073). Each `[network]` flag replaces or adds to the key it names, in
+// the command-line layer that applies last. The egress flags are the ones
+// `min session activate` and `min task run` take, from the same definition.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct StartOverrideArgs {
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        help = START_NETWORK_HELP,
+        long_help = START_NETWORK_LONG_HELP
+    )]
+    pub network: Option<CliNetworkMode>,
+    /// Publish a port of the box: `EXT:INT[/PROTO]`, with PROTO `tcp` or
+    /// `udp` (default `tcp`). Repeatable. Each use adds one port mapping to
+    /// the box's `network.ingress`. Requires `--network own_ip`. A task
+    /// entry does not take it
+    #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
+    pub ingress: Vec<String>,
+    #[command(flatten)]
+    pub egress: EgressArgs,
+    /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
+    /// Repeatable. With any `--loadout`, the client config's
+    /// `[loadouts].default_loadouts` are not applied. A task entry does not
+    /// take it
+    // BCLI-075: `--no-loadouts` with `--loadout` is a usage error, exit 2.
+    // The conflict is declared here because the run verbs take
+    // `--no-loadouts` and no `--loadout`.
+    #[arg(long = "loadout", value_name = "NAME", conflicts_with = "no_loadouts")]
+    pub loadout: Vec<String>,
+    #[command(flatten)]
+    pub other: BoxOverrideArgs,
+}
+
+// The override flags that `min box start`, `min session start`, `min task
+// run` and `min box run` take beside `--network` and the egress flags, as
+// `min session activate` takes them (BCLI-024, BCLI-075, BCLI-076). They
+// are the rest of activate's `[network]` flags, `--no-loadouts` and
+// `--no-hooks`.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct BoxOverrideArgs {
+    /// How the box's requests to publish a port while it runs are decided:
+    /// `allow` publishes a port the box asks for with `min net expose` or
+    /// listens on inside `--dynamic-range`, `ask` puts each request to the
+    /// person attached to the box, and `deny`, the same as leaving the flag
+    /// unset, refuses every request. Sets the box's
+    /// `network.dynamic_ingress`. Requires `--network own_ip`.
+    #[arg(
+        long = "dynamic-ingress",
+        value_name = "allow|ask|deny",
+        value_parser = parse_dynamic_ingress_mode
+    )]
+    pub dynamic_ingress: Option<boxes::DynamicIngress>,
+    /// Port range `LO-HI`, both ends included, in which
+    /// `--dynamic-ingress allow` accepts requests, e.g. `8000-8443`. A
+    /// request outside it is refused. Requires `--dynamic-ingress`.
+    #[arg(
+        long = "dynamic-range",
+        value_name = "LO-HI",
+        value_parser = parse_dynamic_range,
+        requires = "dynamic_ingress"
+    )]
+    pub dynamic_range: Option<(u16, u16)>,
+    /// Let the box reach the Box Egress Proxy, whatever its
+    /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
+    /// box sends to the proxy's address is dropped, unless minimal.toml
+    /// grants the box a secret through the proxy. Takes effect with
+    /// `--network own_ip`, and with `--network host_ip` on a host that runs
+    /// boxes in a VM.
+    #[arg(long)]
+    pub credentialed_upstream: bool,
+    /// Whether the box can send UDP to port 443, the traffic of HTTP/3.
+    /// `block` always blocks it, and `allow` always allows it. `auto`, the
+    /// same as leaving the flag unset, blocks it only when the box has a
+    /// credentialed upstream. Sets the box's `network.quic443`, in place of
+    /// the value in minimal.toml.
+    #[arg(
+        long = "quic443",
+        value_name = "auto|block|allow",
+        value_parser = parse_quic443
+    )]
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// Add this VPN network name to the box's `network.vpn_network_names`.
+    /// Repeatable. The box keeps the names, but this version of minimald
+    /// does not connect the box to a VPN.
+    #[arg(long = "vpn-network-names", value_name = "NAME")]
+    pub vpn_network_names: Vec<String>,
+    /// Apply no loadouts, and not the client config's
+    /// `[loadouts].default_loadouts` either
+    #[arg(long)]
+    pub no_loadouts: bool,
+    /// Run none of the box's lifecycle hooks, from the loadouts or from
+    /// minimal.toml. The choice is kept with the box, so it also holds
+    /// when the box is attached or detached, and when it ends
+    #[arg(long)]
+    pub no_hooks: bool,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
@@ -1181,22 +1666,6 @@ impl GlobalArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(
-    // The egress rule flags as one named set, so a declaration that admits
-    // no exceptions can conflict with them as a family: `--deny-all-egress`
-    // names this group in `conflicts_with`, which is how it comes to
-    // conflict with every `--allow-*`/`--deny-*` rule flag at parse without
-    // the four rules becoming mutually exclusive with each other — they
-    // still combine freely (`multiple`), the way the section they build
-    // combines its dimensions. The one place the egress flags appear is
-    // `ActivateArgs`, so this is the one shared definition.
-    group(
-        ArgGroup::new("egress-rules")
-            .args(["allow_subnets", "allow_dns_hosts", "allow_protocols", "deny_subnets"])
-            .required(false)
-            .multiple(true)
-    )
-)]
 pub struct ActivateArgs {
     /// Optional session name
     #[arg(long, short)]
@@ -1218,11 +1687,12 @@ pub struct ActivateArgs {
         long,
         value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
-        default_value = NETWORK_DEFAULT,
         help = NETWORK_HELP,
         long_help = NETWORK_LONG_HELP
     )]
-    pub network: CliNetworkMode,
+    // `None` when `--network` is not typed, so the entry's `network.mode`
+    // can apply (#3238). [`ActivateArgs::network_mode`] gives the mode.
+    pub network: Option<CliNetworkMode>,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
@@ -1248,41 +1718,9 @@ pub struct ActivateArgs {
         requires = "dynamic_ingress"
     )]
     pub dynamic_range: Option<(u16, u16)>,
-    /// Allow outbound traffic to this destination subnet, in CIDR form,
-    /// e.g. `10.0.0.0/8`. Repeatable. Once any egress flag is given, an
-    /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
-    /// allows nothing, unless the host opts out: `--allow-dns-hosts
-    /// github.com` alone reaches no address directly, and `--allow-subnets
-    /// 0.0.0.0/0` writes allow-all out. The egress flags are accepted with
-    /// `--network own_ip` and `--network host_ip`, and only `own_ip`
-    /// enforces these rules: a `host_ip` box is refused at creation or, on
-    /// a host that cannot filter it, runs with the rules unenforced.
-    /// `--network none` rejects every egress flag. `min session policy`
-    /// shows the rules a box ended up with.
-    #[arg(long = "allow-subnets", value_name = "CIDR")]
-    pub allow_subnets: Vec<String>,
-    /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
-    /// Repeatable. Given without `--allow-subnets`, the box reaches the
-    /// named hosts by name and no address directly; see `--allow-subnets`.
-    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
-    pub allow_dns_hosts: Vec<String>,
-    /// Allow this outbound transport protocol: tcp, udp, or icmp.
-    /// Repeatable; unset allows every protocol. Narrows what the other
-    /// allow flags admit and admits nothing on its own.
-    #[arg(long = "allow-protocols", value_name = "PROTO")]
-    pub allow_protocols: Vec<String>,
-    /// Deny outbound traffic to this destination subnet, in CIDR form,
-    /// subtracted from what the allow flags admit. Repeatable; unset
-    /// denies nothing.
-    #[arg(long = "deny-subnets", value_name = "CIDR")]
-    pub deny_subnets: Vec<String>,
-    /// Declare deny-all egress: the box reaches no external address.
-    /// Cannot be combined with the `--allow-*` or `--deny-subnets` flags.
-    /// Unless the host opts out, a `--network own_ip` box with no egress
-    /// rules already gets this by default. With `--network host_ip` it is
-    /// enforced only on a host that can filter each box.
-    #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
-    pub deny_all_egress: bool,
+    // The egress flags are shared with `min task run`, from one definition.
+    #[command(flatten)]
+    pub egress: EgressArgs,
     /// Let the box reach the Box Egress Proxy, whatever its
     /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
     /// box sends to the proxy's address is dropped. Takes effect with
@@ -1319,6 +1757,87 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+impl ActivateArgs {
+    /// The arguments of a `min session activate` typed with no flag and no
+    /// path, from the one command model, so each default is the parser's.
+    #[must_use]
+    pub fn unflagged() -> Self {
+        #[derive(Parser)]
+        struct Unflagged {
+            #[command(flatten)]
+            args: ActivateArgs,
+        }
+        Unflagged::try_parse_from(["activate"])
+            .expect("every activation flag has a default")
+            .args
+    }
+
+    /// The `--network` mode, else [`NETWORK_DEFAULT`]. An activation sets
+    /// `network` to the entry's `network.mode` before it reads this.
+    #[must_use]
+    pub fn network_mode(&self) -> CliNetworkMode {
+        self.network.unwrap_or_else(default_network_mode)
+    }
+}
+
+// The egress flags of a box-creating command: `min session activate`,
+// `min task run` and `min box run` take them from this one definition.
+// `effective_egress` applies them to the egress minimal.toml declares
+// (arch#166, #3143): a list flag adds, `--allow-protocols` replaces, and
+// `--deny-all-egress` only narrows, so it refuses the two allow flags.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct EgressArgs {
+    /// Allow outbound traffic to this destination subnet, in CIDR form,
+    /// e.g. `10.0.0.0/8`. Repeatable. Adds to the `allow_subnets` that
+    /// minimal.toml declares for the box. Once any egress flag is given, an
+    /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
+    /// allows nothing, unless the host opts out: `--allow-dns-hosts
+    /// github.com` alone reaches no address directly, and `--allow-subnets
+    /// 0.0.0.0/0` writes allow-all out. The egress flags are accepted with
+    /// `--network own_ip` and `--network host_ip`, and only `own_ip`
+    /// enforces these rules: a `host_ip` box is refused at creation or, on
+    /// a host that cannot filter it, runs with the rules unenforced.
+    /// `--network none` rejects every egress flag. `min session policy`
+    /// shows the rules a box ended up with.
+    #[arg(long = "allow-subnets", value_name = "CIDR")]
+    pub allow_subnets: Vec<String>,
+    /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
+    /// Repeatable. Adds to the `allow_dns_hosts` that minimal.toml declares
+    /// for the box. Given without `--allow-subnets`, the box reaches the
+    /// named hosts by name and no address directly; see `--allow-subnets`.
+    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
+    pub allow_dns_hosts: Vec<String>,
+    /// Allow this outbound transport protocol: tcp, udp, or icmp.
+    /// Repeatable; unset allows every protocol. Replaces the
+    /// `allow_protocols` that minimal.toml declares for the box. Narrows
+    /// what the other allow flags admit and admits nothing on its own.
+    #[arg(long = "allow-protocols", value_name = "PROTO")]
+    pub allow_protocols: Vec<String>,
+    /// Deny outbound traffic to this destination subnet, in CIDR form,
+    /// subtracted from what the allow flags admit. Repeatable; unset
+    /// denies nothing. Adds to the `deny_subnets` that minimal.toml
+    /// declares for the box, so it never drops a range the file denies.
+    #[arg(long = "deny-subnets", value_name = "CIDR")]
+    pub deny_subnets: Vec<String>,
+    /// Declare deny-all egress: the box reaches no external address. Drops
+    /// every `allow_subnets` and `allow_dns_hosts` value minimal.toml
+    /// declares for the box. Cannot be combined with `--allow-subnets` or
+    /// `--allow-dns-hosts`. The file's `allow_protocols` and `deny_subnets`
+    /// stay, and `--deny-subnets` and `--allow-protocols` still apply.
+    /// Unless the
+    /// host opts out, a `--network own_ip` box with no egress rules already
+    /// reaches no external address. With `--network host_ip` it is enforced
+    /// only on a host that can filter each box.
+    #[arg(
+        long = "deny-all-egress",
+        conflicts_with_all = ["allow_subnets", "allow_dns_hosts"]
+    )]
+    pub deny_all_egress: bool,
 }
 
 /// Which daemon backend (box host) serves sessions, as `--provider` names it.
@@ -1368,15 +1887,21 @@ pub(crate) const NETWORK_VALUE_NAME: &str = "none|host_ip|own_ip";
 /// spec`, so a preview with no flag is of a box created with no flag.
 pub(crate) const NETWORK_DEFAULT: &str = "host_ip";
 
+/// The mode of [`NETWORK_DEFAULT`].
+pub(crate) fn default_network_mode() -> CliNetworkMode {
+    parse_network_mode(NETWORK_DEFAULT).expect("the default network mode parses")
+}
+
 /// The first paragraph of the `--network` help, as a literal so that
 /// [`NETWORK_LONG_HELP`] can extend it.
 macro_rules! network_help {
     () => {
         "Network mode for the session: `none` gives the session no network (every socket it \
          opens to a destination outside itself fails), `host_ip` shares the host's network \
-         namespace (the default), and `own_ip` gives the session its own IP address, so \
-         `--ingress` can publish ports; unless the host opts out, an `own_ip` session with no \
-         egress rules can reach no external address"
+         namespace, and `own_ip` gives the session its own IP address, so `--ingress` can \
+         publish ports; unless the host opts out, an `own_ip` session with no egress rules can \
+         reach no external address. With no flag, the session takes the `network.mode` \
+         minimal.toml declares for it, else `host_ip`"
     };
 }
 
@@ -1388,6 +1913,60 @@ pub(crate) const NETWORK_HELP: &str = network_help!();
 pub(crate) const NETWORK_LONG_HELP: &str = concat!(
     network_help!(),
     ".\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
+
+/// The first paragraph of the `--network` help of `min task run` and `min
+/// box run`, as a literal so that [`TASK_NETWORK_LONG_HELP`] can extend it.
+/// Neither verb takes `--ingress` yet (#3163), so this names neither a
+/// session nor ingress.
+macro_rules! task_network_help {
+    () => {
+        "Network mode for the task box: `none` gives the box no network (every socket it opens \
+         to a destination outside itself fails), `host_ip` shares the host's network namespace, \
+         and `own_ip` gives the box its own IP address; unless the host opts out, an `own_ip` \
+         box with no egress rules can reach no external address. With no flag, the box takes \
+         the `network.mode` minimal.toml declares for the task, else `host_ip`"
+    };
+}
+
+/// The `--network` short help of `min task run` and `min box run`.
+pub(crate) const TASK_NETWORK_HELP: &str = task_network_help!();
+
+/// The `--network` long help of `min task run` and `min box run`: the short
+/// help, the VM-host refusal, and the legacy spellings.
+pub(crate) const TASK_NETWORK_LONG_HELP: &str = concat!(
+    task_network_help!(),
+    ".\n\n",
+    "On a host that runs boxes in a VM, `own_ip` is refused.\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
+
+/// The first paragraph of the `--network` help of `min box start` and `min
+/// session start`, as a literal so that [`START_NETWORK_LONG_HELP`] can
+/// extend it.
+macro_rules! start_network_help {
+    () => {
+        "Network mode for the box: `none` gives the box no network (every socket it opens to a \
+         destination outside itself fails), `host_ip` shares the host's network namespace, and \
+         `own_ip` gives the box its own IP address, so `--ingress` can publish ports. The flag \
+         replaces the entry's `network.mode`. With no flag, the box takes the \
+         `network.mode` minimal.toml declares for the entry, else `host_ip`"
+    };
+}
+
+/// The `--network` short help of `min box start` and `min session start`.
+pub(crate) const START_NETWORK_HELP: &str = start_network_help!();
+
+/// The `--network` long help of `min box start` and `min session start`:
+/// the short help, the VM-host refusal of a task entry, and the legacy
+/// spellings.
+pub(crate) const START_NETWORK_LONG_HELP: &str = concat!(
+    start_network_help!(),
+    ".\n\n",
+    "On a host that runs boxes in a VM, `own_ip` is refused for a task entry.\n\n",
     "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
      prints a one-line hint naming the current spelling."
 );
@@ -1521,6 +2100,20 @@ pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<boxes::DynamicIngr
     }
 }
 
+/// Parse a `--quic443` value into the box's stance on UDP to port 443
+/// (BCLI-024, BEP-018).
+pub(crate) fn parse_quic443(raw: &str) -> Result<boxes::core::bep::Quic443, String> {
+    use boxes::core::bep::Quic443;
+    match raw {
+        "auto" => Ok(Quic443::Auto),
+        "block" => Ok(Quic443::Block),
+        "allow" => Ok(Quic443::Allow),
+        other => Err(format!(
+            "unknown value '{other}'. Use auto, block or allow."
+        )),
+    }
+}
+
 /// Parse a `--dynamic-range <lo>-<hi>` value (NET-043) into the inclusive
 /// `(lo, hi)` pair the create request's `dynamic_allowed_range` carries.
 /// A malformed value (no `-`, a non-numeric end, a port outside u16), an
@@ -1592,11 +2185,10 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID, unique id prefix, or session name). When
-    /// omitted, `min session attach` resolves a session from the current
-    /// working directory (or the only existing session), and opens an interactive picker if the choice is
-    /// ambiguous. See `--no-input` to skip the picker in scripts.
-    #[arg(add = completion::session_completer())]
+    /// The session box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min session list` prints them. Omit it to
+    /// attach to this project's session box
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: Option<String>,
 }
 
@@ -1615,7 +2207,7 @@ pub struct LsArgs {
 #[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: Option<String>,
     /// Destroy all sessions
     #[arg(long)]
@@ -1646,7 +2238,7 @@ pub enum NetCommand {
 #[derive(Debug, Args)]
 pub struct NetForwardArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
     /// the box-side port it forwards to (`8080:3000` answers on
@@ -1691,7 +2283,7 @@ pub struct StopArgs {
 #[derive(Debug, Args)]
 pub struct RenameArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// New name for the session
     pub new_name: String,

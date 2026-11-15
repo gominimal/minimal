@@ -568,6 +568,85 @@ async fn dropping_a_connection_reaps_only_its_unfinalized_sessions() {
     let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
 }
 
+/// TEL-022: the reap of a session its creating connection left
+/// unfinalized is that CreateSession's cleanup: its span is a child of the
+/// CreateSession `rpc` span, in the client's trace, and so is the record
+/// read it sends. Under the connection's `conn` span alone it was a trace
+/// of its own (a stray trace in every lab run). In the file log the reap
+/// stays under `conn`, as the `rpc` span does.
+///
+/// Driven through `Server::run`: the teardown reap lives in its accept
+/// loop's per-connection task, which `TestServer::connect` does not run.
+#[tokio::test]
+async fn the_reap_of_an_unfinalized_session_joins_its_creators_trace() {
+    use crate::test_harness::{SpanLog, create_session_req};
+    use minimald_rpc::CreateSession;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+    let env = [(
+        minimald_rpc::trace::TRACEPARENT_ENV,
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    )];
+    let log = SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    {
+        let mut client = connect_uds(&sock).await;
+        client
+            .call_with_env::<CreateSession>(&env, &create_session_req("s", "/tmp"))
+            .await
+            .unwrap();
+        // `client` dropped here → connection closes → the teardown reaps
+        // the still-Pending session.
+    }
+
+    // Wait for the reap span to close, not merely to open: its record read
+    // is sent from inside it, so only once it has closed is that read
+    // certain to be in the log.
+    let reap = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(reap) = log
+                .find("sessions.reap_unfinalized", "trace_id", TRACE)
+                .into_iter()
+                .find(|s| s.closed)
+            {
+                return reap;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the teardown's reap span closes");
+
+    let create = log.one("rpc", "rpc", "minimald-v1-CreateSession");
+    assert_eq!(
+        reap.field("parent_span_id"),
+        create.field("span_id"),
+        "the reap is a child of its CreateSession: {reap:?} {create:?}"
+    );
+    assert_eq!(
+        log.parent_of(&reap).map(|p| p.name),
+        Some("conn"),
+        "in the file log the reap stays under its connection"
+    );
+    let parent = reap.field("span_id");
+    let read = log
+        .find("sessions.manager.message", "kind", "GetRecord")
+        .into_iter()
+        .find(|read| read.field("parent_span_id") == parent)
+        .expect("the reap's record read is its child");
+    assert_eq!(read.field("trace_id"), Some(TRACE));
+
+    let mut client = connect_uds(&sock).await;
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
 /// A creator that disconnects mid-upload leaves a half-populated `Draft`
 /// for its teardown to reap. An attach from another connection that
 /// lands after the creator is gone but before that reap is refused — the

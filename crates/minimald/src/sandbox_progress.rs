@@ -187,17 +187,13 @@ impl SandboxProgress {
 /// [`FetchRecord`] an install was started with: the box the fetch was made
 /// for, and — per operation, the same division the meter shows — the host it
 /// leaves for and the object it brings back. A package or the index is
-/// fetched from the configured remote cache; a source from the URL it names,
-/// spelled as the record writes it — with neither the URL's credentials nor
-/// its query, which never belong in a log line. An `http` or `https` source
-/// of an install whose sources were placed in the box's classifier leaf is
-/// the box's own traffic (NET-155), so it is not recorded. A `gs://` source,
-/// and a web source of an install with no leaf, still leave from the daemon's
-/// cgroup, so they are recorded. Scoping is the meter's own: a package outside
-/// the install's `scope` is not this install's fetch, while a source or the
-/// index names no package to scope by and is attributed to whatever is
-/// building, the same caveat the meter's row carries. Run from the tracker's
-/// op-start hook, once per op as it starts.
+/// fetched from the configured remote cache. A source a package declares is
+/// a package build's traffic (NET-155), never the node plane's, so it is not
+/// recorded. Scoping is the meter's own: a package outside the install's
+/// `scope` is not this install's fetch, while the index names no package to
+/// scope by and is attributed to whatever is building, the same caveat the
+/// meter's row carries. Run from the tracker's op-start hook, once per op as
+/// it starts.
 fn record_fetch(record: &FetchRecord, scope: Option<&HashSet<String>>, op: &Operation) {
     let (host, object) = match op {
         Operation::FetchPkg { name } if scope.is_none_or(|s| s.contains(name)) => (
@@ -211,20 +207,17 @@ fn record_fetch(record: &FetchRecord, scope: Option<&HashSet<String>>, op: &Oper
         // A source with no scheme is a tarball read off the operator's
         // own disk: it crosses no network, so it is no node-plane fetch.
         Operation::FetchSource { url } if !url.contains("://") => return,
-        // A web source fetched in the box's classifier leaf, under the
-        // box's egress verdict (NET-155), is the box's traffic, not the
-        // node plane's.
-        Operation::FetchSource { url } if record.sources_placed && is_web(url) => {
+        // A source is a package build's traffic, under the box's rules
+        // (NET-155), and never the node plane's.
+        Operation::FetchSource { url } => {
             tracing::debug!(
                 box_id = %record.box_id,
                 host = %url_host(url),
                 object = %url_object(url),
-                "a web source fetched in the box's classifier leaf is the box's own fetch, \
-                 so the node plane keeps no record of it",
+                "a source is the box's own fetch, so the node plane keeps no record of it",
             );
             return;
         }
-        Operation::FetchSource { url } => (url_host(url), url_object(url)),
         Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
         _ => return,
     };
@@ -256,18 +249,6 @@ pub(crate) struct FetchRecord {
     /// the upstream version appended when the graph knows one — the same
     /// spelling `min search` answers with.
     pub(crate) objects: BTreeMap<String, String>,
-    /// The install's `http` and `https` sources are fetched in the box's
-    /// classifier leaf (NET-155), so they are the box's traffic and not
-    /// recorded here. `false` when the box has no leaf: the daemon then
-    /// fetches them from its own cgroup, and they are recorded.
-    pub(crate) sources_placed: bool,
-}
-
-/// The URL's scheme is `http` or `https`: the sources a placed download
-/// fetches in the box's classifier leaf.
-fn is_web(url: &str) -> bool {
-    url.split_once("://")
-        .is_some_and(|(scheme, _)| matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https"))
 }
 
 /// Relays `events` to the helper through `on_event` until the stream ends,
@@ -761,7 +742,6 @@ mod tests {
             leaf: Some(sandbox::classifier::DAEMON_LEAF),
             cache_host: "cache.minimal.dev".to_string(),
             objects: BTreeMap::from([("jq".to_string(), "jq (version 1.7.1)".to_string())]),
-            sources_placed: true,
         }
     }
 
@@ -934,74 +914,35 @@ mod tests {
         );
     }
 
-    /// NET-155: a web source a box's build fetches in the box's leaf — one
-    /// that carries a credential too — is never recorded as node-plane traffic, so neither
-    /// its URL nor its credential reaches the log through the record.
+    /// NET-155: a source is a package build's traffic, never the node
+    /// plane's, wherever it is fetched. No `http`, `https` or `gs://` source
+    /// is recorded, so neither a URL nor a credential in it reaches the log
+    /// through the record.
     #[test]
-    fn a_web_source_is_not_recorded_as_node_plane_traffic() {
-        let root = OpTracker::new_root();
-        let url = "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz?X-Amz-Signature=deadbeef";
-        let (log, _guard) = capture_log();
-        let _progress =
-            SandboxProgress::new(Some(root.clone()), None).with_fetch_record(fetch_record());
-        let _source = root.new_child().with_op(Operation::FetchSource {
-            url: url.to_string(),
-        });
-
-        let recorded = log.contents();
-        assert!(
-            !recorded.contains("node-plane traffic"),
-            "a web source is the box's fetch: {recorded}"
-        );
-        assert!(
-            !recorded.contains("ghp_deadbeef") && !recorded.contains("X-Amz-Signature"),
-            "neither the token nor the signature reaches the log: {recorded}"
-        );
-    }
-
-    /// NET-080: the daemon still records the sources it fetches from its own
-    /// cgroup. A `gs://` source leaves from the daemon even when the box has
-    /// a leaf. A web source of a box with no leaf leaves from the daemon too.
-    /// Each record names the host and the object, with neither the URL's
-    /// credentials nor its query.
-    #[test]
-    fn an_unplaced_or_gs_source_is_recorded_as_node_plane_traffic() {
-        let root = OpTracker::new_root();
-        let (log, _guard) = capture_log();
-        let _placed =
-            SandboxProgress::new(Some(root.clone()), None).with_fetch_record(fetch_record());
-        let _gs = root.new_child().with_op(Operation::FetchSource {
-            url: "gs://sources-bucket/pkg-1.0.tar.gz".to_string(),
-        });
-        let lines = records(&log);
-        assert_eq!(lines.len(), 1, "the gs:// source is recorded: {lines:?}");
-        assert!(lines[0].contains("sources-bucket"), "{lines:?}");
-        drop(_placed);
-        drop(_gs);
-
-        let root = OpTracker::new_root();
-        let (log, _guard) = capture_log();
-        let _unplaced =
-            SandboxProgress::new(Some(root.clone()), None).with_fetch_record(FetchRecord {
-                sources_placed: false,
-                ..fetch_record()
+    fn no_source_is_recorded_as_node_plane_traffic() {
+        for url in [
+            "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz?X-Amz-Signature=deadbeef",
+            "http://downloads.example.org/pkg-1.0.tar.gz",
+            "gs://sources-bucket/pkg-1.0.tar.gz",
+        ] {
+            let root = OpTracker::new_root();
+            let (log, _guard) = capture_log();
+            let _progress =
+                SandboxProgress::new(Some(root.clone()), None).with_fetch_record(fetch_record());
+            let _source = root.new_child().with_op(Operation::FetchSource {
+                url: url.to_string(),
             });
-        let url = "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz?X-Amz-Signature=deadbeef";
-        let _source = root.new_child().with_op(Operation::FetchSource {
-            url: url.to_string(),
-        });
-        let lines = records(&log);
-        assert_eq!(lines.len(), 1, "the unplaced source is recorded: {lines:?}");
-        let line = &lines[0];
-        assert!(line.contains("host=github.com"), "{line}");
-        assert!(
-            line.contains("object=https://github.com/example/example/archive/v1.tar.gz"),
-            "{line}"
-        );
-        assert!(
-            !line.contains("ghp_deadbeef") && !line.contains("X-Amz-Signature"),
-            "neither the token nor the signature reaches the log: {line}"
-        );
+
+            let recorded = log.contents();
+            assert!(
+                !recorded.contains("node-plane traffic"),
+                "a source is the box's fetch: {recorded}"
+            );
+            assert!(
+                !recorded.contains("ghp_deadbeef") && !recorded.contains("X-Amz-Signature"),
+                "neither the token nor the signature reaches the log: {recorded}"
+            );
+        }
     }
 
     /// NET-080: a fetch that starts and ends between two paints — gone from

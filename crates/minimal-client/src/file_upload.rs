@@ -44,6 +44,35 @@ pub fn is_vcs_root(dir: &Path) -> bool {
     VCS_MARKERS.iter().any(|marker| dir.join(marker).exists())
 }
 
+/// The repository path a `.git` *file* at the root of `dir` points at
+/// (`gitdir: <path>`: a linked worktree's, absolute, or a submodule checked
+/// out on its own, relative and above the root), or `None` when `dir` has
+/// no such file or the file holds no pointer: a plain checkout keeps a
+/// `.git` directory, and a directory with no `.git` is not a worktree.
+/// That path is outside what the box receives, so the upload leaves the
+/// file out ([`stream_tar_zstd`]) and the caller says so, by this one
+/// test, so the two never disagree (gominimal/inbox#854). The pointer is
+/// returned as the file holds it: a caller that prints it escapes it.
+pub fn linked_worktree_gitdir(dir: &Path) -> Option<String> {
+    let marker = dir.join(".git");
+    // the walk's own test (`DirEntry::file_type`, which follows no symlink):
+    // a `.git` that is a symlink travels as the symlink it is
+    if !std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    // git writes the pointer as bytes: a host path need not be UTF-8, and
+    // the file is left out either way; a byte that is not UTF-8 shows as
+    // U+FFFD where the pointer is printed
+    let bytes = std::fs::read(&marker).ok()?;
+    let line = bytes.split(|b| *b == b'\n').next()?;
+    let pointer = String::from_utf8_lossy(line);
+    pointer
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+}
+
 /// Returns `true` when activating from `dir` should skip the workspace
 /// upload without prompting: either `dir` is empty (nothing to sync) or
 /// it is the user's home directory (`home`). An empty box has nothing
@@ -627,6 +656,28 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                         .context(format!("getting file type for {}", entry_path.display())));
                 }
             };
+
+            // A linked worktree's `.git` is a file holding a host path the
+            // box cannot reach; uploaded, it makes every git command in the
+            // box fail, `git config --global` included, since git resolves
+            // the repository first. Left out, the box holds the files and no
+            // repository, which git says plainly (gominimal/inbox#854). The
+            // test is [`linked_worktree_gitdir`]'s, the one the caller's
+            // notice reads, so a file is left out exactly when the person is
+            // told; a root `.git` file with no `gitdir:` pointer travels as
+            // it is, and so do a `.git` directory and a `.git` file below the
+            // root (a submodule's).
+            if prefix.is_empty()
+                && name_str == ".git"
+                && file_type.is_file()
+                && linked_worktree_gitdir(root).is_some()
+            {
+                tracing::info!(
+                    "leaving out {}: its gitdir pointer names a path outside the project",
+                    entry_path.display()
+                );
+                continue;
+            }
 
             if file_type.is_dir() {
                 let mut header = async_tar::Header::new_gnu();
@@ -1433,6 +1484,98 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(".git"), "gitdir: /some/elsewhere\n").unwrap();
         assert!(is_vcs_root(dir.path()));
+    }
+
+    /// gominimal/inbox#854: the pointer a linked worktree's `.git` file
+    /// holds is read; a `.git` directory and no `.git` at all read as none.
+    #[test]
+    fn linked_worktree_gitdir_reads_the_pointer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(linked_worktree_gitdir(dir.path()), None);
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /home/me/repo/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        assert_eq!(
+            linked_worktree_gitdir(dir.path()).as_deref(),
+            Some("/home/me/repo/.git/worktrees/feature")
+        );
+        std::fs::remove_file(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(linked_worktree_gitdir(dir.path()), None);
+    }
+
+    /// The pointer is read as the bytes git wrote: a host path that is not
+    /// UTF-8 is still a pointer, shown with U+FFFD for the byte, and the file
+    /// is still left out; and a `.git` that is a symlink to a pointer file is
+    /// no pointer here, as it is none to the walk, which follows no symlink,
+    /// so it travels as the symlink it is and the person is told nothing.
+    #[tokio::test]
+    async fn linked_worktree_gitdir_reads_bytes_and_follows_no_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            b"gitdir: /home/me/r\xffepo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        let pointer = linked_worktree_gitdir(dir.path()).expect("a pointer");
+        assert_eq!(pointer, "/home/me/r\u{FFFD}epo/.git/worktrees/x");
+        let paths = stream_and_list(dir.path()).await;
+        assert!(!paths.iter().any(|p| p == ".git"), "{paths:?}");
+
+        std::fs::remove_file(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join("pointer"),
+            "gitdir: /home/me/repo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("pointer", dir.path().join(".git")).unwrap();
+        assert_eq!(linked_worktree_gitdir(dir.path()), None);
+        let paths = stream_and_list(dir.path()).await;
+        assert!(paths.iter().any(|p| p == ".git"), "{paths:?}");
+    }
+
+    /// gominimal/inbox#854: a linked worktree's `.git` file is left out of
+    /// the upload, the files beside it are not, and a `.git` file below the
+    /// root (a submodule's) still travels.
+    #[tokio::test]
+    async fn a_linked_worktrees_git_file_is_left_out() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /home/me/repo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        std::fs::create_dir(dir.path().join("vendored")).unwrap();
+        std::fs::write(
+            dir.path().join("vendored/.git"),
+            "gitdir: ../.git/modules/vendored\n",
+        )
+        .unwrap();
+
+        let paths = stream_and_list(dir.path()).await;
+        assert!(paths.iter().any(|p| p == "hello.txt"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p == ".git"),
+            "the worktree's .git file travelled: {paths:?}"
+        );
+        assert!(paths.iter().any(|p| p == "vendored/.git"), "{paths:?}");
+    }
+
+    /// The upload and the notice share one test: a root `.git` file that
+    /// holds no `gitdir:` pointer is not a worktree's, so it travels as it
+    /// is, where the person would be told nothing.
+    #[tokio::test]
+    async fn a_root_git_file_without_a_pointer_travels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".git"), "not a pointer\n").unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        assert_eq!(linked_worktree_gitdir(dir.path()), None);
+        let paths = stream_and_list(dir.path()).await;
+        assert!(paths.iter().any(|p| p == ".git"), "{paths:?}");
+        assert!(paths.iter().any(|p| p == "hello.txt"), "{paths:?}");
     }
 
     /// A writer that accepts a small amount of data then parks forever,

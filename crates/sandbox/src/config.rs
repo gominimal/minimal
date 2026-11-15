@@ -480,6 +480,33 @@ pub struct Invocation {
 }
 
 impl Config {
+    /// The session tree, home or workbench, that the host path `host` is in,
+    /// with the tree's host path, `host` relative to it, and how the box
+    /// shows the tree (`~`, `/workbench`) with its name, for a refusal;
+    /// `None` outside a session layout or outside both trees.
+    #[cfg(target_os = "linux")]
+    fn session_tree_of(&self, host: &Path) -> Option<(PathBuf, PathBuf, String, &'static str)> {
+        let WdSetup::Session {
+            home,
+            working,
+            working_name_override,
+            ..
+        } = &self.wd
+        else {
+            return None;
+        };
+        // The same trees, lookup and view the closure's binds use
+        // (`session_bind`), so the daemon's create and the closure's bind
+        // pick one tree for a host path and name it one way.
+        let wd = working_name_override
+            .as_deref()
+            .unwrap_or(crate::SESSION_DEFAULT_WD);
+        let trees = crate::session_bind::Tree::session(home, working, wd);
+        let (tree, rel) = crate::session_bind::in_tree(&trees, host)?;
+        let view = crate::session_bind::TreeView::of(&tree.mount, tree.name);
+        Some((tree.host.clone(), rel, view.shown.to_string(), tree.name))
+    }
+
     /// The home directory a command in this sandbox sees, as an absolute path
     /// inside the sandbox. One definition, used for both `$HOME` and the
     /// synthesized passwd entry so the two can never disagree.
@@ -811,6 +838,27 @@ impl Config {
         self
     }
 
+    /// The CPU weight the sandbox asks hakoniwa to apply, if any.
+    ///
+    /// hakoniwa applies a weight by moving the sandbox's first process into
+    /// a systemd scope of its own (`hakoniwa.slice`, under the user manager
+    /// for a daemon that is not root) before the pre-exec closure runs. A
+    /// box with a classifier leaf must then move that process into its leaf
+    /// (NET-079), and the kernel allows the move only to a writer of the
+    /// `cgroup.procs` of the closest cgroup the two share, which from such a
+    /// scope is the root cgroup: the join fails with `EACCES` and the box's
+    /// package build never runs (gominimal/inbox#1219). So a box with a
+    /// leaf gets no weight here: the leaf, not a scope, is the cgroup its
+    /// processes belong to.
+    #[must_use]
+    pub fn hakoniwa_cpu_weight(&self) -> Option<u64> {
+        if self.classifier_leaf.is_some() {
+            None
+        } else {
+            self.cpu_weight
+        }
+    }
+
     /// Sets the identifier for the process/daemon doing the build.
     pub fn with_daemon_id(mut self, id: String) -> Self {
         self.daemon_id = Some(id);
@@ -959,16 +1007,38 @@ impl Config {
                     }
 
                     // Missing and needs to be created.
+                    let contents = if m.host_path.ends_with(".json") {
+                        "{}"
+                    } else {
+                        ""
+                    };
+                    // Inside a session's home or workbench the box owns every
+                    // name, and a dangling link there would carry `fs::write`
+                    // or `create_dir_all` out of the tree. The path is created
+                    // beneath the tree, never out of it (inbox#1152).
+                    #[cfg(target_os = "linux")]
+                    if let Some((root, rel, shown, name)) =
+                        self.session_tree_of(Path::new(&m.host_path))
+                    {
+                        let view = crate::session_bind::TreeView {
+                            shown: &shown,
+                            name,
+                        };
+                        let bytes = contents.as_bytes();
+                        let created = crate::session_bind::create_beneath(
+                            &root, view, &rel, m.is_file, bytes,
+                        );
+                        created.map_err(|e| {
+                            Error::IO(
+                                "create mapped path in the session's home or workbench",
+                                m.host_path.clone().into(),
+                                e,
+                            )
+                        })?;
+                        continue;
+                    }
                     if m.is_file {
-                        fs::write(
-                            &m.host_path,
-                            if m.host_path.ends_with(".json") {
-                                "{}"
-                            } else {
-                                ""
-                            },
-                        )
-                        .map_err(|e| {
+                        fs::write(&m.host_path, contents).map_err(|e| {
                             Error::IO("create mapped file", m.host_path.clone().into(), e)
                         })?;
                     } else {
@@ -1428,6 +1498,35 @@ mod tests {
                  constructor's, so no caller can spell a leaf the cohort owns"
             );
         }
+    }
+
+    /// gominimal/inbox#1219: a build placed for a box carries both a CPU
+    /// weight and the box's leaf, and the weight's scope would take the
+    /// build's process out of the daemon's tree before it joins the leaf.
+    /// The leaf wins; a build with no leaf keeps its weight.
+    #[test]
+    fn a_box_with_a_classifier_leaf_gets_no_hakoniwa_cpu_weight() {
+        let weighted = Config::new("build").with_cpu_weight(160);
+        assert_eq!(
+            weighted.hakoniwa_cpu_weight(),
+            Some(160),
+            "a build with no leaf is weighted as before"
+        );
+        let placed = weighted.with_classifier_leaf(ClassifierLeaf::new(
+            "/sys/fs/cgroup/minimald.slice/boxes/allow/b1",
+        ));
+        assert_eq!(
+            placed.hakoniwa_cpu_weight(),
+            None,
+            "a build in a box's leaf must not be moved into a scope of its \
+             own first, or its join of the leaf is refused"
+        );
+        assert_eq!(
+            placed.cpu_weight,
+            Some(160),
+            "the weight the caller set is kept, only not applied"
+        );
+        assert_eq!(Config::new("build").hakoniwa_cpu_weight(), None);
     }
 
     /// A leaf's verdict reads back off its path: the caller that knows the

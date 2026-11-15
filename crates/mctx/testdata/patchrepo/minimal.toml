@@ -1,0 +1,14 @@
+# A project whose task declares a patch the tests' user policy denies
+# (inbox#1128). The path need not exist: the gate refuses it by name, before
+# any package is built or any sandbox assembled.
+[upstream]
+dir = "../fakepkgs"
+
+[tasks.peek-denied]
+packages = ["uroot"]
+exec = "/bbin/cat /min-test-1128-denied/key.txt"
+patch.dir."/min-test-1128-denied" = "read-only"
+
+[tasks.no-patches]
+packages = ["uroot"]
+exec = "/bbin/date"

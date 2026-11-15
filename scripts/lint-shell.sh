@@ -48,7 +48,9 @@ fi
 
 failed=0
 checked=0
-for f in "$here"/*.sh; do
+# Recurse: scripts/metrics/ and scripts/lib/ hold shell too, and a script
+# nobody lints is the one that breaks in the nightly.
+while IFS= read -r f; do
     [ -e "$f" ] || continue
     # Only lint files that actually declare a shell interpreter.
     read -r shebang <"$f" || true
@@ -60,7 +62,7 @@ for f in "$here"/*.sh; do
     if ! shellcheck "$f"; then
         failed=$((failed + 1))
     fi
-done
+done < <(find "$here" -name '*.sh' -type f | sort)
 
 if [ "$checked" -eq 0 ]; then
     # Discovery broke (moved scripts, wrong $here) — never pass green having

@@ -21,6 +21,7 @@ impl BoxMessage {
             Self::IsBusy { .. } => "IsBusy",
             Self::Stop { .. } => "Stop",
             Self::StopBox { .. } => "StopBox",
+            Self::RestartBox { .. } => "RestartBox",
             Self::Destroy { .. } => "Destroy",
             Self::DestroyIfUnfinalized(_) => "DestroyIfUnfinalized",
             Self::GetRecord { .. } => "GetRecord",
