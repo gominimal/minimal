@@ -3107,6 +3107,8 @@ pub(crate) fn add_vpn_network_names(
     }
     // `network.vpn_network_names` is outside the projection, so the
     // client digest that `put_spec` set stays the digest of this spec.
+    // vpn_network_names_keep_the_client_digest_equal_to_the_daemon_digest
+    // pins this.
     Ok(())
 }
 
@@ -5046,6 +5048,40 @@ mod tests {
 
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         assert!(stamp_session_spec(&mut request, root).is_err());
+    }
+
+    /// BOX-071, BOX-072: `--vpn-network-names` edits the sent spec after
+    /// `put_spec` set the client digest. The edit is outside the
+    /// projection, so the daemon's digest of the sent JSON still equals
+    /// the client digest, and the daemon does not refuse the create.
+    #[test]
+    fn vpn_network_names_keep_the_client_digest_equal_to_the_daemon_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "vpn",
+            paths::HostAbsPath::try_new(root.to_path_buf()).unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        );
+        stamp_session_spec(&mut request, root).unwrap();
+        let client = request
+            .config
+            .client_projection_digest()
+            .expect("put_spec sets the client digest")
+            .to_owned();
+
+        add_vpn_network_names(&mut request, &["corp".to_owned(), "lab".to_owned()]).unwrap();
+
+        let wire = request.spec.as_ref().expect("the spec is on the request");
+        assert_eq!(
+            wire["network"]["vpn_network_names"],
+            serde_json_lenient::json!(["corp", "lab"])
+        );
+        let daemon = mfile::projection::spec_digest(wire, boxes::SESSION_BOX_TYPE)
+            .expect("the sent spec projects");
+        assert_eq!(request.config.client_projection_digest(), Some(daemon.as_str()));
+        assert_eq!(client, daemon);
     }
 
     /// BOX-001: with no tarball upload root, a subdirectory resolves to the
