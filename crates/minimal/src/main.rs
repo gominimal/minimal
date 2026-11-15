@@ -232,6 +232,13 @@ fn answer_failure(
         return ExitCode::from(minimal::BoxTimedOut::EXIT_CODE);
     }
     let _ = writeln!(stderr, "error: {e:#}");
+    // BCLI-013: a wait that its `--timeout` ended gives the next step on
+    // its own line, as the machine-mode object gives it in `hint`.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxTimedOut>()
+        && !timed_out.hint().is_empty()
+    {
+        let _ = writeln!(stderr, "{}", timed_out.hint());
+    }
     if let Some(hint) = alias_hint {
         let _ = writeln!(stderr, "{hint}");
     }
@@ -256,7 +263,10 @@ fn answer_failure(
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
 /// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
-/// is not running, 5 when its spec turns exec off), the code a start
+/// is not running, 5 when its spec turns exec off), the code an `--exec
+/// <id>` refusal of `min box stop`, `logs` or `wait` carries
+/// (`minimal::BoxExecIdRefusal`: 2 for text that is not an exec id, 4 for an
+/// exec the box does not have), the code a start
 /// refusal carries (`minimal::StartEntryRefusal`: 4 when the start does not
 /// find the entry, 2 when it cannot pick or start it), 2 when a start needs a terminal
 /// it does not have (`minimal::StartNeedsTerminal`) or asks for a held name
@@ -291,6 +301,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
         return minimal::BoxRenameRefusal::EXIT_CODE;
     }
+    // BCLI-074: `min box restart` refused, such as for a box that runs to
+    // completion (exit 2). The refusal carries its own code, never 0.
+    if let Some(refusal) = e.downcast_ref::<minimald_rpc::RestartRefusal>() {
+        return refusal.exit_code.max(1);
+    }
     // BCLI-005: `min box prune` off a terminal without `--yes`.
     if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
         return minimal::PruneNeedsYes::EXIT_CODE;
@@ -320,6 +335,14 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
         return 3;
     }
+    // BCLI-019, BCLI-020: `min type` of a project whose box types do not
+    // load exits 3, and `min type show` of a name that is no type exits 4.
+    if e.downcast_ref::<minimal::BoxTypesInvalid>().is_some() {
+        return minimal::BoxTypesInvalid::EXIT_CODE;
+    }
+    if e.downcast_ref::<minimal::BoxTypeNotFound>().is_some() {
+        return minimal::BoxTypeNotFound::EXIT_CODE;
+    }
     // BEP-007: a GitHub grant the box cannot receive in its environment.
     if e.downcast_ref::<minimal::GrantNotDelivered>().is_some() {
         return 3;
@@ -338,13 +361,20 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
     }
-    // BCLI-068: `min box attach` refused, or its connection failed.
+    // BCLI-068, BCLI-007, BCLI-009, BCLI-032: `min box attach`, `min box
+    // resume` or `min session attach` refused, or its connection failed.
     if let Some(refused) = e.downcast_ref::<minimal::BoxAttachRefusal>() {
         return refused.exit_code();
     }
     // BCLI-053: `min box exec -t` without a terminal, or into a box that is
     // not running (2), or whose spec turns exec off (5).
     if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-055, BCLI-056, BCLI-057: `--exec <id>` on `min box stop`, `logs`
+    // or `wait` with text that is not an exec id (2), or an exec id the box
+    // does not have (4).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxExecIdRefusal>() {
         return refused.exit_code();
     }
     // BCLI-053: an exec that its own timeout ended.
@@ -452,6 +482,14 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             hint,
         ));
     }
+    // BCLI-020: `min type show` of a name that is no type is `not_found`.
+    if e.downcast_ref::<minimal::BoxTypeNotFound>().is_some() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            "not_found",
+            format!("{e:#}"),
+            minimal::BoxTypeNotFound::HINT.to_string(),
+        ));
+    }
     // BCLI-053: an exec that its own timeout ended is `timeout`.
     if let Some(timed_out) = e.downcast_ref::<minimal::BoxExecTimedOut>() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
@@ -467,6 +505,15 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             timed_out.code(),
             format!("{e:#}"),
             timed_out.hint().to_string(),
+        ));
+    }
+    // BCLI-033: a box address refusal answers with the error kind its exit
+    // code stands for: `not_found` (4), `host_unreachable` (7) or `ambiguous` (2).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            refused.code(),
+            format!("{e:#}"),
+            refused.hint().to_string(),
         ));
     }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
@@ -630,6 +677,18 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Events(args),
         })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
+        // BCLI-033: a `min box show -o json|yaml` failure is one
+        // `min/v1/error` object.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Show(args),
+        })) => args.output.is_some(),
+        // BCLI-019, BCLI-020: `min type list|show -o json|yaml|toml`.
+        Some(minimal::Command::Type(minimal::TypeArgs {
+            command: minimal::TypeCommand::List(minimal::TypeListArgs { output }),
+        })) => output.is_some(),
+        Some(minimal::Command::Type(minimal::TypeArgs {
+            command: minimal::TypeCommand::Show(args),
+        })) => args.output.is_some(),
         _ => false,
     }
 }
@@ -664,6 +723,50 @@ mod tests {
     use super::*;
     use minimal::Command;
 
+    /// BCLI-019, BCLI-020: `min type` exits 3 when the project's box types
+    /// do not load, and 4 for a name that is no type. Its `-o` forms are a
+    /// machine mode, and the unknown name is `not_found` there.
+    #[test]
+    fn type_refusals_exit_3_and_4() {
+        let parse = toml::from_str::<toml::Table>("[").unwrap_err();
+        let invalid = anyhow::Error::new(minimal::BoxTypesInvalid {
+            doing: "list the box types",
+            cause: minimal::BoxTypesCause::Parse {
+                path: "minimal.toml".into(),
+                error: parse,
+            },
+        });
+        assert_eq!(failure_exit_code(&invalid), 3);
+        let not_found = anyhow::Error::new(minimal::BoxTypeNotFound {
+            name: "nope".to_owned(),
+        });
+        assert_eq!(failure_exit_code(&not_found), 4);
+        let MachineModeAnswer::Object(failure) = machine_mode_answer(&not_found) else {
+            panic!("a not-found refusal is an error object");
+        };
+        assert_eq!(failure.code(), "not_found");
+
+        for (output, machine) in [(Some(minimal::TypeOutputFormat::Yaml), true), (None, false)] {
+            let list = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Type(minimal::TypeArgs {
+                    command: minimal::TypeCommand::List(minimal::TypeListArgs { output }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&list), machine);
+            let show = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Type(minimal::TypeArgs {
+                    command: minimal::TypeCommand::Show(minimal::TypeShowArgs {
+                        name: "session".to_owned(),
+                        output,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&show), machine);
+        }
+    }
+
     /// A bare `min` (no subcommand) keeps stdout clean: the non-TTY twin
     /// promises pipelines an empty stdout, so its tracing must go to stderr.
     #[test]
@@ -694,6 +797,7 @@ mod tests {
                 path: None,
                 network: None,
                 egress: minimal::EgressArgs::default(),
+                other: minimal::BoxOverrideArgs::default(),
                 detach: false,
                 args: vec![],
             }),
@@ -1132,6 +1236,45 @@ mod tests {
         );
     }
 
+    /// BCLI-033: under `min box show -o json`, a box that is not found is
+    /// one `min/v1/error` object on stderr. The text form is not a machine
+    /// mode.
+    #[test]
+    fn box_show_output_json_writes_box_with_execs_refusal_as_error_object() {
+        for (output, machine) in [
+            (Some(minimal::BoxShowOutputFormat::Json), true),
+            (Some(minimal::BoxShowOutputFormat::Yaml), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Show(minimal::BoxShowArgs {
+                        target: "web".to_owned(),
+                        network: false,
+                        output,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+        let refusal = anyhow::Error::from(minimal::BoxAddressRefusal::NotFound {
+            address: "web".to_owned(),
+        });
+        let MachineModeAnswer::Object(failure) = machine_mode_answer(&refusal) else {
+            panic!("a not-found box is an error object");
+        };
+        let line = machine_mode_error_line(&failure).unwrap();
+        let object: serde_json_lenient::Value = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(object["schema"], "min/v1/error", "{line}");
+        assert_eq!(object["code"], "not_found", "{line}");
+        assert!(
+            object["message"].as_str().unwrap().contains("web"),
+            "{line}"
+        );
+        assert_eq!(failure_exit_code(&refusal), 4);
+    }
+
     #[test]
     fn box_address_refusals_exit_with_their_codes() {
         let address = |s: &str| s.to_owned();
@@ -1159,6 +1302,61 @@ mod tests {
         ] {
             let err = anyhow::Error::from(refusal).context("showing the box");
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    #[test]
+    fn box_address_refusals_answer_with_their_error_kinds() {
+        let address = |s: &str| s.to_owned();
+        for (refusal, kind, exit) in [
+            (
+                minimal::BoxAddressRefusal::NotFound {
+                    address: address("web"),
+                },
+                "not_found",
+                4,
+            ),
+            (
+                minimal::BoxAddressRefusal::Unreachable {
+                    address: address("web"),
+                    hosts: vec![address("beta.local-minvmd0")],
+                },
+                "host_unreachable",
+                7,
+            ),
+            (
+                minimal::BoxAddressRefusal::Ambiguous {
+                    name: address("web"),
+                    candidates: Vec::new(),
+                },
+                "ambiguous",
+                2,
+            ),
+            (
+                minimal::BoxAddressRefusal::AmbiguousIdStart {
+                    start: address("01"),
+                    candidates: Vec::new(),
+                },
+                "ambiguous",
+                2,
+            ),
+        ] {
+            let text = refusal.to_string();
+            let hint = refusal.hint();
+            let err = anyhow::Error::from(refusal).context("showing the box");
+            let MachineModeAnswer::Object(failure) = machine_mode_answer(&err) else {
+                panic!("a box address refusal is an error object: {err:#}");
+            };
+            let line = machine_mode_error_line(&failure).unwrap();
+            let object: serde_json_lenient::Value = serde_json_lenient::from_str(&line).unwrap();
+            assert_eq!(object["schema"], "min/v1/error", "{line}");
+            assert_eq!(object["code"], kind, "{line}");
+            assert!(
+                object["message"].as_str().unwrap().contains(&text),
+                "{line}"
+            );
+            assert_eq!(object["hint"], hint, "{line}");
+            assert_eq!(failure_exit_code(&err), exit, "{err:#}");
         }
     }
 
@@ -1288,7 +1486,11 @@ mod tests {
         for (timed_out, code) in [
             (minimal::BoxTimedOut::ended("web"), "timeout"),
             (
-                minimal::BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s"),
+                minimal::BoxTimedOut::waited(
+                    Some("web"),
+                    "0190a3c4-0000-7000-8000-000000000000",
+                    "30s",
+                ),
                 "wait_timeout",
             ),
         ] {
@@ -1315,7 +1517,11 @@ mod tests {
                 ExitCode::from(124)
             );
             let text = String::from_utf8(stderr).unwrap();
-            assert_eq!(text, format!("error: {timed_out}\n"));
+            let hint = match timed_out.hint() {
+                "" => String::new(),
+                hint => format!("{hint}\n"),
+            };
+            assert_eq!(text, format!("error: {timed_out}\n{hint}"));
         }
 
         // `min task run` and `min box run`: a box that its timeout ended
@@ -1405,6 +1611,57 @@ mod tests {
             ),
         ] {
             let err = anyhow::Error::new(refusal).context("copying the file");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    /// BCLI-007, BCLI-009, BCLI-032: the refusals of `min box resume` and
+    /// `min session attach` end the run with their exit codes.
+    #[test]
+    fn resume_and_session_attach_refusals_map_to_exit_codes() {
+        let id = boxes::SessionId::parse_str("0199f000-0000-7000-8000-000000000001").unwrap();
+        for (refusal, code) in [
+            (
+                minimal::BoxAttachRefusal::NoTerminalToResume {
+                    address: "web".to_owned(),
+                    until_stopped: true,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NotResumable {
+                    address: "web".to_owned(),
+                    state: "running".to_owned(),
+                    pty_enabled: true,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NotResumable {
+                    address: "web".to_owned(),
+                    state: "running".to_owned(),
+                    pty_enabled: false,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::NameHeld {
+                    address: "web".to_owned(),
+                    name: "web".to_owned(),
+                    holder: id,
+                    box_id: id,
+                },
+                2,
+            ),
+            (
+                minimal::BoxAttachRefusal::AmbiguousSessions {
+                    candidates: Vec::new(),
+                },
+                2,
+            ),
+            (minimal::BoxAttachRefusal::NoSessionCandidate, 4),
+        ] {
+            let err = anyhow::Error::new(refusal);
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
         }
     }
@@ -1525,6 +1782,51 @@ mod tests {
         };
         let e = anyhow::Error::new(invalid).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// An invalid project `minimal.toml` that does not parse prints its TOML
+    /// parse error once, and the run ends with exit 3.
+    #[test]
+    fn invalid_project_file_prints_toml_error_once() {
+        let error = mfile::entry::read_entries(b"[boxes.dev\ntype = \"session\"\n")
+            .expect_err("the file does not parse");
+        assert!(matches!(error, mfile::Error::Format(_)), "{error:?}");
+        let e = anyhow::Error::new(minimal::ProjectFileInvalid { error })
+            .context("activating the session");
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(
+            printed.contains(
+                "Cannot start the box: the project's minimal.toml does not load: \
+                 invalid TOML: TOML parse error"
+            ),
+            "{printed}"
+        );
+        assert_eq!(printed.matches("TOML parse error").count(), 1, "{printed}");
+        assert_eq!(printed.matches("invalid TOML").count(), 1, "{printed}");
+        assert_eq!(printed.matches("[boxes.dev").count(), 1, "{printed}");
+    }
+
+    /// A project `minimal.toml` that cannot be read prints its io error
+    /// once, and the run ends with exit 3.
+    #[test]
+    fn invalid_project_file_prints_toml_error_once_for_io() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied here");
+        let error = mfile::Error::IO("minimal file", "/p/minimal.toml".into(), io);
+        let e = anyhow::Error::new(minimal::ProjectFileInvalid { error })
+            .context("activating the session");
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        let printed = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, ExitCode::from(3), "{printed}");
+        assert!(printed.contains("/p/minimal.toml"), "{printed}");
+        assert_eq!(
+            printed.matches("access denied here").count(),
+            1,
+            "{printed}"
+        );
     }
 
     /// A broken pipe anywhere in the error chain is classified as such, so

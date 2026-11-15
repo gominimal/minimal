@@ -13,7 +13,7 @@ session needs; a loadout carries what *you* want on top (your editor,
 terminal multiplexer, shell config, and dotfiles) so each development
 environment comes up matching your muscle memory.
 
-Loadouts apply to sessions (`min session activate`); they are not used by task
+Loadouts apply to sessions (`min session start`); they are not used by task
 sandboxes, which have their own `packages`/`env_vars`/`patches` schema
 described in [Tasks](./tasks.md).
 
@@ -39,7 +39,7 @@ self-contained directory you can put under version control:
 
 ```console
 $ git clone git@example.com:you/helix-loadout ~/.config/minimal/loadouts/dev
-$ min session activate . --loadout dev
+$ min session start --loadout dev
 ```
 
 Nothing else changes between them, because a loadout's own directory is
@@ -116,7 +116,7 @@ project `minimal.toml` the same hooks nest under `[session]`, written
 `[[session.lifecycle_hooks]]`.
 
 Saved as `<config>/minimal/loadouts/dev.toml`, this is applied with
-`min session activate --loadout dev`, or automatically via
+`min session start --loadout dev`, or automatically via
 [`default_loadouts`](#client-config).
 
 ## Loadout schema
@@ -158,9 +158,12 @@ contributors are deduplicated.
 packages = ["helix", "zellij"]
 ```
 
-Names are not checked at activation: an unknown package composes cleanly
-and fails later, when the session first spawns, with
-`no such package: <name>`.
+Activation checks each name against the packages that the project and its
+`[upstream]` pin declare. An unknown name stops the activation with
+`no such package: <name>`. When the project pins a git `[upstream]`, the
+refusal also names the upstream repo and the short `locked_commit`. A package
+that is newer than that commit is unknown until the pin moves. Run
+`min update` to move the pin, then activate again.
 
 ### `[vars]` - Environment variables {#vars}
 
@@ -460,7 +463,7 @@ follow_symlinks = true
 
 ## Selecting loadouts at activation
 
-[`min session activate`](./cli-min.md#session-activate) decides which loadouts to apply
+[`min session start`](./cli-min.md#session-start) decides which loadouts to apply
 from two flags:
 
 | Flag | Description |
@@ -486,8 +489,8 @@ applied, the CLI prints `Applying loadouts: <names>` to stderr.
 Activation is also when loadout contents are captured: the files are read
 once, inherited vars are resolved against the host environment, and the
 composed result is what the session runs with. Editing a loadout file
-does not change sessions that already exist; destroy and re-activate to
-pick up the edit.
+does not change sessions that already exist. Remove the session with
+`min box rm --force <box>` and start a new one to pick up the edit.
 
 ## Built-in default loadout {#built-in-default-loadout}
 

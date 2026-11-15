@@ -15,7 +15,9 @@ use crate::core::source::{
 };
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::PendingId;
-use crate::wire::request::{ContributionResponse, ContributionVerdict, WireContribution};
+use crate::wire::request::{
+    ContributionResponse, ContributionVerdict, WireBoxEntry, WireContribution,
+};
 
 /// Daemon-side state retained across a `Pending` outcome. Fed back
 /// into [`resume_from_verdict`] once the client's verdict returns
@@ -157,9 +159,9 @@ impl SessionComposer {
         _options: ComposeOptions,
     ) -> Result<ComposeOutcome, ComposeError> {
         let Self {
-            client,
+            mut client,
             mut contribution,
-            env: _,
+            env,
         } = self;
         // Packages may not supply patches, nor vars that carry user data
         // (env-inherited values). Strip them before gating so they never
@@ -167,6 +169,12 @@ impl SessionComposer {
         // an item a package shares with a project or loadout still
         // composes in via that other source's own entry.
         contribution.drop_package_supplied_patches_and_user_data_vars();
+        // BOX-068: the project's part of the box comes from the expanded
+        // entry the client sent, when it sent one. Its items join the
+        // daemon's before the gate, so they face the same verdicts.
+        if let Some(entry) = client.entry.take() {
+            compose_entry(&mut contribution, *entry, &*env)?;
+        }
         let Contribution {
             vars,
             patches,
@@ -219,6 +227,104 @@ impl SessionComposer {
             },
         })
     }
+}
+
+/// Composes the expanded entry the client sent into the daemon's
+/// `contribution`, every item tagged as the project's (BOX-068).
+///
+/// A list the entry leaves out (`None`) leaves the daemon's own list of
+/// that kind as it is. A list it carries is applied as follows:
+///
+/// - `patches` and `lifecycle_hooks` replace the project's own items of
+///   that kind, so a present empty list leaves the project none.
+/// - `vars` and `vars_lenient` set each variable they name, in place of
+///   the project's value for it. The daemon folds the project's stack
+///   variables into its project list, so the project's other variables
+///   stay.
+/// - `packages` adds each package that the daemon does not have yet. The
+///   daemon's project list also holds the stack's packages, so none is
+///   removed.
+///
+/// Items from a package or a loadout are never touched.
+fn compose_entry(
+    contribution: &mut Contribution,
+    entry: WireBoxEntry,
+    env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<(), ComposeError> {
+    let WireBoxEntry {
+        name,
+        box_type,
+        project,
+        packages,
+        vars,
+        vars_lenient,
+        patches,
+        lifecycle_hooks,
+    } = entry;
+    tracing::info!(
+        entry = %name,
+        box_type = %box_type,
+        packages = ?packages.as_ref().map(Vec::len),
+        vars = ?vars.as_ref().map(std::collections::BTreeMap::len),
+        vars_lenient = ?vars_lenient.as_ref().map(Vec::len),
+        patches = ?patches.as_ref().map(crate::core::primitives::Patches::len),
+        lifecycle_hooks = ?lifecycle_hooks.as_ref().map(Vec::len),
+        "compose: composing the project from the received entry (absent lists keep the project's own)",
+    );
+    let source = Source::Project { path: project };
+    let is_project = |s: &Source| matches!(s, Source::Project { .. });
+    let incoming = crate::core::compose::contribute_primitives(
+        &source,
+        packages.clone().unwrap_or_default(),
+        vars.clone().unwrap_or_default(),
+        vars_lenient.clone().unwrap_or_default(),
+        patches.clone().unwrap_or_default(),
+        lifecycle_hooks.clone().unwrap_or_default(),
+        env,
+    )
+    .map_err(|e| ComposeError::InvalidWireItem {
+        what: "expanded entry",
+        context: format!("entry `{name}`: {e}"),
+    })?;
+    let Contribution {
+        vars: incoming_vars,
+        patches: incoming_patches,
+        packages: incoming_packages,
+        lifecycle_hooks: incoming_hooks,
+    } = incoming;
+
+    if patches.is_some() {
+        contribution.patches.retain(|p| !is_project(p.source()));
+        contribution.patches.extend(incoming_patches);
+    }
+    if lifecycle_hooks.is_some() {
+        contribution
+            .lifecycle_hooks
+            .retain(|h| !is_project(h.source()));
+        contribution.lifecycle_hooks.extend(incoming_hooks);
+    }
+    if vars.is_some() || vars_lenient.is_some() {
+        let names: std::collections::BTreeSet<String> = incoming_vars
+            .iter()
+            .map(|v| v.var().name().to_owned())
+            .collect();
+        contribution
+            .vars
+            .retain(|v| !(is_project(v.source()) && names.contains(v.var().name())));
+        contribution.vars.extend(incoming_vars);
+    }
+    if packages.is_some() {
+        for package in incoming_packages {
+            let held = contribution
+                .packages
+                .iter()
+                .any(|p| is_project(p.source()) && p.package() == package.package());
+            if !held {
+                contribution.packages.push(package);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Assemble a finalized [`Composition`] from the daemon's stashed
@@ -1129,5 +1235,110 @@ mod tests {
         assert_eq!(merged.var().name(), "EDITOR");
         assert_eq!(merged.var().value(), "hx");
         assert_eq!(merged.source(), &user_loadout());
+    }
+
+    /// BOX-068: the daemon composes the project's part of the box from
+    /// the expanded entry the client sent. A list the entry carries is
+    /// applied, an empty one included. A list it leaves out keeps the
+    /// daemon's own project items of that kind.
+    #[test]
+    fn daemon_composes_from_received_spec_keeping_absent_lists_apart() {
+        use crate::core::compose::{Composable, Contribution, Error};
+        use crate::core::lifecyclehook::{HookScript, LifecycleHook};
+        use crate::core::primitives::{ResolvedVar, StrictVarName, VarValue};
+        use crate::core::source::{ProvenancedHook, ProvenancedVar};
+        use crate::wire::primitives::WireVarSpec;
+        use crate::wire::request::WireBoxEntry;
+
+        /// What the daemon reads from the project's `[session]` table:
+        /// one package, two vars and one hook.
+        struct ProjectSession;
+        impl Composable for ProjectSession {
+            fn contribute(
+                self,
+                _env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+            ) -> Result<Contribution, Error> {
+                let src = Source::Project {
+                    path: paths::HostPath::try_new("/proj").unwrap(),
+                };
+                let mut c = Contribution::new();
+                c.push_package(ProvenancedPackage::new("ripgrep", src.clone()));
+                for (name, value) in [("EDITOR", "vi"), ("KEEP", "kept")] {
+                    let var = ResolvedVar::resolve_with(
+                        name.to_owned(),
+                        VarValue::specified(value),
+                        |_| Err(std::env::VarError::NotPresent),
+                    )?;
+                    c.push_var(ProvenancedVar::new(var, src.clone()));
+                }
+                let hook = LifecycleHook::builder()
+                    .with_on_activate(HookScript::inline("echo session"))
+                    .build()
+                    .expect("hook has a callback");
+                c.push_hook(ProvenancedHook::new(hook, src));
+                Ok(c)
+            }
+        }
+
+        let project = || paths::HostPath::try_new("/proj").unwrap();
+        let compose = |entry: WireBoxEntry| {
+            let mut composer = SessionComposer::new(WireContribution {
+                entry: Some(Box::new(entry)),
+                ..WireContribution::default()
+            });
+            composer.add(ProjectSession).unwrap();
+            match composer
+                .compose(nil_id(), ComposeOptions::default())
+                .unwrap()
+            {
+                ComposeOutcome::Pending { response, state } => (response, state),
+                ComposeOutcome::Ready(_) => panic!("project vars must reach the gate"),
+            }
+        };
+
+        // The entry carries packages, vars and an empty hook list, and no
+        // patches or lenient vars.
+        let mut entry = WireBoxEntry::new("default", "session", project());
+        entry.packages = Some(vec!["ripgrep".into(), "jq".into()]);
+        entry.vars = Some(
+            [(
+                StrictVarName::try_new("EDITOR").unwrap(),
+                VarValue::specified("hx"),
+            )]
+            .into(),
+        );
+        entry.lifecycle_hooks = Some(Vec::new());
+        let (response, state) = compose(entry);
+        let packages: Vec<&str> = state
+            .daemon_packages
+            .iter()
+            .map(ProvenancedPackage::package)
+            .collect();
+        assert_eq!(packages, ["ripgrep", "jq"], "packages add, each once");
+        let vars: Vec<(&str, &WireVarSpec)> = response
+            .vars
+            .iter()
+            .map(|v| (v.name.as_str(), &v.spec))
+            .collect();
+        assert_eq!(vars.len(), 2, "{vars:?}");
+        assert!(vars.iter().any(|(name, spec)| *name == "EDITOR"
+            && matches!(spec, WireVarSpec::Specified { value } if value == "hx")));
+        assert!(vars.iter().any(|(name, _)| *name == "KEEP"));
+        assert!(
+            response.lifecycle_hooks.is_empty(),
+            "a present empty hook list leaves the project none: {:?}",
+            response.lifecycle_hooks
+        );
+        assert_eq!(response.patches, []);
+        // The stash keeps the client's contribution without the entry.
+        assert_eq!(state.client_contribution.entry, None);
+
+        // An entry with no lists leaves every project list as it is.
+        let (response, state) = compose(WireBoxEntry::new("default", "session", project()));
+        assert_eq!(state.daemon_packages.len(), 1);
+        assert_eq!(response.vars.len(), 2);
+        assert!(response.vars.iter().any(|v| v.name == "EDITOR"
+            && matches!(&v.spec, WireVarSpec::Specified { value } if value == "vi")));
+        assert_eq!(response.lifecycle_hooks.len(), 1);
     }
 }

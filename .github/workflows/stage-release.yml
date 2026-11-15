@@ -185,3 +185,70 @@ jobs:
               env:
                   VERSION: ${{ needs.preflight.outputs.version }}
               run: echo "Staged \`$VERSION\`. Install it with \`install.sh --version $VERSION\`." >> "$GITHUB_STEP_SUMMARY"
+
+    notify:
+        # Tell #releases how the run ended, through gominimal/release-ops. Runs
+        # after every other job, also when one failed. A preflight that failed
+        # before it read the version still reports, with an empty version. A
+        # skipped preflight (dispatched off main) ran nothing to report, and a
+        # dry run is someone watching already.
+        needs: [preflight, check-line, dry-run, stage]
+        if: ${{ always() && !inputs.dry_run && needs.preflight.result != 'skipped' }}
+        # The minimal-backporter key lives in the `release` environment, which
+        # only main and release/* can deploy to.
+        environment: release
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions:
+            contents: read # check out the local release-event action
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Work out the outcome
+              id: result
+              env:
+                  PREFLIGHT: ${{ needs.preflight.result }}
+                  CHECK_LINE: ${{ needs.check-line.result }}
+                  DRY_RUN: ${{ needs.dry-run.result }}
+                  STAGE: ${{ needs.stage.result }}
+              run: |
+                  set -euo pipefail
+                  outcome=success
+                  detail=""
+                  # In run order, so the detail names the job that stopped the
+                  # run; later jobs are only skipped behind it.
+                  for job in "preflight:$PREFLIGHT" "check-line:$CHECK_LINE" "dry-run:$DRY_RUN" "stage:$STAGE"; do
+                    case "${job#*:}" in
+                      failure) outcome=failure; detail="${job%%:*}"; break ;;
+                      cancelled) outcome=cancelled; detail="${job%%:*}"; break ;;
+                    esac
+                  done
+                  {
+                    echo "outcome=$outcome"
+                    echo "detail=$detail"
+                  } >> "$GITHUB_OUTPUT"
+            # Same as promote.yml's report-release: contents:write is what
+            # POST /repos/{owner}/{repo}/dispatches needs, and nothing else.
+            # continue-on-error, so a missing Slack post never turns the run red.
+            - name: Mint release-ops token (minimal-backporter)
+              id: ops-token
+              continue-on-error: true
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              with:
+                  app-id: ${{ vars.MINIMAL_BACKPORTER_APP_ID }}
+                  private-key: ${{ secrets.MINIMAL_BACKPORTER_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: release-ops
+                  permission-contents: write
+            - name: Send the stage event
+              uses: ./.github/actions/release-event
+              with:
+                  token: ${{ steps.ops-token.outputs.token }}
+                  event: stage
+                  outcome: ${{ steps.result.outputs.outcome }}
+                  version: ${{ needs.preflight.outputs.version }}
+                  line: ${{ needs.preflight.outputs.line }}
+                  sha: ${{ needs.preflight.outputs.sha }}
+                  actor: ${{ github.triggering_actor }}
+                  detail: ${{ steps.result.outputs.detail }}

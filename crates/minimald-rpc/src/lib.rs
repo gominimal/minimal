@@ -636,6 +636,38 @@ pub struct BoxConfig {
     pub host_ip_registration: Option<String>,
 }
 
+/// The [`BoxConfig::attrs`] key that carries the client's projection
+/// digest of the spec it sends: the base64url SHA-256 of the spec's
+/// Gatehouse §6.3.2 projection (BOX-071). The daemon stores it in the
+/// box's record under the same key, beside its own digest under
+/// [`DAEMON_PROJECTION_DIGEST_ATTR`]. A client that predates the key
+/// sends none, and the record then holds the daemon's digest alone.
+pub const CLIENT_PROJECTION_DIGEST_ATTR: &str = "projection_digest.client";
+
+/// The record `attrs` key under which the daemon stores the digest it
+/// recomputed from the spec it received (BOX-071). Daemon-owned: a
+/// client that sends this key has it stripped at creation.
+pub const DAEMON_PROJECTION_DIGEST_ATTR: &str = "projection_digest.daemon";
+
+impl BoxConfig {
+    /// The projection digest the client computed for the spec it sends,
+    /// [`CLIENT_PROJECTION_DIGEST_ATTR`] (BOX-071). `None` when the client
+    /// sent none.
+    #[must_use]
+    pub fn client_projection_digest(&self) -> Option<&str> {
+        self.attrs
+            .get(CLIENT_PROJECTION_DIGEST_ATTR)
+            .map(String::as_str)
+    }
+
+    /// Sets the projection digest the client computed for the spec it
+    /// sends (BOX-071).
+    pub fn set_client_projection_digest(&mut self, digest: impl Into<String>) {
+        self.attrs
+            .insert(CLIENT_PROJECTION_DIGEST_ATTR.to_owned(), digest.into());
+    }
+}
+
 /// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
 /// A closed set: a value outside it does not deserialize.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2937,6 +2969,12 @@ pub struct BoxListingEntry {
     /// sends none, and the box reads as one with no terminal.
     #[serde(default)]
     pub pty_enabled: bool,
+    /// The `lifetime` the box's stored spec sets, such as `until_stopped`,
+    /// so a client can name the command that starts the box again
+    /// (BCLI-009). `None` for a spec that sets none, a box filed with no
+    /// spec, and a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
 }
 
 /// The response for a [`ListBoxes`] RPC.
@@ -3016,6 +3054,35 @@ impl OneshotSshRpc for ShowBox {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox");
     type Request<'a> = ShowBoxRequest;
     type Response = Errorable<ShowBoxResponse>;
+}
+
+/// An RPC to read the spec a box was created with: the stored copy beside
+/// its record (BOX-068), for `min box spec <box>` (BCLI-022).
+pub struct GetBoxSpec;
+
+/// The request for a [`GetBoxSpec`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBoxSpecRequest {
+    /// The box to read, as a listing reports its id.
+    pub id: SessionId,
+}
+
+/// The response for a [`GetBoxSpec`] RPC. An id that no retained record
+/// names is the [`Errorable::Err`] that starts with
+/// [`UNKNOWN_SESSION_ID_LEAD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GetBoxSpecResponse {
+    /// The stored spec, as its creating client sent it. `None` for a box
+    /// with no stored spec: one created before specs were stored, or by a
+    /// client that sent none.
+    #[serde(default)]
+    pub spec: Option<serde_json_lenient::Value>,
+}
+
+impl OneshotSshRpc for GetBoxSpec {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetBoxSpec");
+    type Request<'a> = GetBoxSpecRequest;
+    type Response = Errorable<GetBoxSpecResponse>;
 }
 
 /// An RPC to reap one box: delete its record, its events and its
@@ -4165,6 +4232,7 @@ mod box_listing_tests {
             exit_code: None,
             signal: None,
             pty_enabled: true,
+            lifetime: None,
         }
     }
 

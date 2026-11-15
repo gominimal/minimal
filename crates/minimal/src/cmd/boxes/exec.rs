@@ -85,6 +85,9 @@ pub(crate) enum TtyAttach {
     Terminal {
         sock: std::path::PathBuf,
         id: boxes::SessionId,
+        /// The user's session keys, resolved before the exec starts, so
+        /// the attach sends the user's detach keys.
+        session_keys: boxes::keys::SessionKeys,
     },
     /// Through an exec channel, with the caller's stdio as pipes. Only the
     /// scripted tests take it: `min box exec -t` refuses a stdin that is not
@@ -133,7 +136,7 @@ pub(crate) trait ExecChannels {
 
 /// The exec channels of the box `id` on the daemon `client` reaches.
 /// `target` is the box as the user named it.
-struct HostChannels<'a> {
+pub(crate) struct HostChannels<'a> {
     client: client::Client,
     id: boxes::SessionId,
     target: &'a str,
@@ -188,6 +191,7 @@ pub async fn cmd_box_exec(global: &GlobalArgs, args: BoxExecArgs) -> Result<(), 
         daemon_host_kind(global),
         &request,
         stdin_is_tty,
+        global.config_dir.as_deref(),
         input,
         &mut stdout,
         &mut stderr,
@@ -248,15 +252,18 @@ fn stdin_pump() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 /// BOX-149 defines, and returns the exit code to end with. The command's
 /// output goes to `out` and `err`. A tty exec attaches this process's
 /// terminal, and is refused before the box resolves when `terminal` is
-/// not set. A refusal returns as a
+/// not set. The terminal attach sends the session keys from `config_dir`,
+/// so the detach keys end it and leave the exec running. A refusal returns as a
 /// [`BoxExecRefusal`], and an exec that its own timeout ended as a
 /// [`BoxExecTimedOut`]. The verb, the box id and the outcome go on the
 /// command's span.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn box_exec_on_hosts<O, E>(
     hosts: Vec<crate::cmd::list::LocalHost>,
     kind: paths::HostKind,
     request: &BoxExecRequest,
     terminal: bool,
+    config_dir: Option<&std::path::Path>,
     input: ExecInput,
     out: &mut O,
     err: &mut E,
@@ -268,7 +275,7 @@ where
     refuse_tty_without_terminal(request, terminal)?;
     let resolved = resolve_box_on_hosts(hosts, &request.target, "box exec").await?;
     crate::output::record_box_id(&resolved.box_id.to_string());
-    let ran = exec_in_resolved_box(&resolved, kind, request, input, out, err).await;
+    let ran = exec_in_resolved_box(&resolved, kind, request, config_dir, input, out, err).await;
     record_exec_outcome(resolved.box_id, request, &ran);
     ran
 }
@@ -306,6 +313,7 @@ async fn exec_in_resolved_box<O, E>(
     resolved: &ResolvedBox,
     kind: paths::HostKind,
     request: &BoxExecRequest,
+    config_dir: Option<&std::path::Path>,
     input: ExecInput,
     out: &mut O,
     err: &mut E,
@@ -316,6 +324,16 @@ where
 {
     let sock = resolved.host.sock.as_path();
     let id = resolved.box_id;
+    // A tty exec resolves the session keys before it starts the exec. A
+    // session-key config that is not valid then ends the command with no
+    // exec started, not with an exec that has no attach (BCLI-068). Other
+    // modes do not attach a terminal and do not read the config.
+    let session_keys = match request.mode {
+        minimald_rpc::exec::ExecMode::Tty => {
+            minimal_client::attach::resolve_session_keys(config_dir)?
+        }
+        _ => boxes::keys::SessionKeys::default(),
+    };
     // A VM-backed box gets its row and its name hold back before the
     // command runs, as `min session exec` does before its ssh exec.
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
@@ -340,6 +358,7 @@ where
     let attach = TtyAttach::Terminal {
         sock: sock.to_path_buf(),
         id,
+        session_keys,
     };
     exec_over(&mut channels, request, attach, input, out, err).await
 }
@@ -399,17 +418,22 @@ where
             };
             err.write_all(format!("{exec_id}\n").as_bytes()).await?;
             err.flush().await?;
-            let attach_wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
             let status = match attach {
                 #[cfg(test)]
                 TtyAttach::Pipes => {
+                    let attach_wire =
+                        minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
                     let channel = channels.open(&attach_wire).await?;
                     let relayed = relay_box_channel(channel, input, out, err, false).await?;
                     relayed_status(target, relayed, err).await?
                 }
-                TtyAttach::Terminal { sock, id } => {
+                TtyAttach::Terminal {
+                    sock,
+                    id,
+                    session_keys,
+                } => {
                     drop(input);
-                    attach_exec_terminal(&sock, id, &attach_wire).await?
+                    attach_exec_terminal(&sock, id, &exec_id, &session_keys).await?
                 }
             };
             // The attach ends with 124 for an exec that its timeout ended,
@@ -639,21 +663,48 @@ where
     {
         return Err(BoxExecTimedOut::waited(target, exec_id.as_str()).into());
     }
+    // BCLI-057: the daemon has no running exec of this id and no stored end
+    // for one.
+    if status != 0 && String::from_utf8_lossy(&said).contains(NO_EXIT_MARK) {
+        return Err(BoxExecIdRefusal::NoExitCode {
+            target: target.to_owned(),
+            exec_id: exec_id.to_string(),
+        }
+        .into());
+    }
     err.write_all(&said).await?;
     err.flush().await?;
     Ok(status)
 }
 
+/// The `ssh -tt` command that `min box exec -t`'s terminal attach runs to
+/// reach the exec `exec_id` in the box `id`. It carries `session_keys`,
+/// the same command `min box attach --exec` runs (BCLI-068).
+///
+/// # Errors
+///
+/// When ssh's command cannot be built.
+pub(crate) fn exec_terminal_ssh(
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    exec_id: &minimald_rpc::exec::ExecId,
+    session_keys: &boxes::keys::SessionKeys,
+) -> Result<std::process::Command, anyhow::Error> {
+    super::attach::exec_attach_ssh_with_keys(sock, id, exec_id, session_keys)
+}
+
 /// Connects this process's terminal to the tty exec that `attach_wire`
 /// resumes, through `ssh -tt` and the terminal relay `min session attach`
-/// uses. Returns ssh's exit status, which is the exec's.
+/// uses. It sends `session_keys`, as `min box attach --exec` does
+/// (BCLI-068). Returns ssh's exit status: the exec's, or 0
+/// after a detach.
 async fn attach_exec_terminal(
     sock: &std::path::Path,
     id: boxes::SessionId,
-    attach_wire: &str,
+    exec_id: &minimald_rpc::exec::ExecId,
+    session_keys: &boxes::keys::SessionKeys,
 ) -> Result<i32, anyhow::Error> {
-    let ssh = minimal_client::attach::attach_command(sock, id, Some(attach_wire), None)?;
-    let ssh = with_forced_tty(&ssh);
+    let ssh = exec_terminal_ssh(sock, id, exec_id, session_keys)?;
     tokio::task::spawn_blocking(move || {
         interactive_attach(ssh, true, crate::attach::TerminalUnwind::arm, |ssh| {
             let real = minimal_client::tty_relay::RealTty::acquire()
@@ -665,16 +716,291 @@ async fn attach_exec_terminal(
     .context("the terminal attach's thread failed")?
 }
 
-/// `ssh` with `-tt` before its other arguments, so ssh asks for a terminal
-/// for the command that `attach_command` gave it.
-fn with_forced_tty(ssh: &std::process::Command) -> std::process::Command {
-    let mut forced = std::process::Command::new(ssh.get_program());
-    forced.arg("-tt").args(ssh.get_args());
-    for (name, value) in ssh.get_envs() {
-        match value {
-            Some(value) => forced.env(name, value),
-            None => forced.env_remove(name),
-        };
+// The daemon's texts for an exec id it has no exec of (`no_exec_message`,
+// `unknown_exit_message` and the `StopExec` refusal in `minimald`). The
+// `--exec` tests of `min box stop`, `logs` and `wait` pin them: a change on
+// the daemon side fails those tests.
+const NO_EXEC_MARK: &str = "has no exec ";
+const NO_EXIT_MARK: &str = "so it has no exit code or terminal for it.";
+
+/// The exec id `text` that `--exec` gave for the box `target`
+/// (BCLI-055, BCLI-056, BCLI-057). Text that is not an exec id is a
+/// [`BoxExecIdRefusal::NotAnId`].
+pub(crate) fn exec_id_arg(
+    target: &str,
+    text: &str,
+) -> Result<minimald_rpc::exec::ExecId, BoxExecIdRefusal> {
+    minimald_rpc::exec::ExecId::parse(text).map_err(|_| BoxExecIdRefusal::NotAnId {
+        target: target.to_owned(),
+        exec_id: text.trim().to_owned(),
+    })
+}
+
+/// The exec channels of the box `resolved`, which the address `target`
+/// named, on a client gated as `min box exec` gates it.
+pub(crate) async fn exec_channels_of<'a>(
+    resolved: &ResolvedBox,
+    target: &'a str,
+) -> Result<HostChannels<'a>, anyhow::Error> {
+    Ok(HostChannels {
+        client: gated_box_host_client(&resolved.host).await?,
+        id: resolved.box_id,
+        target,
+    })
+}
+
+/// Records the verb `verb` with `--exec`, the box id `box_id` it resolved,
+/// the exec id and the outcome of `result` on the log.
+pub(crate) fn record_exec_id_outcome<T>(
+    verb: &'static str,
+    box_id: Option<boxes::SessionId>,
+    exec_id: &str,
+    result: &Result<T, anyhow::Error>,
+) {
+    let box_id = box_id.map(|id| id.to_string()).unwrap_or_default();
+    match result {
+        Ok(_) => tracing::info!(verb, box_id, exec_id, outcome = "ok"),
+        Err(error) => {
+            let outcome = if let Some(refusal) = error.downcast_ref::<BoxExecIdRefusal>() {
+                refusal.outcome()
+            } else if error.downcast_ref::<BoxExecTimedOut>().is_some() {
+                "exec timeout"
+            } else if error.downcast_ref::<BoxTimedOut>().is_some() {
+                "wait timeout"
+            } else if error.downcast_ref::<BoxAddressRefusal>().is_some() {
+                "not found"
+            } else {
+                "error"
+            };
+            tracing::info!(verb, box_id, exec_id, outcome, "{error:#}");
+        }
     }
-    forced
+}
+
+/// Writes the output that the exec `exec_id` in the box of `channels`
+/// captured to `out`, as BOX-149's output read gives it (BCLI-056). An
+/// exec id the box has no exec of is a [`BoxExecIdRefusal::Unknown`]. The
+/// daemon's other words go to `err`. Returns the exit code to end with.
+pub(crate) async fn exec_output_over<C, O, E>(
+    channels: &mut C,
+    target: &str,
+    exec_id: &minimald_rpc::exec::ExecId,
+    out: &mut O,
+    err: &mut E,
+) -> Result<i32, anyhow::Error>
+where
+    C: ExecChannels,
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
+    let wire = minimald_rpc::exec::ExecRequest::ExecOutput(exec_id.clone()).encode();
+    let channel = channels.open(&wire).await?;
+    let mut said = Vec::new();
+    let relayed = relay_box_channel(channel, None, out, &mut said, false).await?;
+    let status = relayed_status(target, relayed, &mut said).await?;
+    if status != 0 && String::from_utf8_lossy(&said).contains(NO_EXEC_MARK) {
+        return Err(BoxExecIdRefusal::Unknown {
+            target: target.to_owned(),
+            exec_id: exec_id.to_string(),
+        }
+        .into());
+    }
+    err.write_all(&said).await?;
+    err.flush().await?;
+    Ok(status)
+}
+
+/// `min box logs <box> --exec <id>` over the local `hosts`: resolves the
+/// box, then writes the exec's captured output to `out` (BCLI-056).
+/// Returns the exit code to end with.
+pub(crate) async fn box_logs_exec_on_hosts<O, E>(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    target: &str,
+    exec_text: &str,
+    out: &mut O,
+    err: &mut E,
+) -> Result<i32, anyhow::Error>
+where
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
+    const VERB: &str = "box logs";
+    let mut box_id = None;
+    let result = async {
+        let exec_id = exec_id_arg(target, exec_text)?;
+        let resolved = resolve_box_on_hosts(hosts, target, VERB).await?;
+        box_id = Some(resolved.box_id);
+        crate::output::record_box_id(&resolved.box_id.to_string());
+        let mut channels = exec_channels_of(&resolved, target).await?;
+        exec_output_over(&mut channels, target, &exec_id, out, err).await
+    }
+    .await;
+    record_exec_id_outcome(VERB, box_id, exec_text, &result);
+    result
+}
+
+/// `min box logs <box> --exec <id>`: prints what one exec printed, and
+/// exits with 0 when the whole output was read (BCLI-056).
+pub async fn cmd_box_logs_exec(
+    global: &GlobalArgs,
+    target: &str,
+    exec_text: &str,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let mut out = tokio::io::stdout();
+    let mut err = tokio::io::stderr();
+    let code = box_logs_exec_on_hosts(hosts, target, exec_text, &mut out, &mut err).await?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(Handoff::Exit(code).into())
+    }
+}
+
+/// An RPC to stop one exec in a running box (BOX-151). The client's half of
+/// `minimald`'s `StopExec`: the same name and the same wire fields.
+struct StopExec;
+
+/// The request for a [`StopExec`] RPC.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StopExecRequest {
+    /// The box the exec runs in.
+    #[serde(rename = "box")]
+    box_id: boxes::SessionId,
+    /// The exec's id.
+    exec_id: String,
+}
+
+/// The response for a [`StopExec`] RPC: how the exec ended.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StopExecResponse {
+    /// Why the exec ended, as its `exec_exited` event spells it. Required,
+    /// so the untagged `Errorable` never reads a refusal as this answer.
+    reason: String,
+    /// Set when the exec had already ended before the stop, so the stop
+    /// sent no signal.
+    #[serde(default)]
+    already_ended: bool,
+}
+
+impl minimald_rpc::OneshotSshRpc for StopExec {
+    const NAME: &'static str = "minimald-v1-StopExec";
+    type Request<'a> = StopExecRequest;
+    type Response = minimald_rpc::Errorable<StopExecResponse>;
+}
+
+/// `min box stop <box> --exec <id>` over the local `hosts`: resolves the
+/// box, stops that exec as BOX-151 defines, and writes one line to `out`
+/// (BCLI-055). The box and its other execs keep running.
+pub(crate) async fn box_stop_exec_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    out: &mut impl std::io::Write,
+    target: &str,
+    exec_text: &str,
+) -> Result<(), anyhow::Error> {
+    const VERB: &str = "box stop";
+    let mut box_id = None;
+    let result = async {
+        let exec_id = exec_id_arg(target, exec_text)?;
+        let resolved = resolve_box_on_hosts(hosts, target, VERB).await?;
+        box_id = Some(resolved.box_id);
+        send_stop_exec(&resolved, out, target, &exec_id).await
+    }
+    .await;
+    record_exec_id_outcome(VERB, box_id, exec_text, &result);
+    result
+}
+
+/// The stop of one exec in a box the caller already resolved, for a verb
+/// that resolves the box by its own rules. `target` is the address the
+/// person typed, and the printed line and each refusal name it. `verb`
+/// goes to the log with the box id and the outcome.
+pub(crate) async fn box_stop_exec_in_resolved(
+    resolved: &ResolvedBox,
+    out: &mut impl std::io::Write,
+    target: &str,
+    exec_text: &str,
+    verb: &'static str,
+) -> Result<(), anyhow::Error> {
+    let result = async {
+        let exec_id = exec_id_arg(target, exec_text)?;
+        send_stop_exec(resolved, out, target, &exec_id).await
+    }
+    .await;
+    record_exec_id_outcome(verb, Some(resolved.box_id), exec_text, &result);
+    result
+}
+
+/// Sends StopExec for `exec_id` to the box `resolved`, and writes the one
+/// line of `min box stop --exec` to `out`. `target` names the box in the
+/// line and in each refusal.
+async fn send_stop_exec(
+    resolved: &ResolvedBox,
+    out: &mut impl std::io::Write,
+    target: &str,
+    exec_id: &minimald_rpc::exec::ExecId,
+) -> Result<(), anyhow::Error> {
+    crate::output::record_box_id(&resolved.box_id.to_string());
+    let mut client = gated_box_host_client(&resolved.host).await?;
+    let request = StopExecRequest {
+        box_id: resolved.box_id,
+        exec_id: exec_id.to_string(),
+    };
+    let stopped = match client
+        .oneshot_rpc::<StopExec>(request)
+        .await
+        .context("StopExec RPC failed")?
+    {
+        minimald_rpc::Errorable::Ok(stopped) => stopped,
+        minimald_rpc::Errorable::Err { error } => {
+            return Err(if error.contains(NO_EXEC_MARK) {
+                BoxExecIdRefusal::Unknown {
+                    target: target.to_owned(),
+                    exec_id: exec_id.to_string(),
+                }
+                .into()
+            } else if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) {
+                BoxAddressRefusal::NotFound {
+                    address: target.to_owned(),
+                }
+                .into()
+            } else {
+                anyhow::anyhow!("{error}")
+            });
+        }
+    };
+    write_exec_stop_line(out, target, exec_id.as_str(), stopped.already_ended)?;
+    Ok(())
+}
+
+/// `min box stop <box> --exec <id>`: stops one exec and leaves the box
+/// running (BCLI-055).
+pub async fn cmd_box_stop_exec(
+    global: &GlobalArgs,
+    target: &str,
+    exec_text: &str,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let mut out = std::io::stdout().lock();
+    box_stop_exec_on_hosts(hosts, &mut out, target, exec_text).await
+}
+
+/// The one line `min box stop <box> --exec <id>` prints: the exec stopped,
+/// or it had already ended when the stop came (BCLI-055).
+pub(crate) fn write_exec_stop_line(
+    out: &mut impl std::io::Write,
+    target: &str,
+    exec_id: &str,
+    already_ended: bool,
+) -> std::io::Result<()> {
+    if already_ended {
+        writeln!(
+            out,
+            "Exec {exec_id} in {target} ended before the stop, so the stop changed nothing."
+        )
+    } else {
+        writeln!(out, "Stopped exec {exec_id} in {target}.")
+    }
 }

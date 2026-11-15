@@ -479,6 +479,44 @@ pub fn write_unaudited_listen_ports(
 /// held beside the emitter that writes it, in `main`.
 pub const POLICY_JSON_SCHEMA: &str = "min/v1/session-policy";
 
+/// The `[network]` section a box was created with (BCLI-025), from the
+/// network mode and the policy its record stores: the values the creating
+/// command's override flags left after they applied (BCLI-024). These are
+/// the values the create request stamped into the box's spec
+/// ([`crate::spec_flags`]), so the section is written through the spec's
+/// own serializer, key for key as the stored spec holds it.
+///
+/// It is the stored declaration, not the policy the gate enforces:
+/// `min session policy` renders that one ([`format_policy`]).
+///
+/// # Errors
+///
+/// Fails when the section cannot be encoded as TOML or `out` fails.
+pub fn write_stored_network(
+    out: &mut impl std::io::Write,
+    network: boxes::NetworkMode,
+    policy: &boxes::BoxPolicy,
+) -> Result<(), anyhow::Error> {
+    let spec = mfile::spec::BoxSpec::for_session(
+        None,
+        mfile::spec::SpecFlags {
+            network,
+            policy: policy.clone(),
+            hooks_enabled: true,
+        },
+    );
+    let mut document =
+        toml::Table::try_from(&spec).context("Cannot encode the box's network section")?;
+    let section = document
+        .remove("network")
+        .context("The box's spec has no network section")?;
+    let mut table = toml::Table::new();
+    table.insert("network".to_owned(), section);
+    let text = toml::to_string(&table).context("Cannot encode the box's network section")?;
+    out.write_all(text.as_bytes())?;
+    Ok(())
+}
+
 /// The ingress block as the document carries it: the declared policy, or
 /// `deny_all` where the text rendering writes that reading — the same
 /// decision its "deny-all" line makes, so the document never claims rules

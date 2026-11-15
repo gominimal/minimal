@@ -50,3 +50,17 @@ leak-timeout = "5s"
 [[profile.vm.overrides]]
 filter = 'test(hostname_allowlist_toolchain_completes)'
 slow-timeout = { period = "180s", terminate-after = 4 }
+
+[profile.coverage]
+# `just metrics` runs the suite under cargo-llvm-cov with this profile.
+# Instrumented binaries run slower than the ci profile's budget assumes, so
+# the slow period is wider; everything else matches ci. junit lands under
+# target/llvm-cov-target/nextest/coverage/.
+fail-fast = false
+retries = 0
+slow-timeout = { period = "120s", terminate-after = 5 }
+leak-timeout = "1s"
+final-status-level = "slow"
+
+[profile.coverage.junit]
+path = "junit.xml"
