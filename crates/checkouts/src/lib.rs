@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs::{self, File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
@@ -581,6 +582,31 @@ impl Manager {
     }
 }
 
+/// `remote` as an error names it: without userinfo, query or fragment, so a
+/// credential in a remote URL (`https://user:token@host/…`,
+/// `?private_token=…`) never reaches the error's text. The host and path are
+/// kept; they are what makes the error useful. scp-like remotes
+/// (`git@host:org/repo.git`) lose their user the same way; a local path is
+/// returned as given. The same function as on `main`, where the checkout
+/// spans use it too.
+pub(crate) fn scrubbed_remote(remote: &str) -> Cow<'_, str> {
+    let base = remote
+        .find(['?', '#'])
+        .map_or(remote, |at| remote.split_at(at).0);
+    if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            return Cow::Owned(format!("{scheme}://{host}{path}"));
+        }
+    } else if let Some((authority, path)) = base.split_once(':')
+        && !authority.contains('/')
+        && let Some((_, host)) = authority.rsplit_once('@')
+    {
+        return Cow::Owned(format!("{host}:{path}"));
+    }
+    Cow::Borrowed(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +617,39 @@ mod tests {
         assert_eq!(GitRef::Branch("main".to_string()).as_str(), "main");
         assert_eq!(GitRef::Tag("v1.0.0".to_string()).as_str(), "v1.0.0");
         assert_eq!(GitRef::Commit("abc123".to_string()).as_str(), "abc123");
+    }
+
+    #[test]
+    fn an_error_names_a_remote_without_credentials() {
+        for (remote, recorded) in [
+            (
+                "https://github.com/octocat/Spoon-Knife",
+                "https://github.com/octocat/Spoon-Knife",
+            ),
+            (
+                "https://user:ghp_token@github.com/org/private.git",
+                "https://github.com/org/private.git",
+            ),
+            (
+                "https://oauth2:glpat-x@gitlab.internal:8443/team/repo",
+                "https://gitlab.internal:8443/team/repo",
+            ),
+            (
+                "https://git.example/repo.git?private_token=abc#frag",
+                "https://git.example/repo.git",
+            ),
+            ("https://tok@git.example", "https://git.example"),
+            (
+                "ssh://git@git.example:2222/org/repo",
+                "ssh://git.example:2222/org/repo",
+            ),
+            ("git@github.com:org/repo.git", "github.com:org/repo.git"),
+            ("github.com:org/repo.git", "github.com:org/repo.git"),
+            ("/srv/git/repo@v1", "/srv/git/repo@v1"),
+            ("./a@b:c/repo", "./a@b:c/repo"),
+        ] {
+            assert_eq!(scrubbed_remote(remote), recorded, "{remote}");
+        }
     }
 
     #[test]
