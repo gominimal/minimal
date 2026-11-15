@@ -193,6 +193,26 @@ pub(crate) fn placed_box_build_refusal(box_name: &str) -> String {
     )
 }
 
+/// The context with its task state keyed on the record's host project, not
+/// on the workspace tree this daemon parsed the mfile from. Every box
+/// parses its mfile from the tree under `/tree`, native or VM, and that
+/// tree is laid out afresh under a new session id each time, so a key taken
+/// from it changes every session: every run starts empty and leaves an
+/// orphan behind (gominimal/minimal#1373, gominimal/minimal#1729). The host
+/// path does not change with the session, so a task's state is durable
+/// across sessions and bounded per project. Its own function, so a test can
+/// hold the wiring: removing the keying makes a context whose state root is
+/// `None`.
+pub(super) fn keyed_on_project(ctx: mctx::Context, record: &boxes::Record) -> mctx::Context {
+    ctx.with_state_root(
+        record
+            .project_path
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf(),
+    )
+}
+
 /// The policy the gate enforces for a session: its declared ingress, and its
 /// egress resolved to the section [`effective_egress_section`] names — the
 /// deny-all section for an own-address box with no `egress` section once the
@@ -1341,7 +1361,9 @@ impl BoxActor {
     /// The workspace mfile it parses is either the client's uploaded one or
     /// the default [`Self::configure_loadout`] scaffolded. The scaffold is
     /// repeated here as a backstop — it early-returns when the mfile exists,
-    /// so it only fires for a session whose compose predates it.
+    /// so it only fires for a session whose compose predates it. The
+    /// context's task state is keyed on the record's host project
+    /// ([`keyed_on_project`]).
     ///
     /// [`Config`]: mctx::Config
     pub(super) async fn build_context(
@@ -1371,6 +1393,7 @@ impl BoxActor {
             .record()
             .await
             .map_err(|e| format!("reading session record: {e}"))?;
+        let ctx = keyed_on_project(ctx, &record);
         Ok(
             match box_build_network(&record, &self.net_switch, self.deny_all_opt_out) {
                 Some(network) => ctx.with_box_network(network),

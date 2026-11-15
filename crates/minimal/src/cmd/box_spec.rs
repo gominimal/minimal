@@ -458,7 +458,7 @@ pub(crate) fn preview_host(
     let network: boxes::NetworkMode = args
         .overrides
         .network
-        .unwrap_or_else(|| crate::ActivateArgs::unflagged().network)
+        .unwrap_or_else(crate::cli::default_network_mode)
         .into();
     (
         network,
@@ -701,6 +701,7 @@ fn expand_entry(
             .map(|loadout| loadout.name().as_ref().to_owned())
             .collect(),
     );
+    let mut ingress_sources = vec![COMMAND_LINE.to_owned()];
     let (mode, mode_source, egress, ingress) = if box_type == boxes::TASK_BOX_TYPE {
         let project_egress = super::box_verbs::task_project_egress(&root, &entry.name)?;
         let flags = super::box_verbs::flag_egress(&overrides.egress)?;
@@ -713,20 +714,41 @@ fn expand_entry(
             (Some(flag), _) => (flag.into(), vec![COMMAND_LINE.to_owned()]),
             (None, Some(mode)) => (mode, network_label.clone().unwrap_or_default()),
             (None, None) => (
-                crate::ActivateArgs::unflagged().network.into(),
+                crate::cli::default_network_mode().into(),
                 vec![DEFAULT_SOURCE.to_owned()],
             ),
         };
         (mode, source, egress.policy, None)
     } else {
         let mut activate = crate::ActivateArgs::unflagged();
-        if let Some(network) = overrides.network {
-            activate.network = network;
-        }
+        activate.network = overrides.network;
         activate.ingress.clone_from(&overrides.ingress);
         activate.egress.clone_from(&overrides.egress);
         let (port_mappings, flags) = super::box_verbs::flag_network_overrides(&activate)?;
-        let project_egress = super::box_verbs::project_egress(&root, Some(&entry.name))?;
+        let mut project_egress = super::box_verbs::project_egress(&root, Some(&entry.name))?;
+        // #3238: as `min box start` sends them, the entry's `network.mode`
+        // applies when no `--network` replaces it, and each `--ingress` adds
+        // a mapping after the entry's `network.ingress`.
+        let file_ingress = project_egress.ingress.take();
+        let (mode, source) = match (overrides.network, project_egress.mode) {
+            (Some(flag), _) => (flag.into(), vec![COMMAND_LINE.to_owned()]),
+            (None, Some(mode)) => (mode, network_label.clone().unwrap_or_default()),
+            (None, None) => (
+                activate.network_mode().into(),
+                vec![DEFAULT_SOURCE.to_owned()],
+            ),
+        };
+        let mut ingress_source = Vec::new();
+        if file_ingress.is_some() {
+            ingress_source.extend(network_label.clone().unwrap_or_default());
+        }
+        if file_ingress.is_none() || !overrides.ingress.is_empty() {
+            ingress_source.push(COMMAND_LINE.to_owned());
+        }
+        let port_mappings = match file_ingress {
+            Some(file_mappings) => super::box_verbs::union_ingress(file_mappings, port_mappings),
+            None => port_mappings,
+        };
         let egress = super::box_verbs::effective_egress(
             project_egress.policy,
             flags,
@@ -734,17 +756,8 @@ fn expand_entry(
         );
         let policy =
             super::box_verbs::network_override_policy(&activate, port_mappings, egress.policy);
-        let source = if overrides.network.is_some() {
-            COMMAND_LINE
-        } else {
-            DEFAULT_SOURCE
-        };
-        (
-            activate.network.into(),
-            vec![source.to_owned()],
-            policy.egress,
-            policy.ingress,
-        )
+        ingress_sources = ingress_source;
+        (mode, source, policy.egress, policy.ingress)
     };
     let mut network = spec
         .get("network")
@@ -780,7 +793,7 @@ fn expand_entry(
             "ingress".to_owned(),
             toml::Value::try_from(&ingress).context("Cannot encode the ingress")?,
         );
-        sources.insert("network.ingress".to_owned(), vec![COMMAND_LINE.to_owned()]);
+        sources.insert("network.ingress".to_owned(), ingress_sources);
     }
     spec.insert("network".to_owned(), toml::Value::Table(network.clone()));
     if network_label.is_none() {
