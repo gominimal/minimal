@@ -20363,7 +20363,8 @@ async fn session_entry_network_mode_and_ingress() {
 // record holds the two side by side, equal. A session create and a task
 // create both carry it. A `--vpn-network-names` change to the spec leaves
 // the digest the one of the spec that is sent. A spec that changes after
-// the client computed its digest gives two different digests in the record.
+// the client computed its digest gives two different digests, and the
+// daemon refuses that create (BOX-072).
 #[tokio::test]
 async fn create_stores_client_digest_equal_to_daemon_digest() {
     use minimald_rpc::{CLIENT_PROJECTION_DIGEST_ATTR, DAEMON_PROJECTION_DIGEST_ATTR};
@@ -20445,26 +20446,16 @@ async fn create_stores_client_digest_equal_to_daemon_digest() {
     let daemon_expected =
         mfile::projection::spec_digest(&received, boxes::SESSION_BOX_TYPE).unwrap();
     assert_ne!(client_expected, daemon_expected, "the change is projected");
-    let id = match daemon.call::<minimald_rpc::CreateSession>(&changed).await {
-        minimald_rpc::Errorable::Ok(created) => created.id,
-        minimald_rpc::Errorable::Err { error } => panic!("changed: the create failed: {error}"),
-    };
-    let record = stored_box_record(&mut client, id)
-        .await
-        .expect("the record is read")
-        .expect("the box has a record");
-    assert_eq!(
-        record.attrs.get(CLIENT_PROJECTION_DIGEST_ATTR),
-        Some(&client_expected),
-        "{:?}",
-        record.attrs
-    );
-    assert_eq!(
-        record.attrs.get(DAEMON_PROJECTION_DIGEST_ATTR),
-        Some(&daemon_expected),
-        "{:?}",
-        record.attrs
-    );
+    // BOX-072: the daemon refuses a create whose two digests differ.
+    match daemon.call::<minimald_rpc::CreateSession>(&changed).await {
+        minimald_rpc::Errorable::Ok(created) => {
+            panic!("changed: a create with two digests is refused, not {created:?}")
+        }
+        minimald_rpc::Errorable::Err { error } => assert!(
+            error.to_string().starts_with("No box was created."),
+            "changed: {error}"
+        ),
+    }
 }
 
 // BOX-071: `min box spec <entry>` writes each store reference's
