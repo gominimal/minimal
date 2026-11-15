@@ -456,8 +456,18 @@ impl ExportSource for BoxFiles {
             } else if file_type.is_symlink() {
                 // The file service refuses a link that leaves the box's
                 // folders, so a link it follows stays inside them.
+                // A link to nothing has no content to copy. It is left
+                // out, so the other files of the folder still come back.
                 match self.kind(&format!("{path}/{name}")).await {
                     Ok(kind) => kind,
+                    Err(ExportReadError::NotFound) => {
+                        tracing::debug!(
+                            path,
+                            name,
+                            "a file export skips a link that points to nothing"
+                        );
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
             } else {
@@ -525,6 +535,29 @@ pub(crate) async fn copy_box_exports_on_host<E: std::io::Write>(
         }
     };
     copy_box_exports(&mut client, id, label, project_root, err).await
+}
+
+/// Whether the box `id` on `host` declares an export. A host that does not
+/// answer, or a spec that is not readable, declares none.
+pub(crate) async fn box_declares_exports_on_host(
+    host: &crate::cmd::list::LocalHost,
+    id: boxes::SessionId,
+) -> bool {
+    use minimald_rpc::{Errorable, GetBoxSpec, GetBoxSpecRequest};
+
+    let Ok(mut client) = box_host_client(host).await else {
+        return false;
+    };
+    match client
+        .oneshot_rpc::<GetBoxSpec>(GetBoxSpecRequest { id })
+        .await
+    {
+        Ok(Errorable::Ok(reply)) => reply
+            .spec
+            .as_ref()
+            .is_some_and(|spec| !stored_export_paths(spec).is_empty()),
+        _ => false,
+    }
 }
 
 /// [`copy_box_exports_on_host`] over a connected `client`.

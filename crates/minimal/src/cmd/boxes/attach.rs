@@ -1492,9 +1492,19 @@ where
     // whatever code the entrypoint ended with. A detach leaves the box
     // running, and copies nothing (BOX-186). An entrypoint's own nonzero
     // code is not read above, so the box is read here for the copy only.
+    // A box that still runs then waits for the settle bound only when it
+    // declares an export, so a shell that a person leaves with a nonzero
+    // code, or a lost connection, does not wait for nothing.
     let ended = match &after {
         BoxAfterAttach::Unread => {
-            box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await
+            let first = box_after_attach(&target.host, target.box_id).await;
+            let running =
+                matches!(&first, BoxAfterAttach::Listed(entry) if entry.state == "running");
+            if running && box_declares_exports_on_host(&target.host, target.box_id).await {
+                box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await
+            } else {
+                first
+            }
         }
         _ => after.clone(),
     };
