@@ -26,6 +26,17 @@ to fire `on_detach`):
                     to a still-running shell needs: `exit` ends that shell,
                     and the box ends with it. With E2E_PTY_ASK
                     set, the chord also waits until the ask is answered.
+  E2E_PTY_READY     a marker the session's shell prints once the command
+                    stream has started (the first command's own output, say
+                    `RELAY_READY`). Until it shows, the stream is not quiet
+                    for the second stage or the chord: a sandbox that takes
+                    longer than two seconds to mint under load would
+                    otherwise be detached before its shell ran a line.
+                    The marker must not appear in the typed text itself:
+                    the pty echoes what is typed into the transcript before
+                    the shell runs it, so build it (printf "RELAY_%s\n"
+                    READY), never type it.
+
   E2E_PTY_ASK       answer a runtime port-publish ask the attached human is
                     shown: `allow` selects Allow (Down then Enter — Deny
                     stands highlighted), `deny` takes the highlighted Deny
@@ -128,6 +139,8 @@ START_SIZE = size_env("E2E_PTY_SIZE", None)
 RESIZE = size_env("E2E_PTY_RESIZE", None)
 PASTE_FILE = os.environ.get("E2E_PTY_PASTE_FILE")
 AFTER = os.environ.get("E2E_PTY_AFTER")
+READY = os.environ.get("E2E_PTY_READY")
+READY_BYTES = READY.encode() if READY else None
 KILL_TRANSPORT = os.environ.get("E2E_PTY_KILL_TRANSPORT") is not None
 EXPECT_EXIT = int(os.environ.get("E2E_PTY_EXPECT_EXIT", "0"))
 SECOND_STAGE = RESIZE is not None or PASTE_FILE is not None or AFTER is not None
@@ -298,6 +311,10 @@ try:
             break  # EOF / closed
         buf.extend(chunk)
         quiet = 0 if chunk else quiet + 1
+        # With a ready marker, nothing is quiet until the shell printed it:
+        # the stream has not started, only paused, while the sandbox mints.
+        if READY_BYTES is not None and READY_BYTES not in buf:
+            quiet = 0
         if not staged and quiet >= 2:
             second_stage()
             staged = True

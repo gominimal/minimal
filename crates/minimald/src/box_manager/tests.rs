@@ -2039,6 +2039,92 @@ async fn finalize_without_compose_time_names_evaluates_the_graph() {
     assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
 }
 
+/// A local git repo holding an empty upstream layer, committed once.
+/// Returns the repo dir and the full commit, for an `[upstream]` pin
+/// that resolves offline.
+fn local_upstream_repo() -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join(mfile::MFILE_NAME), "").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "upstream"]);
+    let commit = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    (dir, commit)
+}
+
+/// A refusal for a package the pinned upstream does not declare keeps
+/// its old text and adds one note naming the `[upstream]` repo, the
+/// short `locked_commit` and `min update` — on the fast path (names
+/// captured at compose) and on the fallback that evaluates the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_refusal_names_the_upstream_pin() {
+    let (upstream, commit) = local_upstream_repo();
+    let repo = upstream.path().to_str().unwrap().to_owned();
+    for fallback in [false, true] {
+        let (_state, _cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_config(), None).await.unwrap();
+        seed_workspace_package(&mngr, id, "pkg-ok").await;
+        seed_workspace_mfile(
+            &mngr,
+            id,
+            &format!(
+                "[upstream]\nrepo = \"{repo}\"\nlocked_commit = \"{commit}\"\n\n\
+                 [session]\npackages = [\"pkg-ok\", \"no-such-pkg-up\"]\n"
+            ),
+        )
+        .await;
+        let handle = session(&mngr, id).await;
+        handle
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect("packages gate nothing at compose");
+        handle
+            .check_packages_at_finalize(PACKAGE_CHECK_DEADLINE)
+            .await;
+        if fallback {
+            handle.forget_composed_graph_names().await;
+        }
+        let err = handle
+            .finalize()
+            .await
+            .expect_err("a package absent at the pin must not activate");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-up (declared by project")
+                && msg.contains("; the session was not activated"),
+            "the old refusal text stays (fallback: {fallback}), got {msg:?}"
+        );
+        assert!(
+            msg.contains(&repo) && msg.contains(&commit[..7]) && !msg.contains(&commit),
+            "the note names the repo and the short pin (fallback: {fallback}), got {msg:?}"
+        );
+        assert_eq!(
+            msg.matches("min update").count(),
+            1,
+            "the note appears once (fallback: {fallback}), got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
+    }
+}
+
 async fn status_of(mngr: &BoxManagerHandle, id: SessionId) -> boxes::BoxState {
     mngr.get_record(BoxKeyPredicate::Id(id))
         .await
@@ -3974,7 +4060,7 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
         .expect_err("an invalid `[box] name` is refused");
     let text = format!("{refused:#}");
     assert!(
-        text.contains("invalid session name") && text.contains("DNS label"),
+        text.contains("invalid box name") && text.contains("DNS label"),
         "the refusal says the name is invalid: {text}"
     );
     assert!(
@@ -6447,7 +6533,7 @@ fn store_secret() -> serde_json_lenient::Value {
         "source": "store",
         "store": "keychain",
         "id": "npm-token",
-        "upstream": { "hosts": ["registry.npmjs.org"] },
+        "upstream": ["registry.npmjs.org"],
         "inject": { "header": "Authorization", "format": "Bearer {}" },
     })
 }
@@ -7196,4 +7282,252 @@ async fn derived_task_type_refused_at_expansion_and_admission() {
             "the create span records it: {line}"
         );
     }
+}
+
+/// BOX-071: a created box's record holds the client's projection digest
+/// beside the one the daemon recomputed from the spec it received. The
+/// daemon's key is its own: a digest a client sends under it is dropped.
+/// The daemon log names both digests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_digests_stored_side_by_side() {
+    use minimald_rpc::{CLIENT_PROJECTION_DIGEST_ATTR, DAEMON_PROJECTION_DIGEST_ATTR};
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let spec = spec_with_secrets(
+        "digest",
+        serde_json_lenient::json!({ "npm": store_secret() }),
+    );
+    let expected =
+        mfile::projection::spec_digest(&spec, boxes::TASK_BOX_TYPE).expect("the spec projects");
+    let digests_of = |record: boxes::Record| {
+        (
+            record.attrs.get(CLIENT_PROJECTION_DIGEST_ATTR).cloned(),
+            record.attrs.get(DAEMON_PROJECTION_DIGEST_ATTR).cloned(),
+        )
+    };
+    let create = |config: minimald_rpc::BoxConfig| {
+        let mngr = mngr.clone();
+        let spec = spec.clone();
+        async move {
+            let id = mngr
+                .create_box_with_spec(as_task(config), Some(spec), None, None)
+                .await
+                .expect("the box is created");
+            let record = mngr
+                .get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .expect("the record is filed");
+            (id, record)
+        }
+    };
+
+    // A client that projected the same spec: both digests, equal.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    let (agreed, record) = create(config).await;
+    assert_eq!(
+        digests_of(record),
+        (Some(expected.clone()), Some(expected.clone()))
+    );
+
+    // A digest a client sends under the daemon's key is dropped.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    config.attrs.insert(
+        DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
+        "asserted-by-client".to_owned(),
+    );
+    let (_, record) = create(config).await;
+    assert_eq!(
+        digests_of(record),
+        (Some(expected.clone()), Some(expected.clone()))
+    );
+
+    // A client digest that differs, or a client value that is not a
+    // digest in form, refuses the create (BOX-072), so nothing is stored.
+    for client in [&"A".repeat(43), "client-digest", "A\nB", &"A".repeat(44)] {
+        let mut config = unnamed_config();
+        config.set_client_projection_digest(client);
+        mngr.create_box_with_spec(as_task(config), Some(spec.clone()), None, None)
+            .await
+            .expect_err("a differing client digest refuses the create");
+    }
+
+    // A client that predates the digest sends none: the daemon's alone.
+    let (_, record) = create(unnamed_config()).await;
+    assert_eq!(digests_of(record), (None, Some(expected.clone())));
+
+    // A create with no spec has no daemon digest, so the client's is not
+    // stored alone.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    let id = mngr
+        .create_box_with_spec(as_task(config), None, None, None)
+        .await
+        .expect("the box is created");
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is filed");
+    assert_eq!(digests_of(record), (None, None));
+
+    // The daemon log names both digests.
+    let logged = log.contents();
+    // A malformed client value logs as `malformed`, never as `none` and
+    // never as sent.
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains("client_projection_digest=\"malformed\"")
+        }),
+        "a log line names a malformed client digest:\n{logged}"
+    );
+    assert!(!logged.contains("client-digest"), "{logged}");
+    let line = logged
+        .lines()
+        .find(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains(&format!("client_projection_digest=\"{expected}\""))
+        })
+        .unwrap_or_else(|| panic!("a log line names both digests of {agreed}:\n{logged}"));
+    assert!(
+        line.contains(&format!("daemon_projection_digest=\"{expected}\"")),
+        "{line}"
+    );
+}
+
+/// BOX-072: for every pair of specs, one standing for the client's and one
+/// for the spec the daemon receives, the create is refused iff their
+/// projection digests differ. A refused create leaves no record, the
+/// reply says how to recover, and the daemon log and the create span name
+/// both digests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_digest_mismatch_refuses_create() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let other_upstream = {
+        let mut secret = store_secret();
+        secret["upstream"] = serde_json_lenient::json!(["npm.example.com"]);
+        secret
+    };
+    let unprojected_note = {
+        let mut secret = store_secret();
+        secret["note"] = serde_json_lenient::json!("outside the projection");
+        secret
+    };
+    // The specs differ pairwise. The last one differs from the second
+    // only outside the projection, so its digest is the second's.
+    let specs = [
+        task_spec("x72", None),
+        spec_with_secrets("x72", serde_json_lenient::json!({ "npm": store_secret() })),
+        spec_with_secrets("x72", serde_json_lenient::json!({ "npm": other_upstream })),
+        spec_with_secrets(
+            "x72",
+            serde_json_lenient::json!({ "npm": unprojected_note }),
+        ),
+    ];
+    let digest = |spec: &serde_json_lenient::Value| {
+        mfile::projection::spec_digest(spec, boxes::TASK_BOX_TYPE).expect("the spec projects")
+    };
+    assert_eq!(digest(&specs[1]), digest(&specs[3]));
+    assert_ne!(digest(&specs[0]), digest(&specs[1]));
+    assert_ne!(digest(&specs[1]), digest(&specs[2]));
+
+    let mut refused = 0;
+    for (c, client_spec) in specs.iter().enumerate() {
+        for (d, sent) in specs.iter().enumerate() {
+            let client = digest(client_spec);
+            let daemon = digest(sent);
+            let mut config = unnamed_config();
+            config.set_client_projection_digest(client.clone());
+            let before = mngr.list_boxes(None).await.unwrap().len();
+            let created = mngr
+                .create_box_with_spec(as_task(config), Some(sent.clone()), None, None)
+                .await;
+            let after = mngr.list_boxes(None).await.unwrap().len();
+            if client == daemon {
+                created.unwrap_or_else(|e| panic!("({c}, {d}): equal digests create: {e}"));
+                assert_eq!(after, before + 1, "({c}, {d}): the create files a record");
+                continue;
+            }
+            refused += 1;
+            let error = created.expect_err("differing digests refuse the create");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "({c}, {d})");
+            assert_eq!(
+                error.to_string(),
+                "No box was created. minimald read different box settings from the box spec \
+                 than the `min` that sent it. This can happen when `min` and minimald are \
+                 different builds. Run `min stop` to stop minimald, then run the \
+                 command again to start minimald from the same build as `min`."
+            );
+            assert_eq!(
+                after, before,
+                "({c}, {d}): a refused create files no record"
+            );
+            let logged = log.contents();
+            let line = logged
+                .lines()
+                .find(|line| {
+                    line.contains("the client's projection digest differs from the daemon's")
+                        && line.contains(&format!("client_projection_digest=\"{client}\""))
+                        && line.contains(&format!("daemon_projection_digest=\"{daemon}\""))
+                })
+                .unwrap_or_else(|| panic!("({c}, {d}): the log names both digests:\n{logged}"));
+            assert!(
+                line.contains("refusal=\"projection digest mismatch\"")
+                    || line.contains("refusal=projection digest mismatch"),
+                "the create span records the refusal: {line}"
+            );
+        }
+    }
+    assert!(refused > 0, "the pairs include differing digests");
+
+    // A client that sends no digest predates the key, so its create is
+    // not compared and goes ahead.
+    mngr.create_box_with_spec(
+        as_task(unnamed_config()),
+        Some(specs[2].clone()),
+        None,
+        None,
+    )
+    .await
+    .expect("a create without a client digest goes ahead");
+}
+
+/// BOX-073: this host is not enrolled, so a create evaluates no policy
+/// against the projection: a spec any policy could refuse still creates
+/// its box, and the daemon log and the create span say the policy is
+/// `none`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unenrolled_evaluates_no_policy() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let spec = spec_with_secrets("x73", serde_json_lenient::json!({ "npm": store_secret() }));
+    let expected =
+        mfile::projection::spec_digest(&spec, boxes::TASK_BOX_TYPE).expect("the spec projects");
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    mngr.create_box_with_spec(as_task(config), Some(spec), None, None)
+        .await
+        .expect("an un-enrolled host creates the box with no policy check");
+
+    let logged = log.contents();
+    let line = logged
+        .lines()
+        .find(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains(&format!("daemon_projection_digest=\"{expected}\""))
+        })
+        .unwrap_or_else(|| panic!("a log line names the digest:\n{logged}"));
+    assert!(
+        line.contains("policy=\"none\""),
+        "no policy is evaluated: {line}"
+    );
+    assert!(
+        !logged.contains("evaluated policy"),
+        "nothing says a policy was evaluated:\n{logged}"
+    );
 }

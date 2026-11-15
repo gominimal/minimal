@@ -29,17 +29,20 @@
 //! | A, held without one (a box's switch lease) | NODATA (NET-124, NET-128) |
 //! | any other type, held name | NODATA (NET-124) |
 //! | anything, name nothing holds | NXDOMAIN (NET-125) |
-//! | a name outside the box zone | REFUSED |
+//! | a name outside the box zone | NXDOMAIN, citing the root-owned SOA (NET-079) |
 //! | anything but a standard query | NOTIMP |
 //!
-//! Every negative — NODATA and NXDOMAIN — carries the zone's SOA in the
-//! authority section with a 15 s `minimum` (RFC 2308), so the host resolver
+//! Every in-zone negative — NODATA and NXDOMAIN — carries the zone's SOA in
+//! the authority section with a 15 s `minimum` (RFC 2308), so the host resolver
 //! can cache it (NET-124): an uncacheable negative stalls every lookup on a
 //! macOS host, not only the zone's. Every record the answerer emits, those
-//! answers and that SOA, holds a TTL of at most 15 s (NET-126).
+//! answers and that SOA, holds a TTL of at most 15 s (NET-126). An
+//! out-of-zone NXDOMAIN cites the root-owned SOA instead
+//! ([`super::dns_gate::out_of_zone_soa_record`]), which has a 15 s minimum
+//! too: the zone's SOA never covers someone else's namespace.
 //!
 //! Nothing here issues certificates or writes audit records, and the records
-//! it can ever emit are A answers and the zone's own SOA (NET-007: see
+//! it can ever emit are A answers, the zone's own SOA and the root-owned SOA (NET-007: see
 //! [`super::dns::HostnameRegistry::zone_table`] for the state-dump half).
 
 use std::io;
@@ -277,23 +280,38 @@ impl<T: Zone> ZoneAnswerer<T> {
             }
             // Out of zone: this answerer is authoritative for the box zone
             // and nothing else, so a name that strayed in (a too-broad
-            // resolver routing domain) is REFUSED — visibly, so the
-            // misconfiguration names itself — with no authority section: the
-            // zone's SOA certifies our own negatives, never someone else's
-            // namespace.
+            // resolver routing domain) gets NXDOMAIN citing the root-owned
+            // SOA (NET-079, issue 3020). Not REFUSED: glibc reads REFUSED as
+            // a temporary failure and retries it. Not authoritative, and not
+            // the zone's SOA: that SOA certifies our own negatives only. The
+            // root SOA's 15 s minimum bounds how long the negative caches.
             zone_answer::Verdict::Refused => {
-                let reply = self.reply(&request, query, ResponseCode::Refused, None, false);
+                let reply = self.reply(
+                    &request,
+                    query,
+                    ResponseCode::NXDomain,
+                    None,
+                    false,
+                    Some(super::dns_gate::out_of_zone_soa_record()),
+                );
                 tracing::debug!(
                     component = COMPONENT,
                     name = asked,
                     query_type = ?qtype,
-                    answer = "refused",
+                    answer = "nxdomain-out-of-zone",
                     "answered an out-of-zone lookup"
                 );
                 reply
             }
             zone_answer::Verdict::Nodata => {
-                let reply = self.reply(&request, query, ResponseCode::NoError, None, true);
+                let reply = self.reply(
+                    &request,
+                    query,
+                    ResponseCode::NoError,
+                    None,
+                    true,
+                    Some(self.soa.clone()),
+                );
                 tracing::debug!(
                     component = COMPONENT,
                     name = asked,
@@ -304,7 +322,14 @@ impl<T: Zone> ZoneAnswerer<T> {
                 reply
             }
             zone_answer::Verdict::Nxdomain => {
-                let reply = self.reply(&request, query, ResponseCode::NXDomain, None, true);
+                let reply = self.reply(
+                    &request,
+                    query,
+                    ResponseCode::NXDomain,
+                    None,
+                    true,
+                    Some(self.soa.clone()),
+                );
                 tracing::debug!(
                     component = COMPONENT,
                     name = asked,
@@ -317,7 +342,14 @@ impl<T: Zone> ZoneAnswerer<T> {
             zone_answer::Verdict::Address(address) => {
                 let record =
                     Record::from_rdata(qname, zone_answer::ANSWER_TTL_SECS, RData::A(A(address)));
-                let reply = self.reply(&request, query, ResponseCode::NoError, Some(record), true);
+                let reply = self.reply(
+                    &request,
+                    query,
+                    ResponseCode::NoError,
+                    Some(record),
+                    true,
+                    None,
+                );
                 tracing::debug!(
                     component = COMPONENT,
                     name = asked,
@@ -376,12 +408,12 @@ impl<T: Zone> ZoneAnswerer<T> {
     /// The reply bytes for one answered lookup: the envelope every verdict's
     /// reply shares — the query echoed, the rcode named, and the answer
     /// record in the answer section when there is one — authoritative for the
-    /// zone and for nothing else (the REFUSED reply is not, so it never cites
-    /// our SOA over someone else's namespace). The negatives the zone
-    /// certifies are its own — an authoritative reply with no answer records,
-    /// NODATA and NXDOMAIN — and every one of them carries the zone's SOA in
-    /// the authority section (NET-124): the record the host resolver needs to
-    /// cache the negative at all.
+    /// zone and for nothing else (the out-of-zone NXDOMAIN is not). `soa` is
+    /// the record for the authority section. The zone's own negatives, NODATA
+    /// and NXDOMAIN, pass the zone's SOA (NET-124): the record the host
+    /// resolver needs to cache the negative at all. The out-of-zone NXDOMAIN
+    /// passes the root-owned SOA (NET-079), so the zone's SOA never certifies
+    /// someone else's namespace.
     fn reply(
         &self,
         request: &Message,
@@ -389,6 +421,7 @@ impl<T: Zone> ZoneAnswerer<T> {
         rcode: ResponseCode,
         answer: Option<Record>,
         authoritative: bool,
+        soa: Option<Record>,
     ) -> Option<Vec<u8>> {
         let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
         reply.metadata = Metadata::response_from_request(&request.metadata);
@@ -398,8 +431,8 @@ impl<T: Zone> ZoneAnswerer<T> {
         if let Some(record) = answer {
             reply.add_answer(record);
         }
-        if authoritative && reply.answers.is_empty() {
-            reply.add_authority(self.soa.clone());
+        if let Some(soa) = soa {
+            reply.add_authority(soa);
         }
         reply.to_vec().ok()
     }
@@ -2869,10 +2902,8 @@ mod tests {
 
     /// NET-125: a lookup for an in-zone name that no box or node holds answers
     /// NXDOMAIN — authoritative, no answers, the zone's SOA so the negative
-    /// caches. A name outside the box zone is not NXDOMAIN (this answerer is
-    /// authoritative for `min.internal` and nothing else): it is REFUSED, so a
-    /// too-broad resolver routing domain names itself rather than this
-    /// answerer fabricating an NXDOMAIN for someone else's namespace.
+    /// caches. A name outside the box zone gets a different NXDOMAIN: see
+    /// [`out_of_zone_name_is_nxdomain_with_root_soa`].
     #[test]
     fn unknown_in_zone_name_is_nxdomain() {
         let native = answerer(registry(false), AnswerScope::Native);
@@ -2920,19 +2951,40 @@ mod tests {
             "a withdrawn name is held by nothing"
         );
 
-        // Out of zone is REFUSED, not NXDOMAIN.
+        // Out of zone is NXDOMAIN too, but not the zone's own: not
+        // authoritative, and it never cites the zone's SOA.
         let reply = exchange(
             &native,
             on_host(),
             &encode_query("example.com.", RecordType::A),
         )
-        .expect("the answerer refuses rather than ignoring");
-        assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        .expect("an out-of-zone name is answered");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
         assert!(!reply.metadata.authoritative, "not our zone");
-        assert!(
-            reply.authorities.is_empty(),
-            "the zone's SOA certifies our negatives only"
-        );
+        crate::net::dns_gate::tests::assert_cites_root_soa(&reply);
+    }
+
+    /// NET-079, issue 3020: a name outside the box zone answers NXDOMAIN
+    /// citing the root-owned SOA with a 15 s minimum, for every query type.
+    /// It is never REFUSED: glibc reads REFUSED as a temporary failure, so a
+    /// native deny-all box with a host-address resolver retried it.
+    #[test]
+    fn out_of_zone_name_is_nxdomain_with_root_soa() {
+        let native = answerer(registry(false), AnswerScope::Native);
+        for name in ["example.com.", "github.com.", "min.internal.example.com."] {
+            for rtype in [RecordType::A, RecordType::AAAA, RecordType::TXT] {
+                let reply = exchange(&native, on_host(), &encode_query(name, rtype))
+                    .expect("an out-of-zone name is answered");
+                assert_eq!(
+                    reply.metadata.response_code,
+                    ResponseCode::NXDomain,
+                    "{name} {rtype:?} is NXDOMAIN, not REFUSED"
+                );
+                assert!(!reply.metadata.authoritative, "{name}: not our zone");
+                assert!(reply.answers.is_empty(), "{name}: no answers");
+                crate::net::dns_gate::tests::assert_cites_root_soa(&reply);
+            }
+        }
     }
 
     /// NET-126: every record the answerer emits — A answers, and the SOA every
