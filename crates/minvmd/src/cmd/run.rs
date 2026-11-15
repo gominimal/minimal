@@ -4797,12 +4797,16 @@ mod tests {
                 // freed pin, so the fallback asks a fresh port instead.
                 super::CandidateCheck::Skip(super::SKIP_BIND_REFUSED)
                 | super::CandidateCheck::Skip(super::SKIP_LOOPBACK_ANSWERING) => {}
-                // The parallel test released the pin before this probe: the
-                // reservation the verdict hands back is the check's own
-                // answer on the pin.
-                super::CandidateCheck::Free(reservation) => {
-                    reclaimed = Some(reservation);
-                    break;
+                // The parallel test released the pin between the check's
+                // probe and this one: ask the check itself again, so only a
+                // reservation the check took satisfies the assertion. The
+                // verdict names the race; it never stands in for the check's
+                // answer, or a check that always fails would pass here.
+                super::CandidateCheck::Free(_) => {
+                    reclaimed = check(pin);
+                    if reclaimed.is_some() {
+                        break;
+                    }
                 }
                 super::CandidateCheck::Skip(reason) => {
                     panic!("the released pin {pin} was not reclaimed: {reason}")
