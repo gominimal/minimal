@@ -3011,7 +3011,7 @@ pub(crate) fn put_spec(
 /// The digest is over the client's own spec, read as a TOML table. It is
 /// not over the JSON the request sends. The daemon computes its digest from
 /// the JSON it receives, so the two digests differ when the spec changes on
-/// the way. A spec that names no type is of the creating verb's type, as
+/// the way, and the daemon then refuses the create. A spec that names no type is of the creating verb's type, as
 /// the daemon reads it.
 ///
 /// The two sides convert the spec in different ways: the client through
