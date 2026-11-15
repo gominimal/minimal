@@ -4800,9 +4800,14 @@ mod tests {
                 // The parallel test released the pin between the check's
                 // probe and this one: ask the check itself again, so only a
                 // reservation the check took satisfies the assertion. The
-                // verdict names the race; it never stands in for the check's
-                // answer, or a check that always fails would pass here.
-                super::CandidateCheck::Free(_) => {
+                // verdict's own reservation goes first — its flock is the
+                // one the retry's take contends with, so keeping it makes
+                // the retry skip the very pin the verdict just proved free.
+                // The verdict names the race; it never stands in for the
+                // check's answer, or a check that always fails would pass
+                // here.
+                super::CandidateCheck::Free(reservation) => {
+                    drop(reservation);
                     reclaimed = check(pin);
                     if reclaimed.is_some() {
                         break;
