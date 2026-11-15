@@ -232,6 +232,13 @@ fn answer_failure(
         return ExitCode::from(minimal::BoxTimedOut::EXIT_CODE);
     }
     let _ = writeln!(stderr, "error: {e:#}");
+    // BCLI-013: a wait that its `--timeout` ended gives the next step on
+    // its own line, as the machine-mode object gives it in `hint`.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxTimedOut>()
+        && !timed_out.hint().is_empty()
+    {
+        let _ = writeln!(stderr, "{}", timed_out.hint());
+    }
     if let Some(hint) = alias_hint {
         let _ = writeln!(stderr, "{hint}");
     }
@@ -1328,6 +1335,7 @@ mod tests {
             (
                 minimal::BoxAddressRefusal::AmbiguousIdStart {
                     start: address("01"),
+                    candidates: Vec::new(),
                 },
                 "ambiguous",
                 2,
@@ -1478,7 +1486,11 @@ mod tests {
         for (timed_out, code) in [
             (minimal::BoxTimedOut::ended("web"), "timeout"),
             (
-                minimal::BoxTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000", "30s"),
+                minimal::BoxTimedOut::waited(
+                    Some("web"),
+                    "0190a3c4-0000-7000-8000-000000000000",
+                    "30s",
+                ),
                 "wait_timeout",
             ),
         ] {
@@ -1505,7 +1517,11 @@ mod tests {
                 ExitCode::from(124)
             );
             let text = String::from_utf8(stderr).unwrap();
-            assert_eq!(text, format!("error: {timed_out}\n"));
+            let hint = match timed_out.hint() {
+                "" => String::new(),
+                hint => format!("{hint}\n"),
+            };
+            assert_eq!(text, format!("error: {timed_out}\n{hint}"));
         }
 
         // `min task run` and `min box run`: a box that its timeout ended

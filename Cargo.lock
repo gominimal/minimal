@@ -4426,6 +4426,8 @@ dependencies = [
  "anyhow",
  "args",
  "blake3",
+ "boxes",
+ "camino",
  "check",
  "checkouts",
  "clap",
@@ -4453,11 +4455,14 @@ dependencies = [
  "serde_json_lenient",
  "serial_test",
  "smallvec",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "version",
+ "walkdir",
 ]
 
 [[package]]
