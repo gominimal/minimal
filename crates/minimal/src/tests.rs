@@ -17976,6 +17976,17 @@ async fn box_spec_box_renders_stored_copy() {
             serde_json_lenient::json!({"API_KEY": {"source": "client_env", "value": "hunter2"}}),
         );
     }
+    // The spec changed, so its client digest changes with it, as a client
+    // that sends this spec computes it. A stale digest is refused (BOX-072).
+    let digest = mfile::projection::spec_digest(
+        secret_request
+            .spec
+            .as_ref()
+            .expect("the request carries a spec"),
+        boxes::SESSION_BOX_TYPE,
+    )
+    .expect("the spec projects");
+    secret_request.config.set_client_projection_digest(digest);
     let secret_id = create_box_from(&server, &secret_request).await.to_string();
     for format in ["toml", "json", "yaml"] {
         let text = box_spec_text(&global, &["min", "box", "spec", &secret_id, "-o", format])
