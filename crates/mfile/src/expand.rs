@@ -4069,7 +4069,7 @@ mod tests {
             )],
             defaults: toml::Table::new(),
             defaults_type: toml::Table::new(),
-            loadouts: toml::Table::new(),
+            loadouts: Vec::new(),
             overrides: table(overrides),
             host_vars: BTreeMap::new(),
             store_rules: store_rules.clone(),
