@@ -4060,7 +4060,7 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
         .expect_err("an invalid `[box] name` is refused");
     let text = format!("{refused:#}");
     assert!(
-        text.contains("invalid session name") && text.contains("DNS label"),
+        text.contains("invalid box name") && text.contains("DNS label"),
         "the refusal says the name is invalid: {text}"
     );
     assert!(
