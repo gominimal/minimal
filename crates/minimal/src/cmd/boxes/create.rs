@@ -3225,15 +3225,14 @@ pub(crate) fn put_spec(
 }
 
 /// Sets the client's projection digest of `spec` on `request` (BOX-071).
-/// The digest is over the client's own spec, read as a TOML table. It is
-/// not over the JSON the request sends. The daemon computes its digest from
-/// the JSON it receives, so the two digests differ when the spec changes on
-/// the way, and the daemon then refuses the create. A spec that names no type is of the creating verb's type, as
-/// the daemon reads it.
-///
-/// The two sides convert the spec in different ways: the client through
-/// `toml::Table::try_from`, the daemon through `spec_digest`. Both drop a
-/// null, and both refuse an integer that TOML cannot hold.
+/// `spec` is the typed spec that [`put_spec`] also sends as JSON. The
+/// client converts it to a TOML table with `toml::Table::try_from` and
+/// projects that table. The daemon projects the JSON it receives, through
+/// `spec_digest`. Both conversions drop a null, and both refuse an integer
+/// that TOML cannot hold. So for an unchanged spec the two digests are
+/// equal. They differ only when the sent JSON no longer matches `spec`, and
+/// the daemon then refuses the create. A spec that names no type is of the
+/// creating verb's type, as the daemon reads it.
 ///
 /// Gap: the typed spec has no `[secrets]` table, so this digest binds no
 /// secret grants or store rules (BOX-071 says the projection holds the
