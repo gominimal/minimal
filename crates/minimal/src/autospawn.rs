@@ -286,9 +286,11 @@ pub fn wait_for_minvmd_stopped(minimal_dir: Option<&Path>) -> io::Result<()> {
     }
 }
 
-/// Wait for the daemon the CLI talks to to finish shutting down. Only the
-/// minvmd backend has a VM to tear down (and lifecycle state to observe); a
-/// native minimald just exits, so there is nothing to wait for.
+/// Wait for the daemon the CLI talks to to finish shutting down. The minvmd
+/// backend has a VM to tear down, and its lifecycle state to observe. A native
+/// minimald has no lifecycle file, so the wait is for its socket to stop
+/// accepting: until then the next command would connect to the departing
+/// daemon instead of starting a fresh one.
 #[cfg(target_os = "macos")]
 pub fn wait_for_daemon_stopped(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
     let _ = use_minvmd;
@@ -300,7 +302,40 @@ pub fn wait_for_daemon_stopped(use_minvmd: bool, minimal_dir: Option<&Path>) -> 
     if use_minvmd {
         return wait_for_minvmd_stopped(minimal_dir);
     }
-    Ok(())
+    let sock = crate::client::resolve_socket_path(minimal_dir, false)
+        .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
+    wait_for_minimald_unlistening(&sock, MINIMALD_UNLISTEN_WAIT)
+}
+
+/// The bound on [`wait_for_minimald_unlistening`]. A daemon of this build
+/// closes its listener as soon as it answers `Shutdown`; an older one keeps it
+/// bound through its connection drain, so the drain and a margin bound it.
+#[cfg(target_os = "linux")]
+const MINIMALD_UNLISTEN_WAIT: Duration =
+    minimald_rpc::SHUTDOWN_DRAIN_GRACE.saturating_add(Duration::from_secs(1));
+
+/// Linux native (DM2): wait, bounded by `wait`, until the daemon's socket no
+/// longer accepts a connection ([`minimald_socket_live`] reads it as not
+/// running). The socket is `local-minimald<N>/ssh.sock`, which no minvmd
+/// bridge serves (the two backends own distinct host dirs), so what answers
+/// there is the daemon that was asked to stop.
+#[cfg(target_os = "linux")]
+fn wait_for_minimald_unlistening(socket_path: &Path, wait: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if !minimald_socket_live(socket_path) {
+            tracing::debug!("native minimald has stopped listening");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "the daemon is still listening on {} after {}s",
+                socket_path.display(),
+                wait.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(STOPPING_POLL_MS));
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -667,5 +702,65 @@ mod tests {
             "this test is only meaningful while the path is rejected for its length"
         );
         assert!(is_daemon_running(false, Some(&long)).unwrap());
+    }
+
+    /// `min stop` against a native daemon returns only once its socket stops
+    /// accepting: the wait ends when the listener closes, not before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_stop_waits_until_the_socket_stops_accepting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let closed_after = std::time::Duration::from_millis(400);
+        std::thread::spawn(move || {
+            std::thread::sleep(closed_after);
+            drop(listener);
+        });
+
+        let started = std::time::Instant::now();
+        super::wait_for_minimald_unlistening(&sock, std::time::Duration::from_secs(5))
+            .expect("the wait ends once the listener closes");
+        let waited = started.elapsed();
+        assert!(
+            waited >= closed_after,
+            "returned after {waited:?}, while the socket still accepted"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(3),
+            "kept waiting {waited:?} after the listener closed"
+        );
+    }
+
+    /// A socket that nothing listens on (the file a stopped daemon leaves) is
+    /// a stopped daemon at once.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_stop_wait_returns_at_once_on_a_refusing_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let started = std::time::Instant::now();
+        super::wait_for_minimald_unlistening(&sock, std::time::Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A socket that keeps accepting is a daemon that did not stop: the wait
+    /// gives up at its bound and says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_stop_wait_is_bounded_and_reports_a_daemon_still_listening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let wait = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = super::wait_for_minimald_unlistening(&sock, wait)
+            .expect_err("a socket that still accepts is not a stopped daemon");
+        assert!(started.elapsed() >= wait);
+        assert!(
+            err.to_string().contains("still listening"),
+            "the error names the cause: {err}"
+        );
     }
 }
