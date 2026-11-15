@@ -5080,7 +5080,10 @@ mod tests {
         );
         let daemon = mfile::projection::spec_digest(wire, boxes::SESSION_BOX_TYPE)
             .expect("the sent spec projects");
-        assert_eq!(request.config.client_projection_digest(), Some(daemon.as_str()));
+        assert_eq!(
+            request.config.client_projection_digest(),
+            Some(daemon.as_str())
+        );
         assert_eq!(client, daemon);
     }
 
