@@ -20,6 +20,7 @@ pub mod expand;
 pub mod legacy;
 pub mod network;
 mod package_composable;
+pub mod projection;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
 pub use project_composable::ProjectComposable;
@@ -1408,7 +1409,7 @@ impl File {
 
     #[cfg(not(target_os = "linux"))]
     fn read_confined(root: &Path, rel: &Path, path: &Path) -> Result<Option<Vec<u8>>, Error> {
-        Self::check_components(root, rel, path, Access::Read)?;
+        Self::check_components(root, rel, Access::Read)?;
         Self::read_by_path(path)
     }
 
@@ -1430,7 +1431,7 @@ impl File {
                 Beneath::Found { dir, name, shown } => (dir, name, shown),
                 Beneath::NoDir(_) => return Ok(None),
                 Beneath::NoOpenat2 => {
-                    Self::check_components(root, rel, path, Access::Read)?;
+                    Self::check_components(root, rel, Access::Read)?;
                     return Self::read_by_path(path);
                 }
             };
@@ -1689,10 +1690,14 @@ impl File {
             rel.file_name().is_some() && rel.components().all(|c| matches!(c, Component::Normal(_)))
         });
         rel.ok_or_else(|| {
+            // The caller built `path` from something other than `root`: a
+            // daemon bug, not something the box did, so the daemon's paths
+            // are the useful ones here.
             let e = std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
-                    "not a file under the workspace {}; the {} is refused",
+                    "not a file under the workspace {}, so the {} is refused. \
+                     This is a bug in minimald: please report it",
                     root.display(),
                     access.noun()
                 ),
@@ -1701,39 +1706,85 @@ impl File {
         })
     }
 
-    /// The error for a `minimal.toml` whose name leads out of the workspace.
-    fn leads_outside(path: &Path, access: Access) -> Error {
+    // The refusals below name the file by `rel`, its path under the
+    // workspace (`minimal.toml` or `.minimal/minimal.toml`). They reach the
+    // person in the box (at activation, or on `min add`), who knows the
+    // file by that name and not by the daemon's path to the workspace, and
+    // each ends with what that person can do about it.
+
+    /// The error for a `minimal.toml` whose name resolves, through a link,
+    /// to a file outside the workspace.
+    #[cfg(target_os = "linux")]
+    fn leads_outside(rel: &Path, access: Access) -> Error {
         let e = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "the box's minimal.toml leads outside its workspace (a link or `..` out of it); \
-                 the {} is refused",
+                "it leads outside its workspace through a link, so the {} is refused. \
+                 Replace the link (`minimal.toml` or `.minimal`) with a regular file or \
+                 directory, or with a relative link that stays in the workspace",
                 access.noun()
             ),
         );
-        Error::IO(access.op(), path.to_path_buf(), e)
+        Error::IO(access.op(), rel.to_path_buf(), e)
+    }
+
+    /// The error for a link at `link` (a name under the workspace) where
+    /// links are not followed: the fallback for a kernel without `openat2`,
+    /// or a system other than Linux, refuses every link, since it cannot
+    /// keep a followed link inside the workspace. It does not say the link
+    /// leads outside: it did not look where the link leads.
+    fn link_not_followed(link: &Path, access: Access) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "a link, and this system cannot follow a link here and keep the {0} inside \
+                 the workspace, so the {0} is refused. Replace the link with a regular file \
+                 or directory",
+                access.noun()
+            ),
+        );
+        Error::IO(access.op(), link.to_path_buf(), e)
+    }
+
+    /// The error for a `minimal.toml` that became a link after it was
+    /// resolved, while the edit or read held it.
+    #[cfg(target_os = "linux")]
+    fn became_a_link(rel: &Path, access: Access) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "it was replaced by a link during the {0}, so the {0} is refused. \
+                 Run the command again",
+                access.noun()
+            ),
+        );
+        Error::IO(access.op(), rel.to_path_buf(), e)
     }
 
     /// The error for a `minimal.toml` that is a link to nothing.
     #[cfg(target_os = "linux")]
-    fn dangling_within(path: &Path) -> Error {
+    fn dangling_within(rel: &Path) -> Error {
         let e = std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "symlink to a file that does not exist; create it or replace the link with a file",
         );
-        Error::IO("resolving", path.to_path_buf(), e)
+        Error::IO("resolving", rel.to_path_buf(), e)
     }
 
     /// The best-effort confinement: no component of `rel` under `root` may
     /// be a symlink. A link swapped in between this check and the edit or
     /// read is not caught, which is why Linux resolves the names with
     /// `openat2` instead.
-    fn check_components(root: &Path, rel: &Path, path: &Path, access: Access) -> Result<(), Error> {
+    fn check_components(root: &Path, rel: &Path, access: Access) -> Result<(), Error> {
         let mut at = root.to_path_buf();
+        let mut link = PathBuf::new();
         for component in rel.components() {
             at.push(component);
+            link.push(component);
             match std::fs::symlink_metadata(&at) {
-                Ok(meta) if meta.is_symlink() => return Err(Self::leads_outside(path, access)),
+                Ok(meta) if meta.is_symlink() => {
+                    return Err(Self::link_not_followed(&link, access));
+                }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
                 Err(e) => return Err(Error::IO("statting", at, e)),
@@ -1754,7 +1805,7 @@ impl File {
     where
         E: From<Error>,
     {
-        Self::check_components(root, rel, path, Access::Edit)?;
+        Self::check_components(root, rel, Access::Edit)?;
         // No component under `root` is a link, so the path-based editor's
         // canonical path stays under the (trusted) canonical `root`.
         Self::edit_exclusively_in(lock_dir, timeout, path, edit)
@@ -1800,6 +1851,7 @@ impl File {
                 std::fs::File::from(dir),
                 &name,
                 &shown,
+                rel,
                 edit,
             ),
             Beneath::NoDir(e) => Err(Error::IO("opening", path.to_path_buf(), e).into()),
@@ -1826,7 +1878,7 @@ impl File {
 
         let parent_rel = rel.parent().unwrap_or(Path::new(""));
         let Some(name) = rel.file_name() else {
-            return Err(Self::leads_outside(path, access));
+            return Err(Self::leads_outside(rel, access));
         };
 
         let dir_fd = match beneath::open_beneath(root_fd, parent_rel, beneath::DIR_FLAGS) {
@@ -1839,7 +1891,7 @@ impl File {
                 );
                 return Ok(Beneath::NoOpenat2);
             }
-            Err(e) if beneath::escaped(&e) => return Err(Self::leads_outside(path, access)),
+            Err(e) if beneath::escaped(&e) => return Err(Self::leads_outside(rel, access)),
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(Beneath::NoDir(e)),
             Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e)),
         };
@@ -1854,10 +1906,10 @@ impl File {
                 let target = match beneath::open_beneath(root_fd, rel, libc::O_PATH) {
                     Ok(fd) => fd,
                     Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                        return Err(Self::dangling_within(path));
+                        return Err(Self::dangling_within(rel));
                     }
                     Err(e) if beneath::escaped(&e) => {
-                        return Err(Self::leads_outside(path, access));
+                        return Err(Self::leads_outside(rel, access));
                     }
                     Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e)),
                 };
@@ -1866,10 +1918,10 @@ impl File {
                 let root_real = beneath::fd_path(root_fd)
                     .map_err(|e| Error::IO("resolving", root.to_path_buf(), e))?;
                 let Some(real_rel) = resolved.strip_prefix(&root_real).ok() else {
-                    return Err(Self::leads_outside(path, access));
+                    return Err(Self::leads_outside(rel, access));
                 };
                 let Some(real_name) = real_rel.file_name() else {
-                    return Err(Self::leads_outside(path, access));
+                    return Err(Self::leads_outside(rel, access));
                 };
                 // Opened beneath `root` again rather than by the absolute
                 // path, so a directory swapped for a link meanwhile is
@@ -1878,7 +1930,7 @@ impl File {
                 let dir = match beneath::open_beneath(root_fd, real_parent, beneath::DIR_FLAGS) {
                     Ok(fd) => fd,
                     Err(e) if beneath::escaped(&e) => {
-                        return Err(Self::leads_outside(path, access));
+                        return Err(Self::leads_outside(rel, access));
                     }
                     Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e)),
                 };
@@ -1905,6 +1957,10 @@ impl File {
     /// `renameat` within `dir`. A rename never follows a link at its target
     /// name. It duplicates that body rather than sharing it, because the
     /// path-based one must keep following links for the host CLI.
+    ///
+    /// `shown` is the file's real path, for the lock key and the I/O
+    /// errors; `rel` is the name under the workspace the caller asked for,
+    /// for the refusals.
     #[cfg(target_os = "linux")]
     fn edit_in_dir<E>(
         lock_dir: Option<&Path>,
@@ -1912,6 +1968,7 @@ impl File {
         dir: std::fs::File,
         name: &OsStr,
         shown: &Path,
+        rel: &Path,
         edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
     ) -> Result<(), E>
     where
@@ -1945,9 +2002,10 @@ impl File {
                 if !meta.is_file() {
                     let e = std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "not a regular file; the edit is refused",
+                        "not a regular file, so the edit is refused. \
+                         Replace it with a regular file",
                     );
-                    return Err(Error::IO("reading", shown.to_path_buf(), e).into());
+                    return Err(Error::IO("reading", rel.to_path_buf(), e).into());
                 }
                 let mut content = String::new();
                 file.read_to_string(&mut content)
@@ -1957,7 +2015,7 @@ impl File {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
             // A link put at `name` after it was resolved.
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(Self::leads_outside(shown, Access::Edit).into());
+                return Err(Self::became_a_link(rel, Access::Edit).into());
             }
             Err(e) => return Err(Error::IO("reading", shown.to_path_buf(), e).into()),
         };
@@ -2003,7 +2061,8 @@ impl File {
         }
         let (_file, tmp_path) = tmp.into_parts();
         let Some(tmp_name) = tmp_path.file_name().map(OsStr::to_os_string) else {
-            return Err(Self::leads_outside(shown, Access::Edit).into());
+            let e = std::io::Error::other("the temp file has no name");
+            return Err(Error::IO("creating temp", shown.to_path_buf(), e).into());
         };
         match beneath::rename_at(dir.as_fd(), &tmp_name, name) {
             // The temp's name is now the file's: nothing is left to remove.
@@ -2456,12 +2515,52 @@ impl File {
         OsString::from_vec(out)
     }
 
+    /// Encodes a path component for [`Self::state_dir_under`]'s flat
+    /// directory name, injectively: `-` becomes `%2D` and `%` becomes `%25`,
+    /// so a `-` in the result is always a separator. [`Self::encode_component`]
+    /// is not injective across separators (`a-`,`b` and `a`,`-b` both give
+    /// `a---b`); it stays as it is so native `state_dir` keeps its names.
+    /// Non-UTF8 bytes are preserved as-is.
+    fn encode_component_escaped(s: &OsStr) -> OsString {
+        let mut out = Vec::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            match b {
+                b'-' => out.extend_from_slice(b"%2D"),
+                b'%' => out.extend_from_slice(b"%25"),
+                _ => out.push(b),
+            }
+        }
+        OsString::from_vec(out)
+    }
+
     /// Helper method for state_dir to simplify unit testing
     fn state_dir_from_path<P: AsRef<Path>>(
         state_key: &str,
         env_base_dir: P,
         home_dir: Option<&Path>,
         mfile_dir: &Path,
+    ) -> PathBuf {
+        Self::state_dir_encoded(
+            state_key,
+            env_base_dir,
+            home_dir,
+            mfile_dir,
+            Self::encode_component,
+            None,
+        )
+    }
+
+    /// [`Self::state_dir_from_path`] with the component encoder chosen, and
+    /// what a `..` component becomes: `None` drops it, as the native names
+    /// always have; `Some(text)` keeps it as `text`, so that two paths that
+    /// differ only by a `..` get two directories.
+    fn state_dir_encoded<P: AsRef<Path>>(
+        state_key: &str,
+        env_base_dir: P,
+        home_dir: Option<&Path>,
+        mfile_dir: &Path,
+        encode: fn(&OsStr) -> OsString,
+        parent_dir: Option<&str>,
     ) -> PathBuf {
         let (start_marker, components) = home_dir
             .map(|home| mfile_dir.strip_prefix(home))
@@ -2472,7 +2571,8 @@ impl File {
         let mut tail = OsString::new();
         for (i, c) in components
             .filter_map(|c| match c {
-                Component::Normal(s) => Some(Self::encode_component(s)),
+                Component::Normal(s) => Some(encode(s)),
+                Component::ParentDir => parent_dir.map(OsString::from),
                 _ => None,
             })
             .enumerate()
@@ -2513,6 +2613,33 @@ impl File {
                 mfile_dir,
             )
         })
+    }
+
+    /// Returns the path to the durable state directory for the given key,
+    /// keyed on `project_dir` instead of where this minimal file sits on disk.
+    ///
+    /// For a daemon that reads every box's project from a tree laid out
+    /// afresh each session, native or VM, whose path changes every time, so
+    /// the caller supplies the stable host path. The `~` prefix is never
+    /// used: the host's home is not this machine's. Components are encoded
+    /// with [`Self::encode_component_escaped`], so two project paths never
+    /// share a directory.
+    pub fn state_dir_under<P: AsRef<Path>>(
+        &self,
+        state_key: &str,
+        env_base_dir: P,
+        project_dir: &Path,
+    ) -> PathBuf {
+        Self::state_dir_encoded(
+            state_key,
+            env_base_dir,
+            None,
+            project_dir,
+            Self::encode_component_escaped,
+            // A `..` the caller did not resolve stays in the key, escaped
+            // like a name would be, so `/work/a/../b` and `/work/b` differ.
+            Some("%2E%2E"),
+        )
     }
 
     /// Resolves how the remote-cache reader should locate its index:
@@ -3543,6 +3670,71 @@ mod tests {
             Path::new("/home/user/project"),
         );
         assert_eq!(result, Path::new("/tmp/state/~project/env"));
+    }
+
+    #[test]
+    fn state_dir_under_ignores_where_the_mfile_sits() {
+        let at = |p: &str| File {
+            mfile_path: Some(PathBuf::from(p)),
+            ..Default::default()
+        };
+        let project = Path::new("/home/user/src/my-project");
+        let a = at("/var/lib/minimal/sessions/aaaa/tree/minimal.toml");
+        let b = at("/var/lib/minimal/sessions/bbbb/tree/.minimal/minimal.toml");
+        let dir_a = a.state_dir_under("env", "/tmp/state", project);
+        let dir_b = b.state_dir_under("env", "/tmp/state", project);
+        assert_eq!(dir_a, dir_b);
+        // Never `~`: the project's home is another machine's.
+        assert_eq!(
+            dir_a,
+            Path::new("/tmp/state/-home-user-src-my%2Dproject/env")
+        );
+    }
+
+    /// `encode_component` aliases `/work/a-/b` and `/work/a/-b` (both
+    /// `a---b`); `state_dir_under` must give two projects two directories.
+    #[test]
+    fn state_dir_under_never_aliases_two_projects() {
+        let f = File {
+            mfile_path: Some(PathBuf::from("/tree/minimal.toml")),
+            ..Default::default()
+        };
+        let one = f.state_dir_under("env", "/tmp/state", Path::new("/work/a-/b"));
+        let two = f.state_dir_under("env", "/tmp/state", Path::new("/work/a/-b"));
+        assert_ne!(one, two);
+        assert_eq!(one, Path::new("/tmp/state/-work-a%2D-b/env"));
+        assert_eq!(two, Path::new("/tmp/state/-work-a-%2Db/env"));
+        // `%` is escaped too, so a literal `%2D` cannot pose as an escaped `-`.
+        let three = f.state_dir_under("env", "/tmp/state", Path::new("/work/a%2D/b"));
+        assert_eq!(three, Path::new("/tmp/state/-work-a%252D-b/env"));
+        assert_ne!(three, one);
+        // A `..` the caller left in the path is kept, so it cannot pose as
+        // the path it would resolve to.
+        let up = f.state_dir_under("env", "/tmp/state", Path::new("/work/a/../b"));
+        let flat = f.state_dir_under("env", "/tmp/state", Path::new("/work/b"));
+        assert_ne!(up, flat);
+        assert_eq!(up, Path::new("/tmp/state/-work-a-%2E%2E-b/env"));
+        // The native names drop it, as they always have: `/work/a/../b` and
+        // `/work/a/b` share one directory there, the aliasing this encoder
+        // is for.
+        assert_eq!(
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/work/a/../b")),
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/work/a/b"))
+        );
+    }
+
+    #[test]
+    fn encode_component_escaped_escapes_dash_and_percent() {
+        assert_eq!(File::encode_component_escaped(OsStr::new("foo")), "foo");
+        assert_eq!(
+            File::encode_component_escaped(OsStr::new("my-pro%ject")),
+            "my%2Dpro%25ject"
+        );
+        let input = OsStr::from_bytes(b"a\x80-b");
+        assert_eq!(
+            File::encode_component_escaped(input).as_bytes(),
+            b"a\x80%2Db"
+        );
     }
 
     #[test]
@@ -4635,13 +4827,59 @@ bash = \"true\"
         (dir, root, outside)
     }
 
+    /// Whether the edit of a file under `root` refuses every link rather
+    /// than following it: the fallback, taken off Linux and on a Linux
+    /// kernel without `openat2`.
+    fn refuses_every_link(root: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            takes_the_no_openat2_fallback(root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = root;
+            true
+        }
+    }
+
+    /// The edit was refused with a refusal that names the file by its path
+    /// under the workspace and says what to do: as leading outside the
+    /// workspace, or, where every link is refused, as a link. The fallback
+    /// does not look where a link leads, so it must not say.
+    fn assert_link_refusal(err: &Error, root: &Path) {
+        let text = err.to_string();
+        if refuses_every_link(root) {
+            assert!(
+                text.contains("cannot follow a link here") && !text.contains("leads outside"),
+                "error: {text}"
+            );
+            assert!(
+                text.contains("Replace the link with a regular file"),
+                "error: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("leads outside its workspace"),
+                "error: {text}"
+            );
+            assert!(
+                text.contains("or with a relative link that stays in the workspace"),
+                "error: {text}"
+            );
+        }
+        let Error::IO(_, shown, _) = err else {
+            panic!("not an I/O refusal: {err:?}");
+        };
+        assert!(
+            shown.is_relative() && !text.contains(&*root.to_string_lossy()),
+            "the refusal shows the daemon's path: {text}"
+        );
+    }
+
     /// The edit was refused as leading out of the workspace, `outside` is
     /// unchanged, and `link` is still the link it was.
     fn assert_refused_outside(err: &Error, outside: &Path, link: &Path, target: &Path) {
-        assert!(
-            err.to_string().contains("leads outside its workspace"),
-            "error: {err}"
-        );
+        assert_link_refusal(err, link.parent().unwrap());
         assert_eq!(std::fs::read_to_string(outside).unwrap(), BASE);
         assert_eq!(
             std::fs::read_link(link).expect("the link entry was replaced"),
@@ -4778,10 +5016,7 @@ bash = \"true\"
             eprintln!(
                 "this kernel has no openat2: checking the fallback's refusal of every link instead"
             );
-            assert!(
-                err.to_string().contains("leads outside its workspace"),
-                "error: {err}"
-            );
+            assert_link_refusal(&err, &root);
         } else {
             assert!(err.to_string().contains("does not exist"), "error: {err}");
         }
@@ -4808,10 +5043,7 @@ bash = \"true\"
                 "this kernel has no openat2: checking the fallback's refusal of every link instead"
             );
             let err = edit_within_test(&root, &link, append_k).unwrap_err();
-            assert!(
-                err.to_string().contains("leads outside its workspace"),
-                "error: {err}"
-            );
+            assert_link_refusal(&err, &root);
             assert_eq!(std::fs::read_to_string(&real).unwrap(), BASE);
             assert_eq!(std::fs::read_link(&link).unwrap(), target);
             return;

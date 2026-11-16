@@ -27,6 +27,8 @@ pub mod handle;
 pub mod http;
 pub mod inject;
 pub mod keys;
+#[cfg(target_os = "linux")]
+pub mod linux_store;
 pub mod listener;
 pub mod module;
 pub mod proxy;
@@ -35,7 +37,11 @@ pub mod redeem;
 pub mod redeemer;
 pub mod revoke;
 pub mod seal;
+#[cfg(target_os = "linux")]
+pub mod secret_service;
 pub mod signin;
 pub mod store;
 pub mod supervisor;
+#[cfg(target_os = "linux")]
+pub mod tpm;
 pub mod upstream;

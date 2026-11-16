@@ -10,9 +10,10 @@ pub enum Error {
     /// An I/O error occurred.
     #[error("i/o error: {0}")]
     IO(#[from] std::io::Error),
-    /// An error interacting with the Cache occurred.
+    /// An error interacting with the Cache occurred. The `CacheErr` is in the
+    /// message and is not the `source()`, so `{:#}` prints it once.
     #[error("cache error: {0}")]
-    Cache(#[from] CacheErr),
+    Cache(CacheErr),
     /// An error during planning occurred.
     #[error("plan error: {1:?}")]
     Plan(Graph, #[source] PlanErr),
@@ -35,6 +36,12 @@ pub enum Error {
     Other(anyhow::Error),
 }
 
+impl From<CacheErr> for Error {
+    fn from(e: CacheErr) -> Self {
+        Self::Cache(e)
+    }
+}
+
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
         Self::Other(e)
@@ -49,6 +56,27 @@ impl From<op::Error> for Error {
             op::Error::Other(e) => Self::Other(e),
             op::Error::Plan(g, e) => Self::Plan(g, e),
             op::Error::Sandbox(e) => Self::Sandbox(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cache error, whether made here or carried over from op, reads once
+    /// in a chain printed with `{:#}`: not "cache error: not found: not found".
+    #[test]
+    fn a_cache_error_prints_its_cause_once() {
+        for e in [
+            Error::Cache(CacheErr::NotFound),
+            Error::from(op::Error::Cache(CacheErr::NotFound)),
+        ] {
+            assert!(std::error::Error::source(&e).is_none());
+            assert_eq!(
+                format!("{:#}", anyhow::Error::from(e).context("reading foo")),
+                "reading foo: cache error: not found"
+            );
         }
     }
 }

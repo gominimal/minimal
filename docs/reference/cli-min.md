@@ -139,7 +139,7 @@ the current directory).
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Optional session name |
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree. The session starts from a default project configuration and does not apply the project's `minimal.toml`) |
-| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it its own IP address so `--ingress` can publish ports. An `own_ip` box with no egress flags reaches no external address by default (see below). The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before the daemon creates the box. An activation that cannot reach the VM host daemon exits 7. One that daemon refuses because it has no free addresses exits 8 |
+| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace, and `own_ip` gives it its own IP address so `--ingress` can publish ports. With no flag, the session takes the `network.mode` that `minimal.toml` declares for it, else `host_ip`. An `own_ip` box with no egress flags reaches no external address by default (see below). The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before the daemon creates the box. An activation that cannot reach the VM host daemon exits 7. One that daemon refuses because it has no free addresses exits 8 |
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
 | `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them. `ask` asks the attached person about a `min net expose`. With nobody attached, `ask` refuses the request at once. `ask` never publishes a listen. `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. On a VM-backed host the create registers the stance and range with the VM host daemon. That daemon admits each publish the box requests against that grant. It admits an `ask` publish only on a yes the host records. Every macOS host is VM-backed |
 | `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
@@ -233,7 +233,7 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
 | `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
 | `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
-| `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box is `host_ip` |
+| `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box takes the entry's `network.mode`, else `host_ip` |
 | `--ingress <EXT:INT[/PROTO]>` | Override of the entry's `network.ingress`: each use adds one port mapping, `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Requires `--network own_ip` |
 | `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | Overrides of the entry's `network.egress` keys, as on [`session activate`](#session-activate): a list flag adds to the entry's list, `--allow-protocols` replaces it, and `--deny-all-egress` empties the allow lists |
 | `--dynamic-ingress <allow\|ask\|deny>` | Override of the entry's `network.dynamic_ingress`: the stance that decides the box's own requests to publish a port, as on [`session activate`](#session-activate). Requires `--network own_ip` |
@@ -246,15 +246,18 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | `--no-hooks` | Run none of the box's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from the loadouts or from `minimal.toml`. The box keeps hooks off, so the choice also holds when the box is attached or detached, and when it ends |
 
 Each override flag changes only the key it names. The other
-`network.egress` keys of the entry stay as the entry declares them. A session
-box does not take the entry's `network.mode` or `network.ingress` yet
-([#3238](https://github.com/gominimal/minimal/issues/3238)). The box keeps the
+`network.egress` keys of the entry stay as the entry declares them. With no
+`--network`, the box takes the entry's `network.mode`, else `host_ip`. A
+session box takes the entry's `network.ingress`, a list such as
+`[{ port = 8080 }]` or `[{ external_port = 8080, internal_port = 80, proto = "tcp" }]`.
+Each `--ingress` adds one mapping after the entry's mappings.
+Ingress needs an `own_ip` box, so a start refuses `network.ingress` on any
+other mode. The box keeps the
 result: `min box show <box> --network` prints the `[network]` section that
 the box was created with.
 
 `min box start [ENTRY]` takes the same flags. For a task entry, it takes
-every flag in the table except `--ingress` and `--loadout`, and with no
-`--network` the box takes the entry's `network.mode`. A task entry refuses
+every flag in the table except `--ingress` and `--loadout`. A task entry refuses
 `--ingress` and `--loadout` with exit code 2.
 
 `min task run <task>` and `min box run <entry>` take the same flags as a

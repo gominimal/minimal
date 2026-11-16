@@ -766,11 +766,13 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   each request and no `TRACEPARENT`, and the daemon SHALL record nothing for
   that request: a non-recording span and no command line.
   tier:     T0
-  verify:   cargo nextest run -p minimald an_opted_out_request_leaves_no_daemon_span
+  verify:   cargo nextest run -p minimald an_opted_out_request_leaves_no_daemon_span an_opted_out_helper_request_records_no_span_and_opts_its_task_out an_opted_out_helper_request_keeps_its_line_out_of_the_log
   test:     crates/minimald/src/exec.rs::an_opted_out_request_leaves_no_daemon_span;
             crates/minimal-client/src/lib.rs::do_not_track_sends_the_opt_out_and_no_traceparent;
             crates/minimald/src/env.rs::an_opted_out_helper_request_records_no_span_and_opts_its_task_out
-            (the in-box helper's `otel%off%` request)
+            (the in-box helper's `otel%off%` request);
+            crates/minimald/src/env.rs::an_opted_out_helper_request_keeps_its_line_out_of_the_log
+            (the channel's own trace record)
   lab:      785, 712e
 - **TEL-046** IF the host receiver on vsock port 7353 is unreachable THEN THE
   SYSTEM SHALL keep the guest daemon spooling, SHALL retry the connection
