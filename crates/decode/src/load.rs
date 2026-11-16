@@ -1029,8 +1029,11 @@ mod tests {
         )
     }
 
-    /// A package directory that is a symlink out of the layer is refused,
-    /// naming that directory, not reported as an import the layer makes.
+    /// An entry reached through a package directory that is a symlink out
+    /// of the layer is refused, naming that directory, not reported as an
+    /// import the layer makes. The loader's own walk never gets there: a
+    /// linked directory is not a package to it, so the entry is given to the
+    /// check directly, as a caller that names its own entry file does.
     #[cfg(unix)]
     #[test]
     fn package_directory_linked_out_of_the_layer_is_refused_naming_the_link() {
@@ -1042,11 +1045,24 @@ mod tests {
         std::fs::create_dir_all(layer.join("packages")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, layer.join("packages/p")).unwrap();
 
-        let (link, text) = link_refusal(Loader::new_with_all_pkgs(
-            &layer,
-            None,
-            &LoadOptions::for_test(),
-        ));
+        assert_eq!(
+            build_decls_in_dir(layer.join("packages")).unwrap(),
+            Vec::<PathBuf>::new(),
+            "a linked directory is not walked as a package"
+        );
+
+        let root = layer.canonicalize().unwrap();
+        let entry = layer.join("packages/p/build.ncl");
+        let err = confine_imports(
+            std::slice::from_ref(&entry),
+            &root,
+            &LoadOptions::for_test().minimal_lib_path,
+        )
+        .expect_err("an entry through a link out of the layer is refused");
+        let Error::LinkOutside { link, .. } = &err else {
+            panic!("expected Error::LinkOutside, got {err:?}");
+        };
+        let text = err.to_string();
         assert!(link.ends_with("layer/packages/p"), "{text}");
         assert!(
             text.contains("is a link that leads outside the layer"),
