@@ -20992,10 +20992,69 @@ async fn detached_start_or_stop_copies_no_exports() {
         .find("return detached")
         .expect("the detach branch returns");
     let branch = &source[detach..detach + returned];
-    assert!(!branch.contains("copy_box_exports"), "{branch}");
+    assert!(!branch.contains("copy_ended_run_exports"), "{branch}");
     assert!(
-        source[detach + returned..].contains("copy_box_exports"),
+        source[detach + returned..].contains("copy_ended_run_exports("),
         "the attached run copies after the detach branch"
+    );
+}
+
+// BOX-185: an attached run that starts in a folder below the project root
+// copies its exports to `<project root>/<path>`, the root its record names,
+// and writes nothing under the folder it ran in.
+#[tokio::test]
+async fn attached_run_from_subfolder_copies_exports_to_project_root() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = std::fs::canonicalize(project.path()).unwrap();
+    std::fs::write(
+        root.join(mfile::MFILE_NAME),
+        "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+    )
+    .unwrap();
+    let sub = root.join("nested/deep");
+    std::fs::create_dir_all(&sub).unwrap();
+    // The run resolves its root from the folder it ran in, as `run_entry`
+    // does before it stamps the create request.
+    let upload_root = resolve_upload_root(camino::Utf8Path::from_path(&sub).unwrap())
+        .expect("the run finds the project root");
+    assert_eq!(upload_root.as_std_path(), root);
+
+    let mut daemon = server.connect().await;
+    let build = create_spec_box(
+        &mut daemon,
+        "build",
+        upload_root.as_std_path(),
+        Some(export_spec(false, &["out/report.txt"])),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        build,
+        &["/workbench/out"],
+        &[("/workbench/out/report.txt", b"all green")],
+    )
+    .await;
+    let hosts = local_hosts(&global).unwrap();
+    let mut out = Vec::new();
+    cmd::stop_box_on_hosts(hosts.clone(), &mut out, "build", false)
+        .await
+        .expect("the box stops");
+    let mut client = cmd::box_host_client(&hosts[0])
+        .await
+        .expect("a client for the box's host");
+    task::copy_ended_run_exports(&mut client, build, "build", &upload_root).await;
+
+    assert_eq!(
+        std::fs::read(root.join("out/report.txt")).unwrap(),
+        b"all green"
+    );
+    assert!(
+        !sub.join("out").exists(),
+        "nothing is written under the folder the run started in"
     );
 }
 

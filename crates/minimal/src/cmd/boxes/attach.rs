@@ -1523,8 +1523,9 @@ where
         && matches!(entry.state.as_str(), "stopped" | "exited")
     {
         let root = entry.project_root.as_ref();
-        // Interim: the outcomes are not used yet (BOX-193, BOX-195,
-        // BOX-198). See `copy_box_exports`.
+        // Interim: the outcomes are not used yet. BOX-193 is
+        // gominimal/minimal#3445. BOX-195 and BOX-198 are
+        // gominimal/minimal#3446. See `copy_box_exports`.
         let _outcomes = copy_box_exports_on_host(
             &target.host,
             target.box_id,

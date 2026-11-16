@@ -731,9 +731,10 @@ pub(crate) fn exports_elsewhere_line(label: &str, project_root: &std::path::Path
 ///
 /// Interim: this copies again on each call, and its callers do not use the
 /// outcomes yet. No claim stops a later command from copying an export
-/// whose result the record holds (BOX-198). No `file_exported` event goes
-/// to the record (BOX-195). A skipped export does not turn a 0 end into
-/// exit 125 (BOX-193). This changes when those requirements land: the
+/// whose result the record holds (BOX-198, gominimal/minimal#3446). No
+/// `file_exported` event goes to the record (BOX-195,
+/// gominimal/minimal#3446). A skipped export does not turn a 0 end into
+/// exit 125 (BOX-193, gominimal/minimal#3445). This changes when those requirements land: the
 /// claim gates this call, and the outcomes become the report and the code.
 pub(crate) async fn copy_box_exports<E: std::io::Write>(
     client: &mut client::Client,
