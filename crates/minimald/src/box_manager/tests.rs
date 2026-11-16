@@ -7732,6 +7732,31 @@ async fn composes_from_stored_expanded_spec_not_minimal_toml() {
         err.to_string().contains("reading the stored box spec"),
         "{err}"
     );
+
+    // A v0 spec with a hook that has no `declared_by` fails the compose,
+    // as a launch refuses it: the hooks never fall back to `minimal.toml`.
+    std::fs::remove_dir(root.path().join(boxes::store::SPEC_FILE)).unwrap();
+    let mut undeclared = serde_json_lenient::to_value(spec_with_declared_hooks()).unwrap();
+    assert_eq!(undeclared["v"], 0, "the fixture is a v0 spec");
+    undeclared["lifecycle_hooks"][0]
+        .as_object_mut()
+        .expect("each hook is a table")
+        .remove(mfile::spec::DECLARED_BY)
+        .expect("the fixture's hook names its declarer");
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&undeclared).unwrap(),
+    )
+    .unwrap();
+    let err = run_compose(
+        &daemon,
+        &path,
+        &declared_path(),
+        WireContribution::default(),
+        true,
+    )
+    .expect_err("a stored hook with no declared_by fails the compose");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
 }
 
 /// BOX-071, BOX-072, end to end over the golden vectors that

@@ -566,15 +566,15 @@ pub(crate) fn run_compose(
 
 /// The spec stored beside the box's workspace, `project_path`: the
 /// [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
-/// directory (BOX-068). `None` when the box stores no spec, or when the
-/// stored spec does not read as a v0 Box Spec: the daemon stores any spec
-/// with a whole `v` (see `spec_bytes`), so a spec of another version
-/// composes from the project as before.
+/// directory (BOX-068). `None` when the box stores no spec.
 ///
 /// # Errors
 ///
 /// A stored spec that exists but cannot be read fails the compose, so the
-/// box never runs hooks from a source other than its stored spec.
+/// box never runs hooks from a source other than its stored spec. A stored
+/// spec that is not a v0 Box Spec, or has a hook with no valid
+/// `declared_by`, fails the compose with the `InvalidInput` refusal that a
+/// launch gives for the same spec (`crate::box_runtime::stored_spec`).
 fn stored_spec_beside(
     project_path: &DaemonAbsPath,
 ) -> Result<Option<mfile::spec::BoxSpec>, std::io::Error> {
@@ -593,18 +593,11 @@ fn stored_spec_beside(
             ));
         }
     };
-    match serde_json_lenient::from_slice(&bytes) {
-        Ok(spec) => Ok(Some(spec)),
-        Err(e) => {
-            tracing::warn!(
-                spec_path = %path,
-                error = %e,
-                "the stored box spec does not read as a v0 box spec; \
-                 the project's hooks compose from the project as before"
-            );
-            Ok(None)
-        }
-    }
+    crate::box_runtime::stored_spec(&bytes)
+        .inspect_err(|e| {
+            tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
+        })
+        .map(Some)
 }
 
 /// Composes the project's lifecycle hooks from the stored spec `spec`, not
