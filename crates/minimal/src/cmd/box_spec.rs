@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use boxes::core::bep::{
-    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals, store_references,
+    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepTables, BepWarning, HostFacts,
+    Quic443, SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals,
+    store_references,
 };
 
 use crate::output::ObjectType;
@@ -51,6 +52,9 @@ pub(crate) struct SpecInputs<'a> {
     /// The client's `[secret-store-rules]`, merged and with refused rules
     /// left out.
     pub store_rules: &'a StoreRules,
+    /// The minimal.toml tables that set [`Self::secrets`] and
+    /// [`Self::bep`], which a refusal names.
+    pub tables: BepTables<'a>,
 }
 
 /// Writes the `min box spec` rows for `inputs`.
@@ -86,6 +90,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         egress,
         bep: inputs.bep,
         secrets: inputs.secrets,
+        tables: inputs.tables,
     };
     let narrow: Vec<BepRefusal> = refusals(&spec, host, inputs.github_hosts)
         .into_iter()
@@ -401,19 +406,32 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
     });
     tracing::debug!(project = %project.display(), "rendering min box spec");
     let (network, _) = preview_host(crate::daemon_host_kind(global), args);
-    proxy_rows(global, &bep, quic443, &secrets, network, None, out)
+    // This path reads `[defaults.session]`, as `min box start` does.
+    proxy_rows(
+        global,
+        &bep,
+        quic443,
+        &secrets,
+        network,
+        BepTables::SESSION,
+        None,
+        out,
+    )
 }
 
 /// Writes the Box Egress Proxy rows for `secrets` (BEP-038) to `out`, for
 /// a box of `network` on this host. `read_rules` holds the client's
 /// `[secret-store-rules]` when the caller already read them, and the rows
-/// then do not read them again.
+/// then do not read them again. `tables` holds the minimal.toml tables
+/// that a refusal names.
+#[allow(clippy::too_many_arguments)]
 fn proxy_rows(
     global: &GlobalArgs,
     bep: &BepSettings,
     quic443: Option<Quic443>,
     secrets: &SecretGrants,
     network: boxes::NetworkMode,
+    tables: BepTables<'_>,
     read_rules: Option<&StoreRules>,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -445,6 +463,7 @@ fn proxy_rows(
             box_zone_resolver,
             github_hosts: &github_hosts,
             store_rules: &store_rules,
+            tables,
         },
         out,
     )
@@ -487,6 +506,39 @@ fn origin_label(origin: &mfile::expand::Origin, entry: &mfile::entry::BoxEntry) 
         Layer::Entry => format!("[{}.{}]", entry.table.key(), entry.name),
         Layer::Loadouts => "loadouts".to_owned(),
         Layer::Overrides => COMMAND_LINE.to_owned(),
+    }
+}
+
+/// Where a refusal tells the person to edit `key` of `entry`'s expansion,
+/// with its minimal.toml table at `path` (BCLI-021). A value from
+/// `[defaults]` or `[defaults.<type>]` names that table. A value from a
+/// selected loadout names that loadout, or "a selected loadout" when the
+/// report does not record which one. A value from a flag names the
+/// command line. An edit to the entry's own table does not change either
+/// of those two, because they sit above the entry. Every other value
+/// names the entry's own table, or `[defaults.<type>]` for the implicit
+/// default entry: a value from the upstream or the type's defaults sits
+/// below the entry, so an edit there replaces it.
+fn setting_table(
+    report: &mfile::expand::ExpansionReport,
+    entry: &mfile::entry::BoxEntry,
+    key: &str,
+    path: &str,
+) -> String {
+    use mfile::expand::{Layer, ValueOrigin};
+    let box_type = entry.box_type.as_deref().unwrap_or(boxes::SESSION_BOX_TYPE);
+    let origin = match report.values.get(key) {
+        Some(ValueOrigin::Value(origin)) => Some(origin),
+        _ => None,
+    };
+    match origin.map(|origin| (origin.layer, origin.loadout.as_deref())) {
+        Some((Layer::Defaults, _)) => format!("[defaults.{path}]"),
+        Some((Layer::DefaultsType, _)) => format!("[defaults.{box_type}.{path}]"),
+        Some((Layer::Loadouts, Some(name))) => format!("the loadout `{name}`"),
+        Some((Layer::Loadouts, None)) => "a selected loadout".to_owned(),
+        Some((Layer::Overrides, _)) => COMMAND_LINE.to_owned(),
+        _ if entry.implicit => format!("[defaults.{box_type}.{path}]"),
+        _ => format!("[{}.{}.{path}]", entry.table.key(), entry.name),
     }
 }
 
@@ -714,6 +766,10 @@ fn expand_entry(
     for (key, origin) in &expansion.report.values {
         sources.insert(key.clone(), origin_labels(origin, entry));
     }
+    // The tables a refusal names: the layer that set `secrets`, and the
+    // layer that set `network`, whose `bep` table the proxy reads.
+    let secrets_table = setting_table(&expansion.report, entry, "secrets", "secrets");
+    let bep_table = setting_table(&expansion.report, entry, "network", "network.bep");
     for (var, id) in &store_ids {
         if layers.store_rules.contains_key(id) {
             for key in ["upstream", "inject"] {
@@ -926,12 +982,17 @@ fn expand_entry(
             .transpose()
             .map_err(|e| invalid(mfile::Error::Format(e)))?;
         let mut rows = Vec::new();
+        let tables = BepTables {
+            secrets: &secrets_table,
+            network_bep: &bep_table,
+        };
         proxy_rows(
             global,
             &bep,
             quic443,
             &grants,
             mode,
+            tables,
             read_rules.as_ref(),
             &mut rows,
         )?;
@@ -1180,6 +1241,29 @@ mod tests {
         "codeload.github.com",
     ];
 
+    // BCLI-021: a value that a layer above the entry sets names that
+    // layer, because an edit to the entry's own table does not change it.
+    #[test]
+    fn setting_table_names_the_layer_above_the_entry() {
+        use mfile::expand::{ExpansionReport, Layer, Origin, ValueOrigin};
+        let entries = mfile::entry::read_entries(b"[tasks.ci]\necho = 'x'\n").unwrap();
+        let entry = &entries[0];
+        let table_for = |origin: Origin| {
+            let mut report = ExpansionReport::default();
+            report
+                .values
+                .insert("secrets".into(), ValueOrigin::Value(origin));
+            setting_table(&report, entry, "secrets", "secrets")
+        };
+        assert_eq!(table_for(Origin::loadout("gh")), "the loadout `gh`");
+        assert_eq!(table_for(Origin::of(Layer::Loadouts)), "a selected loadout");
+        assert_eq!(table_for(Origin::of(Layer::Overrides)), COMMAND_LINE);
+        // A layer below the entry names the entry's own table.
+        assert_eq!(table_for(Origin::of(Layer::Entry)), "[tasks.ci.secrets]");
+        assert_eq!(table_for(Origin::of(Layer::Upstream)), "[tasks.ci.secrets]");
+        assert_eq!(table_for(Origin::of(Layer::Defaults)), "[defaults.secrets]");
+    }
+
     #[test]
     fn yaml_string_quotes_text_that_reads_as_another_type() {
         for text in [
@@ -1246,6 +1330,7 @@ mod tests {
                 box_zone_resolver: true,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )?;
@@ -1282,6 +1367,7 @@ mod tests {
                     box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
+                    tables: BepTables::SESSION,
                 },
                 &mut out,
             )
@@ -1345,6 +1431,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -1373,6 +1460,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -1385,6 +1473,7 @@ mod tests {
             vec![BepRefusal::BrokerScopeNotGithub {
                 grant: "OLD".into(),
                 scope: "claude".into(),
+                table: "[defaults.session.secrets]".into(),
             }]
         );
         assert!(out.is_empty(), "no rows before the refusal");
@@ -1424,6 +1513,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -1490,6 +1580,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
