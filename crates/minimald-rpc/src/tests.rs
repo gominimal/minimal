@@ -2401,3 +2401,49 @@ fn retire_without_an_end_is_refused_at_decode() {
         other => panic!("decoded as {other:?}"),
     }
 }
+
+/// BOX-074: the `GetVersion` reply carries the daemon's expander version,
+/// and a reply from a daemon that predates the field still decodes, with
+/// no expander version.
+#[test]
+fn get_version_reports_expander_version() {
+    assert_eq!(expander_version(0, 1), "0.1");
+    assert_ne!(expander_version(0, 1), expander_version(1, 1));
+    assert_ne!(expander_version(0, 1), expander_version(0, 2));
+
+    let reply = GetVersionResponse {
+        version: "0.8.0".to_owned(),
+        long_version: "0.8.0 (abc)".to_owned(),
+        stdlib_version: "1".to_owned(),
+        expander_version: Some(expander_version(0, 1)),
+    };
+    let wire = serde_json_lenient::to_value(&reply).expect("the reply serializes");
+    assert_eq!(wire["expander_version"], "0.1");
+    let read: GetVersionResponse = serde_json_lenient::from_value(wire).expect("the reply decodes");
+    assert_eq!(read.expander_version.as_deref(), Some("0.1"));
+
+    let older: GetVersionResponse = serde_json_lenient::from_str(
+        r#"{"version":"0.7.0","long_version":"0.7.0","stdlib_version":"1"}"#,
+    )
+    .expect("a reply without the field decodes");
+    assert_eq!(older.expander_version, None);
+
+    // The client's report names both versions, and says the command goes on.
+    assert_eq!(expander_skew_message("0.1", Some("0.1")), None);
+    assert_eq!(
+        expander_skew_message("0.1", Some("1.1")).as_deref(),
+        Some(
+            "This `min` uses minimal.toml expansion version 0.1, and minimald uses \
+             expansion version 1.1. The command continues. minimald refuses to create \
+             the box if it reads the box settings differently from this `min`."
+        )
+    );
+    assert_eq!(
+        expander_skew_message("0.1", None).as_deref(),
+        Some(
+            "This `min` uses minimal.toml expansion version 0.1, and minimald does not \
+             report its expansion version. The command continues. minimald refuses to \
+             create the box if it reads the box settings differently from this `min`."
+        )
+    );
+}

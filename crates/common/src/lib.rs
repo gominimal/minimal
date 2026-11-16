@@ -533,9 +533,10 @@ impl From<std::io::Error> for GlobError {
 }
 
 /// Enumerates files which match the given glob within the given directory.
-/// Symlinked directories are followed and nothing stops a loop: a link to an
-/// ancestor (`a -> .`) is walked down to the kernel's link limit, matching
-/// each file under it once per level. For a tree a build wrote, use
+/// Symlinked directories are followed, so a file under `lib64 -> lib` matches
+/// at both paths. A link to a directory the walk is already inside (`a -> .`,
+/// `bin/up -> ..`) is not entered again, so a loop ends. For a tree a build
+/// wrote, where a link may lead anywhere, use
 /// [`match_files_for_glob_no_follow`].
 pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
     match_files_for_glob_with(dir, glob, true)
@@ -562,12 +563,24 @@ fn match_files_for_glob_with(
         .build()?
         .compile_matcher();
 
-    // Walk the filesystem starting from root_dir
+    /// The device and inode of the directory at `path`, through any link.
+    fn dir_id(path: &Path) -> Result<(u64, u64), GlobError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(path)?;
+        Ok((m.dev(), m.ino()))
+    }
+
+    // Walk the filesystem starting from root_dir. With `follow`, a symlinked
+    // directory is walked; `inside` holds the directories from the root down
+    // to `dir`, and a link back to any of them is a loop, not entered. A link
+    // to a directory elsewhere (`lib64 -> lib`) is walked. Without `follow`,
+    // a symlinked directory is not entered at all.
     fn walk_dir(
         dir: &Path,
         root_dir: &Path,
         matcher: &globset::GlobMatcher,
         follow: bool,
+        inside: &mut Vec<(u64, u64)>,
         results: &mut Vec<PathBuf>,
     ) -> Result<(), GlobError> {
         let entries = std::fs::read_dir(dir)?;
@@ -586,15 +599,28 @@ fn match_files_for_glob_with(
             if path.is_file() && matcher.is_match(subset) {
                 results.push(path);
             } else if descend {
-                // Recursively walk subdirectories
-                walk_dir(&path, root_dir, matcher, follow, results)?;
+                let id = dir_id(&path)?;
+                if inside.contains(&id) {
+                    continue;
+                }
+                inside.push(id);
+                walk_dir(&path, root_dir, matcher, follow, inside, results)?;
+                inside.pop();
             }
         }
 
         Ok(())
     }
 
-    walk_dir(dir, dir, &matcher, follow_symlinked_dirs, &mut results)?;
+    let mut inside = vec![dir_id(dir)?];
+    walk_dir(
+        dir,
+        dir,
+        &matcher,
+        follow_symlinked_dirs,
+        &mut inside,
+        &mut results,
+    )?;
     Ok(results)
 }
 
@@ -937,10 +963,38 @@ pub fn default_parallelism() -> usize {
 mod tests {
     use super::*;
 
-    /// A symlink loop in a tree sends the following walk down `a/a/a/...` until
-    /// the kernel's link limit, matching the same file at every level; the
-    /// no-follow walk returns each file once, ignores the loop, and still
-    /// matches a symlinked file.
+    /// The walk still matches a file at the path a sibling link gives it
+    /// (`usr/lib64/libfoo.so.1` through `usr/lib64 -> lib`), but does not
+    /// re-enter a directory it is inside: with `loop -> .` and `bin/up -> ..`
+    /// the unchecked walk doubles at each level up to the kernel's 40-link
+    /// limit.
+    #[test]
+    fn the_glob_walk_keeps_sibling_links_and_ends_a_loop() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        std::fs::create_dir_all(r.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(r.join("bin")).unwrap();
+        std::fs::write(r.join("usr/lib/libfoo.so.1"), b"elf").unwrap();
+        std::fs::write(r.join("bin/x"), b"x").unwrap();
+        std::os::unix::fs::symlink("lib", r.join("usr/lib64")).unwrap();
+        std::os::unix::fs::symlink(".", r.join("loop")).unwrap();
+        std::os::unix::fs::symlink("..", r.join("bin/up")).unwrap();
+        let mut got = match_files_for_glob(r, "**/*").unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                r.join("bin/x"),
+                r.join("usr/lib/libfoo.so.1"),
+                r.join("usr/lib64/libfoo.so.1"),
+            ]
+        );
+    }
+
+    /// The no-follow walk returns each file once, does not enter a symlinked
+    /// directory at all (`a -> .`, and `lib64 -> lib` alike), and still
+    /// matches a symlinked file. The following walk ends the same loop by
+    /// not re-entering a directory it is inside, so on this tree the two agree.
     #[test]
     fn the_no_follow_walk_ignores_a_symlink_loop() {
         let t = tempfile::tempdir().unwrap();
@@ -951,12 +1005,9 @@ mod tests {
         let mut got = match_files_for_glob_no_follow(t.path(), "**/*").unwrap();
         got.sort();
         assert_eq!(got, vec![t.path().join("bin/x"), t.path().join("y")]);
-        let following = match_files_for_glob(t.path(), "**/*").unwrap();
-        assert!(
-            following.len() > got.len(),
-            "the following walk matched {} paths: the loop walked",
-            following.len()
-        );
+        let mut following = match_files_for_glob(t.path(), "**/*").unwrap();
+        following.sort();
+        assert_eq!(following, got, "the following walk entered the loop");
     }
 
     /// A path two layers both ship is linked once and counted, with a WARN
