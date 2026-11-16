@@ -990,6 +990,15 @@ async fn attach_command(
             Some(box_list_scope(cwd.as_ref())?)
         }
     };
+    // The command's own project root: exports are copied only when it is
+    // the box's (BOX-199). With none, nothing is copied.
+    let here = match &scope {
+        Some(scope) => Some(scope.clone()),
+        None => crate::attach::cwd_host_path(global)
+            .and_then(|cwd| box_list_scope(cwd.as_ref()))
+            .inspect_err(|e| tracing::info!("attach: no project root here: {e:#}"))
+            .ok(),
+    };
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
     let hosts = match target {
@@ -1002,6 +1011,7 @@ async fn attach_command(
         hosts,
         target,
         scope.as_ref(),
+        here.as_ref(),
         stdin_is_tty,
         async |target: &BoxAttachTarget| {
             let host_asks = host_asks_box(global, target.name.as_deref());
@@ -1463,6 +1473,7 @@ pub(crate) async fn attach_on_hosts<A>(
     hosts: Vec<crate::cmd::list::LocalHost>,
     address: Option<&str>,
     scope: Option<&paths::HostAbsPath>,
+    here: Option<&paths::HostAbsPath>,
     stdin_is_tty: bool,
     attach: A,
 ) -> Result<AttachEnding, anyhow::Error>
@@ -1488,6 +1499,43 @@ where
         }
         _ => BoxAfterAttach::Unread,
     };
+    // BOX-185: an attach that saw the box end copies its declared exports,
+    // whatever code the entrypoint ended with. A detach leaves the box
+    // running, and copies nothing (BOX-186). An entrypoint's own nonzero
+    // code is not read above, so the box is read here for the copy only.
+    // A box that still runs then waits for the settle bound only when it
+    // declares an export, so a shell that a person leaves with a nonzero
+    // code, or a lost connection, does not wait for nothing.
+    let ended = match &after {
+        BoxAfterAttach::Unread => {
+            let first = box_after_attach(&target.host, target.box_id).await;
+            let running =
+                matches!(&first, BoxAfterAttach::Listed(entry) if entry.state == "running");
+            if running && box_declares_exports_on_host(&target.host, target.box_id).await {
+                box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await
+            } else {
+                first
+            }
+        }
+        _ => after.clone(),
+    };
+    if let BoxAfterAttach::Listed(entry) = &ended
+        && matches!(entry.state.as_str(), "stopped" | "exited")
+    {
+        let root = entry.project_root.as_ref();
+        // Interim: the outcomes are not used yet (BOX-193,
+        // gominimal/minimal#3445; BOX-195 and BOX-198,
+        // gominimal/minimal#3446). See `copy_box_exports`.
+        let _outcomes = copy_box_exports_on_host(
+            &target.host,
+            target.box_id,
+            target.name.as_deref().unwrap_or(&target.label),
+            root.map(|root| std::path::Path::new(root.as_str())),
+            here.map(|here| std::path::Path::new(here.as_str())),
+            &mut std::io::stderr(),
+        )
+        .await;
+    }
     match attach_ending(&target, code, &after) {
         Ok(ending) => {
             tracing::info!(
