@@ -549,14 +549,26 @@ pub(crate) fn write_status(
 }
 
 /// One line for each proxy key that Secret Service holds (BEP-090). A key
-/// in the TPM or the keychain prints nothing. So does a missing or
-/// unreadable identity file, because then no proxy published its keys here.
+/// in the TPM or the keychain prints nothing. So does a missing identity
+/// file, because then no proxy published its keys here. Any other failure
+/// to read the file prints why, so silence never stands for safe custody.
 fn write_software_keys(
     identity: Option<&std::path::Path>,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let Some(identity) = identity.and_then(|path| bep::publish::Identity::read(path).ok()) else {
+    use bep::publish::{Identity, PublishError};
+    let Some(path) = identity else {
         return Ok(());
+    };
+    let identity = match Identity::read(path) {
+        Ok(identity) => identity,
+        Err(PublishError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(err) => {
+            writeln!(out, "{err}")?;
+            return Ok(());
+        }
     };
     let keys = [
         ("sealing", &identity.sealing),
@@ -2809,6 +2821,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), sign_in);
+
+        // An identity file that does not read says why, after the sign-in
+        // line, so silence never stands for safe custody.
+        std::fs::write(&path, b"not json").unwrap();
+        let mut out = Vec::new();
+        write_status(&keychain, Some(&path), now, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{sign_in}The proxy's published identity at {} is not valid JSON. Delete it, then start `bep` to publish it again.\n",
+                path.display()
+            )
+        );
     }
 
     /// A memory keychain that counts the reads of the material and the
