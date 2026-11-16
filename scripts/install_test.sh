@@ -1356,6 +1356,60 @@ case_installer_does_not_prompt_on_a_finished_host() {
     check "$fi_probe" "$(cat "$HF9/finalize.calls")" "a failed probe is the run's only call"
 }
 
+case_installer_offers_finalize_install_for_a_stale_answerer() {
+    # An upgrade that ships a new minzoned leaves the installed DNS service on
+    # the old root-owned copy. The probe reports the stale copy as a missing
+    # names item with a script, and the installer offers the step on a
+    # terminal: Enter runs `min finalize-install`, which replaces the copy.
+    fi_stale_line="DNS names for boxes (<box>.min.internal) in every program on this machine"
+    fi_stale_fact="the installed DNS service runs a different minzoned than the one this version of Minimal ships; this step replaces it with this machine's own copy"
+    HF10="$root/hf10"; mkdir -p "$HF10"
+    fake_stale="$root/fake-stale-root"
+    mkdir -p "$fake_stale/usr/local/lib/minimal"
+    printf 'an-older-answerer-body\n' >"$fake_stale/usr/local/lib/minimal/minzoned"
+    printf '%s:\n  ✗ %s\n      today: %s\n      this step: %s\n' "$fi_status" \
+        "$fi_stale_line" "$fi_stale_fact" \
+        "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups to Minimal's DNS service on 127.0.0.1:7656 at every boot and installs that service" \
+        >"$HF10/finalize.summary"
+    FINALIZE_INSTALL_ROOT="$fake_stale"
+    TTY_FILE="$root/tty-enter"
+    printf '\n' >"$TTY_FILE"
+    run fi_stale "$HF10"
+    TTY_FILE=
+    check 0 "$rc" "an install over a stale DNS service exits 0"
+    want_ok "the stale copy is shown as the probe reports it" grep -qF "$fi_stale_fact" "$OUT"
+    want_ok "the installer offers the step" grep -qF "$fi_prompt" "$OUT"
+    check "$fi_probe
+finalize-install" "$(cat "$HF10/finalize.calls")" \
+        "the probe runs once and Enter runs the step that replaces the copy"
+    want_card_last "the card follows the offer over a stale copy (R10.4)"
+
+    # When the probe has no script to offer (it waits on a daemon), the
+    # installer still names the stale copy and the command that replaces it.
+    HF11="$root/hf11"; mkdir -p "$HF11"
+    printf '%s:\n  ✗ %s — waiting on a daemon (no daemon answered within 5s)\n' \
+        "$fi_status" "$fi_stale_line" >"$HF11/finalize.waiting"
+    TTY_FILE="$root/tty-enter"
+    run fi_stale_waiting "$HF11"
+    TTY_FILE=
+    check 0 "$rc" "a waiting host with a stale copy exits 0"
+    want_ok "the stale copy is named" \
+        grep -qF "Minimal's DNS service on this machine runs a different minzoned than this release ships." "$OUT"
+    want_ok "the command that replaces it is named" \
+        grep -qF "To replace it, run \`$(fi_min "$HF11") finalize-install\`." "$OUT"
+    want_err "no come-back note beside it" grep -qF "after your first" "$OUT"
+    check "$fi_probe" "$(cat "$HF11/finalize.calls")" "a waiting host with a stale copy runs only the probe"
+
+    # The same bytes on both sides are no stale copy: a finished host stays quiet.
+    HF12="$root/hf12"; mkdir -p "$HF12"
+    cp "$mock/versions/v1/minzoned-linux-amd64" "$fake_stale/usr/local/lib/minimal/minzoned"
+    run fi_current "$HF12"
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "a host with the current copy exits 0"
+    want_err "a current copy is not named" grep -qF "runs a different minzoned" "$OUT"
+    want_err "a current copy sees no summary" grep -q "$fi_status" "$OUT"
+}
+
 case_checksum_mismatch() {
     # --- Unit 5: checksum mismatch (R5.3) --------------------------------------
     # Point the manifest's minimal hash at a wrong value; artifact stays as-is.
@@ -3911,6 +3965,8 @@ case_for() {
         installer_prints_the_pointer_when_declined_or_without_tty)
             case_installer_prints_the_pointer_when_declined_or_without_tty ;;
         installer_does_not_prompt_on_a_finished_host) case_installer_does_not_prompt_on_a_finished_host ;;
+        installer_offers_finalize_install_for_a_stale_answerer)
+            case_installer_offers_finalize_install_for_a_stale_answerer ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;
@@ -3938,7 +3994,8 @@ case "${1:-}" in
             finalize_install_uninstall \
             installer_offers_finalize_install_on_a_tty \
             installer_prints_the_pointer_when_declined_or_without_tty \
-            installer_does_not_prompt_on_a_finished_host checksum_mismatch \
+            installer_does_not_prompt_on_a_finished_host \
+            installer_offers_finalize_install_for_a_stale_answerer checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
