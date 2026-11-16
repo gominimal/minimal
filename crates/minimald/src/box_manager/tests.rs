@@ -7531,3 +7531,151 @@ async fn unenrolled_evaluates_no_policy() {
         "nothing says a policy was evaluated:\n{logged}"
     );
 }
+
+/// BOX-071, BOX-072, end to end over the golden vectors that
+/// `crates/mfile/tests/golden.rs` pins. For each expanded spec there, the
+/// client's projection (a TOML table, as `min` projects it) and the
+/// daemon's (the JSON the create carries) both equal the pinned digest,
+/// and the record stores the two side by side. A create whose client
+/// digest is another vector's is refused and leaves no record. The daemon
+/// log names both digests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_and_daemon_digests_match_vectors_and_mismatch_refused() {
+    use minimald_rpc::{CLIENT_PROJECTION_DIGEST_ATTR, DAEMON_PROJECTION_DIGEST_ATTR};
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mfile/tests/golden/vectors.json");
+    let text = std::fs::read_to_string(&path).expect("the golden vectors read");
+    let vectors: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&text).expect("the golden vectors are JSON");
+    let vectors = vectors.as_object().expect("the vectors are an object");
+
+    // (name, verb type, the spec as the daemon receives it, client digest,
+    // golden digest)
+    let mut cases = Vec::new();
+    for (name, vector) in vectors {
+        let (Some(spec), Some(golden)) = (
+            vector.get("spec").and_then(|v| v.as_str()),
+            vector.get("digest").and_then(|v| v.as_str()),
+        ) else {
+            // The built-in type vectors carry no spec.
+            continue;
+        };
+        // The vector's projection names the built-in root, which is the
+        // type of the verb that creates the box.
+        let projection: serde_json_lenient::Value = serde_json_lenient::from_str(
+            vector["projection"]
+                .as_str()
+                .expect("the vector has a projection"),
+        )
+        .expect("the projection is JSON");
+        let verb_type = match projection["type"]["root"].as_str() {
+            Some(boxes::SESSION_BOX_TYPE) => boxes::SESSION_BOX_TYPE,
+            _ => boxes::TASK_BOX_TYPE,
+        };
+        // The client's path: project the spec as a TOML table. This crate
+        // does not depend on `toml`, so the table's type comes from
+        // `of_spec`.
+        let table = spec.parse().expect("the golden spec is TOML");
+        let facts = mfile::projection::TypeFacts::of_spec(&table, verb_type)
+            .unwrap_or_else(|| panic!("{name}: the client projects the spec"));
+        let client = mfile::projection::project(&table, &facts).digest();
+        assert_eq!(
+            client, golden,
+            "{name}: the client's digest is the vector's"
+        );
+        // The expanded spec has no `v` yet. The typed spec that `min`
+        // sends carries it, and the daemon refuses a spec without it. `v`
+        // is outside the projection, so the daemon's digest is unchanged.
+        let mut wire = serde_json_lenient::to_value(&table).expect("the spec encodes as JSON");
+        wire["v"] = serde_json_lenient::json!(mfile::spec::BOX_SPEC_VERSION);
+        cases.push((name.clone(), verb_type, wire, client, golden.to_owned()));
+    }
+    assert!(cases.len() >= 2, "the golden file holds specs to compare");
+
+    let config_for = |verb_type: &str, digest: &str| {
+        let mut config = unnamed_config();
+        if verb_type == boxes::TASK_BOX_TYPE {
+            config = as_task(config);
+        }
+        config.set_client_projection_digest(digest.to_owned());
+        config
+    };
+
+    for (name, verb_type, wire, client, golden) in &cases {
+        let id = mngr
+            .create_box_with_spec(
+                config_for(verb_type, client),
+                Some(wire.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: equal digests create the box: {e}"));
+        let record = mngr
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the record is filed");
+        assert_eq!(
+            (
+                record
+                    .attrs
+                    .get(CLIENT_PROJECTION_DIGEST_ATTR)
+                    .map(String::as_str),
+                record
+                    .attrs
+                    .get(DAEMON_PROJECTION_DIGEST_ATTR)
+                    .map(String::as_str),
+            ),
+            (Some(golden.as_str()), Some(golden.as_str())),
+            "{name}: the record stores both digests, equal to the vector's"
+        );
+    }
+
+    // A client digest of another vector's spec is refused.
+    let mut refused = 0;
+    for (name, verb_type, wire, _, golden) in &cases {
+        for (other, _, _, other_digest, _) in &cases {
+            if other_digest == golden {
+                continue;
+            }
+            let before = mngr.list_boxes(None).await.unwrap().len();
+            let error = mngr
+                .create_box_with_spec(
+                    config_for(verb_type, other_digest),
+                    Some(wire.clone()),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("differing digests refuse the create");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "{name} vs {other}");
+            assert!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<ProjectionDigestRefusal>())
+                    .is_some(),
+                "{name} vs {other}: the refusal is the digest mismatch: {error}"
+            );
+            assert_eq!(
+                mngr.list_boxes(None).await.unwrap().len(),
+                before,
+                "{name} vs {other}: a refused create files no record"
+            );
+            let logged = log.contents();
+            assert!(
+                logged.lines().any(|line| {
+                    line.contains("the client's projection digest differs from the daemon's")
+                        && line.contains(&format!("client_projection_digest=\"{other_digest}\""))
+                        && line.contains(&format!("daemon_projection_digest=\"{golden}\""))
+                }),
+                "{name} vs {other}: the log names both digests:\n{logged}"
+            );
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "the vectors include differing digests");
+}
