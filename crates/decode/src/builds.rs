@@ -521,15 +521,17 @@ fn read_package_file(
     let plain = rel
         .components()
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
-    // A string with no source file has no package directory to sit in.
-    let root = match pos.src_id() {
-        Some(src_id) if plain => Path::new(program.files().name(src_id))
-            .parent()
-            .map(Path::to_path_buf),
-        _ => None,
-    };
-    let Some(root) = root else {
+    if !plain {
         return Err(refuse(rel.to_path_buf(), LocalInputWhy::Outside));
+    }
+    // A string with no source file has no package directory to sit in.
+    let root = pos.src_id().and_then(|src_id| {
+        Path::new(program.files().name(src_id))
+            .parent()
+            .map(Path::to_path_buf)
+    });
+    let Some(root) = root else {
+        return Err(refuse(rel.to_path_buf(), LocalInputWhy::NoPackage));
     };
     let full_path = root.join(rel);
 

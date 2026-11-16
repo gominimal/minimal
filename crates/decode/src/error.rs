@@ -110,7 +110,27 @@ pub enum Error {
         import: String,
         root: PathBuf,
     },
+    /// A file the layer loads by its place in the layer (a package's
+    /// `build.ncl`, a stack's `stack.ncl`, ...) resolves outside the layer
+    /// through a symlink.
+    ///
+    /// The message names the link, the path the layer reaches it by, and the
+    /// layer root, never the content of what it leads to.
+    LinkOutside {
+        /// The symlink inside the layer that leads out of it: the entry file
+        /// itself or one of its directories.
+        link: PathBuf,
+        root: PathBuf,
+    },
 }
+
+/// The next step printed after an [Error::ImportOutside].
+const IMPORT_OUTSIDE_HINT: &str =
+    "move the file into the layer, or remove the import that reads it";
+
+/// The next step printed after an [Error::LinkOutside].
+const LINK_OUTSIDE_HINT: &str =
+    "replace the link with the directory or file itself, or remove it from the layer";
 
 /// Why a package-relative `file` was refused (see [Error::LocalInput]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +138,9 @@ pub enum LocalInputWhy {
     /// The path is absolute, climbs out with `..`, or resolves (through a
     /// symlink) outside the package directory.
     Outside,
+    /// The string has no source position, so the decoder cannot tell which
+    /// `.ncl` file names it, nor the package directory it is relative to.
+    NoPackage,
     /// No file exists at the path.
     NotFound,
     /// The path names a directory or another non-regular file.
@@ -130,6 +153,9 @@ impl fmt::Display for LocalInputWhy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LocalInputWhy::Outside => write!(f, "it is outside the package directory"),
+            LocalInputWhy::NoPackage => {
+                write!(f, "the decoder cannot tell which package names it")
+            }
             LocalInputWhy::NotFound => write!(f, "it does not exist"),
             LocalInputWhy::NotAFile => write!(f, "it is not a regular file"),
             LocalInputWhy::Unreadable(kind) => write!(f, "it could not be read ({})", kind),
@@ -245,10 +271,11 @@ impl fmt::Display for Error {
                 root,
             } => write!(
                 f,
-                "{} imports \"{}\", which is outside the layer at {}",
+                "{} imports \"{}\", which is outside the layer at {}; {}",
                 file.display(),
                 import,
-                root.display()
+                root.display(),
+                IMPORT_OUTSIDE_HINT
             ),
             Error::ImportOutside {
                 file: None,
@@ -256,9 +283,17 @@ impl fmt::Display for Error {
                 root,
             } => write!(
                 f,
-                "the layer loads {}, which is outside the layer at {}",
+                "the layer loads {}, which is outside the layer at {}; {}",
                 import,
-                root.display()
+                root.display(),
+                IMPORT_OUTSIDE_HINT
+            ),
+            Error::LinkOutside { link, root } => write!(
+                f,
+                "{} is a link that leads outside the layer at {}; {}",
+                link.display(),
+                root.display(),
+                LINK_OUTSIDE_HINT
             ),
         }
     }
@@ -489,10 +524,15 @@ impl Error {
                 } else {
                     diagnostic
                 };
-                let diagnostic = diagnostic.with_note(
-                    "the file must be inside the package directory, \
-                     without `..` or a leading `/`",
-                );
+                let diagnostic = diagnostic.with_note(match why {
+                    LocalInputWhy::NoPackage => {
+                        "name the file with a string written in the package's own `.ncl` file"
+                    }
+                    _ => {
+                        "the file must be inside the package directory, \
+                         without `..` or a leading `/`"
+                    }
+                });
 
                 report_with(
                     writer,
@@ -501,7 +541,9 @@ impl Error {
                     nickel_lang_core::error::report::ErrorFormat::Text,
                 );
             }
-            Error::ImportOutside { .. } => writeln!(writer, "Error: {}", self).unwrap(),
+            Error::ImportOutside { .. } | Error::LinkOutside { .. } => {
+                writeln!(writer, "Error: {}", self).unwrap()
+            }
         }
     }
 
@@ -699,6 +741,41 @@ mod tests {
             "expected 'nested too deeply' in: {out:?}"
         );
         assert!(out.contains("42"), "expected max depth in: {out:?}");
+    }
+
+    /// A path the decoder cannot place in a package is not called outside it.
+    #[test]
+    fn local_input_with_no_package_says_so() {
+        let why = LocalInputWhy::NoPackage.to_string();
+        assert_eq!(why, "the decoder cannot tell which package names it");
+        assert!(!why.contains("outside"), "{why}");
+    }
+
+    #[test]
+    fn import_outside_gives_a_next_step() {
+        let e = Error::ImportOutside {
+            file: Some(PathBuf::from("/l/packages/p/build.ncl")),
+            import: "/etc/x.ncl".into(),
+            root: PathBuf::from("/l"),
+        };
+        let out = capture(&e);
+        assert!(out.contains("/l/packages/p/build.ncl imports"), "{out:?}");
+        assert!(out.contains(IMPORT_OUTSIDE_HINT), "{out:?}");
+    }
+
+    #[test]
+    fn link_outside_names_the_link_and_a_next_step() {
+        let e = Error::LinkOutside {
+            link: PathBuf::from("/l/packages/p"),
+            root: PathBuf::from("/l"),
+        };
+        let out = capture(&e);
+        assert!(
+            out.contains("/l/packages/p is a link that leads outside the layer at /l"),
+            "{out:?}"
+        );
+        assert!(!out.contains("imports"), "{out:?}");
+        assert!(out.contains(LINK_OUTSIDE_HINT), "{out:?}");
     }
 
     #[test]
