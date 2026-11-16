@@ -151,6 +151,13 @@ packaging/macos/pkg/build-pkg.sh --version X.Y.Z \
     --notarize minimal-notary
 ```
 
+The release workflow's `build-macos-pkg` job runs that line on the signing
+runner for the row it just staged, with `--notary-keychain` naming the
+signing keychain (where the runner keeps the profile) and `--dmg`. The job
+is skipped until the repository variable `MACOS_PKG_INSTALLER_IDENTITY`
+names the Installer identity; it has not run yet, so a signed package is
+still unproven.
+
 `--sign` signs the product archive (timestamped) and checks the signature
 back; `--notarize` submits it with the named `notarytool` keychain profile,
 waits, staples the ticket, and runs the Gatekeeper assessment Installer
