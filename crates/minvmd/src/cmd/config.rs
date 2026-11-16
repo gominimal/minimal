@@ -11,7 +11,8 @@ use anyhow::{Context as _, Result, bail};
 use switch::bep_host::DEFAULT_PER_SOURCE_CAP;
 
 use crate::cmd::{
-    DEFAULT_VM_RAM_MIB, DEFAULT_VM_VCPUS, env_bep_per_box_cap, env_ram_mib, env_vcpus,
+    DEFAULT_VM_RAM_MIB, DEFAULT_VM_VCPUS, MAX_BEP_PER_BOX_CAP, env_bep_per_box_cap, env_ram_mib,
+    env_vcpus,
 };
 use crate::config::ResourceConfig;
 use crate::state::host_dir;
@@ -108,10 +109,14 @@ fn validate_resources(
 
 /// Validate a requested per-box cap on Box Egress Proxy connections: a box
 /// with a cap of zero can open no connection to the proxy, so zero is
-/// refused.
+/// refused. A cap above [`MAX_BEP_PER_BOX_CAP`] is refused too, because each
+/// slot holds sockets and buffers for every registered box.
 fn validate_bep_per_box_cap(cap: Option<u32>) -> Result<()> {
     if cap == Some(0) {
         bail!("--bep-per-box-cap must be at least 1");
+    }
+    if cap.is_some_and(|c| c > MAX_BEP_PER_BOX_CAP) {
+        bail!("--bep-per-box-cap must be at most {MAX_BEP_PER_BOX_CAP}");
     }
     Ok(())
 }
@@ -286,6 +291,13 @@ mod tests {
         validate_bep_per_box_cap(Some(1)).expect("one is a valid cap");
         validate_bep_per_box_cap(Some(128)).expect("128 is a valid cap");
         validate_bep_per_box_cap(None).expect("unset is valid");
+    }
+
+    #[test]
+    fn bep_per_box_cap_above_the_maximum_is_rejected() {
+        let err = validate_bep_per_box_cap(Some(4_000_000_000)).unwrap_err();
+        assert_eq!(err.to_string(), "--bep-per-box-cap must be at most 1024");
+        validate_bep_per_box_cap(Some(MAX_BEP_PER_BOX_CAP)).expect("the maximum is valid");
     }
 
     #[test]

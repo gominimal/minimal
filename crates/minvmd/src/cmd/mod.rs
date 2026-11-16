@@ -254,6 +254,13 @@ pub(crate) fn env_bep_per_box_cap() -> Option<u32> {
     positive_env(BEP_PER_BOX_CAP_ENV)
 }
 
+/// The largest per-box cap `minvmd` accepts. Each slot of a box's share
+/// holds listening sockets with their own buffers while it is idle, so an
+/// unbounded cap (a typo such as `4000000000`) can exhaust memory when a box
+/// registers. `minvmd config set` refuses a value above it, and
+/// [`resolve_bep_per_box_cap`] clamps an env or `config.toml` value to it.
+pub const MAX_BEP_PER_BOX_CAP: u32 = 1024;
+
 /// Where the effective per-box cap came from, in the precedence order
 /// [`resolve_bep_per_box_cap`] applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,10 +288,13 @@ impl CapSource {
 /// Resolve the per-box cap from its layers: the env override, then the
 /// persisted config, then the switch's recorded default. A zero in either
 /// layer counts as unset, because a box with no share can open nothing.
-/// Pure, so the precedence is testable without the process environment.
+/// A value above [`MAX_BEP_PER_BOX_CAP`] is clamped to it. Pure, so the precedence is testable without the process environment.
 #[must_use]
 pub fn resolve_bep_per_box_cap(env: Option<u32>, persisted: Option<u32>) -> (usize, CapSource) {
-    let positive = |v: Option<u32>| v.filter(|v| *v > 0).map(|v| v as usize);
+    let positive = |v: Option<u32>| {
+        v.filter(|v| *v > 0)
+            .map(|v| v.min(MAX_BEP_PER_BOX_CAP) as usize)
+    };
     if let Some(cap) = positive(env) {
         (cap, CapSource::Env)
     } else if let Some(cap) = positive(persisted) {
@@ -301,10 +311,23 @@ pub fn resolve_bep_per_box_cap(env: Option<u32>, persisted: Option<u32>) -> (usi
 /// `minvmd config set --bep-per-box-cap` takes effect on the next boot.
 #[must_use]
 pub fn effective_bep_per_box_cap() -> (usize, CapSource) {
-    resolve_bep_per_box_cap(
-        env_bep_per_box_cap(),
-        persisted_resource_config().bep_per_box_cap,
-    )
+    let env = env_bep_per_box_cap();
+    let persisted = persisted_resource_config().bep_per_box_cap;
+    let resolved = resolve_bep_per_box_cap(env, persisted);
+    let raw = match resolved.1 {
+        CapSource::Env => env,
+        CapSource::Config => persisted,
+        CapSource::Default => None,
+    };
+    if let Some(raw) = raw.filter(|v| *v > MAX_BEP_PER_BOX_CAP) {
+        tracing::warn!(
+            requested = raw,
+            max = MAX_BEP_PER_BOX_CAP,
+            source = resolved.1.label(),
+            "per-box BEP connection cap above the maximum; clamped"
+        );
+    }
+    resolved
 }
 
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
@@ -839,6 +862,23 @@ mod bep_cap_tests {
         assert_eq!(
             resolve_bep_per_box_cap(None, Some(0)),
             (DEFAULT_PER_SOURCE_CAP, CapSource::Default)
+        );
+    }
+
+    #[test]
+    fn effective_bep_per_box_cap_clamps_to_the_maximum() {
+        let max = super::MAX_BEP_PER_BOX_CAP as usize;
+        assert_eq!(
+            resolve_bep_per_box_cap(Some(4_000_000_000), None),
+            (max, CapSource::Env)
+        );
+        assert_eq!(
+            resolve_bep_per_box_cap(None, Some(u32::MAX)),
+            (max, CapSource::Config)
+        );
+        assert_eq!(
+            resolve_bep_per_box_cap(None, Some(super::MAX_BEP_PER_BOX_CAP)),
+            (max, CapSource::Config)
         );
     }
 

@@ -94,7 +94,8 @@ enum ConfigAction {
         /// Guest RAM in MiB.
         #[arg(long)]
         ram_mib: Option<u32>,
-        /// Most connections one box can hold open to the Box Egress Proxy at once.
+        /// Most connections one box can hold open to the Box Egress Proxy at once
+        /// (1 to 1024).
         #[arg(long)]
         bep_per_box_cap: Option<u32>,
     },
