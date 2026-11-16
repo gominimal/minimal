@@ -12043,7 +12043,11 @@ proof_native_answerer_survives_session_stop() {
 #      the second box's switch address. The connect is refused fast, and the
 #      daemon log carries a new `network policy violation` line with
 #      `direction=ingress` and that port as `dst_port`.
-#   5. The second box's name answers NXDOMAIN on the first lookup made after
+#   5. Inside the first box, `getent ahostsv4` of the second box's
+#      `<name>.min.internal` exits 0 with the second box's switch address,
+#      the answer the switch's resolver at the gateway gives. A curl to that
+#      name does not exit 6 (could not resolve host).
+#   6. The second box's name answers NXDOMAIN on the first lookup made after
 #      `min session destroy` returns.
 #
 # Each lookup prints its name, its answer and its latency. When a lookup is
@@ -12080,7 +12084,7 @@ proof_native_names_answer_on_time() {
 
   local nnat_channel=/run/minimal/answerer.sock
   local nnat_base="$XDG_STATE_HOME/minimal"
-  local nnat_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info,minimald::net::switch=debug"
+  local nnat_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info,minimald::net::switch=debug,minimald::net::dns_gate=debug,minimald::net::gvproxy_network=debug"
   local nnat_port="" nnat_closed_port=18193 nnat_open_port=18194
   NNAT_ADDR=""
 
@@ -12277,8 +12281,8 @@ proof_native_names_answer_on_time() {
   # ---- 4. an unpublished port: refused and logged ---------------------------
   # Beat 4 dials box b at its switch address, the 100.64.x.x lease. The name
   # answers the box's loopback address, and a SYN to that never crosses the
-  # switch gate, which writes the line. It is not a lookup from inside a box
-  # either: that is not this case's proof (gominimal/minimal#3001). A
+  # switch gate, which writes the line. The lookup from inside a box is
+  # beat 5's proof (gominimal/minimal#3001). A
   # session rootfs has no iproute2, so the address is read from
   # /proc/net/fib_trie (each local address is a `|-- A.B.C.D` line followed
   # by `/32 host LOCAL`).
@@ -12340,7 +12344,42 @@ proof_native_names_answer_on_time() {
   echo "  daemon log line matched: $nnat_new"
   echo "4. the refused connect to an unpublished port is logged as a policy violation"
 
-  # ---- 5. a destroyed box's name is gone when destroy returns ---------------
+  # ---- 5. a sibling's name resolves from inside a box -----------------------
+  # The first box asks its own resolver, the switch's at the gateway, for the
+  # second box's name (gominimal/minimal#3001). The answer must be the
+  # second box's switch address, read in beat 4. Then curl dials the name at
+  # the published port: any exit but 6 shows that the name resolved.
+  local nnat_b_fqdn="$nnat_b_name.min.internal" nnat_got nnat_curl_rc
+  mnl session exec "$nnat_a_sid" "getent ahostsv4 $nnat_b_fqdn" \
+    >"$WORK/nnat-getent.out" 2>"$WORK/nnat-getent.err"
+  nnat_rc=$?
+  nnat_got="$(awk '{ print $1; exit }' "$WORK/nnat-getent.out" 2>/dev/null)"
+  echo "  getent ahostsv4 $nnat_b_fqdn inside $nnat_a_name: exit $nnat_rc, answer ${nnat_got:-none}"
+  if [ "$nnat_rc" -ne 0 ] || [ "$nnat_got" != "$nnat_b_addr" ]; then
+    echo "::error::$nnat_b_fqdn did not resolve to $nnat_b_addr inside $nnat_a_name"
+    echo "--- getent stdout ---"; cat "$WORK/nnat-getent.out" 2>/dev/null || true
+    echo "--- getent stderr ---"; cat "$WORK/nnat-getent.err" 2>/dev/null || true
+    echo "--- /etc/resolv.conf inside $nnat_a_name ---"
+    mnl session exec "$nnat_a_sid" "cat /etc/resolv.conf" 2>&1 || true
+    echo "--- daemon log: the second box's name registration and the relay's DNS lines (tail) ---"
+    nnat_lines 'min.internal name' | tail -n 5
+    nnat_lines "$nnat_b_name" | tail -n 10
+    nnat_lines 'answered a lookup at the relay' | tail -n 5
+    fail
+  fi
+  mnl session exec "$nnat_a_sid" \
+    "curl -sS --max-time 8 -o /dev/null 'http://$nnat_b_fqdn:$nnat_open_port/'" \
+    >"$WORK/nnat-name-curl.out" 2>"$WORK/nnat-name-curl.err"
+  nnat_curl_rc=$?
+  echo "  curl http://$nnat_b_fqdn:$nnat_open_port/ inside $nnat_a_name: exit $nnat_curl_rc: $(tr '\n' ' ' < "$WORK/nnat-name-curl.err" 2>/dev/null)"
+  if [ "$nnat_curl_rc" -eq 6 ]; then
+    echo "::error::curl inside $nnat_a_name could not resolve $nnat_b_fqdn (exit 6), though getent resolved it"
+    nnat_lines 'answered a lookup at the relay' | tail -n 5
+    fail
+  fi
+  echo "5. $nnat_b_fqdn resolves to $nnat_b_addr inside $nnat_a_name, and curl to the name does not exit 6"
+
+  # ---- 6. a destroyed box's name is gone when destroy returns ---------------
   if ! mnl session destroy --force "$nnat_b_sid" >"$WORK/nnat-destroy.out" 2>&1; then
     echo "::error::'min session destroy' of $nnat_b_name failed"
     cat "$WORK/nnat-destroy.out" 2>/dev/null || true
@@ -12348,7 +12387,7 @@ proof_native_names_answer_on_time() {
   fi
   nnat_t="$(now_ms)"
   nnat_on_time "$nnat_b_name.min.internal" NXDOMAIN "$nnat_t" "destroy"
-  echo "5. $nnat_b_name.min.internal is NXDOMAIN when destroy returns"
+  echo "6. $nnat_b_name.min.internal is NXDOMAIN when destroy returns"
 
   # ---- cleanup: the host as found -------------------------------------------
   mnl session destroy --force "$nnat_a_sid" >/dev/null 2>&1 || true
