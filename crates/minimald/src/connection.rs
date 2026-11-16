@@ -492,14 +492,14 @@ impl russh::server::Handler for ConnectionHandler {
                 .attach(conn_username, channel, config, attacher)
                 .await
             {
-                let _ = hnd
-                    .data(id, format!("Error attaching to session: {e}\r\n"))
-                    .await;
-                // A refusal with its own exit status (a refused resume,
-                // BOX-025) ends the client's attach with it, not 255.
-                if let Some(code) = e.exit_code() {
-                    let _ = hnd.exit_status_request(id, code).await;
-                }
+                let (line, code) = attach_refusal(&e);
+                let _ = hnd.data(id, line).await;
+                // Every refusal ends the client's attach with an exit status,
+                // never ssh's 255: the client reads 255 as a dropped
+                // connection and its blind unwind can move the cursor back
+                // over the line above. A refused resume (BOX-025) carries
+                // its own status.
+                let _ = hnd.exit_status_request(id, code).await;
                 let _ = hnd.close(id).await;
             }
         };
@@ -1033,8 +1033,49 @@ where
     }
 }
 
+/// What the attach channel carries for a refused attach: the line the
+/// client's terminal shows, and the exit status its ssh ends with.
+fn attach_refusal(error: &crate::box_actor::AttachError) -> (String, u32) {
+    (
+        format!("Error attaching to session: {error}\r\n"),
+        error.exit_code(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    /// An attach refusal sends an exit status, so the client's ssh never
+    /// ends with its transport status 255. A row that minvmd released keeps
+    /// its text, and a refused resume keeps its own status.
+    #[test]
+    fn attach_refusal_sends_an_exit_status() {
+        use crate::box_actor::AttachError;
+        let (line, code) = super::attach_refusal(&AttachError::BoxHostRowEnded);
+        assert_eq!(code, 1);
+        assert!(
+            line.contains("the VM host daemon released this session's network addresses"),
+            "{line}"
+        );
+        assert!(line.ends_with("\r\n"), "{line:?}");
+        let refusals = [
+            AttachError::NoPty,
+            AttachError::SessionPending,
+            AttachError::WorkspaceUploadInFlight,
+            AttachError::SessionBusy,
+            AttachError::ContextCreationFailed("x".to_string()),
+            AttachError::SpawnFailed(std::io::Error::other("x")),
+            AttachError::LoadoutFailed(std::io::Error::other("x")),
+            AttachError::LaunchRecordUnwritable(std::io::Error::other("x")),
+        ];
+        for refusal in &refusals {
+            let (_, code) = super::attach_refusal(refusal);
+            assert!(code != 0 && code != 255, "{refusal}: {code}");
+        }
+        let (_, code) =
+            super::attach_refusal(&AttachError::ResumeRefused(std::io::Error::other("x"), 3));
+        assert_eq!(code, 3, "a refused resume keeps its own status");
+    }
+
     /// A direct-tcpip open from the native client carries the CLI's
     /// traceparent as its originator address; an OpenSSH client's address
     /// there is not a context, so the forward starts a fresh trace as before.
