@@ -26,6 +26,8 @@
 //!
 //! The tests need `tpm2-tools`, and the first one needs a TPM. They are
 //! ignored by default, and return early when `BEP_TPM_TCTI` is not set.
+//! With `BEP_TPM_TCTI` set they never return early: a test that cannot
+//! reach the TPM fails. Each test prints the TPM it runs against.
 //! Run them with `BEP_TPM_TCTI=<tcti> cargo nextest run -p bep
 //! --run-ignored ignored-only <test>`.
 
@@ -320,16 +322,19 @@ fn published(path: &Path, out: &Output) -> Vec<(Role, String, Option<String>)> {
         .collect()
 }
 
-/// The TCTI and the tools for a test, or `None` when this host cannot run
-/// it.
+/// The TCTI and the tools for a test, or `None` when this host has no TPM
+/// for it. `BEP_TPM_TCTI` set means the caller asks for a TPM, as the
+/// `bep-tpm-integration` lane does. Then the test never returns early: it
+/// fails when it cannot reach the TPM, so a pass in that lane is a run.
 fn tpm_lane() -> Option<(String, PathBuf)> {
     let Ok(tcti) = std::env::var("BEP_TPM_TCTI") else {
         eprintln!("BEP_TPM_TCTI is not set, so this host has no TPM for the test. Skipped.");
         return None;
     };
     let Some(tools) = tpm2_tools() else {
-        eprintln!("tpm2-tools is not on PATH, so this host cannot reach a TPM. Skipped.");
-        return None;
+        panic!(
+            "BEP_TPM_TCTI is {tcti}, but tpm2-tools is not on PATH, so the test cannot reach the TPM"
+        );
     };
     Some((tcti, tools))
 }
@@ -342,6 +347,7 @@ fn bep_keeps_its_tpm_keys_across_restarts() {
         return;
     };
     let (tcti, _own_tpm) = tpm_for_restarts(tcti, &tools);
+    eprintln!("bep_keeps_its_tpm_keys_across_restarts runs against TPM {tcti}");
     let host = Host::new(&tools, &tcti);
 
     // The first start makes each key in the TPM.
@@ -416,9 +422,13 @@ fn bep_keeps_its_tpm_keys_across_restarts() {
 #[test]
 #[ignore = "needs tpm2-tools: set BEP_TPM_TCTI"]
 fn bep_without_a_tpm_or_keyring_refuses_start() {
-    let Some((_, tools)) = tpm_lane() else {
+    let Some((tcti, tools)) = tpm_lane() else {
         return;
     };
+    eprintln!(
+        "bep_without_a_tpm_or_keyring_refuses_start runs with tpm2-tools from {} and no TPM ({NO_TPM}). The lane TPM is {tcti}.",
+        tools.display()
+    );
     let host = Host::new(&tools, NO_TPM);
 
     let out = host.start();
