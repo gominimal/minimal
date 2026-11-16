@@ -21276,16 +21276,12 @@ async fn export_writes_each_file_atomically() {
         std::fs::write(&tool, b"old tool").unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
         let mut source = ExportBox::default().file("/workbench/bin/tool", b"#!/bin/sh\n");
-        source.modes.insert("/workbench/bin/tool".to_owned(), 0o100_755);
+        source
+            .modes
+            .insert("/workbench/bin/tool".to_owned(), 0o100_755);
         let mut err = Vec::new();
-        let outcomes = cmd::copy_exports(
-            &mut source,
-            &["bin/tool".to_owned()],
-            root,
-            "web",
-            &mut err,
-        )
-        .await;
+        let outcomes =
+            cmd::copy_exports(&mut source, &["bin/tool".to_owned()], root, "web", &mut err).await;
         assert!(outcomes[0].copied, "{err:?}");
         let mode = std::fs::metadata(&tool).unwrap().permissions().mode();
         assert_eq!(mode & 0o100, 0o100, "the owner can run the file: {mode:o}");
