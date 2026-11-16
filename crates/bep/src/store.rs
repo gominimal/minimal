@@ -690,6 +690,102 @@ fn is_bundle_of(path: &str, proxy: &str) -> bool {
     name.is_some() && name == program
 }
 
+/// One access-control entry of a keychain item, as the Keychain Services
+/// API reports it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AclEntry {
+    /// The authorization tags, such as `ACLAuthorizationDecrypt`.
+    authorizations: Vec<String>,
+    /// The paths of the trusted applications. `None` is any application,
+    /// which lists no program, as `dump-keychain` prints `<null>`.
+    applications: Option<Vec<String>>,
+    /// The entry's description. For the partition entry, the partition list.
+    description: String,
+}
+
+/// The authorization that lets a program read the value.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const AUTH_DECRYPT: &str = "ACLAuthorizationDecrypt";
+/// The authorization of the entry that holds the partition list.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const AUTH_PARTITION: &str = "ACLAuthorizationPartitionID";
+
+/// Whether `proxy` can read the item held under one service and identifier,
+/// from the access-control entries of each copy in the search list: `None`
+/// when no copy is held. Every copy must admit the proxy, as in
+/// [`parse_dump`]: a copy without the proxy's entry prompts it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn item_access(copies: &[Vec<AclEntry>], proxy: &Path, partition: Option<&str>) -> Option<bool> {
+    if copies.is_empty() {
+        return None;
+    }
+    let proxy = proxy.to_string_lossy();
+    Some(copies.iter().all(|entries| {
+        entries.iter().any(|entry| acl_admits(entry, &proxy))
+            && partition
+                .is_some_and(|name| entries.iter().any(|entry| acl_names_partition(entry, name)))
+    }))
+}
+
+/// Whether one entry allows `decrypt` and lists `proxy`, as
+/// [`entry_admits`] reads it from a dump.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn acl_admits(entry: &AclEntry, proxy: &str) -> bool {
+    entry.authorizations.iter().any(|a| a == AUTH_DECRYPT)
+        && entry.applications.as_ref().is_some_and(|apps| {
+            apps.iter()
+                .any(|path| path == proxy || is_bundle_of(path, proxy))
+        })
+}
+
+/// Whether one entry is the partition list and names `partition`, as
+/// [`names_partition`] reads it from a dump.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn acl_names_partition(entry: &AclEntry, partition: &str) -> bool {
+    entry.authorizations.iter().any(|a| a == AUTH_PARTITION)
+        && partition_names(&entry.description)
+            .iter()
+            .any(|name| name == partition)
+}
+
+/// The partitions a partition entry's description names. The API gives a
+/// hex-encoded property list whose `Partitions` array holds them;
+/// `dump-keychain` prints that list decoded, comma-separated, and either form
+/// reads here.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn partition_names(description: &str) -> Vec<String> {
+    let description = description.trim();
+    match hex_decode(description).and_then(|bytes| String::from_utf8(bytes).ok()) {
+        Some(plist) => plist
+            .split("<string>")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("</string>"))
+            .map(|(name, _)| name.trim().to_owned())
+            .collect(),
+        None => description
+            .split(',')
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect(),
+    }
+}
+
+/// The bytes of an even-length hex string, or `None` for anything else.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
+        || !text.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// The keychain operations that [`set_item`] puts in order.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 trait Keychain {
@@ -704,8 +800,10 @@ trait Keychain {
         proxy: &Path,
     ) -> Result<String, StoreError>;
 
-    /// The items under `service`, with whether each one admits `proxy`.
-    fn items(&self, service: &str, proxy: &Path) -> Result<Vec<ItemInfo>, StoreError>;
+    /// Whether an item is held under `service` and `id`, and if so whether
+    /// it admits `proxy`: `None` when none is held. Only that item is read,
+    /// never the whole keychain.
+    fn item(&self, service: &str, id: &str, proxy: &Path) -> Result<Option<bool>, StoreError>;
 
     /// Delete the item under `service` and `id`. `false` when none was held.
     fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError>;
@@ -719,8 +817,7 @@ trait Keychain {
 /// go. So when the keychain refuses the new item, the old one stays.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn set_item(kc: &impl Keychain, id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
-    let held = kc.items(SERVICE, proxy)?.iter().any(|item| item.id == id);
-    if !held {
+    if kc.item(SERVICE, id, proxy)?.is_none() {
         return add_checked(kc, SERVICE, id, value, proxy);
     }
     // A failed run can leave a staged item behind. The add below refuses a
@@ -780,10 +877,8 @@ fn add_checked(
     let warnings = kc.add(service, id, value, proxy)?;
     // The program can warn on stderr after a write that succeeded. So the
     // item itself, read back with its access control, decides the result.
-    let mut detail = match kc.items(service, proxy) {
-        Ok(items) if items.iter().any(|item| item.id == id && item.proxy_access) => {
-            return Ok(());
-        }
+    let mut detail = match kc.item(service, id, proxy) {
+        Ok(Some(true)) => return Ok(()),
         Ok(_) if warnings.is_empty() => {
             "the keychain holds no item for it that the proxy can read".to_owned()
         }
@@ -853,9 +948,16 @@ impl ValueReader for HostStore {
 #[cfg(target_os = "macos")]
 mod host {
     use super::{
-        ItemInfo, Keychain, NATIVE_STORE, ReadError, SERVICE, StoreError, add_args, parse_dump,
-        parse_dump_service, set_item, signature_partition,
+        AclEntry, ItemInfo, Keychain, NATIVE_STORE, ReadError, SERVICE, StoreError, add_args,
+        item_access, parse_dump, set_item, signature_partition,
     };
+    use core_foundation::array::{CFArray, CFArrayRef};
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use core_foundation::data::{CFData, CFDataRef};
+    use core_foundation::string::{CFString, CFStringRef};
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
+    use security_framework::os::macos::keychain_item::SecKeychainItem;
+    use security_framework_sys::base::{SecAccessRef, SecKeychainItemRef};
     use std::io::{ErrorKind, Write as _};
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -911,7 +1013,7 @@ mod host {
 
     /// The keychain through `/usr/bin/security`, and through the proxy
     /// program for an add.
-    struct SecurityTool;
+    pub(super) struct SecurityTool;
 
     impl Keychain for SecurityTool {
         fn add(
@@ -929,20 +1031,163 @@ mod host {
             Ok(String::from_utf8_lossy(&out.stderr).trim().to_owned())
         }
 
-        fn items(&self, service: &str, proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
-            let out = dump()?;
+        fn item(&self, service: &str, id: &str, proxy: &Path) -> Result<Option<bool>, StoreError> {
+            let refused = |detail: String| StoreError::Refused {
+                store: NATIVE_STORE,
+                action: "read the secret's access control",
+                detail,
+            };
+            // Every copy in the search list, as references: no value is read,
+            // so the search asks for no access.
+            let mut search = ItemSearchOptions::new();
+            search
+                .class(ItemClass::generic_password())
+                .service(service)
+                .account(id)
+                .load_refs(true)
+                .limit(Limit::All);
+            let found = match search.search() {
+                Ok(found) => found,
+                Err(e) if e.code() == ITEM_NOT_FOUND => return Ok(None),
+                Err(e) => return Err(refused(e.to_string())),
+            };
+            let mut copies = Vec::with_capacity(found.len());
+            for result in found {
+                let SearchResult::Ref(Reference::KeychainItem(item)) = result else {
+                    return Err(refused(
+                        "the keychain answered with something that is not an item".to_owned(),
+                    ));
+                };
+                copies.push(acl_entries(&item).map_err(refused)?);
+            }
             let partition = proxy_partition(proxy);
-            Ok(parse_dump_service(
-                &out,
-                service,
-                proxy,
-                partition.as_deref(),
-            ))
+            Ok(item_access(&copies, proxy, partition.as_deref()))
         }
 
         fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError> {
             delete(service, id)
         }
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        // `security-framework-sys` declares none of these. They are
+        // deprecated with the file-based keychain they read, and that keychain
+        // is the one these items live in.
+        fn SecKeychainItemCopyAccess(item: SecKeychainItemRef, access: *mut SecAccessRef) -> i32;
+        fn SecAccessCopyACLList(access: SecAccessRef, list: *mut CFArrayRef) -> i32;
+        fn SecACLCopyAuthorizations(acl: CFTypeRef) -> CFArrayRef;
+        fn SecACLCopyContents(
+            acl: CFTypeRef,
+            applications: *mut CFArrayRef,
+            description: *mut CFStringRef,
+            prompt_selector: *mut u16,
+        ) -> i32;
+        fn SecTrustedApplicationCopyData(application: CFTypeRef, data: *mut CFDataRef) -> i32;
+    }
+
+    /// The message of a Security framework status.
+    fn status_text(status: i32) -> String {
+        security_framework::base::Error::from_code(status).to_string()
+    }
+
+    /// The access-control entries of one item.
+    fn acl_entries(item: &SecKeychainItem) -> Result<Vec<AclEntry>, String> {
+        let mut access: SecAccessRef = std::ptr::null_mut();
+        // SAFETY: `item` holds a live reference, and `access` is an out
+        // pointer the call fills with an owned reference on success.
+        let status =
+            unsafe { SecKeychainItemCopyAccess(item.as_concrete_TypeRef(), &raw mut access) };
+        if status != 0 || access.is_null() {
+            return Err(status_text(status));
+        }
+        // SAFETY: a Copy call returned `access`, so this takes its one
+        // reference, which drops with `access`.
+        let access = unsafe { CFType::wrap_under_create_rule(access as CFTypeRef) };
+        let mut list: CFArrayRef = std::ptr::null();
+        // SAFETY: `access` is live for the call, and `list` is an out pointer
+        // the call fills with an owned array on success.
+        let status =
+            unsafe { SecAccessCopyACLList(access.as_CFTypeRef() as SecAccessRef, &raw mut list) };
+        if status != 0 || list.is_null() {
+            return Err(status_text(status));
+        }
+        // SAFETY: a Copy call returned `list`, an array of `SecACLRef`.
+        let list = unsafe { CFArray::<CFType>::wrap_under_create_rule(list) };
+        list.iter()
+            .map(|acl| acl_entry(acl.as_CFTypeRef()))
+            .collect()
+    }
+
+    /// One access-control entry.
+    fn acl_entry(acl: CFTypeRef) -> Result<AclEntry, String> {
+        // SAFETY: `acl` is an element of an array the caller holds.
+        let tags = unsafe { SecACLCopyAuthorizations(acl) };
+        let authorizations = if tags.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: a Copy call returned `tags`, an array of `CFString`.
+            let tags = unsafe { CFArray::<CFType>::wrap_under_create_rule(tags) };
+            tags.iter()
+                .filter_map(|tag| tag.downcast::<CFString>().map(|t| t.to_string()))
+                .collect()
+        };
+        let mut applications: CFArrayRef = std::ptr::null();
+        let mut description: CFStringRef = std::ptr::null();
+        let mut prompt = 0u16;
+        // SAFETY: `acl` is live for the call, and each out pointer is filled
+        // with an owned reference or left null.
+        let status = unsafe {
+            SecACLCopyContents(
+                acl,
+                &raw mut applications,
+                &raw mut description,
+                &raw mut prompt,
+            )
+        };
+        if status != 0 {
+            return Err(status_text(status));
+        }
+        let description = if description.is_null() {
+            String::new()
+        } else {
+            // SAFETY: a Copy call returned `description`.
+            unsafe { CFString::wrap_under_create_rule(description) }.to_string()
+        };
+        let applications = if applications.is_null() {
+            None
+        } else {
+            // SAFETY: a Copy call returned `applications`, an array of
+            // `SecTrustedApplicationRef`.
+            let list = unsafe { CFArray::<CFType>::wrap_under_create_rule(applications) };
+            Some(
+                list.iter()
+                    .map(|app| application_path(app.as_CFTypeRef()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        Ok(AclEntry {
+            authorizations,
+            applications,
+            description,
+        })
+    }
+
+    /// The path a trusted application names, as `dump-keychain` prints it.
+    fn application_path(application: CFTypeRef) -> Result<String, String> {
+        let mut data: CFDataRef = std::ptr::null();
+        // SAFETY: `application` is an element of an array the caller holds,
+        // and `data` is an out pointer filled with an owned reference.
+        let status = unsafe { SecTrustedApplicationCopyData(application, &raw mut data) };
+        if status != 0 || data.is_null() {
+            return Err(status_text(status));
+        }
+        // SAFETY: a Copy call returned `data`.
+        let data = unsafe { CFData::wrap_under_create_rule(data) };
+        let bytes = data.bytes();
+        // The path is a C string, with its terminating NUL.
+        let path = bytes.split(|b| *b == 0).next().unwrap_or_default();
+        Ok(String::from_utf8_lossy(path).into_owned())
     }
 
     pub(super) fn set(id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
@@ -1176,24 +1421,19 @@ mod tests {
             Ok(String::new())
         }
 
-        fn items(&self, service: &str, _proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
+        fn item(&self, service: &str, id: &str, _proxy: &Path) -> Result<Option<bool>, StoreError> {
             if self.adds.get() > 0 && self.refuse_read_back_of == Some(self.adds.get()) {
                 return Err(StoreError::Refused {
                     store: NATIVE_STORE,
-                    action: "list the secrets",
+                    action: "read the secret's access control",
                     detail: "The specified item could not be found in the keychain.".into(),
                 });
             }
             Ok(self
                 .items
                 .borrow()
-                .iter()
-                .filter(|((s, _), _)| s == service)
-                .map(|((_, id), (_, access))| ItemInfo {
-                    id: id.clone(),
-                    proxy_access: *access,
-                })
-                .collect())
+                .get(&(service.to_owned(), id.to_owned()))
+                .map(|(_, access)| *access))
         }
 
         fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError> {
@@ -1562,6 +1802,126 @@ access: 3 entries
         assert!(!parse_dump(&dump(""), Path::new(PROXY), team)[0].proxy_access);
     }
 
+    fn acl(authorizations: &[&str], applications: Option<&[&str]>, description: &str) -> AclEntry {
+        AclEntry {
+            authorizations: authorizations.iter().map(|a| (*a).to_owned()).collect(),
+            applications: applications.map(|apps| apps.iter().map(|a| (*a).to_owned()).collect()),
+            description: description.to_owned(),
+        }
+    }
+
+    /// The partition list as the API gives it: a hex-encoded property list.
+    fn partition_plist(names: &[&str]) -> String {
+        let strings: String = names
+            .iter()
+            .map(|n| format!("<string>{n}</string>"))
+            .collect();
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Partitions</key><array>{strings}</array></dict></plist>"
+        );
+        xml.bytes().map(|b| format!("{b:02X}")).collect()
+    }
+
+    #[test]
+    fn one_item_admits_the_proxy_only_with_decrypt_and_its_partition() {
+        let proxy = Path::new("/opt/bep");
+        let decrypt = acl(&[AUTH_DECRYPT], Some(&["/opt/bep"]), "dev.minimal.secret");
+        let partition = acl(
+            &[AUTH_PARTITION],
+            None,
+            &partition_plist(&["apple-tool:", "teamid:3G47C5HY64"]),
+        );
+        let held = vec![decrypt.clone(), partition.clone()];
+        assert_eq!(item_access(&[], proxy, Some("teamid:3G47C5HY64")), None);
+        assert_eq!(
+            item_access(
+                std::slice::from_ref(&held),
+                proxy,
+                Some("teamid:3G47C5HY64")
+            ),
+            Some(true)
+        );
+        // Another partition, no partition, or no decrypt entry for the proxy.
+        assert_eq!(
+            item_access(std::slice::from_ref(&held), proxy, Some("teamid:OTHER")),
+            Some(false)
+        );
+        assert_eq!(
+            item_access(std::slice::from_ref(&held), proxy, None),
+            Some(false)
+        );
+        let other_app = acl(&[AUTH_DECRYPT], Some(&["/usr/bin/other"]), "");
+        assert_eq!(
+            item_access(
+                &[vec![other_app, partition.clone()]],
+                proxy,
+                Some("teamid:3G47C5HY64")
+            ),
+            Some(false)
+        );
+        // Any application lists no program, as the dump reads `<null>`.
+        let any_app = acl(&[AUTH_DECRYPT], None, "");
+        assert_eq!(
+            item_access(
+                &[vec![any_app, partition.clone()]],
+                proxy,
+                Some("teamid:3G47C5HY64")
+            ),
+            Some(false)
+        );
+        // Every copy in the search list must admit the proxy.
+        let no_partition = vec![decrypt.clone()];
+        assert_eq!(
+            item_access(
+                &[held.clone(), no_partition],
+                proxy,
+                Some("teamid:3G47C5HY64")
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            item_access(&[held.clone(), held], proxy, Some("teamid:3G47C5HY64")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn one_item_admits_a_bundled_proxy() {
+        let proxy = Path::new("/Applications/bep.app/Contents/MacOS/bep");
+        let entries = vec![
+            acl(
+                &[AUTH_DECRYPT, "ACLAuthorizationEncrypt"],
+                Some(&["/Applications/bep.app"]),
+                "",
+            ),
+            acl(
+                &[AUTH_PARTITION],
+                None,
+                &partition_plist(&["teamid:3G47C5HY64"]),
+            ),
+        ];
+        assert_eq!(
+            item_access(&[entries], proxy, Some("teamid:3G47C5HY64")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_partition_list_reads_hex_plist_or_plain_text() {
+        assert_eq!(
+            partition_names(&partition_plist(&["apple-tool:", "cdhash:abc"])),
+            vec!["apple-tool:".to_owned(), "cdhash:abc".to_owned()]
+        );
+        assert_eq!(
+            partition_names("teamid:3G47C5HY64, apple:"),
+            vec!["teamid:3G47C5HY64".to_owned(), "apple:".to_owned()]
+        );
+        assert!(partition_names("").is_empty());
+        assert_eq!(hex_decode("4a"), Some(vec![0x4a]));
+        assert_eq!(hex_decode("4"), None);
+        assert_eq!(hex_decode("zz"), None);
+    }
+
     #[test]
     fn a_signature_gives_the_partition_of_the_program() {
         assert_eq!(
@@ -1734,7 +2094,17 @@ access: 1 entries
             items.into_iter().filter(|item| item.id == id).collect()
         };
 
+        let one = |id: &str| host::SecurityTool.item(SERVICE, id, proxy).expect("item");
+        assert_eq!(one(&id), None, "no item before the first set");
+
+        let started = std::time::Instant::now();
         store.set(&id, b"first", proxy).expect("first set");
+        println!("first set took {:?}", started.elapsed());
+        assert_eq!(
+            one(&id),
+            Some(true),
+            "the lookup of one item agrees with the add"
+        );
         let items = mine(store.list(proxy).expect("list"));
         println!("after set: {items:?}");
         assert_eq!(
@@ -1749,7 +2119,10 @@ access: 1 entries
         // The keychain refuses it with prompts off, where it would ask.
         assert!(matches!(store.read(&id), Err(ReadError::Disabled(_))));
 
+        let started = std::time::Instant::now();
         store.set(&id, b"second", proxy).expect("second set");
+        println!("second set took {:?}", started.elapsed());
+        assert_eq!(one(&id), Some(true));
         let items = mine(store.list(proxy).expect("list"));
         println!("after set again: {items:?}");
         assert_eq!(
@@ -1764,6 +2137,7 @@ access: 1 entries
         let items = mine(store.list(proxy).expect("list"));
         println!("after remove: {items:?}");
         assert!(items.is_empty());
+        assert_eq!(one(&id), None, "no item after remove");
         assert!(!store.remove(&id).expect("remove again"));
     }
 
