@@ -21195,7 +21195,7 @@ async fn directory_export_copies_its_tree_and_deletes_nothing() {
     assert!(!outcomes[1].copied);
     assert_eq!(
         String::from_utf8(err).unwrap(),
-        "min did not copy `missing.txt` from box web, because it was not found in the box.\n"
+        "Export missing.txt was not copied: it was not found in the box.\n"
     );
 }
 
@@ -21377,8 +21377,7 @@ async fn export_writes_each_file_atomically() {
     assert!(hidden_names(&root.join("out")).is_empty());
     assert_eq!(
         String::from_utf8(err).unwrap(),
-        "min did not copy all of `out/report.txt` from box web: \
-         could not read all of it from the box.\n"
+        "Export out/report.txt was not copied: could not read all of it from the box.\n"
     );
 
     // A whole read replaces the file. While it is read, the destination
@@ -21901,7 +21900,7 @@ async fn missing_export_named_and_others_copied() {
     );
     assert_eq!(
         String::from_utf8(err).unwrap(),
-        "min did not copy `out/missing.txt` from box build, because it was not found in the box.\n"
+        "Export out/missing.txt was not copied: it was not found in the box.\n"
     );
 }
 
@@ -21981,9 +21980,7 @@ async fn failed_export_file_leaves_its_destination_unchanged() {
     assert_eq!(lines.len(), 4, "{err}");
     for (line, path) in lines.iter().zip(["report.txt", "dist", "site", "log.txt"]) {
         assert!(
-            line.starts_with(&format!(
-                "min did not copy all of `{path}` from box build: "
-            )),
+            line.starts_with(&format!("Export {path} was not copied: ")),
             "{line}"
         );
     }
@@ -22008,10 +22005,12 @@ async fn skipped_export_exit125_when_task_succeeded() {
         std::fs::read(project.path().join("inside.txt")).unwrap(),
         b"copied"
     );
-    assert_eq!(err.lines().count(), 3, "{err}");
-    assert!(err.contains("`missing.txt`"), "{err}");
-    assert!(err.contains("Export out/report.txt "), "{err}");
-    assert!(err.contains("Export key.txt "), "{err}");
+    assert_eq!(
+        err,
+        "Export missing.txt was not copied: it was not found in the box.\n\
+         Export out/report.txt was not copied: it leads outside the project folder.\n\
+         Export key.txt was not copied: it leads outside the box's copy of the project.\n"
+    );
 
     // `min task run` and `min box run`, attached.
     for one in [&outcomes[0..1], &outcomes[1..2], &outcomes[2..3]] {

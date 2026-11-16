@@ -437,7 +437,7 @@ where
         match &reason {
             None => outcome.copied = true,
             Some(line) => {
-                let _ = writeln!(err, "{}", line.text(path, label));
+                let _ = writeln!(err, "{}", line.text(path));
             }
         }
         tracing::info!(
@@ -469,25 +469,18 @@ enum NotCopied {
 }
 
 impl NotCopied {
-    fn text(&self, path: &str, label: &str) -> String {
-        match self {
-            NotCopied::Outside => format!(
-                "min did not copy `{path}` from box {label}, because the path points \
-                 outside the folder that holds minimal.toml."
-            ),
-            NotCopied::LeadsOutsideProject => {
-                format!("Export {path} was not copied: it leads outside the project folder.")
+    // BOX-190, BOX-191: every skip line has the one form
+    // `Export <path> was not copied: <why>.`
+    fn text(&self, path: &str) -> String {
+        let why = match self {
+            NotCopied::Outside | NotCopied::LeadsOutsideProject => {
+                "it leads outside the project folder"
             }
-            NotCopied::LeadsOutsideBox => format!(
-                "Export {path} was not copied: it leads outside the box's copy of the project."
-            ),
-            NotCopied::NotFound => format!(
-                "min did not copy `{path}` from box {label}, because it was not found in the box."
-            ),
-            NotCopied::Failed(reason) => {
-                format!("min did not copy all of `{path}` from box {label}: {reason}.")
-            }
-        }
+            NotCopied::LeadsOutsideBox => "it leads outside the box's copy of the project",
+            NotCopied::NotFound => "it was not found in the box",
+            NotCopied::Failed(reason) => reason.as_str(),
+        };
+        format!("Export {path} was not copied: {why}.")
     }
 }
 
@@ -835,10 +828,7 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
     };
     let not_copied = |err: &mut E, reason: &str| {
         for path in &paths {
-            let _ = writeln!(
-                err,
-                "min did not copy `{path}` from box {label}, because {reason}."
-            );
+            let _ = writeln!(err, "Export {path} was not copied: {reason}.");
         }
         none_copied()
     };
