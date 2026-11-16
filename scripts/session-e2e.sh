@@ -6851,7 +6851,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     # TERM so a stop that reaches it is observable: the trap's echo lands in
     # the redirected output, and the wait below proves the run itself ended
     # 0 — the task's own exit, not the relay's signal death.
-    printf '\n[tasks.e2e-stoptask]\nbash = "trap '"'"'echo TASK-TERM; echo TASK-TERM >&2; exit 0'"'"' TERM; echo TASK-UP; sleep 31337 &; wait; echo TASK-NOT-STOPPED"\n'
+    printf '\n[tasks.e2e-stoptask]\nbash = "trap '"'"'echo TASK-TERM; echo TASK-TERM >&2; exit 0'"'"' TERM; echo TASK-UP; sleep 31337 & wait; echo TASK-NOT-STOPPED"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
     # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
     printf '\n[tasks.e2e-ic]\ninherit_cwd = true\nbash = "echo PWD=$PWD"\n'

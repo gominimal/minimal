@@ -2189,6 +2189,14 @@ pub(crate) struct StopOutcome {
 /// [`stop_box_processes`] still consumes it. A box whose invocations
 /// recorded nothing — no task ran, or the run already returned — is skipped
 /// at once.
+///
+/// The take is a one-time drain: an invocation `run_invocations_in` starts
+/// after it, or one whose spawn races the take, is not recorded in it. A
+/// stop-admission refusal in `record_task_container`, with the run killing a
+/// refused child and the stop draining again until the registry stays
+/// empty, would close that gap. That touches the registry, the run loop and
+/// this stop's loop at once — beyond an iterate round; BOX-013's remaining
+/// seam is tracked for a design pass, not patched here.
 pub(crate) async fn stop_task_containers(
     box_id: boxes::SessionId,
     entrypoint: &JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,

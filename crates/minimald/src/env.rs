@@ -2501,6 +2501,16 @@ impl BoxChannel {
                     .await?
                 }
                 _ => {
+                    // A stop can only end what `run_invocations_in` records,
+                    // and this branch records nothing: a task with no start
+                    // directory and no forwarded stdin runs through
+                    // `Env::run`, whose containers the box's stop never
+                    // signals. Routing this branch through the same
+                    // registration — or a container hook in mctx — needs a
+                    // cross-crate contract change (the sandbox layer owns
+                    // these containers, and `mctx::Env::run` gives no
+                    // container handle back), beyond an iterate round; the
+                    // gap is tracked for a design pass, not patched here.
                     let (stdout_writer, stderr_writer) =
                         StreamWriter::pair_tagged(stream, note_tag)
                             .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
