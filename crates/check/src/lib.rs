@@ -788,20 +788,18 @@ impl FileBasedChecker for ParseCheck {
         })?;
 
         // Refuse an import that leaves the layer before Nickel reads anything,
-        // and check every file it read once it has (see [decode::confine_imports]).
-        let root = match decode::layer_root(&self.layer_dir).and_then(|root| {
-            decode::confine_imports(
-                std::slice::from_ref(&build_ncl_path),
-                &root,
-                &ctx.stdlib_dir,
-            )
-            .map(|()| root)
-        }) {
-            Ok(root) => root,
+        // and check every file it read once it has (see [decode::Confinement]).
+        let confinement = match decode::Confinement::new(
+            &self.layer_dir,
+            std::slice::from_ref(&build_ncl_path),
+            &ctx.stdlib_dir,
+        ) {
+            Ok(confinement) => confinement,
             Err(e) => return Ok(CheckResult::parse_failure(e.to_string())),
         };
         let confine = |program: &Program<CacheImpl>| {
-            decode::confine_files_read(&program.files(), &root, &ctx.stdlib_dir)
+            confinement
+                .check_files_read(&program.files())
                 .map_err(|e| CheckResult::parse_failure(e.to_string()))
         };
         let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
