@@ -842,16 +842,18 @@ pub fn withdraw_box_row_beside(
 /// keeps the one that stands. `box_id` narrows the proof to one creation,
 /// where the caller holds it.
 ///
-/// Blocking. A resume the daemon answers without the row — a daemon that
-/// predates the verb or holds no registration of the box — is a warn
-/// line, and the attach goes ahead: the in-VM daemon still refuses to
-/// relaunch a box whose row is gone. Returns whether the daemon answered
-/// with the row.
+/// Blocking. A reply that is not the row and not a refusal — a daemon that
+/// predates the verb, or a different pair — is a warn line, and the attach
+/// goes ahead: the in-VM daemon still refuses to relaunch a box whose row
+/// is gone. Returns whether the daemon answered with the row.
 ///
 /// # Errors
 ///
 /// [`crate::box_registration::HostUnreachable`] when the daemon cannot be
 /// reached at all (#1790): the caller fails closed on it.
+/// [`crate::box_registration::HostRefusal`] when the daemon refused the
+/// resume: it carries the daemon's reason, for example that the VM cannot
+/// reach the DNS service for box names, so the caller can print it.
 pub fn resume_box_row_at(
     control_sock: &Path,
     box_name: &str,
@@ -881,7 +883,11 @@ pub fn resume_box_row_at(
             row.switch_address
         ),
         Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
-            format!("the daemon refused it: {error}")
+            tracing::warn!(
+                box = %box_name,
+                "the VM host daemon refused the box's host row resume ({error})"
+            );
+            return Err(crate::box_registration::HostRefusal::error(error));
         }
         Ok((other, _)) => format!("another verb's reply: {other:?}"),
         Err(error)

@@ -50,6 +50,34 @@ impl std::fmt::Display for HostUnreachable {
 
 impl std::error::Error for HostUnreachable {}
 
+/// The VM host daemon was reached and refused a box row request, with its
+/// reason: for a resume, the reason the box cannot get its addresses back,
+/// such as a VM that cannot reach the DNS service for box names. It
+/// displays as the daemon's reason, word for word, so the person reads the
+/// remedy the daemon names.
+#[derive(Debug)]
+pub struct HostRefusal(String);
+
+impl HostRefusal {
+    /// The daemon's refusal `reason`, as an error.
+    pub fn error(reason: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self(reason.into()))
+    }
+
+    /// The daemon's reason, word for word.
+    pub fn reason(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for HostRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostRefusal {}
+
 /// The VM host daemon refused a registration for want of addresses: its
 /// switch hand-out run, its loopback slice or the machine's zone answerer
 /// has none left ([`minimald_rpc::is_address_capacity_refusal`]). The host
@@ -562,12 +590,16 @@ pub async fn withdraw_box_row(
 ///
 /// [`HostUnreachable`] when the VM host daemon cannot be reached — the
 /// control socket cannot be connected to or exchanged with: the box's row
-/// cannot be asked back, so the attach or the exec fails closed. A daemon
-/// that answers nothing within [`BOX_CONTROL_TIMEOUT`], and a refusal the
-/// daemon answers, stay warn lines (NET-138): this is a session that already
-/// exists, and the in-VM daemon's own row check before it relaunches the
-/// box's host is the gate that fails closed. Exit 7 stays with the
-/// registration a create makes.
+/// cannot be asked back, so the attach or the exec fails closed.
+/// [`HostRefusal`] when the daemon answers with a refusal: the attach or the
+/// exec fails with the daemon's reason, which names the remedy, for example
+/// `min finalize-install --show` when the VM cannot reach the DNS service
+/// for box names. Without it, the attach goes on and the in-VM daemon
+/// refuses the launch with a text that hides the cause. A daemon that
+/// answers nothing within [`BOX_CONTROL_TIMEOUT`] stays a warn line
+/// (NET-138): this is a session that already exists, and the in-VM daemon's
+/// own row check before it relaunches the box's host is the gate that fails
+/// closed. Exit 7 stays with the registration a create makes.
 pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyhow::Result<()> {
     let Some(control_sock) = control_sock_beside(sock) else {
         return Ok(());
@@ -589,6 +621,9 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
     .await;
     match resumed {
         Ok(Ok(Ok(_))) => Ok(()),
+        Ok(Ok(Err(error))) if error.downcast_ref::<HostRefusal>().is_some() => Err(error.context(
+            format!("the running VM refused to restore the network addresses of box {name}"),
+        )),
         Ok(Ok(Err(error))) => Err(error.context(format!(
             "asking the VM host daemon for box {name}'s host row back failed"
         ))),
@@ -991,6 +1026,52 @@ mod tests {
         assert!(
             error.downcast_ref::<HostUnreachable>().is_some(),
             "{error:#}"
+        );
+    }
+
+    /// A resume that the VM host daemon refuses fails the attach or the exec
+    /// with the daemon's reason, word for word, not a warn line.
+    #[tokio::test]
+    async fn resume_refusal_carries_the_vm_host_reason() {
+        use std::io::{BufRead as _, Write as _};
+        const REASON: &str = "the running VM cannot reach Minimal's DNS service for box \
+                              names, so this box cannot be given an address; run `min \
+                              finalize-install --show` to check the service's setup";
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, listener) = silent_vm_host(&dir);
+        let daemon = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(line.trim()).unwrap();
+            assert!(
+                matches!(request, minimald_rpc::BoxControlRequest::ResumeBox(_)),
+                "{request:?}"
+            );
+            let reply = minimald_rpc::BoxControlReply::Error {
+                error: REASON.to_string(),
+            };
+            let mut reply = serde_json_lenient::to_string(&reply).unwrap();
+            reply.push('\n');
+            (&stream).write_all(reply.as_bytes()).unwrap();
+        });
+        let error = resume_box_row(
+            &dir.path().join(paths::SSH_SOCK_FILE),
+            Some(&own_ip_record(PAIR)),
+        )
+        .await
+        .expect_err("a refused resume fails the attach");
+        daemon.join().unwrap();
+        let refusal = error
+            .downcast_ref::<HostRefusal>()
+            .expect("the error is the daemon's refusal");
+        assert_eq!(refusal.reason(), REASON);
+        assert!(error.downcast_ref::<HostUnreachable>().is_none());
+        assert_eq!(
+            format!("{error:#}"),
+            format!("the running VM refused to restore the network addresses of box web: {REASON}")
         );
     }
 
