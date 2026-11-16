@@ -17,6 +17,13 @@
 //! command left in the TPM, as the kernel's resource manager does. A test
 //! removes the TPM when it points the wrappers at a TCTI with no TPM.
 //!
+//! That flush removes every object and session in the TPM, and the store
+//! in `key_store_tpm_integration` flushes the same way. nextest runs each
+//! test binary in its own process, so the two can remove each other's
+//! loaded keys. So when `BEP_TPM_TCTI` names a TPM with no resource
+//! manager, and `swtpm` is on `PATH`, the restart test starts an `swtpm`
+//! of its own and runs against that.
+//!
 //! The tests need `tpm2-tools`, and the first one needs a TPM. They are
 //! ignored by default, and return early when `BEP_TPM_TCTI` is not set.
 //! Run them with `BEP_TPM_TCTI=<tcti> cargo nextest run -p bep
@@ -25,9 +32,11 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use bep::keys::Role;
 use bep::publish::Identity;
@@ -166,10 +175,121 @@ fn script(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
 }
 
+/// The directory on `PATH` that holds `command`.
+fn on_path(command: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).find(|dir| dir.join(command).is_file())
+}
+
 /// The directory of the installed `tpm2-tools`, from `PATH`.
 fn tpm2_tools() -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .find(|dir| dir.join("tpm2_createprimary").is_file())
+    on_path("tpm2_createprimary")
+}
+
+/// Whether a resource manager stands between `tcti` and the TPM. Without
+/// one, every command in a test flushes the whole TPM.
+fn has_resource_manager(tcti: &str) -> bool {
+    tcti.starts_with("device:/dev/tpmrm") || tcti.starts_with("tabrmd")
+}
+
+/// An `swtpm` that only this test uses. Dropping it stops the `swtpm`.
+struct OwnTpm {
+    child: Child,
+    _state: TempDir,
+    tcti: String,
+}
+
+impl OwnTpm {
+    /// Starts an `swtpm` on two free local ports, and waits until it
+    /// answers `tpm2_getcap`.
+    fn start(swtpm: &Path, tools: &Path) -> Self {
+        let state = tempfile::tempdir().expect("tempdir");
+        let port = free_port_pair();
+        let child = Command::new(swtpm)
+            .arg("socket")
+            .arg("--tpm2")
+            .arg("--tpmstate")
+            .arg(format!("dir={}", state.path().display()))
+            .arg("--server")
+            .arg(format!("type=tcp,port={port}"))
+            .arg("--ctrl")
+            .arg(format!("type=tcp,port={}", port + 1))
+            // The TPM starts up itself, as a booted host's TPM does.
+            .args(["--flags", "not-need-init,startup-clear"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start swtpm");
+        let mut tpm = Self {
+            child,
+            _state: state,
+            tcti: format!("swtpm:host=localhost,port={port}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = tpm.child.try_wait().expect("wait for swtpm") {
+                panic!("swtpm on port {port} exited before it answered: {status}");
+            }
+            let answered = Command::new(tools.join("tpm2_getcap"))
+                .arg("properties-fixed")
+                .env("TPM2TOOLS_TCTI", &tpm.tcti)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if answered {
+                return tpm;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "swtpm at {} did not answer in 30 s",
+                tpm.tcti
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for OwnTpm {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A free local port whose next port is free too, for the `swtpm` server
+/// and control channels.
+fn free_port_pair() -> u16 {
+    for _ in 0..100 {
+        let first = TcpListener::bind(("127.0.0.1", 0)).expect("bind a local port");
+        let port = first.local_addr().expect("local address").port();
+        if port < u16::MAX && TcpListener::bind(("127.0.0.1", port + 1)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no two free local ports in a row");
+}
+
+/// The TPM for the restart test. It is the TPM that `tcti` names, unless
+/// that TPM has no resource manager and `swtpm` is on `PATH`. Then it is
+/// an `swtpm` of the test's own, so no other test binary flushes its keys.
+fn tpm_for_restarts(tcti: String, tools: &Path) -> (String, Option<OwnTpm>) {
+    if has_resource_manager(&tcti) {
+        return (tcti, None);
+    }
+    let Some(dir) = on_path("swtpm") else {
+        eprintln!(
+            "TPM {tcti} has no resource manager and swtpm is not on PATH. \
+             The test uses {tcti}, and another TPM test that runs at the same time can flush its keys."
+        );
+        return (tcti, None);
+    };
+    let own = OwnTpm::start(&dir.join("swtpm"), tools);
+    eprintln!(
+        "TPM {tcti} has no resource manager, so this test runs on its own swtpm at {}.",
+        own.tcti
+    );
+    (own.tcti.clone(), Some(own))
 }
 
 /// The `bep` log lines that name a key store, so a failure shows where each
@@ -221,6 +341,7 @@ fn bep_keeps_its_tpm_keys_across_restarts() {
     let Some((tcti, tools)) = tpm_lane() else {
         return;
     };
+    let (tcti, _own_tpm) = tpm_for_restarts(tcti, &tools);
     let host = Host::new(&tools, &tcti);
 
     // The first start makes each key in the TPM.
