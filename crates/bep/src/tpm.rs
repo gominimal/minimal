@@ -1059,6 +1059,10 @@ impl HeldKey for TpmKey {
         self.role
     }
 
+    fn store(&self) -> Option<&'static str> {
+        Some("tpm")
+    }
+
     fn public(&self) -> ProxyPublicKey {
         self.public
     }
