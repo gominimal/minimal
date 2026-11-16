@@ -1776,8 +1776,6 @@ mod tests {
         egress.tear_down();
     }
 
-    /// The microVM's relay runtime is built up front and taken down outside
-    /// any runtime, as `main` does after its final flush, without blocking.
     /// Holds the exclusive lock on `path` from another thread, the way a
     /// running daemon does, until the returned sender is dropped or sent to.
     fn hold_lock(path: &std::path::Path) -> std::sync::mpsc::Sender<()> {
@@ -1877,6 +1875,8 @@ mod tests {
         );
     }
 
+    /// The microVM's relay runtime is built up front and taken down outside
+    /// any runtime, as `main` does after its final flush, without blocking.
     #[test]
     fn the_microvm_egress_runtime_is_built_up_front_and_torn_down_cleanly() {
         let egress = GuestEgress::new(true);
