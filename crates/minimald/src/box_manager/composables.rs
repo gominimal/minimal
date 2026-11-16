@@ -567,14 +567,15 @@ pub(crate) fn run_compose(
 /// The spec stored beside the box's workspace, `project_path`: the
 /// [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
 /// directory (BOX-068). `None` when the box stores no spec, or when the
-/// stored spec does not read as a v0 Box Spec: the daemon stores any spec
-/// with a whole `v` (see `spec_bytes`), so a spec of another version
-/// composes from the project as before.
+/// stored spec has a whole `v` that is not [`mfile::spec::BOX_SPEC_VERSION`]:
+/// the daemon stores any spec with a whole `v` (see `spec_bytes`), so a
+/// spec of another version composes from the project as before.
 ///
 /// # Errors
 ///
-/// A stored spec that exists but cannot be read fails the compose, so the
-/// box never runs hooks from a source other than its stored spec.
+/// A stored spec that exists but cannot be read fails the compose. So does
+/// a v0 spec that does not parse, or a spec with no readable `v`. The box
+/// never runs hooks from a source other than its stored spec.
 fn stored_spec_beside(
     project_path: &DaemonAbsPath,
 ) -> Result<Option<mfile::spec::BoxSpec>, std::io::Error> {
@@ -596,13 +597,28 @@ fn stored_spec_beside(
     match serde_json_lenient::from_slice(&bytes) {
         Ok(spec) => Ok(Some(spec)),
         Err(e) => {
-            tracing::warn!(
-                spec_path = %path,
-                error = %e,
-                "the stored box spec does not read as a v0 box spec; \
-                 the project's hooks compose from the project as before"
-            );
-            Ok(None)
+            // Only a spec of another whole version composes as before. A v0
+            // spec that does not parse, or a spec with no readable `v`, fails
+            // the compose: admission stores any spec with a whole `v`, so the
+            // record would show hooks the box does not run.
+            let other_version = serde_json_lenient::from_slice::<serde_json_lenient::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("v").and_then(serde_json_lenient::Value::as_u64))
+                .is_some_and(|v| v != u64::from(mfile::spec::BOX_SPEC_VERSION));
+            if other_version {
+                tracing::warn!(
+                    spec_path = %path,
+                    error = %e,
+                    "the stored box spec has another spec version; \
+                     the project's hooks compose from the project as before"
+                );
+                return Ok(None);
+            }
+            tracing::error!(spec_path = %path, error = %e, "could not parse the stored box spec");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("reading the stored box spec at {path}: {e}"),
+            ))
         }
     }
 }

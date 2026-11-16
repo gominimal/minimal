@@ -7732,6 +7732,43 @@ async fn composes_from_stored_expanded_spec_not_minimal_toml() {
         err.to_string().contains("reading the stored box spec"),
         "{err}"
     );
+    std::fs::remove_dir(root.path().join(boxes::store::SPEC_FILE)).unwrap();
+
+    // A v0 stored spec that does not parse fails the compose too: here a
+    // hook has no `declared_by`. The `from-toml` hook does not compose.
+    let mut bad = serde_json_lenient::to_value(spec_with_declared_hooks()).unwrap();
+    bad["lifecycle_hooks"][0]
+        .as_object_mut()
+        .expect("the stored hook is an object")
+        .remove("declared_by")
+        .expect("the stored hook names its declarer");
+    assert_eq!(bad["v"], serde_json_lenient::json!(0));
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&bad).unwrap(),
+    )
+    .unwrap();
+    let err = run_compose(
+        &daemon,
+        &path,
+        &declared_path(),
+        WireContribution::default(),
+        true,
+    )
+    .expect_err("a v0 stored spec that does not parse fails the compose");
+    assert!(
+        err.to_string().contains("reading the stored box spec"),
+        "{err}"
+    );
+
+    // A stored spec of another whole version composes from the project.
+    bad["v"] = serde_json_lenient::json!(u64::from(mfile::spec::BOX_SPEC_VERSION) + 1);
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&bad).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pending_hooks(), ["from-toml"]);
 }
 
 /// BOX-071, BOX-072, end to end over the golden vectors that
