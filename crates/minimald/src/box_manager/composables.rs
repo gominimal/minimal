@@ -907,11 +907,10 @@ mod tests {
                     decode::AttrValue::String(prefix.to_string(), None),
                 );
             }
-            let mut b = graph::BuildSpec {
-                name: "bad".into(),
-                ..Default::default()
-            };
+            // `BuildSpec` has a private field, so it is built from its default
+            let mut b = graph::BuildSpec::default();
             b.attrs.insert("env_state_wiring".to_string(), entry);
+            b.name = "bad".into();
             b
         };
 
