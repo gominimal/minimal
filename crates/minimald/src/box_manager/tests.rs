@@ -7762,6 +7762,31 @@ async fn composes_from_stored_expanded_spec_not_minimal_toml() {
     )
     .expect_err("a stored hook with no declared_by fails the compose");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+    // A stored file that is not JSON fails the compose.
+    std::fs::write(root.path().join(boxes::store::SPEC_FILE), b"not json").unwrap();
+    let err = run_compose(
+        &daemon,
+        &path,
+        &declared_path(),
+        WireContribution::default(),
+        true,
+    )
+    .expect_err("a stored spec that is not JSON fails the compose");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+    // A stored spec with no hook list has no hooks to compose, so the
+    // project's hooks come from `minimal.toml`.
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        br#"{"v": 1, "io": {"pty_enabled": true}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        pending_hooks(),
+        ["from-toml"],
+        "a stored spec with no hook list leaves the minimal.toml hook"
+    );
 }
 
 /// BOX-071, BOX-072, end to end over the golden vectors that

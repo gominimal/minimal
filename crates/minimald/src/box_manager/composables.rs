@@ -566,13 +566,15 @@ pub(crate) fn run_compose(
 
 /// The spec stored beside the box's workspace, `project_path`: the
 /// [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
-/// directory (BOX-068). `None` when the box stores no spec.
+/// directory (BOX-068). `None` when the box stores no spec, or stores a
+/// spec with no `lifecycle_hooks` list, which has no hooks to compose.
 ///
 /// # Errors
 ///
 /// A stored spec that exists but cannot be read fails the compose, so the
 /// box never runs hooks from a source other than its stored spec. A stored
-/// spec that is not a v0 Box Spec, or has a hook with no valid
+/// spec that is not JSON fails the compose. A spec with a hook list that is
+/// not a v0 Box Spec, or has a hook with no valid
 /// `declared_by`, fails the compose with the `InvalidInput` refusal that a
 /// launch gives for the same spec (`crate::box_runtime::stored_spec`).
 fn stored_spec_beside(
@@ -593,6 +595,19 @@ fn stored_spec_beside(
             ));
         }
     };
+    // A stored spec with no hook list changes nothing here, so only a spec
+    // that carries one must parse as a full Box Spec. Other readers (the
+    // terminal and lifetime lookups) read such a partial spec leniently.
+    let value: serde_json_lenient::Value = serde_json_lenient::from_slice(&bytes).map_err(|e| {
+        tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("The settings it was created with cannot be read: {e}."),
+        )
+    })?;
+    if value.get("lifecycle_hooks").is_none() {
+        return Ok(None);
+    }
     crate::box_runtime::stored_spec(&bytes)
         .inspect_err(|e| {
             tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
