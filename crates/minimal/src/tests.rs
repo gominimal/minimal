@@ -21832,3 +21832,361 @@ async fn exports_not_copied_from_another_project() {
         )
     );
 }
+
+/// The harness host that `global` selects.
+fn selected_host(global: &GlobalArgs) -> LocalHost {
+    local_hosts(global)
+        .unwrap()
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the harness host")
+}
+
+/// The `file_exported` events on the record of box `target`, as
+/// `min box events -o jsonl` prints them.
+async fn file_exported_lines(global: &GlobalArgs, target: &str) -> Vec<serde_json_lenient::Value> {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    box_events_on_hosts(
+        local_hosts(global).unwrap(),
+        &events_args(Some(target), None, false),
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("the events replay");
+    event_lines(&out)
+        .into_iter()
+        .filter(|line| line["type"] == "file_exported")
+        .collect()
+}
+
+/// The sha256 of `bytes`, in lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes))
+}
+
+// BOX-195: the command that waited reports each export it copied or
+// skipped, and the box's record holds one `file_exported` event for each,
+// with its path, whether it was copied, and each file written with its
+// size and sha256.
+#[tokio::test]
+async fn export_report_appends_file_exported_event() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let build = create_spec_box(
+        &mut daemon,
+        "build",
+        project.path(),
+        Some(export_spec(
+            false,
+            &["out/report.txt", "dist", "missing.txt"],
+        )),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        build,
+        &["/workbench/out", "/workbench/dist"],
+        &[
+            ("/workbench/out/report.txt", b"all green"),
+            ("/workbench/dist/app.bin", b"binary"),
+        ],
+    )
+    .await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        &mut Vec::new(),
+        "build",
+        false,
+    )
+    .await
+    .expect("the box stops");
+    cmd::box_wait_on_hosts(
+        local_hosts(&global).unwrap(),
+        "build",
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees the box end");
+
+    let events = file_exported_lines(&global, "build").await;
+    assert_eq!(events.len(), 3, "one event for each export: {events:?}");
+    let data: Vec<_> = events.iter().map(|event| event["data"].clone()).collect();
+    assert_eq!(data[0]["path"], "out/report.txt");
+    assert_eq!(data[0]["copied"], true);
+    assert_eq!(
+        data[0]["files"],
+        serde_json_lenient::json!([{
+            "path": "out/report.txt",
+            "size": 9,
+            "sha256": sha256_hex(b"all green"),
+        }])
+    );
+    assert_eq!(data[1]["path"], "dist");
+    assert_eq!(data[1]["copied"], true);
+    assert_eq!(
+        data[1]["files"],
+        serde_json_lenient::json!([{
+            "path": "dist/app.bin",
+            "size": 6,
+            "sha256": sha256_hex(b"binary"),
+        }])
+    );
+    assert_eq!(data[2]["path"], "missing.txt");
+    assert_eq!(data[2]["copied"], false);
+    assert_eq!(data[2]["files"], serde_json_lenient::json!([]));
+}
+
+// BOX-197: a skipped export leaves the entrypoint's own end on the box's
+// record, so a later `min box wait` returns the same code.
+#[tokio::test]
+async fn skipped_export_leaves_record_exit_code() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let build = create_spec_box(
+        &mut daemon,
+        "build",
+        project.path(),
+        Some(export_spec(false, &["missing.txt"])),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        &mut Vec::new(),
+        "build",
+        false,
+    )
+    .await
+    .expect("the box stops");
+    let host = selected_host(&global);
+    let before = shown_record(&host, build).await;
+
+    let wait = async || {
+        cmd::box_wait_on_hosts(
+            local_hosts(&global).unwrap(),
+            "build",
+            Some(&here),
+            None,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("the wait sees the box end")
+    };
+    let first = wait().await;
+    let events = file_exported_lines(&global, "build").await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["data"]["copied"], false, "the export is skipped");
+
+    let after = shown_record(&host, build).await;
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.exit_code, before.exit_code);
+    assert_eq!(after.signal, before.signal);
+    assert_eq!(wait().await, first, "a later wait returns the same code");
+}
+
+/// A reporter whose every report fails, as a lost connection fails it.
+struct LostReport(usize);
+
+impl cmd::ExportReporter for LostReport {
+    async fn report(&mut self, _outcome: &cmd::ExportOutcome) -> Result<(), String> {
+        self.0 += 1;
+        Err("the connection ended".to_owned())
+    }
+}
+
+// BOX-200, BOX-202: a report that fails is named on stderr, and the export
+// keeps the outcome it had, so the exit code does not change. The copy then
+// stops, and renames no further file into place.
+#[tokio::test]
+async fn lost_export_report_named_exit_unchanged() {
+    let source = || {
+        ExportBox::default()
+            .file("/workbench/a.txt", b"first")
+            .file("/workbench/b.txt", b"second")
+    };
+    let paths = ["a.txt".to_owned(), "b.txt".to_owned()];
+
+    let reported = tempfile::tempdir().expect("a temp project dir");
+    let mut err = Vec::new();
+    let expected = cmd::copy_exports(&mut source(), &paths, reported.path(), "web", &mut err).await;
+
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    let mut err = Vec::new();
+    let mut reporter = LostReport(0);
+    let outcomes =
+        cmd::copy_and_report_exports(&mut source(), &paths, root, "web", &mut err, &mut reporter)
+            .await;
+
+    assert_eq!(reporter.0, 1, "the copy stops after the first lost report");
+    assert_eq!(
+        outcomes,
+        expected[..1],
+        "the export keeps its outcome, so the exit code is the same"
+    );
+    assert!(outcomes[0].copied);
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"first");
+    assert!(
+        !root.join("b.txt").exists(),
+        "no file after the lost report"
+    );
+    assert!(hidden_names(root).is_empty(), "no temporary file is left");
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        format!(
+            "{}\n{}\n",
+            cmd::report_lost_line("a.txt", "web"),
+            cmd::copy_stopped_line("b.txt", "web")
+        )
+    );
+    assert_eq!(
+        cmd::report_lost_line("a.txt", "web"),
+        "min could not confirm that the record of box web holds an entry for export `a.txt`."
+    );
+    assert_eq!(
+        cmd::copy_stopped_line("b.txt", "web"),
+        "min did not copy `b.txt` from box web, because min could not confirm an earlier \
+         export with the box's host. Run `min box wait web` in this project to copy it."
+    );
+}
+
+// BOX-198, BOX-201, BOX-202: two commands wait on one end of a box. Each
+// export is copied once: the second command names each export that the
+// first one holds or reported, copies none of them, and its exit code does
+// not change. When the first command's connection ends before it reports
+// an export, the next wait copies that export.
+#[tokio::test]
+async fn refused_export_claim_copies_nothing() {
+    use minimald_rpc::{ClaimExports, ClaimExportsRequest, Errorable};
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    let mut daemon = server.connect().await;
+    let build = create_spec_box(
+        &mut daemon,
+        "build",
+        root,
+        Some(export_spec(false, &["out/report.txt", "notes.txt"])),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        build,
+        &["/workbench/out"],
+        &[
+            ("/workbench/out/report.txt", b"all green"),
+            ("/workbench/notes.txt", b"notes"),
+        ],
+    )
+    .await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        &mut Vec::new(),
+        "build",
+        false,
+    )
+    .await
+    .expect("the box stops");
+
+    // A first command holds the claim on the report, and is killed before
+    // it reports it.
+    let mut killed = server.connect().await;
+    match killed
+        .call::<ClaimExports>(&ClaimExportsRequest {
+            id: build,
+            paths: vec!["out/report.txt".to_owned()],
+        })
+        .await
+    {
+        Errorable::Ok(claim) => assert_eq!(claim.granted, ["out/report.txt"]),
+        Errorable::Err { error } => panic!("the claim failed: {error}"),
+    }
+
+    let host = selected_host(&global);
+    let copy = async |err: &mut Vec<u8>| {
+        let mut client = box_host_client(&host).await.expect("a client");
+        cmd::copy_box_exports(&mut client, build, "build", Some(root), Some(root), err).await
+    };
+    let mut err = Vec::new();
+    let outcomes = copy(&mut err).await;
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        format!(
+            "{}\n",
+            cmd::claimed_elsewhere_line("out/report.txt", "build")
+        )
+    );
+    assert_eq!(
+        cmd::claimed_elsewhere_line("out/report.txt", "build"),
+        "min did not copy `out/report.txt` from box build, because another min command \
+         copied it or is copying it."
+    );
+    assert_eq!(outcomes.len(), 1, "a refused export has no outcome");
+    assert_eq!(outcomes[0].path, "notes.txt");
+    assert!(outcomes[0].copied);
+    assert!(
+        !root.join("out").exists(),
+        "the refused export writes nothing"
+    );
+    assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(), b"notes");
+
+    // A second wait on the same end copies nothing again.
+    std::fs::write(root.join("notes.txt"), b"edited here").unwrap();
+    let mut err = Vec::new();
+    assert!(copy(&mut err).await.is_empty());
+    assert_eq!(
+        std::fs::read(root.join("notes.txt")).unwrap(),
+        b"edited here",
+        "a reported export is not copied twice"
+    );
+    assert!(!root.join("out").exists());
+
+    // The killed command's connection ends, and the next wait copies the
+    // export it never reported.
+    drop(killed);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let outcomes = loop {
+        let mut err = Vec::new();
+        let outcomes = copy(&mut err).await;
+        if !outcomes.is_empty() || tokio::time::Instant::now() > deadline {
+            break outcomes;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0].path, "out/report.txt");
+    assert_eq!(
+        std::fs::read(root.join("out/report.txt")).unwrap(),
+        b"all green"
+    );
+    assert_eq!(
+        std::fs::read(root.join("notes.txt")).unwrap(),
+        b"edited here"
+    );
+    let events = file_exported_lines(&global, "build").await;
+    let paths: Vec<_> = events
+        .iter()
+        .map(|event| event["data"]["path"].clone())
+        .collect();
+    assert_eq!(
+        paths,
+        ["notes.txt", "out/report.txt"],
+        "one event for each export"
+    );
+}

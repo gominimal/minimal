@@ -7,6 +7,10 @@
 //! A folder export creates each folder of the tree, empty ones too, and
 //! deletes nothing in the project (BOX-187). Each file goes to a temporary
 //! name beside its destination and is then renamed into place (BOX-188).
+//!
+//! The copy claims the exports of the box's end from the box's host first,
+//! and copies only those the host grants (BOX-198). It reports each export
+//! it finishes, and the host records a `file_exported` event (BOX-195).
 
 use super::*;
 
@@ -378,10 +382,29 @@ async fn write_file_atomically<S: ExportSource>(
     Ok((bytes, sha256))
 }
 
+/// Where a copy sends how each export went (BOX-195).
+pub(crate) trait ExportReporter {
+    /// Reports `outcome`. `Err` holds the reason, for the log.
+    async fn report(&mut self, outcome: &ExportOutcome) -> Result<(), String>;
+}
+
+/// A reporter that tells no one, for a copy that claimed nothing.
+#[cfg(test)]
+pub(crate) struct NoReport;
+
+#[cfg(test)]
+impl ExportReporter for NoReport {
+    async fn report(&mut self, _outcome: &ExportOutcome) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Copies each export in `paths` from `source` to the same path under
 /// `project_root`, and returns how each one went. A skipped or failed
 /// export gets one line on `err` that names its path, and the copy goes on
-/// with the next export. `label` names the box in those lines.
+/// with the next export. `label` names the box in those lines. It
+/// reports nothing.
+#[cfg(test)]
 pub(crate) async fn copy_exports<S, E>(
     source: &mut S,
     paths: &[String],
@@ -393,8 +416,31 @@ where
     S: ExportSource,
     E: std::io::Write,
 {
+    copy_and_report_exports(source, paths, project_root, label, err, &mut NoReport).await
+}
+
+/// [`copy_exports`], with each export reported to `reporter` as soon as it
+/// is done (BOX-195). A report that fails gets one line on `err` that
+/// names the export (BOX-200), and the export keeps its outcome. The copy
+/// then stops, because the command cannot tell a lost report from a lost
+/// connection, and a lost connection releases the claim on each export
+/// not yet reported (BOX-202). Each export not copied for this reason gets
+/// one line on `err`, and no outcome.
+pub(crate) async fn copy_and_report_exports<S, E, R>(
+    source: &mut S,
+    paths: &[String],
+    project_root: &std::path::Path,
+    label: &str,
+    err: &mut E,
+    reporter: &mut R,
+) -> Vec<ExportOutcome>
+where
+    S: ExportSource,
+    E: std::io::Write,
+    R: ExportReporter,
+{
     let mut outcomes = Vec::with_capacity(paths.len());
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
         let mut outcome = ExportOutcome {
             path: path.clone(),
             copied: false,
@@ -414,9 +460,50 @@ where
             files = outcome.files.len(),
             "file export"
         );
+        let reported = reporter.report(&outcome).await;
         outcomes.push(outcome);
+        if let Err(reason) = reported {
+            tracing::warn!(
+                box_label = label,
+                export = %path,
+                "file export: the report to the box's host failed, so the copy stops: {reason}"
+            );
+            let _ = writeln!(err, "{}", report_lost_line(path, label));
+            for rest in paths.iter().skip(index + 1) {
+                let _ = writeln!(err, "{}", copy_stopped_line(rest, label));
+            }
+            break;
+        }
     }
     outcomes
+}
+
+/// The stderr line for an export whose report the box's host did not
+/// confirm (BOX-200).
+pub(crate) fn report_lost_line(path: &str, label: &str) -> String {
+    format!(
+        "min could not confirm that the record of box {label} holds an entry for export `{path}`."
+    )
+}
+
+/// The stderr line for an export that a copy did not reach, because an
+/// earlier report failed (BOX-202). The command's connection ends when it
+/// exits, and that releases the export for the next wait.
+pub(crate) fn copy_stopped_line(path: &str, label: &str) -> String {
+    format!(
+        "min did not copy `{path}` from box {label}, because min could not confirm an \
+         earlier export with the box's host. Run `min box wait {label}` in this project \
+         to copy it."
+    )
+}
+
+/// The stderr line for an export that another command claimed for this
+/// end of the box (BOX-201).
+pub(crate) fn claimed_elsewhere_line(path: &str, label: &str) -> String {
+    format!(
+        "min did not copy `{path}` from box {label}, because another min command copied \
+         it or is copying it."
+    )
 }
 
 /// Why an export was not copied, as its stderr line says it.
@@ -752,14 +839,14 @@ pub(crate) fn exports_elsewhere_line(label: &str, project_root: &std::path::Path
 
 /// [`copy_box_exports_on_host`] over a connected `client`.
 ///
-/// Interim: this copies again on each call, and its callers do not use the
-/// outcomes yet. No claim stops a later command from copying an export
-/// whose result the record holds (BOX-198, gominimal/minimal#3446). No
-/// `file_exported` event goes to the record (BOX-195,
-/// gominimal/minimal#3446). A skipped export does not turn a 0 end into
-/// exit 125 (BOX-193, gominimal/minimal#3445). This changes when those
-/// requirements land: the claim gates this call, and the outcomes become
-/// the report and the code.
+/// The copy first claims the exports of the box's end from its host
+/// (BOX-198). It copies only the exports the host grants, and names each
+/// refused one on `err` (BOX-201). A refused export has no outcome, so it
+/// changes no exit code. Each copied or skipped export is reported to the
+/// host, which records a `file_exported` event for it (BOX-195).
+///
+/// Interim: the callers do not use the outcomes yet. A skipped export
+/// does not turn a 0 end into exit 125 (BOX-193, gominimal/minimal#3445).
 pub(crate) async fn copy_box_exports<E: std::io::Write>(
     client: &mut client::Client,
     id: boxes::SessionId,
@@ -790,8 +877,8 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
     if paths.is_empty() {
         return Vec::new();
     }
-    let none_copied = || {
-        paths
+    let none_copied = |which: &[String]| {
+        which
             .iter()
             .map(|path| ExportOutcome {
                 path: path.clone(),
@@ -800,18 +887,18 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
             })
             .collect::<Vec<_>>()
     };
-    let not_copied = |err: &mut E, reason: &str| {
-        for path in &paths {
+    let not_copied = |err: &mut E, which: &[String], reason: &str| {
+        for path in which {
             let _ = writeln!(
                 err,
                 "min did not copy `{path}` from box {label}, because {reason}."
             );
         }
-        none_copied()
+        none_copied(which)
     };
     let Some(project_root) = project_root else {
         tracing::warn!(box_id = %id, "file exports: the box's record names no project folder");
-        return not_copied(err, "the box's record names no project folder");
+        return not_copied(err, &paths, "the box's record names no project folder");
     };
     // BOX-199: a box's exports are copied only in the project that made it.
     if here != Some(project_root) {
@@ -822,22 +909,108 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
             "file exports: the waiting command is in another project"
         );
         let _ = writeln!(err, "{}", exports_elsewhere_line(label, project_root));
-        return none_copied();
+        return none_copied(&paths);
+    }
+    // BOX-198: the claim comes after the project check of BOX-199, so a
+    // command in another project never claims the end.
+    let claim = match claim_exports(client, id, &paths).await {
+        Ok(claim) => claim,
+        Err(reason) => return not_copied(err, &paths, &reason),
+    };
+    for path in &claim.refused {
+        let _ = writeln!(err, "{}", claimed_elsewhere_line(path, label));
+    }
+    let (end, granted) = (claim.end, claim.granted);
+    if granted.is_empty() {
+        return Vec::new();
     }
     let channel = match client.open_box_subsystem(id, "sftp").await {
         Ok(channel) => channel,
         Err(e) => {
             tracing::warn!(box_id = %id, "file exports: open the box's files: {e:#}");
-            return not_copied(err, "min could not read the box's files");
+            return not_copied(err, &granted, "min could not read the box's files");
         }
     };
     let sftp = match russh_sftp::client::SftpSession::new(channel.into_stream()).await {
         Ok(sftp) => sftp,
         Err(e) => {
             tracing::warn!(box_id = %id, "file exports: start the file conversation: {e}");
-            return not_copied(err, "min could not read the box's files");
+            return not_copied(err, &granted, "min could not read the box's files");
         }
     };
     let mut files = BoxFiles { sftp };
-    copy_exports(&mut files, &paths, project_root, label, err).await
+    let mut reporter = HostReport { client, id, end };
+    copy_and_report_exports(
+        &mut files,
+        &granted,
+        project_root,
+        label,
+        err,
+        &mut reporter,
+    )
+    .await
+}
+
+/// Claims the exports `paths` of the last end of box `id` from its host
+/// (BOX-198). `Ok` is the end with the granted and the refused paths.
+/// `Err` is the reason for the stderr line when the host grants nothing.
+async fn claim_exports(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+    paths: &[String],
+) -> Result<minimald_rpc::ClaimExportsResponse, String> {
+    use minimald_rpc::{ClaimExports, ClaimExportsRequest, Errorable};
+
+    match client
+        .oneshot_rpc::<ClaimExports>(ClaimExportsRequest {
+            id,
+            paths: paths.to_vec(),
+        })
+        .await
+    {
+        Ok(Errorable::Ok(reply)) => Ok(reply),
+        Ok(Errorable::Err { error }) => {
+            tracing::info!(box_id = %id, "file exports: the claim was refused: {error}");
+            Err(error)
+        }
+        Err(e) => {
+            tracing::warn!(box_id = %id, "file exports: the claim did not reach the host: {e:#}");
+            Err("min could not reach the box's host".to_owned())
+        }
+    }
+}
+
+/// Reports each export to the box's host over the connection that holds
+/// its claim (BOX-195).
+struct HostReport<'a> {
+    client: &'a mut client::Client,
+    id: boxes::SessionId,
+    end: u64,
+}
+
+impl ExportReporter for HostReport<'_> {
+    async fn report(&mut self, outcome: &ExportOutcome) -> Result<(), String> {
+        use minimald_rpc::{Errorable, ExportedFileReport, ReportExport, ReportExportRequest};
+
+        let request = ReportExportRequest {
+            id: self.id,
+            end: self.end,
+            path: outcome.path.clone(),
+            copied: outcome.copied,
+            files: outcome
+                .files
+                .iter()
+                .map(|file| ExportedFileReport {
+                    path: file.path.clone(),
+                    size: file.size,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+        };
+        match self.client.oneshot_rpc::<ReportExport>(request).await {
+            Ok(Errorable::Ok(_)) => Ok(()),
+            Ok(Errorable::Err { error }) => Err(error),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
 }
