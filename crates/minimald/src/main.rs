@@ -475,8 +475,8 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
     use std::time::{Duration, Instant};
 
     // The child may first wait out a departing daemon's lock
-    // (`DEPARTING_DAEMON_WAIT`) before its own startup.
-    const DETACH_TIMEOUT_SECS: u64 = 8 + DEPARTING_DAEMON_WAIT.as_secs();
+    // (`SHUTDOWN_DEPARTURE_WAIT`) before its own startup.
+    const DETACH_TIMEOUT_SECS: u64 = 8 + minimald_rpc::SHUTDOWN_DEPARTURE_WAIT.as_secs();
 
     let exe = std::env::current_exe().map_err(|e| MainError::IO(e, "resolving current exe"))?;
     let args: Vec<String> = std::env::args()
@@ -540,16 +540,6 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
-
-/// How long a starting daemon waits for a departing one to release the
-/// instance lock: the departing daemon's connection drain, which it holds the
-/// lock through after it stopped listening, and a margin for its exit.
-const DEPARTING_DAEMON_WAIT: std::time::Duration =
-    minimald::server::SHUTDOWN_GRACE.saturating_add(std::time::Duration::from_secs(1));
-const _: () = assert!(
-    DEPARTING_DAEMON_WAIT.as_millis() > minimald::server::SHUTDOWN_GRACE.as_millis(),
-    "the lock wait must cover the departing daemon's drain"
-);
 
 /// Wait, bounded by `wait`, while the instance lock at `lock_path` is held by
 /// a daemon on its way out: one whose socket at `sock_path` refuses a
@@ -1169,7 +1159,9 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         wait_for_departing_daemon(
             instance_lock_path.as_utf8_path().as_std_path(),
             std::path::Path::new(sock.as_utf8_path().as_str()),
-            DEPARTING_DAEMON_WAIT,
+            // The departing daemon's drain, which it holds the lock
+            // through, and a margin for its exit.
+            minimald_rpc::SHUTDOWN_DEPARTURE_WAIT,
         )
         .await
         .map_err(|e| MainError::IO(e, "probing instance lock"))?;

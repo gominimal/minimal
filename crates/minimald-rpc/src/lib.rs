@@ -3408,6 +3408,13 @@ pub struct Shutdown;
 /// ends, so a client waiting for the socket to refuse needs this long.
 pub const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long to wait for a daemon that answered [`ShutdownResponse::ShuttingDown`]
+/// to be gone: its drain ([`SHUTDOWN_DRAIN_GRACE`]) and a margin for its exit.
+/// A client waits this long for the daemon's socket to refuse, and a starting
+/// daemon this long for the departing one to release the instance lock.
+pub const SHUTDOWN_DEPARTURE_WAIT: std::time::Duration =
+    SHUTDOWN_DRAIN_GRACE.saturating_add(std::time::Duration::from_secs(1));
+
 /// The request for a [`Shutdown`] RPC.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShutdownRequest {
