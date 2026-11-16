@@ -73,7 +73,7 @@ pub const ANSWERER_PORT: u16 = 7656;
 
 /// The `component` field every answerer log line carries, matching the
 /// proxies' `dns-proxy` convention.
-const COMPONENT: &str = "zone-answerer";
+pub(crate) const COMPONENT: &str = "zone-answerer";
 
 /// Largest datagram the answerer reads: a DNS query fits far below this
 /// (queries are tens of bytes), and a larger datagram is dropped rather than
@@ -1534,6 +1534,15 @@ async fn recheck_live_carve_outs(
     facts: &HolderFacts,
     said: &mut Option<String>,
 ) {
+    // A test's stand-in for the table probe's seconds, which no test host
+    // that cannot decide per box would otherwise pay.
+    #[cfg(test)]
+    {
+        let stall = RECHECK_STALL.with(std::cell::Cell::get);
+        if !stall.is_zero() {
+            tokio::time::sleep(stall).await;
+        }
+    }
     // Only a host that decides a host-address box's verdict per box has
     // boxes whose carve-out is a fact the table enforces; on any other host
     // there is nothing to re-check and nothing a bind change could break.
@@ -1558,6 +1567,14 @@ async fn recheck_live_carve_outs(
     .await
     .unwrap_or_default();
     recheck_live_carve_outs_against(manager, recorded, live, facts, said).await;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How long [`recheck_live_carve_outs`] stalls on this thread before it
+    /// runs: zero but on an acquisition a test drives with a stall.
+    static RECHECK_STALL: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 /// [`recheck_live_carve_outs`] over a recorded half the caller names — the
@@ -1779,29 +1796,37 @@ async fn acquire_at(
                 .await;
                 // The publish just landed over the channel: the service is
                 // live, so its bind (when the unit names one) is its own.
-                recheck_live_carve_outs(
-                    &manager,
-                    service_bind,
-                    &HolderFacts {
-                        interim: None,
-                        service: service_bind,
-                    },
-                    &mut carve_out_said,
-                )
-                .await;
-                if !hold_the_publish(
-                    &registry,
-                    &mut commands,
-                    published.registration,
-                    published.carried,
-                    published.generation,
-                    &status,
-                    &node,
-                    &mut erroring,
-                    &shutdown,
-                )
-                .await
-                {
+                // The re-check runs beside the held publish, never before
+                // it: on a host that decides per box it probes the table,
+                // which takes seconds, and a name change registered while
+                // the first publish was in flight waits for the held
+                // publish's ack. Run first, the probe outlasted that wait's
+                // bound, and an activate right after a daemon start
+                // returned before its name answered.
+                let holder_facts = HolderFacts {
+                    interim: None,
+                    service: service_bind,
+                };
+                let (held, ()) = tokio::join!(
+                    hold_the_publish(
+                        &registry,
+                        &mut commands,
+                        published.registration,
+                        published.carried,
+                        published.generation,
+                        &status,
+                        &node,
+                        &mut erroring,
+                        &shutdown,
+                    ),
+                    recheck_live_carve_outs(
+                        &manager,
+                        service_bind,
+                        &holder_facts,
+                        &mut carve_out_said,
+                    ),
+                );
+                if !held {
                     // The connection's end is the whole withdrawal: the
                     // cell this publish fed clears with it.
                     crate::net::classifier::clear_live_answerer();
@@ -3149,9 +3174,33 @@ mod tests {
         shutdown: CancellationToken,
         buf: CaptureWriter,
     ) -> std::thread::JoinHandle<()> {
+        drive_stalled(
+            state,
+            hook_port,
+            status,
+            paths,
+            shutdown,
+            buf,
+            Duration::ZERO,
+        )
+    }
+
+    /// [`drive`] with every carve-out re-check on the acquisition's thread
+    /// stalled by `stall` first, the time a host that decides per box spends
+    /// probing its table.
+    fn drive_stalled(
+        state: crate::server::ServerStateHandle,
+        hook_port: u16,
+        status: AnswererStatus,
+        paths: AnswererPaths,
+        shutdown: CancellationToken,
+        buf: CaptureWriter,
+        stall: Duration,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
             .name("the acquisition".to_string())
             .spawn(move || {
+                super::RECHECK_STALL.with(|cell| cell.set(stall));
                 let subscriber = tracing_subscriber::fmt()
                     .with_writer(buf)
                     .with_ansi(false)
@@ -4345,6 +4394,22 @@ mod tests {
         AnswererStatus,
         tempfile::TempDir,
     ) {
+        drive_gated_stalled(server, gate, Duration::ZERO).await
+    }
+
+    /// [`drive_gated`] with the acquisition's carve-out re-checks stalled
+    /// by `stall` ([`drive_stalled`]).
+    async fn drive_gated_stalled(
+        server: &crate::test_harness::TestServer,
+        gate: Arc<tokio::sync::Notify>,
+        stall: Duration,
+    ) -> (
+        FakeServiceHandle,
+        std::thread::JoinHandle<()>,
+        CancellationToken,
+        AnswererStatus,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
         let channel = dir.path().join("answerer.sock");
         let marker = dir.path().join("minzoned.socket");
@@ -4357,7 +4422,7 @@ mod tests {
         );
         let status = AnswererStatus::starting();
         let shutdown = CancellationToken::new();
-        let task = drive(
+        let task = drive_stalled(
             server.state.clone(),
             free_udp_port(),
             status.clone(),
@@ -4368,6 +4433,7 @@ mod tests {
             },
             shutdown.clone(),
             CaptureWriter::default(),
+            stall,
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while service.publishes().is_empty() {
@@ -4419,6 +4485,42 @@ mod tests {
         assert!(
             took < PORT_RECHECK,
             "the row waited for the recheck: {took:?}"
+        );
+
+        service.stop();
+        end(task, &shutdown);
+    }
+
+    /// NET-011: a box registered while the daemon's first publish is in
+    /// flight is acknowledged inside the activate's wait, even when the
+    /// carve-out re-check after that publish takes longer than the wait. The
+    /// re-check runs beside the held publish, so the held publish sends the
+    /// row while the re-check still runs. Run before it, the re-check kept
+    /// the row from the answerer past the wait's bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_carve_out_recheck_does_not_hold_back_a_new_name() {
+        // Longer than the 2 s the activate waits (`NAME_CHANGE_BOUND`).
+        let stall = Duration::from_secs(3);
+        let server = crate::test_harness::TestServer::new().await;
+        let registry = server.state.sessions_manager().await.hostnames();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (service, task, shutdown, _status, _dir) =
+            drive_gated_stalled(&server, Arc::clone(&gate), stall).await;
+
+        let waiter = {
+            let mut reg = registry.write().expect("the registry lock is held");
+            reg.register_host_net(SessionId::nil(), "web");
+            reg.zone_change_waiter()
+        };
+        gate.notify_one();
+        assert!(
+            waiter.wait(Duration::from_secs(2)).await,
+            "the box's registration was not acknowledged inside the activate's wait"
+        );
+        assert_eq!(
+            service.answer("web.min.internal"),
+            Some(Some(Ipv4Addr::LOCALHOST)),
+            "the box's name answers at the installed answerer when the wait returns"
         );
 
         service.stop();
