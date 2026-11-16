@@ -108,6 +108,11 @@ async fn serve_get_version(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
                 version: version::VERSION.to_string(),
                 long_version: version::LONG_VERSION.to_string(),
                 stdlib_version: stdlib::VERSION.to_string(),
+                // BOX-074: the expansion this daemon applies.
+                expander_version: Some(minimald_rpc::expander_version(
+                    mfile::spec::BOX_SPEC_VERSION,
+                    mfile::projection::PROJECTION_VERSION,
+                )),
             })
         })
         .await

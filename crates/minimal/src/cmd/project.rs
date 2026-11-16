@@ -269,6 +269,9 @@ async fn upload_workspace(
     root: &camino::Utf8Path,
     progress: UploadProgress,
 ) -> Result<WorkspaceUpload, anyhow::Error> {
+    if let (UploadProgress::Bar, Some(notice)) = (progress, linked_worktree_notice(root)) {
+        eprintln!("{notice}");
+    }
     let result = match progress {
         UploadProgress::Bar => client.upload_workspace_files(id, root.as_std_path()).await,
         UploadProgress::Quiet => {
@@ -280,6 +283,37 @@ async fn upload_workspace(
     result
         .map(|()| WorkspaceUpload::Uploaded)
         .context("Failed to upload project files")
+}
+
+/// The notice that the project is a linked git worktree, whose `.git` file
+/// names a host path the box cannot reach: the upload leaves it out, so the
+/// box holds the files and no repository (gominimal/inbox#854). `None` for a
+/// plain checkout or a directory with no `.git`.
+pub(crate) fn linked_worktree_notice(root: &camino::Utf8Path) -> Option<String> {
+    let gitdir = file_upload::linked_worktree_gitdir(root.as_std_path())?;
+    // the pointer is a cloned repository's text: a control byte in it (an
+    // escape sequence) would reach the terminal as it is
+    let gitdir = printable(&gitdir);
+    Some(format!(
+        "{root}'s .git file points at {gitdir}, outside the project (a linked git worktree, \
+         or a submodule checked out on its own), which the box cannot reach, so the upload \
+         leaves it out; the files are in /workbench, and git there sees no repository"
+    ))
+}
+
+/// `s` with every control character shown as its escape (`\u{1b}`, `\n`),
+/// so text read from a repository prints as text and never as a terminal
+/// command.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The notice that the upload root resolved above the invocation directory —
@@ -516,8 +550,9 @@ impl InitOutcome {
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
 /// missing-mfile prompt.
 ///
-/// The file is always written in the entry shape (BCLI-017): the
-/// initializer's legacy `[session]` shape goes through [`to_entry_shape`].
+/// The file is always written in the entry shape (BCLI-017):
+/// [`to_entry_shape`] adds the `[boxes.dev]` session entry to the
+/// initializer's `[defaults.task]` and `[defaults.session]`.
 pub(crate) fn run_init_flow(
     config: mctx::Config,
     skip_confirm: bool,
@@ -720,10 +755,12 @@ fn check_entry_name(entry: &str) -> Result<(), InitRefusal> {
 }
 
 /// Rewrite the scaffold that the project initializer generates into the
-/// entry shape (BCLI-017): the legacy `[session]` table becomes
-/// `[defaults.session]`, the legacy `[defaults] state_key` becomes
-/// `[defaults.task] state_key` (BOX-050, BOX-051), and the file declares
-/// one session entry, `[boxes.dev]`.
+/// entry shape (BCLI-017): the file declares one session entry,
+/// `[boxes.dev]`. The initializer writes `[defaults.task]` and
+/// `[defaults.session]`, and those are kept as they are. A legacy
+/// `[session]` table still becomes `[defaults.session]`, and a legacy
+/// `[defaults] state_key` becomes `[defaults.task] state_key` (BOX-050,
+/// BOX-051).
 pub(crate) fn to_entry_shape(legacy: &str) -> Result<String, anyhow::Error> {
     use toml_edit::{DocumentMut, Item, Table, value};
     let mut doc: DocumentMut = legacy
@@ -1239,18 +1276,64 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
 }
 
 #[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    /// A `.git` pointer is a cloned repository's text: an escape sequence in
+    /// it is printed as its escape, and a plain path as it is. The notice
+    /// says the same for a worktree's absolute pointer and a submodule's
+    /// relative one, since the upload leaves both out by the one test.
+    #[test]
+    fn the_notice_prints_a_pointer_as_text_and_names_the_file_for_both_shapes() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf-8");
+        assert_eq!(
+            linked_worktree_notice(root),
+            None,
+            "no .git file, no notice"
+        );
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /home/me/repo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        let n = linked_worktree_notice(root).expect("a worktree's pointer");
+        assert!(
+            n.contains("points at /home/me/repo/.git/worktrees/x, outside the project"),
+            "{n}"
+        );
+        std::fs::write(dir.path().join(".git"), "gitdir: ../.git/modules/x\n").unwrap();
+        let n = linked_worktree_notice(root).expect("a submodule's pointer");
+        assert!(
+            n.contains("points at ../.git/modules/x, outside the project"),
+            "{n}"
+        );
+        std::fs::write(dir.path().join(".git"), "gitdir: /x\u{1b}]0;owned\u{7}\n").unwrap();
+        let n = linked_worktree_notice(root).expect("a pointer with an escape in it");
+        assert!(n.contains("/x\\u{1b}]0;owned\\u{7},"), "{n}");
+        assert!(!n.contains('\u{1b}'), "{n}");
+        std::fs::write(dir.path().join(".git"), "not a pointer\n").unwrap();
+        assert_eq!(
+            linked_worktree_notice(root),
+            None,
+            "no pointer, nothing left out, no notice"
+        );
+    }
+}
+
+#[cfg(test)]
 mod init_tests {
     use super::*;
 
-    /// The scaffold the project initializer writes today, in the legacy
-    /// shape (`op::project::init::generate_mfile`).
-    const LEGACY_SCAFFOLD: &str = "# Generated by `min init`\n\n\
+    /// The scaffold the project initializer writes today
+    /// (`op::project::init::generate_mfile`).
+    const INIT_SCAFFOLD: &str = "# Generated by `min init`\n\n\
         [upstream] # Source of software & tooling\n\
         repo = \"https://github.com/gominimal/pkgs\"\n\
         locked_commit = \"abc123\"\n\n\
-        [defaults]\n\
+        [defaults.task]\n\
         state_key = \"dev\"\n\n\
-        [session] # min session attach\n\
+        [defaults.session] # min session attach\n\
         packages = [\"base\", \"vim\", \"git\"]\n";
 
     fn init_args(argv: &[&str]) -> InitArgs {
@@ -1291,7 +1374,7 @@ mod init_tests {
             init_request(&init_args(&["init"])),
             Ok(InitRequest::Scaffold)
         );
-        let shaped = to_entry_shape(LEGACY_SCAFFOLD).expect("the scaffold converts");
+        let shaped = to_entry_shape(INIT_SCAFFOLD).expect("the scaffold converts");
         let doc: toml::Table = shaped.parse().expect("the scaffold parses");
         assert!(
             doc.get("session").is_none(),
@@ -1326,7 +1409,7 @@ mod init_tests {
     // BCLI-018
     #[test]
     fn init_entry_type_appends_one() {
-        let dir = project(&to_entry_shape(LEGACY_SCAFFOLD).unwrap());
+        let dir = project(&to_entry_shape(INIT_SCAFFOLD).unwrap());
         let before: toml::Table = read(&dir).parse().unwrap();
         run(&dir, &["init", "build", "--type", "task"]).expect("the entry is appended");
         let after_text = read(&dir);
@@ -1409,8 +1492,8 @@ mod init_tests {
     #[test]
     fn init_noun_flag_is_type_alias() {
         for noun in ["session", "task"] {
-            let by_flag = project(LEGACY_SCAFFOLD);
-            let by_type = project(LEGACY_SCAFFOLD);
+            let by_flag = project(INIT_SCAFFOLD);
+            let by_type = project(INIT_SCAFFOLD);
             let flag = format!("--{noun}");
             run(&by_flag, &["init", flag.as_str(), "web"]).expect("appended by flag");
             run(&by_type, &["init", "web", "--type", noun]).expect("appended by type");
@@ -1436,7 +1519,7 @@ mod init_tests {
     #[test]
     fn init_entry_name_invalid_exit3_appends_nothing() {
         let long = "a".repeat(64);
-        let dir = project(LEGACY_SCAFFOLD);
+        let dir = project(INIT_SCAFFOLD);
         let empty = tempfile::tempdir().expect("a temp dir");
         for name in ["self", "My_Box", "-dev", long.as_str(), ""] {
             let task_flag = format!("--task={name}");
@@ -1451,11 +1534,7 @@ mod init_tests {
                     "{argv:?}: names the value: {}",
                     refusal.message
                 );
-                assert_eq!(
-                    read(&dir),
-                    LEGACY_SCAFFOLD,
-                    "{argv:?}: the file is unchanged"
-                );
+                assert_eq!(read(&dir), INIT_SCAFFOLD, "{argv:?}: the file is unchanged");
                 // No minimal.toml: the name is refused before the file is looked for.
                 assert_eq!(run(&empty, &argv).unwrap_err().code, 3, "{argv:?}");
             }
@@ -1474,7 +1553,7 @@ mod init_tests {
     // BCLI-018
     #[test]
     fn init_noun_flags_exclusive_exit2_appends_nothing() {
-        let dir = project(LEGACY_SCAFFOLD);
+        let dir = project(INIT_SCAFFOLD);
         for argv in [
             &["init", "--session", "a", "--task", "b"][..],
             &["init", "--agent", "a", "--service", "b"],
@@ -1501,11 +1580,7 @@ mod init_tests {
                 },
                 "{argv:?}"
             );
-            assert_eq!(
-                read(&dir),
-                LEGACY_SCAFFOLD,
-                "{argv:?}: the file is unchanged"
-            );
+            assert_eq!(read(&dir), INIT_SCAFFOLD, "{argv:?}: the file is unchanged");
         }
         assert_eq!(
             INIT_ONE_TYPE_FLAG,
@@ -1523,7 +1598,7 @@ mod init_tests {
     // BCLI-018: the append finds minimal.toml the way the other commands do.
     #[test]
     fn init_entry_type_appends_from_subdirectory() {
-        let root = project(LEGACY_SCAFFOLD);
+        let root = project(INIT_SCAFFOLD);
         let sub = root.path().join("src").join("bin");
         std::fs::create_dir_all(&sub).expect("create the subdirectory");
         let path = append_from(&sub, "worker").expect("the entry is appended");
@@ -1577,11 +1652,11 @@ mod init_tests {
     // BCLI-018: both layouts in one directory are refused, as mfile refuses them.
     #[test]
     fn init_conflicting_layouts_exit3_appends_nothing() {
-        let root = project(LEGACY_SCAFFOLD);
+        let root = project(INIT_SCAFFOLD);
         let dot = root.path().join(".minimal");
         std::fs::create_dir(&dot).expect("create .minimal");
         let dot_file = dot.join(mfile::MFILE_NAME);
-        std::fs::write(&dot_file, LEGACY_SCAFFOLD).expect("write .minimal/minimal.toml");
+        std::fs::write(&dot_file, INIT_SCAFFOLD).expect("write .minimal/minimal.toml");
         let sub = root.path().join("src");
         std::fs::create_dir(&sub).expect("create the subdirectory");
         for dir in [root.path(), sub.as_path()] {
@@ -1595,10 +1670,10 @@ mod init_tests {
                     refusal.message
                 );
             }
-            assert_eq!(read(&root), LEGACY_SCAFFOLD, "the root file is unchanged");
+            assert_eq!(read(&root), INIT_SCAFFOLD, "the root file is unchanged");
             assert_eq!(
                 std::fs::read_to_string(&dot_file).unwrap(),
-                LEGACY_SCAFFOLD,
+                INIT_SCAFFOLD,
                 "the .minimal file is unchanged"
             );
         }

@@ -212,24 +212,71 @@ impl LinkCollision {
     }
 }
 
+/// One path two layers ship with different contents, as
+/// [`LinkCollisions`] records it: the path relative to the layer roots, the
+/// layer whose copy was refused (the first-linked file stays), and why the
+/// two differ. Which layer placed the file first is the caller's to find,
+/// by the inode the destination carries ([`LinkCollisions::differing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DifferingPath {
+    /// The path, relative to every layer's root.
+    pub rel: PathBuf,
+    /// The layer whose copy was not linked.
+    pub loser: PathBuf,
+    /// The note [`LinkCollision::note`] gives for the difference.
+    pub why: &'static str,
+}
+
+/// How many differing paths [`LinkCollisions`] keeps by name; past this
+/// they are counted only, so a closure that re-ships a whole tree cannot
+/// grow the record without bound.
+pub const DIFFERING_KEPT: usize = 64;
+
 /// The collisions one or more [`hardlink_dir_contents_counted`] calls found,
-/// by kind. The caller owns it, so concurrent assemblies never share counts.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// by kind, and the first [`DIFFERING_KEPT`] differing paths by name. The
+/// caller owns it, so concurrent assemblies never share counts.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LinkCollisions {
     /// Same inode, same bytes, or a symlink to the same target.
     pub same: u64,
     /// Equal-size regular files too large to compare.
     pub unchecked: u64,
-    /// Files or symlinks that differ: each one also logs a WARN.
+    /// Files or symlinks that differ. A caller that will name both layers
+    /// itself ([`Self::recording`]) gets each at debug here; any other gets
+    /// a WARN per file naming the refused copy.
     pub differ: u64,
+    /// The differing paths, up to [`DIFFERING_KEPT`], in the order found.
+    pub differing: Vec<DifferingPath>,
+    /// Whether the caller names both layers of a differing path itself, so
+    /// the per-file line here stays at debug.
+    recording: bool,
 }
 
 impl LinkCollisions {
-    fn add(&mut self, collision: LinkCollision) {
+    /// A record for a caller that will name both layers of each differing
+    /// path from [`Self::differing`]: the per-file line stays at debug.
+    #[must_use]
+    pub fn recording() -> Self {
+        Self {
+            recording: true,
+            ..Self::default()
+        }
+    }
+
+    fn add(&mut self, collision: LinkCollision, rel: &Path, loser: &Path) {
         let n = match collision {
             LinkCollision::Same => &mut self.same,
             LinkCollision::Unchecked => &mut self.unchecked,
-            LinkCollision::Differs(_) => &mut self.differ,
+            LinkCollision::Differs(why) => {
+                if self.differing.len() < DIFFERING_KEPT {
+                    self.differing.push(DifferingPath {
+                        rel: rel.to_path_buf(),
+                        loser: loser.to_path_buf(),
+                        why,
+                    });
+                }
+                &mut self.differ
+            }
         };
         *n = n.saturating_add(1);
     }
@@ -289,8 +336,20 @@ pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError
 /// [`hardlink_dir_contents`], adding each path already in place at `dst`
 /// to `counts`. A caller that assembles a tree from several layers passes
 /// one `counts` to every call and logs one summary line, instead of one
-/// line per path.
+/// line per path. `src` is the layer's root: a differing path is recorded
+/// relative to it, with `src` as the layer that lost.
 pub fn hardlink_dir_contents_counted(
+    src: &Path,
+    dst: &Path,
+    counts: &mut LinkCollisions,
+) -> Result<(), HardlinkError> {
+    hardlink_layer_contents(src, src, dst, counts)
+}
+
+/// The recursion of [`hardlink_dir_contents_counted`]: `layer` is the root
+/// the call started from, `src` the directory under it being linked now.
+fn hardlink_layer_contents(
+    layer: &Path,
     src: &Path,
     dst: &Path,
     counts: &mut LinkCollisions,
@@ -314,7 +373,7 @@ pub fn hardlink_dir_contents_counted(
         if metadata.is_dir() {
             fs::create_dir_all(&dst_path)
                 .map_err(|e| HardlinkError::IO("create directory", dst_path.clone(), e))?;
-            hardlink_dir_contents_counted(&path, &dst_path, counts)?;
+            hardlink_layer_contents(layer, &path, &dst_path, counts)?;
         } else if metadata.is_file() {
             match fs::hard_link(&path, &dst_path) {
                 Ok(()) => Ok(()),
@@ -323,13 +382,22 @@ pub fn hardlink_dir_contents_counted(
                     // rule, not the exception. The first-linked file stays;
                     // the collision is a WARN only when the files differ.
                     let collision = hardlink_collision(&path, &metadata, &dst_path);
-                    counts.add(collision);
+                    let rel = path.strip_prefix(layer).unwrap_or(path.as_path());
+                    counts.add(collision, rel, layer);
                     match collision {
                         LinkCollision::Same | LinkCollision::Unchecked => tracing::debug!(
                             "Not linking {} => {}, already exists ({})",
                             path.display(),
                             dst_path.display(),
                             collision.note()
+                        ),
+                        // A recording caller names both layers from the
+                        // record; this line, which knows the loser alone,
+                        // stays at debug for it (gominimal/inbox#1226).
+                        LinkCollision::Differs(why) if counts.recording => tracing::debug!(
+                            "Not linking {} => {}, already exists ({why}; the first-linked file stays)",
+                            path.display(),
+                            dst_path.display()
                         ),
                         LinkCollision::Differs(why) => warn!(
                             "Not linking {} => {}, already exists ({why}; the first-linked file stays)",
@@ -379,22 +447,39 @@ pub fn hardlink_dir_contents_counted(
                         // Same rule as for files: a symlink to the same target
                         // is the common overlap, a different target is worth
                         // the WARN.
+                        let rel = path.strip_prefix(layer).unwrap_or(path.as_path());
                         match fs::read_link(&dst_path) {
                             Ok(existing) if existing == target => {
-                                counts.add(LinkCollision::Same);
+                                counts.add(LinkCollision::Same, rel, layer);
                                 tracing::debug!(
                                     "Not symlinking {} => {}, already exists (same target)",
                                     path.display(),
                                     dst_path.display()
                                 );
                             }
-                            _ => {
-                                counts.add(LinkCollision::Differs("another target"));
-                                warn!(
-                                    "Not symlinking {} => {}, already exists (another target or not a symlink; the first stays)",
-                                    path.display(),
-                                    dst_path.display()
-                                );
+                            existing => {
+                                // what stands there: a symlink elsewhere, or
+                                // a file or directory an earlier layer put
+                                // at the path, which has no target to name
+                                let why = if existing.is_ok() {
+                                    "another target"
+                                } else {
+                                    "not a symlink"
+                                };
+                                counts.add(LinkCollision::Differs(why), rel, layer);
+                                if counts.recording {
+                                    tracing::debug!(
+                                        "Not symlinking {} => {}, already exists ({why}; the first stays)",
+                                        path.display(),
+                                        dst_path.display()
+                                    );
+                                } else {
+                                    warn!(
+                                        "Not symlinking {} => {}, already exists ({why}; the first stays)",
+                                        path.display(),
+                                        dst_path.display()
+                                    );
+                                }
                             }
                         }
                         Ok(())
@@ -448,9 +533,10 @@ impl From<std::io::Error> for GlobError {
 }
 
 /// Enumerates files which match the given glob within the given directory.
-/// Symlinked directories are followed and nothing stops a loop: a link to an
-/// ancestor (`a -> .`) is walked down to the kernel's link limit, matching
-/// each file under it once per level. For a tree a build wrote, use
+/// Symlinked directories are followed, so a file under `lib64 -> lib` matches
+/// at both paths. A link to a directory the walk is already inside (`a -> .`,
+/// `bin/up -> ..`) is not entered again, so a loop ends. For a tree a build
+/// wrote, where a link may lead anywhere, use
 /// [`match_files_for_glob_no_follow`].
 pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
     match_files_for_glob_with(dir, glob, true)
@@ -477,12 +563,24 @@ fn match_files_for_glob_with(
         .build()?
         .compile_matcher();
 
-    // Walk the filesystem starting from root_dir
+    /// The device and inode of the directory at `path`, through any link.
+    fn dir_id(path: &Path) -> Result<(u64, u64), GlobError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(path)?;
+        Ok((m.dev(), m.ino()))
+    }
+
+    // Walk the filesystem starting from root_dir. With `follow`, a symlinked
+    // directory is walked; `inside` holds the directories from the root down
+    // to `dir`, and a link back to any of them is a loop, not entered. A link
+    // to a directory elsewhere (`lib64 -> lib`) is walked. Without `follow`,
+    // a symlinked directory is not entered at all.
     fn walk_dir(
         dir: &Path,
         root_dir: &Path,
         matcher: &globset::GlobMatcher,
         follow: bool,
+        inside: &mut Vec<(u64, u64)>,
         results: &mut Vec<PathBuf>,
     ) -> Result<(), GlobError> {
         let entries = std::fs::read_dir(dir)?;
@@ -501,15 +599,28 @@ fn match_files_for_glob_with(
             if path.is_file() && matcher.is_match(subset) {
                 results.push(path);
             } else if descend {
-                // Recursively walk subdirectories
-                walk_dir(&path, root_dir, matcher, follow, results)?;
+                let id = dir_id(&path)?;
+                if inside.contains(&id) {
+                    continue;
+                }
+                inside.push(id);
+                walk_dir(&path, root_dir, matcher, follow, inside, results)?;
+                inside.pop();
             }
         }
 
         Ok(())
     }
 
-    walk_dir(dir, dir, &matcher, follow_symlinked_dirs, &mut results)?;
+    let mut inside = vec![dir_id(dir)?];
+    walk_dir(
+        dir,
+        dir,
+        &matcher,
+        follow_symlinked_dirs,
+        &mut inside,
+        &mut results,
+    )?;
     Ok(results)
 }
 
@@ -852,10 +963,38 @@ pub fn default_parallelism() -> usize {
 mod tests {
     use super::*;
 
-    /// A symlink loop in a tree sends the following walk down `a/a/a/...` until
-    /// the kernel's link limit, matching the same file at every level; the
-    /// no-follow walk returns each file once, ignores the loop, and still
-    /// matches a symlinked file.
+    /// The walk still matches a file at the path a sibling link gives it
+    /// (`usr/lib64/libfoo.so.1` through `usr/lib64 -> lib`), but does not
+    /// re-enter a directory it is inside: with `loop -> .` and `bin/up -> ..`
+    /// the unchecked walk doubles at each level up to the kernel's 40-link
+    /// limit.
+    #[test]
+    fn the_glob_walk_keeps_sibling_links_and_ends_a_loop() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        std::fs::create_dir_all(r.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(r.join("bin")).unwrap();
+        std::fs::write(r.join("usr/lib/libfoo.so.1"), b"elf").unwrap();
+        std::fs::write(r.join("bin/x"), b"x").unwrap();
+        std::os::unix::fs::symlink("lib", r.join("usr/lib64")).unwrap();
+        std::os::unix::fs::symlink(".", r.join("loop")).unwrap();
+        std::os::unix::fs::symlink("..", r.join("bin/up")).unwrap();
+        let mut got = match_files_for_glob(r, "**/*").unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                r.join("bin/x"),
+                r.join("usr/lib/libfoo.so.1"),
+                r.join("usr/lib64/libfoo.so.1"),
+            ]
+        );
+    }
+
+    /// The no-follow walk returns each file once, does not enter a symlinked
+    /// directory at all (`a -> .`, and `lib64 -> lib` alike), and still
+    /// matches a symlinked file. The following walk ends the same loop by
+    /// not re-entering a directory it is inside, so on this tree the two agree.
     #[test]
     fn the_no_follow_walk_ignores_a_symlink_loop() {
         let t = tempfile::tempdir().unwrap();
@@ -866,12 +1005,9 @@ mod tests {
         let mut got = match_files_for_glob_no_follow(t.path(), "**/*").unwrap();
         got.sort();
         assert_eq!(got, vec![t.path().join("bin/x"), t.path().join("y")]);
-        let following = match_files_for_glob(t.path(), "**/*").unwrap();
-        assert!(
-            following.len() > got.len(),
-            "the following walk matched {} paths: the loop walked",
-            following.len()
-        );
+        let mut following = match_files_for_glob(t.path(), "**/*").unwrap();
+        following.sort();
+        assert_eq!(following, got, "the following walk entered the loop");
     }
 
     /// A path two layers both ship is linked once and counted, with a WARN
@@ -907,25 +1043,47 @@ mod tests {
         std::fs::write(a.join("usr/lib/big.bin"), vec![0u8; big]).unwrap();
         std::fs::write(b.join("usr/lib/big.bin"), vec![1u8; big]).unwrap();
 
-        let mut counts = LinkCollisions::default();
+        let mut counts = LinkCollisions::recording();
         hardlink_dir_contents_counted(&a, &dst, &mut counts).unwrap();
         assert_eq!(
-            counts,
-            LinkCollisions::default(),
+            (
+                counts.same,
+                counts.unchecked,
+                counts.differ,
+                counts.differing.len()
+            ),
+            (0, 0, 0, 0),
             "the first layer collides with nothing"
         );
         hardlink_dir_contents_counted(&b, &dst, &mut counts).unwrap();
         assert_eq!(
-            counts,
-            LinkCollisions {
-                same: 1,
-                unchecked: 1,
-                differ: 4
-            },
+            (counts.same, counts.unchecked, counts.differ),
+            (1, 1, 4),
             "same bytes; an unchecked large file; other bytes, another size, \
              a differing symlink and a symlink destination"
         );
         assert_eq!(counts.total(), 6);
+        // Each differing path is on record with the layer that lost and the
+        // reason, relative to the layer's root, so the caller can name the
+        // winner beside it (gominimal/inbox#1226).
+        let mut differing: Vec<(String, &str)> = counts
+            .differing
+            .iter()
+            .map(|d| {
+                assert_eq!(d.loser, b, "the second layer lost every one: {d:?}");
+                (d.rel.to_string_lossy().into_owned(), d.why)
+            })
+            .collect();
+        differing.sort();
+        assert_eq!(
+            differing,
+            [
+                ("usr/lib/alias".to_string(), "not a regular file"),
+                ("usr/lib/bumped.txt".to_string(), "different content"),
+                ("usr/lib/differs.txt".to_string(), "different size"),
+                ("usr/lib/link".to_string(), "another target"),
+            ]
+        );
         // the first-linked file stays
         assert_eq!(
             std::fs::read(dst.join("usr/lib/differs.txt")).unwrap(),

@@ -235,12 +235,19 @@ pub(crate) async fn release_held_box_name(
 /// box under that name takes a fresh id (BEP-082). The VM host daemon
 /// serves that withdraw by name alone: it retires and revokes nothing.
 /// Then the old name's hold is released. Best-effort, as the hold is.
+///
+/// With no control socket (a native host) no VM host daemon holds a row or
+/// a name for the box, so the move asks for nothing and logs nothing
+/// (BCLI-058).
 pub(crate) async fn move_held_box_name(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
     old_name: Option<&str>,
     new_name: &str,
 ) {
+    if control_sock.is_none() {
+        return;
+    }
     if let Some(old_name) = old_name {
         withdraw_box_row(
             control_sock.clone(),
@@ -2380,6 +2387,96 @@ mod tests {
         );
     }
 
+    /// BEP-043: the dashboard's rename of a running `host_ip` box makes the
+    /// move `min session rename` and `min box rename` make, over the control
+    /// socket beside the dashboard's ssh socket. It withdraws the old name
+    /// by the box's id, moves the name's hold and retires nothing, so the
+    /// box keeps its egress rules.
+    #[tokio::test]
+    async fn dashboard_rename_of_host_ip_box_retires_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (requests, residency) = fake_vm_host_with_residency(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"name":"web","held":true}"#.to_string(),
+        )
+        .await;
+        let id = boxes::SessionId::mint();
+        let record = boxes::Record {
+            id,
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::HostNet,
+            policy: boxes::BoxPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+                quic443: None,
+            },
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: None,
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
+            attrs: Default::default(),
+        };
+        assert!(holds_name(&record), "a host_ip box holds its name");
+
+        // `dash::rpc::rename`'s move, after the in-VM daemon renamed it.
+        let ssh_sock = dir.path().join("ssh.sock");
+        rename_box_with_vm_host(control_sock_beside(&ssh_sock), &record, "api").await;
+
+        assert!(
+            residency.lock().unwrap().is_empty(),
+            "the dashboard's rename sends no retire"
+        );
+        let seen = requests.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "one withdraw, one release, one hold: {seen:?}"
+        );
+        let minimald_rpc::BoxControlRequest::Withdraw(withdraw) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!(
+                "the old name is withdrawn by the withdraw verb: {}",
+                seen[0]
+            );
+        };
+        assert_eq!(withdraw.name, "web");
+        assert_eq!(
+            withdraw.box_id,
+            Some(minimald_rpc::BoxId::from_bytes(id.to_bytes())),
+            "the withdraw carries the box's id"
+        );
+        let minimald_rpc::BoxControlRequest::ReleaseBoxName(release) =
+            serde_json_lenient::from_str(&seen[1]).expect("the request is the wire type")
+        else {
+            panic!("the old name is released by the release verb: {}", seen[1]);
+        };
+        assert_eq!(release.name, "web");
+        let minimald_rpc::BoxControlRequest::HoldBoxName(hold) =
+            serde_json_lenient::from_str(&seen[2]).expect("the request is the wire type")
+        else {
+            panic!("the new name is held by the hold verb: {}", seen[2]);
+        };
+        assert_eq!(hold.name, "api");
+        assert_eq!(hold.session_id, Some(id));
+    }
+
     /// The `host_ip` hold's attach-exit side: the shell-exit prompt's
     /// Delete destroys the session daemon-side, so the attach's own exit is
     /// where the name is released — one release request naming it and its
@@ -3309,7 +3406,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("gate-web".to_string()),
             path: Some(project.path().to_str().unwrap().to_string()),
-            network: CliNetworkMode::OwnIp,
+            network: Some(CliNetworkMode::OwnIp),
             sync: Some(SyncMode::None),
             no_loadouts: true,
             no_prompt: true,
@@ -3396,7 +3493,7 @@ mod tests {
         let args = ActivateArgs {
             name: Some("web".to_string()),
             path: Some(project.path().to_str().unwrap().to_string()),
-            network: CliNetworkMode::OwnIp,
+            network: Some(CliNetworkMode::OwnIp),
             no_prompt: true,
             attach: false,
             ..bare_activate_args()

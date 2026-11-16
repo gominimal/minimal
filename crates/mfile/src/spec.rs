@@ -722,6 +722,69 @@ fn check_table(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The declarer of a lifecycle hook (BOX-179).
+// ---------------------------------------------------------------------------
+
+/// The key of a lifecycle hook table that names who declared the hook.
+/// The expansion writes it into each hook of the spec's `lifecycle_hooks`.
+pub const DECLARED_BY: &str = "declared_by";
+
+/// Who declared one lifecycle hook of an expanded spec: the `declared_by`
+/// table of the hook (BOX-179).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum HookDeclarer {
+    /// The project's `minimal.toml`, in any of its layers. It carries no
+    /// host path.
+    Project,
+    /// The selected loadout `name`.
+    Loadout {
+        /// The loadout's name.
+        name: String,
+    },
+}
+
+impl HookDeclarer {
+    /// The `declared_by` table: `{ kind = "project" }` or
+    /// `{ kind = "loadout", name = "<name>" }`.
+    #[must_use]
+    pub fn to_value(&self) -> toml::Value {
+        let mut table = toml::Table::new();
+        match self {
+            HookDeclarer::Project => {
+                table.insert("kind".to_owned(), "project".into());
+            }
+            HookDeclarer::Loadout { name } => {
+                table.insert("kind".to_owned(), "loadout".into());
+                table.insert("name".to_owned(), name.as_str().into());
+            }
+        }
+        toml::Value::Table(table)
+    }
+
+    /// The declarer of `hook`, a hook table of an expanded spec. `None`
+    /// for a hook with no `declared_by`, or one of another shape.
+    #[must_use]
+    pub fn of(hook: &toml::Value) -> Option<Self> {
+        hook.get(DECLARED_BY)?.clone().try_into().ok()
+    }
+}
+
+/// `hook`, a hook table of an expanded spec, without its `declared_by`:
+/// the hook as the project or the loadout wrote it.
+#[must_use]
+pub fn hook_without_declarer(hook: &toml::Value) -> toml::Value {
+    match hook {
+        toml::Value::Table(table) => {
+            let mut table = table.clone();
+            table.remove(DECLARED_BY);
+            toml::Value::Table(table)
+        }
+        other => other.clone(),
+    }
+}
+
 /// The warning for a project section that the expansion leaves out of the
 /// spec ([`crate::expand::IGNORED_SECTIONS`]). Each of these sections is
 /// client configuration, which only the user's own `config.toml` sets.

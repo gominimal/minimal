@@ -61,20 +61,27 @@ pub(crate) async fn cmd_box_logs(
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
+    let stdout_is_terminal = std::io::stdout().is_terminal();
     let mut out = std::io::stdout().lock();
-    box_logs_on_hosts(hosts, &args, box_type, verb, &mut out).await
+    box_logs_on_hosts(hosts, &args, box_type, verb, stdout_is_terminal, &mut out).await
 }
 
 /// The logs verb over the local `hosts`: resolves the box among the boxes
 /// of `box_type`, or of every type when it is `None`, reads its output log
-/// from the start, and writes each byte to `out` as the box wrote it. With
-/// `-f`, it keeps writing new output until the box is removed. The verb,
-/// the box id and the outcome go to the log.
+/// from the start, and writes it to `out`. With `-f`, it keeps writing new
+/// output until the box is removed. The verb, the box id and the outcome go
+/// to the log.
+///
+/// A box with a terminal writes terminal control sequences into its
+/// output. When `out` is not a terminal and `--raw` is not given, those
+/// sequences are removed, so a pipe or a file gets the text alone. Every
+/// other read writes each byte as the box wrote it.
 pub(crate) async fn box_logs_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     args: &BoxLogsArgs,
     box_type: Option<&str>,
     verb: &'static str,
+    stdout_is_terminal: bool,
     out: &mut dyn std::io::Write,
 ) -> Result<(), anyhow::Error> {
     let address = args.target.as_str();
@@ -84,8 +91,13 @@ pub(crate) async fn box_logs_on_hosts(
     };
     crate::output::record_box_id(&resolved.box_id.to_string());
     let box_id = resolved.box_id;
+    let mut stripped = false;
     let written = async {
         let mut client = box_host_client(&resolved.host).await?;
+        if !args.raw && !stdout_is_terminal {
+            stripped = box_has_terminal(&mut client, verb, box_id).await;
+        }
+        let mut strip = stripped.then(ControlStripper::default);
         let request = minimald_rpc::ReadLogRequest {
             id: box_id,
             offset: 0,
@@ -99,11 +111,11 @@ pub(crate) async fn box_logs_on_hosts(
                 tracing::warn!(verb, box_id = %box_id, "open the log read: {e:#}");
                 log_read_failed(address)
             })?;
-        copy_log(verb, address, &mut lines, out).await
+        copy_log(verb, address, &mut lines, strip.as_mut(), out).await
     }
     .await;
     let outcome = if written.is_ok() { "ok" } else { "error" };
-    tracing::info!(verb, box_id = %box_id, follow = args.follow, outcome);
+    tracing::info!(verb, box_id = %box_id, follow = args.follow, stripped, outcome);
     written
 }
 
@@ -149,6 +161,161 @@ async fn resolve_typed_box_on_hosts(
     }
 }
 
+/// Whether the stored spec of box `box_id` gives it a terminal. Only the
+/// strip decision depends on this read, so a failed read gives `false`:
+/// the log is then written as the box wrote it. The detail goes to the log.
+async fn box_has_terminal(
+    client: &mut client::Client,
+    verb: &'static str,
+    box_id: boxes::SessionId,
+) -> bool {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+    match client
+        .oneshot_rpc::<ShowBox>(ShowBoxRequest { id: box_id })
+        .await
+    {
+        Ok(Errorable::Ok(shown)) => shown.record.pty_enabled,
+        Ok(Errorable::Err { error }) => {
+            tracing::warn!(verb, box_id = %box_id, "read the box record, write the log raw: {error}");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(verb, box_id = %box_id, "read the box record, write the log raw: {e:#}");
+            false
+        }
+    }
+}
+
+/// Removes terminal control sequences from a byte stream that arrives in
+/// chunks: CSI sequences (`ESC [`), OSC strings (`ESC ]`, ended by BEL or
+/// `ESC \`), the DCS, SOS, PM and APC strings, the other escape sequences,
+/// and the C0 control codes except tab, line feed and carriage return. A
+/// sequence can be split across chunks: the state carries over. A line
+/// feed ends an OSC, DCS, SOS, PM or APC string that has no end. A line
+/// feed or a carriage return ends a CSI or escape sequence that has no
+/// final byte, and stays as text. Bytes of
+/// 0x80 and up pass through, so UTF-8 text stays whole.
+#[derive(Debug, Default)]
+pub(crate) struct ControlStripper {
+    state: StripState,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum StripState {
+    /// Plain text.
+    #[default]
+    Ground,
+    /// After ESC.
+    Escape,
+    /// After ESC and one or more intermediate bytes.
+    EscapeIntermediate,
+    /// Inside a CSI sequence, before its final byte.
+    Csi,
+    /// Inside an OSC, DCS, SOS, PM or APC string.
+    ControlString,
+    /// After ESC inside such a string.
+    StringEscape,
+}
+
+impl ControlStripper {
+    const ESC: u8 = 0x1b;
+    const BEL: u8 = 0x07;
+    /// CAN and SUB end any sequence, as a terminal does.
+    const CAN: u8 = 0x18;
+    const SUB: u8 = 0x1a;
+
+    /// Appends the text of `chunk` to `text`, without the control
+    /// sequences.
+    pub(crate) fn strip(&mut self, chunk: &[u8], text: &mut Vec<u8>) {
+        for &byte in chunk {
+            self.step(byte, text);
+        }
+    }
+
+    fn step(&mut self, byte: u8, text: &mut Vec<u8>) {
+        use StripState::*;
+        if self.state != Ground && matches!(byte, Self::CAN | Self::SUB) {
+            self.state = Ground;
+            return;
+        }
+        self.state = match self.state {
+            Ground => match byte {
+                Self::ESC => Escape,
+                b'\t' | b'\n' | b'\r' => {
+                    text.push(byte);
+                    Ground
+                }
+                0x00..=0x1f | 0x7f => Ground,
+                _ => {
+                    text.push(byte);
+                    Ground
+                }
+            },
+            Escape => match byte {
+                b'[' => Csi,
+                b']' | b'P' | b'X' | b'^' | b'_' => ControlString,
+                Self::ESC => Escape,
+                0x20..=0x2f => EscapeIntermediate,
+                0x30..=0x7e => Ground,
+                // A control code or a byte past ASCII ends the escape, and
+                // is read as text.
+                _ => {
+                    self.state = Ground;
+                    return self.step(byte, text);
+                }
+            },
+            EscapeIntermediate => match byte {
+                Self::ESC => Escape,
+                // A sequence with no final byte must not hide the rest of the
+                // log, so a line end ends it and is kept as text.
+                b'\n' | b'\r' => {
+                    text.push(byte);
+                    Ground
+                }
+                0x20..=0x2f => EscapeIntermediate,
+                0x30..=0x7e => Ground,
+                0x00..=0x1f | 0x7f => EscapeIntermediate,
+                _ => {
+                    self.state = Ground;
+                    return self.step(byte, text);
+                }
+            },
+            Csi => match byte {
+                Self::ESC => Escape,
+                b'\n' | b'\r' => {
+                    text.push(byte);
+                    Ground
+                }
+                0x40..=0x7e => Ground,
+                0x00..=0x3f | 0x7f => Csi,
+                _ => {
+                    self.state = Ground;
+                    return self.step(byte, text);
+                }
+            },
+            ControlString => match byte {
+                Self::BEL => Ground,
+                Self::ESC => StringEscape,
+                // A string with no end must not hide the rest of the log, so
+                // a line feed ends it and is kept as text.
+                b'\n' => {
+                    text.push(byte);
+                    Ground
+                }
+                _ => ControlString,
+            },
+            StringEscape => match byte {
+                b'\\' => Ground,
+                // Another ESC starts a new sequence, as a terminal reads it.
+                _ => {
+                    self.state = Escape;
+                    return self.step(byte, text);
+                }
+            },
+        };
+    }
+}
+
 /// The error for a log read that did not start or did not end cleanly.
 fn log_read_failed(address: &str) -> anyhow::Error {
     anyhow::anyhow!(
@@ -164,9 +331,11 @@ async fn copy_log(
     verb: &'static str,
     address: &str,
     lines: &mut client::SubsystemLines,
+    mut strip: Option<&mut ControlStripper>,
     out: &mut dyn std::io::Write,
 ) -> Result<(), anyhow::Error> {
     use minimald_rpc::ReadLogUpdate;
+    let mut text = Vec::new();
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
@@ -197,7 +366,14 @@ async fn copy_log(
         };
         match update {
             ReadLogUpdate::Output { data, .. } => {
-                out.write_all(&data)?;
+                match strip.as_deref_mut() {
+                    Some(strip) => {
+                        text.clear();
+                        strip.strip(&data, &mut text);
+                        out.write_all(&text)?;
+                    }
+                    None => out.write_all(&data)?,
+                }
                 out.flush()?;
             }
             ReadLogUpdate::Done { .. } | ReadLogUpdate::Reaped => return Ok(()),
