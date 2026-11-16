@@ -39,8 +39,13 @@ pub use container::{Container, ExposedPort, ExposedPortProto};
 // Increment for any big change to the format of build specs / stacks, so that hash
 // keys get invalidated.
 //
+// Also increment it when evaluating the same inputs can give a different result, since
+// the layer cache serves a layer by this hash and never evaluates it again.
+//
 // Version 1: Switch from harnesses/ to stacks/.
-const FORMAT_VERSION: u8 = 1;
+// Version 2: Package reads and imports confined to the package and its layer, so a layer
+//            cached before the confinement is evaluated again under it.
+const FORMAT_VERSION: u8 = 2;
 
 /// The start and end bytes where a string was defined.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
