@@ -1770,11 +1770,58 @@ pub(crate) struct BoxEntryExpansion {
     /// carry only the project's.
     pub(crate) wire: boxes::wire::request::WireBoxEntry,
     /// The expanded spec over every layer, the selected loadouts included.
-    /// Each of its hooks names its declarer (BOX-179). Only the tests read
-    /// it until the daemon stores this spec. Remove the `allow` below when
-    /// gominimal/minimal#3409 (T129) lands and the daemon stores it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Each of its hooks names its declarer (BOX-179). Its hooks reach the
+    /// daemon in the stored spec ([`Self::spec_hooks`]).
     pub(crate) spec: toml::Table,
+}
+
+impl BoxEntryExpansion {
+    /// The expanded spec's `lifecycle_hooks`, each with its `declared_by`,
+    /// for the spec the daemon stores (BOX-068, BOX-179). Empty when the
+    /// entry declares no hook, or when `--no-hooks` dropped them.
+    ///
+    /// # Errors
+    ///
+    /// Fails with exit 3 when a hook of the expanded spec does not read
+    /// as a lifecycle hook with its declarer.
+    pub(crate) fn spec_hooks(&self) -> anyhow::Result<Vec<mfile::spec::SpecHook>> {
+        let Some(hooks) = self.spec.get("lifecycle_hooks") else {
+            return Ok(Vec::new());
+        };
+        // The same refusal as a hook the wire entry cannot carry.
+        hooks.clone().try_into().map_err(|error| {
+            ProjectFileInvalid {
+                error: mfile::Error::Format(error),
+            }
+            .into()
+        })
+    }
+}
+
+/// Puts `hooks`, the expanded spec's hooks with their declarers, into the
+/// spec on `request`, so the daemon stores them in `spec.json` and
+/// composes the project's hooks from them (BOX-068, BOX-179). Nothing
+/// changes for a request with no spec.
+///
+/// # Errors
+///
+/// Fails if the spec on `request` does not read as a box spec, or cannot
+/// be encoded again.
+pub(crate) fn put_spec_hooks(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    hooks: Vec<mfile::spec::SpecHook>,
+) -> Result<(), anyhow::Error> {
+    let Some(value) = request.spec.clone() else {
+        return Ok(());
+    };
+    let mut spec: mfile::spec::BoxSpec =
+        serde_json_lenient::from_value(value).context("Cannot read the box spec")?;
+    tracing::debug!(
+        lifecycle_hooks = hooks.len(),
+        "put the expanded spec's hooks, with their declarers, on the box spec"
+    );
+    spec.lifecycle_hooks = Some(hooks);
+    put_spec(request, &spec)
 }
 
 /// The expanded session entry of the project at `project`, with
@@ -4026,6 +4073,12 @@ pub(crate) async fn activate_box(
     })?;
     // The expansion logs each hook with its declarer and layer. The whole
     // spec is not logged, because it carries loadout variable values.
+    // BOX-068, BOX-179: the expanded spec's hooks, each with its declarer,
+    // ride in the spec the daemon stores.
+    let spec_hooks = expanded
+        .as_ref()
+        .map(BoxEntryExpansion::spec_hooks)
+        .transpose()?;
     contribution.entry = expanded.map(|expanded| Box::new(expanded.wire));
 
     // The upload decision needs no TTY — the interactive `Confirm` is answered
@@ -4043,6 +4096,9 @@ pub(crate) async fn activate_box(
                 options.entry.as_deref(),
                 options.box_name.as_deref(),
             )?;
+            if let Some(hooks) = spec_hooks {
+                put_spec_hooks(&mut request, hooks)?;
+            }
             add_vpn_network_names(&mut request, &options.vpn_network_names)?;
 
             let Some(root) = upload_root else {
