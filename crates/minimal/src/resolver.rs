@@ -297,13 +297,13 @@ const COMMAND_RESERVES_THE_RANGE: bool = false;
 /// launchd's job label for the answerer service: the plist file is named
 /// after it.
 #[cfg(any(test, target_os = "macos"))]
-const ANSWERER_LAUNCHD_LABEL: &str = "dev.gominimal.zone";
+pub(crate) const ANSWERER_LAUNCHD_LABEL: &str = "dev.gominimal.zone";
 
 /// systemd's unit name stem for the answerer service:
 /// `minzoned.socket` and `minzoned.service`, named after the program
 /// they run.
 #[cfg(any(test, not(target_os = "macos")))]
-const ANSWERER_SYSTEMD_UNIT: &str = "minzoned";
+pub(crate) const ANSWERER_SYSTEMD_UNIT: &str = "minzoned";
 
 /// The name of the app bundle `minzoned` ships in on macOS, and of the
 /// root-owned copy the step installs.
@@ -435,7 +435,11 @@ const ANSWERER_UNIT_PATHS: &[&str] = &[ANSWERER_UNIT_SOCKET_PATH, ANSWERER_UNIT_
 /// defence in depth rather than the only check.
 /// `AssociatedBundleIdentifiers` names the app bundle the program sits in
 /// ([`ANSWERER_BUNDLE_IDENTIFIER`]), the key by which macOS lists the job
-/// under the bundle's name and icon.
+/// under the bundle's name and icon. `StandardOutPath` and
+/// `StandardErrorPath` send the service's output to the operator's
+/// `<state>/logs/minzoned.log` ([`answerer_log_path`]), where `min bug`
+/// collects it: without them launchd drops it, and a service that exits
+/// at start leaves no record.
 ///
 /// Like [`RANGE_UNIT_PLIST`], the script writes the body under a quoted
 /// heredoc, so nothing in it expands.
@@ -457,6 +461,10 @@ const ANSWERER_PLIST_TEMPLATE: &str = "\
 \t<array>
 \t\t<string>__BUNDLE__</string>
 \t</array>
+\t<key>StandardOutPath</key>
+\t<string>__LOG__</string>
+\t<key>StandardErrorPath</key>
+\t<string>__LOG__</string>
 \t<key>Sockets</key>
 \t<dict>
 \t\t<key>Listener</key>
@@ -1549,7 +1557,7 @@ async fn bundle_files_of(source: &str) -> std::io::Result<Vec<BundleFile>> {
 /// The answerer program this machine's step copies ([`answerer_source_in`]
 /// over this `min`'s directory and `PATH`); the not-found arm is asserted
 /// on the pure half.
-fn answerer_source() -> Option<String> {
+pub(crate) fn answerer_source() -> Option<String> {
     let exe = std::env::current_exe().ok();
     answerer_source_in(
         exe.as_deref().and_then(std::path::Path::parent),
@@ -1804,7 +1812,7 @@ async fn answerer_source_identity(_source: String) -> Result<Option<String>, Sou
 }
 
 /// The lowercase hex SHA-256 of `path`'s bytes.
-async fn sha256_of(path: &str) -> std::io::Result<String> {
+pub(crate) async fn sha256_of(path: &str) -> std::io::Result<String> {
     use sha2::Digest as _;
     let bytes = tokio::fs::read(path).await?;
     Ok(hex::encode(sha2::Sha256::digest(&bytes)))
@@ -3290,6 +3298,34 @@ fn answerer_unit_plist(install: &AnswererInstall) -> String {
         .replace("__OPERATOR__", &install.operator)
         .replace("__OPERATOR_UID__", &install.operator_uid.to_string())
         .replace("__CHANNEL__", &install.channel)
+        .replace("__LOG__", &xml_escape(&answerer_log_path()))
+}
+
+/// The file name the answerer service's output goes to under the
+/// operator's `<state>/logs`, the prefix `min bug` collects it by.
+pub(crate) const ANSWERER_LOG_FILE: &str = "minzoned.log";
+
+/// The operator's answerer log: `<state>/logs/minzoned.log` under this
+/// `min`'s default state directory. The CLI renders the unit as the
+/// operator, so this is the operator's state directory.
+#[cfg(any(test, target_os = "macos"))]
+fn answerer_log_path() -> String {
+    paths::minimal_state_dir()
+        .as_utf8_path()
+        .join("logs")
+        .join(ANSWERER_LOG_FILE)
+        .to_string()
+}
+
+/// `text` with the five XML special characters escaped, for a value the
+/// plist carries inside a `<string>`.
+#[cfg(any(test, target_os = "macos"))]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// The answerer's systemd socket unit, rendered from
@@ -7238,6 +7274,32 @@ exit 0
                 None
             );
         }
+    }
+
+    /// The answerer's launchd unit sends its stdout and stderr to the
+    /// operator's `<state>/logs/minzoned.log`, the file `min bug` collects,
+    /// so a service that exits at start leaves its reason there.
+    #[test]
+    fn answerer_plist_sets_a_log_path() {
+        let plist = answerer_unit_plist(&test_install());
+        let log = answerer_log_path();
+        assert!(
+            log.ends_with("/logs/minzoned.log"),
+            "the log sits under the state dir's logs: {log}"
+        );
+        assert!(
+            log.starts_with(paths::minimal_state_dir().as_utf8_path().as_str()),
+            "the log is the operator's state dir's: {log}"
+        );
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            let line = format!(
+                "\t<key>{key}</key>\n\t<string>{}</string>\n",
+                xml_escape(&log)
+            );
+            assert!(plist.contains(&line), "{key} names {log}:\n{plist}");
+        }
+        assert!(!plist.contains("__LOG__"), "{plist}");
+        assert_eq!(xml_escape("a&b<c>'\""), "a&amp;b&lt;c&gt;&apos;&quot;");
     }
 
     #[test]

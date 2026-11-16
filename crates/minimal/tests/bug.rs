@@ -207,6 +207,89 @@ async fn the_invoking_terminal_is_described() {
     }
 }
 
+/// The bundle describes the host's answerer service (`minzoned`): the
+/// version and SHA-256 of the installed copy and of the copy `min` ships,
+/// and the service manager's view of the service. A part this host cannot
+/// give is a skip that says why, never a silent gap. Under `cargo test`
+/// neither copy is usually present, so each copy carries its reason.
+#[tokio::test]
+async fn the_answerer_service_is_described() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    cmd_bug(&global_args(state.path(), config.path()), bug_args(&out))
+        .await
+        .unwrap();
+
+    let files = unpack(&out).await;
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let errors = manifest["errors"].to_string();
+    assert!(
+        !errors.contains("host.answerer"),
+        "the answerer collector does not fail: {errors}"
+    );
+
+    let report: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "host/answerer.json").expect("answerer.json"))
+            .unwrap();
+    for copy in ["installed", "shipped"] {
+        let entry = &report[copy];
+        let errors = entry["errors"].as_array().expect("errors is a list");
+        for field in ["version", "sha256"] {
+            let value = &entry[field];
+            assert!(
+                value.as_str().is_some_and(|v| !v.is_empty()) || !errors.is_empty(),
+                "the {copy} copy's {field} is present or an error says why: {entry}"
+            );
+        }
+        if let Some(sha) = entry["sha256"].as_str() {
+            assert_eq!(sha.len(), 64, "a SHA-256 is 64 hex digits: {sha}");
+        }
+    }
+    assert!(
+        report["same_bytes"].is_null()
+            == (report["installed"]["sha256"].is_null() || report["shipped"]["sha256"].is_null()),
+        "the copies are compared only when both hash: {report}"
+    );
+
+    // The service state is a transcript, or a skip that says why.
+    let skips: Vec<(String, String)> = manifest["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["what"].as_str().unwrap().to_string(),
+                s["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let mut entries = vec!["host/answerer-service.txt"];
+    if !cfg!(target_os = "macos") {
+        entries.push("host/answerer-journal.txt");
+    }
+    for entry in entries {
+        match find(&files, entry) {
+            Some(text) => {
+                let text = String::from_utf8_lossy(text);
+                assert!(
+                    text.starts_with("$ "),
+                    "a transcript names its command: {text}"
+                );
+            }
+            None => {
+                let (_, reason) = skips
+                    .iter()
+                    .find(|(what, _)| what == entry)
+                    .unwrap_or_else(|| panic!("{entry} is collected or skipped: {skips:?}"));
+                assert!(reason.contains("did not run"), "{entry}: {reason}");
+            }
+        }
+    }
+}
+
 /// A project laid out under `.minimal/`.
 fn fake_project() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
