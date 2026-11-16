@@ -642,6 +642,19 @@ const SECTIONS: &[SectionKey] = &[
     ("network", KeyShape::Keys(NETWORK_KEYS)),
 ];
 
+/// The section that also carries the flat top-level setting `key`, such
+/// as `io` for `pty_enabled` or `install` for `packages`. `None` when
+/// `key` is not a flat setting of the spec, or no section carries it.
+pub(crate) fn flat_key_section(key: &str) -> Option<&'static str> {
+    if !crate::expand::is_spec_key(key) {
+        return None;
+    }
+    SECTIONS.iter().find_map(|(section, shape)| match shape {
+        KeyShape::Keys(keys) if keys.iter().any(|(k, _)| *k == key) => Some(*section),
+        _ => None,
+    })
+}
+
 /// A key inside a Box Spec section that the spec cannot carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SectionProblem {
@@ -707,6 +720,69 @@ fn check_table(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The declarer of a lifecycle hook (BOX-179).
+// ---------------------------------------------------------------------------
+
+/// The key of a lifecycle hook table that names who declared the hook.
+/// The expansion writes it into each hook of the spec's `lifecycle_hooks`.
+pub const DECLARED_BY: &str = "declared_by";
+
+/// Who declared one lifecycle hook of an expanded spec: the `declared_by`
+/// table of the hook (BOX-179).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum HookDeclarer {
+    /// The project's `minimal.toml`, in any of its layers. It carries no
+    /// host path.
+    Project,
+    /// The selected loadout `name`.
+    Loadout {
+        /// The loadout's name.
+        name: String,
+    },
+}
+
+impl HookDeclarer {
+    /// The `declared_by` table: `{ kind = "project" }` or
+    /// `{ kind = "loadout", name = "<name>" }`.
+    #[must_use]
+    pub fn to_value(&self) -> toml::Value {
+        let mut table = toml::Table::new();
+        match self {
+            HookDeclarer::Project => {
+                table.insert("kind".to_owned(), "project".into());
+            }
+            HookDeclarer::Loadout { name } => {
+                table.insert("kind".to_owned(), "loadout".into());
+                table.insert("name".to_owned(), name.as_str().into());
+            }
+        }
+        toml::Value::Table(table)
+    }
+
+    /// The declarer of `hook`, a hook table of an expanded spec. `None`
+    /// for a hook with no `declared_by`, or one of another shape.
+    #[must_use]
+    pub fn of(hook: &toml::Value) -> Option<Self> {
+        hook.get(DECLARED_BY)?.clone().try_into().ok()
+    }
+}
+
+/// `hook`, a hook table of an expanded spec, without its `declared_by`:
+/// the hook as the project or the loadout wrote it.
+#[must_use]
+pub fn hook_without_declarer(hook: &toml::Value) -> toml::Value {
+    match hook {
+        toml::Value::Table(table) => {
+            let mut table = table.clone();
+            table.remove(DECLARED_BY);
+            toml::Value::Table(table)
+        }
+        other => other.clone(),
+    }
 }
 
 /// The warning for a project section that the expansion leaves out of the
@@ -1101,7 +1177,7 @@ mod tests {
             type = "session"
             name = "dev"
             lifetime = "until_stopped"
-            loadout_mode = "merge"
+            loadout_mode = "open"
             volumes = ["cache"]
 
             [sessions.dev.io]

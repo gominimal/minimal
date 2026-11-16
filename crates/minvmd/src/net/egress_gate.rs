@@ -1620,31 +1620,31 @@ async fn serve_connection(
         // head itself, so it is the last byte of the guest's that reaches the
         // switch un-decided, and the handshake bound covers the write as it
         // covers every step before it. A control request's head is **not**
-        // forwarded: what the gate decides the request to be decides whether
-        // any of it is written on, and the head goes out only with the
-        // admitted request, from [`relay_control`].
+        // forwarded at all: what the gate decides the request to be decides
+        // whether anything is written on, and what is written is the request
+        // rebuilt from what it decided, from [`relay_control`]
+        // ([`canonical_control_request`]).
         if matches!(speak, GuestSpeak::Frames)
             && let Err(error) = switch.write_all(&head).await
         {
             tracing::warn!(%error, "egress gate could not forward the request head");
             return Err(());
         }
-        Ok((switch, head, carry, speak))
+        Ok((switch, carry, speak))
     };
-    let (switch, head, carry, speak) =
-        match tokio::time::timeout(handshake_timeout, handshake).await {
-            Ok(Ok(quadruple)) => quadruple,
-            // Whichever step failed has already said why; the connection is
-            // refused either way.
-            Ok(Err(())) => return,
-            Err(_) => {
-                tracing::warn!(
-                    handshake_timeout = ?handshake_timeout,
-                    "egress gate handshake timed out; refusing the guest connection"
-                );
-                return;
-            }
-        };
+    let (switch, carry, speak) = match tokio::time::timeout(handshake_timeout, handshake).await {
+        Ok(Ok(triple)) => triple,
+        // Whichever step failed has already said why; the connection is
+        // refused either way.
+        Ok(Err(())) => return,
+        Err(_) => {
+            tracing::warn!(
+                handshake_timeout = ?handshake_timeout,
+                "egress gate handshake timed out; refusing the guest connection"
+            );
+            return;
+        }
+    };
     let (switch_rx, switch_tx) = switch.into_split();
     let (guest_rx, guest_tx) = guest.into_split();
     match speak {
@@ -1669,7 +1669,6 @@ async fn serve_connection(
                 switch_tx,
                 switch_rx,
                 guest_tx,
-                head,
                 verb,
                 body,
                 table,
@@ -2033,13 +2032,18 @@ impl Drop for AbortOnDrop {
 /// on. The head arrived with the handshake but was **not** forwarded: the
 /// gate reads the `Content-Length` body — `body` bytes, however many reads
 /// they arrive in — summarizes the request the verb and the body ask the
-/// switch for, and decides it against the host-side table. An admitted
-/// request's head and body go on together, verbatim, and the exchange
-/// finishes as a control exchange always finished: the switch answers, the
-/// answer is drained to the guest, bounded. Anything else — a body the guest
-/// never finished, a publish the table refuses, a body that is not the
-/// verb's own JSON shape — is refused with **nothing** written on: gvproxy
-/// never sees the request, no answer is owed, and the connection comes down.
+/// switch for, and decides it against the host-side table. The body is read
+/// strictly first ([`canonical_control_body`]), and an admitted request goes
+/// on in one write as the gate rebuilt it from that read
+/// ([`canonical_control_request`]) — never the guest's own bytes, so gvproxy
+/// decodes exactly what was decided — and the exchange finishes as a control
+/// exchange always finished: the switch answers, the answer is drained to
+/// the guest, bounded. Anything else — a body the guest never finished, a
+/// publish the table refuses — is refused with **nothing** written on:
+/// gvproxy never sees the request, no answer is owed, and the connection
+/// comes down. A body with no strict read is refused with nothing written on
+/// too, and answered with an HTTP refusal, so the guest reads a refusal
+/// rather than a fault of the channel.
 /// The daemon's own client speaks one request per connection and closes from
 /// its side once the answer is read (`post_json`,
 /// `crates/minimald/src/net/policy.rs`), so one request is all the gate ever
@@ -2096,7 +2100,6 @@ async fn relay_control(
     mut switch: OwnedWriteHalf,
     switch_rx: OwnedReadHalf,
     mut guest_tx: OwnedWriteHalf,
-    head: Vec<u8>,
     verb: ControlVerb,
     body: usize,
     table: BoxTable,
@@ -2149,6 +2152,37 @@ async fn relay_control(
                 return;
             }
         };
+    // The body is read strictly before anything reads it for a decision
+    // (inbox#1180): the verb's own fields, once each, spelled exactly, in
+    // strict JSON ([`canonical_control_body`]). gvproxy's Go decoder matches
+    // keys without regard to case and lets a repeated key's last value win,
+    // so a body carrying anything else could have gvproxy act on a value the
+    // decision never read. Such a body is refused with an HTTP refusal and
+    // never relayed. From here on `request` is the body rebuilt from its
+    // strict read: every step below decides by it, and it is what the switch
+    // is written.
+    let Some(request) = canonical_control_body(verb, &request) else {
+        refuse_request(
+            &limiter,
+            &RefusedRequest {
+                rule: MALFORMED_PUBLISH_RULE,
+                addr: None,
+                what: None,
+                reason: "the body is not exactly the JSON shape the daemon's own client \
+                         sends: an unknown, repeated or case-variant key, a missing \
+                         field, or not strict JSON"
+                    .to_string(),
+            },
+        );
+        answer_unrelayed(
+            &mut guest,
+            &mut guest_tx,
+            &malformed_body_answer(),
+            drain_timeout,
+        )
+        .await;
+        return;
+    };
     // One round of the guest daemon's loopback range probe is decided by the
     // probe's own bounds, never by a row ([`range_probe_listener`]). The
     // guest is untrusted here, so a round binds only at a range address no
@@ -2172,32 +2206,6 @@ async fn relay_control(
     // ([`canonical_probe_request`]).
     let mut probe_spoken = None;
     let probe = range_probe_listener(verb, &request);
-    if let Some(listener) = probe
-        && !probe_body_is_strict(verb, &request)
-    {
-        // A probe-shaped body with a key the gate's shape check does not
-        // read: unknown, repeated, or a case variant gvproxy's decoder would
-        // take for one of the probe's fields. Refused with an answer, never
-        // relayed.
-        refuse_request(
-            &limiter,
-            &RefusedRequest {
-                rule: RANGE_PROBE_RULE,
-                addr: Some(listener.0),
-                what: Some(format!("port {}", listener.1)),
-                reason: "a loopback range probe round carried a key beyond its own fields"
-                    .to_string(),
-            },
-        );
-        answer_unrelayed(
-            &mut guest,
-            &mut guest_tx,
-            &probe_malformed_answer(),
-            drain_timeout,
-        )
-        .await;
-        return;
-    }
     let decision = match probe {
         Some(listener) if !range_address_held(&table, forwards, listener.0) => {
             probe_spoken = Some(canonical_probe_request(verb, listener));
@@ -2411,15 +2419,12 @@ async fn relay_control(
         }
         _ => None,
     };
-    // Admitted: the head and body are forwarded together, in one write, so
-    // the request gvproxy sees is exactly the request the guest sent and
-    // exactly the request the table admitted. A probe round is the
-    // exception: it is written as the gate rebuilt it from what it checked.
-    let spoken = probe_spoken.unwrap_or_else(|| {
-        let mut spoken = head;
-        spoken.extend_from_slice(&request);
-        spoken
-    });
+    // Admitted: the request is written in one write, rebuilt from what the
+    // gate decided ([`canonical_control_request`]) and never the guest's own
+    // bytes, so the request gvproxy sees is exactly the request the table
+    // admitted. A probe round is written as the gate rebuilt it from the
+    // listener it checked.
+    let spoken = probe_spoken.unwrap_or_else(|| canonical_control_request(verb, &request));
     if let Err(error) = switch.write_all(&spoken).await {
         tracing::warn!(%error, "egress gate could not forward an admitted control request");
         if let Some(listener) = noted {
@@ -4250,7 +4255,10 @@ fn warn_interim_publish(limiter: &DropLimiter, decision: &ControlDecision) -> bo
 /// diagnostic bundle's log tail is read for. Returns whether a line was
 /// written.
 fn refuse_request(limiter: &DropLimiter, refused: &RefusedRequest) -> bool {
-    let what = refused.what.as_deref().unwrap_or("none");
+    let what = refused
+        .what
+        .as_deref()
+        .map_or(std::borrow::Cow::Borrowed("none"), loggable_what);
     match limiter.should_warn_at(refused.addr, refused.rule, Instant::now()) {
         WarnDecision::Silent => false,
         WarnDecision::Named => {
@@ -4275,6 +4283,47 @@ fn refuse_request(limiter: &DropLimiter, refused: &RefusedRequest) -> bool {
             true
         }
     }
+}
+
+/// How many bytes of a refused value's escaped form a refusal line carries
+/// ([`loggable_what`]): the daemon's own values — a port, a loopback
+/// listener, a switch address, the box zone, a record's name — are a few
+/// dozen bytes at most.
+const MAX_LOGGED_WHAT: usize = 120;
+
+/// A refused value as the refusal line names it. The value is the guest's:
+/// a field of a body the gate refused to summarize, up to
+/// [`MAX_CONTROL_BODY`] bytes of anything a JSON string can spell, newlines
+/// and control characters included, and the line writes it with `%`. A
+/// value of printable ASCII within [`MAX_LOGGED_WHAT`] with no `=`, `"` or
+/// `\` — every value the daemon's own client sends — is written as it is,
+/// so the line reads the same as before; anything else is written escaped
+/// (`{:?}`, one quoted token, so a value carrying `rule_matched="..."` cannot
+/// pose as a field of the line, nor break it or forge another), and cut to
+/// the bound on a char boundary, the closing quote kept and a marker naming
+/// the value's full length, so it cannot flood the log.
+fn loggable_what(what: &str) -> std::borrow::Cow<'_, str> {
+    let plain = |b: u8| (b == b' ' || b.is_ascii_graphic()) && !matches!(b, b'=' | b'"' | b'\\');
+    if what.len() <= MAX_LOGGED_WHAT && what.bytes().all(plain) {
+        return std::borrow::Cow::Borrowed(what);
+    }
+    let full = format!("{what:?}");
+    if full.len() <= MAX_LOGGED_WHAT {
+        return std::borrow::Cow::Owned(full);
+    }
+    // Cut between whole escape sequences, never inside one: a cut right after a
+    // backslash would make the closing quote read as an escaped one, and the
+    // value is the guest's to shape.
+    let mut escaped = String::from("\"");
+    for ch in what.chars() {
+        let piece: String = ch.escape_debug().collect();
+        if escaped.len() + piece.len() > MAX_LOGGED_WHAT {
+            break;
+        }
+        escaped.push_str(&piece);
+    }
+    escaped.push_str(&format!("\"... ({} bytes in all)", what.len()));
+    std::borrow::Cow::Owned(escaped)
 }
 
 /// The per-decision name dictionary's bound: name records are `u8` indices,
@@ -4307,12 +4356,15 @@ struct UnexposeBody {
 
 /// The body shape for a zone-add (`dns_add_body`,
 /// `crates/minimald/src/net/policy.rs`): the zone's name and the records
-/// that name it. The zone's own name is the daemon's plumbing — it names
-/// which zone the records land in, and the decision is about what the
-/// records publish and at what address — so it is not read here; the
-/// records are.
+/// that name it. gvproxy files the records under the zone's name and
+/// answers every query that ends in it, so the name is decided too
+/// (inbox#1180): the daemon only ever adds the box zone
+/// ([`box_zone_name`]), and a zone-add naming any other zone — `com.`, or
+/// `""`, which every name ends in — would have the gateway answer names
+/// outside the box zone with a box's lease.
 #[derive(Debug, serde::Deserialize)]
 struct DnsAddBody {
+    name: String,
     records: Vec<DnsRecordBody>,
 }
 
@@ -4322,6 +4374,14 @@ struct DnsAddBody {
 struct DnsRecordBody {
     name: String,
     ip: String,
+}
+
+/// The one zone a zone-add may name: the box zone, as gvproxy matches it
+/// (trailing-dotted, the way DNS queries spell names), exactly as the
+/// daemon's own client writes it (`dns_add_body`,
+/// `crates/minimald/src/net/policy.rs`).
+fn box_zone_name() -> String {
+    format!("{}.", boxes::core::zone_answer::ZONE_APEX)
 }
 
 /// How many records a zone-add the decision summarizes may carry: the
@@ -4346,11 +4406,9 @@ const MAX_ZONE_RECORDS: usize = MAX_REQUEST_RECORDS;
 /// probe may bind ([`PublishedForwards::begin_probe`],
 /// [`range_address_held`], [`RANGE_PROBE_HOLD`]).
 fn range_probe_listener(verb: ControlVerb, body: &[u8]) -> Option<Listener> {
-    // Read as a plain object, keyed as written, a repeated key's last value
-    // winning as it does in gvproxy's decoder, so a body that would bind as a
-    // probe round there is recognised as one here, and the strict read that
-    // follows ([`probe_body_is_strict`]) refuses it if it carries anything
-    // beyond the round's own fields.
+    // Read as a plain object. The body is the canonical one by now
+    // ([`canonical_control_body`]): every key once, spelled exactly, so the
+    // fields read here are the fields gvproxy reads.
     let value: serde_json_lenient::Value = serde_json_lenient::from_slice(body).ok()?;
     let field = |name: &str| value.get(name).and_then(serde_json_lenient::Value::as_str);
     match verb {
@@ -4367,35 +4425,100 @@ fn range_probe_listener(verb: ControlVerb, body: &[u8]) -> Option<Listener> {
     .then_some(listener)
 }
 
-/// A range probe round's expose body, read strictly: exactly these fields,
-/// once each, spelled exactly. gvproxy's Go decoder matches keys without
-/// regard to case and lets a repeated key win, so a body carrying anything
-/// else could bind there what the gate never checked.
+/// An expose body read strictly (inbox#1180): exactly the three fields the
+/// daemon's own client sends, once each, spelled exactly. gvproxy's Go
+/// decoder matches keys without regard to case and lets a repeated key's
+/// last value win, so a body carrying anything else — `LOCAL` beside
+/// `local`, a second `remote` — could have gvproxy bind or dial what the
+/// gate never decided. The derived reader refuses an unknown key (which a
+/// case variant is) and a repeated one.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-struct ProbeExposeBody {
+struct StrictExposeBody {
     local: String,
     remote: String,
     protocol: String,
 }
 
-/// A range probe round's unexpose body, read as strictly as
-/// [`ProbeExposeBody`].
+/// An unexpose body, read as strictly as [`StrictExposeBody`].
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-struct ProbeUnexposeBody {
+struct StrictUnexposeBody {
     local: String,
     protocol: String,
 }
 
-/// Whether a probe-shaped body carries its own fields and nothing else:
-/// no unknown key, no key twice, no case variant of one.
-fn probe_body_is_strict(verb: ControlVerb, body: &[u8]) -> bool {
-    match verb {
-        ControlVerb::Expose => serde_json_lenient::from_slice::<ProbeExposeBody>(body).is_ok(),
-        ControlVerb::Unexpose => serde_json_lenient::from_slice::<ProbeUnexposeBody>(body).is_ok(),
-        ControlVerb::DnsAdd => false,
+/// A zone-add body, read as strictly as [`StrictExposeBody`]: the zone's
+/// name (the daemon's own client always sends it, and the decision reads
+/// it: [`summarize_dns_add`]) and its records. gvproxy's zone carries
+/// fields the gate never decides — a record's `regexp`, which answers every
+/// name it matches, and the zone's default address — so a body naming any
+/// of them, in any case, is refused.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct StrictZoneBody {
+    name: String,
+    records: Vec<StrictRecordBody>,
+}
+
+/// One zone-add record, read as strictly as its zone.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct StrictRecordBody {
+    name: String,
+    ip: String,
+}
+
+/// The body a control request is relayed with, rebuilt from its strict read
+/// (inbox#1180): the verb's own fields, parsed as strict JSON — no comment,
+/// no trailing comma, nothing past the one value — with no unknown, repeated
+/// or case-variant key, then written back in the daemon's own spelling. Every
+/// step after this reads these bytes, and the switch is written exactly
+/// these bytes, so what gvproxy decodes is what the gate decided, whatever
+/// the guest sent. `None` for a body with no strict read: refused, and never
+/// relayed.
+///
+/// The read is strict about the value's shape as well as its keys: the
+/// derived reader also takes a struct spelled as an array of its fields,
+/// which the daemon never sends, so the body's JSON value must be the
+/// rebuilt body's own.
+fn canonical_control_body(verb: ControlVerb, body: &[u8]) -> Option<Vec<u8>> {
+    fn reread<T>(body: &[u8]) -> Option<Vec<u8>>
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        let parsed: T = serde_json::from_slice(body).ok()?;
+        let canonical = serde_json::to_vec(&parsed).ok()?;
+        let sent: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let rebuilt: serde_json::Value = serde_json::from_slice(&canonical).ok()?;
+        (sent == rebuilt).then_some(canonical)
     }
+    match verb {
+        ControlVerb::Expose => reread::<StrictExposeBody>(body),
+        ControlVerb::Unexpose => reread::<StrictUnexposeBody>(body),
+        ControlVerb::DnsAdd => reread::<StrictZoneBody>(body),
+    }
+}
+
+/// The request the gate writes to the switch for `verb` and its canonical
+/// `body`: the head the daemon's own client writes (`post_json_within`,
+/// `crates/minimald/src/net/policy.rs`), framed by the body's own length.
+/// The guest's head is never relayed: its count framed the body the gate
+/// read, and nothing else in it is the gate's to pass on.
+fn canonical_control_request(verb: ControlVerb, body: &[u8]) -> Vec<u8> {
+    let path = match verb {
+        ControlVerb::Expose => "/services/forwarder/expose",
+        ControlVerb::Unexpose => "/services/forwarder/unexpose",
+        ControlVerb::DnsAdd => "/services/dns/add",
+    };
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    request
 }
 
 /// The request an admitted range probe round writes to the switch, built
@@ -4405,36 +4528,28 @@ fn probe_body_is_strict(verb: ControlVerb, body: &[u8]) -> bool {
 fn canonical_probe_request(verb: ControlVerb, listener: Listener) -> Vec<u8> {
     let local = forward_revoke::listener_local(listener.0, listener.1);
     let protocol = "tcp".to_string();
-    let (path, body) = match verb {
+    let (verb, body) = match verb {
         ControlVerb::Unexpose => (
-            "/services/forwarder/unexpose",
-            serde_json_lenient::to_vec(&ProbeUnexposeBody { local, protocol }),
+            ControlVerb::Unexpose,
+            serde_json::to_vec(&StrictUnexposeBody { local, protocol }),
         ),
         _ => (
-            "/services/forwarder/expose",
-            serde_json_lenient::to_vec(&ProbeExposeBody {
+            ControlVerb::Expose,
+            serde_json::to_vec(&StrictExposeBody {
                 local,
                 remote: switch::loopback::RANGE_PROBE_REMOTE.to_string(),
                 protocol,
             }),
         ),
     };
-    let body = body.expect("three strings always serialize");
-    let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    request.extend_from_slice(&body);
-    request
+    canonical_control_request(verb, &body.expect("three strings always serialize"))
 }
 
-/// The answer to a probe-shaped round the gate refuses for a key beyond its
-/// own fields: an HTTP refusal, so the guest reads a refusal, never a fault
-/// of the channel.
-fn probe_malformed_answer() -> Vec<u8> {
-    const BODY: &str = "a loopback range probe round carried a key beyond its own fields";
+/// The answer to a control request whose body has no strict read
+/// ([`canonical_control_body`]): an HTTP refusal, so the guest reads a
+/// refusal, never a fault of the channel.
+fn malformed_body_answer() -> Vec<u8> {
+    const BODY: &str = "the control body is not exactly the shape the daemon's own client sends";
     format!(
         "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\n\
          Content-Length: {}\r\n\r\n{BODY}\n",
@@ -4673,6 +4788,11 @@ fn summarize_dns_add(
     let Ok(parsed) = serde_json_lenient::from_slice::<DnsAddBody>(body) else {
         return Err(malformed(None));
     };
+    // The zone the records land in is decided before the records are: a
+    // record the row holds is the row's own only inside the box zone.
+    if parsed.name != box_zone_name() {
+        return Err(malformed(Some(parsed.name)));
+    }
     if parsed.records.is_empty() || parsed.records.len() > MAX_ZONE_RECORDS {
         return Err(malformed(None));
     }
@@ -7999,11 +8119,7 @@ pub(crate) mod test_support {
     /// the inside one), and as equal when it is not.
     pub(crate) fn expose_request(local: &str, remote: &str, protocol: &str) -> Vec<u8> {
         let body = format!(r#"{{"local":"{local}","remote":"{remote}","protocol":"{protocol}"}}"#);
-        let mut request =
-            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body.as_bytes());
-        request
+        daemon_request("/services/forwarder/expose", body.as_bytes())
     }
 
     /// The forwarder's retraction verb, spelled as the CLI the guest runs
@@ -8012,10 +8128,22 @@ pub(crate) mod test_support {
     /// which is the number the reply-flow records below are keyed by.
     pub(crate) fn unexpose_request(local: &str, protocol: &str) -> Vec<u8> {
         let body = format!(r#"{{"local":"{local}","protocol":"{protocol}"}}"#);
-        let mut request =
-            b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        daemon_request("/services/forwarder/unexpose", body.as_bytes())
+    }
+
+    /// A control request for `path` carrying `body`, spelled byte for byte
+    /// as the guest daemon's own client writes it (`post_json_within`,
+    /// `crates/minimald/src/net/policy.rs`): the one spelling the gate
+    /// relays (inbox#1180), so a test whose guest speaks it reads the same
+    /// bytes back off the switch end. Written out here rather than borrowed
+    /// from the gate, so the tests pin the spelling instead of echoing it.
+    pub(crate) fn daemon_request(path: &str, body: &[u8]) -> Vec<u8> {
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        )
+        .into_bytes();
         request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body.as_bytes());
+        request.extend_from_slice(body);
         request
     }
 
@@ -8235,10 +8363,10 @@ mod tests {
 
     use super::test_support::{
         CaptureWriter, DEADLINE, arp_frame, box_cohort_frame, capture_log, connect_control,
-        connect_over, expect_frame, expect_silence, expect_teardown, expose_request,
-        gate_connected, gate_connected_with_phase, gate_over, gate_over_control, gate_over_shipped,
-        gate_over_with, gate_over_with_node_baseline, ipv4_frame, ipv6_frame, read_within,
-        send_frame, unexpose_request, wait_for_log,
+        connect_over, daemon_request, expect_frame, expect_silence, expect_teardown,
+        expose_request, gate_connected, gate_connected_with_phase, gate_over, gate_over_control,
+        gate_over_shipped, gate_over_with, gate_over_with_node_baseline, ipv4_frame, ipv6_frame,
+        read_within, send_frame, unexpose_request, wait_for_log,
     };
     use super::{
         AcceptFailure, AliasRow, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter,
@@ -14221,10 +14349,17 @@ mod tests {
             .write_all(&request)
             .await
             .expect("writing the zone-add");
-        let mut spoken = vec![0u8; request.len()];
+        // The switch reads the zone-add as the gate rebuilt it from the
+        // fields it decided (inbox#1180): the same records, in the daemon's
+        // own compact spelling.
+        let canonical = daemon_request(
+            "/services/dns/add",
+            br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"},{"name":"web.host-a1b2","ip":"100.64.0.9"}]}"#,
+        );
+        let mut spoken = vec![0u8; canonical.len()];
         read_within(&mut h.switch, &mut spoken).await;
         assert_eq!(
-            spoken, request,
+            spoken, canonical,
             "the row's own name, both forms, reached the switch whole"
         );
     }
@@ -14290,7 +14425,7 @@ mod tests {
     /// grepped the stream for them would tear a perfectly legitimate control
     /// exchange down. The gate parses the body as the verb's own JSON shape
     /// and never as a byte scan, so a body carrying the path verbatim — in
-    /// the zone name it carries — is summarized as the request its shape says
+    /// a record name it carries — is summarized as the request its shape says
     /// it is, admitted by the row that holds its address like any other
     /// publish of the row's own name, and answered.
     #[tokio::test]
@@ -14299,9 +14434,11 @@ mod tests {
         tcp_lan_box(&registry, LEASE);
         // The request the guest's own control client writes, with a session
         // named after a branch — the legitimate body a content watch would
-        // have torn this exchange down over.
+        // have torn this exchange down over. The zone is the box zone, the
+        // one a zone-add may name (inbox#1180); the branch rides in the
+        // host-qualified record, which dot-extends the row's own name.
         let body =
-            br#"{"name":"fix/connection-leak","records":[{"name":"web","ip":"100.64.0.9"}]}"#;
+            br#"{"name":"min.internal.","records":[{"name":"web.fix/connection-leak","ip":"100.64.0.9"}]}"#;
         let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n\
                            Content-Type: application/json\r\n"
             .to_vec();
@@ -14381,9 +14518,7 @@ mod tests {
         // traffic and the guest is still on it: the state a smuggled second
         // request arrives in, however long the guest waits.
         let body = br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}]}"#;
-        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body);
+        let request = daemon_request("/services/dns/add", body);
         let answer: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         let mut h = gate_over_control(registry, request).await;
 
@@ -14474,9 +14609,7 @@ mod tests {
         // `Content-Length` it read out of the head and a body it decided on,
         // not the empty body of a hand-built one.
         let body = br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}]}"#;
-        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body);
+        let mut request = daemon_request("/services/dns/add", body);
         // The boundary the switch end's read is pinned to: the one request the
         // head declared, everything behind it being the gate's to refuse.
         let spoken_len = request.len();
@@ -14943,9 +15076,7 @@ mod tests {
         // name at its own address — so the connection really is relaying control
         // traffic and the guest is on it, idle, waiting.
         let body = br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}]}"#;
-        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body);
+        let request = daemon_request("/services/dns/add", body);
         let mut h = gate_over_control(registry, request).await;
 
         // The switch hangs up while the guest is idle: no request is in
@@ -15023,9 +15154,7 @@ mod tests {
         // One control request, spoken whole, answered by nothing: an honest
         // zone-add of the row's own name at its own address.
         let body = br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}]}"#;
-        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body);
+        let request = daemon_request("/services/dns/add", body);
         guest
             .write_all(&request)
             .await
@@ -15114,9 +15243,7 @@ mod tests {
         // an answer in, which is why neither leg can end the exchange. An
         // honest zone-add of the row's own name at its own address.
         let body = br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}]}"#;
-        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body);
+        let request = daemon_request("/services/dns/add", body);
         guest
             .write_all(&request)
             .await
@@ -18073,10 +18200,7 @@ mod tests {
         // rules, so a refusal turns on the listener alone. The publish stops
         // at what the host published.
         let body = br#"{"local":"127.0.0.1:9999","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
-        let mut request =
-            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body);
+        let request = daemon_request("/services/forwarder/expose", body);
         let mut h = gate_connected(registry).await;
         h.guest
             .write_all(&request)
@@ -18140,10 +18264,7 @@ mod tests {
         // 8080 on the host, dialing 18080 inside the box: the listener end is
         // the row's, the inside one no row carries.
         let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:18080","protocol":"tcp"}"#;
-        let mut request =
-            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body);
+        let request = daemon_request("/services/forwarder/expose", body);
         let mut h = gate_connected(registry).await;
         h.guest
             .write_all(&request)
@@ -18177,10 +18298,7 @@ mod tests {
         // own-address box's declaration
         // (`crates/minimald/src/net/policy.rs`).
         let body = br#"{"local":"127.0.64.9:8080","remote":"100.64.0.9:18080","protocol":"tcp"}"#;
-        let mut expose =
-            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        expose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        expose.extend_from_slice(body);
+        let expose = daemon_request("/services/forwarder/expose", body);
         let mut h = gate_connected(registry).await;
         h.guest
             .write_all(&expose)
@@ -18212,10 +18330,7 @@ mod tests {
         // publish was applied at — and the listener, and its own class, the
         // retraction's, not the malformed body's.
         let body = br#"{"local":"127.0.64.9:8080","protocol":"tcp"}"#;
-        let mut unexpose =
-            b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        unexpose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        unexpose.extend_from_slice(body);
+        let unexpose = daemon_request("/services/forwarder/unexpose", body);
         let (mut guest, mut switch) = connect_control(&h).await;
         guest
             .write_all(&unexpose)
@@ -18280,13 +18395,7 @@ mod tests {
     /// A control request in the guest daemon's own spelling
     /// (`post_json_within`, `crates/minimald/src/net/policy.rs`).
     fn control_request(path: &str, body: &str) -> Vec<u8> {
-        let mut request = format!(
-            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
-        )
-        .into_bytes();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body.as_bytes());
-        request
+        daemon_request(path, body.as_bytes())
     }
 
     /// #2748: gvproxy's Go decoder matches a key without regard to case and
@@ -18362,6 +18471,525 @@ mod tests {
             String::from_utf8_lossy(&canonical),
             "the switch reads the canonical request, not the guest's bytes"
         );
+    }
+
+    /// The body shapes the daemon's own client sends (`ExposeRequest`,
+    /// `UnexposeRequest`, `DnsZone`, `crates/minimald/src/net/policy.rs`), in
+    /// its own spelling, each with the keys its strict read takes: the
+    /// fixtures the strict-read tests below mutate (inbox#1180).
+    const STRICT_SHAPES: [(ControlVerb, &str, &[&str]); 3] = [
+        (
+            ControlVerb::Expose,
+            r#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:18080","protocol":"tcp"}"#,
+            &["local", "remote", "protocol"],
+        ),
+        (
+            ControlVerb::Unexpose,
+            r#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#,
+            &["local", "protocol"],
+        ),
+        (
+            ControlVerb::DnsAdd,
+            r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}]}"#,
+            &["name", "records"],
+        ),
+    ];
+
+    /// The strict read of `body` for `verb`, as the relay takes it.
+    fn strict_read(verb: ControlVerb, body: &str) -> Option<Vec<u8>> {
+        super::canonical_control_body(verb, body.as_bytes())
+    }
+
+    /// The spellings of `key` gvproxy's Go decoder takes for it and the
+    /// derived reader does not: every key its fold matches — upper case,
+    /// a capital, mixed case, and the Unicode fold of `s` (`ſ`) where the
+    /// key has one — and the key itself with a letter escaped, which every
+    /// JSON reader decodes back to the key. Go's fold has one other
+    /// non-ASCII letter, the Kelvin sign for `k`, and no key of the daemon's
+    /// shapes has a `k`, so it has nothing to stand in for here.
+    fn key_spellings(key: &str) -> Vec<String> {
+        let mut letters = key.chars();
+        let first = letters.next().expect("a key has a letter");
+        let rest: String = letters.collect();
+        let last = key.len() - 1;
+        let mut spellings = vec![
+            key.to_string(),
+            key.to_ascii_uppercase(),
+            format!("{}{rest}", first.to_ascii_uppercase()),
+            format!("{}{}", &key[..last], key[last..].to_ascii_uppercase()),
+            format!("\\u{:04x}{rest}", u32::from(first)),
+        ];
+        assert!(
+            !key.contains('k'),
+            "{key}: a key with a `k` needs its Kelvin-sign fold"
+        );
+        if key.contains('s') {
+            spellings.push(key.replace('s', "\u{17f}"));
+        }
+        spellings
+    }
+
+    /// inbox#1180, the refusal half, over every key of every shape: a body
+    /// with a key gvproxy reads and the gate's decision would not — any
+    /// spelling of a field beside the field itself, before it or after it,
+    /// an unknown key, a field missing or of another type — and a body that
+    /// is not exactly one strict JSON value — a trailing comma, a comment,
+    /// two bodies concatenated, bytes past the value, and every proper prefix
+    /// of the honest body — has no strict read, so the relay refuses it.
+    #[test]
+    fn a_control_body_beyond_the_daemons_shape_has_no_strict_read() {
+        for (verb, body, keys) in STRICT_SHAPES {
+            let open = &body[1..];
+            let close = &body[..body.len() - 1];
+            let mut refused: Vec<String> = Vec::new();
+            for key in keys {
+                let value = if *key == "records" {
+                    r#"[{"name":"evil","ip":"10.0.0.1"}]"#
+                } else {
+                    r#""0.0.0.0:2222""#
+                };
+                for spelling in key_spellings(key) {
+                    refused.push(format!(r#"{{"{spelling}":{value},{open}"#));
+                    refused.push(format!(r#"{close},"{spelling}":{value}}}"#));
+                }
+                let mut fields: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(body).expect("the fixture is JSON");
+                fields.insert((*key).to_string(), serde_json::Value::from(6));
+                refused.push(serde_json::Value::Object(fields.clone()).to_string());
+                fields.remove(*key);
+                refused.push(serde_json::Value::Object(fields).to_string());
+            }
+            refused.push(format!(r#"{close},"extra":1}}"#));
+            refused.push(format!("{close},}}"));
+            refused.push(format!("/* a comment */{body}"));
+            refused.push(format!("{body}{body}"));
+            refused.push(format!("{body}x"));
+            refused.push(format!("[{body}]"));
+            refused.push(String::new());
+            refused.extend((0..body.len()).map(|end| body[..end].to_string()));
+            for refused in refused {
+                assert!(
+                    strict_read(verb, &refused).is_none(),
+                    "{verb:?} {refused} has no strict read"
+                );
+            }
+        }
+        // A zone's records are read as strictly as the zone: a record's
+        // `regexp` would answer every name it matches, and a zone's default
+        // address every name the zone holds, so neither is the gate's to
+        // relay, in any spelling.
+        for refused in [
+            r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9","regexp":".*"}]}"#,
+            r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9","Regexp":".*"}]}"#,
+            r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9","IP":"10.0.0.1"}]}"#,
+            r#"{"name":"min.internal.","records":[{"name":"web","name":"evil","ip":"100.64.0.9"}]}"#,
+            r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}],"defaultIP":"10.0.0.1"}"#,
+            r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}],"Name":"com."}"#,
+            r#"{"name":"min.internal.","records":[["web","100.64.0.9"]]}"#,
+            r#"{"name":null,"records":[{"name":"web","ip":"100.64.0.9"}]}"#,
+        ] {
+            assert!(
+                strict_read(ControlVerb::DnsAdd, refused).is_none(),
+                "{refused} has no strict read"
+            );
+        }
+        // A struct spelled as an array of its fields is the derived reader's
+        // own leniency, never the daemon's spelling.
+        let array = r#"["127.0.0.1:8080","100.64.0.9:18080","tcp"]"#;
+        assert!(
+            strict_read(ControlVerb::Expose, array).is_none(),
+            "an expose spelled as an array has no strict read"
+        );
+    }
+
+    /// inbox#1180, the admission half: the daemon's own spelling is its own
+    /// canonical form, so every honest request relays byte for byte; a body
+    /// with the same fields in another order, spacing or escaping is
+    /// rebuilt into that spelling; the strict read of a canonical body is
+    /// itself; and the request the gate writes is the daemon's own head over
+    /// it, at the path the allow-list names for the verb.
+    #[test]
+    fn a_strict_read_rebuilds_the_daemons_own_spelling() {
+        for (verb, body, _) in STRICT_SHAPES {
+            assert_eq!(
+                strict_read(verb, body).as_deref(),
+                Some(body.as_bytes()),
+                "{verb:?}: the daemon's own spelling is its own canonical form"
+            );
+            let (_, path) = CONTROL_VERBS
+                .into_iter()
+                .find(|(listed, _)| *listed == verb)
+                .expect("every verb is on the allow-list");
+            let written = super::canonical_control_request(verb, body.as_bytes());
+            let daemon = daemon_request(&String::from_utf8_lossy(path), body.as_bytes());
+            assert_eq!(
+                String::from_utf8_lossy(&written),
+                String::from_utf8_lossy(&daemon),
+                "{verb:?}: the gate writes the daemon's own request"
+            );
+        }
+        let (_, expose, _) = STRICT_SHAPES[0];
+        let (_, unexpose, _) = STRICT_SHAPES[1];
+        let (_, zone, _) = STRICT_SHAPES[2];
+        for (verb, sent, canonical) in [
+            (
+                ControlVerb::Expose,
+                r#" { "protocol" : "tcp", "remote" : "100.64.0.9:18080", "local" : "127.0.0.1:8080" } "#,
+                expose,
+            ),
+            (
+                ControlVerb::Unexpose,
+                r#"{"loc\u0061l":"127.0.0.1:8080","protocol":"tcp"}"#,
+                unexpose,
+            ),
+            (
+                ControlVerb::DnsAdd,
+                "{\"records\":[\n  {\"ip\":\"100.64.0.9\",\"name\":\"web\"}\n],\"name\":\"min.internal.\"}",
+                zone,
+            ),
+        ] {
+            let read = strict_read(verb, sent).expect("the same fields have a strict read");
+            assert_eq!(
+                String::from_utf8_lossy(&read),
+                canonical,
+                "{verb:?} {sent} is rebuilt in the daemon's own spelling"
+            );
+            let again = super::canonical_control_body(verb, &read);
+            assert_eq!(
+                again.as_deref(),
+                Some(read.as_slice()),
+                "{verb:?}: a canonical body's strict read is itself"
+            );
+        }
+    }
+
+    /// inbox#1180, end to end: a control request whose decided fields the
+    /// row would admit, carrying beside them a key gvproxy would read
+    /// instead — a case variant of `local`, a second `local` or `remote`,
+    /// a record's `regexp`, a zone's default address — or a body that is not
+    /// one strict JSON value, is refused with an HTTP refusal and not one
+    /// byte of it reaches the switch, so gvproxy never binds, dials or
+    /// answers what the decision never saw. The honest request still relays.
+    #[tokio::test]
+    async fn a_control_request_beyond_the_daemons_shape_is_refused_unrelayed() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let h = gate_connected(registry).await;
+        for (path, body) in [
+            (
+                "/services/forwarder/expose",
+                r#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:18080","protocol":"tcp","LOCAL":"0.0.0.0:2222"}"#,
+            ),
+            (
+                "/services/forwarder/expose",
+                r#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:18080","protocol":"tcp","REMOTE":"10.0.0.1:22"}"#,
+            ),
+            (
+                "/services/forwarder/expose",
+                r#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:18080","protocol":"tcp","local":"0.0.0.0:2222"}"#,
+            ),
+            (
+                "/services/forwarder/expose",
+                r#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:18080","protocol":"tcp",}"#,
+            ),
+            (
+                "/services/forwarder/expose",
+                r#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:18080","protocol":"tcp"}{"local":"0.0.0.0:2222","remote":"10.0.0.1:22","protocol":"tcp"}"#,
+            ),
+            (
+                "/services/forwarder/unexpose",
+                r#"{"local":"127.0.0.1:8080","protocol":"tcp","Local":"127.0.0.1:9999"}"#,
+            ),
+            (
+                "/services/dns/add",
+                r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9","regexp":".*"}]}"#,
+            ),
+            (
+                "/services/dns/add",
+                r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"}],"defaultIP":"10.0.0.1"}"#,
+            ),
+        ] {
+            let refused = answered_unrelayed(&h, &daemon_request(path, body.as_bytes())).await;
+            assert!(
+                refused.starts_with("HTTP/1.1 400 "),
+                "{body} is refused with an HTTP refusal, got: {refused}"
+            );
+        }
+        wait_for_log(&h.log, MALFORMED_PUBLISH_RULE).await;
+        relayed_and_answered(
+            &h,
+            &expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp"),
+        )
+        .await;
+    }
+
+    /// inbox#1180: an admitted request reaches the switch as the gate rebuilt
+    /// it from the fields it decided — the daemon's own head and body — never
+    /// the guest's own bytes: not its field order or spacing, and not a
+    /// header of its head beyond the count that framed the body.
+    #[tokio::test]
+    async fn an_admitted_control_request_is_relayed_as_its_canonical_request() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let h = gate_connected(registry).await;
+        let body =
+            r#"{ "protocol": "tcp", "remote": "100.64.0.9:18080", "local": "127.0.0.1:8080" }"#;
+        let mut sent =
+            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: x\r\nX-Guest: 1\r\n".to_vec();
+        sent.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        sent.extend_from_slice(body.as_bytes());
+        let canonical = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        assert_ne!(sent, canonical);
+
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest.write_all(&sent).await.expect("writing the expose");
+        let mut spoken = vec![0u8; canonical.len()];
+        read_within(&mut switch, &mut spoken).await;
+        assert_eq!(
+            String::from_utf8_lossy(&spoken),
+            String::from_utf8_lossy(&canonical),
+            "the switch reads the canonical request, not the guest's bytes"
+        );
+        let answer = super::forward_revoke::bound_answer();
+        switch
+            .write_all(answer)
+            .await
+            .expect("writing gvproxy's answer");
+        let mut seen = vec![0u8; answer.len()];
+        read_within(&mut guest, &mut seen).await;
+        assert_eq!(seen, answer, "the answer reaches the guest verbatim");
+    }
+
+    /// inbox#1180, the zone a zone-add names: gvproxy files the records
+    /// under it and answers every query ending in it, so the decision reads
+    /// it. A zone-add whose records the row holds, at the row's own lease,
+    /// but naming any zone other than the box zone — another apex, the root,
+    /// `""` (which every name ends in), the box zone in another case or
+    /// without its dot, a zone inside it — reads strictly, is refused by the
+    /// decision, and not one byte of it reaches the switch. The same records
+    /// under the box zone still relay.
+    #[tokio::test]
+    async fn a_zone_add_naming_a_zone_other_than_the_box_zone_is_refused() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let h = gate_connected(registry).await;
+        for zone in [
+            "com.",
+            ".",
+            "",
+            "MIN.INTERNAL.",
+            "min.internal",
+            "web.min.internal.",
+        ] {
+            let body = format!(
+                r#"{{"name":"{zone}","records":[{{"name":"web","ip":"100.64.0.9"}},{{"name":"web.github","ip":"100.64.0.9"}}]}}"#
+            );
+            assert!(
+                strict_read(ControlVerb::DnsAdd, &body).is_some(),
+                "{body}: the zone's name is the decision's to refuse, not the strict read's"
+            );
+            let (mut guest, mut switch) = connect_control(&h).await;
+            guest
+                .write_all(&daemon_request("/services/dns/add", body.as_bytes()))
+                .await
+                .expect("writing the zone-add");
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("{n} byte(s) of a zone-add in {zone:?} reached the switch"),
+                Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+                Err(_) => panic!("the gate left the switch side hanging"),
+            }
+            expect_teardown(&mut guest).await;
+        }
+        wait_for_log(&h.log, MALFORMED_PUBLISH_RULE).await;
+        relayed_and_answered(
+            &h,
+            &daemon_request(
+                "/services/dns/add",
+                br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.9"},{"name":"web.github","ip":"100.64.0.9"}]}"#,
+            ),
+        )
+        .await;
+    }
+
+    /// The zone-add body [`super::summarize_dns_add`] refuses for its zone:
+    /// one record the row holds, under `zone`.
+    fn zone_add_in(zone: &str) -> String {
+        serde_json::json!({
+            "name": zone,
+            "records": [{"name": "web", "ip": "100.64.0.9"}],
+        })
+        .to_string()
+    }
+
+    /// inbox#1180 review: a refused value is the guest's, up to a body's
+    /// bound of anything a JSON string spells, so the refusal line names it
+    /// bounded and escaped. Every value the daemon's own client sends is
+    /// named as it is; a zone name carrying a newline or another control
+    /// character is named escaped, so it cannot break the line or forge one;
+    /// a name as long as a body can carry is cut to the bound on a char
+    /// boundary, with a marker naming its full length.
+    #[test]
+    fn a_refused_zone_name_is_named_bounded_and_escaped() {
+        use super::{MAX_LOGGED_WHAT, loggable_what};
+        use std::borrow::Cow;
+        for plain in [
+            "port 9999",
+            "127.0.0.2:8080",
+            "100.64.0.9",
+            "min.internal.",
+            "name web",
+            "",
+        ] {
+            assert!(
+                matches!(loggable_what(plain), Cow::Borrowed(named) if named == plain),
+                "{plain:?} is named as it is"
+            );
+        }
+        // A value that could pose as a field of the line (`key=value`, a quote,
+        // a backslash) is one quoted token, its own quotes escaped.
+        for posed in [
+            "x rule_matched=\"egress-control-upgrade\"",
+            "name \"web\"",
+            "a=b",
+            "back\\slash",
+        ] {
+            let named = loggable_what(posed);
+            assert_eq!(named, format!("{posed:?}"), "{posed:?} is escaped whole");
+            assert!(
+                named.starts_with('"')
+                    && named.ends_with('"')
+                    && !named[1..named.len() - 1].contains("\" "),
+                "{posed:?} is one quoted token: {named:?}"
+            );
+        }
+        let refused = |zone: &str| {
+            let mut dictionary = Vec::new();
+            match super::summarize_dns_add(zone_add_in(zone).as_bytes(), &mut dictionary) {
+                Err(refused) => refused,
+                Ok(_) => panic!("a zone-add in {zone:?} summarized"),
+            }
+        };
+
+        // A newline: the refusal keeps the name, and its line names it escaped.
+        let forged = "evil.\nWARN refused nothing rule_matched=\"forged\"";
+        let refusal = refused(forged);
+        assert_eq!(refusal.rule, MALFORMED_PUBLISH_RULE);
+        assert_eq!(
+            refusal.what.as_deref(),
+            Some(forged),
+            "the refusal keeps the name"
+        );
+        let named = loggable_what(forged);
+        assert_eq!(
+            named,
+            format!("{forged:?}"),
+            "within the bound it is escaped whole"
+        );
+        assert!(
+            !named.contains('\n'),
+            "an escaped name has no newline: {named:?}"
+        );
+        for control in ["\r", "\u{0}", "\u{1b}", "\u{7f}", "\u{85}", "\u{2028}"] {
+            let name = format!("web{control}min.internal.");
+            let named = loggable_what(&name);
+            assert!(
+                !named.chars().any(|c| c.is_control() || c == '\u{2028}'),
+                "{name:?} is named with no raw control character: {named:?}"
+            );
+        }
+
+        // A long name: cut to the bound, marked with the name's full length.
+        let long = format!("{}.", "a".repeat(7000));
+        let refusal = refused(&long);
+        assert_eq!(
+            refusal.what.as_deref(),
+            Some(long.as_str()),
+            "the refusal keeps the name"
+        );
+        let named = loggable_what(&long);
+        let marker = format!("\"... ({} bytes in all)", long.len());
+        assert!(
+            named.ends_with(&marker),
+            "the cut is marked, its quote closed: {named:?}"
+        );
+        assert_eq!(
+            named.len(),
+            MAX_LOGGED_WHAT + marker.len(),
+            "an ASCII name is cut at the bound"
+        );
+        // a cut never lands inside an escape: a value of quotes (two bytes each, escaped) keeps whole pairs,
+        // and the token still ends at its own quote before the marker
+        assert!(
+            named.starts_with("\"aaa"),
+            "the cut keeps the name's head: {named:?}"
+        );
+        let quotes = "\"".repeat(MAX_LOGGED_WHAT);
+        let quoted = loggable_what(&quotes);
+        let body = quoted
+            .strip_suffix(&format!("\"... ({} bytes in all)", quotes.len()))
+            .expect("marked");
+        assert!(
+            body.starts_with('"') && body.len() <= MAX_LOGGED_WHAT,
+            "{quoted:?}"
+        );
+        assert!(
+            !body.ends_with('\\') || body.ends_with("\\\\"),
+            "no dangling backslash before the closing quote: {quoted:?}"
+        );
+        assert_eq!(
+            (body.len() - 1) % 2,
+            0,
+            "whole escape pairs only: {quoted:?}"
+        );
+
+        // A cut inside a multi-byte character lands on its boundary, at every
+        // offset the bound can fall on.
+        for run in 0..=MAX_LOGGED_WHAT {
+            let name = format!("{}日{}", "x".repeat(run), "é".repeat(MAX_LOGGED_WHAT));
+            let named = loggable_what(&name);
+            let marker = format!("\"... ({} bytes in all)", name.len());
+            assert!(
+                named.len() <= MAX_LOGGED_WHAT + marker.len(),
+                "a {}-byte name is named within the bound, got {} bytes",
+                name.len(),
+                named.len()
+            );
+        }
+    }
+
+    /// The same two names through the gate: the refusal line is written,
+    /// names the zone escaped and bounded, and the guest's bytes reach the
+    /// log neither raw nor whole.
+    #[tokio::test]
+    async fn a_refused_zone_name_cannot_break_or_flood_the_refusal_line() {
+        let forged = "evil.\nforged=line".to_string();
+        let escaped = r#"port_or_name="evil.\nforged=line""#.to_string();
+        let long = format!("{}.", "a".repeat(7000));
+        let marker = format!("... ({} bytes in all)", long.len());
+        for (zone, needle) in [(forged, escaped), (long, marker)] {
+            let registry = BoxRegistry::new(SUBNET);
+            tcp_lan_box(&registry, LEASE);
+            let h = gate_connected(registry).await;
+            let (mut guest, _switch) = connect_control(&h).await;
+            let request = daemon_request("/services/dns/add", zone_add_in(&zone).as_bytes());
+            guest
+                .write_all(&request)
+                .await
+                .expect("writing the zone-add");
+            wait_for_log(&h.log, &needle).await;
+            let logged = h.log.contents();
+            assert!(
+                !logged.contains(zone.as_str()),
+                "the refused name never reaches the log raw, got: {logged}"
+            );
+            assert!(
+                !logged.lines().any(|line| line.starts_with("forged=line")),
+                "no line of the log is the guest's, got: {logged}"
+            );
+            expect_teardown(&mut guest).await;
+        }
     }
 
     /// Speaks `request` on a fresh control connection and answers it from
@@ -18690,10 +19318,7 @@ mod tests {
         // the daemon builds, carrying a declared port at the row's own
         // address, so the refusal that comes is the parser's alone.
         let body = br#"{"local":"127.0.0.2:8080","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
-        let mut request =
-            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        request.extend_from_slice(body);
+        let request = daemon_request("/services/forwarder/expose", body);
         let mut h = gate_connected(registry).await;
         h.guest
             .write_all(&request)
@@ -18758,10 +19383,7 @@ mod tests {
             // happens to be the listener's port too, but it decides nothing:
             // the record is the listener alone.
             let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
-            let mut expose =
-                b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-            expose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-            expose.extend_from_slice(body);
+            let expose = daemon_request("/services/forwarder/expose", body);
             h.guest
                 .write_all(&expose)
                 .await
@@ -18792,11 +19414,7 @@ mod tests {
             // applied at, the row's own: the refusal names that source, not
             // the unspecified one, which is the attribution made visible.
             let body = br#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#;
-            let mut unexpose =
-                b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-            unexpose
-                .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-            unexpose.extend_from_slice(body);
+            let unexpose = daemon_request("/services/forwarder/unexpose", body);
             let (mut guest, mut switch) = connect_control(&h).await;
             guest
                 .write_all(&unexpose)
@@ -18826,10 +19444,7 @@ mod tests {
             // own rule, naming the unspecified source, the port, and the
             // reason.
             let body = br#"{"local":"127.0.0.1:9999","protocol":"tcp"}"#;
-            let mut stray =
-                b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-            stray.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-            stray.extend_from_slice(body);
+            let stray = daemon_request("/services/forwarder/unexpose", body);
             let (mut guest, mut switch) = connect_control(&h).await;
             guest
                 .write_all(&stray)
@@ -19169,10 +19784,7 @@ mod tests {
             // The declared forward's publish, applied by the row, and its
             // answer read back so the ledger's attribution is in place.
             let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
-            let mut expose =
-                b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-            expose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-            expose.extend_from_slice(body);
+            let expose = daemon_request("/services/forwarder/expose", body);
             h.guest
                 .write_all(&expose)
                 .await
@@ -19196,11 +19808,7 @@ mod tests {
             // row's own address, where the row declares the port and its
             // runtime published nothing — refused, and never written on.
             let body = br#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#;
-            let mut unexpose =
-                b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-            unexpose
-                .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-            unexpose.extend_from_slice(body);
+            let unexpose = daemon_request("/services/forwarder/unexpose", body);
             let (mut guest, mut switch) = connect_control(&h).await;
             guest
                 .write_all(&unexpose)
@@ -19449,10 +20057,7 @@ mod tests {
         // lease the plan could hand out and no row holds. Applied — and said
         // so, marked as the interim's own line, naming the address.
         let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.10:8080","protocol":"tcp"}"#;
-        let mut expose =
-            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        expose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        expose.extend_from_slice(body);
+        let expose = daemon_request("/services/forwarder/expose", body);
         h.guest
             .write_all(&expose)
             .await
@@ -19476,10 +20081,7 @@ mod tests {
         // interim applies it — the publications whose rows are still to come
         // are the ones whose teardowns must work.
         let body = br#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#;
-        let mut unexpose =
-            b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        unexpose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        unexpose.extend_from_slice(body);
+        let unexpose = daemon_request("/services/forwarder/unexpose", body);
         let (mut guest, mut switch) = connect_control(&h).await;
         guest
             .write_all(&unexpose)

@@ -216,19 +216,9 @@ error: task 'deploy' declares `env_vars.TOKEN = { inherit = true }`, but TOKEN
 is not set in this shell; export it before running the task
 ```
 
-This applies to `min task run`, and to `min session run <session> <task>`,
-which runs a task against a session you already have. `min session run` reads
-the task's declaration from the project's `minimal.toml` on your machine, the
-only copy it can read, and resolves and gates it the same way. The session
-runs its own copy of the project, taken when it was activated. If that copy
-declares an `inherit` the file on your machine does not, the run is refused
-rather than resolved against the daemon's environment. This happens when the
-file changed after the session was activated, and when a stack provides the
-task, since `min` reads only the project's own file. For a changed file,
-destroy the session with `min session destroy <session>` and activate the
-project again with `min session activate`: a second activation alone leaves
-the old session in place. A `minimal.toml` on your machine that does not
-parse refuses the run before it reaches the session.
+This applies to `min task run`. It reads the task's declaration from the
+project's `minimal.toml` on your machine. A `minimal.toml` on your machine
+that does not parse refuses the run before the task's box is created.
 
 `min run <task>`, from *inside* a session, has no invoking client to read
 from, so it still resolves `inherit` against the daemon's environment. Prefer
@@ -331,6 +321,13 @@ missing read-only source is an error naming the task and the patch declaration.
 Mapped paths must be absolute or start with `~/`, in which case the tilde is expanded to the user's
 home directory.
 
+`mip run <task>` checks each entry against the `[patches]` section of your
+[user policy](./user-policy.md) before it builds the sandbox, and so does a `min run <task>` from
+inside that sandbox. A denied entry, or a directory that holds a path a `deny` rule names, refuses the run
+with `policy denied`. An ignored entry is left out, with a warning. An entry that no rule allows
+refuses the run and prints the `[patches] allow` snippet that would approve it, since `mip` does not
+prompt.
+
 In a task the daemon runs in the session layout, `~/` expands to the session home. The daemon
 mounts a mapping inside that home or the project tree at the matching path under `/home` or
 `/workbench`. It mounts the mapping on top of the read-write session mounts, so a read-only mapping
@@ -384,10 +381,11 @@ Usage: mip run greeter --name <name> --greeting <greeting>
 $> min task run greeter --name Alice --greeting hi
 ```
 
-`min task run` reads its own options (`--path`, `--help`) before the task's. To pass a
-task argument with one of those names, put it after `--`, as in
-`min task run deploy -- --path prod`. The project directory is the `--path` option, not a
-positional argument.
+`min task run` reads its own options (such as `--detach` and `--help`) before the
+task's. To pass a task argument with one of those names, put it after `--`, as
+in `min task run deploy -- --detach prod`. The project directory is the global
+`-C <dir>` option, as in `min -C ../app task run deploy`, not a positional
+argument.
 
 Each argument's datatype may be:
 
@@ -410,13 +408,12 @@ exec = "echo Hello %{name}"
 
 A task has no `--network` flag of its own. It uses the network of the
 session that runs it, which the session's
-[`--network` mode](./cli-min.md#session-activate) sets:
+[`--network` mode](./cli-min.md#session-start) sets:
 
 - `min task run` composes an ephemeral session with the default mode,
   `host_ip`.
-- `min run <task>` inside a session and
-  [`min session run <session> <task>`](./cli-min.md#session-run) run the task
-  in a session that already exists. The task takes that session's mode.
+- `min run <task>` inside a session runs the task in a session that already
+  exists. The task takes that session's mode.
 
 `host_ip` (the default) shares the host's network namespace. The task
 reaches everything the host reaches. This includes the host-side hostname

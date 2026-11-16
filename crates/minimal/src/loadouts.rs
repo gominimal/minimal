@@ -39,6 +39,106 @@ impl LoadoutSelection {
     }
 }
 
+/// The loadout gate of `entry`, the entry a box creation expands, in the
+/// `minimal.toml` whose bytes are `bytes`. It reads the layers up to and
+/// including the entry, the type chain's constraints and `named`, the
+/// loadouts a `--loadout` flag names, and never a loadout file. So a
+/// sealed box reads no default loadout (BOX-175).
+///
+/// An entry whose type does not resolve takes the defaults and the
+/// constraints of its type name when that name is built in.
+///
+/// # Errors
+///
+/// The refusals of [`mfile::expand::loadout_gate`], each with exit 3, and
+/// a legacy table this release no longer reads. An entry whose type name
+/// is not built in and does not resolve fails with
+/// [`mfile::Error::BoxType`], exit 3.
+pub(crate) fn entry_loadout_gate(
+    bytes: Option<&[u8]>,
+    entry: &mfile::entry::BoxEntry,
+    named: &[String],
+) -> Result<mfile::expand::LoadoutMode, mfile::Error> {
+    let mut doc = match bytes {
+        Some(bytes) => toml::from_slice::<toml::Table>(bytes).map_err(mfile::Error::Format)?,
+        None => toml::Table::new(),
+    };
+    // The hint for a legacy table prints when the file loads, so the hints
+    // this rewrite returns do not print again.
+    mfile::legacy::canonicalize(&mut doc, mfile::legacy::this_release())?;
+    let defaults = doc
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let types = mfile::box_types::BoxTypes::from_file(&doc);
+    let project_types = types
+        .as_ref()
+        .map(|types| types.project().keys().cloned().collect())
+        .unwrap_or_default();
+    let resolved = match types {
+        Ok(types) => mfile::expand::expandable_type(entry, &types),
+        Err(error) => Err(error),
+    };
+    let (type_defaults, type_constraints) = match resolved {
+        Ok(resolved) => (resolved.defaults, resolved.constraints),
+        // A built-in type name keeps its built-in defaults and its built-in
+        // constraints, so a `build` entry that sets `open` is refused. Any
+        // other name has constraints the gate cannot read, so the gate
+        // refuses the entry rather than decide the mode without them.
+        Err(error) => match builtin_type_layer(entry) {
+            Some(layer) => {
+                tracing::debug!(%error, "the loadout gate reads the entry with its built-in type");
+                layer
+            }
+            None => return Err(mfile::Error::BoxType(Box::new(error))),
+        },
+    };
+    let layers = mfile::expand::Layers {
+        type_defaults,
+        type_constraints,
+        named_loadouts: named.to_vec(),
+        ..mfile::expand::Layers::default()
+    }
+    .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+    let mode = mfile::expand::loadout_gate(entry, &layers)?;
+    tracing::info!(entry = %entry.name, loadout_mode = ?mode, "the box's loadout mode");
+    Ok(mode)
+}
+
+/// A type chain's layers: its defaults and its constraints, each by type.
+type TypeLayer = (Vec<(String, toml::Table)>, Vec<(String, toml::Table)>);
+
+/// The type layer of an entry whose type does not resolve: the built-in
+/// defaults and the built-in constraints of its type name, when the name
+/// is built in.
+fn builtin_type_layer(entry: &mfile::entry::BoxEntry) -> Option<TypeLayer> {
+    entry
+        .box_type
+        .as_deref()
+        .and_then(mfile::box_types::builtin)
+        .map(|root| {
+            (
+                vec![(root.to_owned(), mfile::box_types::builtin_defaults(root))],
+                vec![(root.to_owned(), mfile::box_types::builtin_constraints(root))],
+            )
+        })
+}
+
+/// `selection` under the box's loadout `mode`. A sealed box selects no
+/// loadout, so its default loadouts are never read and nothing prints
+/// about them (BOX-171, BOX-175). [`entry_loadout_gate`] already refused
+/// a `--loadout` for a sealed box (BOX-173).
+pub(crate) fn gate_selection(
+    selection: LoadoutSelection,
+    mode: mfile::expand::LoadoutMode,
+) -> LoadoutSelection {
+    match mode {
+        mfile::expand::LoadoutMode::Open => selection,
+        mfile::expand::LoadoutMode::Sealed => LoadoutSelection::None,
+    }
+}
+
 /// Filename stem and `name` of the built-in `default` loadout.
 const BUILTIN_DEFAULT_NAME: &str = "default";
 
@@ -192,9 +292,19 @@ pub(crate) fn resolve_active_loadouts(
             // `LoadError`'s Display already embeds its I/O source, so flatten
             // it to a leaf before adding context; otherwise anyhow re-renders
             // the underlying error a second time from the chain.
+            // BCLI-034: a loadout name with no loadout file is not found
+            // (exit 4), from `--loadout` and `default_loadouts` alike. The
+            // text is the same as before.
             boxes::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name)
                 .map(|(loadout, _layout)| loadout)
-                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map_err(|e| match e {
+                    boxes::client::disk::LoadError::NotFound { .. } => {
+                        anyhow::Error::new(LoadoutNotFound {
+                            message: e.to_string(),
+                        })
+                    }
+                    e => anyhow::anyhow!("{e}"),
+                })
                 .with_context(|| format!("{source} `{name}`"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -204,6 +314,28 @@ pub(crate) fn resolve_active_loadouts(
         builtin_default: false,
     })
 }
+
+/// A loadout name, from `--loadout` or `default_loadouts`, that no loadout
+/// file carries. The run ends with exit 4 (`main.rs`), the architecture's
+/// code for a thing not found.
+#[derive(Debug)]
+pub struct LoadoutNotFound {
+    /// The loader's own text, which names the paths it looked at.
+    pub message: String,
+}
+
+impl LoadoutNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for LoadoutNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LoadoutNotFound {}
 
 /// Whether the user has a `default` loadout of their own on disk, in
 /// either layout — the probe behind the zero-config fallback in
@@ -548,9 +680,16 @@ impl ActivationInputs {
     /// Print the "Applying loadouts" orientation line the CLI emits at
     /// session start. Never called by the dashboard, which owns its screen.
     pub(crate) fn announce_loadouts(&self) {
-        if !self.loadout_names.is_empty() {
-            eprintln!("Applying loadouts: {}", self.loadout_names.join(", "));
+        if let Some(line) = self.loadouts_line() {
+            eprintln!("{line}");
         }
+    }
+
+    /// The line [`Self::announce_loadouts`] prints, or `None` when no
+    /// loadout applies, so a sealed box prints nothing (BOX-171).
+    pub(crate) fn loadouts_line(&self) -> Option<String> {
+        (!self.loadout_names.is_empty())
+            .then(|| format!("Applying loadouts: {}", self.loadout_names.join(", ")))
     }
 }
 
@@ -626,6 +765,16 @@ pub(crate) fn prepare_activation_inputs_with_config(
     let initial_policy = user_policy.clone();
     let compose_options = compose_options_from_config(cfg);
     let active = resolve_active_loadouts(selection, cfg, global)?;
+    // BOX-172: the gate read the mode before any loadout, so a loadout's
+    // `loadout_mode` would do nothing. Refuse it, so its author learns.
+    if let Some(loadout) = active.loadouts.iter().find(|l| l.sets_loadout_mode()) {
+        return Err(crate::ProjectFileInvalid {
+            error: mfile::Error::LoadoutSetsLoadoutMode {
+                loadout: Some(loadout.name().as_ref().to_owned()),
+            },
+        }
+        .into());
+    }
     let loadout_names = active
         .loadouts
         .iter()

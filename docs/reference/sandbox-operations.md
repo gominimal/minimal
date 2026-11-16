@@ -86,9 +86,8 @@ The stances apply only to a `--network own_ip` box. On a `host_ip` box (the
 default), the port does not need exposing: the box shares the host's network
 and already answers at `<box>.min.internal:<PORT>`. Minimal refuses the
 request from a `--network none` box. A deny or an unanswered `ask` names its
-way forward, such as re-activating with the flags or the host-side
-[`min net forward`](./cli-min.md#net-forward). Runtime publishes appear in
-[`min session policy`](./cli-min.md#session-policy).
+way forward, such as starting the box again with the flags or the host-side
+[`min net forward`](./cli-min.md#net-forward).
 
 ### `package build <PACKAGES...>`
 

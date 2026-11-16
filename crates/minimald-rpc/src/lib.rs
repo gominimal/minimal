@@ -111,6 +111,44 @@ pub struct GetVersionResponse {
     pub version: String,
     pub long_version: String,
     pub stdlib_version: String,
+    /// The version of the expansion the daemon applies to a box spec, as
+    /// [`expander_version`] forms it (BOX-074). `None` from a daemon that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expander_version: Option<String>,
+}
+
+/// The expander version of a build: the Box Spec shape version and the
+/// projection version, joined by a dot (BOX-074). The client and the
+/// daemon each pass their own `mfile` constants, so two builds that
+/// expand and project a spec the same way report the same version.
+#[must_use]
+pub fn expander_version(spec_version: u32, projection_version: i64) -> String {
+    format!("{spec_version}.{projection_version}")
+}
+
+/// What the client prints when its expander version differs from the
+/// daemon's (BOX-074), or `None` when the two match. `daemon` is `None`
+/// when the daemon reports no expander version. The create goes ahead:
+/// the daemon's digest comparison and admission check are the checks
+/// that refuse it.
+#[must_use]
+pub fn expander_skew_message(cli: &str, daemon: Option<&str>) -> Option<String> {
+    let first = match daemon {
+        Some(daemon) if daemon == cli => return None,
+        Some(daemon) => format!(
+            "This `min` uses minimal.toml expansion version {cli}, \
+             and minimald uses expansion version {daemon}."
+        ),
+        None => format!(
+            "This `min` uses minimal.toml expansion version {cli}, \
+             and minimald does not report its expansion version."
+        ),
+    };
+    Some(format!(
+        "{first} The command continues. minimald refuses to create the box \
+         if it reads the box settings differently from this `min`."
+    ))
 }
 
 impl OneshotSshRpc for GetVersion {
@@ -634,6 +672,38 @@ pub struct BoxConfig {
     /// box's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_registration: Option<String>,
+}
+
+/// The [`BoxConfig::attrs`] key that carries the client's projection
+/// digest of the spec it sends: the base64url SHA-256 of the spec's
+/// Gatehouse §6.3.2 projection (BOX-071). The daemon stores it in the
+/// box's record under the same key, beside its own digest under
+/// [`DAEMON_PROJECTION_DIGEST_ATTR`]. A client that predates the key
+/// sends none, and the record then holds the daemon's digest alone.
+pub const CLIENT_PROJECTION_DIGEST_ATTR: &str = "projection_digest.client";
+
+/// The record `attrs` key under which the daemon stores the digest it
+/// recomputed from the spec it received (BOX-071). Daemon-owned: a
+/// client that sends this key has it stripped at creation.
+pub const DAEMON_PROJECTION_DIGEST_ATTR: &str = "projection_digest.daemon";
+
+impl BoxConfig {
+    /// The projection digest the client computed for the spec it sends,
+    /// [`CLIENT_PROJECTION_DIGEST_ATTR`] (BOX-071). `None` when the client
+    /// sent none.
+    #[must_use]
+    pub fn client_projection_digest(&self) -> Option<&str> {
+        self.attrs
+            .get(CLIENT_PROJECTION_DIGEST_ATTR)
+            .map(String::as_str)
+    }
+
+    /// Sets the projection digest the client computed for the spec it
+    /// sends (BOX-071).
+    pub fn set_client_projection_digest(&mut self, digest: impl Into<String>) {
+        self.attrs
+            .insert(CLIENT_PROJECTION_DIGEST_ATTR.to_owned(), digest.into());
+    }
 }
 
 /// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
@@ -2937,6 +3007,12 @@ pub struct BoxListingEntry {
     /// sends none, and the box reads as one with no terminal.
     #[serde(default)]
     pub pty_enabled: bool,
+    /// The `lifetime` the box's stored spec sets, such as `until_stopped`,
+    /// so a client can name the command that starts the box again
+    /// (BCLI-009). `None` for a spec that sets none, a box filed with no
+    /// spec, and a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
 }
 
 /// The response for a [`ListBoxes`] RPC.
@@ -3016,6 +3092,35 @@ impl OneshotSshRpc for ShowBox {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox");
     type Request<'a> = ShowBoxRequest;
     type Response = Errorable<ShowBoxResponse>;
+}
+
+/// An RPC to read the spec a box was created with: the stored copy beside
+/// its record (BOX-068), for `min box spec <box>` (BCLI-022).
+pub struct GetBoxSpec;
+
+/// The request for a [`GetBoxSpec`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBoxSpecRequest {
+    /// The box to read, as a listing reports its id.
+    pub id: SessionId,
+}
+
+/// The response for a [`GetBoxSpec`] RPC. An id that no retained record
+/// names is the [`Errorable::Err`] that starts with
+/// [`UNKNOWN_SESSION_ID_LEAD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GetBoxSpecResponse {
+    /// The stored spec, as its creating client sent it. `None` for a box
+    /// with no stored spec: one created before specs were stored, or by a
+    /// client that sent none.
+    #[serde(default)]
+    pub spec: Option<serde_json_lenient::Value>,
+}
+
+impl OneshotSshRpc for GetBoxSpec {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetBoxSpec");
+    type Request<'a> = GetBoxSpecRequest;
+    type Response = Errorable<GetBoxSpecResponse>;
 }
 
 /// An RPC to reap one box: delete its record, its events and its
@@ -4165,6 +4270,7 @@ mod box_listing_tests {
             exit_code: None,
             signal: None,
             pty_enabled: true,
+            lifetime: None,
         }
     }
 

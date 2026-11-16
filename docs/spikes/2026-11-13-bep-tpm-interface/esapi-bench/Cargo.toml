@@ -1,0 +1,13 @@
+[package]
+name = "esapi-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tss-esapi = { version = "=7.7.0", default-features = false }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Not a member of the minimal workspace.
+[workspace]

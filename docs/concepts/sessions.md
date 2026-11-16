@@ -25,7 +25,7 @@ each project its own isolated environment:
 
 - **Reproducible.** A session's tools come from Minimal packages, built or
   fetched deterministically from your project's declarative config. Two people
-  who activate the same project get the same environment.
+  who start the same project get the same environment.
 - **Isolated.** Everything that runs in a session runs in a sandbox. Your
   host filesystem, host environment, and other projects are not visible inside
   it unless the project or your policy brings them in.
@@ -62,40 +62,44 @@ it.
 
 ## Creating and entering a session
 
-You create a session by **activating** a project. From the project directory:
+You create a session by **starting** a session entry of a project. From the project directory:
 
 ```console
-$ min session activate --attach
+$ min session start
 ```
 
-`min session activate` takes a project path that defaults to the current directory.
-`--attach` drops you straight into a shell in the new session once it is ready.
-Without `--attach`, activation prints the new session's id and returns, leaving
-the session ready in the background for you to attach to later.
+`min session start` reads the project in the current directory. Pass `-C <dir>`
+to start a session from another project directory. On a terminal, the command
+attaches you to a shell in the new session once it is ready. With `--detach`,
+the command prints the new session's id and returns, and leaves the session
+ready in the background for you to attach to later.
 
-A few things happen during activation:
+A few things happen when a session starts:
 
-1. `min` resolves the project path and, if the project has no `minimal.toml`
+1. `min` resolves the project directory and, if the project has no `minimal.toml`
    yet, offers to scaffold one on an interactive terminal; when prompts are
    skipped (`--no-input`, or a non-terminal stdin) it prints a notice and
    continues without writing anything to the directory. Either way the session
    still comes up with a default environment.
 2. Your project files are uploaded into the session's workspace on the provider
-   so it can read your config. You can opt out of this with `--sync none`.
+   so it can read your config.
 3. The session is composed from your project config plus any loadouts (see the
    next section), and any environment values that need your approval are gated
    against your user policy.
 
-Useful activation options:
+Useful start options:
 
 - `--name <NAME>` gives the session a stable, human-friendly name you can use
   in place of its id.
+- `--new` creates another session from the same entry, even when a running
+  session holds the entry's name.
+- `--detach` creates the session and returns without attaching. Off a terminal,
+  the command requires `--detach`.
 - `--loadout <NAME>` applies a named loadout (repeatable); `--no-loadouts`
   applies none.
-- `--no-prompt` fails instead of prompting when composition surfaces items your
-  policy cannot auto-decide, printing a ready-to-paste policy snippet instead.
-  This mode is selected automatically when stdout or stderr is not a terminal,
-  so activation is safe to run from scripts and CI.
+
+The [`session start`](../reference/cli-min.md#session-start) section of the CLI
+reference lists every flag.
 
 To enter a session that already exists, **attach** to it by id or name:
 
@@ -104,7 +108,7 @@ $ min session attach my-session
 ```
 
 Attach opens an interactive shell inside the session, with your tools on `PATH`
-and the session's workspace (your project files, uploaded at activation) as your
+and the session's workspace (your project files, uploaded at start) as your
 working directory. That shell is bash unless a loadout asks for another one it
 has installed — set `SHELL` in `[vars]` to be dropped into zsh, fish, nushell,
 or POSIX `sh` instead ([reference](../reference/loadouts.md#session-shell)).
@@ -113,14 +117,13 @@ background, and `min session attach` rejoins it later. Changes you make inside s
 the session's workspace; bring them back to the host by pushing them out with
 `git push min://<session>`.
 
-Activating a project whose directory already has a session does not reuse that
-session: `min` warns, names the existing session, and creates a second one
-anyway. Once two sessions share a path, `min` can no longer resolve that
-directory to a single session, so a bare `min` there is ambiguous and `min
-session attach` opens a picker to choose between them (erroring when
-`--no-input` is set or stdin/stdout is not a terminal). Attach to the existing
-session instead of activating again when
-you mean to rejoin it.
+Starting an entry whose name a running session already holds does not reuse
+that session: `min session start` refuses, and creates nothing. Attach to the
+existing session when you mean to rejoin it. Pass `--new` or `--name <NAME>`
+when you want a second session from the same entry. Once two sessions share a
+project directory, a bare `min session attach` there opens a picker to choose
+between them (and fails when `--no-input` is set or stdin/stdout is not a
+terminal).
 
 ## How a session is composed
 
@@ -185,43 +188,40 @@ scripting, and `--json` prints the full list as JSON.
 Rename a session:
 
 ```console
-$ min session rename my-session backend-work
+$ min box rename my-session backend-work
 ```
 
-Destroy a session when you are finished with it:
+Remove a session when you are finished with it:
 
 ```console
-$ min session destroy my-session
+$ min box rm --force my-session
 ```
 
-`min session destroy` terminates a single session by id or name.
-`min session destroy --all` tears down every session at once (add `--force` to
-skip the confirmation).
+`min box rm` removes one session by id or name. `--force` stops the session
+first when it is still running.
 
-Stop the provider itself:
+Stop a host, which is the daemon that runs your sessions:
 
 ```console
-$ min stop
+$ min host list
+$ min host stop local0
 ```
 
-`min stop` shuts down the active provider.
-Stopping the provider ends
-every running shell, but the sessions themselves survive: their records and
-workspaces persist, and a provider that comes back up re-hosts them (the extras
-composed from loadouts are rebuilt when you re-activate). The provider refuses
-to shut down while any session is busy (a live shell, or an activation in
-flight) unless you pass `--force`. Contrast this with `min session destroy`, which
-removes one session entirely and leaves the provider running to host the rest.
+`min host list` prints the names of the local hosts. `min host stop <host>`
+stops each running session on that host, and then stops its daemon. Pass
+`--force` to force-stop each session and to stop the daemon without waiting
+for a clean shutdown. Contrast this with `min box rm`, which
+removes one session entirely and leaves the host running for the other sessions.
 Because `min` auto-spawns a provider on demand, the next `min` command after a
 stop simply brings one back up.
 
-You can inspect a session's effective networking rules, rendered as text.
-Pass `-o json` for the machine-readable document; see the CLI reference's
-[`session policy`](../reference/cli-min.md#session-policy) section:
+You can inspect the network settings that a session was created with:
 
 ```console
-$ min session policy my-session
+$ min box show my-session --network
 ```
+
+`min box show <box> --network` prints the `[network]` section of the box.
 
 And list the loadouts available in your user config:
 
@@ -249,9 +249,8 @@ packages that task needs. If a needed package is not present, Minimal builds it
 or fetches it from a remote cache first. Loadouts contribute to the session's
 interactive shell only, never to tasks, so your personal tooling cannot
 influence a task's deterministic execution. Running `min task run <task>` is
-the non-interactive way to trigger a declared task; `min session run <session>
-<task>` runs one against a session you already have, rather than composing a
-task session of its own.
+the non-interactive way to trigger a declared task. It runs the task as a box
+of its own, with its own filesystem and network.
 
 The through-line: a **session** is the durable, named environment a provider
 hosts; a **sandbox** is the isolated execution context composed from a package
