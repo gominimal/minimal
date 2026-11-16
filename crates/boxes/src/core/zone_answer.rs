@@ -19,7 +19,7 @@
 //! | Lookup | Verdict |
 //! |---|---|
 //! | from off this machine | [`Verdict::Silent`] |
-//! | a name outside the box zone | [`Verdict::Refused`] |
+//! | a name outside the box zone | [`Verdict::Refused`] (NXDOMAIN, root-owned SOA) |
 //! | the apex `min.internal` | [`Verdict::Nodata`] |
 //! | in-zone, held, live, A, with an address | [`Verdict::Address`] |
 //! | in-zone, held — any other shape | [`Verdict::Nodata`] |
@@ -33,11 +33,14 @@
 //! *held*: the zone never says NXDOMAIN for a box that exists, and never
 //! hands out an address nothing is answering on.
 //!
-//! Every negative — NODATA and NXDOMAIN — is a negative the answerer is
-//! authoritative for, so it carries the zone's SOA in the reply's
-//! authority section for the host resolver to cache (NET-124, RFC 2308);
-//! REFUSED, a namespace that is not ours, carries nothing. The relays that
-//! answer an out-of-zone name NXDOMAIN cite [`out_of_zone_soa`]. The SOA, and
+//! Every in-zone negative — NODATA and NXDOMAIN — is a negative the
+//! answerer is authoritative for, so it carries the zone's SOA in the
+//! reply's authority section for the host resolver to cache (NET-124,
+//! RFC 2308). An out-of-zone name ([`Verdict::Refused`]) is a namespace that
+//! is not ours. The native answerer and the relays answer it NXDOMAIN,
+//! not authoritative, citing the root-owned [`out_of_zone_soa`] (NET-079).
+//! It is not REFUSED: glibc reads REFUSED as a temporary failure. The VM
+//! host daemon's answerer still answers it REFUSED, with no SOA. The SOA, and
 //! the records the A answers come in, are wire things: the answerer that
 //! calls this decision builds them, at a TTL of at most
 //! [`ANSWER_TTL_SECS`] (NET-126).
@@ -222,10 +225,12 @@ pub enum Verdict {
     /// (NET-006). The zone leaves the machine with *nothing*, not even a
     /// refusal.
     Silent,
-    /// REFUSED: the name is outside the box zone, and this answerer is
-    /// authoritative for the zone and nothing else. No authority section —
-    /// the zone's SOA certifies its own negatives, never someone else's
-    /// namespace.
+    /// Out of zone: the name is outside the box zone, and this answerer is
+    /// authoritative for the zone and nothing else. The native answerer
+    /// replies NXDOMAIN, not authoritative, citing the root-owned
+    /// [`out_of_zone_soa`] (NET-079), never the zone's SOA: that SOA
+    /// certifies the zone's own negatives only. The variant keeps its old
+    /// name. The VM host daemon's answerer still replies REFUSED.
     Refused,
     /// NODATA: the name is held — or is the apex, which carries the SOA —
     /// and there is no record to give. The reply is authoritative and
@@ -246,7 +251,8 @@ pub enum Verdict {
 /// they ask — then the zone's own boundary: the apex is held (it carries
 /// the SOA every negative cites, so it is NODATA, never NXDOMAIN —
 /// answering that the zone does not exist while citing its SOA in the same
-/// reply would contradict itself), a name outside the zone is REFUSED, and
+/// reply would contradict itself), a name outside the zone is out of zone
+/// ([`Verdict::Refused`], answered NXDOMAIN with the root-owned SOA), and
 /// a name inside is decided by the view: held, and held live with an
 /// address for an A lookup, answers the address; held in any other shape —
 /// non-A, no address, or a namespace that is stopped — is NODATA; held by
@@ -265,7 +271,7 @@ pub fn decide(lookup: &Lookup, view: &ZoneView) -> Verdict {
     }
     if !in_zone(&name) {
         // Authoritative for the box zone and nothing else: a name that
-        // strayed in is REFUSED, visibly, with no SOA of ours attached.
+        // strayed in is out of zone, with no SOA of ours attached.
         return Verdict::Refused;
     }
     match view.held(&name) {
@@ -471,12 +477,12 @@ mod tests {
             "an empty zone holds nothing: every in-zone name is NXDOMAIN"
         );
 
-        // A name outside the box zone is REFUSED, whatever it asks —
+        // A name outside the box zone is out of zone, whatever it asks —
         // authoritative for the zone and nothing else.
         assert_eq!(
             decide(&a_lookup("example.com"), &view),
             Verdict::Refused,
-            "an out-of-zone name is REFUSED"
+            "an out-of-zone name is out of zone"
         );
 
         // The apex is held: it carries the SOA every negative cites, so it

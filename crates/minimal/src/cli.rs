@@ -301,7 +301,7 @@ pub enum SessionCommand {
 #[derive(Debug, Args)]
 pub struct SetupZedArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Zed settings file to edit (default: `~/.config/zed/settings.json`)
     #[arg(long, value_name = "FILE")]
@@ -315,7 +315,7 @@ pub struct SetupZedArgs {
 #[derive(Debug, Args)]
 pub struct HooksArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Emit the raw JSON the daemon returned instead of a table
     #[arg(long)]
@@ -325,7 +325,7 @@ pub struct HooksArgs {
 #[derive(Debug, Args)]
 pub struct ExecArgs {
     /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Command to execute in the session context
     ///
@@ -340,7 +340,7 @@ pub struct ExecArgs {
 #[derive(Debug, Args)]
 pub struct SessionRunArgs {
     /// Session identifier (UUID, unique id prefix, or session name).
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Name of a task declared in the session project's minimal.toml
     pub task: String,
@@ -349,7 +349,7 @@ pub struct SessionRunArgs {
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Write one JSON document instead of text (the default)
     #[arg(short = 'o', long = "output", value_enum)]
@@ -559,11 +559,18 @@ pub enum BoxCommand {
 pub struct BoxLogsArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Show the output so far, then keep showing new output as the box
     /// writes it, until the box is removed or the command is interrupted
     #[arg(short = 'f', long)]
     pub follow: bool,
+    /// Write the box's own output byte for byte, with its terminal control
+    /// codes. Without `--raw`, the codes are removed from the output of a
+    /// box with a terminal when stdout is not a terminal. `--exec` output is
+    /// always written unchanged, so `--exec` does not take `--raw`
+    #[arg(long)]
+    pub raw: bool,
 }
 
 // BCLI-012, BCLI-056: `min box logs <box> [-f | --exec <id>]`. Only the box
@@ -575,7 +582,11 @@ pub struct BoxLogsExecArgs {
     pub logs: BoxLogsArgs,
     /// Show what one command printed, by the exec id that `min box exec`
     /// printed for it. The command can be running or ended
-    #[arg(long = "exec", value_name = "EXEC_ID", conflicts_with = "follow")]
+    #[arg(
+        long = "exec",
+        value_name = "EXEC_ID",
+        conflicts_with_all = ["follow", "raw"]
+    )]
     pub exec: Option<String>,
 }
 
@@ -585,10 +596,11 @@ pub struct BoxLogsExecArgs {
 pub struct BoxEventsArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Show the events of every child box of this box together, in time
     /// order, each event naming its box
-    #[arg(long, value_name = "BOX")]
+    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Write each event as one JSON object on its own line
     #[arg(short = 'o', long = "output", value_enum)]
@@ -753,6 +765,7 @@ pub enum BoxListOutputFormat {
 pub struct BoxShowArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Show only the box's `[network]` section, as the box was created
     /// with it: its network mode, ingress and egress, with the flags of
@@ -782,6 +795,7 @@ pub enum BoxShowOutputFormat {
 pub struct BoxStopArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Kill every process in the box at once, with no grace period
     #[arg(long)]
@@ -797,6 +811,7 @@ pub struct BoxStopArgs {
 pub struct BoxRestartArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
 }
 
@@ -806,6 +821,7 @@ pub struct BoxAttachArgs {
     /// The box: its id, the start of its id, its name, or
     /// provider/host/name, as `min box list` prints them. Omit it to attach
     /// to this project's box
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Attach to a command that `min box exec -t` started in the box, by the
     /// exec id it printed. Needs a box
@@ -818,6 +834,7 @@ pub struct BoxAttachArgs {
 pub struct BoxResumeArgs {
     /// The box: its id, the start of its id, its name, or
     /// provider/host/name, as `min box list` prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
 }
 
@@ -826,6 +843,7 @@ pub struct BoxResumeArgs {
 pub struct BoxRmArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Remove a running box too: stop it at once, then remove it
     #[arg(long)]
@@ -838,6 +856,7 @@ pub struct BoxRmArgs {
 pub struct BoxWaitArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Stop waiting after this long: a number of seconds, or a number
     /// followed by s, m or h, such as 30s, 5m or 1h. The box keeps running,
@@ -856,6 +875,7 @@ pub struct BoxWaitArgs {
 pub struct BoxExecArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// Give the command a terminal and connect this terminal to it. The
     /// command's exec id is printed on stderr
@@ -1091,6 +1111,7 @@ impl std::error::Error for BoxExecTimedOut {}
 pub struct BoxRenameArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: String,
     /// The new name for the box
     pub new_name: String,
@@ -1107,7 +1128,7 @@ pub struct BoxPruneArgs {
     pub older_than: Option<std::time::Duration>,
     /// Remove only the child boxes of this box: its id, the start of its
     /// id, or its name
-    #[arg(long, value_name = "BOX")]
+    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Remove the boxes without asking first
     #[arg(long, short)]
@@ -1145,10 +1166,11 @@ pub struct BoxAuditArgs {
     /// The box: its id, or its name. A name reads the running box of that
     /// name, else the newest box created under it. `self` is the box this
     /// command runs in
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// Show the records of every child box of this box (an id, a name or
     /// `self`) together, each record naming its box
-    #[arg(long, value_name = "BOX")]
+    #[arg(long, value_name = "BOX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub parent: Option<String>,
     /// Write each record as one JSON line, as the proxy wrote it
     #[arg(short = 'o', long = "output", value_enum)]
@@ -1175,6 +1197,7 @@ pub struct BoxSpecArgs {
     /// start of its id, or its name, as `min box list` prints them. With
     /// none, show the project's proxy rows. Use --repo-dir to name another
     /// project
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub target: Option<String>,
     /// The format of an entry's or a box's spec (default: toml)
     #[arg(short = 'o', long = "output", value_enum)]
@@ -1664,11 +1687,12 @@ pub struct ActivateArgs {
         long,
         value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
-        default_value = NETWORK_DEFAULT,
         help = NETWORK_HELP,
         long_help = NETWORK_LONG_HELP
     )]
-    pub network: CliNetworkMode,
+    // `None` when `--network` is not typed, so the entry's `network.mode`
+    // can apply (#3238). [`ActivateArgs::network_mode`] gives the mode.
+    pub network: Option<CliNetworkMode>,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
@@ -1749,6 +1773,13 @@ impl ActivateArgs {
             .expect("every activation flag has a default")
             .args
     }
+
+    /// The `--network` mode, else [`NETWORK_DEFAULT`]. An activation sets
+    /// `network` to the entry's `network.mode` before it reads this.
+    #[must_use]
+    pub fn network_mode(&self) -> CliNetworkMode {
+        self.network.unwrap_or_else(default_network_mode)
+    }
 }
 
 // The egress flags of a box-creating command: `min session activate`,
@@ -1779,7 +1810,7 @@ pub struct EgressArgs {
     /// Repeatable. Adds to the `allow_dns_hosts` that minimal.toml declares
     /// for the box. Given without `--allow-subnets`, the box reaches the
     /// named hosts by name and no address directly; see `--allow-subnets`.
-    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
+    #[arg(long = "allow-dns-hosts", value_name = "HOST", value_parser = parse_dns_host)]
     pub allow_dns_hosts: Vec<String>,
     /// Allow this outbound transport protocol: tcp, udp, or icmp.
     /// Repeatable; unset allows every protocol. Replaces the
@@ -1856,15 +1887,21 @@ pub(crate) const NETWORK_VALUE_NAME: &str = "none|host_ip|own_ip";
 /// spec`, so a preview with no flag is of a box created with no flag.
 pub(crate) const NETWORK_DEFAULT: &str = "host_ip";
 
+/// The mode of [`NETWORK_DEFAULT`].
+pub(crate) fn default_network_mode() -> CliNetworkMode {
+    parse_network_mode(NETWORK_DEFAULT).expect("the default network mode parses")
+}
+
 /// The first paragraph of the `--network` help, as a literal so that
 /// [`NETWORK_LONG_HELP`] can extend it.
 macro_rules! network_help {
     () => {
         "Network mode for the session: `none` gives the session no network (every socket it \
          opens to a destination outside itself fails), `host_ip` shares the host's network \
-         namespace (the default), and `own_ip` gives the session its own IP address, so \
-         `--ingress` can publish ports; unless the host opts out, an `own_ip` session with no \
-         egress rules can reach no external address"
+         namespace, and `own_ip` gives the session its own IP address, so `--ingress` can \
+         publish ports; unless the host opts out, an `own_ip` session with no egress rules can \
+         reach no external address. With no flag, the session takes the `network.mode` \
+         minimal.toml declares for it, else `host_ip`"
     };
 }
 
@@ -1915,9 +1952,8 @@ macro_rules! start_network_help {
         "Network mode for the box: `none` gives the box no network (every socket it opens to a \
          destination outside itself fails), `host_ip` shares the host's network namespace, and \
          `own_ip` gives the box its own IP address, so `--ingress` can publish ports. The flag \
-         replaces the entry's `network.mode`. With no flag, a task entry's box takes the \
-         `network.mode` minimal.toml declares for it, else `host_ip`, and a session box is \
-         `host_ip`"
+         replaces the entry's `network.mode`. With no flag, the box takes the \
+         `network.mode` minimal.toml declares for the entry, else `host_ip`"
     };
 }
 
@@ -1934,6 +1970,20 @@ pub(crate) const START_NETWORK_LONG_HELP: &str = concat!(
     "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
      prints a one-line hint naming the current spelling."
 );
+
+/// The value of one `--allow-dns-hosts`: a DNS hostname, checked as the
+/// egress policy checks it, so a bad host is a usage error (exit 2) before
+/// anything runs (BCLI-034). Clap quotes the value in front of this text.
+pub(crate) fn parse_dns_host(raw: &str) -> Result<String, String> {
+    if boxes::is_valid_dns_host(raw) {
+        return Ok(raw.to_owned());
+    }
+    Err(
+        "not a valid DNS hostname. Wildcards are not supported. Write an \
+         internationalized name in its punycode xn-- form."
+            .to_owned(),
+    )
+}
 
 /// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
 /// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
@@ -2152,7 +2202,7 @@ pub struct AttachArgs {
     /// The session box: its id, the start of its id, its name, or
     /// provider/host/name, as `min session list` prints them. Omit it to
     /// attach to this project's session box
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: Option<String>,
 }
 
@@ -2171,7 +2221,7 @@ pub struct LsArgs {
 #[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: Option<String>,
     /// Destroy all sessions
     #[arg(long)]
@@ -2202,7 +2252,7 @@ pub enum NetCommand {
 #[derive(Debug, Args)]
 pub struct NetForwardArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
     /// the box-side port it forwards to (`8080:3000` answers on
@@ -2247,7 +2297,7 @@ pub struct StopArgs {
 #[derive(Debug, Args)]
 pub struct RenameArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
-    #[arg(add = completion::session_completer())]
+    #[arg(add = completion::session_completer(), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub session: String,
     /// New name for the session
     pub new_name: String,
