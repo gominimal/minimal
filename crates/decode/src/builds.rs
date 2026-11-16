@@ -996,8 +996,18 @@ impl BuildDecl {
                         }
                         "attrs" => {
                             if let Some(attrs_rt) = field.value.as_ref() {
+                                // BuildSpec declares `attrs | Attrs`, but the
+                                // record spine leaves a field's contracts
+                                // pending: apply them here, or the attribute
+                                // rules hold only for a package that writes
+                                // `| Attrs` on its own attrs record.
+                                let attrs_rt = RuntimeContract::apply_all(
+                                    attrs_rt.clone(),
+                                    field.pending_contracts.iter().cloned(),
+                                    attrs_rt.pos_idx(),
+                                );
                                 let attrs_rt =
-                                    eval_if_closure(attrs_rt, program)?;
+                                    eval_if_closure(&attrs_rt, program)?;
 
                                 if let Some(r) = crate::record_data_from_val(&attrs_rt) {
                                     attrs = Some(r.fields.iter().map(
@@ -1044,8 +1054,15 @@ impl BuildDecl {
                         }
                         "needs" => {
                             if let Some(needs_rt) = field.value.as_ref() {
+                                // BuildSpec's `needs | Needs`, pending like
+                                // `attrs`'s: apply it, or it never runs.
+                                let needs_rt = RuntimeContract::apply_all(
+                                    needs_rt.clone(),
+                                    field.pending_contracts.iter().cloned(),
+                                    needs_rt.pos_idx(),
+                                );
                                 let needs_rt =
-                                    eval_if_closure(needs_rt, program)?;
+                                    eval_if_closure(&needs_rt, program)?;
 
                                 if let Some(r) = crate::record_data_from_val(&needs_rt) {
                                     needs = Some(r.fields.iter().map(
