@@ -1523,6 +1523,49 @@ mod tests {
         }
     }
 
+    // BCLI-021, BCLI-078: a refuser that cannot know the table, as the host
+    // daemon cannot, names the secrets of the box's entry and no table. A
+    // value from outside the file names its source as it is.
+    #[test]
+    fn bep_refusals_name_the_minimal_toml_table_or_the_source() {
+        // A refuser that cannot know the table, as the host daemon cannot,
+        // names the secrets of the box's entry and no table.
+        let unnamed = unenrolled_node(
+            vec!["GH_TOKEN".into()],
+            false,
+            ProxyAbsence::NotServed,
+            None,
+        );
+        let text = unnamed.to_string();
+        assert!(
+            text.ends_with(
+                "To create the box without the grant, remove GH_TOKEN from the secrets of \
+                 this box's entry in minimal.toml."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("[defaults."), "{text}");
+        assert_eq!(
+            unnamed.refusals[0].next_step().as_deref(),
+            Some(
+                "to create the box without the grant, remove GH_TOKEN from the secrets of \
+                 this box's entry in minimal.toml"
+            )
+        );
+
+        // A value set outside a minimal.toml table names its source as it is.
+        let overridden = BepRefusal::NoResolver {
+            steering: Steering::Dns,
+            table: "the command line".into(),
+        };
+        assert!(
+            overridden
+                .to_string()
+                .ends_with("Set steering = \"proxy_env\" in the command line."),
+            "{overridden}"
+        );
+    }
+
     // BCLI-021, BCLI-078: the checks fill the table from the spec's tables,
     // and the checks that only `min box start` runs fill
     // `[defaults.session.secrets]`.
@@ -1592,43 +1635,6 @@ mod tests {
                 .to_string()
                 .contains("[defaults.session.secrets]"),
             "{unenrolled}"
-        );
-
-        // A refuser that cannot know the table, as the host daemon cannot,
-        // names the secrets of the box's entry and no table.
-        let unnamed = unenrolled_node(
-            vec!["GH_TOKEN".into()],
-            false,
-            ProxyAbsence::NotServed,
-            None,
-        );
-        let text = unnamed.to_string();
-        assert!(
-            text.ends_with(
-                "To create the box without the grant, remove GH_TOKEN from the secrets of \
-                 this box's entry in minimal.toml."
-            ),
-            "{text}"
-        );
-        assert!(!text.contains("[defaults."), "{text}");
-        assert_eq!(
-            unnamed.refusals[0].next_step().as_deref(),
-            Some(
-                "to create the box without the grant, remove GH_TOKEN from the secrets of \
-                 this box's entry in minimal.toml"
-            )
-        );
-
-        // A value set outside a minimal.toml table names its source as it is.
-        let overridden = BepRefusal::NoResolver {
-            steering: Steering::Dns,
-            table: "the command line".into(),
-        };
-        assert!(
-            overridden
-                .to_string()
-                .ends_with("Set steering = \"proxy_env\" in the command line."),
-            "{overridden}"
         );
 
         assert!(PROJECT_ACKNOWLEDGEMENT_IGNORED.contains("in [defaults.session.secrets]."));
