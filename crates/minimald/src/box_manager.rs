@@ -6098,6 +6098,234 @@ pub(crate) fn write_box_event(
     Ok(event)
 }
 
+/// The keys of the `data` object of a `file_exported` event (BOX-195).
+pub mod export_data {
+    /// The export's path, as the spec declares it.
+    pub const PATH: &str = "path";
+    /// Whether every file and folder of the export was written.
+    pub const COPIED: &str = "copied";
+    /// Each file the command wrote, with its `path`, `size` and `sha256`.
+    pub const FILES: &str = "files";
+    /// The end the export was claimed for: the count of `exited` events
+    /// on the record when the claim was granted.
+    pub const END: &str = "end";
+}
+
+/// Where one export of one end of a box stands (BOX-198).
+#[derive(Debug)]
+enum ExportClaim {
+    /// A command holds the export. It stays held while the weak reference
+    /// to the liveness of that command's connection upgrades (BOX-202).
+    Held(std::sync::Weak<()>),
+    /// A command reported the export. No other command gets it for this
+    /// end.
+    Reported,
+}
+
+/// The key of one export of one end of a box: the record id, the end, and
+/// the export's path.
+type ExportClaimKey = (SessionId, u64, String);
+
+/// Every export claim on this daemon. A claim held by a connection that
+/// ended is released here: the next claim for that export replaces it. A
+/// reported export is also on the record as a `file_exported` event, so a
+/// daemon that restarts still refuses it.
+static EXPORT_CLAIMS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ExportClaimKey, ExportClaim>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Locks [`EXPORT_CLAIMS`]. A panic while the lock was held leaves the map
+/// whole, so a poisoned lock is still used.
+fn export_claims()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<ExportClaimKey, ExportClaim>> {
+    EXPORT_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl BoxManagerHandle {
+    /// The record of the ended box `id`, its events reader, and its last
+    /// end: the count of its `exited` events.
+    async fn ended_box_events(
+        &self,
+        id: SessionId,
+    ) -> Result<(boxes::Record, BoxEventsReader, Vec<BoxEvent>, u64), BoxManagerError> {
+        let Some(record) = self.retained_record(id).await? else {
+            return Err(unknown_box(id));
+        };
+        let mut reader = self.box_events(record.id).await?;
+        let events = reader.read_new()?;
+        let end = events
+            .iter()
+            .filter(|event| event.kind == BoxEventType::Exited)
+            .count() as u64;
+        Ok((record, reader, events, end))
+    }
+
+    /// Claims the exports `paths` of the last end of box `id` for the
+    /// connection whose liveness is `holder` (BOX-198). Each path that no
+    /// live connection holds and no command reported for that end is
+    /// granted, and the rest are refused. The grant is recorded before
+    /// this returns, so two callers never both hold one export of an end.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `InvalidInput` for a box that
+    /// is running or has never ended, or an I/O error if its events cannot
+    /// be read.
+    pub async fn claim_exports(
+        &self,
+        id: SessionId,
+        paths: &[String],
+        holder: &std::sync::Weak<()>,
+    ) -> Result<minimald_rpc::ClaimExportsResponse, BoxManagerError> {
+        let (record, _reader, events, end) = self.ended_box_events(id).await?;
+        let ended = matches!(
+            record.status,
+            boxes::BoxState::Stopped | boxes::BoxState::Exited
+        );
+        if !ended || end == 0 {
+            tracing::info!(
+                session_id = %record.id,
+                status = ?record.status,
+                end,
+                "export claim: the box has not ended; nothing is granted"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the box is running again, so its files can change",
+            ));
+        }
+        let reported: std::collections::HashSet<&str> = events
+            .iter()
+            .filter(|event| {
+                event.kind == BoxEventType::FileExported
+                    && event
+                        .data
+                        .get(export_data::END)
+                        .and_then(serde_json_lenient::Value::as_u64)
+                        == Some(end)
+            })
+            .filter_map(|event| {
+                event
+                    .data
+                    .get(export_data::PATH)
+                    .and_then(serde_json_lenient::Value::as_str)
+            })
+            .collect();
+        let mut granted = Vec::new();
+        let mut refused = Vec::new();
+        {
+            let mut claims = export_claims();
+            // A claim whose connection ended holds nothing (BOX-202).
+            claims.retain(|_, claim| match claim {
+                ExportClaim::Held(live) => live.strong_count() > 0,
+                ExportClaim::Reported => true,
+            });
+            for path in paths {
+                if granted.contains(path) || refused.contains(path) {
+                    continue;
+                }
+                let key = (record.id, end, path.clone());
+                if reported.contains(path.as_str()) || claims.contains_key(&key) {
+                    refused.push(path.clone());
+                } else {
+                    claims.insert(key, ExportClaim::Held(holder.clone()));
+                    granted.push(path.clone());
+                }
+            }
+        }
+        tracing::info!(
+            session_id = %record.id,
+            end,
+            granted = ?granted,
+            refused = ?refused,
+            "export claim"
+        );
+        Ok(minimald_rpc::ClaimExportsResponse {
+            end,
+            granted,
+            refused,
+        })
+    }
+
+    /// Appends the `file_exported` event of one export that the connection
+    /// whose liveness is `holder` claimed (BOX-195). The export stays
+    /// claimed for the end, so no later command copies it again. A report
+    /// that is not written leaves the claim held, so the end of the
+    /// connection releases it (BOX-200, BOX-202).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `PermissionDenied` when
+    /// `holder` does not hold the export for that end, or the I/O error of
+    /// the append.
+    pub async fn report_export(
+        &self,
+        report: &minimald_rpc::ReportExportRequest,
+        holder: &std::sync::Weak<()>,
+    ) -> Result<BoxEvent, BoxManagerError> {
+        let Some(record) = self.retained_record(report.id).await? else {
+            return Err(unknown_box(report.id));
+        };
+        let reader = self.box_events(record.id).await?;
+        let key = (record.id, report.end, report.path.clone());
+        {
+            let mut claims = export_claims();
+            match claims.get(&key) {
+                Some(ExportClaim::Held(live)) if std::sync::Weak::ptr_eq(live, holder) => {
+                    claims.insert(key.clone(), ExportClaim::Reported);
+                }
+                other => {
+                    tracing::info!(
+                        session_id = %record.id,
+                        end = report.end,
+                        export = %report.path,
+                        claim = ?other,
+                        "export report refused: this connection does not hold the export"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "this command does not hold the export `{}` of the box",
+                            report.path
+                        ),
+                    ));
+                }
+            }
+        }
+        let files: Vec<serde_json_lenient::Value> = report
+            .files
+            .iter()
+            .map(|file| {
+                serde_json_lenient::json!({
+                    "path": file.path,
+                    "size": file.size,
+                    "sha256": file.sha256,
+                })
+            })
+            .collect();
+        let mut data = EventData::new();
+        data.insert(export_data::PATH.into(), report.path.clone().into());
+        data.insert(export_data::COPIED.into(), report.copied.into());
+        data.insert(export_data::FILES.into(), files.into());
+        data.insert(export_data::END.into(), report.end.into());
+        match write_box_event(&reader.object, BoxEventType::FileExported, data) {
+            Ok(event) => Ok(event),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %record.id,
+                    export = %report.path,
+                    %error,
+                    "export report: the file_exported event was not written; the claim stays held"
+                );
+                export_claims().insert(key, ExportClaim::Held(holder.clone()));
+                Err(error)
+            }
+        }
+    }
+}
+
 /// A read of one box's events (BOX-162): every retained event in the order
 /// it was written, then, for a follower, each new one as it is written.
 #[derive(Debug)]

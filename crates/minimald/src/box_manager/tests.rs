@@ -7714,3 +7714,200 @@ async fn client_and_daemon_digests_match_vectors_and_mismatch_refused() {
     }
     assert!(refused > 0, "the vectors include differing digests");
 }
+
+/// A stopped box with one `exited` event, so its first end: the manager
+/// over `state` and `cache` that holds it, and its id.
+async fn ended_box(state: &TempDir, cache: &TempDir) -> (BoxManagerHandle, SessionId) {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let mngr = manager_over(state.path(), cache.path()).await;
+    let id = create_active_session_with(&mngr, rooted_config("build", "/p")).await;
+    drop(mngr);
+    set_record_state(
+        state.path(),
+        id,
+        RecordState::Stopped(StopEnding::Signalled {
+            signal: libc::SIGTERM,
+        }),
+    )
+    .await;
+    write_exited_event(state.path(), id, std::time::SystemTime::now()).await;
+    (manager_over(state.path(), cache.path()).await, id)
+}
+
+/// The report of `path` for `end`, copied, with one file.
+fn export_report(id: SessionId, end: u64, path: &str) -> minimald_rpc::ReportExportRequest {
+    minimald_rpc::ReportExportRequest {
+        id,
+        end,
+        path: path.to_string(),
+        copied: true,
+        files: vec![minimald_rpc::ExportedFileReport {
+            path: path.to_string(),
+            size: 9,
+            sha256: "ab".repeat(32),
+        }],
+    }
+}
+
+/// The `file_exported` events on the record of box `id`.
+async fn file_exported_events(mngr: &BoxManagerHandle, id: SessionId) -> Vec<BoxEvent> {
+    mngr.box_events(id)
+        .await
+        .unwrap()
+        .read_new()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == BoxEventType::FileExported)
+        .collect()
+}
+
+/// BOX-198, BOX-195: the daemon grants each export of an end to one
+/// command, refuses it to every other command while it is held and after
+/// it is reported, and grants it again at the box's next end. A report
+/// appends one `file_exported` event, and only the holder can report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_claim_granted_once_for_each_end() {
+    let (state, cache) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (mngr, id) = ended_box(&state, &cache).await;
+    let paths = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+
+    let first = std::sync::Arc::new(());
+    let claim = mngr
+        .claim_exports(
+            id,
+            &paths(&["a.txt", "dist"]),
+            &std::sync::Arc::downgrade(&first),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim.end, 1);
+    assert_eq!(claim.granted, paths(&["a.txt", "dist"]));
+    assert!(claim.refused.is_empty());
+
+    // A second command that waits on the same end gets only what is free.
+    let second = std::sync::Arc::new(());
+    let claim = mngr
+        .claim_exports(
+            id,
+            &paths(&["a.txt", "dist", "c.txt"]),
+            &std::sync::Arc::downgrade(&second),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim.granted, paths(&["c.txt"]));
+    assert_eq!(claim.refused, paths(&["a.txt", "dist"]));
+
+    // Only the holder reports an export.
+    let refused = mngr
+        .report_export(
+            &export_report(id, 1, "a.txt"),
+            &std::sync::Arc::downgrade(&second),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::PermissionDenied, "{refused}");
+    assert!(file_exported_events(&mngr, id).await.is_empty());
+
+    let event = mngr
+        .report_export(
+            &export_report(id, 1, "a.txt"),
+            &std::sync::Arc::downgrade(&first),
+        )
+        .await
+        .unwrap();
+    assert_eq!(event.kind, BoxEventType::FileExported);
+    assert_eq!(event.data[export_data::PATH], "a.txt");
+    assert_eq!(event.data[export_data::COPIED], true);
+    assert_eq!(event.data[export_data::END], 1);
+    assert_eq!(
+        event.data[export_data::FILES],
+        serde_json_lenient::json!([{"path": "a.txt", "size": 9, "sha256": "ab".repeat(32)}])
+    );
+    assert_eq!(file_exported_events(&mngr, id).await, [event]);
+
+    // A reported export stays refused for this end, even after its
+    // command is gone.
+    drop(first);
+    let third = std::sync::Arc::new(());
+    let claim = mngr
+        .claim_exports(id, &paths(&["a.txt"]), &std::sync::Arc::downgrade(&third))
+        .await
+        .unwrap();
+    assert_eq!(claim.refused, paths(&["a.txt"]));
+
+    // The box's next end is claimed afresh.
+    write_exited_event(state.path(), id, std::time::SystemTime::now()).await;
+    let claim = mngr
+        .claim_exports(id, &paths(&["a.txt"]), &std::sync::Arc::downgrade(&third))
+        .await
+        .unwrap();
+    assert_eq!(claim.end, 2);
+    assert_eq!(claim.granted, paths(&["a.txt"]));
+
+    // A box that has not ended grants nothing.
+    let running = create_active_session_with(&mngr, rooted_config("dev", "/p")).await;
+    let error = mngr
+        .claim_exports(
+            running,
+            &paths(&["a.txt"]),
+            &std::sync::Arc::downgrade(&third),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+}
+
+/// BOX-202: when the connection that holds a claim ends, each export it did
+/// not report is granted to the next command, and each export it reported
+/// stays refused, also after the daemon restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_claim_released_for_unreported_exports_on_disconnect() {
+    let (state, cache) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (mngr, id) = ended_box(&state, &cache).await;
+    let paths = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+
+    let killed = std::sync::Arc::new(());
+    let claim = mngr
+        .claim_exports(
+            id,
+            &paths(&["a.txt", "b.txt"]),
+            &std::sync::Arc::downgrade(&killed),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim.granted, paths(&["a.txt", "b.txt"]));
+    mngr.report_export(
+        &export_report(id, claim.end, "a.txt"),
+        &std::sync::Arc::downgrade(&killed),
+    )
+    .await
+    .unwrap();
+    // The command is killed mid-copy: its connection's liveness ends.
+    drop(killed);
+
+    let next = std::sync::Arc::new(());
+    let claim = mngr
+        .claim_exports(
+            id,
+            &paths(&["a.txt", "b.txt"]),
+            &std::sync::Arc::downgrade(&next),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim.granted, paths(&["b.txt"]));
+    assert_eq!(claim.refused, paths(&["a.txt"]));
+    drop(next);
+
+    // The record keeps the report across a daemon restart, which starts
+    // with no claim in memory.
+    drop(mngr);
+    export_claims().retain(|(box_id, _, _), _| *box_id != id);
+    let mngr = manager_over(state.path(), cache.path()).await;
+    let after = std::sync::Arc::new(());
+    let claim = mngr
+        .claim_exports(id, &paths(&["a.txt"]), &std::sync::Arc::downgrade(&after))
+        .await
+        .unwrap();
+    assert_eq!(claim.refused, paths(&["a.txt"]));
+}
