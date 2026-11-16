@@ -78,45 +78,28 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
             Some(mfile::StateWiring { env_var, prefix })
         })
         .map(|w| {
-            // Multi-component prefixes (`foo/bar`) are unused by
-            // any package in `gominimal/pkgs` today. The composition
-            // path's state-dir derivation would silently drop them
-            // while the legacy `SetupForPackages` path would
-            // `mkdir -p` them — a task-vs-session divergence for
-            // the same nickel entry. Reject at extraction so the
-            // divergence never gets exercised; if a package
-            // legitimately needs this shape, both branches will
-            // need to agree on how to handle it and this check can
-            // relax then.
-            if !graph::is_valid_state_prefix(&w.prefix) {
+            // The prefix is joined onto the state dir and sent to the shell
+            // helpers, so it has to be one directory name. The same rule
+            // (`mfile::is_state_prefix`) and the same text guard the task
+            // path in `graph::SetupForPackages`. It holds for any spec, also
+            // one that no Nickel contract has checked.
+            if !mfile::is_state_prefix(&w.prefix) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "package `{}` declares `env_state_wiring` with prefix `{}`, \
-                         which is not one plain path component (not `.` or `..`, no \
-                         '/', ':' or control character); multi-component prefixes are \
-                         not supported on the session composition path. Split into a \
-                         single component or open an issue if you need this shape.",
-                        b.name, w.prefix,
-                    ),
+                    mfile::state_prefix_refusal(&b.name, &w.prefix),
                 ));
             }
             // The composition path exports the same names to the session
             // shell that the task path does; a non-identifier name would
             // be evaluated by the helper's `set_env` branch (bash runs
-            // array-subscript arithmetic inside a `declare`d name), and
-            // framing characters would let the entry forge protocol
-            // lines. The nickel contract rejects these shapes at parse
-            // time; this re-check covers specs that arrive without it.
+            // array-subscript arithmetic inside a `declare`d name). The
+            // nickel contract rejects such a name at parse time; this
+            // re-check covers specs that arrive without it, with the
+            // graph's text.
             if !graph::is_valid_env_var_name(&w.env_var) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "package `{}` declares `env_state_wiring` with env_var `{}` \
-                         which is not a valid environment variable name (letters, \
-                         digits and underscore, not starting with a digit).",
-                        b.name, w.env_var,
-                    ),
+                    graph::env_var_refusal(&b.name, &w.env_var),
                 ));
             }
             Ok(w)
@@ -903,6 +886,64 @@ mod tests {
             msg.contains("cache/artifacts"),
             "error should name the offending prefix: {msg}"
         );
+    }
+
+    /// The composition path re-checks both fields of a wiring entry for a
+    /// spec that no Nickel contract has checked, such as one that arrives by
+    /// wire. The spec is built by hand, so these cases reach the check
+    /// whatever the contract does. Each refusal names the package, quotes
+    /// the value escaped onto one line, and uses the same text as the graph.
+    #[test]
+    fn a_wiring_entry_the_contract_never_saw_is_refused_at_composition() {
+        let spec = |env_var: &str, prefix: &str| {
+            let mut entry = decode::AttrValue::Map(Default::default());
+            if let decode::AttrValue::Map(m) = &mut entry {
+                m.insert(
+                    "env_var".to_string(),
+                    decode::AttrValue::String(env_var.to_string(), None),
+                );
+                m.insert(
+                    "prefix".to_string(),
+                    decode::AttrValue::String(prefix.to_string(), None),
+                );
+            }
+            let mut b = graph::BuildSpec {
+                name: "bad".into(),
+                ..Default::default()
+            };
+            b.attrs.insert("env_state_wiring".to_string(), entry);
+            b
+        };
+
+        for (env_var, prefix, quoted) in [
+            (
+                "X[$(touch /tmp/pwned)]",
+                "gocache",
+                "\"X[$(touch /tmp/pwned)]\"",
+            ),
+            ("1A", "gocache", "\"1A\""),
+            ("A\nB", "gocache", "\"A\\nB\""),
+            ("GOCACHE", "..", "\"..\""),
+            ("GOCACHE", "cache:artifacts", "\"cache:artifacts\""),
+            ("GOCACHE", "a\u{1b}[2Jb", "\"a\\u{1b}[2Jb\""),
+        ] {
+            let b = spec(env_var, prefix);
+            let err = extract_package_attrs(&b).expect_err(quoted);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{quoted}");
+            let msg = err.to_string();
+            assert!(msg.contains("`bad`"), "names the package: {msg}");
+            assert!(msg.contains(quoted), "quotes {quoted} escaped: {msg}");
+            assert!(!msg.contains(['\n', '\u{1b}']), "one line: {msg:?}");
+            let graph_text = if graph::is_valid_env_var_name(env_var) {
+                mfile::state_prefix_refusal("bad", prefix)
+            } else {
+                graph::env_var_refusal("bad", env_var)
+            };
+            assert_eq!(msg, graph_text, "the graph's text");
+        }
+
+        let ok = extract_package_attrs(&spec("GOCACHE", "gocache")).expect("a plain entry");
+        assert_eq!(ok.state_wiring.len(), 1);
     }
 
     /// BOX-068: when the client sends an expanded entry, the daemon

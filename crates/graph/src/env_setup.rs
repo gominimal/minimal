@@ -22,15 +22,19 @@ pub fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// A state-dir prefix is one plain component under `/state`: not empty, not
-/// `.` or `..`, and carrying none of the characters that would name a deeper
-/// path or forge daemon-to-helper framing (`/`, `:`, any control character).
-pub fn is_valid_state_prefix(prefix: &str) -> bool {
-    !prefix.is_empty()
-        && prefix != "."
-        && prefix != ".."
-        && !prefix.contains(['/', ':'])
-        && !prefix.chars().any(char::is_control)
+/// The refusal for a package's `env_state_wiring` env_var that fails
+/// [`is_valid_env_var_name`]. The package graph and the session composition
+/// both refuse such a name with this text. The values are escaped, so a
+/// newline or an escape sequence in one prints as text and the refusal stays
+/// one line. The prefix has its own rule and text, [`mfile::is_state_prefix`]
+/// and [`mfile::state_prefix_refusal`].
+pub fn env_var_refusal(package: &str, env_var: &str) -> String {
+    format!(
+        "package `{}` declares `env_state_wiring` with env_var \"{}\". The name must be \
+         letters, digits and `_`, and not start with a digit.",
+        package.escape_debug(),
+        env_var.escape_debug(),
+    )
 }
 
 /// Describes sandbox configuration that needs to be set to power present packages.
@@ -112,40 +116,27 @@ impl SetupForPackages {
                     let entry = entry.as_map().unwrap();
                     let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
                     let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
+                    // the prefix is joined onto the state dir and sent to the
+                    // shell helpers: one directory name only
+                    if !mfile::is_state_prefix(&prefix) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            mfile::state_prefix_refusal(&b.name, &prefix),
+                        ));
+                    }
 
                     // The variable name is handed verbatim to the shell
                     // helpers' `set_env` branch: bash evaluates a `declare`'d
                     // name for array subscripts, so a crafted name executes
-                    // code in the user's live shell. The prefix rides the
-                    // same daemon-to-helper line (`set_env:{name}:{value}`,
-                    // split on the first ':'), so framing characters would
-                    // let a value forge protocol lines. The nickel contract
-                    // already rejects these shapes; this re-check keeps the
-                    // helpers safe from any writer that bypasses it.
-                    // Both values are escaped in the errors, which reach the
-                    // helper as a single `error:` line.
+                    // code in the user's live shell. The nickel contract
+                    // already rejects such a name; this re-check keeps the
+                    // helpers safe from any writer that bypasses it. The
+                    // refusal escapes the name, as it reaches the helper as a
+                    // single `error:` line.
                     if !is_valid_env_var_name(&env_var) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!(
-                                "package `{}` declares `env_state_wiring` with env_var `{}` \
-                                 which is not a valid environment variable name (letters, \
-                                 digits and underscore, not starting with a digit)",
-                                b.name,
-                                env_var.escape_debug(),
-                            ),
-                        ));
-                    }
-                    if !is_valid_state_prefix(&prefix) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "package `{}` declares `env_state_wiring` with prefix `{}` \
-                                 which is not one plain path component (not `.` or `..`, no \
-                                 '/', ':' or control character)",
-                                b.name,
-                                prefix.escape_debug(),
-                            ),
+                            env_var_refusal(&b.name, &env_var),
                         ));
                     }
 
@@ -484,12 +475,13 @@ mod tests {
 
         // the rule itself, at its edges
         for ok in ["gocache", "go-mod_cache.v2", "..."] {
-            assert!(is_valid_state_prefix(ok), "{ok}");
+            assert!(mfile::is_state_prefix(ok), "{ok}");
         }
         for bad in [
-            "", ".", "..", "a/b", "a:b", "a\nb", "a\rb", "a\tb", "a\u{7f}b", "a\u{85}b", "a\u{9f}b",
+            "", ".", "..", "a/b", "a\\b", "a:b", "a\nb", "a\rb", "a\tb", "a\u{7f}b", "a\u{85}b",
+            "a\u{9f}b",
         ] {
-            assert!(!is_valid_state_prefix(bad), "{bad:?}");
+            assert!(!mfile::is_state_prefix(bad), "{bad:?}");
         }
         for ok in ["GOCACHE", "_x", "a1"] {
             assert!(is_valid_env_var_name(ok), "{ok}");

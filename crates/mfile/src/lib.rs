@@ -864,6 +864,35 @@ pub struct ChainLink {
     pub snapshot: String,
 }
 
+/// Whether a package's `env_state_wiring` prefix names one directory under
+/// /state. The prefix is joined onto the state directory and is sent to the
+/// shell helpers on a `set_env:` line, so it is refused when it is empty, `.`
+/// or `..`, or holds `/`, `\`, `:` or a control character (Unicode category
+/// Cc, as [`char::is_control`] has it).
+#[must_use]
+pub fn is_state_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix != "."
+        && prefix != ".."
+        && !prefix.contains(['/', '\\', ':'])
+        && !prefix.chars().any(char::is_control)
+}
+
+/// The refusal for a package's `env_state_wiring` prefix that fails
+/// [`is_state_prefix`]. The package graph and the session composition both
+/// refuse such a prefix with this text. The values are escaped, so a newline
+/// or an escape sequence in one prints as text and the refusal stays one line.
+#[must_use]
+pub fn state_prefix_refusal(package: &str, prefix: &str) -> String {
+    format!(
+        "package `{}` declares `env_state_wiring` with prefix \"{}\". The prefix must be one \
+         directory name under /state, with no `/`, `\\`, `:` or control character, and not \
+         `.` or `..`.",
+        package.escape_debug(),
+        prefix.escape_debug(),
+    )
+}
+
 /// Object key of the per-commit index snapshot for a repo + commit:
 /// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
 pub fn commit_index_object(repo_url: &str, commit_sha: &str) -> String {

@@ -492,6 +492,9 @@ mod tests {
             "{ env_var = \"GOCACHE\", prefix = \"cache/artifacts\" }"
         ));
         assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"cache\\\\artifacts\" }"
+        ));
+        assert!(!wiring(
             "{ env_var = \"GOCACHE\", prefix = \"cache\nartifacts\" }"
         ));
         assert!(!wiring(
