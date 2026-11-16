@@ -248,8 +248,9 @@ async fn box_via_ssh_with(
         None => None,
     };
     // A VM host that cannot be reached fails the attach or the exec
-    // closed (#1790); one that answers late or refuses is a warn line, and
-    // the attach or the exec goes on (NET-138).
+    // closed (#1790). One that refuses fails it with its own reason, which
+    // `main` prints before any terminal is taken, so it stays on screen.
+    // One that answers late is a warn line, and the attach goes on (NET-138).
     resume_box_row(sock, record.as_ref()).await?;
     // The name hold a `host_ip` session without a row depends on may not
     // have survived a VM host daemon restart; re-make it before the
@@ -495,6 +496,11 @@ pub(crate) fn mark_relay_not_started(
 /// terminal ([`crate::attach::TerminalNotTaken`]) or never started ssh's
 /// session on it ([`crate::attach::RelayNotStarted`]) stands the guard
 /// down, because nothing of the session reached the terminal.
+///
+/// An attach that the daemon refuses prints its refusal through ssh, and
+/// the daemon sends an exit status with it. So ssh does not end with 255,
+/// the guard is stood down, and no blind cursor restore moves the cursor
+/// back over the refusal line.
 pub(crate) fn interactive_attach<W: std::io::Write>(
     ssh: std::process::Command,
     stdin_is_tty: bool,
@@ -1416,7 +1422,8 @@ async fn attach_exec_by_id(
     config_dir: Option<&std::path::Path>,
 ) -> Result<i32, anyhow::Error> {
     // A VM-backed box gets its row and its name hold back first, as
-    // `min box exec` does.
+    // `min box exec` does. A refused resume ends here with the VM host's
+    // reason, before the terminal is taken.
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
         Some(_) => attached_box_record(sock, id).await.unwrap_or_else(|error| {
             tracing::warn!(
