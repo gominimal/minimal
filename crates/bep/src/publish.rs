@@ -61,6 +61,13 @@ impl PublishedKey {
     pub fn in_secret_service(&self) -> bool {
         self.store.as_deref() == Some("secret-service")
     }
+
+    /// Whether both entries name the same key. The store is left out, so an
+    /// entry from a file an older `bep` wrote matches the key it names.
+    #[must_use]
+    pub fn same_key(&self, other: &Self) -> bool {
+        self.public == other.public && self.kid == other.kid
+    }
 }
 
 /// How long the root CA is valid, counted from the root key's creation.
@@ -340,7 +347,12 @@ impl Identity {
         // `with_root_certificate`.
         let root_certificate = previous
             .filter(|previous| {
-                role != Role::Root && previous.root.is_some() && previous.root == root
+                role != Role::Root
+                    && previous
+                        .root
+                        .as_ref()
+                        .zip(root.as_ref())
+                        .is_some_and(|(before, now)| before.same_key(now))
             })
             .and_then(|previous| previous.root_certificate.clone());
         Self {
@@ -953,6 +965,19 @@ mod tests {
         let old = Identity::read(&path).unwrap();
         assert_eq!(old.sealing.as_ref().unwrap().store, None);
         assert_eq!(old.key(Role::Sealing).unwrap(), sealing);
+
+        // A store that differs between the file and the fresh entry still
+        // keeps the root certificate, because the root key is the same.
+        let keys = load(&store, &Role::ALL).unwrap();
+        let (mut previous, _) = Identity::of(&keys)
+            .issuing_root(&keys.root, github_union(), std::time::SystemTime::now())
+            .unwrap();
+        drop(keys);
+        previous.root.as_mut().unwrap().store = Some("secret-service".to_owned());
+        let sealing = replace(&store, Role::Sealing).unwrap();
+        let kept = Identity::after_replacement(&store, Role::Sealing, &sealing, Some(&previous));
+        assert!(kept.root_certificate.is_some());
+        assert_eq!(kept.root_certificate, previous.root_certificate);
     }
 
     // BEP-005, OQ3: the identity carries the end of the root's validity, the
