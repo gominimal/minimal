@@ -126,6 +126,10 @@ pub enum SpecKeyProblem {
         found: String,
         accepted: &'static [&'static str],
     },
+    /// A project lifecycle hook sets `declared_by`, which only the
+    /// expansion writes (BOX-179). Carries the hook as the message names
+    /// it.
+    DeclarerSet { hook: String },
 }
 
 /// The naming rule that an entry name breaks.
@@ -324,6 +328,11 @@ impl fmt::Display for Error {
                         accepted.join(" or ")
                     )
                 }
+                SpecKeyProblem::DeclarerSet { hook } => write!(
+                    f,
+                    "{layer} sets `{key}` in {hook}. A project cannot set \
+                     the declarer of its own hook. Remove `{key}` from that hook."
+                ),
             },
             Error::LegacyTable { path, legacy } => {
                 match path {
