@@ -61,9 +61,10 @@ pub enum Error<BE: std::fmt::Debug> {
     /// against the trust store (`cause` is the verification failure, naming
     /// the host when known). Distinct from [`Error::Unavailable`] because it
     /// is not a connectivity problem and never transient: it recurs
-    /// identically until the trust path is fixed. The usual cause is a
-    /// TLS-inspecting proxy re-signing traffic with a CA this environment
-    /// does not trust.
+    /// identically until the cause is fixed. Two causes are common: a
+    /// TLS-inspecting proxy re-signing traffic with a CA this environment does
+    /// not trust, or a wrong system clock that makes a valid certificate look
+    /// expired or not yet valid.
     TlsCert { object: String, cause: String },
 }
 
@@ -86,10 +87,12 @@ impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
             Error::TlsCert { object, cause } => write!(
                 f,
                 "TLS certificate verification failed while fetching {object}: {cause}. \
-                 This is not a connectivity problem and will not clear on retry: a \
-                 TLS-inspecting proxy (a corporate VPN, Cloudflare WARP, Zscaler, or \
-                 similar) may be re-signing HTTPS traffic with a certificate authority \
-                 this environment does not trust."
+                 This is not a connectivity problem, and retrying will not clear it: \
+                 the same verification fails the same way until the cause is fixed. \
+                 A TLS-inspecting proxy (a corporate VPN, Cloudflare WARP, Zscaler, or \
+                 similar) re-signing HTTPS traffic with a certificate authority this \
+                 environment does not trust is one cause. A wrong system clock, which \
+                 makes a valid certificate look expired or not yet valid, is another."
             ),
             _ => write!(f, "{:?}", self),
         }
@@ -2101,10 +2104,12 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    /// The certificate error reads as a diagnosis the operator can act on: it
-    /// names the object and cause, says retrying will not help, and points at
-    /// the usual cause (an inspecting proxy), rather than the old generic
-    /// "cache server was unreachable".
+    /// The certificate error reads as a diagnosis, not a transient outage: it
+    /// names the object and cause, says retrying will not clear it, and gives
+    /// both common causes (an inspecting proxy and a wrong clock) without
+    /// asserting either, rather than the old generic "cache server was
+    /// unreachable". It names no proxy as *the* cause, because a wrong clock
+    /// produces the same `invalid peer certificate` reason.
     #[test]
     fn tls_cert_error_display_is_actionable() {
         let err: Error<std::io::Error> = Error::TlsCert {
@@ -2114,8 +2119,10 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("index.shisha"), "{shown}");
         assert!(shown.contains("cache.minimal.dev"), "{shown}");
-        assert!(shown.contains("will not clear on retry"), "{shown}");
+        assert!(shown.contains("retrying will not clear it"), "{shown}");
+        // Both causes are offered; neither is asserted as the sole one.
         assert!(shown.contains("proxy"), "{shown}");
+        assert!(shown.contains("clock"), "{shown}");
         assert!(!shown.contains("unreachable"), "{shown}");
     }
 }
