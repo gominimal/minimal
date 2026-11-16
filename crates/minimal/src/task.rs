@@ -3508,6 +3508,50 @@ mod tests {
         );
     }
 
+    /// #3252: a `network` key that a task box does not apply, declared in
+    /// the task's own table or `[defaults.task]`, refuses the run and names
+    /// the key, the table and the next step. A key in `[defaults]` reaches
+    /// every Box Type and does not refuse a task.
+    #[test]
+    fn task_box_network_refuses_a_network_key_a_task_does_not_apply() {
+        let (_dir, project) = project_with(
+            "[tasks.build]\nexec = 'true'\n\n\
+             [tasks.build.network]\nmode = \"own_ip\"\nquic443 = \"block\"\n",
+        );
+        let refusal = box_network(&project, "build", None, &crate::EgressArgs::default())
+            .expect_err("quic443 on a task refuses the run");
+        assert_eq!(
+            refusal.to_string(),
+            "Cannot run the task: [tasks.build] in minimal.toml sets network.quic443, which a \
+             task box does not apply. Remove network.quic443 from [tasks.build], and run the \
+             task with --quic443 block to set it."
+        );
+
+        let (_dir, defaults_task) =
+            project_with("[defaults.task.network]\nbep = { }\n\n[tasks.build]\nexec = 'true'\n");
+        let refusal = box_network(&defaults_task, "build", None, &crate::EgressArgs::default())
+            .expect_err("bep in [defaults.task] refuses the run");
+        assert_eq!(
+            refusal.to_string(),
+            "Cannot run the task: [defaults.task] in minimal.toml sets network.bep, which a \
+             task box does not apply. Remove network.bep from [defaults.task]."
+        );
+
+        // The keys a task box applies, flat egress spellings included, and
+        // a key in `[defaults]`, run.
+        let (_dir, applied) = project_with(
+            "[defaults.network]\nquic443 = \"block\"\n\n\
+             [tasks.build]\nexec = 'true'\n\n\
+             [tasks.build.network]\nmode = \"own_ip\"\n\
+             egress_allow_dns = [\"build.example\"]\n\n\
+             [tasks.lint]\nexec = 'true'\n",
+        );
+        box_network(&applied, "build", None, &crate::EgressArgs::default())
+            .expect("mode and egress are applied");
+        box_network(&applied, "lint", None, &crate::EgressArgs::default())
+            .expect("a [defaults] key does not refuse a task");
+    }
+
     /// arch#166: a list egress flag adds to the file's list, the file's
     /// values first and each value once, and `--allow-protocols` replaces
     /// the file's list.

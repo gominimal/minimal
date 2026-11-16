@@ -1539,7 +1539,66 @@ fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
     }) else {
         return Ok(ProjectEgress::default());
     };
+    refuse_unapplied_task_network(&file, &entry)?;
     entry_egress(&file, entry)
+}
+
+/// The `[network]` keys a task box takes from `minimal.toml`: the mode and
+/// the egress, in its nested or its flat spelling. Every other key reaches
+/// a task box only by its run flag.
+const TASK_NETWORK_KEYS: [&str; 2] = ["mode", "egress"];
+
+/// Refuses a `network` key that a task's own layers declare and that a
+/// task box does not apply, such as `quic443` (#3252). Without it the key
+/// is dropped in silence, and a `quic443 = "block"` runs as `auto`. Only
+/// `[tasks.<name>]` and `[defaults.task]` are read here: `[defaults]`
+/// reaches every Box Type, so a key there is not written for the task.
+fn refuse_unapplied_task_network(
+    file: &toml::Table,
+    entry: &mfile::entry::BoxEntry,
+) -> anyhow::Result<()> {
+    let network_in = |table: Option<&toml::Table>| {
+        table
+            .and_then(|table| table.get("network"))
+            .and_then(toml::Value::as_table)
+            .cloned()
+    };
+    // The merge replaces the `network` table whole, so the entry's own
+    // table, when present, is the only one the task box reads.
+    let defaults_task = file
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .and_then(|defaults| defaults.get(boxes::TASK_BOX_TYPE))
+        .and_then(toml::Value::as_table);
+    let (network, layer) = match network_in(Some(&entry.body)) {
+        Some(network) => (network, format!("[{}.{}]", entry.table.key(), entry.name)),
+        None => match network_in(defaults_task) {
+            Some(network) => (network, format!("[defaults.{}]", boxes::TASK_BOX_TYPE)),
+            None => return Ok(()),
+        },
+    };
+    let unapplied = network.iter().find(|(key, _)| {
+        !TASK_NETWORK_KEYS.contains(&key.as_str())
+            && !mfile::network::FLAT_EGRESS_KEYS
+                .iter()
+                .any(|(flat, _)| flat == key)
+    });
+    let Some((key, value)) = unapplied else {
+        return Ok(());
+    };
+    let remedy = if key == "quic443" {
+        let stance = value.as_str().unwrap_or("<stance>");
+        format!(
+            "Remove network.quic443 from {layer}, and run the task with --quic443 {stance} to set it."
+        )
+    } else {
+        format!("Remove network.{key} from {layer}.")
+    };
+    bail!(
+        "Cannot run the task: {layer} in {file} sets network.{key}, which a task box does \
+         not apply. {remedy}",
+        file = mfile::MFILE_NAME,
+    )
 }
 
 /// The egress of `entry` in the parsed `file`: its `[defaults]`,
