@@ -365,7 +365,7 @@ pub struct ProjectSecrets {
 
 /// The warning for a project that sets the acknowledgement.
 pub const PROJECT_ACKNOWLEDGEMENT_IGNORED: &str = "minimal.toml sets \
-     acknowledge_full_breadth_unenrolled in [session.secrets]. A project cannot set it, \
+     acknowledge_full_breadth_unenrolled in [defaults.session.secrets]. A project cannot set it, \
      so it is ignored. Set it in [secrets] in your own config.toml instead. \
      Run `min dirs` to find that file.";
 
@@ -463,6 +463,34 @@ pub struct ActivationSpec<'a> {
     pub bep: &'a BepSettings,
     /// The grants.
     pub secrets: &'a SecretGrants,
+    /// The minimal.toml tables that set `secrets` and the proxy settings,
+    /// for the refusal text.
+    pub tables: BepTables<'a>,
+}
+
+/// The minimal.toml tables that a refusal tells the person to edit: the
+/// table that set the box's grants, and the table that set its proxy
+/// settings. `min box start` reads both from `[defaults.session]`, and
+/// `min box spec <entry>` names the layer that set each (BCLI-021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BepTables<'a> {
+    /// The table that holds the grants, such as `[defaults.session.secrets]`.
+    pub secrets: &'a str,
+    /// The table that holds the proxy settings, such as
+    /// `[defaults.session.network.bep]`.
+    pub network_bep: &'a str,
+}
+
+/// The table that `min box start` reads the grants from.
+pub const SESSION_SECRETS_TABLE: &str = "[defaults.session.secrets]";
+
+impl BepTables<'static> {
+    /// The tables `min box start` reads: `[defaults.session.secrets]` and
+    /// `[defaults.session.network.bep]`.
+    pub const SESSION: Self = Self {
+        secrets: SESSION_SECRETS_TABLE,
+        network_bep: "[defaults.session.network.bep]",
+    };
 }
 
 /// Whether a box's egress admits every name without listing any: a
@@ -574,18 +602,27 @@ pub enum BepRefusal {
     NoNetworkWithGrant {
         /// The grants, in name order.
         grants: Vec<String>,
+        /// The minimal.toml table that holds the setting, as the text names it.
+        table: String,
     },
     /// BEP-010: `steering = "off"` with `proxy_env = true`.
-    SteeringOffWithProxyEnv,
+    SteeringOffWithProxyEnv {
+        /// The minimal.toml table that holds the setting, as the text names it.
+        table: String,
+    },
     /// BEP-017: `dns` or `both` steering with no box-zone resolver.
     NoResolver {
         /// The resolved steering mode.
         steering: Steering,
+        /// The minimal.toml table that holds the setting, as the text names it.
+        table: String,
     },
     /// BEP-056: an `installation` grant on an un-enrolled host.
     InstallationUnenrolled {
         /// The grant's name.
         grant: String,
+        /// The minimal.toml table that holds the setting, as the text names it.
+        table: String,
     },
     /// BEP-057: a grant narrower than `full` on an un-enrolled host with no
     /// acknowledgement.
@@ -611,11 +648,17 @@ pub enum BepRefusal {
         stored: bool,
         /// Why no proxy serves boxes, as far as the creator can tell.
         cause: ProxyAbsence,
+        /// The minimal.toml table that set the grants, as the text names it.
+        /// `None` when the refuser cannot know which table set them, as the
+        /// host daemon cannot. The text then names the box's entry.
+        table: Option<String>,
     },
     /// BEP-034: a store reference names the GitHub sign-in item.
     StoreReferenceToSignIn {
         /// The grant's name.
         grant: String,
+        /// The minimal.toml table that holds the setting, as the text names it.
+        table: String,
     },
     /// BEP-036: the egress does not admit these hosts that the store rule
     /// for a reference registers.
@@ -632,6 +675,8 @@ pub enum BepRefusal {
         grant: String,
         /// The first such scope.
         scope: String,
+        /// The minimal.toml table that holds the setting, as the text names it.
+        table: String,
     },
 }
 
@@ -642,7 +687,7 @@ impl BepRefusal {
         match self {
             Self::HostsOutsideEgress { .. } => "BEP-008",
             Self::NoNetworkWithGrant { .. } => "BEP-009",
-            Self::SteeringOffWithProxyEnv => "BEP-010",
+            Self::SteeringOffWithProxyEnv { .. } => "BEP-010",
             Self::NoResolver { .. } => "BEP-017",
             Self::InstallationUnenrolled { .. } => "BEP-056",
             Self::NarrowScopesUnenrolled { .. } => "BEP-057",
@@ -671,10 +716,10 @@ impl BepRefusal {
             Self::SignInRequired { .. } => {
                 Some("run `min auth login`, then create the box again".to_owned())
             }
-            Self::UnenrolledNode { grants, .. } => Some(format!(
-                "to create the box without the grant, remove {} from [session.secrets] in \
-                 minimal.toml",
-                grants.join(", ")
+            Self::UnenrolledNode { grants, table, .. } => Some(format!(
+                "to create the box without the grant, remove {} from {}",
+                grants.join(", "),
+                UnenrolledPlace(table.as_deref())
             )),
             _ => None,
         }
@@ -686,7 +731,7 @@ impl BepRefusal {
         match self {
             Self::HostsOutsideEgress { .. } => "secrets, egress.allow_dns_hosts",
             Self::NoNetworkWithGrant { .. } => "secrets, network.mode",
-            Self::SteeringOffWithProxyEnv => "network.bep.steering, network.bep.proxy_env",
+            Self::SteeringOffWithProxyEnv { .. } => "network.bep.steering, network.bep.proxy_env",
             Self::NoResolver { .. } => "secrets, network.bep.steering",
             Self::InstallationUnenrolled { .. } => "secrets.mode",
             Self::NarrowScopesUnenrolled { .. } => {
@@ -702,6 +747,36 @@ impl BepRefusal {
     }
 }
 
+/// Where a refusal tells the person to edit a value. A minimal.toml table,
+/// such as `[defaults.session.secrets]`, reads "<table> in minimal.toml".
+/// Any other source, such as "the command line" or "the loadout `ci`",
+/// reads as it is.
+struct Place<'a>(&'a str);
+
+impl fmt::Display for Place<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.starts_with('[') {
+            write!(f, "{} in minimal.toml", self.0)
+        } else {
+            f.write_str(self.0)
+        }
+    }
+}
+
+/// Where the [`BepRefusal::UnenrolledNode`] text tells the person to
+/// remove the grants: the table that set them, or the box's entry when the
+/// refuser cannot know that table.
+struct UnenrolledPlace<'a>(Option<&'a str>);
+
+impl fmt::Display for UnenrolledPlace<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(table) => write!(f, "{}", Place(table)),
+            None => f.write_str("the secrets of this box's entry in minimal.toml"),
+        }
+    }
+}
+
 impl fmt::Display for BepRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -712,30 +787,37 @@ impl fmt::Display for BepRefusal {
                  Add them to egress.allow_dns_hosts.",
                 missing.join(", ")
             ),
-            Self::NoNetworkWithGrant { grants } => write!(
+            Self::NoNetworkWithGrant { grants, table } => write!(
                 f,
                 "This box declares the secret {} but has no network, so the secret \
-                 cannot reach anything. Use --network own_ip, or remove the secret.",
-                grants.join(", ")
+                 cannot reach anything. Use --network own_ip, or remove {} from {}.",
+                grants.join(", "),
+                grants.join(", "),
+                Place(table)
             ),
-            Self::SteeringOffWithProxyEnv => write!(
+            Self::SteeringOffWithProxyEnv { table } => write!(
                 f,
-                "This box sets steering = \"off\" and proxy_env = true in [network.bep]. \
+                "This box sets steering = \"off\" and proxy_env = true in \
+                 {}. \
                  With steering off the box does not trust the proxy, so every HTTPS \
                  request through the proxy fails. Remove proxy_env, or set \
-                 steering = \"proxy_env\"."
+                 steering = \"proxy_env\".",
+                Place(table)
             ),
-            Self::NoResolver { steering } => write!(
+            Self::NoResolver { steering, table } => write!(
                 f,
                 "This box declares a secret with steering = \"{}\", but this host has no \
-                 box DNS resolver. Set steering = \"proxy_env\" in [network.bep].",
-                steering.word()
+                 box DNS resolver. Set steering = \"proxy_env\" in \
+                 {}.",
+                steering.word(),
+                Place(table)
             ),
-            Self::InstallationUnenrolled { grant } => write!(
+            Self::InstallationUnenrolled { grant, table } => write!(
                 f,
                 "The GitHub secret {grant} sets mode = \"installation\", but this host is \
                  not enrolled, so it cannot act as a GitHub App installation. \
-                 Set mode = \"user\"."
+                 Set mode = \"user\" for {grant} in {}.",
+                Place(table)
             ),
             Self::NarrowScopesUnenrolled { grant, scopes } => write!(
                 f,
@@ -756,6 +838,7 @@ impl fmt::Display for BepRefusal {
                 grants,
                 stored,
                 cause,
+                table,
             } => {
                 let grants = grants.join(", ");
                 let kind = if *stored { "secret" } else { "GitHub grant" };
@@ -766,16 +849,17 @@ impl fmt::Display for BepRefusal {
                 write!(f, "{cause}")?;
                 write!(
                     f,
-                    " To create the box without the grant, remove {grants} from \
-                     [session.secrets] in minimal.toml."
+                    " To create the box without the grant, remove {grants} from {}.",
+                    UnenrolledPlace(table.as_deref())
                 )
             }
-            Self::StoreReferenceToSignIn { grant } => write!(
+            Self::StoreReferenceToSignIn { grant, table } => write!(
                 f,
                 "The secret {grant} names the item that holds your GitHub sign-in. Only \
-                 GitHub grants can use that item. To use your GitHub sign-in, set \
-                 source = \"broker\" and scopes = [\"github:user-token\"] for {grant}, \
-                 and remove its store and id."
+                 GitHub grants can use that item. To use your GitHub sign-in, go to {grant} in \
+                 {}. Set source = \"broker\" and \
+                 scopes = [\"github:user-token\"], and remove its store and id.",
+                Place(table)
             ),
             Self::StoreHostsOutsideEgress { grant, missing } => write!(
                 f,
@@ -783,12 +867,18 @@ impl fmt::Display for BepRefusal {
                  {}. Add them to egress.allow_dns_hosts.",
                 missing.join(", ")
             ),
-            Self::BrokerScopeNotGithub { grant, scope } => write!(
+            Self::BrokerScopeNotGithub {
+                grant,
+                scope,
+                table,
+            } => write!(
                 f,
                 "The secret {grant} sets source = \"broker\" with the scope \"{scope}\". \
                  A grant with source = \"broker\" takes only github: scopes. For a secret \
-                 you stored with `min secret set`, write source = \"store\", \
-                 store = \"keychain\" and id = \"<id>\" in place of source and scopes."
+                 you stored with `min secret set`, go to {grant} in {}. \
+                 Write source = \"store\", store = \"keychain\" and \
+                 id = \"<id>\" in place of source and scopes.",
+                Place(table)
             ),
         }
     }
@@ -906,6 +996,7 @@ pub fn refusals(
             out.push(BepRefusal::BrokerScopeNotGithub {
                 grant: name.clone(),
                 scope: scope.clone(),
+                table: spec.tables.secrets.to_owned(),
             });
         }
     }
@@ -919,6 +1010,7 @@ pub fn refusals(
                 .filter(|(_, grant)| grant.is_credentialed())
                 .map(|(name, _)| name.clone())
                 .collect(),
+            table: spec.tables.secrets.to_owned(),
         });
     }
 
@@ -942,12 +1034,17 @@ pub fn refusals(
 
     // BEP-010: `off` injects no CA, so a proxy environment cannot work.
     if steering == Steering::Off && spec.bep.proxy_env {
-        out.push(BepRefusal::SteeringOffWithProxyEnv);
+        out.push(BepRefusal::SteeringOffWithProxyEnv {
+            table: spec.tables.network_bep.to_owned(),
+        });
     }
 
     // BEP-017: `dns` and `both` need the box-zone resolver.
     if !host.box_zone_resolver && steering.needs_resolver() && spec.has_credentialed_upstream() {
-        out.push(BepRefusal::NoResolver { steering });
+        out.push(BepRefusal::NoResolver {
+            steering,
+            table: spec.tables.network_bep.to_owned(),
+        });
     }
 
     // BEP-056: an un-enrolled host has no GitHub App key.
@@ -956,6 +1053,7 @@ pub fn refusals(
             if grant.is_github() && grant.mode == Some(GrantMode::Installation) {
                 out.push(BepRefusal::InstallationUnenrolled {
                     grant: name.clone(),
+                    table: spec.tables.secrets.to_owned(),
                 });
             }
         }
@@ -1076,7 +1174,9 @@ pub fn require_sign_in(secrets: &SecretGrants, signed_in: bool) -> Result<(), Ac
 
 /// Refuses a box spec with a GitHub grant where no node-local proxy serves
 /// boxes (Gatehouse §6.2). `absence` is `None` when one does, and else
-/// says why none does. Logs one debug line when it refuses.
+/// says why none does. `table` is the minimal.toml table that set
+/// `secrets`, or `None` when the caller cannot know it. Logs one debug
+/// line when it refuses.
 ///
 /// # Errors
 ///
@@ -1085,6 +1185,7 @@ pub fn require_sign_in(secrets: &SecretGrants, signed_in: bool) -> Result<(), Ac
 pub fn require_proxy(
     secrets: &SecretGrants,
     absence: Option<ProxyAbsence>,
+    table: Option<&str>,
 ) -> Result<(), ActivationRefused> {
     let grants: Vec<String> = secrets
         .iter()
@@ -1092,24 +1193,34 @@ pub fn require_proxy(
         .map(|(name, _)| name.clone())
         .collect();
     match absence {
-        Some(cause) if !grants.is_empty() => Err(unenrolled_node(grants, false, cause)),
+        Some(cause) if !grants.is_empty() => Err(unenrolled_node(
+            grants,
+            false,
+            cause,
+            table.map(str::to_owned),
+        )),
         _ => Ok(()),
     }
 }
 
 /// The [`GATEHOUSE_UNENROLLED_NODE`] refusal of the grants `grants`, for
 /// the cause `cause`. `stored` says whether any of them is a store
-/// reference. Logs one debug line.
+/// reference. `table` is the minimal.toml table that set the grants. A
+/// caller that cannot know that table passes `None`: the host daemon gets
+/// a spec from any entry and not the layer that set its `secrets`. The
+/// text then names the secrets of the box's entry. Logs one debug line.
 #[must_use]
 pub fn unenrolled_node(
     grants: Vec<String>,
     stored: bool,
     cause: ProxyAbsence,
+    table: Option<String>,
 ) -> ActivationRefused {
     let refusal = BepRefusal::UnenrolledNode {
         grants,
         stored,
         cause,
+        table,
     };
     tracing::debug!(
         rule = refusal.rule(),
@@ -1219,8 +1330,11 @@ pub fn store_refusals(
     let mut out = Vec::new();
     for reference in store_references(secrets) {
         if deny.is_sign_in_item(reference.id) {
+            // Only `min box start` checks store references, and it reads
+            // the grants from `[defaults.session.secrets]`.
             out.push(BepRefusal::StoreReferenceToSignIn {
                 grant: reference.grant.to_string(),
+                table: SESSION_SECRETS_TABLE.to_owned(),
             });
             continue;
         }
@@ -1301,6 +1415,239 @@ mod tests {
         BTreeMap::from([("GH_TOKEN".to_string(), grant)])
     }
 
+    // BCLI-021, BCLI-078: each refusal and hint that tells the person to edit
+    // the project names the table in minimal.toml that set the refused
+    // value: `[defaults.session.*]` for `min box start`, and the layer that
+    // set it for `min box spec <entry>`.
+    #[test]
+    fn bep_refusals_name_the_minimal_toml_table() {
+        let grant = || "GH_TOKEN".to_owned();
+        for (secrets, network_bep) in [
+            (
+                "[defaults.session.secrets]",
+                "[defaults.session.network.bep]",
+            ),
+            ("[tasks.ci.secrets]", "[boxes.dev.network.bep]"),
+        ] {
+            let s = || secrets.to_owned();
+            let n = || network_bep.to_owned();
+            let cases = [
+                (
+                    BepRefusal::NoNetworkWithGrant {
+                        grants: vec![grant()],
+                        table: s(),
+                    },
+                    format!(
+                        "This box declares the secret GH_TOKEN but has no network, so the \
+                         secret cannot reach anything. Use --network own_ip, or remove \
+                         GH_TOKEN from {secrets} in minimal.toml."
+                    ),
+                ),
+                (
+                    BepRefusal::SteeringOffWithProxyEnv { table: n() },
+                    format!(
+                        "This box sets steering = \"off\" and proxy_env = true in \
+                         {network_bep} in minimal.toml. With steering off the box does not \
+                         trust the proxy, so every HTTPS request through the proxy fails. \
+                         Remove proxy_env, or set steering = \"proxy_env\"."
+                    ),
+                ),
+                (
+                    BepRefusal::NoResolver {
+                        steering: Steering::Dns,
+                        table: n(),
+                    },
+                    format!(
+                        "This box declares a secret with steering = \"dns\", but this host \
+                         has no box DNS resolver. Set steering = \"proxy_env\" in \
+                         {network_bep} in minimal.toml."
+                    ),
+                ),
+                (
+                    BepRefusal::InstallationUnenrolled {
+                        grant: grant(),
+                        table: s(),
+                    },
+                    format!(
+                        "The GitHub secret GH_TOKEN sets mode = \"installation\", but this \
+                         host is not enrolled, so it cannot act as a GitHub App \
+                         installation. Set mode = \"user\" for GH_TOKEN in {secrets} in \
+                         minimal.toml."
+                    ),
+                ),
+                (
+                    BepRefusal::UnenrolledNode {
+                        grants: vec![grant()],
+                        stored: false,
+                        cause: ProxyAbsence::NotInstalled { path: None },
+                        table: Some(s()),
+                    },
+                    format!(
+                        "Cannot create the box: it declares the GitHub grant GH_TOKEN, and \
+                         `bep`, the Box Egress Proxy, is not installed, so no proxy serves \
+                         boxes on this machine. To create the box without the grant, remove \
+                         GH_TOKEN from {secrets} in minimal.toml."
+                    ),
+                ),
+                (
+                    BepRefusal::StoreReferenceToSignIn {
+                        grant: grant(),
+                        table: s(),
+                    },
+                    format!(
+                        "The secret GH_TOKEN names the item that holds your GitHub sign-in. \
+                         Only GitHub grants can use that item. To use your GitHub sign-in, go \
+                         to GH_TOKEN in {secrets} in minimal.toml. Set source = \"broker\" \
+                         and scopes = [\"github:user-token\"], and remove its store and id."
+                    ),
+                ),
+                (
+                    BepRefusal::BrokerScopeNotGithub {
+                        grant: grant(),
+                        scope: "repo".into(),
+                        table: s(),
+                    },
+                    format!(
+                        "The secret GH_TOKEN sets source = \"broker\" with the scope \
+                         \"repo\". A grant with source = \"broker\" takes only github: \
+                         scopes. For a secret you stored with `min secret set`, go to \
+                         GH_TOKEN in {secrets} in minimal.toml. Write source = \"store\", \
+                         store = \"keychain\" and id = \"<id>\" in place of source and \
+                         scopes."
+                    ),
+                ),
+            ];
+            for (refusal, text) in cases {
+                assert_eq!(refusal.to_string(), text);
+            }
+        }
+    }
+
+    // BCLI-021, BCLI-078: a refuser that cannot know the table, as the host
+    // daemon cannot, names the secrets of the box's entry and no table. A
+    // value from outside the file names its source as it is.
+    #[test]
+    fn bep_refusals_name_the_minimal_toml_table_or_the_source() {
+        // A refuser that cannot know the table, as the host daemon cannot,
+        // names the secrets of the box's entry and no table.
+        let unnamed = unenrolled_node(
+            vec!["GH_TOKEN".into()],
+            false,
+            ProxyAbsence::NotServed,
+            None,
+        );
+        let text = unnamed.to_string();
+        assert!(
+            text.ends_with(
+                "To create the box without the grant, remove GH_TOKEN from the secrets of \
+                 this box's entry in minimal.toml."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("[defaults."), "{text}");
+        assert_eq!(
+            unnamed.refusals[0].next_step().as_deref(),
+            Some(
+                "to create the box without the grant, remove GH_TOKEN from the secrets of \
+                 this box's entry in minimal.toml"
+            )
+        );
+
+        // A value set outside a minimal.toml table names its source as it is.
+        let overridden = BepRefusal::NoResolver {
+            steering: Steering::Dns,
+            table: "the command line".into(),
+        };
+        assert!(
+            overridden
+                .to_string()
+                .ends_with("Set steering = \"proxy_env\" in the command line."),
+            "{overridden}"
+        );
+    }
+
+    // BCLI-021, BCLI-078: the checks fill the table from the spec's tables,
+    // and the checks that only `min box start` runs fill
+    // `[defaults.session.secrets]`.
+    #[test]
+    fn bep_refusals_name_the_minimal_toml_table_the_checks_fill() {
+        // The `-o json` hint of the un-enrolled refusal names its table.
+        for secrets in ["[defaults.session.secrets]", "[tasks.ci.secrets]"] {
+            let unenrolled = BepRefusal::UnenrolledNode {
+                grants: vec!["GH_TOKEN".into()],
+                stored: true,
+                cause: ProxyAbsence::NotServed,
+                table: Some(secrets.into()),
+            };
+            assert_eq!(
+                unenrolled.next_step(),
+                Some(format!(
+                    "to create the box without the grant, remove GH_TOKEN from {secrets} \
+                     in minimal.toml"
+                ))
+            );
+        }
+
+        let secrets = SecretGrants::from([(
+            "OLD".to_owned(),
+            SecretGrant {
+                scopes: vec!["claude".into()],
+                ..github_grant(None)
+            },
+        )]);
+        let bep = BepSettings::default();
+        let spec = ActivationSpec {
+            network: NetworkMode::NoNet,
+            egress: None,
+            bep: &bep,
+            secrets: &secrets,
+            tables: BepTables {
+                secrets: "[tasks.ci.secrets]",
+                network_bep: "[tasks.ci.network.bep]",
+            },
+        };
+        let found = refusals(&spec, HostFacts::LOCAL, &[]);
+        let tables: Vec<(&str, &str)> = found
+            .iter()
+            .map(|refusal| match refusal {
+                BepRefusal::BrokerScopeNotGithub { table, .. } => ("BEP-032", table.as_str()),
+                BepRefusal::NoNetworkWithGrant { table, .. } => ("BEP-009", table.as_str()),
+                BepRefusal::NoResolver { table, .. } => ("BEP-017", table.as_str()),
+                other => panic!("unexpected refusal {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                ("BEP-032", "[tasks.ci.secrets]"),
+                ("BEP-009", "[tasks.ci.secrets]"),
+                ("BEP-017", "[tasks.ci.network.bep]"),
+            ]
+        );
+        let unenrolled = unenrolled_node(
+            vec!["GH_TOKEN".into()],
+            false,
+            ProxyAbsence::NotServed,
+            Some(SESSION_SECRETS_TABLE.into()),
+        );
+        assert!(
+            unenrolled
+                .to_string()
+                .contains("[defaults.session.secrets]"),
+            "{unenrolled}"
+        );
+
+        assert!(PROJECT_ACKNOWLEDGEMENT_IGNORED.contains("in [defaults.session.secrets]."));
+        // No refusal names a legacy table.
+        for text in [
+            unenrolled.to_string(),
+            PROJECT_ACKNOWLEDGEMENT_IGNORED.to_owned(),
+        ] {
+            assert!(!text.contains("[session."), "{text}");
+            assert!(!text.contains(" [network.bep]"), "{text}");
+        }
+    }
+
     // BEP-003: a GitHub grant with no sign-in held fails with the defined
     // error and the fixed text, and exits as a refused box spec.
     #[test]
@@ -1337,8 +1684,11 @@ mod tests {
         assert!(require_sign_in(&client_env, false).is_ok());
         assert!(require_sign_in(&SecretGrants::new(), false).is_ok());
         // Another refusal has no defined error, and no `-o json` hint.
-        assert_eq!(BepRefusal::SteeringOffWithProxyEnv.code(), None);
-        assert_eq!(BepRefusal::SteeringOffWithProxyEnv.next_step(), None);
+        let steering_off = BepRefusal::SteeringOffWithProxyEnv {
+            table: BepTables::SESSION.network_bep.into(),
+        };
+        assert_eq!(steering_off.code(), None);
+        assert_eq!(steering_off.next_step(), None);
     }
 
     fn egress_with(hosts: &[&str]) -> EgressPolicy {
@@ -1490,7 +1840,7 @@ mod tests {
             host in any_host(),
             module in any_module_hosts(),
         ) {
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets, tables: BepTables::SESSION };
             let allowed: Vec<String> = egress
                 .as_ref()
                 .and_then(|e| e.allow_dns_hosts.clone())
@@ -1533,13 +1883,13 @@ mod tests {
             host in any_host(),
         ) {
             // A `client_env` grant in a `none` box is legal.
-            let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client };
+            let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client, tables: BepTables::SESSION };
             let client_fired = refusals(&client_spec, host, GITHUB_HOSTS)
                 .iter()
                 .any(|r| matches!(r, BepRefusal::NoNetworkWithGrant { .. }));
             prop_assert!(!client_fired);
 
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets, tables: BepTables::SESSION };
             let credentialed: Vec<String> = secrets
                 .iter()
                 .filter(|(_, g)| g.is_credentialed())
@@ -1547,7 +1897,7 @@ mod tests {
                 .collect();
             let expected = network == NetworkMode::NoNet && !credentialed.is_empty();
             let named = refusals(&spec, host, GITHUB_HOSTS).into_iter().find_map(|r| match r {
-                BepRefusal::NoNetworkWithGrant { grants } => Some(grants),
+                BepRefusal::NoNetworkWithGrant { grants, .. } => Some(grants),
                 _ => None,
             });
             prop_assert_eq!(named.is_some(), expected);
@@ -1574,7 +1924,7 @@ mod tests {
         ) {
             let host = HostFacts { enrolled, box_zone_resolver: false, full_breadth_acknowledged: false };
 
-            let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client };
+            let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client, tables: BepTables::SESSION };
             let client_fired = refusals(&client_spec, host, GITHUB_HOSTS)
                 .iter()
                 .any(|r| matches!(r, BepRefusal::NoResolver { .. }));
@@ -1584,7 +1934,7 @@ mod tests {
                 prop_assert!(plan.is_ok_and(|plan| !plan.inject_ca));
             }
 
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets, tables: BepTables::SESSION };
             let resolved = bep.steering.unwrap_or(Steering::Dns);
             let expected = secrets.values().any(SecretGrant::is_credentialed)
                 && matches!(resolved, Steering::Dns | Steering::Both);
@@ -1624,7 +1974,7 @@ mod tests {
             box_zone_resolver in any::<bool>(),
         ) {
             let host = HostFacts { enrolled: false, box_zone_resolver, full_breadth_acknowledged: false };
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets, tables: BepTables::SESSION };
             let expected: Vec<String> = secrets
                 .iter()
                 .filter(|(_, g)| g.is_github() && g.mode == Some(GrantMode::Installation))
@@ -1633,7 +1983,7 @@ mod tests {
             let named: Vec<String> = refusals(&spec, host, GITHUB_HOSTS)
                 .into_iter()
                 .filter_map(|r| match r {
-                    BepRefusal::InstallationUnenrolled { grant } => Some(grant),
+                    BepRefusal::InstallationUnenrolled { grant, .. } => Some(grant),
                     _ => None,
                 })
                 .collect();
@@ -1662,7 +2012,7 @@ mod tests {
             acknowledged in any::<bool>(),
         ) {
             let host = HostFacts { enrolled, box_zone_resolver, full_breadth_acknowledged: acknowledged };
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets, tables: BepTables::SESSION };
             let expected: Vec<String> = if enrolled || acknowledged {
                 Vec::new()
             } else {
@@ -1727,6 +2077,7 @@ mod tests {
             egress: Some(&egress),
             bep: &bep,
             secrets: &secrets.grants,
+            tables: BepTables::SESSION,
         };
         let refused = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect_err("refused");
         assert_eq!(refused.exit_code(), 3);
@@ -1773,7 +2124,7 @@ mod tests {
             bep in any_bep(),
             secrets in any_grants(),
         ) {
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets, tables: BepTables::SESSION };
             let credentialed = secrets.values().any(SecretGrant::is_credentialed);
             prop_assert_eq!(spec.has_credentialed_upstream(), credentialed);
             let resolved = bep.steering.unwrap_or(Steering::Dns);
@@ -1802,6 +2153,7 @@ mod tests {
             egress: Some(&egress),
             bep: &bep,
             secrets: &secrets,
+            tables: BepTables::SESSION,
         };
         let refused = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect_err("refused");
         assert_eq!(
@@ -1826,6 +2178,7 @@ mod tests {
             egress: Some(&egress),
             bep: &bep,
             secrets: &secrets,
+            tables: BepTables::SESSION,
         };
         let plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect("accepted");
         assert_eq!(plan.steering, Steering::Off);
@@ -1863,6 +2216,7 @@ mod tests {
             egress: Some(&egress),
             bep: &bep,
             secrets: &secrets,
+            tables: BepTables::SESSION,
         };
         let mut plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect("accepted");
         assert!(plan.inject_ca);
@@ -1911,9 +2265,15 @@ mod tests {
             egress: None,
             bep: &bep,
             secrets: &secrets,
+            tables: BepTables::SESSION,
         };
         let refused = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect_err("refused");
-        assert_eq!(refused.refusals, vec![BepRefusal::SteeringOffWithProxyEnv]);
+        assert_eq!(
+            refused.refusals,
+            vec![BepRefusal::SteeringOffWithProxyEnv {
+                table: "[defaults.session.network.bep]".into()
+            }]
+        );
         assert_eq!(refused.exit_code(), 3);
         let text = refused.to_string();
         assert!(text.contains("steering = \"off\""), "{text}");
@@ -1939,6 +2299,7 @@ mod tests {
             egress: Some(&egress),
             bep: &bep,
             secrets: &secrets,
+            tables: BepTables::SESSION,
         };
         // Where the host resolves box names, the default `dns` is admitted.
         let plan = check_activation(&spec, RESOLVER_HOST, GITHUB_HOSTS).expect("admitted");
@@ -1967,6 +2328,7 @@ mod tests {
                     egress: Some(&egress),
                     bep: &bep,
                     secrets: &secrets,
+                    tables: BepTables::SESSION,
                 };
                 let case = format!("{steering:?} {network:?}");
                 assert_eq!(refusals(&spec, RESOLVER_HOST, GITHUB_HOSTS), [], "{case}");
@@ -1981,7 +2343,8 @@ mod tests {
                 assert_eq!(
                     refused.refusals,
                     vec![BepRefusal::NoResolver {
-                        steering: bep.resolved_steering()
+                        steering: bep.resolved_steering(),
+                        table: "[defaults.session.network.bep]".into(),
                     }],
                     "{case}"
                 );
@@ -2086,6 +2449,7 @@ mod tests {
                 egress: Some(&egress),
                 bep: &bep,
                 secrets: &secrets,
+                tables: BepTables::SESSION,
             };
             let refused =
                 check_activation(&spec, RESOLVER_HOST, GITHUB_HOSTS).expect_err("refused");
@@ -2095,6 +2459,7 @@ mod tests {
                 vec![BepRefusal::BrokerScopeNotGithub {
                     grant: "GH_TOKEN".into(),
                     scope: scope.into(),
+                    table: "[defaults.session.secrets]".into(),
                 }]
             );
             let text = refused.to_string();
@@ -2215,6 +2580,7 @@ mod tests {
                 egress,
                 bep: &bep,
                 secrets: &secrets,
+                tables: BepTables::SESSION,
             };
             refusals(&spec, RESOLVER_HOST, GITHUB_HOSTS)
                 .iter()
@@ -2617,7 +2983,8 @@ mod tests {
         assert_eq!(
             err.refusals,
             vec![BepRefusal::StoreReferenceToSignIn {
-                grant: "TOKEN".into()
+                grant: "TOKEN".into(),
+                table: "[defaults.session.secrets]".into(),
             }]
         );
         assert!(

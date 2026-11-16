@@ -6673,6 +6673,36 @@ async fn broker_secret_unenrolled_exit5() {
     }
 }
 
+// BCLI-021, BCLI-078: the daemon gets a spec from any entry, and not the
+// minimal.toml table that set its `secrets`. Its refusal of a task entry's
+// GitHub grant names the entry's secrets, and no `[defaults.session.secrets]`.
+#[test]
+fn unenrolled_refusal_of_a_task_entry_names_no_session_table() {
+    let spec = spec_with_secrets(
+        "ci",
+        serde_json_lenient::json!({ "GH_TOKEN": broker_secret() }),
+    );
+    let (refusal, grants) =
+        unenrolled_broker_refusal(&spec, false).expect("a GitHub grant nothing serves is refused");
+    assert_eq!(grants, vec!["GH_TOKEN"]);
+    let text = refusal.to_string();
+    assert!(!text.contains("[defaults.session.secrets]"), "{text}");
+    assert!(
+        text.ends_with(
+            "To create the box without the grant, remove GH_TOKEN from the secrets of \
+             this box's entry in minimal.toml."
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        refusal.refusals[0].next_step().as_deref(),
+        Some(
+            "to create the box without the grant, remove GH_TOKEN from the secrets of \
+             this box's entry in minimal.toml"
+        )
+    );
+}
+
 /// A brokered secret with no `github:` scope.
 fn broker_secret_aws() -> serde_json_lenient::Value {
     serde_json_lenient::json!({ "source": "broker", "scopes": ["aws:s3"] })
