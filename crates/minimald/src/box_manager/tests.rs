@@ -7715,4 +7715,22 @@ async fn composes_from_stored_expanded_spec_not_minimal_toml() {
         panic!("with hooks off nothing is pending");
     };
     assert!(composition.lifecycle_hooks().is_empty());
+
+    // A stored spec that cannot be read fails the compose: the hooks never
+    // fall back to `minimal.toml` for a box that stores a spec.
+    std::fs::remove_file(root.path().join(boxes::store::SPEC_FILE)).unwrap();
+    std::fs::create_dir(root.path().join(boxes::store::SPEC_FILE)).unwrap();
+    let err = run_compose(
+        &daemon,
+        &path,
+        &declared_path(),
+        WireContribution::default(),
+        true,
+    )
+    .err()
+    .expect("an unreadable stored spec fails the compose");
+    assert!(
+        err.to_string().contains("reading the stored box spec"),
+        "{err}"
+    );
 }

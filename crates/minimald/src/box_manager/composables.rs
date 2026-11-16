@@ -557,7 +557,7 @@ pub(crate) fn run_compose(
         hooks_enabled,
     )?;
     let mut contribution = contribution;
-    if hooks_enabled && let Some(spec) = stored_spec_beside(project_path) {
+    if hooks_enabled && let Some(spec) = stored_spec_beside(project_path)? {
         compose_hooks_from_stored_spec(&mut contribution, declared_path, &spec);
     }
     let outcome = run_composer(contribution, project_composable, package_composables)?;
@@ -567,30 +567,42 @@ pub(crate) fn run_compose(
 /// The spec stored beside the box's workspace, `project_path`: the
 /// [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
 /// directory (BOX-068). `None` when the box stores no spec, or when the
-/// stored spec does not read as a Box Spec.
-fn stored_spec_beside(project_path: &DaemonAbsPath) -> Option<mfile::spec::BoxSpec> {
-    let path = project_path
-        .as_utf8_path()
-        .parent()?
-        .join(boxes::store::SPEC_FILE);
+/// stored spec does not read as a v0 Box Spec: the daemon stores any spec
+/// with a whole `v` (see `spec_bytes`), so a spec of another version
+/// composes from the project as before.
+///
+/// # Errors
+///
+/// A stored spec that exists but cannot be read fails the compose, so the
+/// box never runs hooks from a source other than its stored spec.
+fn stored_spec_beside(
+    project_path: &DaemonAbsPath,
+) -> Result<Option<mfile::spec::BoxSpec>, std::io::Error> {
+    let Some(dir) = project_path.as_utf8_path().parent() else {
+        return Ok(None);
+    };
+    let path = dir.join(boxes::store::SPEC_FILE);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            tracing::warn!(spec_path = %path, error = %e, "could not read the stored box spec");
-            return None;
+            tracing::error!(spec_path = %path, error = %e, "could not read the stored box spec");
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("reading the stored box spec at {path}: {e}"),
+            ));
         }
     };
     match serde_json_lenient::from_slice(&bytes) {
-        Ok(spec) => Some(spec),
+        Ok(spec) => Ok(Some(spec)),
         Err(e) => {
             tracing::warn!(
                 spec_path = %path,
                 error = %e,
-                "the stored box spec does not read as a box spec; \
+                "the stored box spec does not read as a v0 box spec; \
                  the project's hooks compose from the project as before"
             );
-            None
+            Ok(None)
         }
     }
 }
