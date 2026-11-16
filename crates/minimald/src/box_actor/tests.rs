@@ -18706,7 +18706,12 @@ fn a_scaffold_over_a_link_out_of_the_workspace_is_refused() {
     )
     .unwrap_err();
 
-    assert!(err.contains("leads outside its workspace"), "error: {err}");
+    // Where every link is refused (off Linux, or a kernel without
+    // `openat2`) the refusal says only that it is a link.
+    assert!(
+        err.contains("leads outside its workspace") || err.contains("cannot follow a link here"),
+        "error: {err}"
+    );
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# outside\n");
     assert_eq!(std::fs::read_link(&link).unwrap(), outside);
 }

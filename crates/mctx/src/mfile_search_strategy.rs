@@ -111,11 +111,14 @@ mod tests {
         let err = MFileSearchStrategy::Within(workspace.path().to_path_buf())
             .find_mfile()
             .unwrap_err();
+        // Where every link is refused (off Linux, or a kernel without
+        // `openat2`) the refusal says only that it is a link.
         assert!(
             matches!(
                 &err,
                 Error::MFile(mfile::Error::IO(_, _, io))
                     if io.to_string().contains("leads outside its workspace")
+                        || io.to_string().contains("cannot follow a link here")
             ),
             "error: {err:?}"
         );

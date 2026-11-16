@@ -1444,9 +1444,10 @@ impl File {
                 if !meta.is_file() {
                     let e = std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "not a regular file; the read is refused",
+                        "not a regular file, so the read is refused. \
+                         Replace it with a regular file",
                     );
-                    return Err(Error::IO("minimal file", shown, e));
+                    return Err(Error::IO("reading", rel.to_path_buf(), e));
                 }
                 let mut file_data = Vec::new();
                 file.read_to_end(&mut file_data)
@@ -1456,7 +1457,7 @@ impl File {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
             // A link put at `name` after it was resolved.
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                Err(Self::leads_outside(&shown, Access::Read))
+                Err(Self::became_a_link(rel, Access::Read))
             }
             Err(e) => Err(Error::IO("minimal file", shown, e)),
         }
@@ -4827,8 +4828,8 @@ bash = \"true\"
         (dir, root, outside)
     }
 
-    /// Whether the edit of a file under `root` refuses every link rather
-    /// than following it: the fallback, taken off Linux and on a Linux
+    /// Whether the edit or read of a file under `root` refuses every link
+    /// rather than following it: the fallback, taken off Linux and on a Linux
     /// kernel without `openat2`.
     fn refuses_every_link(root: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -4842,8 +4843,8 @@ bash = \"true\"
         }
     }
 
-    /// The edit was refused with a refusal that names the file by its path
-    /// under the workspace and says what to do: as leading outside the
+    /// The edit or read was refused with a refusal that names the file by
+    /// its path under the workspace and says what to do: as leading outside the
     /// workspace, or, where every link is refused, as a link. The fallback
     /// does not look where a link leads, so it must not say.
     fn assert_link_refusal(err: &Error, root: &Path) {
@@ -5081,29 +5082,12 @@ bash = \"true\"
     /// Not TOML, so a parse of it would quote it back: a refusal must not.
     const OUTSIDE_SECRET: &str = "outside-secret = = 1\n";
 
-    /// Whether a confined read at `root` checks the components for links
-    /// instead of resolving the names with `openat2`: always off Linux, and
-    /// on a Linux kernel without `openat2`.
-    fn reads_by_component_check(root: &Path) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            takes_the_no_openat2_fallback(root)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = root;
-            true
-        }
-    }
-
-    /// The read was refused as leading out of the workspace, nothing of the
-    /// file outside is in the error, and `link` is still the link it was.
+    /// The read was refused as leading out of the workspace (or, where
+    /// every link is refused, as a link), nothing of the file outside is in
+    /// the error, and `link` is still the link it was.
     fn assert_read_refused(err: &Error, link: &Path, target: &Path) {
+        assert_link_refusal(err, link.parent().unwrap());
         let shown = format!("{err} {err:?}");
-        assert!(
-            shown.contains("leads outside its workspace"),
-            "error: {err}"
-        );
         assert!(
             !shown.contains("outside-secret"),
             "the refusal carries the content of the file outside: {shown}"
@@ -5196,12 +5180,9 @@ bash = \"true\"
 
         let err = File::from_dir_within(&root).unwrap_err();
 
-        if reads_by_component_check(&root) {
+        if refuses_every_link(&root) {
             eprintln!("no openat2 here: checking the fallback's refusal of every link instead");
-            assert!(
-                err.to_string().contains("leads outside its workspace"),
-                "error: {err}"
-            );
+            assert_link_refusal(&err, &root);
         } else {
             assert!(err.to_string().contains("does not exist"), "error: {err}");
         }
@@ -5217,13 +5198,10 @@ bash = \"true\"
         let target = Path::new("conf/real.toml");
         std::os::unix::fs::symlink(target, &link).unwrap();
 
-        if reads_by_component_check(&root) {
+        if refuses_every_link(&root) {
             eprintln!("no openat2 here: checking the fallback's refusal of every link instead");
             let err = File::from_dir_within(&root).unwrap_err();
-            assert!(
-                err.to_string().contains("leads outside its workspace"),
-                "error: {err}"
-            );
+            assert_link_refusal(&err, &root);
             assert_eq!(std::fs::read_link(&link).unwrap(), target);
             return;
         }
