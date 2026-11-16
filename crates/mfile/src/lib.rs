@@ -1529,10 +1529,14 @@ impl File {
             rel.file_name().is_some() && rel.components().all(|c| matches!(c, Component::Normal(_)))
         });
         let Some(rel) = rel else {
+            // The caller built `path` from something other than `root`: a
+            // daemon bug, not something the box did, so the daemon's paths
+            // are the useful ones here.
             let e = std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
-                    "not a file under the workspace {}; the edit is refused",
+                    "not a file under the workspace {}, so the edit is refused. \
+                     This is a bug in minimald: please report it",
                     root.display()
                 ),
             );
@@ -1541,24 +1545,60 @@ impl File {
         Self::edit_confined(lock_dir, timeout, root, rel, path, edit)
     }
 
-    /// The error for a `minimal.toml` whose name leads out of the workspace.
-    fn leads_outside(path: &Path) -> Error {
+    // The refusals below name the file by `rel`, its path under the
+    // workspace (`minimal.toml` or `.minimal/minimal.toml`). They reach the
+    // person who ran `min add` in the box, who knows the file by that name
+    // and not by the daemon's path to the workspace, and each ends with what
+    // that person can do about it.
+
+    /// The error for a `minimal.toml` whose name resolves, through a link,
+    /// to a file outside the workspace.
+    #[cfg(target_os = "linux")]
+    fn leads_outside(rel: &Path) -> Error {
         let e = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "the box's minimal.toml leads outside its workspace (a link or `..` out of it); \
-             the edit is refused",
+            "it leads outside its workspace through a link, so the edit is refused. \
+             Replace the link (`minimal.toml` or `.minimal`) with a regular file or directory, \
+             or with a relative link that stays in the workspace",
         );
-        Error::IO("editing", path.to_path_buf(), e)
+        Error::IO("editing", rel.to_path_buf(), e)
+    }
+
+    /// The error for a link at `link` (a name under the workspace) where
+    /// links are not followed: the fallback for a kernel without `openat2`,
+    /// or a system other than Linux, refuses every link, since it cannot
+    /// keep a followed link inside the workspace. It does not say the link
+    /// leads outside: it did not look where the link leads.
+    fn link_not_followed(link: &Path) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "a link, and this system cannot follow a link here and keep the edit inside \
+             the workspace, so the edit is refused. Replace the link with a regular file \
+             or directory",
+        );
+        Error::IO("editing", link.to_path_buf(), e)
+    }
+
+    /// The error for a `minimal.toml` that became a link after it was
+    /// resolved, while the edit held it.
+    #[cfg(target_os = "linux")]
+    fn became_a_link(rel: &Path) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "it was replaced by a link during the edit, so the edit is refused. \
+             Run the command again",
+        );
+        Error::IO("editing", rel.to_path_buf(), e)
     }
 
     /// The error for a `minimal.toml` that is a link to nothing.
     #[cfg(target_os = "linux")]
-    fn dangling_within(path: &Path) -> Error {
+    fn dangling_within(rel: &Path) -> Error {
         let e = std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "symlink to a file that does not exist; create it or replace the link with a file",
         );
-        Error::IO("resolving", path.to_path_buf(), e)
+        Error::IO("resolving", rel.to_path_buf(), e)
     }
 
     /// The best-effort confinement: no component of `rel` under `root` may
@@ -1577,10 +1617,12 @@ impl File {
         E: From<Error>,
     {
         let mut at = root.to_path_buf();
+        let mut link = PathBuf::new();
         for component in rel.components() {
             at.push(component);
+            link.push(component);
             match std::fs::symlink_metadata(&at) {
-                Ok(meta) if meta.is_symlink() => return Err(Self::leads_outside(path).into()),
+                Ok(meta) if meta.is_symlink() => return Err(Self::link_not_followed(&link).into()),
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
                 Err(e) => return Err(Error::IO("statting", at, e).into()),
@@ -1626,7 +1668,7 @@ impl File {
             .map_err(|e| Error::IO("opening workspace", root.to_path_buf(), e))?;
         let parent_rel = rel.parent().unwrap_or(Path::new(""));
         let Some(name) = rel.file_name() else {
-            return Err(Self::leads_outside(path).into());
+            return Err(Self::leads_outside(rel).into());
         };
 
         let dir_fd = match beneath::open_beneath(root_fd.as_fd(), parent_rel, beneath::DIR_FLAGS) {
@@ -1638,7 +1680,7 @@ impl File {
                 );
                 return Self::edit_checking_components(lock_dir, timeout, root, rel, path, edit);
             }
-            Err(e) if beneath::escaped(&e) => return Err(Self::leads_outside(path).into()),
+            Err(e) if beneath::escaped(&e) => return Err(Self::leads_outside(rel).into()),
             Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e).into()),
         };
 
@@ -1652,10 +1694,10 @@ impl File {
                 let target = match beneath::open_beneath(root_fd.as_fd(), rel, libc::O_PATH) {
                     Ok(fd) => fd,
                     Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                        return Err(Self::dangling_within(path).into());
+                        return Err(Self::dangling_within(rel).into());
                     }
                     Err(e) if beneath::escaped(&e) => {
-                        return Err(Self::leads_outside(path).into());
+                        return Err(Self::leads_outside(rel).into());
                     }
                     Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e).into()),
                 };
@@ -1664,10 +1706,10 @@ impl File {
                 let root_real = beneath::fd_path(root_fd.as_fd())
                     .map_err(|e| Error::IO("resolving", root.to_path_buf(), e))?;
                 let Some(real_rel) = resolved.strip_prefix(&root_real).ok() else {
-                    return Err(Self::leads_outside(path).into());
+                    return Err(Self::leads_outside(rel).into());
                 };
                 let Some(real_name) = real_rel.file_name() else {
-                    return Err(Self::leads_outside(path).into());
+                    return Err(Self::leads_outside(rel).into());
                 };
                 // Opened beneath `root` again rather than by the absolute
                 // path, so a directory swapped for a link meanwhile is
@@ -1677,7 +1719,7 @@ impl File {
                     match beneath::open_beneath(root_fd.as_fd(), real_parent, beneath::DIR_FLAGS) {
                         Ok(fd) => fd,
                         Err(e) if beneath::escaped(&e) => {
-                            return Err(Self::leads_outside(path).into());
+                            return Err(Self::leads_outside(rel).into());
                         }
                         Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e).into()),
                     };
@@ -1695,6 +1737,7 @@ impl File {
             std::fs::File::from(dir_fd),
             &name,
             &shown,
+            rel,
             edit,
         )
     }
@@ -1707,6 +1750,10 @@ impl File {
     /// `renameat` within `dir`. A rename never follows a link at its target
     /// name. It duplicates that body rather than sharing it, because the
     /// path-based one must keep following links for the host CLI.
+    ///
+    /// `shown` is the file's real path, for the lock key and the I/O
+    /// errors; `rel` is the name under the workspace the caller asked for,
+    /// for the refusals.
     #[cfg(target_os = "linux")]
     fn edit_in_dir<E>(
         lock_dir: Option<&Path>,
@@ -1714,6 +1761,7 @@ impl File {
         dir: std::fs::File,
         name: &OsStr,
         shown: &Path,
+        rel: &Path,
         edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
     ) -> Result<(), E>
     where
@@ -1747,9 +1795,10 @@ impl File {
                 if !meta.is_file() {
                     let e = std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "not a regular file; the edit is refused",
+                        "not a regular file, so the edit is refused. \
+                         Replace it with a regular file",
                     );
-                    return Err(Error::IO("reading", shown.to_path_buf(), e).into());
+                    return Err(Error::IO("reading", rel.to_path_buf(), e).into());
                 }
                 let mut content = String::new();
                 file.read_to_string(&mut content)
@@ -1759,7 +1808,7 @@ impl File {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
             // A link put at `name` after it was resolved.
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(Self::leads_outside(shown).into());
+                return Err(Self::became_a_link(rel).into());
             }
             Err(e) => return Err(Error::IO("reading", shown.to_path_buf(), e).into()),
         };
@@ -1805,7 +1854,8 @@ impl File {
         }
         let (_file, tmp_path) = tmp.into_parts();
         let Some(tmp_name) = tmp_path.file_name().map(OsStr::to_os_string) else {
-            return Err(Self::leads_outside(shown).into());
+            let e = std::io::Error::other("the temp file has no name");
+            return Err(Error::IO("creating temp", shown.to_path_buf(), e).into());
         };
         match beneath::rename_at(dir.as_fd(), &tmp_name, name) {
             // The temp's name is now the file's: nothing is left to remove.
@@ -4570,13 +4620,59 @@ bash = \"true\"
         (dir, root, outside)
     }
 
+    /// Whether the edit of a file under `root` refuses every link rather
+    /// than following it: the fallback, taken off Linux and on a Linux
+    /// kernel without `openat2`.
+    fn refuses_every_link(root: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            takes_the_no_openat2_fallback(root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = root;
+            true
+        }
+    }
+
+    /// The edit was refused with a refusal that names the file by its path
+    /// under the workspace and says what to do: as leading outside the
+    /// workspace, or, where every link is refused, as a link. The fallback
+    /// does not look where a link leads, so it must not say.
+    fn assert_link_refusal(err: &Error, root: &Path) {
+        let text = err.to_string();
+        if refuses_every_link(root) {
+            assert!(
+                text.contains("cannot follow a link here") && !text.contains("leads outside"),
+                "error: {text}"
+            );
+            assert!(
+                text.contains("Replace the link with a regular file"),
+                "error: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("leads outside its workspace"),
+                "error: {text}"
+            );
+            assert!(
+                text.contains("or with a relative link that stays in the workspace"),
+                "error: {text}"
+            );
+        }
+        let Error::IO(_, shown, _) = err else {
+            panic!("not an I/O refusal: {err:?}");
+        };
+        assert!(
+            shown.is_relative() && !text.contains(&*root.to_string_lossy()),
+            "the refusal shows the daemon's path: {text}"
+        );
+    }
+
     /// The edit was refused as leading out of the workspace, `outside` is
     /// unchanged, and `link` is still the link it was.
     fn assert_refused_outside(err: &Error, outside: &Path, link: &Path, target: &Path) {
-        assert!(
-            err.to_string().contains("leads outside its workspace"),
-            "error: {err}"
-        );
+        assert_link_refusal(err, link.parent().unwrap());
         assert_eq!(std::fs::read_to_string(outside).unwrap(), BASE);
         assert_eq!(
             std::fs::read_link(link).expect("the link entry was replaced"),
@@ -4713,10 +4809,7 @@ bash = \"true\"
             eprintln!(
                 "this kernel has no openat2: checking the fallback's refusal of every link instead"
             );
-            assert!(
-                err.to_string().contains("leads outside its workspace"),
-                "error: {err}"
-            );
+            assert_link_refusal(&err, &root);
         } else {
             assert!(err.to_string().contains("does not exist"), "error: {err}");
         }
@@ -4743,10 +4836,7 @@ bash = \"true\"
                 "this kernel has no openat2: checking the fallback's refusal of every link instead"
             );
             let err = edit_within_test(&root, &link, append_k).unwrap_err();
-            assert!(
-                err.to_string().contains("leads outside its workspace"),
-                "error: {err}"
-            );
+            assert_link_refusal(&err, &root);
             assert_eq!(std::fs::read_to_string(&real).unwrap(), BASE);
             assert_eq!(std::fs::read_link(&link).unwrap(), target);
             return;
