@@ -1893,16 +1893,40 @@ pub(crate) async fn run_entry(
                                 // BOX-185: an attached run copies the box's
                                 // declared exports once the box ended. A
                                 // `--detach` run returned above and copies
-                                // nothing (BOX-186).
-                                crate::cmd::copy_box_exports(
-                                    &mut client,
-                                    id,
-                                    &session_name,
-                                    Some(std::path::Path::new(abs_path.as_str())),
-                                    Some(std::path::Path::new(abs_path.as_str())),
-                                    &mut std::io::stderr(),
-                                )
-                                .await;
+                                // nothing (BOX-186). A run with no exit
+                                // status lost its connection, and the box
+                                // can still run, so the record must show
+                                // that the box ended before the copy, as
+                                // the attach checks.
+                                let box_ended = matches!(
+                                    record_state(&mut client, id).await,
+                                    Some(
+                                        boxes::core::record::RecordState::Stopped(_)
+                                            | boxes::core::record::RecordState::Exited(_)
+                                    )
+                                );
+                                if box_ended {
+                                    // Interim: the outcomes are not used
+                                    // yet. A skipped export does not turn
+                                    // a 0 end into 125 (BOX-193), and no
+                                    // `file_exported` event records them
+                                    // (BOX-195). Both are later tasks.
+                                    let _outcomes = crate::cmd::copy_box_exports(
+                                        &mut client,
+                                        id,
+                                        &session_name,
+                                        Some(std::path::Path::new(abs_path.as_str())),
+                                        Some(std::path::Path::new(abs_path.as_str())),
+                                        &mut std::io::stderr(),
+                                    )
+                                    .await;
+                                } else {
+                                    tracing::info!(
+                                        box_id = %id,
+                                        "file exports: the task box has not ended; \
+                                         nothing was copied"
+                                    );
+                                }
                             }
                             TaskBoxEnd::Remove => {
                                 tracing::info!(

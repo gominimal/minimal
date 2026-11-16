@@ -233,8 +233,14 @@ pub(crate) async fn box_wait_on_hosts(
             // BOX-185: the wait copies the box's declared exports, on
             // every end, before it gives back the box's code. It copies
             // only into its own project (BOX-199).
+            //
+            // Interim: each wait on an ended box copies again, and the
+            // outcomes are not used yet. The claim that stops a later
+            // wait from copying an export the record already holds is
+            // BOX-198. The `file_exported` event is BOX-195, and exit 125
+            // for a skipped export is BOX-193. All are later tasks.
             let root = shown.record.project_root.as_ref();
-            copy_box_exports(
+            let _outcomes = copy_box_exports(
                 &mut client,
                 id,
                 shown.record.name.as_deref().unwrap_or(target),
