@@ -664,6 +664,26 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
         }
     };
     let Some((port, bound)) = answerer else {
+        // D3472: no daemon reports a port its channel reaches. When the
+        // installed DNS service is stale or not running, that service is
+        // what holds the port (or will, once it runs), so the item offers
+        // its reinstall at that port instead of waiting on a daemon.
+        let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
+        let service_port = held_no_channel.unwrap_or(minvmd::net::answerer::DEFAULT_ANSWERER_PORT);
+        if answerer_step.installed_but_stale_or_failing() {
+            let range_present = crate::resolver::live_name_surface_with_range_at(
+                &detection,
+                Some(service_port),
+                false,
+            )
+            .await
+            .and_then(|verdict| verdict.range_present);
+            if let Some(item) =
+                reinstall_item(&detection, service_port, range_present, &answerer_step)
+            {
+                return item;
+            }
+        }
         // No port to point a script at yet: the item waits on a daemon,
         // and never blocks the items the script can carry without one.
         let cause = match held_no_channel {
@@ -690,6 +710,37 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
         blocker.as_deref(),
     );
     names_item(verdict, port)
+}
+
+/// The names item when no daemon reports a port its channel reaches and
+/// the installed DNS service is stale or not running (D3472): the item the
+/// verdict decides at the service's port, so the script reinstalls the
+/// service. `None` when the service is not stale or failing: the caller
+/// then reports the item as waiting on a daemon. Pure over the reads.
+pub(crate) fn reinstall_item(
+    detection: &(
+        crate::resolver::Hook,
+        Option<String>,
+        crate::resolver::RangeStep,
+    ),
+    port: u16,
+    range_present: Option<bool>,
+    answerer_step: &crate::resolver::AnswererStep,
+) -> Option<Item> {
+    if !answerer_step.installed_but_stale_or_failing() {
+        return None;
+    }
+    let (hook, blocker, range_step) = detection;
+    let verdict = crate::resolver::names_verdict_at(
+        hook,
+        port,
+        false,
+        range_present,
+        range_step,
+        answerer_step,
+        blocker.as_deref(),
+    );
+    Some(names_item(verdict, port))
 }
 
 /// The answerer port the daemons report (with whether it is bound), and
@@ -2829,6 +2880,80 @@ mod tests {
         let script = missing.script.unwrap();
         assert!(script.starts_with("# The resolver: "), "{script}");
         assert!(!script.contains("#!/bin/sh"), "{script}");
+    }
+
+    /// D3472: when the port is held with no channel and the installed DNS
+    /// service is not running, `--show` offers the step that reinstalls it
+    /// at that port, with a script, and does not report the item waiting.
+    #[test]
+    fn finalize_install_show_offers_reinstall_for_a_failing_answerer() {
+        use crate::resolver::{AnswererStep, BootUnit, Hook, RangeStep, VerifiedSource};
+        let port = minvmd::net::answerer::DEFAULT_ANSWERER_PORT;
+        let detection = (
+            Hook {
+                source: "test".to_string(),
+                port: Some(port),
+                detail: "routes the zone".to_string(),
+                boot_unit: BootUnit::Installed { port: Some(port) },
+            },
+            None,
+            RangeStep::not_needed(),
+        );
+        let verified = |service: AnswererStep| AnswererStep::SourceVerified {
+            service: Box::new(service),
+            source: VerifiedSource {
+                path: crate::resolver::TEST_ANSWERER_SOURCE.to_string(),
+                sha256: "0".repeat(64),
+                bundle: Vec::new(),
+                requirement: None,
+            },
+        };
+        for (service, fact) in [
+            (
+                AnswererStep::NotRunning,
+                "Minimal's DNS service is installed but not running",
+            ),
+            (
+                AnswererStep::CopyDiffers,
+                "the installed DNS service runs a different minzoned than the one this version \
+                 of Minimal ships",
+            ),
+        ] {
+            let item = reinstall_item(&detection, port, Some(true), &verified(service))
+                .expect("a failing service is offered, not left waiting");
+            assert_eq!(item.state, ItemState::Missing, "{item:?}");
+            let today = item.today.clone().unwrap_or_default();
+            assert!(today.contains(fact), "{today}");
+            let script = item.script.as_deref().expect("the item carries a script");
+            assert!(script.contains(&port.to_string()), "{script}");
+            let plan = Plan { items: vec![item] };
+            let summary = plan.summary();
+            assert!(!summary.contains(WAITING), "{summary}");
+            assert!(
+                summary.contains(&format!("  ✗ {NAMES_LABEL}\n")),
+                "{summary}"
+            );
+            let shown = plan.script().expect("--show --script prints a script");
+            assert!(shown.starts_with("#!/bin/sh\n"), "{shown}");
+            if crate::resolver::answerer_install(&VerifiedSource {
+                path: crate::resolver::TEST_ANSWERER_SOURCE.to_string(),
+                sha256: "0".repeat(64),
+                bundle: Vec::new(),
+                requirement: None,
+            })
+            .is_some()
+            {
+                assert!(
+                    today.contains("; this step") && shown.contains(&"0".repeat(64)),
+                    "the script replaces the installed copy with the pinned one: {shown}"
+                );
+            }
+        }
+        // A service that holds, or none at all, is no reinstall: the caller
+        // reports the item waiting on a daemon, as before.
+        for service in [AnswererStep::Installed, AnswererStep::Absent] {
+            assert!(reinstall_item(&detection, port, Some(true), &verified(service)).is_none());
+        }
     }
 
     /// The names item's facts are a list in the summary and one line in

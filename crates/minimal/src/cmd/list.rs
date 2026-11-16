@@ -1083,9 +1083,9 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         // the pre-acquisition state prints no answerer line and forces no
         // blank one, and a proxy cause rides beside whatever the answerer's
         // own state decided — displacing nothing, displaced by nothing.
-        let vm_answerer_line = vm_answerer
-            .as_ref()
-            .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()));
+        let vm_answerer_line = vm_answerer.as_ref().and_then(|reply| {
+            crate::resolver::dns_service_line_on_this_host(reply.answerer.clone())
+        });
         // NET-020: the cause prints on the HOSTNAME PROXY row, once. The
         // surface folds the cause out, so the BOX NAMES row beside it does
         // not repeat it (#3046).
@@ -1623,10 +1623,9 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
                     width = VM_COLUMN_WIDTH,
                 )?;
                 facts += 1;
-            } else if let Some(line) = answerer_at(index)
-                .as_ref()
-                .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()))
-            {
+            } else if let Some(line) = answerer_at(index).as_ref().and_then(|reply| {
+                crate::resolver::dns_service_line_on_this_host(reply.answerer.clone())
+            }) {
                 writeln!(
                     out,
                     "DNS SERVICE:     {vm:<width$} {line}",

@@ -5060,6 +5060,24 @@ pub fn vm_host_answerer_line_beside(
     }
 }
 
+/// The DNS SERVICE line `min ls` and the session start print for a
+/// control socket's status read, on this host: [`vm_host_answerer_line_beside`]
+/// with the job state read from this host's service manager. The read runs
+/// only when another program holds the DNS service's own port, so every
+/// other state prints without it.
+#[must_use]
+pub fn dns_service_line_on_this_host(status: ZoneAnswererStatus) -> Option<String> {
+    let job = match status {
+        ZoneAnswererStatus::PortHeldNoChannel { port }
+            if port == minvmd::net::answerer::DEFAULT_ANSWERER_PORT =>
+        {
+            answerer_job_blocking()
+        }
+        _ => AnswererJob::Unknown,
+    };
+    vm_host_answerer_line_beside(status, job)
+}
+
 /// The DNS SERVICE line for Minimal's own DNS service when its job holds
 /// the port and its program is not running. `min finalize-install`
 /// offers the reinstall for this state ([`AnswererStep::NotRunning`]).

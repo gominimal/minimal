@@ -190,9 +190,11 @@ pub(crate) async fn vm_host_answerer_status_at(
 /// machine the session is about to rely on: which VM host daemon answers
 /// the zone decides where the names resolve from, and a start that said
 /// nothing left the holder discoverable only from `min ls`. The same line
-/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line`]),
-/// so the two surfaces name one holder the same way. Pure, so the test
-/// asserts the wording without capturing stderr.
+/// `min ls` prints for the state ([`crate::resolver::dns_service_line_on_this_host`]),
+/// so the two surfaces name one holder the same way. That includes a
+/// failing DNS service: when its job holds the port and is not running,
+/// both name it and `min finalize-install`. The job state is read only
+/// for a port held with no channel, so the other states stay pure.
 ///
 /// `None` for the pre-acquisition state — a daemon still bringing its
 /// answerer up has nothing to name yet, and the start prints nothing for
@@ -201,7 +203,8 @@ pub(crate) async fn vm_host_answerer_status_at(
 pub(crate) fn vm_host_answerer_start_line(
     status: minimald_rpc::ZoneAnswererStatus,
 ) -> Option<String> {
-    crate::resolver::vm_host_answerer_line(status).map(|line| format!("DNS service: {line}"))
+    crate::resolver::dns_service_line_on_this_host(status)
+        .map(|line| format!("DNS service: {line}"))
 }
 
 /// Releases the zone hold a destroyed session's activation made, when the
