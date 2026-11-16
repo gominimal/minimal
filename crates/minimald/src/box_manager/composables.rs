@@ -30,7 +30,7 @@ use boxes::{
     SessionId,
     core::compose::ComposeOptions,
     daemon::composer::{ComposeOutcome, SessionComposer},
-    wire::request::WireContribution,
+    wire::request::{WireBoxEntry, WireContribution},
 };
 use graph::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
 use paths::DaemonAbsPath;
@@ -556,8 +556,80 @@ pub(crate) fn run_compose(
         &contribution,
         hooks_enabled,
     )?;
+    let mut contribution = contribution;
+    if hooks_enabled && let Some(spec) = stored_spec_beside(project_path) {
+        compose_hooks_from_stored_spec(&mut contribution, declared_path, &spec);
+    }
     let outcome = run_composer(contribution, project_composable, package_composables)?;
     Ok((outcome, graph_names))
+}
+
+/// The spec stored beside the box's workspace, `project_path`: the
+/// [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
+/// directory (BOX-068). `None` when the box stores no spec, or when the
+/// stored spec does not read as a Box Spec.
+fn stored_spec_beside(project_path: &DaemonAbsPath) -> Option<mfile::spec::BoxSpec> {
+    let path = project_path
+        .as_utf8_path()
+        .parent()?
+        .join(boxes::store::SPEC_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(spec_path = %path, error = %e, "could not read the stored box spec");
+            return None;
+        }
+    };
+    match serde_json_lenient::from_slice(&bytes) {
+        Ok(spec) => Some(spec),
+        Err(e) => {
+            tracing::warn!(
+                spec_path = %path,
+                error = %e,
+                "the stored box spec does not read as a box spec; \
+                 the project's hooks compose from the project as before"
+            );
+            None
+        }
+    }
+}
+
+/// Composes the project's lifecycle hooks from the stored spec `spec`, not
+/// from the project's `minimal.toml` (BOX-068, BOX-179). The hooks whose
+/// `declared_by` names the project replace every project hook: the ones
+/// the daemon read from `[session]` and the ones the expanded entry sent.
+/// A loadout's hooks stay on the client's contribution, with their
+/// loadout, so the stored loadout hooks are not added a second time.
+///
+/// A spec with no hook list changes nothing.
+pub(crate) fn compose_hooks_from_stored_spec(
+    contribution: &mut WireContribution,
+    declared_path: &paths::HostAbsPath,
+    spec: &mfile::spec::BoxSpec,
+) {
+    let Some(stored) = spec.lifecycle_hooks.as_ref() else {
+        return;
+    };
+    let project: Vec<_> = stored
+        .iter()
+        .filter(|h| h.declared_by == mfile::spec::HookDeclarer::Project)
+        .map(|h| h.hook.clone())
+        .collect();
+    tracing::info!(
+        entry = %spec.entry,
+        stored_hooks = stored.len(),
+        project_hooks = project.len(),
+        "compose: the project's lifecycle hooks come from the stored spec"
+    );
+    let entry = contribution.entry.get_or_insert_with(|| {
+        Box::new(WireBoxEntry::new(
+            &spec.entry,
+            &spec.box_type,
+            declared_path.clone().into(),
+        ))
+    });
+    entry.lifecycle_hooks = Some(project);
 }
 
 /// Assemble the [`SessionComposer`], `add()` the daemon-side
