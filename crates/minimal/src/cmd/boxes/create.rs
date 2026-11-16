@@ -3220,7 +3220,62 @@ pub(crate) fn put_spec(
     spec: &mfile::spec::BoxSpec,
 ) -> Result<(), anyhow::Error> {
     request.spec = Some(serde_json_lenient::to_value(spec).context("Cannot encode the box spec")?);
+    stamp_client_projection_digest(request, spec);
     Ok(())
+}
+
+/// Sets the client's projection digest of `spec` on `request` (BOX-071).
+/// `spec` is the typed spec that [`put_spec`] also sends as JSON. The
+/// client converts it to a TOML table with `toml::Table::try_from` and
+/// projects that table. The daemon projects the JSON it receives, through
+/// `spec_digest`. Both conversions drop a null, and both refuse an integer
+/// that TOML cannot hold. So for an unchanged spec the two digests are
+/// equal. They differ only when the sent JSON no longer matches `spec`, and
+/// the daemon then refuses the create. A spec that names no type is of the
+/// creating verb's type, as the daemon reads it.
+///
+/// Gap: the typed spec has no `[secrets]` table, so this digest binds no
+/// secret grants or store rules (BOX-071 says the projection holds the
+/// requested secret scopes). It binds them when the create sends the
+/// expanded spec in place of the typed one, which #2410 tracks.
+///
+/// A spec that does not project carries no client digest. The daemon then
+/// stores none.
+pub(crate) fn stamp_client_projection_digest(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    spec: &mfile::spec::BoxSpec,
+) {
+    request
+        .config
+        .attrs
+        .remove(minimald_rpc::CLIENT_PROJECTION_DIGEST_ATTR);
+    let verb_type = match request.config.creating_verb {
+        minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
+        minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
+    };
+    let table = match toml::Table::try_from(spec) {
+        Ok(table) => table,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "computed no projection digest for the box spec; the create carries none"
+            );
+            return;
+        }
+    };
+    let Some(facts) = mfile::projection::TypeFacts::of_spec(&table, verb_type) else {
+        tracing::warn!(
+            "computed no projection digest for the box spec: it does not name its type's \
+             built-in root; the create carries none"
+        );
+        return;
+    };
+    let digest = mfile::projection::project(&table, &facts).digest();
+    tracing::info!(
+        client_projection_digest = %digest,
+        "computed the box spec's projection digest"
+    );
+    request.config.set_client_projection_digest(digest);
 }
 
 /// Adds each `--vpn-network-names` value to the `network.vpn_network_names`
@@ -3266,6 +3321,10 @@ pub(crate) fn add_vpn_network_names(
             list.push(value);
         }
     }
+    // `network.vpn_network_names` is outside the projection, so the
+    // client digest that `put_spec` set stays the digest of this spec.
+    // vpn_network_names_keep_the_client_digest_equal_to_the_daemon_digest
+    // pins this.
     Ok(())
 }
 
@@ -5229,6 +5288,43 @@ mod tests {
 
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         assert!(stamp_session_spec(&mut request, root).is_err());
+    }
+
+    /// BOX-071, BOX-072: `--vpn-network-names` edits the sent spec after
+    /// `put_spec` set the client digest. The edit is outside the
+    /// projection, so the daemon's digest of the sent JSON still equals
+    /// the client digest, and the daemon does not refuse the create.
+    #[test]
+    fn vpn_network_names_keep_the_client_digest_equal_to_the_daemon_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "vpn",
+            paths::HostAbsPath::try_new(root.to_path_buf()).unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        );
+        stamp_session_spec(&mut request, root).unwrap();
+        let client = request
+            .config
+            .client_projection_digest()
+            .expect("put_spec sets the client digest")
+            .to_owned();
+
+        add_vpn_network_names(&mut request, &["corp".to_owned(), "lab".to_owned()]).unwrap();
+
+        let wire = request.spec.as_ref().expect("the spec is on the request");
+        assert_eq!(
+            wire["network"]["vpn_network_names"],
+            serde_json_lenient::json!(["corp", "lab"])
+        );
+        let daemon = mfile::projection::spec_digest(wire, boxes::SESSION_BOX_TYPE)
+            .expect("the sent spec projects");
+        assert_eq!(
+            request.config.client_projection_digest(),
+            Some(daemon.as_str())
+        );
+        assert_eq!(client, daemon);
     }
 
     /// BOX-001: with no tarball upload root, a subdirectory resolves to the
