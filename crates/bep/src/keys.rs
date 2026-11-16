@@ -257,6 +257,14 @@ pub trait HeldKey {
         Build::CURRENT
     }
 
+    /// The name of the store that holds the key: `keychain`, `tpm` or
+    /// `secret-service`. `None` for a key that no host store holds, as a
+    /// test key. The published identity carries it, so `min auth status`
+    /// can name a software key (BEP-090).
+    fn store(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The raw ECDH shared secret (the x-coordinate) with `peer`.
     /// [`seal::open_held`](crate::seal::open_held) opens a sealed value
     /// through it, so the private half stays in the store.
@@ -1541,6 +1549,10 @@ mod keychain {
 
         fn exportable(&self) -> bool {
             self.key.external_representation().is_some()
+        }
+
+        fn store(&self) -> Option<&'static str> {
+            Some("keychain")
         }
 
         fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
