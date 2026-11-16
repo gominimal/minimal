@@ -129,13 +129,22 @@ fn a_package_without_its_own_attrs_contract_is_checked() {
     );
 }
 
-/// BuildSpec's `needs | Needs`: an unknown need is refused, on both load
-/// paths.
+/// BuildSpec's `needs | Needs`: an unknown need, and a known need of the
+/// wrong shape, are refused on both load paths. The wrong shape's refusal
+/// says what a need looks like.
 #[test]
-fn an_unknown_need_is_refused() {
-    let (good, bad) = (spec("needs = { dns = {} }"), spec("needs = { bogus = {} }"));
-    good_loads_bad_refused(&good, &bad, |src| Layer::new_for_test(src.to_string()));
-    layer_dir_refuses_naming(&good, &bad, "bogus");
+fn an_unknown_or_misshapen_need_is_refused() {
+    let good = spec("needs = { internet = {} }");
+    for (bad, names) in [
+        (spec("needs = { bogus = {} }"), "bogus"),
+        (
+            spec("needs = { internet = true }"),
+            "a need is written as a record, as in `needs.internet = {}`",
+        ),
+    ] {
+        good_loads_bad_refused(&good, &bad, |src| Layer::new_for_test(src.to_string()));
+        layer_dir_refuses_naming(&good, &bad, names);
+    }
 }
 
 /// `attrs` and `needs` are not loosely annotated: their contracts refuse a
