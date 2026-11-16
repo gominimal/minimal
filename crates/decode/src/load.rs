@@ -234,7 +234,8 @@ fn unescape_import(raw: &str) -> String {
 /// directory first, then the minimal library. An absolute import is refused
 /// outright. A relative one, `..` included, must land (symlinks resolved)
 /// under `root` or under the minimal library. An import that resolves to no
-/// file is left for Nickel to report.
+/// file is left for Nickel to report. An entry that a symlink takes out of
+/// the layer is refused as an [Error::LinkOutside] naming the link.
 ///
 /// Packages import their siblings as `../<name>/build.ncl`, so `..` itself
 /// is not refused: where the path lands is what counts.
@@ -258,7 +259,12 @@ fn confine_imports(entries: &[PathBuf], root: &Path, lib_path: &Path) -> Result<
         let named = normalize_path(entry.as_path())?;
         match named.canonicalize() {
             Ok(canon) if canon.starts_with(root) => todo.push(named),
-            Ok(_) => return Err(outside(root, &entry.to_string_lossy())),
+            Ok(_) => {
+                return Err(Error::LinkOutside {
+                    link: link_out_of(&named, root),
+                    root: root.to_path_buf(),
+                });
+            }
             // A missing entry is Nickel's to report.
             Err(_) => {}
         }
@@ -319,6 +325,26 @@ fn confine_imports(entries: &[PathBuf], root: &Path, lib_path: &Path) -> Result<
         }
     }
     Ok(())
+}
+
+/// The symlink that takes `entry`, a path the layer at `root` (canonical)
+/// loads a file by, out of the layer: the first of `entry`'s directories, or
+/// `entry` itself, that sits in the layer and resolves outside it. Falls back
+/// to `entry` when no single link does.
+fn link_out_of(entry: &Path, root: &Path) -> PathBuf {
+    let in_root = |p: &Path| p.canonicalize().is_ok_and(|c| c.starts_with(root));
+    let mut prefixes: Vec<&Path> = entry.ancestors().collect();
+    prefixes.reverse();
+    prefixes
+        .into_iter()
+        .find(|&p| {
+            p.symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+                && p.parent().is_some_and(in_root)
+                && !in_root(p)
+        })
+        .unwrap_or(entry)
+        .to_path_buf()
 }
 
 /// Returns the first file in `files` read from disk outside `root` and the
@@ -923,6 +949,70 @@ mod tests {
             &LoadOptions::for_test(),
         ));
         assert_eq!(import, "./lib/helper.ncl");
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    /// The link a [Error::LinkOutside] names, and everything the error prints.
+    fn link_refusal(res: Result<Loader, Error>) -> (PathBuf, String) {
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected the load to be refused"),
+        };
+        let link = match &err {
+            Error::LinkOutside { link, .. } => link.clone(),
+            other => panic!("expected Error::LinkOutside, got {other:?}"),
+        };
+        let mut buf = codespan_reporting::term::termcolor::Buffer::no_color();
+        err.report_to(&mut buf);
+        (
+            link,
+            format!("{err}\n{}", String::from_utf8_lossy(buf.as_slice())),
+        )
+    }
+
+    /// A package directory that is a symlink out of the layer is refused,
+    /// naming that directory, not reported as an import the layer makes.
+    #[cfg(unix)]
+    #[test]
+    fn package_directory_linked_out_of_the_layer_is_refused_naming_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("build.ncl"), SECRET).unwrap();
+        let layer = dir.path().join("layer");
+        std::fs::create_dir_all(layer.join("packages")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, layer.join("packages/p")).unwrap();
+
+        let (link, text) = link_refusal(Loader::new_with_all_pkgs(
+            &layer,
+            None,
+            &LoadOptions::for_test(),
+        ));
+        assert!(link.ends_with("layer/packages/p"), "{text}");
+        assert!(
+            text.contains("is a link that leads outside the layer"),
+            "{text}"
+        );
+        assert!(!text.contains(SECRET), "{text}");
+    }
+
+    /// The same for a `build.ncl` that is itself the link.
+    #[cfg(unix)]
+    #[test]
+    fn package_file_linked_out_of_the_layer_is_refused_naming_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.ncl");
+        std::fs::write(&secret, SECRET).unwrap();
+        let layer = dir.path().join("layer");
+        std::fs::create_dir_all(layer.join("packages/p")).unwrap();
+        std::os::unix::fs::symlink(&secret, layer.join("packages/p/build.ncl")).unwrap();
+
+        let (link, text) = link_refusal(Loader::new_with_all_pkgs(
+            &layer,
+            None,
+            &LoadOptions::for_test(),
+        ));
+        assert!(link.ends_with("layer/packages/p/build.ncl"), "{text}");
         assert!(!text.contains(SECRET), "{text}");
     }
 
