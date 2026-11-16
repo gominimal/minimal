@@ -41,6 +41,7 @@
 #   packaging/macos/pkg/build-pkg.sh (--version V | --channel stable|unstable)
 #                                    [--with <manifest dest>=<path>]...
 #                                    [--sign "<Developer ID Installer identity>"]
+#                                    [--notarize PROFILE [--notary-keychain PATH]]
 #                                    [--dmg [--sign-dmg "<Developer ID Application identity>"]]
 #                                    [--out DIR]
 #
@@ -68,6 +69,10 @@
 #                    verdict, staple the ticket, and assess the result as
 #                    Gatekeeper would (`spctl --assess --type install`). Needs
 #                    --sign.
+#   --notary-keychain PATH
+#                    The keychain file that holds the profile, when it is
+#                    not the default one (the release runner keeps it in its
+#                    signing keychain). Needs --notarize.
 #   --dmg            Also write a disk image beside the package, for a
 #                    download page: a read-only compressed volume named
 #                    "Minimal" with the package alone at its top. A person
@@ -118,6 +123,7 @@ CHANNEL=""
 OUT="$ROOT/target/pkg"
 SIGN=""
 NOTARIZE=""
+NOTARY_KEYCHAIN=""
 MIN_OS="15.0"
 DMG=0
 SIGN_DMG=""
@@ -130,6 +136,7 @@ while [ $# -gt 0 ]; do
         --with) WITH+=("${2:?--with needs dest=path}"); shift 2 ;;
         --sign) SIGN="${2:?--sign needs an identity}"; shift 2 ;;
         --notarize) NOTARIZE="${2:?--notarize needs a notarytool keychain profile}"; shift 2 ;;
+        --notary-keychain) NOTARY_KEYCHAIN="${2:?--notary-keychain needs a keychain file}"; shift 2 ;;
         --dmg) DMG=1; shift ;;
         --sign-dmg) SIGN_DMG="${2:?--sign-dmg needs an identity}"; shift 2 ;;
         --min-os) MIN_OS="${2:?--min-os needs a version}"; shift 2 ;;
@@ -148,6 +155,13 @@ case "$MIN_OS" in
     *) die "--min-os takes a version such as 15.0" ;;
 esac
 [ -z "$NOTARIZE" ] || [ -n "$SIGN" ] || die "--notarize needs --sign: Apple notarizes signed packages only"
+[ -z "$NOTARY_KEYCHAIN" ] || [ -n "$NOTARIZE" ] || die "--notary-keychain needs --notarize"
+[ -z "$NOTARY_KEYCHAIN" ] || [ -f "$NOTARY_KEYCHAIN" ] || die "--notary-keychain: $NOTARY_KEYCHAIN is not a file"
+declare -a NOTARY_ARGS=()
+if [ -n "$NOTARIZE" ]; then
+    NOTARY_ARGS=(--keychain-profile "$NOTARIZE")
+    [ -z "$NOTARY_KEYCHAIN" ] || NOTARY_ARGS+=(--keychain "$NOTARY_KEYCHAIN")
+fi
 [ -z "$SIGN_DMG" ] || [ "$DMG" -eq 1 ] || die "--sign-dmg needs --dmg"
 [ -z "$SIGN_DMG" ] || [ -n "$SIGN" ] || die "--sign-dmg needs --sign: a signed image around an unsigned package would say more than is true"
 [ "$DMG" -eq 0 ] || command -v hdiutil >/dev/null || die "hdiutil is not on PATH"
@@ -420,8 +434,8 @@ else
 fi
 if [ -n "$NOTARIZE" ]; then
     echo "==> notarytool submit (profile $NOTARIZE), waiting for Apple"
-    xcrun notarytool submit "$pkg" --keychain-profile "$NOTARIZE" --wait \
-        || die "notarization did not succeed; xcrun notarytool log <id> --keychain-profile $NOTARIZE says why"
+    xcrun notarytool submit "$pkg" "${NOTARY_ARGS[@]}" --wait \
+        || die "notarization did not succeed; xcrun notarytool log <id> ${NOTARY_ARGS[*]} says why"
     echo "==> stapler staple"
     xcrun stapler staple "$pkg" || die "stapling failed"
     echo "==> spctl --assess --type install"
@@ -451,8 +465,8 @@ if [ "$DMG" -eq 1 ]; then
     fi
     if [ -n "$NOTARIZE" ]; then
         echo "==> notarytool submit (profile $NOTARIZE) for the disk image, waiting for Apple"
-        xcrun notarytool submit "$dmg" --keychain-profile "$NOTARIZE" --wait \
-            || die "the disk image's notarization did not succeed; xcrun notarytool log <id> --keychain-profile $NOTARIZE says why"
+        xcrun notarytool submit "$dmg" "${NOTARY_ARGS[@]}" --wait \
+            || die "the disk image's notarization did not succeed; xcrun notarytool log <id> ${NOTARY_ARGS[*]} says why"
         echo "==> stapler staple (disk image)"
         xcrun stapler staple "$dmg" || die "stapling the disk image failed"
     fi
