@@ -7287,11 +7287,26 @@ mod tests {
             "the guest's table refuses in these chains and no other: {ruleset}"
         );
 
+        // An own-IP box is placed in no leaf. Only a host-address launch is.
+        assert!(
+            !crate::box_runtime::placed_in_classifier_leaf(boxes::NetworkMode::OwnIp),
+            "an own-IP box is placed in no classifier leaf"
+        );
+        assert!(
+            crate::box_runtime::placed_in_classifier_leaf(boxes::NetworkMode::HostNet),
+            "a host-address box is placed in a classifier leaf"
+        );
+
         // The base chains' rules that reject or jump to a refusing chain all
         // match a socket of the boxes subtree. A socket in no leaf of it, as
         // an own-IP box's is, never reaches a refusal.
         for base in ["output", "ipv6_out"] {
-            for rule in chain_rules(&ruleset, base) {
+            let rules = chain_rules(&ruleset, base);
+            assert!(
+                !rules.is_empty(),
+                "the guest's table has a {base} chain with rules: {ruleset}"
+            );
+            for rule in rules {
                 if !(rule.contains("reject") || rule.contains("jump ")) {
                     continue;
                 }
@@ -7327,8 +7342,13 @@ mod tests {
                 );
             }
         }
+        let ipv6_out = chain_rules(&ruleset, "ipv6_out");
         assert!(
-            chain_rules(&ruleset, "ipv6_out")
+            !ipv6_out.is_empty(),
+            "the guest's table has an ipv6_out chain with rules: {ruleset}"
+        );
+        assert!(
+            ipv6_out
                 .iter()
                 .all(|rule| rule.contains("oifname != \"lo\"")),
             "the IPv6 refusal leaves the loopback out"
