@@ -963,7 +963,10 @@ impl<B: FetchBackend> RemoteCache<B> {
             || self.fetch_verified(sha256, &materialize_op),
         )
         .await
-        .map_err(|e| Self::name_tls_cert_error(e, span_name))?;
+        // Name the artifact object (`<sha256>.zst`), not `span_name`: all
+        // three callers already prefix the error with the package name, so
+        // naming it here too would print it twice.
+        .map_err(|e| Self::name_tls_cert_error(e, &format!("{}.zst", hex::encode(sha256))))?;
 
         tar_file
             .seek(std::io::SeekFrom::Start(0))
@@ -1076,6 +1079,12 @@ mod tests {
         /// Responses served before `responses` takes over. Lets a test
         /// script failures-then-success.
         scripted: std::sync::Mutex<ScriptedResponses>,
+        /// Per-URL queues of error messages. A queued message makes `execute`
+        /// return an `io::Error` carrying it, instead of any response — the
+        /// one way to drive a transport failure (such as a certificate error)
+        /// through the fetch/retry/surfacing path, which the response-only
+        /// script cannot reach.
+        errors: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
         /// Total executed requests; an Arc so tests can keep counting after
         /// the backend moves into the RemoteCache.
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1093,6 +1102,14 @@ mod tests {
             self.scripted.lock().unwrap().insert(url.to_string(), seq);
             self
         }
+
+        /// Script a queue of transport errors for `url`: each `execute` of it
+        /// pops one message and returns it as an `io::Error` until the queue
+        /// empties, after which the scripted/static responses take over.
+        fn script_errors(self, url: &str, msgs: Vec<String>) -> Self {
+            self.errors.lock().unwrap().insert(url.to_string(), msgs);
+            self
+        }
     }
 
     impl FetchBackend for MockBackend {
@@ -1105,6 +1122,11 @@ mod tests {
         }
         async fn execute(&self, req: MockUrl) -> Result<MockResponse, std::io::Error> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(seq) = self.errors.lock().unwrap().get_mut(&req.0)
+                && !seq.is_empty()
+            {
+                return Err(std::io::Error::other(seq.remove(0)));
+            }
             if let Some(seq) = self.scripted.lock().unwrap().get_mut(&req.0)
                 && !seq.is_empty()
             {
@@ -2000,6 +2022,83 @@ mod tests {
             matches!(passthrough, Error::Backend(_)),
             "a non-certificate error must pass through unchanged"
         );
+    }
+
+    /// End-to-end on the index path: a certificate failure the backend
+    /// returns from `execute` surfaces as [`Error::TlsCert`] (naming the index
+    /// object), after a single attempt — not collapsed to the generic
+    /// "unreachable", and not retried. Scripting more failures than attempts
+    /// proves the one call is the whole budget. Guards the
+    /// `name_tls_cert_error` call on the index path: drop it and this fails.
+    #[tokio::test(start_paused = true)]
+    async fn index_certificate_failure_surfaces_at_once() {
+        let backend = MockBackend::default().script_errors(
+            &format!("mock://cache/{INDEX_FILENAME}"),
+            vec!["invalid peer certificate: UnknownIssuer".to_string(); 4],
+        );
+        let calls = backend.calls.clone();
+
+        let err = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            Error::TlsCert { object, cause } => {
+                assert_eq!(object, INDEX_FILENAME);
+                assert!(cause.contains("UnknownIssuer"), "{cause}");
+            }
+            other => panic!("expected TlsCert, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a certificate failure is not retried"
+        );
+    }
+
+    /// End-to-end on the artifact path: the index fetch succeeds, then every
+    /// artifact fetch hits a certificate failure. It surfaces as
+    /// [`Error::TlsCert`] naming the artifact object (`<sha256>.zst`, not the
+    /// package name), after a single artifact attempt. Guards the
+    /// `name_tls_cert_error` call in `materialize`: drop it and this fails.
+    #[tokio::test(start_paused = true)]
+    async fn materialize_certificate_failure_surfaces_at_once() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        let expected_object = art_url.strip_prefix("mock://cache/").unwrap().to_string();
+        let backend = MockBackend::new(responses).script_errors(
+            &art_url,
+            vec!["invalid peer certificate: UnknownIssuer".to_string(); 4],
+        );
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        match err {
+            Error::TlsCert { object, cause } => {
+                assert_eq!(object, expected_object);
+                assert!(cause.contains("UnknownIssuer"), "{cause}");
+            }
+            other => panic!("expected TlsCert, got {other:?}"),
+        }
+        // One index fetch + one artifact attempt: the cert failure is not retried.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// The certificate error reads as a diagnosis the operator can act on: it
