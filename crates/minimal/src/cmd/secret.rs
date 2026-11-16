@@ -176,7 +176,7 @@ fn read_terminal(id: &str) -> anyhow::Result<Zeroizing<String>> {
     let value = {
         crossterm::terminal::enable_raw_mode().context(TERMINAL_READ_FAILED)?;
         let _restore = RawModeGuard;
-        let mut value = Zeroizing::new(String::new());
+        let mut value = Zeroizing::new(String::with_capacity(VALUE_CAPACITY));
         loop {
             let event = crossterm::event::read().context(TERMINAL_READ_FAILED)?;
             let crossterm::event::Event::Key(key) = event else {
@@ -242,6 +242,15 @@ fn hidden_key(value: &mut Zeroizing<String>, key: crossterm::event::KeyEvent) ->
         }
         KeyCode::Char(_) if control => HiddenStep::More,
         KeyCode::Char(c) => {
+            // `String` frees its old buffer unzeroed when it grows, so grow
+            // it here: the old `Zeroizing` buffer is wiped when replaced.
+            if value.len() + c.len_utf8() > value.capacity() {
+                let mut grown = Zeroizing::new(String::with_capacity(
+                    (value.capacity() * 2).max(VALUE_CAPACITY),
+                ));
+                grown.push_str(value);
+                *value = grown;
+            }
             value.push(c);
             HiddenStep::More
         }
@@ -262,6 +271,10 @@ fn mask_len() -> usize {
     let _ = getrandom::fill(&mut byte);
     MASK_MIN + usize::from(byte[0]) % (MASK_MAX - MASK_MIN + 1)
 }
+
+/// The bytes a typed value starts with room for. Most values fit, so the
+/// buffer holding them is never copied.
+const VALUE_CAPACITY: usize = 512;
 
 /// The shortest mask.
 const MASK_MIN: usize = 8;
@@ -970,6 +983,16 @@ mod tests {
         ]);
         assert_eq!(step, HiddenStep::Done);
         assert_eq!(value.as_str(), "aC");
+    }
+
+    #[test]
+    fn hidden_read_keeps_a_value_longer_than_its_first_buffer() {
+        let long: Vec<_> = std::iter::repeat_n(key(KeyCode::Char('é')), VALUE_CAPACITY)
+            .chain([key(KeyCode::Enter)])
+            .collect();
+        let (value, step) = type_keys(&long);
+        assert_eq!(step, HiddenStep::Done);
+        assert_eq!(value.as_str(), "é".repeat(VALUE_CAPACITY));
     }
 
     #[test]

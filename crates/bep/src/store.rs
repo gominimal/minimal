@@ -697,7 +697,8 @@ fn is_bundle_of(path: &str, proxy: &str) -> bool {
 struct AclEntry {
     /// The authorization tags, such as `ACLAuthorizationDecrypt`.
     authorizations: Vec<String>,
-    /// The paths of the trusted applications. `None` is any application,
+    /// The paths of the trusted applications whose programs pass the
+    /// requirement the entry recorded. `None` is any application,
     /// which lists no program, as `dump-keychain` prints `<null>`.
     applications: Option<Vec<String>>,
     /// The entry's description. For the partition entry, the partition list.
@@ -1084,6 +1085,10 @@ mod host {
             prompt_selector: *mut u16,
         ) -> i32;
         fn SecTrustedApplicationCopyData(application: CFTypeRef, data: *mut CFDataRef) -> i32;
+        fn SecTrustedApplicationValidateWithPath(
+            application: CFTypeRef,
+            path: *const std::ffi::c_char,
+        ) -> i32;
     }
 
     /// The message of a Security framework status.
@@ -1160,11 +1165,13 @@ mod host {
             // SAFETY: a Copy call returned `applications`, an array of
             // `SecTrustedApplicationRef`.
             let list = unsafe { CFArray::<CFType>::wrap_under_create_rule(applications) };
-            Some(
-                list.iter()
-                    .map(|app| application_path(app.as_CFTypeRef()))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
+            let mut paths = Vec::new();
+            for app in list.iter() {
+                if let Some(path) = application_path(app.as_CFTypeRef())? {
+                    paths.push(path);
+                }
+            }
+            Some(paths)
         };
         Ok(AclEntry {
             authorizations,
@@ -1174,7 +1181,10 @@ mod host {
     }
 
     /// The path a trusted application names, as `dump-keychain` prints it.
-    fn application_path(application: CFTypeRef) -> Result<String, String> {
+    /// `None` when the program at that path fails the requirement the entry
+    /// recorded, which `dump-keychain` prints as a failure status: the
+    /// keychain would not trust that program, so the entry does not admit it.
+    fn application_path(application: CFTypeRef) -> Result<Option<String>, String> {
         let mut data: CFDataRef = std::ptr::null();
         // SAFETY: `application` is an element of an array the caller holds,
         // and `data` is an out pointer filled with an owned reference.
@@ -1187,7 +1197,16 @@ mod host {
         let bytes = data.bytes();
         // The path is a C string, with its terminating NUL.
         let path = bytes.split(|b| *b == 0).next().unwrap_or_default();
-        Ok(String::from_utf8_lossy(path).into_owned())
+        let Ok(c_path) = std::ffi::CString::new(path) else {
+            return Ok(None);
+        };
+        // SAFETY: `application` is live for the call, and `c_path` is a
+        // NUL-terminated string that outlives it.
+        let status = unsafe { SecTrustedApplicationValidateWithPath(application, c_path.as_ptr()) };
+        if status != 0 {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(path).into_owned()))
     }
 
     pub(super) fn set(id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
@@ -1517,6 +1536,31 @@ mod tests {
         set_item(&kc, "claude", b"new", proxy).expect("stored");
         assert_eq!(kc.adds.get(), 1);
         assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"new"[..]));
+    }
+
+    // A set looks up only the item under its own service and identifier: an
+    // item under another identifier, or a staged copy of this one, is not
+    // the item it replaces, and stays as it was.
+    #[test]
+    fn set_item_looks_up_one_item_by_service_and_account() {
+        let kc = FakeKeychain::holding("other", b"kept");
+        kc.items.borrow_mut().insert(
+            (STAGING_SERVICE.into(), "claude".into()),
+            (b"staged".to_vec(), true),
+        );
+        assert_eq!(
+            kc.item(SERVICE, "claude", Path::new(PROXY)).expect("read"),
+            None
+        );
+        set_item(&kc, "claude", b"new", Path::new(PROXY)).expect("stored");
+        // A first set: one add, with no staged copy made.
+        assert_eq!(kc.adds.get(), 1);
+        assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"new"[..]));
+        assert_eq!(kc.value(SERVICE, "other").as_deref(), Some(&b"kept"[..]));
+        assert_eq!(
+            kc.value(STAGING_SERVICE, "claude").as_deref(),
+            Some(&b"staged"[..])
+        );
     }
 
     // Review finding 4369348719: a staging copy that the keychain does not
