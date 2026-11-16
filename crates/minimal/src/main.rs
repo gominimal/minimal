@@ -363,6 +363,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
         return 3;
     }
+    // A `network` key a task box does not apply is the project file
+    // refusing the run the same way (#3252), so it ends with exit 3 too.
+    if e.downcast_ref::<minimal::TaskNetworkUnapplied>().is_some() {
+        return minimal::TaskNetworkUnapplied::EXIT_CODE;
+    }
     // BCLI-019, BCLI-020: `min type` of a project whose box types do not
     // load exits 3, and `min type show` of a name that is no type exits 4.
     if e.downcast_ref::<minimal::BoxTypesInvalid>().is_some() {
@@ -1102,7 +1107,7 @@ mod tests {
         }
         let object: serde_json_lenient::Value = {
             let mut stderr = Vec::new();
-            answer_failure(&failures[0], true, false, None, &mut stderr);
+            let _ = answer_failure(&failures[0], true, false, None, &mut stderr);
             serde_json_lenient::from_slice(&stderr).unwrap()
         };
         assert_eq!(object["code"], "not_found");
@@ -1118,14 +1123,14 @@ mod tests {
         let hint = "local-minimald is now called local.";
         let e = anyhow::anyhow!("the daemon went away");
         let mut stderr = Vec::new();
-        answer_failure(&e, true, false, Some(hint), &mut stderr);
+        let _ = answer_failure(&e, true, false, Some(hint), &mut stderr);
         let text = String::from_utf8(stderr).unwrap();
         assert_eq!(text.lines().count(), 1, "one object, one line: {text}");
         let object: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
         assert_eq!(object["hint"], hint);
 
         let mut stderr = Vec::new();
-        answer_failure(&e, false, false, Some(hint), &mut stderr);
+        let _ = answer_failure(&e, false, false, Some(hint), &mut stderr);
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             format!("error: the daemon went away\n{hint}\n")
@@ -1812,6 +1817,26 @@ mod tests {
             error: mfile::Error::HarnessTable(None),
         };
         let e = anyhow::Error::new(invalid).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// #3252: a task's `minimal.toml` that sets a `network` key a task box
+    /// does not apply refuses the run with exit 3, the code an invalid
+    /// project file ends with, through the context the run adds over it.
+    /// `task`'s test of the same name proves the refusal names the key, the
+    /// table and the next step.
+    #[test]
+    fn task_network_key_a_task_does_not_apply_exits_3() {
+        let e = anyhow::Error::new(minimal::TaskNetworkUnapplied {
+            message: "Cannot run the task: [tasks.build] in minimal.toml sets \
+                      network.quic443, which a task box does not apply."
+                .to_owned(),
+        })
+        .context("running the task");
+        assert_eq!(
+            failure_exit_code(&e),
+            minimal::TaskNetworkUnapplied::EXIT_CODE
+        );
         assert_eq!(failure_exit_code(&e), 3);
     }
 

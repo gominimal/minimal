@@ -1548,6 +1548,30 @@ fn task_egress_from(bytes: &[u8], task: &str) -> anyhow::Result<ProjectEgress> {
 /// a task box only by its run flag.
 const TASK_NETWORK_KEYS: [&str; 2] = ["mode", "egress"];
 
+/// A `network` key that a task's own layers declare and that a task box
+/// does not apply, such as `quic443` (#3252). The message names the key,
+/// the table and the next step. An invalid project `minimal.toml` refuses
+/// the run the same way, so the run ends with exit 3 (`main.rs`), the
+/// code the architecture gives an invalid project file.
+#[derive(Debug)]
+pub struct TaskNetworkUnapplied {
+    /// The refusal, with the key, the table and the next step.
+    pub message: String,
+}
+
+impl TaskNetworkUnapplied {
+    /// The architecture's exit code for an invalid project file.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for TaskNetworkUnapplied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TaskNetworkUnapplied {}
+
 /// Refuses a `network` key that a task's own layers declare and that a
 /// task box does not apply, such as `quic443` (#3252). Without it the key
 /// is dropped in silence, and a `quic443 = "block"` runs as `auto`. Only
@@ -1594,11 +1618,14 @@ fn refuse_unapplied_task_network(
     } else {
         format!("Remove network.{key} from {layer}.")
     };
-    bail!(
-        "Cannot run the task: {layer} in {file} sets network.{key}, which a task box does \
-         not apply. {remedy}",
-        file = mfile::MFILE_NAME,
-    )
+    Err(TaskNetworkUnapplied {
+        message: format!(
+            "Cannot run the task: {layer} in {file} sets network.{key}, which a task box \
+             does not apply. {remedy}",
+            file = mfile::MFILE_NAME,
+        ),
+    }
+    .into())
 }
 
 /// The egress of `entry` in the parsed `file`: its `[defaults]`,
