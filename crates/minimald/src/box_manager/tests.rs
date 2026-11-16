@@ -7727,8 +7727,7 @@ async fn composes_from_stored_expanded_spec_not_minimal_toml() {
         WireContribution::default(),
         true,
     )
-    .err()
-    .expect("an unreadable stored spec fails the compose");
+    .expect_err("an unreadable stored spec fails the compose");
     assert!(
         err.to_string().contains("reading the stored box spec"),
         "{err}"
