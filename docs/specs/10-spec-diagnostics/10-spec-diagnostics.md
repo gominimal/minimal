@@ -421,6 +421,22 @@ paths, and the archive layout.
   config is reported as malformed without quoting the offending line, which
   would be a line of the user's configuration. `SCHEMA_VERSION` stays at 1:
   the field is additive and a v1 reader is unaffected.
+- **R2.12**: When `min bug` collects the host bundle, the bundle shall
+  describe the DNS answerer service (`minzoned`). `host/answerer.json` shall
+  record the output of `minzoned --version` and the SHA-256 of two copies:
+  the root-owned copy the service runs, and the copy beside `min` or on
+  `PATH` that `min` installs. `host/answerer-service.txt` shall hold the
+  service manager's view: `launchctl print system/dev.gominimal.zone` on
+  macOS, and `systemctl status` of `minzoned.socket` and `minzoned.service`
+  on Linux. On Linux, `host/answerer-journal.txt` shall hold the journal of
+  those two units for the last 24 hours. On macOS, the launchd unit shall
+  send the service's stdout and stderr to `<state>/logs/minzoned.log`, and
+  the `logs/` collector shall take `minzoned.log*` with the other host log
+  prefixes. If a copy or a command is not available, then the entry shall
+  say why: the copy's `errors` list in `host/answerer.json`, or a manifest
+  skip for a command that did not run. A service that exits at start
+  leaves no other record, so a copy mismatch or a start failure is
+  otherwise not visible in a bundle.
 
 **Proof Artifacts:**
 
@@ -446,6 +462,11 @@ paths, and the archive layout.
    `a_malformed_config_is_reported_without_quoting_it` — a secret planted on
    the line the TOML parser rejects reaches no file in the bundle, the
    manifest's own reason included. Covers R2.11.
+6. **Test:** `the_answerer_service_is_described` — `host/answerer.json`
+   gives each copy's version and SHA-256 or an error that says why, and the
+   service and journal entries are transcripts or skips that say why;
+   `answerer_plist_sets_a_log_path` — the launchd unit sends its output to
+   `<state>/logs/minzoned.log`. Covers R2.12.
 
 ---
 
