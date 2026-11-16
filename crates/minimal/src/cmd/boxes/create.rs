@@ -57,10 +57,12 @@ pub(crate) fn refuse_dynamic_ingress_off_own_ip(
     range: Option<(u16, u16)>,
 ) -> Result<(), anyhow::Error> {
     if network.into() != boxes::NetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
-        anyhow::bail!(
-            "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with \
-             its own IP address can publish ports"
-        );
+        return Err(NetworkFlagRefusal {
+            message: "--dynamic-ingress and --dynamic-range need --network own_ip: only a box \
+                      with its own IP address can publish ports"
+                .to_owned(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -70,18 +72,43 @@ pub(crate) fn refuse_dynamic_ingress_off_own_ip(
 /// a mapping on a `host_ip` or `none` box would be recorded and shown with
 /// no publish surface to honour it. The CLI reference documents the flag as
 /// requiring `--network own_ip`.
-fn refuse_ingress_off_own_ip(
+pub(crate) fn refuse_ingress_off_own_ip(
     network: crate::cli::CliNetworkMode,
     has_ingress: bool,
 ) -> Result<(), anyhow::Error> {
     if network != crate::cli::CliNetworkMode::OwnIp && has_ingress {
-        anyhow::bail!(
-            "--ingress needs --network own_ip: only a box with its own IP address can \
-             publish ports"
-        );
+        return Err(NetworkFlagRefusal {
+            message: "--ingress needs --network own_ip: only a box with its own IP address can \
+                      publish ports"
+                .to_owned(),
+        }
+        .into());
     }
     Ok(())
 }
+
+/// A network flag that the box's network mode refuses: `--ingress`,
+/// `--dynamic-ingress` or `--dynamic-range` off `--network own_ip`, or
+/// egress rules on a `--network none` box. It is a usage error, and the run
+/// ends with exit 2 (`main.rs`).
+#[derive(Debug)]
+pub struct NetworkFlagRefusal {
+    /// The refusal, with the flag that answers it.
+    pub message: String,
+}
+
+impl NetworkFlagRefusal {
+    /// The architecture's exit code for a usage error.
+    pub const EXIT_CODE: u8 = 2;
+}
+
+impl std::fmt::Display for NetworkFlagRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NetworkFlagRefusal {}
 
 /// Refuses a `network.ingress` from `minimal.toml` on a box that is not
 /// `own_ip`, as [`refuse_ingress_off_own_ip`] refuses `--ingress`. `layer`
@@ -1676,11 +1703,102 @@ fn file_port_mappings(ingress: &toml::Value) -> anyhow::Result<Vec<boxes::PortMa
 /// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
 /// Fails with [`SessionEntryUndecided`] (exit 2) when no single session
 /// entry can be picked.
+///
+/// The start path calls [`session_box_expansion`] with its selected
+/// loadouts. This form selects none.
+#[cfg(test)]
 pub(crate) fn session_box_entry(
     project: &camino::Utf8Path,
     entry: Option<&str>,
     hooks_enabled: bool,
 ) -> anyhow::Result<Option<boxes::wire::request::WireBoxEntry>> {
+    session_box_expansion(project, entry, hooks_enabled, &SelectedLoadouts::default())
+        .map(|expanded| expanded.map(|expanded| expanded.wire))
+}
+
+/// The loadouts that the box takes at the selected-loadouts layer, after
+/// the loadout gate, in selection order (BOX-064, BOX-167).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SelectedLoadouts {
+    /// The gated loadouts. A sealed box has none.
+    pub(crate) loadouts: Vec<boxes::core::loadout::Loadout>,
+    /// The user policy's var `ignore` list. A loadout var it matches is
+    /// dropped before the merge, so it never conflicts (BOX-183).
+    pub(crate) ignore: Option<boxes::core::policy::VarNameGlobs>,
+}
+
+impl SelectedLoadouts {
+    /// The layer of each loadout, with its name: the keys that BOX-167
+    /// applies, without the vars that the policy ignores.
+    fn layers(&self) -> anyhow::Result<Vec<(String, toml::Table)>> {
+        const APPLIED: [&str; 5] = [
+            "packages",
+            "patches",
+            "vars",
+            "vars_lenient",
+            "lifecycle_hooks",
+        ];
+        let ignored = |name: &str| self.ignore.as_ref().is_some_and(|g| g.is_match(name));
+        self.loadouts
+            .iter()
+            .map(|loadout| {
+                let name = loadout.name().as_ref().to_owned();
+                let mut table = toml::Table::try_from(loadout)
+                    .with_context(|| format!("Cannot read loadout {name}"))?;
+                table.retain(|key, _| APPLIED.contains(&key));
+                if let Some(toml::Value::Table(vars)) = table.get_mut("vars") {
+                    vars.retain(|var, _| !ignored(var));
+                }
+                if let Some(toml::Value::Array(items)) = table.get_mut("vars_lenient") {
+                    items.retain(|item| {
+                        !item
+                            .get("name")
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(ignored)
+                    });
+                }
+                Ok((name, table))
+            })
+            .collect()
+    }
+}
+
+/// An expanded entry: the lists the daemon composes, and the whole
+/// expanded spec.
+#[derive(Debug, Clone)]
+pub(crate) struct BoxEntryExpansion {
+    /// The project's lists, for the daemon (BOX-068). A loadout's items
+    /// reach the daemon on the contribution, with their loadout, so these
+    /// carry only the project's.
+    pub(crate) wire: boxes::wire::request::WireBoxEntry,
+    /// The expanded spec over every layer, the selected loadouts included.
+    /// Each of its hooks names its declarer (BOX-179). Only the tests read
+    /// it until the daemon stores this spec. Remove the `allow` below when
+    /// gominimal/minimal#3409 (T129) lands and the daemon stores it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) spec: toml::Table,
+}
+
+/// The expanded session entry of the project at `project`, with
+/// `selected` as the selected-loadouts layer. `entry` names the entry.
+/// With no name, the session entry pick applies, and the implicit
+/// `default` entry answers a project that declares none (BOX-165). A
+/// selected loadout that conflicts with the project refuses the start
+/// here, before the box is created (BOX-183).
+///
+/// `None` for a project with no `minimal.toml`.
+///
+/// # Errors
+///
+/// Fails with exit 3 on a `minimal.toml` whose entry does not expand, and
+/// on a loadout var conflict. Fails with [`SessionEntryUndecided`] (exit 2)
+/// when no single session entry can be picked.
+pub(crate) fn session_box_expansion(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    hooks_enabled: bool,
+    selected: &SelectedLoadouts,
+) -> anyhow::Result<Option<BoxEntryExpansion>> {
     let Some(bytes) = project_file_bytes(project)? else {
         return Ok(None);
     };
@@ -1693,7 +1811,7 @@ pub(crate) fn session_box_entry(
         // project's `[session]` table.
         None => pick_session_entry(&entries)?,
     };
-    box_entry(project, &bytes, picked, hooks_enabled).map(Some)
+    box_entry(project, &bytes, picked, hooks_enabled, selected).map(Some)
 }
 
 /// The expanded `[tasks.<task>]` entry of the project at `project`, for the
@@ -1718,7 +1836,19 @@ pub(crate) fn task_box_entry(
     }) else {
         return Ok(None);
     };
-    box_entry(project, &bytes, entry, hooks_enabled).map(Some)
+    // Gap (BOX-183, issue #3302): `min task run` does not pass its gated
+    // loadouts here yet, so the loadout var conflict refusal does not run
+    // before it creates the task box. A task is sealed by default
+    // (BOX-169), but an open task takes its loadouts only on the
+    // contribution from `task_activation_inputs`.
+    box_entry(
+        project,
+        &bytes,
+        entry,
+        hooks_enabled,
+        &SelectedLoadouts::default(),
+    )
+    .map(|expanded| Some(expanded.wire))
 }
 
 /// Expands `entry` of the `minimal.toml` in `bytes` over `[defaults]` and
@@ -1732,12 +1862,18 @@ pub(crate) fn task_box_entry(
 /// keys from `[defaults]` and `[defaults.task]` do not reach a task box.
 /// gominimal/minimal#3266 tracks that gap. With hooks off (`--no-hooks`), no
 /// `lifecycle_hooks` list is sent.
+///
+/// The entry also expands with `selected` as its selected-loadouts layer,
+/// so a loadout that conflicts with the project fails here (BOX-183), and
+/// each hook of that spec names its declarer (BOX-179). The lists sent
+/// come from the expansion without the loadouts.
 fn box_entry(
     project: &camino::Utf8Path,
     bytes: &[u8],
     entry: mfile::entry::BoxEntry,
     hooks_enabled: bool,
-) -> anyhow::Result<boxes::wire::request::WireBoxEntry> {
+    selected: &SelectedLoadouts,
+) -> anyhow::Result<BoxEntryExpansion> {
     let format_error = |error| ProjectFileInvalid {
         error: mfile::Error::Format(error),
     };
@@ -1765,14 +1901,49 @@ fn box_entry(
     // BOX-183, BOX-184: the merge compares resolved values, so each
     // `inherit` name takes this process's value. A name it does not set
     // stays out, and the merge falls back to the `default`.
-    // Gap (BOX-183, residual of T125, issue #3302): `layers.loadouts` stays
-    // empty here. So the loadout var conflict refusal in `merge_vars` does
-    // not run before `min box create`, `min session start` or `min task run`
-    // creates the box.
-    layers.host_vars = mfile::expand::inherited_var_names(&entry, &layers)
+    let host_vars = |layers: &mfile::expand::Layers| {
+        mfile::expand::inherited_var_names(&entry, layers)
+            .into_iter()
+            .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
+            .collect()
+    };
+    // BOX-064, BOX-179: the whole spec has one layer for each selected
+    // loadout, with its name. It reads the type chain's layers too, so its
+    // loadout gate opens as the start's gate did. Its expansion comes
+    // first, so a loadout that conflicts with the project refuses the
+    // start before the box exists (BOX-183).
+    let mut whole = layers.clone();
+    whole.loadouts = selected.layers()?;
+    (whole.type_defaults, whole.type_constraints) = entry_type_layers(&doc, &entry);
+    whole.host_vars = host_vars(&whole);
+    let mut full =
+        mfile::expand::expand(&entry, &whole).map_err(|error| ProjectFileInvalid { error })?;
+    // With hooks off (`--no-hooks`), the spec carries no hook.
+    if !hooks_enabled {
+        full.spec.remove("lifecycle_hooks");
+    }
+    // The report keeps the layer, and the loadout, of each hook.
+    let origins = match full.report.values.get("lifecycle_hooks") {
+        Some(mfile::expand::ValueOrigin::List(origins)) => origins.as_slice(),
+        _ => &[],
+    };
+    for (hook, origin) in full
+        .spec
+        .get("lifecycle_hooks")
+        .and_then(toml::Value::as_array)
         .into_iter()
-        .filter_map(|name| std::env::var(&name).ok().map(|value| (name, value)))
-        .collect();
+        .flatten()
+        .zip(origins)
+    {
+        tracing::debug!(
+            entry = %entry.name,
+            declared_by = ?mfile::spec::HookDeclarer::of(hook),
+            layer = ?origin.layer,
+            loadout = ?origin.loadout,
+            "lifecycle hook of the expanded spec"
+        );
+    }
+    layers.host_vars = host_vars(&layers);
     let expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
     let spec = &expansion.spec;
@@ -1795,7 +1966,21 @@ fn box_entry(
     let mut wire = boxes::wire::request::WireBoxEntry::new(&entry.name, &box_type, project_path);
     wire.packages = list(spec, "packages").map_err(format_error)?;
     if hooks_enabled {
-        wire.lifecycle_hooks = list(spec, "lifecycle_hooks").map_err(format_error)?;
+        // The daemon takes a hook as the project wrote it, so the
+        // `declared_by` the expansion wrote stays in the spec.
+        let hooks = spec.get("lifecycle_hooks").map(|hooks| match hooks {
+            toml::Value::Array(items) => toml::Value::Array(
+                items
+                    .iter()
+                    .map(mfile::spec::hook_without_declarer)
+                    .collect(),
+            ),
+            other => other.clone(),
+        });
+        wire.lifecycle_hooks = hooks
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(format_error)?;
     }
     // A task entry sends no `vars`, `vars_lenient` or `patches`, so the
     // `[defaults]` and `[defaults.task]` values for them do not reach the
@@ -1812,7 +1997,39 @@ fn box_entry(
         packages = ?wire.packages,
         "expanded the box's entry"
     );
-    Ok(wire)
+    Ok(BoxEntryExpansion {
+        wire,
+        spec: full.spec,
+    })
+}
+
+/// A table for each type of a chain, with the type's name.
+type TypeTables = Vec<(String, toml::Table)>;
+
+/// The defaults and the constraints of each type in the chain of `entry`,
+/// as the start's loadout gate reads them: the resolved chain, or the
+/// built-in layers of a built-in type name that does not resolve. Empty
+/// for any other name, which the gate already refused.
+fn entry_type_layers(
+    doc: &toml::Table,
+    entry: &mfile::entry::BoxEntry,
+) -> (TypeTables, TypeTables) {
+    if let Ok(types) = mfile::box_types::BoxTypes::from_file(doc)
+        && let Ok(resolved) = mfile::expand::expandable_type(entry, &types)
+    {
+        return (resolved.defaults, resolved.constraints);
+    }
+    match entry
+        .box_type
+        .as_deref()
+        .and_then(mfile::box_types::builtin)
+    {
+        Some(root) => (
+            vec![(root.to_owned(), mfile::box_types::builtin_defaults(root))],
+            vec![(root.to_owned(), mfile::box_types::builtin_constraints(root))],
+        ),
+        None => (Vec::new(), Vec::new()),
+    }
 }
 
 /// The refusal for a `[network]` key that the network module cannot read:
@@ -2870,7 +3087,7 @@ pub(crate) enum ActivationStep {
     ResolveLoadouts,
     /// The upload root and whether the upload is skipped.
     PlanUpload,
-    /// The daemon connection and the duplicate-session advisory.
+    /// The daemon connection.
     ConnectDaemon,
     /// The box's registration with the VM host daemon.
     RegisterBox,
@@ -3425,6 +3642,54 @@ pub(crate) fn start_loadout_selection(args: &ActivateArgs) -> loadouts::LoadoutS
     loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts)
 }
 
+/// The expander version of this `min` (BOX-074), from the same `mfile`
+/// constants the daemon reports its own from.
+pub(crate) fn client_expander_version() -> String {
+    minimald_rpc::expander_version(
+        mfile::spec::BOX_SPEC_VERSION,
+        mfile::projection::PROJECTION_VERSION,
+    )
+}
+
+/// The line `min` prints before the create when the daemon's expander
+/// version, `daemon`, differs from this `min`'s (BOX-074), or `None` when
+/// they match. A report, never a refusal: the daemon's digest comparison
+/// (BOX-072) and admission check (BOX-160) are the checks that refuse.
+pub(crate) fn expander_skew_report(daemon: Option<&str>) -> Option<String> {
+    minimald_rpc::expander_skew_message(&client_expander_version(), daemon)
+        .map(|message| format!("warning: {message}"))
+}
+
+/// Reports a skew between this `min`'s expander version and the daemon's
+/// before the create, and goes on whatever the answer (BOX-074).
+///
+/// It asks only under the version skew override. Without it, the create
+/// carries `must_match_version`, and a daemon of another build refuses
+/// the create. One build has one expander version, so a matched pair
+/// has nothing to report, and the activation path pays no round trip.
+async fn report_expander_skew(client: &mut client::Client) {
+    if version_assertion().is_some() {
+        return;
+    }
+    match client.oneshot_rpc::<minimald_rpc::GetVersion>(()).await {
+        Ok(reply) => {
+            let daemon = reply.expander_version.as_deref();
+            tracing::info!(
+                client_expander_version = %client_expander_version(),
+                daemon_expander_version = daemon.unwrap_or("none"),
+                "compared the expander versions before the create"
+            );
+            if let Some(report) = expander_skew_report(daemon) {
+                eprintln!("{report}");
+            }
+        }
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "could not read minimald's expander version; the create goes ahead"
+        ),
+    }
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     mut args: ActivateArgs,
@@ -3613,6 +3878,7 @@ pub(crate) async fn activate_box(
         finalize_hook_budget,
         contribution,
         user_policy,
+        selected,
     ) = ActivationStep::ResolveLoadouts
         .run(async {
             // Resolve and compose the loadouts BEFORE opening the daemon
@@ -3636,8 +3902,22 @@ pub(crate) async fn activate_box(
             } else {
                 loadouts::HookPrep::Enforce
             };
-            let inputs =
-                loadouts::prepare_activation_inputs(global, &project_root, selection, hooks, None)?;
+            let cfg = config::read_client_config(global)?;
+            let inputs = loadouts::prepare_activation_inputs_with_config(
+                &cfg,
+                global,
+                &project_root,
+                selection.clone(),
+                hooks,
+                None,
+            )?;
+            // BOX-064, BOX-179: the gated loadouts again, whole, for the
+            // selected-loadouts layer of the entry's expansion. The read
+            // above already refused a missing or malformed one.
+            let selected = SelectedLoadouts {
+                loadouts: loadouts::resolve_active_loadouts(selection, &cfg, global)?.loadouts,
+                ignore: Some(inputs.user_policy.vars().ignore().clone()),
+            };
 
             // Scaffold-offer a missing `minimal.toml` only after the loadouts
             // resolve and compose: a bad `--loadout` must error before anything
@@ -3671,6 +3951,7 @@ pub(crate) async fn activate_box(
                 inputs.hook_budget,
                 inputs.contribution,
                 inputs.user_policy,
+                selected,
             ))
         })
         .await?;
@@ -3681,9 +3962,17 @@ pub(crate) async fn activate_box(
     use tracing::Instrument as _;
     let entry_span = tracing::info_span!("box_entry", box_type = boxes::SESSION_BOX_TYPE);
     let mut contribution = contribution;
-    contribution.entry = entry_span
-        .in_scope(|| session_box_entry(&project_root, options.entry.as_deref(), !args.no_hooks))?
-        .map(Box::new);
+    let expanded = entry_span.in_scope(|| {
+        session_box_expansion(
+            &project_root,
+            options.entry.as_deref(),
+            !args.no_hooks,
+            &selected,
+        )
+    })?;
+    // The expansion logs each hook with its declarer and layer. The whole
+    // spec is not logged, because it carries loadout variable values.
+    contribution.entry = expanded.map(|expanded| Box::new(expanded.wire));
 
     // The upload decision needs no TTY — the interactive `Confirm` is answered
     // at the upload step, once the session exists — so it is resolved here,
@@ -3726,51 +4015,10 @@ pub(crate) async fn activate_box(
     // Activation is the hot path #1251's gate landed on, and it must not pay a
     // round trip for a check its own first RPC can make.
     let mut client = ActivationStep::ConnectDaemon
-        .run(async {
-            let mut client = connect_daemon_unchecked(global).await?;
-
-            // Warn before minting a second session for a path that already has one:
-            // the duplicate leaves bare `min` from this directory ambiguous between
-            // them. Advisory only — a listing failure (ordinary transport or
-            // daemon-side error) must not block activation, so the duplicate check is
-            // skipped on error. But `oneshot_rpc` reuses one `russh` handle, and a
-            // transport-level listing failure can close the shared connection, which
-            // would then break the `CreateSession` channel below; so on any listing
-            // error, reconnect before creation. A benign daemon-side error leaves the
-            // old connection usable and the reconnect is merely a no-op cost on the
-            // rare failure path — the happy path still pays no extra round trip. The
-            // hard version gate is unaffected: `CreateSession` below carries its own
-            // `must_match_version`, so a version-skewed daemon is still refused there
-            // even when this enumeration is skipped.
-            match list_sessions_version_gated(&mut client).await {
-                Ok(existing_sessions) => {
-                    if let Some(warning) = duplicate_session_warning(
-                        &existing_sessions.sessions,
-                        &request.config.project_path,
-                    ) {
-                        eprintln!("{warning}");
-                    }
-                }
-                Err(_) => {
-                    // The listing failed. A transport-level closure can leave the
-                    // shared `russh` handle unusable, which would then break the
-                    // `CreateSession` channel below, so try to reconnect. But a
-                    // daemon-side listing error closes only the RPC channel and leaves
-                    // the SSH connection intact — so if the reconnect itself fails,
-                    // keep the original client and let `CreateSession` proceed on it
-                    // rather than aborting activation outright. `CreateSession` carries
-                    // its own hard version gate and surfaces a clear error if the
-                    // connection really is dead, so retaining the original client can
-                    // only help the daemon-side-error case and never regresses the
-                    // transport-closure case.
-                    if let Ok(reconnected) = connect_daemon_unchecked(global).await {
-                        client = reconnected;
-                    }
-                }
-            }
-            Ok::<_, anyhow::Error>(client)
-        })
+        .run(connect_daemon_unchecked(global))
         .await?;
+    // BOX-074: a skewed expander is reported, and the create goes on.
+    report_expander_skew(&mut client).await;
 
     // T66: an own-address box on a VM-backed host registers with the VM host
     // daemon just before the create — the host allocates the box's switch

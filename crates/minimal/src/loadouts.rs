@@ -292,9 +292,19 @@ pub(crate) fn resolve_active_loadouts(
             // `LoadError`'s Display already embeds its I/O source, so flatten
             // it to a leaf before adding context; otherwise anyhow re-renders
             // the underlying error a second time from the chain.
+            // BCLI-034: a loadout name with no loadout file is not found
+            // (exit 4), from `--loadout` and `default_loadouts` alike. The
+            // text is the same as before.
             boxes::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name)
                 .map(|(loadout, _layout)| loadout)
-                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map_err(|e| match e {
+                    boxes::client::disk::LoadError::NotFound { .. } => {
+                        anyhow::Error::new(LoadoutNotFound {
+                            message: e.to_string(),
+                        })
+                    }
+                    e => anyhow::anyhow!("{e}"),
+                })
                 .with_context(|| format!("{source} `{name}`"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -304,6 +314,28 @@ pub(crate) fn resolve_active_loadouts(
         builtin_default: false,
     })
 }
+
+/// A loadout name, from `--loadout` or `default_loadouts`, that no loadout
+/// file carries. The run ends with exit 4 (`main.rs`), the architecture's
+/// code for a thing not found.
+#[derive(Debug)]
+pub struct LoadoutNotFound {
+    /// The loader's own text, which names the paths it looked at.
+    pub message: String,
+}
+
+impl LoadoutNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for LoadoutNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LoadoutNotFound {}
 
 /// Whether the user has a `default` loadout of their own on disk, in
 /// either layout — the probe behind the zero-config fallback in
