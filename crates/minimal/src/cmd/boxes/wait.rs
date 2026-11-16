@@ -237,8 +237,10 @@ pub(crate) async fn box_wait_on_hosts(
             // Interim: each wait on an ended box copies again, and the
             // outcomes are not used yet. The claim that stops a later
             // wait from copying an export the record already holds is
-            // BOX-198. The `file_exported` event is BOX-195, and exit 125
-            // for a skipped export is BOX-193. All are later tasks.
+            // BOX-198 (gominimal/minimal#3446). The `file_exported` event
+            // is BOX-195 (gominimal/minimal#3446), and exit 125 for a
+            // skipped export is BOX-193 (gominimal/minimal#3445). All are
+            // later tasks.
             let root = shown.record.project_root.as_ref();
             let _outcomes = copy_box_exports(
                 &mut client,

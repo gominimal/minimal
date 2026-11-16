@@ -21010,10 +21010,86 @@ async fn detached_start_or_stop_copies_no_exports() {
         .expect("the detach branch returns");
     let branch = &source[detach..detach + returned];
     assert!(!branch.contains("copy_box_exports"), "{branch}");
+    assert!(!branch.contains("copy_ended_task_box_exports"), "{branch}");
     assert!(
-        source[detach + returned..].contains("copy_box_exports"),
+        source[detach + returned..].contains("copy_ended_task_box_exports("),
         "the attached run copies after the detach branch"
     );
+}
+
+// BOX-185: an attached task run that starts in a folder below the project
+// root copies its exports to the project root that the box's record names,
+// and writes nothing below the folder the run started in.
+#[tokio::test]
+async fn attached_run_from_subfolder_copies_exports_to_project_root() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 temp path");
+    let subfolder = root.join("src/deep");
+    std::fs::create_dir_all(&subfolder).unwrap();
+    // `run_entry` resolves the root from the folder the run started in,
+    // and stamps that root on the create request.
+    let upload_root = resolve_upload_root(&subfolder).expect("the project root");
+    assert_eq!(upload_root, root);
+
+    let mut daemon = server.connect().await;
+    let build = create_spec_box(
+        &mut daemon,
+        "build",
+        upload_root.as_std_path(),
+        Some(export_spec(false, &["out/report.txt"])),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        build,
+        &["/workbench/out"],
+        &[("/workbench/out/report.txt", b"all green")],
+    )
+    .await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        &mut Vec::new(),
+        "build",
+        false,
+    )
+    .await
+    .expect("the box stops");
+
+    let host = local_hosts(&global)
+        .unwrap()
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the harness host");
+    let mut client = box_host_client(&host).await.expect("a client");
+    let mut err = Vec::new();
+    let outcomes = crate::task::copy_ended_task_box_exports(
+        &mut client,
+        build,
+        "build",
+        &upload_root,
+        &mut err,
+    )
+    .await;
+    assert_eq!(outcomes.len(), 1, "{}", String::from_utf8_lossy(&err));
+    assert!(outcomes[0].copied, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(
+        std::fs::read(root.join("out/report.txt")).unwrap(),
+        b"all green"
+    );
+    assert!(
+        !subfolder.join("out/report.txt").exists(),
+        "nothing goes below the folder the run started in"
+    );
+    assert_eq!(std::fs::read_dir(&subfolder).unwrap().count(), 0);
 }
 
 // BOX-187: a folder export makes every folder of the box's tree, empty
