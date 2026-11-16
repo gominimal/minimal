@@ -20741,6 +20741,8 @@ struct ExportBox {
     reads: Vec<String>,
     /// Each link in the box, by its path, with the path it leads to.
     links: std::collections::BTreeMap<String, String>,
+    /// The permission bits of a file, by its path.
+    modes: std::collections::BTreeMap<String, u32>,
 }
 
 impl ExportBox {
@@ -20819,6 +20821,10 @@ impl cmd::ExportSource for ExportBox {
         }
         out.write_all(bytes).unwrap();
         Ok(bytes.len() as u64)
+    }
+
+    async fn mode(&mut self, path: &str) -> Option<u32> {
+        self.modes.get(path).copied()
     }
 
     async fn resolve(&mut self, path: &str) -> Result<String, cmd::ExportReadError> {
@@ -21259,6 +21265,31 @@ async fn export_writes_each_file_atomically() {
     assert!(outcomes[0].copied, "{err:?}");
     assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
     assert_eq!(source.reads, ["/workbench/fresh.txt"]);
+
+    // The written file keeps the permission bits of the box's file, so an
+    // exported executable stays executable, also where it replaces a file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = root.join("bin/tool");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(&tool, b"old tool").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut source = ExportBox::default().file("/workbench/bin/tool", b"#!/bin/sh\n");
+        source.modes.insert("/workbench/bin/tool".to_owned(), 0o100_755);
+        let mut err = Vec::new();
+        let outcomes = cmd::copy_exports(
+            &mut source,
+            &["bin/tool".to_owned()],
+            root,
+            "web",
+            &mut err,
+        )
+        .await;
+        assert!(outcomes[0].copied, "{err:?}");
+        let mode = std::fs::metadata(&tool).unwrap().permissions().mode();
+        assert_eq!(mode & 0o100, 0o100, "the owner can run the file: {mode:o}");
+    }
 }
 
 // BOX-071: a create carries the client's projection digest of its own spec.

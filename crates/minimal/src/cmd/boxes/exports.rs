@@ -55,6 +55,12 @@ pub(crate) trait ExportSource {
         None
     }
 
+    /// The permission bits of the file `path`, after links. `None` when
+    /// the source cannot tell.
+    async fn mode(&mut self, _path: &str) -> Option<u32> {
+        None
+    }
+
     /// The path in the box that `path` leads to after every link in it.
     async fn resolve(&mut self, path: &str) -> Result<String, ExportReadError> {
         Ok(path.to_owned())
@@ -328,10 +334,15 @@ async fn write_file_atomically<S: ExportSource>(
     let prefix = format!(".{name}.min-export-");
     let mut builder = tempfile::Builder::new();
     builder.prefix(&prefix);
-    // The umask applies to this mode, as it does to `File::create`, so the
-    // file gets the default mode and not the 0600 of a temporary file.
+    // The file gets the permission bits of the box's file, so an exported
+    // executable stays executable. When the box does not say, the file
+    // gets the default mode and not the 0600 of a temporary file. The
+    // umask applies to either mode, as it does to `cp`.
+    let mode = source.mode(src).await.map_or(0o666, |mode| mode & 0o777);
     #[cfg(unix)]
-    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(mode));
+    #[cfg(not(unix))]
+    let _ = mode;
     let (mut file, partial) = builder
         .tempfile_in(dir)
         .map_err(|e| format!("could not write {}: {e}", dest.display()))?
@@ -662,6 +673,10 @@ impl ExportSource for BoxFiles {
 
     async fn identity(&mut self, path: &str) -> Option<String> {
         self.sftp.canonicalize(path).await.ok()
+    }
+
+    async fn mode(&mut self, path: &str) -> Option<u32> {
+        self.sftp.metadata(path).await.ok()?.permissions
     }
 
     async fn resolve(&mut self, path: &str) -> Result<String, ExportReadError> {
