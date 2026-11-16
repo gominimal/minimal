@@ -21201,6 +21201,154 @@ async fn directory_export_copies_its_tree_and_deletes_nothing() {
 // BOX-188: each file goes to a temporary name beside its destination and
 // is renamed into place, so the destination holds the whole earlier file
 // until the new one is whole, and a failed read leaves it as it was.
+/// A box whose folders can hold links to other folders, as `latest ->
+/// run-5`. Every read goes through the links first.
+#[derive(Default)]
+struct LinkedBox {
+    dirs: std::collections::BTreeSet<String>,
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Each link to a folder, by its path, with the folder it leads to.
+    links: std::collections::BTreeMap<String, String>,
+}
+
+impl LinkedBox {
+    fn real(&self, path: &str) -> String {
+        let mut path = path.to_owned();
+        // A bound on the hops, so a test link loop cannot hang the test.
+        for _ in 0..64 {
+            let next = self.links.iter().find_map(|(link, target)| {
+                if path == *link {
+                    Some(target.clone())
+                } else {
+                    path.strip_prefix(&format!("{link}/"))
+                        .map(|rest| format!("{target}/{rest}"))
+                }
+            });
+            match next {
+                Some(next) => path = next,
+                None => break,
+            }
+        }
+        path
+    }
+}
+
+impl cmd::ExportSource for LinkedBox {
+    async fn kind(&mut self, path: &str) -> Result<cmd::ExportKind, cmd::ExportReadError> {
+        let real = self.real(path);
+        if self.dirs.contains(&real) {
+            Ok(cmd::ExportKind::Dir)
+        } else if self.files.contains_key(&real) {
+            Ok(cmd::ExportKind::File)
+        } else {
+            Err(cmd::ExportReadError::NotFound)
+        }
+    }
+
+    async fn list(
+        &mut self,
+        path: &str,
+    ) -> Result<Vec<(String, cmd::ExportKind)>, cmd::ExportReadError> {
+        let prefix = format!("{}/", self.real(path));
+        let child = |p: &String| {
+            p.strip_prefix(&prefix)
+                .filter(|rest| !rest.contains('/'))
+                .map(str::to_owned)
+        };
+        let mut names: Vec<_> = self
+            .dirs
+            .iter()
+            .chain(self.links.keys())
+            .filter_map(|d| child(d).map(|n| (n, cmd::ExportKind::Dir)))
+            .collect();
+        names.extend(
+            self.files
+                .keys()
+                .filter_map(|f| child(f).map(|n| (n, cmd::ExportKind::File))),
+        );
+        Ok(names)
+    }
+
+    async fn read_into(
+        &mut self,
+        path: &str,
+        out: &mut (dyn std::io::Write + Send),
+    ) -> Result<u64, cmd::ExportReadError> {
+        let bytes = self
+            .files
+            .get(&self.real(path))
+            .ok_or(cmd::ExportReadError::NotFound)?;
+        out.write_all(bytes).unwrap();
+        Ok(bytes.len() as u64)
+    }
+
+    async fn identity(&mut self, path: &str) -> Option<String> {
+        Some(self.real(path))
+    }
+
+    async fn resolve(&mut self, path: &str) -> Result<String, cmd::ExportReadError> {
+        Ok(self.real(path))
+    }
+}
+
+// BOX-187: a folder export copies its whole tree. A link to a sibling
+// folder copies that folder under both names, and a link back to a folder
+// above it is not followed, so the walk ends.
+#[tokio::test]
+async fn directory_export_copies_its_tree_and_deletes_nothing_through_sibling_links() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+
+    let mut source = LinkedBox::default();
+    source.dirs.insert("/workbench/out".to_owned());
+    source.dirs.insert("/workbench/out/run-5".to_owned());
+    source.files.insert(
+        "/workbench/out/run-5/log.txt".to_owned(),
+        b"run five".to_vec(),
+    );
+    // `latest` sorts before `run-5`, so the walk reaches the folder first
+    // through the link.
+    source.links.insert(
+        "/workbench/out/latest".to_owned(),
+        "/workbench/out/run-5".to_owned(),
+    );
+    // A link back to the export folder itself, a loop.
+    source.links.insert(
+        "/workbench/out/run-5/up".to_owned(),
+        "/workbench/out".to_owned(),
+    );
+
+    let mut err = Vec::new();
+    let outcomes =
+        cmd::copy_exports(&mut source, &["out/".to_owned()], root, "web", &mut err).await;
+
+    assert_eq!(
+        std::fs::read(root.join("out/run-5/log.txt")).unwrap(),
+        b"run five",
+        "the real folder is copied"
+    );
+    assert_eq!(
+        std::fs::read(root.join("out/latest/log.txt")).unwrap(),
+        b"run five",
+        "the link to it is copied too"
+    );
+    assert!(
+        !root.join("out/run-5/up").exists(),
+        "a loop is not followed"
+    );
+    assert!(
+        !root.join("out/latest/up").exists(),
+        "a loop is not followed"
+    );
+
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].copied, "{outcomes:?}");
+    let mut files: Vec<_> = outcomes[0].files.iter().map(|f| f.path.as_str()).collect();
+    files.sort_unstable();
+    assert_eq!(files, ["out/latest/log.txt", "out/run-5/log.txt"]);
+    assert_eq!(String::from_utf8(err).unwrap(), "");
+}
+
 #[tokio::test]
 async fn export_writes_each_file_atomically() {
     let project = tempfile::tempdir().expect("a temp project dir");

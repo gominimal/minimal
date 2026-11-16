@@ -49,7 +49,7 @@ pub(crate) trait ExportSource {
     ) -> Result<u64, ExportReadError>;
 
     /// One name for the folder `path` that two paths to the same folder
-    /// share, so a walk through links visits each folder once. `None`
+    /// share, so a walk through links stops at a link to an ancestor. `None`
     /// when the source cannot tell, and then the path itself is used.
     async fn identity(&mut self, _path: &str) -> Option<String> {
         None
@@ -247,21 +247,22 @@ struct ExportTree {
 }
 
 /// Reads the whole tree below the folder `root` in the box before anything
-/// is written. A folder reached twice, through a link, is read once.
+/// is written. Each path to a folder is read, so a link to a sibling folder
+/// copies that folder under both names (BOX-187). A link back to a folder on
+/// the current path, an ancestor, is not followed, so a loop ends.
 async fn read_tree<S: ExportSource>(
     source: &mut S,
     root: &str,
 ) -> Result<ExportTree, ExportReadError> {
     let mut tree = ExportTree::default();
-    let mut seen = std::collections::BTreeSet::new();
-    seen.insert(
-        source
-            .identity(root)
-            .await
-            .unwrap_or_else(|| root.to_owned()),
-    );
-    let mut pending = std::collections::VecDeque::from([String::new()]);
-    while let Some(rel) = pending.pop_front() {
+    let root_id = source
+        .identity(root)
+        .await
+        .unwrap_or_else(|| root.to_owned());
+    // Each folder still to read, with the identities of the folders on its
+    // path from `root`, itself included.
+    let mut pending = std::collections::VecDeque::from([(String::new(), vec![root_id])]);
+    while let Some((rel, ancestors)) = pending.pop_front() {
         let dir = if rel.is_empty() {
             root.to_owned()
         } else {
@@ -283,10 +284,17 @@ async fn read_tree<S: ExportSource>(
                 ExportKind::Dir => {
                     let full = format!("{root}/{child}");
                     let id = source.identity(&full).await.unwrap_or(full);
-                    if seen.insert(id) {
-                        tree.dirs.push(child.clone());
-                        pending.push_back(child);
+                    if ancestors.contains(&id) {
+                        tracing::info!(
+                            path = %child,
+                            "a folder export link leads back to a folder above it, not followed"
+                        );
+                        continue;
                     }
+                    let mut path = ancestors.clone();
+                    path.push(id);
+                    tree.dirs.push(child.clone());
+                    pending.push_back((child, path));
                 }
             }
         }
