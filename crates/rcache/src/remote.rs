@@ -57,6 +57,14 @@ pub enum Error<BE: std::fmt::Debug> {
         object: String,
         status: Option<usize>,
     },
+    /// The TLS certificate presented while fetching `object` did not verify
+    /// against the trust store (`cause` is the verification failure, naming
+    /// the host when known). Distinct from [`Error::Unavailable`] because it
+    /// is not a connectivity problem and never transient: it recurs
+    /// identically until the trust path is fixed. The usual cause is a
+    /// TLS-inspecting proxy re-signing traffic with a CA this environment
+    /// does not trust.
+    TlsCert { object: String, cause: String },
 }
 
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
@@ -75,6 +83,14 @@ impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
                     "cache server was unreachable for {object}; try again shortly"
                 ),
             },
+            Error::TlsCert { object, cause } => write!(
+                f,
+                "TLS certificate verification failed while fetching {object}: {cause}. \
+                 This is not a connectivity problem and will not clear on retry: a \
+                 TLS-inspecting proxy (a corporate VPN, Cloudflare WARP, Zscaler, or \
+                 similar) may be re-signing HTTPS traffic with a certificate authority \
+                 this environment does not trust."
+            ),
             _ => write!(f, "{:?}", self),
         }
     }
@@ -652,20 +668,28 @@ impl<B: FetchBackend> RemoteCache<B> {
             .await;
             match fetched {
                 Ok(pair) => Ok(pair),
-                // The same class of failure artifact downloads already
-                // survive: report it in terms of what was fetched, not
-                // the raw transport error.
-                Err(e) if Self::is_transient(&e) => {
-                    let status = match &e {
-                        Error::Fetch { status } => Some(*status),
-                        _ => None,
-                    };
-                    Err(Error::Unavailable {
-                        object: source.object().to_string(),
-                        status,
-                    })
+                Err(e) => {
+                    // A certificate failure is named (and surfaced, since it
+                    // is non-transient) rather than collapsed into the
+                    // generic "unreachable" below, which would be wrong twice
+                    // over: it connected, and retrying cannot fix it.
+                    let e = Self::name_tls_cert_error(e, source.object());
+                    if Self::is_transient(&e) {
+                        // The same class of failure artifact downloads already
+                        // survive: report it in terms of what was fetched, not
+                        // the raw transport error.
+                        let status = match &e {
+                            Error::Fetch { status } => Some(*status),
+                            _ => None,
+                        };
+                        Err(Error::Unavailable {
+                            object: source.object().to_string(),
+                            status,
+                        })
+                    } else {
+                        Err(e)
+                    }
                 }
-                Err(e) => Err(e),
             }
         })
         .await?;
@@ -869,17 +893,44 @@ impl<B: FetchBackend> RemoteCache<B> {
     /// gone on refetch; persistent corruption pays the backoff and then
     /// surfaces as the same loud `HashMismatch`). Not retried: a request that
     /// could not be built (`Request`), a 4xx, which is an answer and comes
-    /// back the same way every time, local I/O errors, and a spec or snapshot
-    /// the index does not have. Both the index path and the artifact path
-    /// classify an error status as `Fetch { status }`, so the rule is one.
+    /// back the same way every time, local I/O errors, a spec or snapshot
+    /// the index does not have, and a TLS certificate-verification failure
+    /// (a `Backend` error the backend classifies as such), which recurs
+    /// identically until the trust path is fixed and so surfaces at once
+    /// rather than paying the backoff. Both the index path and the artifact
+    /// path classify an error status as `Fetch { status }`, so the rule is
+    /// one.
     fn is_transient(e: &Error<<B::Response as FetchResponse>::Error>) -> bool {
         match e {
-            Error::Backend(_) | Error::HashMismatch { .. } => true,
+            // A transport failure is transient unless it is a certificate
+            // problem, which retrying cannot fix.
+            Error::Backend(be) => B::Response::tls_cert_error(be).is_none(),
+            Error::HashMismatch { .. } => true,
             Error::Fetch { status } => *status >= 500 || *status == 429,
             // A response cut off mid-record (the whole-record check above).
             Error::IO(e) => e.kind() == std::io::ErrorKind::UnexpectedEof,
             _ => false,
         }
+    }
+
+    /// Rewrites a transport error that is really a TLS certificate-verification
+    /// failure into [`Error::TlsCert`], naming `object`; every other error
+    /// passes through unchanged. Applied where a spent fetch surfaces, so the
+    /// certificate cause reaches the user in place of a generic "unreachable"
+    /// (the index path) or a raw transport-error dump (the artifact path).
+    fn name_tls_cert_error(
+        e: Error<<B::Response as FetchResponse>::Error>,
+        object: &str,
+    ) -> Error<<B::Response as FetchResponse>::Error> {
+        if let Error::Backend(be) = &e
+            && let Some(cause) = B::Response::tls_cert_error(be)
+        {
+            return Error::TlsCert {
+                object: object.to_string(),
+                cause,
+            };
+        }
+        e
     }
 
     /// Download the given spec hash into the local cache. Transient fetch
@@ -911,7 +962,8 @@ impl<B: FetchBackend> RemoteCache<B> {
             Self::is_transient,
             || self.fetch_verified(sha256, &materialize_op),
         )
-        .await?;
+        .await
+        .map_err(|e| Self::name_tls_cert_error(e, span_name))?;
 
         tar_file
             .seek(std::io::SeekFrom::Start(0))
@@ -1005,6 +1057,13 @@ mod tests {
             }
             self.consumed = true;
             Ok(Some(Bytes::from(self.data.clone())))
+        }
+
+        // The mock's backend error is a plain `io::Error`; classify it with
+        // the same message heuristic the real backends use, so the rcache
+        // retry/surfacing logic can be exercised without a real TLS stack.
+        fn tls_cert_error(err: &Self::Error) -> Option<String> {
+            tls_cert_cause(err, None)
         }
     }
 
@@ -1891,5 +1950,73 @@ mod tests {
             matches!(err, Error::Backend(AnyRespError::InvalidUrl(_))),
             "expected InvalidUrl, got {err:?}"
         );
+    }
+
+    /// A transport error that is really a certificate-verification failure is
+    /// not retried: retrying cannot fix the trust path, so it surfaces at
+    /// once. An ordinary transport error stays transient.
+    #[test]
+    fn certificate_failures_are_not_transient() {
+        let cert: Error<std::io::Error> = Error::Backend(std::io::Error::other(
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert!(
+            !RemoteCache::<MockBackend>::is_transient(&cert),
+            "a certificate failure must not be retried"
+        );
+
+        let transport: Error<std::io::Error> =
+            Error::Backend(std::io::Error::other("connection reset by peer"));
+        assert!(
+            RemoteCache::<MockBackend>::is_transient(&transport),
+            "an ordinary transport error stays transient"
+        );
+    }
+
+    /// A spent certificate failure is rewritten to [`Error::TlsCert`], naming
+    /// the object; an ordinary transport error passes through unchanged (so
+    /// the index path can still collapse it to `Unavailable`).
+    #[test]
+    fn name_tls_cert_error_renames_only_certificate_failures() {
+        let named = RemoteCache::<MockBackend>::name_tls_cert_error(
+            Error::Backend(std::io::Error::other(
+                "invalid peer certificate: UnknownIssuer",
+            )),
+            "index.shisha",
+        );
+        match named {
+            Error::TlsCert { object, cause } => {
+                assert_eq!(object, "index.shisha");
+                assert!(cause.contains("UnknownIssuer"), "{cause}");
+            }
+            other => panic!("expected TlsCert, got {other:?}"),
+        }
+
+        let passthrough = RemoteCache::<MockBackend>::name_tls_cert_error(
+            Error::Backend(std::io::Error::other("connection reset by peer")),
+            "index.shisha",
+        );
+        assert!(
+            matches!(passthrough, Error::Backend(_)),
+            "a non-certificate error must pass through unchanged"
+        );
+    }
+
+    /// The certificate error reads as a diagnosis the operator can act on: it
+    /// names the object and cause, says retrying will not help, and points at
+    /// the usual cause (an inspecting proxy), rather than the old generic
+    /// "cache server was unreachable".
+    #[test]
+    fn tls_cert_error_display_is_actionable() {
+        let err: Error<std::io::Error> = Error::TlsCert {
+            object: "index.shisha".to_string(),
+            cause: "invalid peer certificate: UnknownIssuer (from cache.minimal.dev)".to_string(),
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("index.shisha"), "{shown}");
+        assert!(shown.contains("cache.minimal.dev"), "{shown}");
+        assert!(shown.contains("will not clear on retry"), "{shown}");
+        assert!(shown.contains("proxy"), "{shown}");
+        assert!(!shown.contains("unreachable"), "{shown}");
     }
 }
