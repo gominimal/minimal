@@ -2496,6 +2496,7 @@ impl BoxChannel {
                         stream,
                         note_tag,
                         forward_stdin.then_some(&mut forwarded),
+                        self.session_id,
                     )
                     .await?
                 }
@@ -3617,6 +3618,7 @@ async fn run_invocations_in(
     stream: &UnixStream,
     err_tag: &'static str,
     mut stdin: Option<&mut Option<crate::exec::ForwardedStdin>>,
+    box_id: Option<boxes::SessionId>,
 ) -> Result<(), Error> {
     let io = |what: &'static str| move |e: std::io::Error| Error::IO(what, Default::default(), e);
     let shared = Arc::new(Mutex::new(
@@ -3639,6 +3641,7 @@ async fn run_invocations_in(
         cmd.stderr(hakoniwa::Stdio::MakePipe);
         let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
             .map_err(|e| Error::Other(anyhow::anyhow!("spawn failed: {e}")))?;
+        let container_pid = child.id();
         let guard = match planned.attach_child(&mut child).await {
             Ok(guard) => guard,
             Err(e) => {
@@ -3677,6 +3680,9 @@ async fn run_invocations_in(
         }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        if let Some(box_id) = box_id {
+            crate::box_runtime::record_task_container(box_id, container_pid);
+        }
         let (out, err) = (shared.clone(), shared.clone());
         let status = crate::traced::spawn_blocking(move || {
             let out = std::thread::spawn(move || stdout.map(|p| forward_lines(p, &out, "msg")));
@@ -3686,6 +3692,9 @@ async fn run_invocations_in(
             child.wait()
         })
         .await;
+        if let Some(box_id) = box_id {
+            crate::box_runtime::forget_task_container(box_id, container_pid);
+        }
         // The task ended, so a read of the forwarded stdin that fails now
         // does not fail the run.
         if let Some(Some(forwarded)) = stdin.as_deref() {

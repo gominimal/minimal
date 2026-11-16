@@ -15601,6 +15601,115 @@ async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
     assert!(!exited.contains_key("signal"));
 }
 
+/// BOX-013: a stop ends the task containers recorded beside the box, not
+/// only the box's own processes. A task's TERM trap runs, its shell exits 0,
+/// and nothing of the task outlives the stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_ends_the_recorded_task_containers() {
+    let box_id = SessionId::mint();
+    // A stand-in task. The trap is the proof the stop's signal reached the
+    // task container: without it the shell is signalled to 125, with it the
+    // shell exits 0. No `echo` — the stand-in's stdout pipe is already
+    // closed, and a trap that writes dies of SIGPIPE before it can exit 0.
+    let child = spawn_stand_in_box("trap 'exit 0' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    assert!(!processes.pids().is_empty(), "the stand-in task runs");
+    crate::box_runtime::record_task_container(box_id, child.id());
+    // The entrypoint wraps the task container, as a task box's entrypoint
+    // wraps the relay: the task's end is the entrypoint's end.
+    let entrypoint = stand_in_entrypoint(child);
+
+    let started = std::time::Instant::now();
+    super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the task container ends within the stop's grace period"
+    );
+    let exit = entrypoint.await.unwrap().unwrap();
+    assert_eq!(
+        exit.code, 0,
+        "the task container's trap ran; its shell exited 0, not signalled"
+    );
+    assert_eq!(exit.reason.unwrap().exit_code, Some(0));
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the task outlives the stop"
+    );
+    assert!(
+        crate::box_runtime::take_task_containers(box_id).is_empty(),
+        "the stop drained the box's task containers"
+    );
+
+    // A box with no recorded container — no task ran, or the run returned —
+    // signals nothing and ends at once: the entrypoint is untouched. The
+    // stand-in ignores TERM, so the proof ends it: kill, then reap.
+    let relay = spawn_stand_in_box("trap '' TERM");
+    let relay_pid = relay.id();
+    let entrypoint = stand_in_entrypoint(relay);
+    super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_millis(200),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        !entrypoint.is_finished(),
+        "a stop without a recorded task container leaves the box alone"
+    );
+    // SAFETY: `kill` reads no memory of ours. The stand-in ignores TERM, so
+    // SIGKILL is what ends it; the await reaps it.
+    unsafe {
+        libc::kill(i32::try_from(relay_pid).unwrap(), libc::SIGKILL);
+    }
+    entrypoint.await.unwrap().unwrap();
+}
+
+/// BOX-013: a forced stop kills the recorded task containers at once,
+/// without the grace period, and cuts a graceful stop's grace short the same
+/// way it does the box's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_forces_the_recorded_task_containers() {
+    let box_id = SessionId::mint();
+    // A task that ignores TERM: only the forced SIGKILL ends it.
+    let child = spawn_stand_in_box("trap '' TERM");
+    let task_pid = child.id();
+    let processes = crate::box_runtime::BoxProcesses::of_container(task_pid);
+    let entrypoint = stand_in_entrypoint(child);
+    crate::box_runtime::record_task_container(box_id, task_pid);
+    let forced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let setter = std::sync::Arc::clone(&forced);
+    let _setter = crate::traced::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        setter.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    super::stop_task_containers(box_id, &entrypoint, false, Duration::from_secs(60), &forced).await;
+    let elapsed = started.elapsed();
+    assert!(
+        (Duration::from_millis(300)..Duration::from_secs(10)).contains(&elapsed),
+        "the graceful stop of the task containers ends when the forced stop arrives: {elapsed:?}"
+    );
+    let exit = entrypoint.await.unwrap().unwrap();
+    assert_eq!(
+        exit.code, 125,
+        "the killed task carries the container's 125"
+    );
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the task outlives the forced stop"
+    );
+}
+
 /// BOX-013: a stop that ends the processes and cannot write the `stopped`
 /// record keeps the box hosted. No launch starts new processes in it until a
 /// retried stop writes the record with the ending of the first stop.

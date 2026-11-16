@@ -1294,6 +1294,80 @@ pub(crate) fn host_address_box_in_namespace(namespace: (u64, u64)) -> Option<box
     host_address_namespaces().owner(namespace)
 }
 
+/// The task containers of the running boxes, by box: the container a
+/// `min task run` invocation runs in, spawned by this daemon beside the
+/// invocation's box (BOX-013). Each entry is the box and the container's
+/// supervisor pid.
+///
+/// A box's own PID namespace ends with the box, but a task invocation runs
+/// in a container of its own, and a stop that signals only the box leaves
+/// the task running. The stop takes these records so it can end the task
+/// containers first, and the task's own wait drops its record. Only a
+/// supervisor that is still this daemon's child is signalled
+/// ([`BoxProcesses::of_container`]), so a reaped container's pid names
+/// nothing even before its record is dropped.
+#[derive(Debug, Default)]
+pub(crate) struct TaskContainers {
+    by_box: BTreeMap<(boxes::SessionId, u32), ()>,
+}
+
+impl TaskContainers {
+    /// Records the task container `supervisor` of box `id`.
+    fn record(&mut self, id: boxes::SessionId, supervisor: u32) {
+        self.by_box.insert((id, supervisor), ());
+    }
+
+    /// Drops the record of box `id`'s task container `supervisor`.
+    fn forget(&mut self, id: boxes::SessionId, supervisor: u32) {
+        self.by_box.remove(&(id, supervisor));
+    }
+
+    /// Takes every task container record of box `id`, so the stop that
+    /// signals them cannot race a second take.
+    fn take(&mut self, id: boxes::SessionId) -> Vec<u32> {
+        let mut supervisors = Vec::new();
+        self.by_box.retain(|(boxed, supervisor), _| {
+            if *boxed == id {
+                supervisors.push(*supervisor);
+                false
+            } else {
+                true
+            }
+        });
+        supervisors
+    }
+}
+
+/// The running boxes' task containers ([`TaskContainers`]).
+static TASK_CONTAINERS: std::sync::Mutex<TaskContainers> = std::sync::Mutex::new(TaskContainers {
+    by_box: BTreeMap::new(),
+});
+
+fn task_containers() -> std::sync::MutexGuard<'static, TaskContainers> {
+    TASK_CONTAINERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Records the task container `supervisor` that box `id`'s invocation just
+/// spawned (BOX-013), so `min box stop` can end it with the box.
+pub(crate) fn record_task_container(id: boxes::SessionId, supervisor: u32) {
+    task_containers().record(id, supervisor);
+}
+
+/// Drops the record of box `id`'s task container `supervisor`: the
+/// invocation's wait returned, so the container no longer needs a stop.
+pub(crate) fn forget_task_container(id: boxes::SessionId, supervisor: u32) {
+    task_containers().forget(id, supervisor);
+}
+
+/// Takes every task container of box `id` (BOX-013): the supervisor pids
+/// `min box stop` signals before the box's own processes, so the task's
+/// TERM trap runs and its exit code reaches the box's record.
+pub(crate) fn take_task_containers(id: boxes::SessionId) -> Vec<u32> {
+    task_containers().take(id)
+}
+
 /// The `(device, inode)` of process `pid`'s PID namespace, or `None` when
 /// `/proc` does not show it to this daemon.
 #[cfg(test)]
