@@ -281,7 +281,13 @@ impl FetchUrl for GcsUrl {
     type JoinError = ();
 
     fn origin(&self) -> String {
-        format!("gs://{}", self.bucket)
+        // `bucket` holds the storage API's resource name,
+        // `projects/_/buckets/<id>`, and a bucket's URL names the id alone.
+        let id = self
+            .bucket
+            .strip_prefix("projects/_/buckets/")
+            .unwrap_or(&self.bucket);
+        format!("gs://{id}")
     }
 
     fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
@@ -593,7 +599,14 @@ mod any_backend_tests {
             https("https://cache.example.com:443/x").origin(),
             "https://cache.example.com"
         );
-        assert_eq!(gcs("pkgs/a.tar").origin(), "gs://projects/_/buckets/b");
+        // A bucket is named as its URL names it, not by the storage API's
+        // resource path, so a filter on `gs://b` finds its spans.
+        assert_eq!(gcs("pkgs/a.tar").origin(), "gs://b");
+        let bare = AnyUrl::Gcs(GcsUrl {
+            bucket: "b".into(),
+            object: "pkgs/a.tar".into(),
+        });
+        assert_eq!(bare.origin(), "gs://b");
     }
 
     #[test]
