@@ -87,7 +87,7 @@ impl EnvChannel<'_> {
                 for want_dir in setup.state_dirs {
                     // a package's state prefix is one name under the state dir;
                     // graph refuses others, checked again here
-                    if !mfile::is_state_key(&want_dir) {
+                    if !mfile::is_state_prefix(&want_dir) {
                         writeln!(stream, "error: {}", state_dir_refusal(&want_dir)).ok();
                         return;
                     }
@@ -566,13 +566,17 @@ pub enum WdLayout {
 }
 
 /// The refusal for a state directory that a package's `env_state_wiring`
-/// prefix names and that is not one directory name. The set of directories
-/// no longer says which package declared each one. The package graph refuses
-/// such a prefix first and names the package, so reaching this is a bug.
+/// prefix names and that is not one directory name ([`mfile::is_state_prefix`]).
+/// The set of directories no longer says which package declared each one. The
+/// package graph refuses such a prefix first and names the package, so
+/// reaching this is a bug. The text prints as `error:` on `min install` and in
+/// task setup, so it gives the user one action. The prefix is escaped, so the
+/// refusal stays one line.
 fn state_dir_refusal(dir: &str) -> String {
     format!(
-        "A package's `env_state_wiring` prefix {dir:?} is not one directory name. The package \
-         graph should have refused it and named the package, so please report this as a bug."
+        "A package's `env_state_wiring` prefix \"{}\" is not one directory name. This is a bug \
+         in Minimal. Run `min bug` to report it.",
+        dir.escape_debug()
     )
 }
 
@@ -1407,7 +1411,7 @@ impl<'a> Env<'a> {
                     .unwrap_or_else(|| e.into())
             })?;
         for want_dir in state_dirs {
-            if !mfile::is_state_key(&want_dir) {
+            if !mfile::is_state_prefix(&want_dir) {
                 return Err(Error::Other(anyhow::anyhow!(
                     "{}",
                     state_dir_refusal(&want_dir)

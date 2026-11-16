@@ -78,13 +78,12 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
             Some(mfile::StateWiring { env_var, prefix })
         })
         .map(|w| {
-            // The prefix is joined onto the state dir, so it has to be one
-            // directory name. The same rule (`mfile::is_state_key`) and the
-            // same wording guard the task path in `graph::SetupForPackages`.
-            // Multi-component prefixes (`foo/bar`) are unused by any package
-            // in `gominimal/pkgs` today; if one legitimately needs that
-            // shape, both paths will need to agree on how to handle it.
-            if !mfile::is_state_key(&w.prefix) {
+            // The prefix is joined onto the state dir and sent to the shell
+            // helpers, so it has to be one directory name. The same rule
+            // (`mfile::is_state_prefix`) and the same text guard the task
+            // path in `graph::SetupForPackages`. It holds for any spec, also
+            // one that no Nickel contract has checked.
+            if !mfile::is_state_prefix(&w.prefix) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     mfile::state_prefix_refusal(&b.name, &w.prefix),

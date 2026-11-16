@@ -856,19 +856,11 @@ pub enum CacheConfig {
     },
 }
 
-/// One pinned chain link's candidate index objects, most-curated first.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChainLink {
-    /// `<repo>/<commit>.closure.shisha` — the sealed, bounded catalog.
-    pub closure: String,
-    /// `<repo>/<commit>.shisha` — the byte-copy of the root at publish.
-    pub snapshot: String,
-}
-
-/// Whether `key` names one directory under a project's state base: a
-/// `state_key`, or a package's `env_state_wiring` prefix. The value is joined
-/// onto the base, so it has to be a single name: empty, `.`, `..`, and any
-/// value holding `/`, a backslash or NUL are refused.
+/// Whether `key`, a `state_key`, names one directory under a project's state
+/// base. The value is joined onto the base, so it has to be a single name:
+/// empty, `.`, `..`, and any value holding `/`, a backslash or NUL are
+/// refused. A package's `env_state_wiring` prefix has its own, stricter rule,
+/// [`is_state_prefix`].
 ///
 /// An empty `state_key` on a task is allowed at load and means "no key": it
 /// opts the task out of a `[defaults.task]` key, and the task gets a
@@ -884,15 +876,41 @@ fn bad_state_key(key: &str) -> bool {
     !key.is_empty() && !is_state_key(key)
 }
 
-/// The refusal for a package's `env_state_wiring` prefix that is not one
-/// directory name ([`is_state_key`]). The package graph and the session
-/// composition path both read the prefix, and both refuse it with this text.
+/// One pinned chain link's candidate index objects, most-curated first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainLink {
+    /// `<repo>/<commit>.closure.shisha` — the sealed, bounded catalog.
+    pub closure: String,
+    /// `<repo>/<commit>.shisha` — the byte-copy of the root at publish.
+    pub snapshot: String,
+}
+
+/// Whether a package's `env_state_wiring` prefix names one directory under
+/// /state. The prefix is joined onto the state directory and is sent to the
+/// shell helpers on a `set_env:` line, so it is refused when it is empty, `.`
+/// or `..`, or holds `/`, `\`, `:` or a control character (Unicode category
+/// Cc, as [`char::is_control`] has it).
+#[must_use]
+pub fn is_state_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix != "."
+        && prefix != ".."
+        && !prefix.contains(['/', '\\', ':'])
+        && !prefix.chars().any(char::is_control)
+}
+
+/// The refusal for a package's `env_state_wiring` prefix that fails
+/// [`is_state_prefix`]. The package graph and the session composition both
+/// refuse such a prefix with this text. The values are escaped, so a newline
+/// or an escape sequence in one prints as text and the refusal stays one line.
 #[must_use]
 pub fn state_prefix_refusal(package: &str, prefix: &str) -> String {
     format!(
-        "package `{package}` declares `env_state_wiring` with prefix {prefix:?}. A prefix is \
-         one directory name under the state directory. It is not empty, `.` or `..`, and has \
-         no `/` or `\\`. Fix the prefix in that package, or report it to its maintainers."
+        "package `{}` declares `env_state_wiring` with prefix \"{}\". The prefix must be one \
+         directory name under /state, with no `/`, `\\`, `:` or control character, and not \
+         `.` or `..`.",
+        package.escape_debug(),
+        prefix.escape_debug(),
     )
 }
 
@@ -2925,7 +2943,14 @@ mod tests {
         }
         for good in ["dev", "env", "go-cache", "v1.2", "~home"] {
             assert!(is_state_key(good), "{good:?}");
+            assert!(is_state_prefix(good), "{good:?}");
         }
+        // a package's prefix also goes on a `set_env:` line: no `:` or control
+        for bad in ["", ".", "..", "a/b", "a\\b", "a:b", "a\nb", "a\u{85}b"] {
+            assert!(!is_state_prefix(bad), "{bad:?}");
+        }
+        let text = state_prefix_refusal("pkg", "a\nb");
+        assert!(!text.contains('\n') && text.contains("\"a\\nb\""), "{text}");
         let toml = |t: &str| format!("[tasks.t]\nexec = \"true\"\n{t}\n");
         let parse = |text: &str| -> File { toml::from_str(text).unwrap() };
         let err = parse(&toml("state_key = \"/home/user\""))

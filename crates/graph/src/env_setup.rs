@@ -87,8 +87,9 @@ impl SetupForPackages {
                     let entry = entry.as_map().unwrap();
                     let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
                     let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
-                    // the prefix is joined onto the state dir: one name only
-                    if !mfile::is_state_key(&prefix) {
+                    // the prefix is joined onto the state dir and sent to the
+                    // shell helpers: one directory name only
+                    if !mfile::is_state_prefix(&prefix) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             mfile::state_prefix_refusal(&b.name, &prefix),
@@ -229,7 +230,7 @@ mod tests {
             let g = Graph::new().ingest(layer).unwrap();
             SetupForPackages::build(&g, [g.by_name("wired").unwrap()])
         };
-        for bad in ["..", "a/b"] {
+        for bad in ["..", "a/b", "a:b"] {
             let err = setup(bad).expect_err(bad);
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{bad}");
             let msg = err.to_string();
