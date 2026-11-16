@@ -1033,7 +1033,7 @@ mod tests {
             grants,
             stored: false,
             cause: ProxyAbsence::NotInstalled { path: None },
-            table: "[defaults.session.secrets]".into(),
+            table: Some("[defaults.session.secrets]".into()),
         });
         assert_eq!(failure.code(), "gatehouse_unenrolled_node");
         assert_eq!(

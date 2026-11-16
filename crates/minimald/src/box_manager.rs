@@ -1917,6 +1917,9 @@ fn unenrolled_broker_refusal(
             // proxy is present and serves only GitHub grants. The cause
             // for that case lives in `crates/boxes` (#3277).
             boxes::core::bep::ProxyAbsence::NotServed,
+            // A spec comes from any entry, and not with the minimal.toml
+            // table that set its `secrets`, so the refusal names none.
+            None,
         ),
         grants,
     ))

@@ -2586,7 +2586,13 @@ pub(crate) fn check_github_grants(
         }
         .into());
     }
-    boxes::core::bep::require_proxy(secrets, proxy_absence)?;
+    // `min box start` reads the grants from `[defaults.session]`
+    // (`project_bep_and_grants`), so its refusal names that table.
+    boxes::core::bep::require_proxy(
+        secrets,
+        proxy_absence,
+        Some(boxes::core::bep::SESSION_SECRETS_TABLE),
+    )?;
     let signed_in = sign_in_held(keychain)?;
     boxes::core::bep::require_sign_in(secrets, signed_in)?;
     Ok(grants)
@@ -2625,6 +2631,8 @@ fn proxy_box_facts(
             grants,
             !stores.is_empty(),
             boxes::core::bep::ProxyAbsence::NotServed,
+            // The grants come from `[defaults.session]`, as above.
+            Some(boxes::core::bep::SESSION_SECRETS_TABLE.to_owned()),
         )),
     }
 }
