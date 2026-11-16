@@ -501,12 +501,16 @@ fn origin_label(origin: &mfile::expand::Origin, entry: &mfile::entry::BoxEntry) 
     }
 }
 
-/// The minimal.toml table at `path` under the layer that set `key` of
-/// `entry`'s expansion, for a refusal that names where to edit the value
-/// (BCLI-021). A table replaces the one a lower layer sets, so a value
-/// that no table of the file sets names the table where an edit takes
-/// effect: the entry's own table, or `[defaults.<type>]` for the implicit
-/// default entry.
+/// Where a refusal tells the person to edit `key` of `entry`'s expansion,
+/// with its minimal.toml table at `path` (BCLI-021). A value from
+/// `[defaults]` or `[defaults.<type>]` names that table. A value from a
+/// selected loadout names that loadout, or "a selected loadout" when the
+/// report does not record which one. A value from a flag names the
+/// command line. An edit to the entry's own table does not change either
+/// of those two, because they sit above the entry. Every other value
+/// names the entry's own table, or `[defaults.<type>]` for the implicit
+/// default entry: a value from the upstream or the type's defaults sits
+/// below the entry, so an edit there replaces it.
 fn setting_table(
     report: &mfile::expand::ExpansionReport,
     entry: &mfile::entry::BoxEntry,
@@ -515,13 +519,16 @@ fn setting_table(
 ) -> String {
     use mfile::expand::{Layer, ValueOrigin};
     let box_type = entry.box_type.as_deref().unwrap_or(boxes::SESSION_BOX_TYPE);
-    let layer = match report.values.get(key) {
-        Some(ValueOrigin::Value(origin)) => Some(origin.layer),
+    let origin = match report.values.get(key) {
+        Some(ValueOrigin::Value(origin)) => Some(origin),
         _ => None,
     };
-    match layer {
-        Some(Layer::Defaults) => format!("[defaults.{path}]"),
-        Some(Layer::DefaultsType) => format!("[defaults.{box_type}.{path}]"),
+    match origin.map(|origin| (origin.layer, origin.loadout.as_deref())) {
+        Some((Layer::Defaults, _)) => format!("[defaults.{path}]"),
+        Some((Layer::DefaultsType, _)) => format!("[defaults.{box_type}.{path}]"),
+        Some((Layer::Loadouts, Some(name))) => format!("the loadout `{name}`"),
+        Some((Layer::Loadouts, None)) => "a selected loadout".to_owned(),
+        Some((Layer::Overrides, _)) => COMMAND_LINE.to_owned(),
         _ if entry.implicit => format!("[defaults.{box_type}.{path}]"),
         _ => format!("[{}.{}.{path}]", entry.table.key(), entry.name),
     }
@@ -1125,6 +1132,29 @@ mod tests {
         "uploads.github.com",
         "codeload.github.com",
     ];
+
+    // BCLI-021: a value that a layer above the entry sets names that
+    // layer, because an edit to the entry's own table does not change it.
+    #[test]
+    fn setting_table_names_the_layer_above_the_entry() {
+        use mfile::expand::{ExpansionReport, Layer, Origin, ValueOrigin};
+        let entries = mfile::entry::read_entries(b"[tasks.ci]\necho = 'x'\n").unwrap();
+        let entry = &entries[0];
+        let table_for = |origin: Origin| {
+            let mut report = ExpansionReport::default();
+            report
+                .values
+                .insert("secrets".into(), ValueOrigin::Value(origin));
+            setting_table(&report, entry, "secrets", "secrets")
+        };
+        assert_eq!(table_for(Origin::loadout("gh")), "the loadout `gh`");
+        assert_eq!(table_for(Origin::of(Layer::Loadouts)), "a selected loadout");
+        assert_eq!(table_for(Origin::of(Layer::Overrides)), COMMAND_LINE);
+        // A layer below the entry names the entry's own table.
+        assert_eq!(table_for(Origin::of(Layer::Entry)), "[tasks.ci.secrets]");
+        assert_eq!(table_for(Origin::of(Layer::Upstream)), "[tasks.ci.secrets]");
+        assert_eq!(table_for(Origin::of(Layer::Defaults)), "[defaults.secrets]");
+    }
 
     #[test]
     fn yaml_string_quotes_text_that_reads_as_another_type() {
