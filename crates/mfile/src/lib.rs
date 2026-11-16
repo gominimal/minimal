@@ -1536,7 +1536,7 @@ impl File {
                 std::io::ErrorKind::PermissionDenied,
                 format!(
                     "not a file under the workspace {}, so the edit is refused. \
-                     This is a bug in minimald: please report it",
+                     This is a bug in Minimal. Run `min bug` to report it.",
                     root.display()
                 ),
             );
