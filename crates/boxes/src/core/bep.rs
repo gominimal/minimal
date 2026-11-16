@@ -648,8 +648,10 @@ pub enum BepRefusal {
         stored: bool,
         /// Why no proxy serves boxes, as far as the creator can tell.
         cause: ProxyAbsence,
-        /// The minimal.toml table that holds the setting, as the text names it.
-        table: String,
+        /// The minimal.toml table that set the grants, as the text names it.
+        /// `None` when the refuser cannot know which table set them, as the
+        /// host daemon cannot. The text then names the box's entry.
+        table: Option<String>,
     },
     /// BEP-034: a store reference names the GitHub sign-in item.
     StoreReferenceToSignIn {
@@ -715,8 +717,9 @@ impl BepRefusal {
                 Some("run `min auth login`, then create the box again".to_owned())
             }
             Self::UnenrolledNode { grants, table, .. } => Some(format!(
-                "to create the box without the grant, remove {} from {table} in minimal.toml",
-                grants.join(", ")
+                "to create the box without the grant, remove {} from {}",
+                grants.join(", "),
+                UnenrolledPlace(table.as_deref())
             )),
             _ => None,
         }
@@ -744,6 +747,36 @@ impl BepRefusal {
     }
 }
 
+/// Where a refusal tells the person to edit a value. A minimal.toml table,
+/// such as `[defaults.session.secrets]`, reads "<table> in minimal.toml".
+/// Any other source, such as "the command line" or "the loadout `ci`",
+/// reads as it is.
+struct Place<'a>(&'a str);
+
+impl fmt::Display for Place<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.starts_with('[') {
+            write!(f, "{} in minimal.toml", self.0)
+        } else {
+            f.write_str(self.0)
+        }
+    }
+}
+
+/// Where the [`BepRefusal::UnenrolledNode`] text tells the person to
+/// remove the grants: the table that set them, or the box's entry when the
+/// refuser cannot know that table.
+struct UnenrolledPlace<'a>(Option<&'a str>);
+
+impl fmt::Display for UnenrolledPlace<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(table) => write!(f, "{}", Place(table)),
+            None => f.write_str("the secrets of this box's entry in minimal.toml"),
+        }
+    }
+}
+
 impl fmt::Display for BepRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -757,31 +790,34 @@ impl fmt::Display for BepRefusal {
             Self::NoNetworkWithGrant { grants, table } => write!(
                 f,
                 "This box declares the secret {} but has no network, so the secret \
-                 cannot reach anything. Use --network own_ip, or remove {} from \
-                 {table} in minimal.toml.",
+                 cannot reach anything. Use --network own_ip, or remove {} from {}.",
                 grants.join(", "),
-                grants.join(", ")
+                grants.join(", "),
+                Place(table)
             ),
             Self::SteeringOffWithProxyEnv { table } => write!(
                 f,
                 "This box sets steering = \"off\" and proxy_env = true in \
-                 {table} in minimal.toml. \
+                 {}. \
                  With steering off the box does not trust the proxy, so every HTTPS \
                  request through the proxy fails. Remove proxy_env, or set \
-                 steering = \"proxy_env\"."
+                 steering = \"proxy_env\".",
+                Place(table)
             ),
             Self::NoResolver { steering, table } => write!(
                 f,
                 "This box declares a secret with steering = \"{}\", but this host has no \
                  box DNS resolver. Set steering = \"proxy_env\" in \
-                 {table} in minimal.toml.",
-                steering.word()
+                 {}.",
+                steering.word(),
+                Place(table)
             ),
             Self::InstallationUnenrolled { grant, table } => write!(
                 f,
                 "The GitHub secret {grant} sets mode = \"installation\", but this host is \
                  not enrolled, so it cannot act as a GitHub App installation. \
-                 Set mode = \"user\" for {grant} in {table} in minimal.toml."
+                 Set mode = \"user\" for {grant} in {}.",
+                Place(table)
             ),
             Self::NarrowScopesUnenrolled { grant, scopes } => write!(
                 f,
@@ -813,16 +849,17 @@ impl fmt::Display for BepRefusal {
                 write!(f, "{cause}")?;
                 write!(
                     f,
-                    " To create the box without the grant, remove {grants} from \
-                     {table} in minimal.toml."
+                    " To create the box without the grant, remove {grants} from {}.",
+                    UnenrolledPlace(table.as_deref())
                 )
             }
             Self::StoreReferenceToSignIn { grant, table } => write!(
                 f,
                 "The secret {grant} names the item that holds your GitHub sign-in. Only \
                  GitHub grants can use that item. To use your GitHub sign-in, go to {grant} in \
-                 {table} in minimal.toml. Set source = \"broker\" and \
-                 scopes = [\"github:user-token\"], and remove its store and id."
+                 {}. Set source = \"broker\" and \
+                 scopes = [\"github:user-token\"], and remove its store and id.",
+                Place(table)
             ),
             Self::StoreHostsOutsideEgress { grant, missing } => write!(
                 f,
@@ -838,9 +875,10 @@ impl fmt::Display for BepRefusal {
                 f,
                 "The secret {grant} sets source = \"broker\" with the scope \"{scope}\". \
                  A grant with source = \"broker\" takes only github: scopes. For a secret \
-                 you stored with `min secret set`, go to {grant} in {table} \
-                 in minimal.toml. Write source = \"store\", store = \"keychain\" and \
-                 id = \"<id>\" in place of source and scopes."
+                 you stored with `min secret set`, go to {grant} in {}. \
+                 Write source = \"store\", store = \"keychain\" and \
+                 id = \"<id>\" in place of source and scopes.",
+                Place(table)
             ),
         }
     }
@@ -1136,7 +1174,9 @@ pub fn require_sign_in(secrets: &SecretGrants, signed_in: bool) -> Result<(), Ac
 
 /// Refuses a box spec with a GitHub grant where no node-local proxy serves
 /// boxes (Gatehouse §6.2). `absence` is `None` when one does, and else
-/// says why none does. Logs one debug line when it refuses.
+/// says why none does. `table` is the minimal.toml table that set
+/// `secrets`, or `None` when the caller cannot know it. Logs one debug
+/// line when it refuses.
 ///
 /// # Errors
 ///
@@ -1145,6 +1185,7 @@ pub fn require_sign_in(secrets: &SecretGrants, signed_in: bool) -> Result<(), Ac
 pub fn require_proxy(
     secrets: &SecretGrants,
     absence: Option<ProxyAbsence>,
+    table: Option<&str>,
 ) -> Result<(), ActivationRefused> {
     let grants: Vec<String> = secrets
         .iter()
@@ -1152,27 +1193,34 @@ pub fn require_proxy(
         .map(|(name, _)| name.clone())
         .collect();
     match absence {
-        Some(cause) if !grants.is_empty() => Err(unenrolled_node(grants, false, cause)),
+        Some(cause) if !grants.is_empty() => Err(unenrolled_node(
+            grants,
+            false,
+            cause,
+            table.map(str::to_owned),
+        )),
         _ => Ok(()),
     }
 }
 
 /// The [`GATEHOUSE_UNENROLLED_NODE`] refusal of the grants `grants`, for
 /// the cause `cause`. `stored` says whether any of them is a store
-/// reference. Logs one debug line.
+/// reference. `table` is the minimal.toml table that set the grants. A
+/// caller that cannot know that table passes `None`: the host daemon gets
+/// a spec from any entry and not the layer that set its `secrets`. The
+/// text then names the secrets of the box's entry. Logs one debug line.
 #[must_use]
 pub fn unenrolled_node(
     grants: Vec<String>,
     stored: bool,
     cause: ProxyAbsence,
+    table: Option<String>,
 ) -> ActivationRefused {
-    // Only `min box start` and the daemon refuse this, and both read the
-    // grants from `[defaults.session.secrets]`.
     let refusal = BepRefusal::UnenrolledNode {
         grants,
         stored,
         cause,
-        table: SESSION_SECRETS_TABLE.to_owned(),
+        table,
     };
     tracing::debug!(
         rule = refusal.rule(),
@@ -1432,7 +1480,7 @@ mod tests {
                         grants: vec![grant()],
                         stored: false,
                         cause: ProxyAbsence::NotInstalled { path: None },
-                        table: s(),
+                        table: Some(s()),
                     },
                     format!(
                         "Cannot create the box: it declares the GitHub grant GH_TOKEN, and \
@@ -1486,7 +1534,7 @@ mod tests {
                 grants: vec!["GH_TOKEN".into()],
                 stored: true,
                 cause: ProxyAbsence::NotServed,
-                table: secrets.into(),
+                table: Some(secrets.into()),
             };
             assert_eq!(
                 unenrolled.next_step(),
@@ -1533,12 +1581,54 @@ mod tests {
                 ("BEP-017", "[tasks.ci.network.bep]"),
             ]
         );
-        let unenrolled = unenrolled_node(vec!["GH_TOKEN".into()], false, ProxyAbsence::NotServed);
+        let unenrolled = unenrolled_node(
+            vec!["GH_TOKEN".into()],
+            false,
+            ProxyAbsence::NotServed,
+            Some(SESSION_SECRETS_TABLE.into()),
+        );
         assert!(
             unenrolled
                 .to_string()
                 .contains("[defaults.session.secrets]"),
             "{unenrolled}"
+        );
+
+        // A refuser that cannot know the table, as the host daemon cannot,
+        // names the secrets of the box's entry and no table.
+        let unnamed = unenrolled_node(
+            vec!["GH_TOKEN".into()],
+            false,
+            ProxyAbsence::NotServed,
+            None,
+        );
+        let text = unnamed.to_string();
+        assert!(
+            text.ends_with(
+                "To create the box without the grant, remove GH_TOKEN from the secrets of \
+                 this box's entry in minimal.toml."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("[defaults."), "{text}");
+        assert_eq!(
+            unnamed.refusals[0].next_step().as_deref(),
+            Some(
+                "to create the box without the grant, remove GH_TOKEN from the secrets of \
+                 this box's entry in minimal.toml"
+            )
+        );
+
+        // A value set outside a minimal.toml table names its source as it is.
+        let overridden = BepRefusal::NoResolver {
+            steering: Steering::Dns,
+            table: "the command line".into(),
+        };
+        assert!(
+            overridden
+                .to_string()
+                .ends_with("Set steering = \"proxy_env\" in the command line."),
+            "{overridden}"
         );
 
         assert!(PROJECT_ACKNOWLEDGEMENT_IGNORED.contains("in [defaults.session.secrets]."));
