@@ -401,24 +401,29 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
     });
     tracing::debug!(project = %project.display(), "rendering min box spec");
     let (network, _) = preview_host(crate::daemon_host_kind(global), args);
-    proxy_rows(global, &bep, quic443, &secrets, network, out)
+    proxy_rows(global, &bep, quic443, &secrets, network, None, out)
 }
 
 /// Writes the Box Egress Proxy rows for `secrets` (BEP-038) to `out`, for
-/// a box of `network` on this host.
+/// a box of `network` on this host. `read_rules` holds the client's
+/// `[secret-store-rules]` when the caller already read them, and the rows
+/// then do not read them again.
 fn proxy_rows(
     global: &GlobalArgs,
     bep: &BepSettings,
     quic443: Option<Quic443>,
     secrets: &SecretGrants,
     network: boxes::NetworkMode,
+    read_rules: Option<&StoreRules>,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     let acknowledged = crate::config::full_breadth_acknowledged(global)?;
-    let store_rules = if boxes::core::bep::store_references(secrets).next().is_some() {
-        crate::config::read_client_config_and_store_rules(global)?.1
-    } else {
-        StoreRules::new()
+    let store_rules = match read_rules {
+        Some(rules) => rules.clone(),
+        None if boxes::core::bep::store_references(secrets).next().is_some() => {
+            crate::config::read_client_config_and_store_rules(global)?.1
+        }
+        None => StoreRules::new(),
     };
     let root = root_fingerprint(identity_path().as_deref());
     tracing::debug!(root_found = root.is_some(), "rendering the proxy rows");
@@ -511,9 +516,63 @@ fn origin_labels(
 }
 
 /// The keys of a `[secrets.<VAR>]` grant that name where its value comes
-/// from. Every other key is left out of a render, so a secret shows as its
-/// reference only.
-const SECRET_REFERENCE_KEYS: [&str; 5] = ["source", "store", "id", "scopes", "mode"];
+/// from, and where a store reference's value goes: its `upstream` and
+/// `inject`. Every other key is left out of a render, so a secret shows as
+/// its reference only.
+const SECRET_REFERENCE_KEYS: [&str; 7] = [
+    "source", "store", "id", "scopes", "mode", "upstream", "inject",
+];
+
+/// The source of a store reference's `upstream` and `inject`: the client's
+/// `[secret-store-rules]`, never `minimal.toml`.
+const STORE_RULES_SOURCE: &str = "[secret-store-rules]";
+
+/// Each `[secrets.<VAR>]` store reference of `spec`, as its variable name
+/// and the item identifier its `id` names.
+fn store_reference_ids(spec: &toml::Table) -> Vec<(String, String)> {
+    let Some(secrets) = spec.get("secrets").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    secrets
+        .iter()
+        .filter_map(|(var, grant)| {
+            let grant = grant.as_table()?;
+            if grant.get("source").and_then(toml::Value::as_str) != Some("store") {
+                return None;
+            }
+            let id = grant.get("id").and_then(toml::Value::as_str)?.trim();
+            Some((var.clone(), id.to_owned()))
+        })
+        .collect()
+}
+
+/// The client's `[secret-store-rules]` as expansion writes them into a
+/// store reference (BOX-071): each rule's `upstream`, and its `header`,
+/// `prefix` and `basic_auth` as `inject`, as the rule sets them.
+pub(crate) fn expansion_store_rules(
+    rules: &StoreRules,
+) -> std::collections::BTreeMap<String, mfile::expand::StoreRule> {
+    rules
+        .iter()
+        .map(|(id, rule)| {
+            let mut inject = toml::Table::new();
+            for (key, value) in [
+                ("header", &rule.header),
+                ("prefix", &rule.prefix),
+                ("basic_auth", &rule.basic_auth),
+            ] {
+                if let Some(value) = value {
+                    inject.insert(key.to_owned(), toml::Value::String(value.clone()));
+                }
+            }
+            let rule = mfile::expand::StoreRule {
+                upstream: rule.upstream.clone(),
+                inject,
+            };
+            (id.clone(), rule)
+        })
+        .collect()
+}
 
 /// An entry's expanded spec, the source of each value, and the proxy rows
 /// of an entry with a credentialed upstream.
@@ -629,16 +688,41 @@ fn expand_entry(
         .and_then(toml::Value::as_table)
         .map(|types| types.keys().cloned().collect())
         .unwrap_or_default();
-    let layers = mfile::expand::Layers::default().with_file_defaults(
+    let mut layers = mfile::expand::Layers::default().with_file_defaults(
         &defaults,
         entry.box_type.as_deref(),
         &project_types,
     );
-    let expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
+    let mut expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
+    // BOX-071: the client's `[secret-store-rules]` write each store
+    // reference's `upstream` and `inject` into the expanded spec. They are
+    // read once, only for a spec with a store reference, and the proxy rows
+    // below use the same read.
+    // Gap: the v0 spec that a create sends has no `[secrets]` table, so
+    // these values do not reach the daemon yet. #2410 moves the wire to the
+    // expanded spec.
+    let store_ids = store_reference_ids(&expansion.spec);
+    let mut read_rules = None;
+    if !store_ids.is_empty() {
+        let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
+        layers.store_rules = expansion_store_rules(&rules);
+        expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
+        read_rules = Some(rules);
+    }
     let mut spec = expansion.spec;
     let mut sources = std::collections::BTreeMap::new();
     for (key, origin) in &expansion.report.values {
         sources.insert(key.clone(), origin_labels(origin, entry));
+    }
+    for (var, id) in &store_ids {
+        if layers.store_rules.contains_key(id) {
+            for key in ["upstream", "inject"] {
+                sources.insert(
+                    format!("secrets.{var}.{key}"),
+                    vec![STORE_RULES_SOURCE.to_owned()],
+                );
+            }
+        }
     }
     let box_type = entry
         .box_type
@@ -805,7 +889,19 @@ fn expand_entry(
     // refused here too.
     let mut grants = SecretGrants::new();
     if let Some(toml::Value::Table(secrets)) = spec.get_mut("secrets") {
-        grants = toml::Value::Table(secrets.clone())
+        // The `upstream` and `inject` that the client's store rules wrote
+        // into a store reference are not grant keys, so the grants parse
+        // without them. Expansion refuses a layer that sets either.
+        let mut declared = secrets.clone();
+        for (_, grant) in declared.iter_mut() {
+            if let toml::Value::Table(fields) = grant
+                && fields.get("source").and_then(toml::Value::as_str) == Some("store")
+            {
+                fields.remove("upstream");
+                fields.remove("inject");
+            }
+        }
+        grants = toml::Value::Table(declared)
             .try_into()
             .map_err(|e| invalid(mfile::Error::Format(e)))?;
         for (_, grant) in secrets.iter_mut() {
@@ -830,7 +926,15 @@ fn expand_entry(
             .transpose()
             .map_err(|e| invalid(mfile::Error::Format(e)))?;
         let mut rows = Vec::new();
-        proxy_rows(global, &bep, quic443, &grants, mode, &mut rows)?;
+        proxy_rows(
+            global,
+            &bep,
+            quic443,
+            &grants,
+            mode,
+            read_rules.as_ref(),
+            &mut rows,
+        )?;
         rows_text = String::from_utf8_lossy(&rows)
             .lines()
             .map(str::to_owned)
