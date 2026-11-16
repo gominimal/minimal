@@ -11,8 +11,10 @@
 //! binds.
 //!
 //! The file is JSON, one object per role:
-//! `{"sealing": {"public": ..., "kid": ...}, "root": {...}, "signing": {...}}`,
-//! beside `root_not_after` and `root_certificate`.
+//! `{"sealing": {"public": ..., "kid": ..., "store": ...}, "root": {...}, "signing": {...}}`,
+//! beside `root_not_after` and `root_certificate`. `store` names the store
+//! that holds the key, so `min auth status` can report a software key
+//! (BEP-090).
 //! `public` is the uncompressed SEC1 point in unpadded base64url. A role is
 //! read only when it is used, and [`Identity::key`] refuses a role whose
 //! entry is missing, does not parse as a P-256 key, or carries a `kid` that is
@@ -37,14 +39,27 @@ pub struct PublishedKey {
     pub public: String,
     /// The key's fingerprint, as [`ProxyPublicKey::kid`] computes it.
     pub kid: String,
+    /// The store that holds the key: `keychain`, `tpm` or `secret-service`,
+    /// as [`HeldKey::store`] names it. `None` in a file that an older `bep`
+    /// published, and for a key that no host store holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
 }
 
 impl PublishedKey {
-    fn of(key: &ProxyPublicKey) -> Self {
+    fn of(key: &impl HeldKey) -> Self {
+        let public = key.public();
         Self {
-            public: URL_SAFE_NO_PAD.encode(key.to_sec1_bytes()),
-            kid: key.kid(),
+            public: URL_SAFE_NO_PAD.encode(public.to_sec1_bytes()),
+            kid: public.kid(),
+            store: key.store().map(str::to_owned),
         }
+    }
+
+    /// Whether a software key in Secret Service is the key (BEP-090).
+    #[must_use]
+    pub fn in_secret_service(&self) -> bool {
+        self.store.as_deref() == Some("secret-service")
     }
 }
 
@@ -169,9 +184,9 @@ impl Identity {
     /// The identity of the proxy's loaded keys.
     pub fn of<K: HeldKey>(keys: &ProxyKeys<K>) -> Self {
         Self {
-            sealing: Some(PublishedKey::of(&keys.sealing.public())),
-            root: Some(PublishedKey::of(&keys.root.public())),
-            signing: Some(PublishedKey::of(&keys.signing.public())),
+            sealing: Some(PublishedKey::of(&keys.sealing)),
+            root: Some(PublishedKey::of(&keys.root)),
+            signing: Some(PublishedKey::of(&keys.signing)),
             root_not_after: None,
             root_certificate: None,
         }
@@ -307,10 +322,10 @@ impl Identity {
     ) -> Self {
         let entry = |other: Role| {
             if other == role {
-                return Some(PublishedKey::of(&key.public()));
+                return Some(PublishedKey::of(key));
             }
             let entry = match store.find(other) {
-                Ok(Some(held)) => Some(PublishedKey::of(&held.public())),
+                Ok(Some(held)) => Some(PublishedKey::of(&held)),
                 _ => previous.and_then(|previous| previous.entry(other).cloned()),
             };
             if entry.is_none() {
@@ -810,6 +825,7 @@ mod tests {
             sealing: Some(PublishedKey {
                 public: URL_SAFE_NO_PAD.encode([4u8; 65]),
                 kid: good.sealing.clone().unwrap().kid,
+                store: None,
             }),
             ..good.clone()
         };
@@ -867,6 +883,76 @@ mod tests {
             .seal(&context(&republished), &members())
             .unwrap();
         assert!(restarted.sealing.open(&fresh, &binding()).is_ok());
+    }
+
+    /// A memory key that answers a host store's name.
+    struct Stored(crate::keys::memory::MemoryKey, &'static str);
+
+    impl HeldKey for Stored {
+        fn role(&self) -> Role {
+            self.0.role()
+        }
+        fn public(&self) -> ProxyPublicKey {
+            self.0.public()
+        }
+        fn exportable(&self) -> bool {
+            self.0.exportable()
+        }
+        fn store(&self) -> Option<&'static str> {
+            Some(self.1)
+        }
+        fn agree(
+            &self,
+            peer: &ProxyPublicKey,
+        ) -> Result<Zeroizing<Vec<u8>>, crate::keys::KeyError> {
+            self.0.agree(peer)
+        }
+        fn probe(&self) -> Result<(), crate::keys::KeyError> {
+            self.0.probe()
+        }
+    }
+
+    // BEP-090
+    #[test]
+    fn the_published_identity_names_each_key_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let store = MemoryStore::default();
+        let held = load(&store, &[]).unwrap();
+        let keys = ProxyKeys {
+            sealing: Stored(held.sealing, "tpm"),
+            root: Stored(held.root, "secret-service"),
+            signing: Stored(held.signing, "keychain"),
+        };
+        Identity::of(&keys).publish(&path).unwrap();
+        let published = Identity::read(&path).unwrap();
+        let stores: Vec<_> = Role::ALL
+            .map(|role| published.entry(role).unwrap().store.as_deref())
+            .to_vec();
+        assert_eq!(
+            stores,
+            [Some("tpm"), Some("secret-service"), Some("keychain")]
+        );
+        assert!(!published.sealing.as_ref().unwrap().in_secret_service());
+        assert!(published.root.as_ref().unwrap().in_secret_service());
+        let sealing = keys.sealing.public();
+        drop(keys);
+
+        // A replacement names the new key's store too.
+        let new = replace(&store, Role::Root).unwrap();
+        let after = Identity::after_replacement(&store, Role::Root, &new, Some(&published));
+        assert_eq!(after.root.unwrap().store, None);
+
+        // A file an older `bep` wrote has no store, and still reads.
+        let older = format!(
+            r#"{{"sealing": {{"public": "{}", "kid": "{}"}}}}"#,
+            published.sealing.as_ref().unwrap().public,
+            published.sealing.as_ref().unwrap().kid,
+        );
+        std::fs::write(&path, older).unwrap();
+        let old = Identity::read(&path).unwrap();
+        assert_eq!(old.sealing.as_ref().unwrap().store, None);
+        assert_eq!(old.key(Role::Sealing).unwrap(), sealing);
     }
 
     // BEP-005, OQ3: the identity carries the end of the root's validity, the
