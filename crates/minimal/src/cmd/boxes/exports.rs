@@ -54,6 +54,123 @@ pub(crate) trait ExportSource {
     async fn identity(&mut self, _path: &str) -> Option<String> {
         None
     }
+
+    /// The path in the box that `path` leads to after every link in it.
+    async fn resolve(&mut self, path: &str) -> Result<String, ExportReadError> {
+        Ok(path.to_owned())
+    }
+}
+
+/// Whether the resolved path `path` in the box is in the box's copy of the
+/// project (BOX-196).
+fn in_box_project(path: &str) -> bool {
+    path == BOX_PROJECT_DIR
+        || path
+            .strip_prefix(BOX_PROJECT_DIR)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `path` with each `..` taken out against the part before it, and each
+/// `.` taken out, with no look at the disk.
+fn lexical(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The path on this machine that a write to `path` reaches: the deepest
+/// part of `path` that exists, with every link in it resolved, and the
+/// rest of `path` after it. A link to nothing is followed to its target.
+/// `None` when a link cannot be resolved, as for a loop.
+fn resolve_dest(path: &std::path::Path, links: u8) -> Option<std::path::PathBuf> {
+    for part in path.ancestors() {
+        if part.as_os_str().is_empty() {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(part) else {
+            continue;
+        };
+        let rest = path.strip_prefix(part).ok()?;
+        return match std::fs::canonicalize(part) {
+            Ok(real) => Some(lexical(&real.join(rest))),
+            Err(_) if meta.file_type().is_symlink() && links > 0 => {
+                let target = std::fs::read_link(part).ok()?;
+                let target = match part.parent() {
+                    Some(parent) if target.is_relative() => parent.join(target),
+                    _ => target,
+                };
+                resolve_dest(&target.join(rest), links - 1)
+            }
+            Err(_) => None,
+        };
+    }
+    None
+}
+
+/// Checks that each of `dests` reaches a path inside `project_root` after
+/// links (BOX-192). `Some` is why the export is not copied.
+fn check_dests(project_root: &std::path::Path, dests: &[std::path::PathBuf]) -> Option<NotCopied> {
+    let root = match std::fs::canonicalize(project_root) {
+        Ok(root) => root,
+        Err(e) => {
+            return Some(NotCopied::Failed(format!(
+                "could not read the project folder {}: {e}",
+                project_root.display()
+            )));
+        }
+    };
+    for dest in dests {
+        match resolve_dest(dest, 40) {
+            Some(real) if real.starts_with(&root) && real != root => {}
+            Some(real) => {
+                tracing::info!(
+                    dest = %dest.display(),
+                    resolved = %real.display(),
+                    "a file export destination leads outside the project folder"
+                );
+                return Some(NotCopied::LeadsOutsideProject);
+            }
+            None => {
+                return Some(NotCopied::Failed(format!(
+                    "could not resolve the links in {}",
+                    dest.display()
+                )));
+            }
+        }
+    }
+    None
+}
+
+/// Checks that each of `srcs` in the box leads to a path in the box's copy
+/// of the project after links (BOX-196). `Some` is why the export is not
+/// copied.
+async fn check_sources<S: ExportSource>(source: &mut S, srcs: &[String]) -> Option<NotCopied> {
+    for src in srcs {
+        match source.resolve(src).await {
+            Ok(real) if in_box_project(&real) => {}
+            Ok(real) => {
+                tracing::info!(
+                    src = %src,
+                    resolved = %real,
+                    "a file export source leads outside /workbench"
+                );
+                return Some(NotCopied::LeadsOutsideBox);
+            }
+            Err(ExportReadError::NotFound) => {
+                return Some(NotCopied::Failed(format!("{src} is no longer in the box")));
+            }
+            Err(ExportReadError::Failed(reason)) => return Some(NotCopied::Failed(reason)),
+        }
+    }
+    None
 }
 
 /// One file an export wrote under the project root.
@@ -287,6 +404,12 @@ where
 enum NotCopied {
     /// The path points outside the project folder.
     Outside,
+    /// A destination leads through a link outside the project folder
+    /// (BOX-192).
+    LeadsOutsideProject,
+    /// A source in the box leads through a link outside `/workbench`
+    /// (BOX-196).
+    LeadsOutsideBox,
     /// The box has nothing at the path.
     NotFound,
     /// A read or a write failed, with the reason.
@@ -299,6 +422,12 @@ impl NotCopied {
             NotCopied::Outside => format!(
                 "min did not copy `{path}` from box {label}, because the path points \
                  outside the folder that holds minimal.toml."
+            ),
+            NotCopied::LeadsOutsideProject => {
+                format!("Export {path} was not copied: it leads outside the project folder.")
+            }
+            NotCopied::LeadsOutsideBox => format!(
+                "Export {path} was not copied: it leads outside the box's copy of the project."
             ),
             NotCopied::NotFound => format!(
                 "min did not copy `{path}` from box {label}, because it was not found in the box."
@@ -332,6 +461,12 @@ async fn copy_one<S: ExportSource>(
     };
     match kind {
         ExportKind::File => {
+            if let Some(refused) = check_sources(source, std::slice::from_ref(&src)).await {
+                return Some(refused);
+            }
+            if let Some(refused) = check_dests(project_root, std::slice::from_ref(&dest)) {
+                return Some(refused);
+            }
             if let Some(parent) = dest.parent()
                 && let Err(e) = std::fs::create_dir_all(parent)
             {
@@ -362,6 +497,22 @@ async fn copy_one<S: ExportSource>(
                 }
                 Err(ExportReadError::Failed(reason)) => return Some(NotCopied::Failed(reason)),
             };
+            // Every source and every destination is checked before the
+            // first write, so a refused export writes nothing.
+            let srcs: Vec<String> = std::iter::once(src.clone())
+                .chain(tree.dirs.iter().map(|dir| format!("{src}/{dir}")))
+                .chain(tree.files.iter().map(|file| format!("{src}/{file}")))
+                .collect();
+            if let Some(refused) = check_sources(source, &srcs).await {
+                return Some(refused);
+            }
+            let dests: Vec<std::path::PathBuf> = std::iter::once(dest.clone())
+                .chain(tree.dirs.iter().map(|dir| dest.join(dir)))
+                .chain(tree.files.iter().map(|file| dest.join(file)))
+                .collect();
+            if let Some(refused) = check_dests(project_root, &dests) {
+                return Some(refused);
+            }
             let mut failed = None;
             if let Err(e) = std::fs::create_dir_all(&dest) {
                 return Some(NotCopied::Failed(format!(
@@ -454,8 +605,6 @@ impl ExportSource for BoxFiles {
             } else if file_type.is_file() {
                 ExportKind::File
             } else if file_type.is_symlink() {
-                // The file service refuses a link that leaves the box's
-                // folders, so a link it follows stays inside them.
                 // A link to nothing has no content to copy. It is left
                 // out, so the other files of the folder still come back.
                 match self.kind(&format!("{path}/{name}")).await {
@@ -514,17 +663,26 @@ impl ExportSource for BoxFiles {
     async fn identity(&mut self, path: &str) -> Option<String> {
         self.sftp.canonicalize(path).await.ok()
     }
+
+    async fn resolve(&mut self, path: &str) -> Result<String, ExportReadError> {
+        self.sftp
+            .canonicalize(path)
+            .await
+            .map_err(|e| read_error(path, &e))
+    }
 }
 
 /// Copies the declared exports of the ended box `id` on `host` into
-/// `project_root`, the project the box came from (BOX-185). `label` names
-/// the box on `err`. A box whose spec declares no export copies nothing,
+/// `project_root`, the project the box came from (BOX-185). `here` is the
+/// project root of the command that waited, and nothing is copied unless
+/// it is `project_root` (BOX-199). `label` names the box on `err`. A box whose spec declares no export copies nothing,
 /// and reads nothing more from its host.
 pub(crate) async fn copy_box_exports_on_host<E: std::io::Write>(
     host: &crate::cmd::list::LocalHost,
     id: boxes::SessionId,
     label: &str,
     project_root: Option<&std::path::Path>,
+    here: Option<&std::path::Path>,
     err: &mut E,
 ) -> Vec<ExportOutcome> {
     let mut client = match box_host_client(host).await {
@@ -534,7 +692,7 @@ pub(crate) async fn copy_box_exports_on_host<E: std::io::Write>(
             return Vec::new();
         }
     };
-    copy_box_exports(&mut client, id, label, project_root, err).await
+    copy_box_exports(&mut client, id, label, project_root, here, err).await
 }
 
 /// Whether the box `id` on `host` declares an export. A host that does not
@@ -560,12 +718,22 @@ pub(crate) async fn box_declares_exports_on_host(
     }
 }
 
+/// The stderr line for a box whose exports a command in another project
+/// does not copy (BOX-199).
+pub(crate) fn exports_elsewhere_line(label: &str, project_root: &std::path::Path) -> String {
+    format!(
+        "Box {label} was created in {}, so its exports were not copied here.",
+        project_root.display()
+    )
+}
+
 /// [`copy_box_exports_on_host`] over a connected `client`.
 pub(crate) async fn copy_box_exports<E: std::io::Write>(
     client: &mut client::Client,
     id: boxes::SessionId,
     label: &str,
     project_root: Option<&std::path::Path>,
+    here: Option<&std::path::Path>,
     err: &mut E,
 ) -> Vec<ExportOutcome> {
     use minimald_rpc::{Errorable, GetBoxSpec, GetBoxSpecRequest};
@@ -590,13 +758,7 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
     if paths.is_empty() {
         return Vec::new();
     }
-    let not_copied = |err: &mut E, reason: &str| {
-        for path in &paths {
-            let _ = writeln!(
-                err,
-                "min did not copy `{path}` from box {label}, because {reason}."
-            );
-        }
+    let none_copied = || {
         paths
             .iter()
             .map(|path| ExportOutcome {
@@ -606,10 +768,30 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
             })
             .collect::<Vec<_>>()
     };
+    let not_copied = |err: &mut E, reason: &str| {
+        for path in &paths {
+            let _ = writeln!(
+                err,
+                "min did not copy `{path}` from box {label}, because {reason}."
+            );
+        }
+        none_copied()
+    };
     let Some(project_root) = project_root else {
         tracing::warn!(box_id = %id, "file exports: the box's record names no project folder");
         return not_copied(err, "the box's record names no project folder");
     };
+    // BOX-199: a box's exports are copied only in the project that made it.
+    if here != Some(project_root) {
+        tracing::info!(
+            box_id = %id,
+            record_root = %project_root.display(),
+            here = ?here,
+            "file exports: the waiting command is in another project"
+        );
+        let _ = writeln!(err, "{}", exports_elsewhere_line(label, project_root));
+        return none_copied();
+    }
     let channel = match client.open_box_subsystem(id, "sftp").await {
         Ok(channel) => channel,
         Err(e) => {

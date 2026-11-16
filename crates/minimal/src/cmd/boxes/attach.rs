@@ -990,6 +990,15 @@ async fn attach_command(
             Some(box_list_scope(cwd.as_ref())?)
         }
     };
+    // The command's own project root: exports are copied only when it is
+    // the box's (BOX-199). With none, nothing is copied.
+    let here = match &scope {
+        Some(scope) => Some(scope.clone()),
+        None => crate::attach::cwd_host_path(global)
+            .and_then(|cwd| box_list_scope(cwd.as_ref()))
+            .inspect_err(|e| tracing::info!("attach: no project root here: {e:#}"))
+            .ok(),
+    };
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
     let hosts = match target {
@@ -1002,6 +1011,7 @@ async fn attach_command(
         hosts,
         target,
         scope.as_ref(),
+        here.as_ref(),
         stdin_is_tty,
         async |target: &BoxAttachTarget| {
             let host_asks = host_asks_box(global, target.name.as_deref());
@@ -1463,6 +1473,7 @@ pub(crate) async fn attach_on_hosts<A>(
     hosts: Vec<crate::cmd::list::LocalHost>,
     address: Option<&str>,
     scope: Option<&paths::HostAbsPath>,
+    here: Option<&paths::HostAbsPath>,
     stdin_is_tty: bool,
     attach: A,
 ) -> Result<AttachEnding, anyhow::Error>
@@ -1515,8 +1526,9 @@ where
         copy_box_exports_on_host(
             &target.host,
             target.box_id,
-            &target.label,
+            target.name.as_deref().unwrap_or(&target.label),
             root.map(|root| std::path::Path::new(root.as_str())),
+            here.map(|here| std::path::Path::new(here.as_str())),
             &mut std::io::stderr(),
         )
         .await;

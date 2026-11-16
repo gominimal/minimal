@@ -13607,6 +13607,7 @@ async fn box_wait_returns_retained_exit_code_or_128_plus_signal() {
             vec![alpha.host.clone()],
             "web",
             None,
+            None,
             std::time::Duration::from_millis(20),
         ),
     )
@@ -13638,6 +13639,7 @@ async fn box_wait_timeout_flag_returns_124_box_runs_on() {
     let err = box_wait_on_hosts(
         vec![alpha.host.clone()],
         "web",
+        None,
         Some(std::time::Duration::from_millis(300)),
         std::time::Duration::from_millis(20),
     )
@@ -13671,6 +13673,7 @@ async fn box_wait_timeout_flag_returns_124_box_runs_on() {
             box_wait_on_hosts(
                 vec![host],
                 "web",
+                None,
                 None,
                 std::time::Duration::from_millis(20),
             )
@@ -14700,6 +14703,7 @@ where
         hosts,
         address,
         scope,
+        None,
         stdin_is_tty,
         attach,
     )
@@ -14733,6 +14737,7 @@ async fn attached_by(
         hosts.to_vec(),
         address,
         scope,
+        None,
         true,
         async |target: &BoxAttachTarget| {
             attached = Some(target.clone());
@@ -14750,7 +14755,7 @@ async fn refused_by(
     address: Option<&str>,
     scope: Option<&paths::HostAbsPath>,
 ) -> (String, u8) {
-    let err = attach_on_hosts(verb, hosts.to_vec(), address, scope, true, no_attach)
+    let err = attach_on_hosts(verb, hosts.to_vec(), address, scope, None, true, no_attach)
         .await
         .expect_err("the attach is refused");
     attach_refusal(&err)
@@ -14979,6 +14984,7 @@ async fn session_attach_is_box_attach_filtered_to_sessions() {
         AttachVerb::SessionAttach,
         hosts.to_vec(),
         Some("build"),
+        None,
         None,
         true,
         no_attach,
@@ -17158,6 +17164,7 @@ async fn task_run_logs_wait_list_end_to_end() {
                 local_hosts(&global).unwrap(),
                 "check",
                 None,
+                None,
                 std::time::Duration::from_millis(20),
             )
             .in_current_span();
@@ -17207,6 +17214,7 @@ async fn task_run_logs_wait_list_end_to_end() {
             let rewaited = box_wait_on_hosts(
                 local_hosts(&global).unwrap(),
                 "check",
+                None,
                 Some(std::time::Duration::from_secs(10)),
                 std::time::Duration::from_millis(20),
             )
@@ -20351,6 +20359,7 @@ async fn box_messages_name_the_box_and_the_next_step() {
     let err = box_wait_on_hosts(
         vec![alpha.host.clone()],
         &id.to_string(),
+        None,
         Some(std::time::Duration::from_millis(200)),
         std::time::Duration::from_millis(20),
     )
@@ -20682,6 +20691,8 @@ struct ExportBox {
     watch: Option<(std::path::PathBuf, Option<Vec<u8>>)>,
     /// Each file read, in order.
     reads: Vec<String>,
+    /// Each link in the box, by its path, with the path it leads to.
+    links: std::collections::BTreeMap<String, String>,
 }
 
 impl ExportBox {
@@ -20692,6 +20703,12 @@ impl ExportBox {
 
     fn file(mut self, path: &str, bytes: &[u8]) -> Self {
         self.files.insert(path.to_owned(), bytes.to_vec());
+        self
+    }
+
+    /// The path `path` in the box is a link to `target`.
+    fn link(mut self, path: &str, target: &str) -> Self {
+        self.links.insert(path.to_owned(), target.to_owned());
         self
     }
 }
@@ -20755,6 +20772,18 @@ impl cmd::ExportSource for ExportBox {
         out.write_all(bytes).unwrap();
         Ok(bytes.len() as u64)
     }
+
+    async fn resolve(&mut self, path: &str) -> Result<String, cmd::ExportReadError> {
+        for (link, target) in &self.links {
+            if path == link {
+                return Ok(target.clone());
+            }
+            if let Some(rest) = path.strip_prefix(&format!("{link}/")) {
+                return Ok(format!("{target}/{rest}"));
+            }
+        }
+        Ok(path.to_owned())
+    }
 }
 
 /// The names in `dir` that start with `.`, as a temporary file of an
@@ -20810,6 +20839,7 @@ async fn waiting_command_copies_file_exports_after_box_ends() {
     let state = tempfile::tempdir().expect("a temp daemon state dir");
     let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
     let project = tempfile::tempdir().expect("a temp project dir");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
     let mut daemon = server.connect().await;
 
     // `min box wait` on a task box that a stop ended.
@@ -20840,6 +20870,7 @@ async fn waiting_command_copies_file_exports_after_box_ends() {
     let code = cmd::box_wait_on_hosts(
         local_hosts(&global).unwrap(),
         "build",
+        Some(&here),
         None,
         std::time::Duration::from_millis(20),
     )
@@ -20884,6 +20915,7 @@ async fn waiting_command_copies_file_exports_after_box_ends() {
         hosts,
         Some("dev"),
         None,
+        Some(&here),
         true,
         async |_target: &BoxAttachTarget| {
             // The box ends while the terminal is attached to it.
@@ -20910,6 +20942,7 @@ async fn detached_start_or_stop_copies_no_exports() {
     let state = tempfile::tempdir().expect("a temp daemon state dir");
     let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
     let project = tempfile::tempdir().expect("a temp project dir");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
     let mut daemon = server.connect().await;
     let dev = create_spec_box(
         &mut daemon,
@@ -20927,6 +20960,7 @@ async fn detached_start_or_stop_copies_no_exports() {
         local_hosts(&global).unwrap(),
         Some("dev"),
         None,
+        Some(&here),
         true,
         async |_target: &BoxAttachTarget| Ok(0),
     )
@@ -21158,5 +21192,180 @@ fn expander_skew_reports_and_continues() {
     assert!(
         reporter.contains("async fn report_expander_skew(client: &mut client::Client) {"),
         "the reporter returns nothing, so it cannot stop the create: {reporter}"
+    );
+}
+
+// BOX-192: an export whose destination, or a destination inside a folder
+// export, leads through a link in the project to a path outside it writes
+// nothing at all. Its line names its path, and the next export is copied.
+#[cfg(unix)]
+#[tokio::test]
+async fn export_through_escaping_symlink_writes_nothing() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let outside = tempfile::tempdir().expect("a temp folder outside the project");
+    let root = project.path();
+    std::os::unix::fs::symlink(outside.path(), root.join("out")).unwrap();
+    std::fs::create_dir_all(root.join("site")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("site/css")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("gone.txt"), root.join("dangling.txt")).unwrap();
+
+    let mut source = ExportBox::default()
+        .file("/workbench/out/report.txt", b"report")
+        .dir("/workbench/site")
+        .dir("/workbench/site/css")
+        .file("/workbench/site/index.html", b"page")
+        .file("/workbench/site/css/main.css", b"body{}")
+        .file("/workbench/dangling.txt", b"through a link to nothing")
+        .file("/workbench/inside.txt", b"copied");
+    let mut err = Vec::new();
+    let outcomes = cmd::copy_exports(
+        &mut source,
+        &[
+            "out/report.txt".to_owned(),
+            "site".to_owned(),
+            "dangling.txt".to_owned(),
+            "inside.txt".to_owned(),
+        ],
+        root,
+        "web",
+        &mut err,
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read_dir(outside.path()).unwrap().count(),
+        0,
+        "nothing is written outside the project"
+    );
+    assert!(
+        !root.join("site/index.html").exists(),
+        "a refused folder export writes none of its files"
+    );
+    assert_eq!(source.reads, ["/workbench/inside.txt"]);
+    assert_eq!(std::fs::read(root.join("inside.txt")).unwrap(), b"copied");
+    let copied: Vec<_> = outcomes.iter().map(|o| o.copied).collect();
+    assert_eq!(copied, [false, false, false, true]);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "Export out/report.txt was not copied: it leads outside the project folder.\n\
+         Export site was not copied: it leads outside the project folder.\n\
+         Export dangling.txt was not copied: it leads outside the project folder.\n"
+    );
+}
+
+// BOX-196: an export whose path in the box, or a file inside a folder
+// export, is a link that leads out of /workbench, here into the box's
+// home, writes nothing. Its line names its path, and the next export is
+// copied.
+#[tokio::test]
+async fn export_source_symlink_out_of_workbench_writes_nothing() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    let mut source = ExportBox::default()
+        .file("/workbench/key.txt", b"the box's key")
+        .link("/workbench/key.txt", "/root/.ssh/id_ed25519")
+        .dir("/workbench/site")
+        .file("/workbench/site/index.html", b"page")
+        .file("/workbench/site/token", b"the box's token")
+        .link("/workbench/site/token", "/root/.config/token")
+        .dir("/workbench/docs")
+        .file("/workbench/docs/a.md", b"a")
+        .link("/workbench/docs", "/workbench/real-docs");
+    let mut err = Vec::new();
+    let outcomes = cmd::copy_exports(
+        &mut source,
+        &["key.txt".to_owned(), "site".to_owned(), "docs".to_owned()],
+        root,
+        "web",
+        &mut err,
+    )
+    .await;
+
+    assert!(!root.join("key.txt").exists());
+    assert!(
+        !root.join("site").exists(),
+        "a refused folder export writes none of its files or folders"
+    );
+    assert_eq!(source.reads, ["/workbench/docs/a.md"]);
+    assert_eq!(
+        std::fs::read(root.join("docs/a.md")).unwrap(),
+        b"a",
+        "a link that stays inside /workbench is followed"
+    );
+    let copied: Vec<_> = outcomes.iter().map(|o| o.copied).collect();
+    assert_eq!(copied, [false, false, true]);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "Export key.txt was not copied: it leads outside the box's copy of the project.\n\
+         Export site was not copied: it leads outside the box's copy of the project.\n"
+    );
+}
+
+// BOX-199: a wait from another project copies nothing from the box, and
+// keeps the exit code. A wait from the box's own project then copies. The
+// stderr line names the box and the folder that created it.
+#[tokio::test]
+async fn exports_not_copied_from_another_project() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let other = tempfile::tempdir().expect("a temp folder of another project");
+    let other_root = paths::HostAbsPath::try_new(other.path().to_str().unwrap()).unwrap();
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let build = create_spec_box(
+        &mut daemon,
+        "build",
+        project.path(),
+        Some(export_spec(false, &["report.txt"])),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        build,
+        &[],
+        &[("/workbench/report.txt", b"done")],
+    )
+    .await;
+    let mut out = Vec::new();
+    cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut out, "build", false)
+        .await
+        .expect("the box stops");
+
+    let elsewhere = cmd::box_wait_on_hosts(
+        local_hosts(&global).unwrap(),
+        "build",
+        Some(&other_root),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees the box end");
+    assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+
+    let code = cmd::box_wait_on_hosts(
+        local_hosts(&global).unwrap(),
+        "build",
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees the box end");
+    assert_eq!(code, elsewhere, "the exit code does not change");
+    assert_eq!(
+        std::fs::read(project.path().join("report.txt")).unwrap(),
+        b"done"
+    );
+
+    assert_eq!(
+        cmd::exports_elsewhere_line("build", project.path()),
+        format!(
+            "Box build was created in {}, so its exports were not copied here.",
+            project.path().display()
+        )
     );
 }

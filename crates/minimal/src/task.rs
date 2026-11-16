@@ -1899,6 +1899,7 @@ pub(crate) async fn run_entry(
                                     id,
                                     &session_name,
                                     Some(std::path::Path::new(abs_path.as_str())),
+                                    Some(std::path::Path::new(abs_path.as_str())),
                                     &mut std::io::stderr(),
                                 )
                                 .await;

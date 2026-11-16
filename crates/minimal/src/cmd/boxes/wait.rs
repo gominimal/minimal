@@ -189,13 +189,15 @@ fn wait_label(after: std::time::Duration) -> String {
 }
 
 /// Waits until the box `target` names on `hosts` ends, copies its declared
-/// file exports into its project, and returns its exit code as
+/// file exports into its project when `here`, the command's own project
+/// root, is the one the box's record names, and returns its exit code as
 /// [`wait_exit`] gives it. With `timeout`, the wait stops when the
 /// box still runs after it, with a [`BoxTimedOut`], and leaves the box
 /// running. The record is read again every `poll`.
 pub(crate) async fn box_wait_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     target: &str,
+    here: Option<&paths::HostAbsPath>,
     timeout: Option<std::time::Duration>,
     poll: std::time::Duration,
 ) -> Result<i32, anyhow::Error> {
@@ -229,13 +231,15 @@ pub(crate) async fn box_wait_on_hosts(
         };
         if let Some(ended) = wait_exit(&shown.record, target) {
             // BOX-185: the wait copies the box's declared exports, on
-            // every end, before it gives back the box's code.
+            // every end, before it gives back the box's code. It copies
+            // only into its own project (BOX-199).
             let root = shown.record.project_root.as_ref();
             copy_box_exports(
                 &mut client,
                 id,
-                target,
+                shown.record.name.as_deref().unwrap_or(target),
                 root.map(|root| std::path::Path::new(root.as_str())),
+                here.map(|here| std::path::Path::new(here.as_str())),
                 &mut std::io::stderr(),
             )
             .await;
@@ -325,7 +329,15 @@ pub async fn cmd_box_wait(global: &GlobalArgs, args: BoxWaitArgs) -> Result<(), 
             let mut err = tokio::io::stderr();
             box_wait_exec_on_hosts(hosts, &args.target, exec, timeout, &mut err).await?
         }
-        None => box_wait_on_hosts(hosts, &args.target, timeout, POLL_INTERVAL).await?,
+        None => {
+            // The command's own project root, found from its folder as a
+            // create finds it (BOX-199). With none, nothing is copied.
+            let here = crate::attach::cwd_host_path(global)
+                .and_then(|cwd| box_list_scope(cwd.as_ref()))
+                .inspect_err(|e| tracing::info!("box wait: no project root here: {e:#}"))
+                .ok();
+            box_wait_on_hosts(hosts, &args.target, here.as_ref(), timeout, POLL_INTERVAL).await?
+        }
     };
     if code == 0 {
         Ok(())
