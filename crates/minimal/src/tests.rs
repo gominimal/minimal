@@ -21944,6 +21944,71 @@ async fn export_report_appends_file_exported_event() {
     assert_eq!(data[2]["files"], serde_json_lenient::json!([]));
 }
 
+// BOX-195, BOX-198: when min cannot open the box's files after the host
+// granted the exports, each granted export is reported as not copied, so
+// the record holds one `file_exported` event for it with no files.
+#[tokio::test]
+async fn unreadable_box_files_report_each_granted_export() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let build = create_spec_box(
+        &mut daemon,
+        "build",
+        project.path(),
+        Some(export_spec(false, &["out/report.txt", "dist"])),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        &mut Vec::new(),
+        "build",
+        false,
+    )
+    .await
+    .expect("the box stops");
+
+    let host = local_hosts(&global).unwrap().remove(0);
+    let mut err = Vec::new();
+    let outcomes = cmd::copy_box_exports_unreadable_on_host(
+        &host,
+        build,
+        "build",
+        Some(project.path()),
+        Some(project.path()),
+        &mut err,
+    )
+    .await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| (outcome.path.as_str(), outcome.copied, outcome.files.len()))
+            .collect::<Vec<_>>(),
+        [("out/report.txt", false, 0), ("dist", false, 0)]
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        "min did not copy `out/report.txt` from box build, because min could not read the box's files.\n\
+         min did not copy `dist` from box build, because min could not read the box's files.\n"
+    );
+
+    let events = file_exported_lines(&global, "build").await;
+    let data: Vec<_> = events.iter().map(|event| event["data"].clone()).collect();
+    assert_eq!(
+        data.len(),
+        2,
+        "one event for each granted export: {events:?}"
+    );
+    for (data, path) in data.iter().zip(["out/report.txt", "dist"]) {
+        assert_eq!(data["path"], path);
+        assert_eq!(data["copied"], false);
+        assert_eq!(data["files"], serde_json_lenient::json!([]));
+    }
+}
+
 // BOX-197: a skipped export leaves the entrypoint's own end on the box's
 // record, so a later `min box wait` returns the same code.
 #[tokio::test]

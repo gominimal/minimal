@@ -896,6 +896,61 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
     here: Option<&std::path::Path>,
     err: &mut E,
 ) -> Vec<ExportOutcome> {
+    copy_box_exports_from(client, id, label, project_root, here, err, open_box_files).await
+}
+
+/// Opens the files of box `id` on its host for a copy. `Err` is logged
+/// here, and the copy names each granted export on stderr.
+async fn open_box_files(client: &mut client::Client, id: boxes::SessionId) -> Result<BoxFiles, ()> {
+    let channel = match client.open_box_subsystem(id, "sftp").await {
+        Ok(channel) => channel,
+        Err(e) => {
+            tracing::warn!(box_id = %id, "file exports: open the box's files: {e:#}");
+            return Err(());
+        }
+    };
+    match russh_sftp::client::SftpSession::new(channel.into_stream()).await {
+        Ok(sftp) => Ok(BoxFiles { sftp }),
+        Err(e) => {
+            tracing::warn!(box_id = %id, "file exports: start the file conversation: {e}");
+            Err(())
+        }
+    }
+}
+
+/// [`copy_box_exports_on_host`], with an open of the box's files that
+/// fails after the grant, as a lost connection to the box's files does.
+#[cfg(test)]
+pub(crate) async fn copy_box_exports_unreadable_on_host<E: std::io::Write>(
+    host: &crate::cmd::list::LocalHost,
+    id: boxes::SessionId,
+    label: &str,
+    project_root: Option<&std::path::Path>,
+    here: Option<&std::path::Path>,
+    err: &mut E,
+) -> Vec<ExportOutcome> {
+    let mut client = box_host_client(host).await.expect("the box's host");
+    let unreadable = async |_: &mut client::Client, _: boxes::SessionId| Err::<BoxFiles, ()>(());
+    copy_box_exports_from(&mut client, id, label, project_root, here, err, unreadable).await
+}
+
+/// [`copy_box_exports`], with `open` to open the box's files after the
+/// claim. When `open` fails, each granted export is reported with no
+/// files, so the record holds an entry for it (BOX-195).
+async fn copy_box_exports_from<E, S, F>(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+    label: &str,
+    project_root: Option<&std::path::Path>,
+    here: Option<&std::path::Path>,
+    err: &mut E,
+    open: F,
+) -> Vec<ExportOutcome>
+where
+    E: std::io::Write,
+    S: ExportSource,
+    F: AsyncFnOnce(&mut client::Client, boxes::SessionId) -> Result<S, ()>,
+{
     use minimald_rpc::{Errorable, GetBoxSpec, GetBoxSpecRequest};
 
     let spec = match client
@@ -965,24 +1020,11 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
     if granted.is_empty() {
         return Vec::new();
     }
-    let unreadable = "min could not read the box's files";
-    let channel = match client.open_box_subsystem(id, "sftp").await {
-        Ok(channel) => channel,
-        Err(e) => {
-            tracing::warn!(box_id = %id, "file exports: open the box's files: {e:#}");
-            let mut reporter = HostReport { client, id, end };
-            return report_not_copied(&mut reporter, &granted, label, unreadable, err).await;
-        }
+    let Ok(mut files) = open(client, id).await else {
+        let unreadable = "min could not read the box's files";
+        let mut reporter = HostReport { client, id, end };
+        return report_not_copied(&mut reporter, &granted, label, unreadable, err).await;
     };
-    let sftp = match russh_sftp::client::SftpSession::new(channel.into_stream()).await {
-        Ok(sftp) => sftp,
-        Err(e) => {
-            tracing::warn!(box_id = %id, "file exports: start the file conversation: {e}");
-            let mut reporter = HostReport { client, id, end };
-            return report_not_copied(&mut reporter, &granted, label, unreadable, err).await;
-        }
-    };
-    let mut files = BoxFiles { sftp };
     let mut reporter = HostReport { client, id, end };
     copy_and_report_exports(
         &mut files,
