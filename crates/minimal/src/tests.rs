@@ -18258,6 +18258,78 @@ async fn box_spec_box_renders_stored_copy() {
     );
 }
 
+// BCLI-022, BOX-179: `min box spec <box>` lists each stored lifecycle
+// hook with its event, its command, its description and its declarer.
+#[tokio::test]
+async fn box_spec_box_lists_hooks() {
+    let toml = r#"
+[sessions.default]
+loadout_mode = "open"
+lifecycle_hooks = [{ description = "Warm the cache", on_activate = { type = "inline", value = "echo project" }, on_destroy = { type = "inline", value = "echo bye\necho done" } }]
+"#;
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    let selected = crate::SelectedLoadouts {
+        loadouts: vec![named_loadout(
+            "rust",
+            "[[lifecycle_hooks]]\non_attach = { type = \"inline\", value = \"echo rust\" }\n",
+        )],
+        ignore: None,
+    };
+    let expanded = crate::session_box_expansion(root, None, true, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+    let start = parsed_start(&["min", "box", "start"]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+    else {
+        panic!("the default entry is a session");
+    };
+    let mut request = planned_session_request(&args, &options, root);
+    crate::put_spec_hooks(&mut request, expanded.spec_hooks().expect("the hooks read"))
+        .expect("the hooks go on the spec");
+
+    let (_state, mut global, server) = show_network_daemon().await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    global.repo_dir = Some(elsewhere.path().to_path_buf());
+    let id = create_box_from(&server, &request).await.to_string();
+
+    let text = box_spec_text(&global, &["min", "box", "spec", &id])
+        .await
+        .expect("the stored spec renders");
+    let header = format!(
+        "# The spec box {id} was created with.\n\
+         # Lifecycle hooks:\n\
+         #   on_activate \"Warm the cache\": echo project (from minimal.toml)\n\
+         #   on_destroy \"Warm the cache\": echo bye ... (from minimal.toml)\n\
+         #   on_attach: echo rust (from loadout rust)\n"
+    );
+    assert!(text.starts_with(&header), "{text}");
+    // The list is comments, so the render stays TOML with the hooks in it.
+    let parsed: toml::Table = toml::from_str(&text).expect("the render is TOML");
+    let hooks = parsed["lifecycle_hooks"]
+        .as_array()
+        .expect("the hooks render");
+    assert_eq!(hooks.len(), 2);
+    assert_eq!(hooks[1]["declared_by"]["name"].as_str(), Some("rust"));
+
+    // A box stored with an empty hook list says it has none.
+    let mut unhooked = request.clone();
+    unhooked.config.name = Some("unhooked".to_owned());
+    crate::put_spec_hooks(&mut unhooked, Vec::new()).expect("the hooks go on the spec");
+    let unhooked_id = create_box_from(&server, &unhooked).await.to_string();
+    let text = box_spec_text(&global, &["min", "box", "spec", &unhooked_id])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        text.starts_with(&format!(
+            "# The spec box {unhooked_id} was created with.\n# Lifecycle hooks: none.\n"
+        )),
+        "{text}"
+    );
+}
+
 // BCLI-022: an argument is an entry of the project that `--repo-dir`
 // names first, and a box address second. It is never a directory.
 #[tokio::test]
