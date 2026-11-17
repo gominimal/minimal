@@ -22015,10 +22015,11 @@ async fn multi_box_wait_copies_in_order_of_ends() {
     }
 }
 
-// BOX-204: a box with a terminal that ended and is resumed before any
-// command claimed that end copies at its next end only, what its files hold
-// then. An attach whose resume did not happen copies nothing of the end the
-// box resumed from.
+// BOX-204: an attach that resumes a box with a terminal copies only an end
+// that comes after the resume, never the end the box resumed from. Here the
+// resume does not happen, as when its launch fails and the host writes back
+// the record it resumed from. The attach copies nothing and claims nothing,
+// so a later wait still copies that end once.
 #[tokio::test]
 async fn resumed_box_copies_at_next_end_only() {
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
@@ -22035,85 +22036,51 @@ async fn resumed_box_copies_at_next_end_only() {
         minimald_rpc::CreatingVerb::Session,
     )
     .await;
-    put_box_files(&mut daemon, dev, &[], &[("/workbench/notes.md", b"first end")]).await;
+    put_box_files(
+        &mut daemon,
+        dev,
+        &[],
+        &[("/workbench/notes.md", b"first end")],
+    )
+    .await;
     cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "dev", false)
         .await
         .expect("the box stops");
 
-    // A resume whose launch did not happen leaves the box at its first
-    // end. The attach copies nothing of that end.
-    let _ = attach_on_hosts(
-        AttachVerb::BoxResume,
-        local_hosts(&global).unwrap(),
-        Some("dev"),
-        None,
-        Some(&here),
-        true,
-        async |_target: &BoxAttachTarget| Ok(1),
-    )
-    .await;
-    assert!(
-        !project.path().join("notes.md").exists(),
-        "the end the box resumes from gets no copy"
-    );
-    assert!(file_exported_lines(&global, "dev").await.is_empty());
+    for code in [0, 1] {
+        let _ = attach_on_hosts(
+            AttachVerb::BoxResume,
+            local_hosts(&global).unwrap(),
+            Some("dev"),
+            None,
+            Some(&here),
+            true,
+            async |_target: &BoxAttachTarget| Ok(code),
+        )
+        .await;
+        assert!(
+            !project.path().join("notes.md").exists(),
+            "code {code}: the end the box resumes from gets no copy"
+        );
+        assert!(file_exported_lines(&global, "dev").await.is_empty());
+    }
 
-    // The box resumes, its file changes, and it ends again.
-    let hosts = local_hosts(&global).unwrap();
-    let stop_hosts = hosts.clone();
-    let shell = std::sync::Mutex::new(None);
-    attach_on_hosts(
-        AttachVerb::BoxResume,
-        hosts,
-        Some("dev"),
-        None,
-        Some(&here),
-        true,
-        async |_target: &BoxAttachTarget| {
-            *shell.lock().unwrap() = Some(daemon.open_shell(dev).await);
-            let mut seen = String::new();
-            for _ in 0..200 {
-                let shown = daemon
-                    .call::<minimald_rpc::ShowBox>(&minimald_rpc::ShowBoxRequest { id: dev })
-                    .await;
-                if let minimald_rpc::Errorable::Ok(shown) = shown {
-                    seen = shown.record.state;
-                    if seen == "running" {
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            assert_eq!(seen, "running", "the shell resumes the box");
-            put_box_files(&mut daemon, dev, &[], &[("/workbench/notes.md", b"next end")]).await;
-            cmd::stop_box_on_hosts(stop_hosts, &mut Vec::new(), "dev", false)
-                .await
-                .expect("the box stops");
-            Ok(0)
-        },
-    )
-    .await
-    .expect("the attach ends");
+    // The end is not claimed, so a wait copies it, once.
+    for _ in 0..2 {
+        cmd::box_wait_on_hosts(
+            local_hosts(&global).unwrap(),
+            "dev",
+            Some(&here),
+            None,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("the wait sees the box end");
+    }
     assert_eq!(
         std::fs::read(project.path().join("notes.md")).unwrap(),
-        b"next end",
-        "the copy holds the files of the next end"
+        b"first end"
     );
-    let events = file_exported_lines(&global, "dev").await;
-    assert_eq!(events.len(), 1, "one copy, at the next end: {events:?}");
-
-    // A later wait finds that end claimed, and copies nothing again.
-    std::fs::remove_file(project.path().join("notes.md")).unwrap();
-    cmd::box_wait_on_hosts(
-        local_hosts(&global).unwrap(),
-        "dev",
-        Some(&here),
-        None,
-        std::time::Duration::from_millis(20),
-    )
-    .await
-    .expect("the wait sees the box end");
-    assert!(!project.path().join("notes.md").exists());
     assert_eq!(file_exported_lines(&global, "dev").await.len(), 1);
 }
 

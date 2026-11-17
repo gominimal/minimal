@@ -1583,7 +1583,9 @@ async fn ended_box_end_count(target: &BoxAttachTarget) -> Option<u64> {
         .await
         .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
         .ok()?;
-    box_ends(&mut client, target.box_id).await.map(|ends| ends.count)
+    box_ends(&mut client, target.box_id)
+        .await
+        .map(|ends| ends.count)
 }
 
 /// Whether the box `target`, which ended `before` times when the attach
@@ -1597,7 +1599,9 @@ async fn ended_again(target: &BoxAttachTarget, before: Option<u64>) -> bool {
     };
     let mut after = None;
     if let Ok(mut client) = box_host_client(&target.host).await {
-        after = box_ends(&mut client, target.box_id).await.map(|ends| ends.count);
+        after = box_ends(&mut client, target.box_id)
+            .await
+            .map(|ends| ends.count);
     }
     let again = after.is_some_and(|after| after > before);
     if !again {

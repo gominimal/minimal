@@ -400,9 +400,12 @@ pub(crate) async fn box_wait_all_on_hosts(
             let now = tokio::time::Instant::now();
             if now >= at {
                 tracing::info!(verb = "box wait", box_id = %id, outcome = "wait timeout");
-                return Err(
-                    BoxTimedOut::waited(name.as_deref(), &id.to_string(), &wait_label(after)).into(),
-                );
+                return Err(BoxTimedOut::waited(
+                    name.as_deref(),
+                    &id.to_string(),
+                    &wait_label(after),
+                )
+                .into());
             }
             pause = pause.min(at - now);
         }
