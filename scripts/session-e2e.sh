@@ -19290,9 +19290,9 @@ proof_github_only_allowlist() {
   # The toolchain's hosts, verbatim from boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
   # (crates/boxes/src/lib.rs) — the one list the minimald unit fixture and
   # the minvmd VM harness share; keep this copy in step with it. Docker Hub
-  # serves its image blobs through a 307 redirect that lands on one of its
-  # two CDNs or on its S3 bucket, so a container pull needs all three.
-  GOA_HOSTS="github.com codeload.github.com raw.githubusercontent.com registry.npmjs.org pypi.org files.pythonhosted.org registry-1.docker.io auth.docker.io production.cloudflare.docker.com production.cloudfront.docker.com docker-images-prod.s3.dualstack.us-east-1.amazonaws.com"
+  # serves its image blobs through a 307 redirect that lands on either of
+  # its two CDNs, so a container pull needs both.
+  GOA_HOSTS="github.com codeload.github.com raw.githubusercontent.com registry.npmjs.org pypi.org files.pythonhosted.org registry-1.docker.io auth.docker.io production.cloudflare.docker.com production.cloudfront.docker.com"
 
   # The daemon's log for THIS lane: natively the daily-rotated JSON file
   # (newest last); on a VM lane the in-guest daemon's stdout rides the
