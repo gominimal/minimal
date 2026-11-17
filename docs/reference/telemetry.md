@@ -45,6 +45,24 @@ request is made by a detached `min update-check --background` with a
 2 second budget and no retry, and the command that spawned it does not wait.
 An endpoint that is down, slow, or answers 404 produces nothing.
 
+### How to update
+
+An install made by the installer updates by running the installer again for
+your channel. It replaces the binaries in place and keeps your loadouts and
+settings. It also restarts the Minimal daemon, which ends any active
+sessions: when sessions are running, it lists them and asks on your terminal
+first ([Upgrade](../guide/install.md#upgrade) has the details):
+
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
+```
+
+Use `unstable` or `nightly` in place of `stable` for those channels. An
+install made with `--version` is pinned and gets no notice; run the
+installer with the version you want. An install from a package manager
+updates through that package manager. `min update` does not update `min`
+itself: it re-pins the project's `[upstream]` in `minimal.toml`.
+
 ### What is sent
 
 The request carries six fields, and a `User-Agent: min` header that is the
@@ -107,24 +125,6 @@ where `<state>` is `$XDG_STATE_HOME` when it is set to an absolute path, and
 Uninstalling with the installer's `--uninstall` removes `install.toml`;
 `--purge` also removes the state directory, and with it the install id.
 
-### How to update
-
-An install made by the installer updates by running the installer again for
-your channel. It replaces the binaries in place and keeps your loadouts and
-settings. It also restarts the Minimal daemon, which ends any active
-sessions: when sessions are running, it lists them and asks on your terminal
-first ([Upgrade](../guide/install.md#upgrade) has the details):
-
-```shell
-curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
-```
-
-Use `unstable` or `nightly` in place of `stable` for those channels. An
-install made with `--version` is pinned and gets no notice; run the
-installer with the version you want. An install from a package manager
-updates through that package manager. `min update` does not update `min`
-itself: it re-pins the project's `[upstream]` in `minimal.toml`.
-
 ## Turning the check off
 
 Any one of these turns it off:
@@ -145,8 +145,11 @@ In `config.toml` the table is:
 enabled = false
 ```
 
-On this release line, `/etc/minimal/config.toml` is read for this table
-only. A `config.toml` that exists but does not parse, yours or the
+On this release line nothing but the update check reads
+`/etc/minimal/config.toml`, and only its `[telemetry]` table matters. The
+file is still parsed whole, so a table this release does not know (one
+written for a newer release) makes it unparseable here, which turns the
+check off. A `config.toml` that exists but does not parse, yours or the
 organization's, turns the check off until it is fixed, and so does a config
 directory that cannot be found (no `HOME`, no `XDG_CONFIG_HOME`).
 
