@@ -7825,6 +7825,12 @@ async fn export_claim_granted_once_for_each_end() {
         serde_json_lenient::json!([{"path": "a.txt", "size": 9, "sha256": "ab".repeat(32)}])
     );
     assert_eq!(file_exported_events(&mngr, id).await, [event]);
+    // The event refuses the export from now on, so the daemon keeps no
+    // entry for it in memory.
+    assert!(
+        !super::export_claims().contains_key(&(id, 1, "a.txt".to_string())),
+        "a written report leaves no claim entry"
+    );
 
     // A reported export stays refused for this end, even after its
     // command is gone.
@@ -7856,6 +7862,7 @@ async fn export_claim_granted_once_for_each_end() {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+    assert_eq!(error.to_string(), "the box has not ended");
 }
 
 /// BOX-202: when the connection that holds a claim ends, each export it did

@@ -6117,8 +6117,9 @@ enum ExportClaim {
     /// A command holds the export. It stays held while the weak reference
     /// to the liveness of that command's connection upgrades (BOX-202).
     Held(std::sync::Weak<()>),
-    /// A command reported the export. No other command gets it for this
-    /// end.
+    /// A command is writing the export's `file_exported` event. The entry
+    /// goes when the event is written, because the event then refuses the
+    /// export, or turns back into `Held` when the write fails.
     Reported,
 }
 
@@ -6128,8 +6129,8 @@ type ExportClaimKey = (SessionId, u64, String);
 
 /// Every export claim on this daemon. A claim held by a connection that
 /// ended is released here: the next claim for that export replaces it. A
-/// reported export is also on the record as a `file_exported` event, so a
-/// daemon that restarts still refuses it.
+/// reported export is on the record as a `file_exported` event, so its
+/// entry leaves this map, and a daemon that restarts still refuses it.
 static EXPORT_CLAIMS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<ExportClaimKey, ExportClaim>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -6179,7 +6180,7 @@ impl BoxManagerHandle {
         paths: &[String],
         holder: &std::sync::Weak<()>,
     ) -> Result<minimald_rpc::ClaimExportsResponse, BoxManagerError> {
-        let (record, _reader, events, end) = self.ended_box_events(id).await?;
+        let (record, mut reader, mut events, end) = self.ended_box_events(id).await?;
         let ended = matches!(
             record.status,
             boxes::BoxState::Stopped | boxes::BoxState::Exited
@@ -6191,11 +6192,25 @@ impl BoxManagerHandle {
                 end,
                 "export claim: the box has not ended; nothing is granted"
             );
+            // The client puts this reason after "because". A box with an
+            // end that runs now was resumed. Any other box has no end.
+            let reason = if end > 0 {
+                "the box is running again, so its files can change"
+            } else {
+                "the box has not ended"
+            };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "the box is running again, so its files can change",
+                reason,
             ));
         }
+        let mut granted = Vec::new();
+        let mut refused = Vec::new();
+        // The lock is held from the last read of the events to the grant.
+        // A report drops its entry only after its event is written, so
+        // each export is refused here by its entry or by its event.
+        let mut claims = export_claims();
+        events.extend(reader.read_new()?);
         let reported: std::collections::HashSet<&str> = events
             .iter()
             .filter(|event| {
@@ -6213,28 +6228,24 @@ impl BoxManagerHandle {
                     .and_then(serde_json_lenient::Value::as_str)
             })
             .collect();
-        let mut granted = Vec::new();
-        let mut refused = Vec::new();
-        {
-            let mut claims = export_claims();
-            // A claim whose connection ended holds nothing (BOX-202).
-            claims.retain(|_, claim| match claim {
-                ExportClaim::Held(live) => live.strong_count() > 0,
-                ExportClaim::Reported => true,
-            });
-            for path in paths {
-                if granted.contains(path) || refused.contains(path) {
-                    continue;
-                }
-                let key = (record.id, end, path.clone());
-                if reported.contains(path.as_str()) || claims.contains_key(&key) {
-                    refused.push(path.clone());
-                } else {
-                    claims.insert(key, ExportClaim::Held(holder.clone()));
-                    granted.push(path.clone());
-                }
+        // A claim whose connection ended holds nothing (BOX-202).
+        claims.retain(|_, claim| match claim {
+            ExportClaim::Held(live) => live.strong_count() > 0,
+            ExportClaim::Reported => true,
+        });
+        for path in paths {
+            if granted.contains(path) || refused.contains(path) {
+                continue;
+            }
+            let key = (record.id, end, path.clone());
+            if reported.contains(path.as_str()) || claims.contains_key(&key) {
+                refused.push(path.clone());
+            } else {
+                claims.insert(key, ExportClaim::Held(holder.clone()));
+                granted.push(path.clone());
             }
         }
+        drop(claims);
         tracing::info!(
             session_id = %record.id,
             end,
@@ -6311,7 +6322,11 @@ impl BoxManagerHandle {
         data.insert(export_data::FILES.into(), files.into());
         data.insert(export_data::END.into(), report.end.into());
         match write_box_event(&reader.object, BoxEventType::FileExported, data) {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                // The event now refuses the export, so the entry goes.
+                export_claims().remove(&key);
+                Ok(event)
+            }
             Err(error) => {
                 tracing::warn!(
                     session_id = %record.id,
