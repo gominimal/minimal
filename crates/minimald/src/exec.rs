@@ -496,7 +496,13 @@ pub(crate) async fn handle_exec(
         }
         ExecRequest::ExecAttach(exec_id) => {
             session.channel_success(id)?;
-            spawn(serve_exec_attach(channel, session_handle, session_id, exec_id).instrument(span));
+            // The keys the client negotiated, as a box attach reads them
+            // (BCLI-068). A client that sent none gets the default keys.
+            let keys = boxes::keys::SessionKeys::from_env(&config.env_vars).validated_or_default();
+            spawn(
+                serve_exec_attach(channel, session_handle, session_id, exec_id, keys)
+                    .instrument(span),
+            );
         }
         ExecRequest::ExecOutput(exec_id) => {
             session.channel_success(id)?;

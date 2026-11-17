@@ -72,7 +72,7 @@ pub(crate) fn bare_activate_args() -> ActivateArgs {
         name: None,
         path: None,
         sync: None,
-        network: CliNetworkMode::HostNet,
+        network: None,
         ingress: Vec::new(),
         dynamic_ingress: None,
         dynamic_range: None,
@@ -200,66 +200,6 @@ pub(crate) fn entry_handle(entry: &minimald_rpc::ListSessionsEntry) -> String {
             let id = entry.id.to_string();
             id.split('-').next().unwrap_or(&id).to_string()
         }
-    }
-}
-
-/// Warn when the daemon already tracks a session for `target`.
-///
-/// Activating a path that already has a session mints a second, independent
-/// one; bare `min` from that directory is then ambiguous between them. The
-/// activation still proceeds — this only surfaces the foot-gun the caller
-/// would otherwise hit silently, and points at `attach` as the way to reuse
-/// the existing session. Pure, so the message is unit-testable.
-pub(crate) fn duplicate_session_warning(
-    entries: &[minimald_rpc::ListSessionsEntry],
-    target: &paths::HostAbsPath,
-) -> Option<String> {
-    // When several sessions track the same path, prefer an `Active` one: it is
-    // the only status `attach` accepts, so recommending it (rather than the
-    // first match, which may be `Pending`/`Materializing`) points the user at a
-    // session they can actually reuse. Fall back to the first match when none is
-    // active, so the "still being created; wait" guidance still fires.
-    let existing = entries
-        .iter()
-        .filter(|e| e.project_path.as_ref() == Some(target))
-        .find(|e| e.status == boxes::BoxState::Active)
-        .or_else(|| {
-            entries
-                .iter()
-                .find(|e| e.project_path.as_ref() == Some(target))
-        })?;
-    let handle = entry_handle(existing);
-    let lead = format!(
-        "warning: a session already exists for this path ({handle}); activating \
-         creates a second one, leaving bare `min` here ambiguous between them."
-    );
-    // Only point at `attach` as the step to take now for a session it will
-    // actually accept. Attach refuses anything not yet `Active` (see
-    // `boxes::BoxState`), so for a `Pending`/`Materializing`
-    // duplicate the reuse command would fail immediately — say to wait
-    // first, and show the later attach with a `<session>` placeholder so no
-    // printed command names a session attach would refuse right now. When
-    // we do suggest it, use a key `SessionLookup::parse` can resolve: a name
-    // matches by name and the full id parses as a UUID, but the short
-    // unnamed handle would parse as a nonexistent name and the attach lookup
-    // would miss.
-    match existing.status {
-        boxes::BoxState::Active => {
-            let key = existing
-                .name
-                .clone()
-                .unwrap_or_else(|| existing.id.to_string());
-            Some(format!(
-                "{lead} To reuse it instead: min session attach {key}"
-            ))
-        }
-        boxes::BoxState::Pending | boxes::BoxState::Materializing => Some(format!(
-            "{lead} The existing session is still being created; run `min ls` \
-             until its status is running, then attach to it with `min session \
-             attach <session>` instead of creating a second."
-        )),
-        // An ended session is not one attach accepts, so no reuse command.
-        boxes::BoxState::Stopped | boxes::BoxState::Exited => Some(lead),
     }
 }
 
@@ -762,10 +702,18 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // the same host facts the session start's host line does, so the two
     // verbs print the same pointer. Machine modes print no row, so they pay
     // no probe.
+    // D3472: the `DNS SERVICE` row names Minimal's failing DNS service
+    // from one read of its state for the whole listing, not one per row.
     let host_install = if args.json || args.raw {
         crate::resolver::HostInstall::default()
     } else {
-        crate::cmd::finalize_install::host_install_for_this_host(global)
+        crate::resolver::HostInstall {
+            dns_service: crate::resolver::dns_service_state_on_this_host(
+                vm_answerers.iter().flatten().map(|reply| &reply.answerer),
+            )
+            .await,
+            ..crate::cmd::finalize_install::host_install_for_this_host(global)
+        }
     };
     // T126 (NET-138): each VM host daemon's collided mirror ports, read
     // over that VM's own control socket, all VMs at once so a VM that does
@@ -1143,12 +1091,12 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         // the pre-acquisition state prints no answerer line and forces no
         // blank one, and a proxy cause rides beside whatever the answerer's
         // own state decided — displacing nothing, displaced by nothing.
-        let vm_answerer_line = vm_answerer
-            .as_ref()
-            .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()));
-        // A Proxy verdict beside the cause becomes the cause-naming
-        // surface, and the standalone cause row prints only when the
-        // surface row does not already name it: one proxy verdict per VM.
+        let vm_answerer_line = vm_answerer.as_ref().and_then(|reply| {
+            crate::resolver::vm_host_answerer_line_beside(reply.answerer.clone(), host.dns_service)
+        });
+        // NET-020: the cause prints on the HOSTNAME PROXY row, once. The
+        // surface folds the cause out, so the BOX NAMES row beside it does
+        // not repeat it (#3046).
         let surface =
             surface.map(|surface| crate::resolver::surface_beside_proxy_down(surface, proxy_down));
         let proxy_down_line = crate::resolver::proxy_down_line_beside(surface.as_ref(), proxy_down);
@@ -1173,7 +1121,7 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         {
             // NET-020: the daemon's own cause takes the row that names the
             // listener, on stdout, once. A proxy-down sibling names its own
-            // cause above or on the BOX NAMES row, so it wins.
+            // cause on this row above, so it wins.
             tracing::debug!(
                 surface = "min ls HOSTNAME PROXY row",
                 "printed the hostname-routing cause"
@@ -1197,10 +1145,11 @@ pub(crate) fn format_ls_with_proxy_ports_on(
                 out,
                 "BOX NAMES:       {}",
                 crate::resolver::with_install_pointer(
-                    crate::resolver::name_surface_line_at(
+                    crate::resolver::name_surface_line_beside(
                         surface.clone(),
                         serving_proxy_port,
                         boxes_at_own_address(resp),
+                        proxy_down,
                     ),
                     crate::resolver::install_unfinished(&surface, host),
                 ),
@@ -1682,10 +1631,12 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
                     width = VM_COLUMN_WIDTH,
                 )?;
                 facts += 1;
-            } else if let Some(line) = answerer_at(index)
-                .as_ref()
-                .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()))
-            {
+            } else if let Some(line) = answerer_at(index).as_ref().and_then(|reply| {
+                crate::resolver::vm_host_answerer_line_beside(
+                    reply.answerer.clone(),
+                    host.dns_service,
+                )
+            }) {
                 writeln!(
                     out,
                     "DNS SERVICE:     {vm:<width$} {line}",
@@ -1699,9 +1650,9 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
             // VM's answerer line — the same words the single-VM listing
             // prints — because each VM's proxy publishes on a host port of
             // its own and fails on its own.
-            // A Proxy verdict beside the cause becomes the cause-naming
-            // surface, and the standalone cause row prints only when the
-            // surface row does not already name it: one proxy verdict per VM.
+            // NET-020: the cause prints on this VM's HOSTNAME PROXY row,
+            // once. The surface folds the cause out, so the BOX NAMES row
+            // beside it does not repeat it (#3046).
             let surface = surface_at(index)
                 .map(|surface| crate::resolver::surface_beside_proxy_down(surface, proxy_down));
             if let Some(line) =
@@ -1745,10 +1696,11 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
                     out,
                     "BOX NAMES:       {vm:<width$} {}",
                     crate::resolver::with_install_pointer(
-                        crate::resolver::name_surface_line_at(
+                        crate::resolver::name_surface_line_beside(
                             surface.clone(),
                             serving_proxy_port,
                             boxes_at_own_address(&listing.resp),
+                            proxy_down,
                         ),
                         crate::resolver::install_unfinished(&surface, host),
                     ),

@@ -1,0 +1,10 @@
+# A pinned file that declares only `[defaults.session]`, for the golden
+# vectors of BOX-145. It has no entry, so its project has the implicit
+# `default` session entry (BOX-165).
+
+[defaults.session]
+timeout = "4h"
+packages = ["git", "zsh"]
+
+[defaults.session.network]
+mode = "own_ip"

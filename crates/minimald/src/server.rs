@@ -1163,7 +1163,11 @@ impl Listener for tokio_vsock::VsockListener {
 /// [`Shutdown`](minimald_rpc::Shutdown) RPC before aborting the stragglers. The
 /// shutdown-initiating client's own connection stays open until it disconnects,
 /// so an unbounded wait could hang the process; this bounds it.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+///
+/// It also bounds how long a departing daemon holds its instance lock after it
+/// stopped listening, which is why it is public: a daemon that starts in that
+/// window waits this long (and a margin) for the lock instead of refusing.
+pub const SHUTDOWN_GRACE: std::time::Duration = minimald_rpc::SHUTDOWN_DRAIN_GRACE;
 
 /// How long a freshly accepted connection may spend exchanging SSH id lines
 /// before it is dropped. The id-line exchange is the only pre-auth step that
@@ -1426,6 +1430,16 @@ impl Server {
         // goes first — the token has already stopped it between passes; this
         // covers the case where it was mid-pass.
         maintenance.abort();
+
+        // Close the listener before the drain, not when `serve` returns. The
+        // loop above no longer accepts, but a listener that is still bound
+        // completes new connections into its backlog, and the kernel resets
+        // each one when the listener closes, up to `SHUTDOWN_GRACE` later. A
+        // client that connects in that window reads a live daemon, starts
+        // none, and fails its handshake with "connection reset by peer".
+        // Closed here, the socket refuses at once, which a client reads as
+        // "not running", so it starts a fresh daemon.
+        drop(listener);
 
         // Shutdown requested: stop accepting (done — loop exited) and drain
         // in-flight connections. The initiating client's own connection stays

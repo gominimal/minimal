@@ -30,7 +30,7 @@ use boxes::{
     SessionId,
     core::compose::ComposeOptions,
     daemon::composer::{ComposeOutcome, SessionComposer},
-    wire::request::WireContribution,
+    wire::request::{WireBoxEntry, WireContribution},
 };
 use graph::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
 use paths::DaemonAbsPath;
@@ -505,6 +505,16 @@ pub(crate) fn build_composables(
     Ok((project_composable, package_composables))
 }
 
+/// What [`run_compose`] learned about the compose-time graph for the
+/// finalize-time package check.
+#[derive(Debug)]
+pub(crate) struct ComposedGraph {
+    /// The package names the graph declared.
+    pub(crate) names: std::collections::HashSet<String>,
+    /// The project's `[upstream]` pin, if it has one.
+    pub(crate) pin: Option<crate::env::UpstreamPin>,
+}
+
 /// The full compose chain for a create flow: resolve the project,
 /// build its composables, and run the composer. Synchronous and
 /// potentially expensive (nickel evaluation, graph resolution) —
@@ -522,18 +532,22 @@ pub(crate) fn build_composables(
 /// among the most expensive steps of this chain, and the finalize-time
 /// package check asks the same question of the same workspace:
 /// handing the names back lets its caller answer from them instead of
-/// evaluating the graph a second time.
+/// evaluating the graph a second time. The project's `[upstream]` pin
+/// rides along, so that check can name the commit it judged against.
 pub(crate) fn run_compose(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
     declared_path: &paths::HostAbsPath,
     contribution: WireContribution,
     hooks_enabled: bool,
-) -> Result<(ComposeOutcome, Option<std::collections::HashSet<String>>), std::io::Error> {
+) -> Result<(ComposeOutcome, Option<ComposedGraph>), std::io::Error> {
     let resolution = resolve_project_ctx_and_graph(daemon_ctx, project_path)?;
     let graph_names = match &resolution {
         ProjectResolution::NoMFile => None,
-        ProjectResolution::Full(_, graph) => Some(graph.names().map(str::to_owned).collect()),
+        ProjectResolution::Full(ctx, graph) => Some(ComposedGraph {
+            names: graph.names().map(str::to_owned).collect(),
+            pin: crate::env::UpstreamPin::of(ctx.minimal_file()),
+        }),
     };
     let (project_composable, package_composables) = build_composables(
         project_path,
@@ -542,8 +556,132 @@ pub(crate) fn run_compose(
         &contribution,
         hooks_enabled,
     )?;
+    let mut contribution = contribution;
+    if hooks_enabled && let Some(spec) = stored_spec_beside(project_path)? {
+        compose_hooks_from_stored_spec(&mut contribution, declared_path, &spec);
+    }
     let outcome = run_composer(contribution, project_composable, package_composables)?;
     Ok((outcome, graph_names))
+}
+
+/// The hooks of the spec stored beside a box's workspace, with the entry
+/// and the Box Type that the spec names (BOX-068, BOX-179).
+pub(crate) struct StoredHooks {
+    /// The spec's `entry`.
+    entry: String,
+    /// The spec's `box.type`.
+    box_type: String,
+    /// The spec's `lifecycle_hooks`, each with its `declared_by`.
+    hooks: Vec<mfile::spec::SpecHook>,
+}
+
+/// The hooks of the spec stored beside the box's workspace, `project_path`:
+/// the [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
+/// directory (BOX-068). `None` when the box stores no spec, or a spec with
+/// no `lifecycle_hooks` key.
+///
+/// It reads only the keys the compose uses: `v`, `entry`, `box.type` and
+/// `lifecycle_hooks`. A stored spec also carries keys that other readers of
+/// the daemon read one at a time, such as `io.exec_enabled`,
+/// `[[file_exports]]` and `network.vpn_network_names`. A whole-spec parse
+/// refuses those keys, so it is not used here.
+///
+/// # Errors
+///
+/// A stored spec that exists but cannot be read fails the compose, so the
+/// box never runs hooks from a source other than its stored spec. A stored
+/// spec that is not JSON fails the compose with `InvalidInput`. So does a
+/// hook list in a spec that is not a v0 Box Spec, that names no `entry` or
+/// `box.type`, or that has a hook with no valid `declared_by`.
+fn stored_spec_beside(project_path: &DaemonAbsPath) -> Result<Option<StoredHooks>, std::io::Error> {
+    let Some(dir) = project_path.as_utf8_path().parent() else {
+        return Ok(None);
+    };
+    let path = dir.join(boxes::store::SPEC_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            tracing::error!(spec_path = %path, error = %e, "could not read the stored box spec");
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("reading the stored box spec at {path}: {e}"),
+            ));
+        }
+    };
+    stored_hooks(&bytes).inspect_err(|e| {
+        tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
+    })
+}
+
+/// The hooks of the stored spec `bytes`, as [`stored_spec_beside`] reads
+/// them.
+fn stored_hooks(bytes: &[u8]) -> Result<Option<StoredHooks>, std::io::Error> {
+    let refused = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
+    let spec: serde_json_lenient::Value = serde_json_lenient::from_slice(bytes)
+        .map_err(|e| refused(format!("the stored box spec is not JSON: {e}")))?;
+    let Some(hooks) = spec.get("lifecycle_hooks") else {
+        return Ok(None);
+    };
+    let version = spec.get("v").and_then(serde_json_lenient::Value::as_u64);
+    if version != Some(u64::from(mfile::spec::BOX_SPEC_VERSION)) {
+        return Err(refused(format!(
+            "the stored box spec has lifecycle_hooks, and its version is not {}",
+            mfile::spec::BOX_SPEC_VERSION
+        )));
+    }
+    let text = |value: Option<&serde_json_lenient::Value>, key: &str| {
+        value
+            .and_then(serde_json_lenient::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                refused(format!(
+                    "the stored box spec has lifecycle_hooks and no {key}"
+                ))
+            })
+    };
+    let entry = text(spec.get("entry"), "entry")?;
+    let box_type = text(spec.get("box").and_then(|b| b.get("type")), "box.type")?;
+    let hooks: Vec<mfile::spec::SpecHook> = serde_json_lenient::from_value(hooks.clone())
+        .map_err(|e| refused(format!("the stored box spec's lifecycle_hooks: {e}")))?;
+    Ok(Some(StoredHooks {
+        entry,
+        box_type,
+        hooks,
+    }))
+}
+
+/// Composes the project's lifecycle hooks from the stored spec's hooks,
+/// `stored`, not from the project's `minimal.toml` (BOX-068, BOX-179). The
+/// hooks whose `declared_by` names the project replace every project hook:
+/// the ones the daemon read from `[session]` and the ones the expanded
+/// entry sent. A loadout's hooks stay on the client's contribution, with
+/// their loadout, so the stored loadout hooks are not added a second time.
+pub(crate) fn compose_hooks_from_stored_spec(
+    contribution: &mut WireContribution,
+    declared_path: &paths::HostAbsPath,
+    stored: &StoredHooks,
+) {
+    let project: Vec<_> = stored
+        .hooks
+        .iter()
+        .filter(|h| h.declared_by == mfile::spec::HookDeclarer::Project)
+        .map(|h| h.hook.clone())
+        .collect();
+    tracing::info!(
+        entry = %stored.entry,
+        stored_hooks = stored.hooks.len(),
+        project_hooks = project.len(),
+        "compose: the project's lifecycle hooks come from the stored spec"
+    );
+    let entry = contribution.entry.get_or_insert_with(|| {
+        Box::new(WireBoxEntry::new(
+            &stored.entry,
+            &stored.box_type,
+            declared_path.clone().into(),
+        ))
+    });
+    entry.lifecycle_hooks = Some(project);
 }
 
 /// Assemble the [`SessionComposer`], `add()` the daemon-side

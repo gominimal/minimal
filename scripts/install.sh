@@ -1683,6 +1683,27 @@ say "  ${dim}record: $(tilde "$prev_record")$rst"
 # is reported and the installer still exits 0: Minimal is installed either
 # way. Every printed command names `min` as this shell can resolve it: bare
 # only once $bindir is on PATH, which on a fresh install it is not yet.
+# answerer_copy_differs — whether this run shipped a `minzoned` whose bytes
+# differ from the root-owned copy `min finalize-install` installed: the
+# DNS service then runs the old program until the step runs again. False
+# when either file is missing or unreadable. The root is overridable for
+# install_test.sh. Sets $_ac_source to what the step's script copies from:
+# the shipped program on Linux, the app bundle around it on macOS.
+answerer_copy_differs() {
+    _ac_root="${MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT:-}"
+    if [ "$os" = darwin ]; then
+        _ac_source="$bindir/Minimal.app"
+        _ac_shipped="$_ac_source/Contents/MacOS/minzoned"
+        _ac_installed="$_ac_root/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
+    else
+        _ac_shipped="$bindir/minzoned"
+        _ac_source="$_ac_shipped"
+        _ac_installed="$_ac_root/usr/local/lib/minimal/minzoned"
+    fi
+    [ -f "$_ac_shipped" ] && [ -f "$_ac_installed" ] && [ -r "$_ac_installed" ] || return 1
+    [ "$(sha256 "$_ac_shipped")" != "$(sha256 "$_ac_installed" 2>/dev/null)" ]
+}
+
 offer_finalize_install() {
     [ -x "$bindir/min" ] || return 0
     _fi_summary="$tmpdir/finalize-summary"
@@ -1703,6 +1724,13 @@ offer_finalize_install() {
             say "  box names finish once a daemon runs: after your first \`min\`, run \`$_fi_min finalize-install\`."
         fi
         return 0
+    fi
+    # An upgrade that ships a new minzoned leaves the installed DNS service
+    # on the old copy. The replace line prints only when the probe's script
+    # copies this release's minzoned, so the run it names replaces the copy.
+    if answerer_copy_differs && grep -qF "\"$_ac_source" "$_fi_script"; then
+        say "  Minimal's DNS service on this machine runs a different minzoned than this release ships."
+        say "  To replace it, run \`$_fi_min finalize-install\`."
     fi
     _fi_tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
     if (exec <"$_fi_tty") 2>/dev/null; then
