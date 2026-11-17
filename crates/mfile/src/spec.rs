@@ -203,13 +203,39 @@ impl BoxSpec {
     #[must_use]
     pub fn for_session(session: Option<&Session>, flags: SpecFlags) -> Self {
         let packages = session.map_or(&[][..], |s| s.packages.as_slice());
+        let extra = session.map(|s| settings_of(&s.extra));
         Self::build(
             boxes::SESSION_BOX_TYPE,
             DEFAULT_SESSION_ENTRY,
             packages,
             true,
             Entrypoint::Shell,
-            session.map(|s| &s.extra),
+            extra.as_ref(),
+            flags,
+        )
+    }
+
+    /// The spec of a session box from the session entry `entry`, expanded
+    /// over its layers into `expanded` (BOX-064). The spec takes the
+    /// entry's packages, lifetime, timeout and `hooks_on_resume` from the
+    /// expansion, and each value the flags set from `flags`.
+    #[must_use]
+    pub fn for_session_entry(entry: &str, expanded: &toml::Table, flags: SpecFlags) -> Self {
+        let packages: Vec<String> =
+            first_value(expanded, &[&["packages"], &["install", "packages"]])
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect();
+        Self::build(
+            boxes::SESSION_BOX_TYPE,
+            entry,
+            &packages,
+            true,
+            Entrypoint::Shell,
+            Some(expanded),
             flags,
         )
     }
@@ -230,7 +256,7 @@ impl BoxSpec {
             &task.packages,
             false,
             Entrypoint::for_task(name),
-            Some(&task.extra),
+            Some(&settings_of(&task.extra)),
             flags,
         ))
     }
@@ -241,13 +267,18 @@ impl BoxSpec {
         packages: &[String],
         pty_enabled: bool,
         entrypoint: Entrypoint,
-        extra: Option<&std::collections::HashMap<String, toml::Value>>,
+        extra: Option<&toml::Table>,
         flags: SpecFlags,
     ) -> Self {
         // The entry's own keys that its table keeps among the ones it does
         // not read itself.
         let hooks_on_resume = extra.is_some_and(hooks_on_resume);
         let timeout = extra.and_then(entry_timeout);
+        // A spec that sets no lifetime keeps the `until_complete` that the
+        // shipped `session` and `task` types declare.
+        let lifetime = extra
+            .and_then(entry_lifetime)
+            .unwrap_or(Lifetime::UntilComplete);
         let mut seen = std::collections::BTreeSet::new();
         let packages = packages
             .iter()
@@ -262,9 +293,7 @@ impl BoxSpec {
             packages,
             pty_enabled,
             entrypoint,
-            // The shipped `session` and `task` types both end their run
-            // when the entrypoint returns.
-            lifetime: Lifetime::UntilComplete,
+            lifetime,
             hooks_enabled: flags.hooks_enabled,
             hooks_on_resume,
             timeout,
@@ -287,20 +316,52 @@ impl BoxSpec {
 /// Whether an entry's own table sets `hooks_on_resume = true` (BOX-028).
 /// The entry tables keep the key among the ones they do not read
 /// themselves, so it is read from there.
-fn hooks_on_resume(extra: &std::collections::HashMap<String, toml::Value>) -> bool {
+fn hooks_on_resume(extra: &toml::Table) -> bool {
+    first_value(
+        extra,
+        &[&["hooks_on_resume"], &["execution", "hooks_on_resume"]],
+    )
+    .and_then(toml::Value::as_bool)
+    .unwrap_or(false)
+}
+
+/// The entry's own `lifetime`, from `lifetime` or `box.lifetime`. `None`
+/// when the entry sets none. [`crate::File::validate`] and the expansion
+/// refuse a bad value before a spec is built, so a bad value here reads as
+/// `None`.
+fn entry_lifetime(extra: &toml::Table) -> Option<Lifetime> {
+    first_value(extra, &[&["lifetime"], &["box", "lifetime"]])
+        .and_then(|value| value.clone().try_into().ok())
+}
+
+/// The first value that one of `paths` finds in `table`. An expanded spec
+/// can carry a key flat or under its `box.toml` section.
+fn first_value<'a>(table: &'a toml::Table, paths: &[&[&str]]) -> Option<&'a toml::Value> {
+    paths.iter().find_map(|path| {
+        let (last, parents) = path.split_last()?;
+        let mut current = table;
+        for key in parents {
+            current = current.get(*key)?.as_table()?;
+        }
+        current.get(*last)
+    })
+}
+
+/// The keys an entry table keeps among the ones it does not read itself,
+/// as one table.
+fn settings_of(extra: &std::collections::HashMap<String, toml::Value>) -> toml::Table {
     extra
-        .get("hooks_on_resume")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false)
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// The entry's own `timeout` in whole seconds, read through
 /// [`crate::duration::spec_timeout`]: `None` when the entry sets none or
 /// sets zero. [`crate::File::validate`] refuses a bad value before a spec
 /// is built, so a bad value here reads as `None`.
-fn entry_timeout(extra: &std::collections::HashMap<String, toml::Value>) -> Option<u64> {
-    extra
-        .get("timeout")
+fn entry_timeout(extra: &toml::Table) -> Option<u64> {
+    first_value(extra, &[&["timeout"], &["execution", "timeout"]])
         .and_then(|value| crate::duration::spec_timeout(value).ok().flatten())
 }
 
@@ -1234,6 +1295,47 @@ mod tests {
         assert_eq!(value["box"]["name"].as_str(), Some("dev"), "{text}");
         assert_eq!(value["entry"].as_str(), Some("lint"), "{text}");
         assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), spec);
+    }
+
+    // BCLI-029: a session entry's spec takes its lifetime from the
+    // expansion, so `until_stopped` reaches the stored spec, and an entry
+    // that sets none keeps `until_complete`.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion() {
+        let file = r#"
+            [sessions.dev]
+            packages = ["git"]
+
+            [sessions.dev.box]
+            lifetime = "until_stopped"
+
+            [sessions.plain]
+            packages = ["ripgrep"]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec = BoxSpec::for_session_entry("dev", &dev.spec, SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
+        assert_eq!(spec.entry, "dev");
+        assert_eq!(spec.packages, vec!["git".to_string()]);
+        assert_eq!(spec.box_type, boxes::SESSION_BOX_TYPE);
+        assert!(spec.pty_enabled);
+        let text = toml::to_string(&spec).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            value["box"]["lifetime"].as_str(),
+            Some("until_stopped"),
+            "{text}"
+        );
+
+        let plain = expand_in(file, "plain").expect("plain expands");
+        let spec = BoxSpec::for_session_entry("plain", &plain.spec, SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilComplete, "{:?}", plain.spec);
+        assert_eq!(spec.packages, vec!["ripgrep".to_string()]);
+
+        // The flat key reads the same as the `box` table's.
+        let flat: toml::Table = toml::from_str(r#"lifetime = "until_stopped""#).unwrap();
+        let spec = BoxSpec::for_session_entry("dev", &flat, SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilStopped);
     }
 
     /// Expands the entry `name` of `file`, with the file's `[defaults]`.
