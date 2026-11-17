@@ -126,6 +126,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
+    // The daily update check (inbox#589): reads its cache, spawns the
+    // detached check when one is due, prints a notice once per new release.
+    // Never waits, never fails the command.
+    minimal::update_check::before_command(&cli.global_args, &cli.command);
+
     if let Err(e) = minimal::run(cli).await {
         // A task's non-zero exit (`min task run`) is a status to relay, not
         // an error to print — the task's own output already streamed through

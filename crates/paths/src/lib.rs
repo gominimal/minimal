@@ -147,6 +147,17 @@ pub fn minimal_state_dir() -> DaemonAbsPath {
     default_dir(|| explicit.or_else(dirs::state_dir), ".local/state")
 }
 
+/// [`minimal_state_dir`] without the panics: `None` when neither a state
+/// directory nor a home directory can be resolved, or the path is not valid
+/// UTF-8 or not absolute. For a caller that can do without the directory
+/// (a spool that then writes nothing) rather than one that cannot start.
+pub fn try_minimal_state_dir() -> Option<DaemonAbsPath> {
+    let explicit = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute());
+    try_default_dir(|| explicit.or_else(dirs::state_dir), ".local/state")
+}
+
 /// File name of the daemon SSH socket in a provider instance dir. Served by
 /// native minimald or by the minvmd host↔guest bridge — one endpoint either way.
 pub const SSH_SOCK_FILE: &str = "ssh.sock";
@@ -491,6 +502,19 @@ pub fn minimal_config_dir_with_override(over: Option<&Path>) -> std::path::PathB
     }
 }
 
+/// [`minimal_config_dir_with_override`] without the panics: `None` when no
+/// override is given and neither `$XDG_CONFIG_HOME` nor a home directory
+/// resolves, or the default path is not valid UTF-8 or not absolute. For a
+/// caller that runs before every command and can do without the directory.
+#[must_use]
+pub fn try_minimal_config_dir_with_override(over: Option<&Path>) -> Option<std::path::PathBuf> {
+    match over {
+        Some(dir) => Some(dir.join("minimal")),
+        None => try_default_dir(xdg_config_home, ".config")
+            .map(|p| p.as_utf8_path().as_std_path().to_path_buf()),
+    }
+}
+
 /// Return `$XDG_CONFIG_HOME` if it's set to an absolute path. Matches the
 /// spec: [XDG Base Directory Specification, "XDG_CONFIG_HOME"](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 /// says relative paths are invalid and should be ignored.
@@ -523,6 +547,19 @@ fn xdg_data_home() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute())
+}
+
+/// [`default_dir`] without the panics: `None` where it would panic.
+fn try_default_dir(
+    base_dir: impl FnOnce() -> Option<std::path::PathBuf>,
+    home_fallback: &str,
+) -> Option<DaemonAbsPath> {
+    let base = match base_dir() {
+        Some(b) => b,
+        None => dirs::home_dir()?.join(home_fallback),
+    };
+    let path = Utf8PathBuf::from_path_buf(base.join("minimal")).ok()?;
+    DaemonAbsPath::try_new(path).ok()
 }
 
 /// Computes `<base>/minimal`, where `base` comes from `base_dir` or, failing
