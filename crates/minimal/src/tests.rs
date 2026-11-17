@@ -7845,6 +7845,12 @@ fn attach_error_printed_after_terminal_restore() {
 /// sends with the refusal, not ssh's 255. So the terminal guard writes no
 /// blind unwind, and its cursor restore cannot move the cursor back over
 /// the refusal line. The line stays the last thing on the screen.
+///
+/// This pins the client half. The daemon half, the exit status sent before
+/// the close, is `attach_refusal_sends_an_exit_status_before_the_close` in
+/// minimald. The last part shows what that status prevents: a refusal that
+/// ends with 255, as it did before the daemon sent a status, gets the blind
+/// unwind written after it.
 #[test]
 fn attach_error_stays_on_screen_after_the_unwind() {
     use std::cell::RefCell;
@@ -7866,6 +7872,27 @@ fn attach_error_stays_on_screen_after_the_unwind() {
 
     const REFUSAL: &[u8] = b"Cannot attach to the box: the VM host daemon released this \
         session's network addresses; run the same command again to restore them\r\n";
+    let refused_with = |raw_status: i32| {
+        let screen = Screen::default();
+        let code = interactive_attach(
+            std::process::Command::new("ssh"),
+            true,
+            || attach::TerminalUnwind::arm_on(screen.clone(), true),
+            |_| {
+                std::io::Write::write_all(&mut screen.clone(), REFUSAL).expect("print");
+                Ok(std::process::ExitStatus::from_raw(raw_status << 8))
+            },
+        )
+        .expect("a refused attach ends with a status");
+        (code, screen.0.borrow().clone())
+    };
+    let (code, seen) = refused_with(255);
+    assert_eq!(code, 255);
+    assert!(
+        !seen.ends_with(REFUSAL),
+        "without the daemon's status, the blind unwind follows the refusal: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
     let screen = Screen::default();
     let code = interactive_attach(
         std::process::Command::new("ssh"),
