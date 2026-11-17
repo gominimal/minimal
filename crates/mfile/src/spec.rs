@@ -32,6 +32,7 @@
 //! Box Type, `[defaults]`, `[upstream]` and loadouts. The interim ends when
 //! that expander lands, writes this file, and bumps [`BOX_SPEC_VERSION`].
 
+use crate::expand::{ExpansionReport, Layer, ValueOrigin};
 use crate::{Session, Task};
 
 /// The version of the Box Spec shape that [`BoxSpec`] serializes.
@@ -216,6 +217,7 @@ impl BoxSpec {
             true,
             Entrypoint::Shell,
             extra.as_ref(),
+            None,
             flags,
         )
     }
@@ -224,16 +226,19 @@ impl BoxSpec {
     /// over its layers into `expanded` (BOX-064). The spec takes the
     /// entry's packages, lifetime, timeout and `hooks_on_resume` from the
     /// expansion, and each value the flags set from `flags`.
+    ///
+    /// `report` is the expansion's record of the layer that set each key.
+    /// A setting that the expansion keeps both flat and under its section
+    /// takes the form that the later layer set. The packages take both
+    /// lists, in layer order, without duplicates.
     #[must_use]
-    pub fn for_session_entry(entry: &str, expanded: &toml::Table, flags: SpecFlags) -> Self {
-        let packages: Vec<String> =
-            first_value(expanded, &[&["packages"], &["install", "packages"]])
-                .and_then(toml::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect();
+    pub fn for_session_entry(
+        entry: &str,
+        expanded: &toml::Table,
+        report: &ExpansionReport,
+        flags: SpecFlags,
+    ) -> Self {
+        let packages = layered_packages(expanded, report);
         Self::build(
             boxes::SESSION_BOX_TYPE,
             entry,
@@ -241,6 +246,7 @@ impl BoxSpec {
             true,
             Entrypoint::Shell,
             Some(expanded),
+            Some(report),
             flags,
         )
     }
@@ -262,6 +268,7 @@ impl BoxSpec {
             false,
             Entrypoint::for_task(name),
             Some(&settings_of(&task.extra)),
+            None,
             flags,
         ))
     }
@@ -273,16 +280,17 @@ impl BoxSpec {
         pty_enabled: bool,
         entrypoint: Entrypoint,
         extra: Option<&toml::Table>,
+        report: Option<&ExpansionReport>,
         flags: SpecFlags,
     ) -> Self {
         // The entry's own keys that its table keeps among the ones it does
         // not read itself.
-        let hooks_on_resume = extra.is_some_and(hooks_on_resume);
-        let timeout = extra.and_then(entry_timeout);
+        let hooks_on_resume = extra.is_some_and(|t| hooks_on_resume(t, report));
+        let timeout = extra.and_then(|t| entry_timeout(t, report));
         // A spec that sets no lifetime keeps the `until_complete` that the
         // shipped `session` and `task` types declare.
         let lifetime = extra
-            .and_then(entry_lifetime)
+            .and_then(|t| entry_lifetime(t, report))
             .unwrap_or(Lifetime::UntilComplete);
         let mut seen = std::collections::BTreeSet::new();
         let packages = packages
@@ -321,35 +329,95 @@ impl BoxSpec {
 /// Whether an entry's own table sets `hooks_on_resume = true` (BOX-028).
 /// The entry tables keep the key among the ones they do not read
 /// themselves, so it is read from there.
-fn hooks_on_resume(extra: &toml::Table) -> bool {
-    first_value(
-        extra,
-        &[&["hooks_on_resume"], &["execution", "hooks_on_resume"]],
-    )
-    .and_then(toml::Value::as_bool)
-    .unwrap_or(false)
+fn hooks_on_resume(extra: &toml::Table, report: Option<&ExpansionReport>) -> bool {
+    later_value(extra, report, "hooks_on_resume", "execution")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The entry's own `lifetime`, from `lifetime` or `box.lifetime`. `None`
 /// when the entry sets none. The expansion refuses a value that is not
 /// one of [`Lifetime::ACCEPTED`] (see [`check_section`]), so an expanded
 /// spec never reaches here with a bad value.
-fn entry_lifetime(extra: &toml::Table) -> Option<Lifetime> {
-    first_value(extra, &[&["lifetime"], &["box", "lifetime"]])
-        .and_then(|value| value.clone().try_into().ok())
+fn entry_lifetime(extra: &toml::Table, report: Option<&ExpansionReport>) -> Option<Lifetime> {
+    later_value(extra, report, "lifetime", "box").and_then(|value| value.clone().try_into().ok())
 }
 
-/// The first value that one of `paths` finds in `table`. An expanded spec
-/// can carry a key flat or under its `box.toml` section.
-fn first_value<'a>(table: &'a toml::Table, paths: &[&[&str]]) -> Option<&'a toml::Value> {
-    paths.iter().find_map(|path| {
-        let (last, parents) = path.split_last()?;
-        let mut current = table;
-        for key in parents {
-            current = current.get(*key)?.as_table()?;
+/// The value of the setting `key`, written flat or under `section` with
+/// the same name. The expansion keeps the two forms as two top-level keys.
+/// The form that the later layer in `report` set wins, as for
+/// `loadout_mode` in [`crate::expand`]. Without a report, or when one
+/// layer sets both, the flat key wins.
+fn later_value<'a>(
+    table: &'a toml::Table,
+    report: Option<&ExpansionReport>,
+    key: &str,
+    section: &str,
+) -> Option<&'a toml::Value> {
+    let flat = table.get(key);
+    let nested = table
+        .get(section)
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get(key));
+    match (flat, nested) {
+        (Some(f), Some(n)) => {
+            let rank = |k: &str| report.and_then(|r| Some(r.values.get(k)?.first()?.layer));
+            match (rank(key), rank(section)) {
+                (Some(f_at), Some(n_at)) if n_at > f_at => Some(n),
+                _ => Some(f),
+            }
         }
-        current.get(*last)
-    })
+        (f, n) => f.or(n),
+    }
+}
+
+/// The expanded spec's packages: the flat `packages` and the
+/// `install.packages` of its `[install]` section, merged in the order of
+/// the layers that set them, without duplicates. The fold already unions
+/// each form across its layers, and the report keeps the layer of each
+/// flat item and of the `install` table.
+fn layered_packages(expanded: &toml::Table, report: &ExpansionReport) -> Vec<String> {
+    let strings = |value: Option<&toml::Value>| -> Vec<String> {
+        value
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    let flat = strings(expanded.get("packages"));
+    let flat_layers: Vec<Option<Layer>> = match report.values.get("packages") {
+        Some(ValueOrigin::List(origins)) => origins.iter().map(|o| Some(o.layer)).collect(),
+        Some(ValueOrigin::Value(o)) => vec![Some(o.layer); flat.len()],
+        None => Vec::new(),
+    };
+    let nested = strings(
+        expanded
+            .get("install")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("packages")),
+    );
+    let nested_layer = report
+        .values
+        .get("install")
+        .and_then(ValueOrigin::first)
+        .map(|o| o.layer);
+    let mut items: Vec<(Option<Layer>, String)> = flat
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| (flat_layers.get(i).copied().flatten(), p))
+        .chain(nested.into_iter().map(|p| (nested_layer, p)))
+        .collect();
+    // A stable sort keeps each form's own order, and the flat items first
+    // within one layer.
+    items.sort_by_key(|(layer, _)| *layer);
+    let mut seen = std::collections::BTreeSet::new();
+    items
+        .into_iter()
+        .map(|(_, p)| p)
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
 }
 
 /// The keys an entry table keeps among the ones it does not read itself,
@@ -365,8 +433,8 @@ fn settings_of(extra: &std::collections::HashMap<String, toml::Value>) -> toml::
 /// [`crate::duration::spec_timeout`]: `None` when the entry sets none or
 /// sets zero. [`crate::File::validate`] refuses a bad value before a spec
 /// is built, so a bad value here reads as `None`.
-fn entry_timeout(extra: &toml::Table) -> Option<u64> {
-    first_value(extra, &[&["timeout"], &["execution", "timeout"]])
+fn entry_timeout(extra: &toml::Table, report: Option<&ExpansionReport>) -> Option<u64> {
+    later_value(extra, report, "timeout", "execution")
         .and_then(|value| crate::duration::spec_timeout(value).ok().flatten())
 }
 
@@ -1354,7 +1422,7 @@ mod tests {
             packages = ["ripgrep"]
         "#;
         let dev = expand_in(file, "dev").expect("dev expands");
-        let spec = BoxSpec::for_session_entry("dev", &dev.spec, SpecFlags::default());
+        let spec = BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, SpecFlags::default());
         assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
         assert_eq!(spec.entry, "dev");
         assert_eq!(spec.packages, vec!["git".to_string()]);
@@ -1369,14 +1437,65 @@ mod tests {
         );
 
         let plain = expand_in(file, "plain").expect("plain expands");
-        let spec = BoxSpec::for_session_entry("plain", &plain.spec, SpecFlags::default());
+        let spec =
+            BoxSpec::for_session_entry("plain", &plain.spec, &plain.report, SpecFlags::default());
         assert_eq!(spec.lifetime, Lifetime::UntilComplete, "{:?}", plain.spec);
         assert_eq!(spec.packages, vec!["ripgrep".to_string()]);
 
         // The flat key reads the same as the `box` table's.
         let flat: toml::Table = toml::from_str(r#"lifetime = "until_stopped""#).unwrap();
-        let spec = BoxSpec::for_session_entry("dev", &flat, SpecFlags::default());
+        let spec = BoxSpec::for_session_entry(
+            "dev",
+            &flat,
+            &ExpansionReport::default(),
+            SpecFlags::default(),
+        );
         assert_eq!(spec.lifetime, Lifetime::UntilStopped);
+    }
+
+    // BCLI-029: the entry's `[box] lifetime` beats a flat `lifetime` that
+    // a default sets. The later layer wins, whichever form each one uses.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion_later_layer_wins() {
+        let file = r#"
+            [defaults.session]
+            lifetime = "until_complete"
+
+            [sessions.dev.box]
+            lifetime = "until_stopped"
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec = BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
+
+        // The other way round: the entry's flat key beats a default's
+        // `[box]` key.
+        let file = r#"
+            [defaults.session.box]
+            lifetime = "until_stopped"
+
+            [sessions.dev]
+            lifetime = "until_complete"
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec = BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilComplete, "{:?}", dev.spec);
+    }
+
+    // BCLI-029: the stored packages union the flat `packages` and the
+    // `[install] packages` of every layer, in layer order, once each.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion_unions_packages() {
+        let file = r#"
+            [defaults]
+            packages = ["a", "c"]
+
+            [sessions.dev.install]
+            packages = ["b", "a"]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec = BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, SpecFlags::default());
+        assert_eq!(spec.packages, ["a", "c", "b"], "{:?}", dev.spec);
     }
 
     // BCLI-029: the expansion refuses a lifetime that is not one of the

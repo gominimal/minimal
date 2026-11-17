@@ -1783,6 +1783,9 @@ pub(crate) struct BoxEntryExpansion {
     /// Each of its hooks names its declarer (BOX-179). Its hooks reach the
     /// daemon in the stored spec ([`Self::spec_hooks`]).
     pub(crate) spec: toml::Table,
+    /// The layer that set each top-level key of [`Self::spec`]. The stored
+    /// spec reads it to choose between a flat key and its section's key.
+    pub(crate) report: mfile::expand::ExpansionReport,
 }
 
 impl BoxEntryExpansion {
@@ -2055,6 +2058,7 @@ fn box_entry(
     Ok(BoxEntryExpansion {
         wire,
         spec: full.spec,
+        report: full.report,
     })
 }
 
@@ -3592,9 +3596,12 @@ pub(crate) fn stamp_session_spec_as(
         &SelectedLoadouts::default(),
     )?;
     let mut spec = match &expanded {
-        Some(expanded) => {
-            mfile::spec::BoxSpec::for_session_entry(&expanded.wire.name, &expanded.spec, flags)
-        }
+        Some(expanded) => mfile::spec::BoxSpec::for_session_entry(
+            &expanded.wire.name,
+            &expanded.spec,
+            &expanded.report,
+            flags,
+        ),
         None => mfile::spec::BoxSpec::for_session(None, flags),
     };
     if let Some(entry) = entry {
