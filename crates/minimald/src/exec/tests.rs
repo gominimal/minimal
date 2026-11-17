@@ -5671,3 +5671,36 @@ async fn an_unread_exit_notice_does_not_hold_the_status() {
     .await;
     assert_eq!(status, 125);
 }
+
+/// The lines an exec writes to the client's stderr read as the product's:
+/// none opens with, or names, the daemon's process name, and a refusal's
+/// reason reaches the client unchanged, as the sandbox-failure line does.
+#[test]
+fn client_stderr_lines_do_not_name_the_daemon() {
+    use super::HeldBound;
+
+    let reason = "unknown exec form `min://nope`";
+    assert_eq!(
+        super::unsupported_command_message(reason),
+        format!("{reason}\n")
+    );
+
+    let lines = [
+        super::unsupported_command_message(reason),
+        super::bridge::held_input_notice(HeldBound::Exec),
+        super::bridge::held_input_notice(HeldBound::Daemon),
+        super::bridge::unstarted_input_notice(HeldBound::Exec),
+        super::bridge::unstarted_input_notice(HeldBound::Daemon),
+        super::sandbox_failure_notice("mount /home/h810: ENOENT"),
+    ];
+    for line in &lines {
+        assert!(
+            !line.contains("minimald"),
+            "a client line names the daemon: {line:?}"
+        );
+        assert!(
+            line.ends_with('\n'),
+            "a client line is one whole line: {line:?}"
+        );
+    }
+}

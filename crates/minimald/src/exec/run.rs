@@ -168,7 +168,7 @@ pub(super) async fn run_build_exec(
         }
         Err(err) => {
             let _ = e
-                .write_all(format!("minimald: failed to start build: {err}\n").as_bytes())
+                .write_all(format!("failed to start build: {err}\n").as_bytes())
                 .await;
             1
         }
@@ -202,7 +202,7 @@ pub(super) async fn run_check_exec(
     let opts = match CheckOpts::from_args(&args) {
         Ok(opts) => opts,
         Err(msg) => {
-            let _ = e.write_all(format!("minimald: {msg}\n").as_bytes()).await;
+            let _ = e.write_all(format!("{msg}\n").as_bytes()).await;
             let _ = e.flush().await;
             let _ = ws.eof().await;
             let _ = ws.exit_status(1).await;
@@ -239,7 +239,7 @@ pub(super) async fn run_check_exec(
         }
         Err(err) => {
             let _ = e
-                .write_all(format!("minimald: failed to start check: {err}\n").as_bytes())
+                .write_all(format!("failed to start check: {err}\n").as_bytes())
                 .await;
             1
         }

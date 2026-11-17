@@ -306,7 +306,7 @@ pub(super) async fn handle_git_upload(
             // client believes is read-only, and would turn an
             // uploaded/generated workspace into a repo with an unborn
             // branch. Reject instead of initializing.
-            let msg = "minimald: session has no repository yet\n";
+            let msg = "session has no repository yet\n";
             tracing::warn!("git-upload-pack rejected: session has no repository");
             let _ = channel.extended_data(1, msg.as_bytes()).await;
             let _ = channel.exit_status(1).await;
