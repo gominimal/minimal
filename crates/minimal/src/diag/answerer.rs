@@ -313,10 +313,21 @@ async fn absent_log_reason(log: &LogSource) -> String {
                 "absent: the installed DNS service logs to {named}, not {path}. \
                  Run min finalize-install to move the log to {path}"
             ),
-            Some(_) => format!(
-                "absent: {path} does not exist. \
-                 Run min finalize-install to make it again"
-            ),
+            // The unit names the right log. launchd creates the file when
+            // the service next starts, but never its directory. A missing
+            // directory fails the step's custody walk, so only then does
+            // the command have work to do.
+            Some(_) => match Path::new(path).parent() {
+                Some(dir) if !tokio::fs::try_exists(dir).await.unwrap_or(true) => format!(
+                    "absent: {path} and its directory {} do not exist. \
+                     Run min finalize-install to make them again",
+                    dir.display()
+                ),
+                _ => format!(
+                    "absent: {path} does not exist. \
+                     The DNS service creates it when it next starts"
+                ),
+            },
         },
     }
 }

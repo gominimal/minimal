@@ -429,7 +429,8 @@ async fn the_answerer_service_is_described_from_fixtures() {
 }
 
 /// A log that is not there is a skip that says why. A unit from before
-/// the log names none, and the skip names the command that adds it.
+/// the log names none, and the skip names the command that adds it. A
+/// skip names that command only when the step has work to do.
 #[tokio::test]
 async fn the_answerer_service_is_described_when_its_log_is_absent() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -473,7 +474,9 @@ async fn the_answerer_service_is_described_when_its_log_is_absent() {
         "{reason}"
     );
 
-    // A unit that names the log, whose file is gone.
+    // A unit that names the log, whose file is gone. Every check of the
+    // step passes, so the skip names no command: the service makes the
+    // file again when it next starts.
     std::fs::write(
         &unit,
         format!("<key>StandardErrorPath</key>\n<string>{log}</string>\n"),
@@ -482,7 +485,34 @@ async fn the_answerer_service_is_described_when_its_log_is_absent() {
     let (_, skips) = answerer_bundle(&sources).await;
     let reason = skip_of(&skips);
     assert!(
-        reason.contains(&log) && reason.contains("min finalize-install"),
+        reason.contains(&log)
+            && reason.contains("when it next starts")
+            && !reason.contains("min finalize-install"),
+        "{reason}"
+    );
+
+    // A unit that names a log whose directory is gone. launchd does not
+    // make a directory, so the skip names the command that does.
+    let gone = dir
+        .path()
+        .join("gone")
+        .join("minzoned.log")
+        .to_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(
+        &unit,
+        format!("<key>StandardErrorPath</key>\n<string>{gone}</string>\n"),
+    )
+    .unwrap();
+    sources.log = Some(answerer::LogSource {
+        path: gone.clone(),
+        unit: unit.to_str().unwrap().to_string(),
+    });
+    let (_, skips) = answerer_bundle(&sources).await;
+    let reason = skip_of(&skips);
+    assert!(
+        reason.contains(&gone) && reason.contains("min finalize-install"),
         "{reason}"
     );
 

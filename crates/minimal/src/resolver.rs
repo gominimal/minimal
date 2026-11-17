@@ -1271,6 +1271,14 @@ pub(crate) struct AnswererFacts {
     /// The channel protocol version the installed copy answered the
     /// probe with, when it exists, runs, and answers a number.
     pub installed_version: Option<u32>,
+    /// The owner and mode of the log's size-cap unit
+    /// ([`ANSWERER_LOG_CAP_PLIST_PATH`]), when it exists. macOS only:
+    /// Linux keeps the service's output in the journal, which has its
+    /// own cap.
+    pub log_cap: Option<FileCustody>,
+    /// The `ProgramArguments` the size-cap unit names, unescaped, when it
+    /// reads.
+    pub log_cap_arguments: Option<Vec<String>>,
 }
 
 /// The program path a systemd service unit's `ExecStart=` names: the
@@ -1326,6 +1334,16 @@ pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> Answerer
     #[cfg(target_os = "macos")]
     if facts.units.iter().all(Option::is_some)
         && let Some(check) = answerer_log_check(facts.unit_log.as_deref())
+    {
+        checks.push(check);
+    }
+    // The log's size cap: a missing cap unit, one root does not own, or
+    // one that runs other arguments leaves the log without a bound, so
+    // the step re-runs and writes it again.
+    #[cfg(target_os = "macos")]
+    if facts.units.iter().all(Option::is_some)
+        && let Some(check) =
+            answerer_log_cap_check(facts.log_cap, facts.log_cap_arguments.as_deref())
     {
         checks.push(check);
     }
@@ -1438,6 +1456,68 @@ fn answerer_log_check(unit_log: Option<&str>) -> Option<String> {
             "its unit logs to {other}, not {MACOS_ANSWERER_LOG_PATH}"
         )),
     }
+}
+
+/// The check on the log's size-cap unit (`custody` and `arguments`, its
+/// file and its `ProgramArguments`): `None` when the unit is root-owned
+/// and runs the cap ([`answerer_log_cap_script`]), else the check that
+/// failed. Pure, so it is unit-tested on every platform the suite runs on.
+#[cfg(any(test, target_os = "macos"))]
+fn answerer_log_cap_check(
+    custody: Option<FileCustody>,
+    arguments: Option<&[String]>,
+) -> Option<String> {
+    let Some(custody) = custody else {
+        return Some(format!(
+            "its log size cap {ANSWERER_LOG_CAP_PLIST_PATH} is missing"
+        ));
+    };
+    if !custody.root_owned() {
+        return Some(not_root_owned(
+            "its log size cap",
+            ANSWERER_LOG_CAP_PLIST_PATH,
+            &custody,
+        ));
+    }
+    let script = answerer_log_cap_script();
+    let expected = ["/bin/sh", "-c", script.as_str()];
+    match arguments {
+        Some(arguments) if arguments.iter().map(String::as_str).eq(expected) => None,
+        _ => Some(format!(
+            "its log size cap {ANSWERER_LOG_CAP_PLIST_PATH} does not run the cap on {MACOS_ANSWERER_LOG_PATH}"
+        )),
+    }
+}
+
+/// The `<string>` values of the plist array under the key `key`, with the
+/// XML escapes undone, as launchd reads them. `None` when the key is not
+/// there or its value is not an array. Pure, so the parse is unit-tested
+/// on every platform the suite runs on.
+#[cfg(any(test, target_os = "macos"))]
+fn plist_string_array(text: &str, key: &str) -> Option<Vec<String>> {
+    let marker = format!("<key>{key}</key>");
+    let at = text.find(&marker)? + marker.len();
+    let body = text[at..].trim_start().strip_prefix("<array>")?;
+    let body = &body[..body.find("</array>")?];
+    let mut values = Vec::new();
+    let mut rest = body.trim_start();
+    while !rest.is_empty() {
+        let value = rest.strip_prefix("<string>")?;
+        let end = value.find("</string>")?;
+        values.push(xml_unescape(&value[..end]));
+        rest = value[end + "</string>".len()..].trim_start();
+    }
+    Some(values)
+}
+
+/// `text` with the five XML escapes [`xml_escape`] writes undone.
+#[cfg(any(test, target_os = "macos"))]
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// The log paths whose directories the custody walk covers: the macOS log
@@ -2084,6 +2164,16 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     .await;
     let operator = operator_name();
     let operator_uid = account_uid(&operator);
+    #[cfg(target_os = "macos")]
+    let (log_cap, log_cap_arguments) = (
+        file_custody(ANSWERER_LOG_CAP_PLIST_PATH).await,
+        tokio::fs::read_to_string(ANSWERER_LOG_CAP_PLIST_PATH)
+            .await
+            .ok()
+            .and_then(|text| plist_string_array(&text, "ProgramArguments")),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (log_cap, log_cap_arguments) = (None, None);
     let facts = AnswererFacts {
         components: path_component_custody(&paths).await,
         program: file_custody(ANSWERER_PROGRAM_PATH).await,
@@ -2100,6 +2190,8 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
         channel_owner: channel.map(|custody| custody.owner),
         operator_uid,
         installed_version: installed_protocol_version().await,
+        log_cap,
+        log_cap_arguments,
     };
     let step = answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION);
     // The unit owns the channel socket by the operator's uid, so an
@@ -3448,7 +3540,8 @@ fn macos_answerer_unit_steps(install: &AnswererInstall) -> String {
          chown root:wheel {ANSWERER_LOG_CAP_PLIST_PATH}\n\
          chmod 0644 {ANSWERER_LOG_CAP_PLIST_PATH}\n\
          launchctl bootstrap system {ANSWERER_LOG_CAP_PLIST_PATH} || \
-         echo \"minimal: the hourly size cap on {MACOS_ANSWERER_LOG_PATH} did not load, so the log can grow without a limit\" >&2\n",
+         {{ rm -f {ANSWERER_LOG_CAP_PLIST_PATH} ; \
+         echo \"minimal: the hourly size cap on {MACOS_ANSWERER_LOG_PATH} did not load, so the log can grow without a limit. Run min finalize-install to try again.\" >&2 ; }}\n",
         handover = handover_comment(&controls, "launchd loads the service"),
         cap_plist = answerer_log_cap_plist(install),
         keep_kib = ANSWERER_LOG_KEEP_BYTES / 1024,
@@ -7466,6 +7559,49 @@ exit 0
         }
     }
 
+    /// The log's size-cap unit is one of the step's custody checks: the
+    /// unit the step writes passes, and a missing unit, one root does not
+    /// own, or one that runs other arguments re-surfaces the step. A cap
+    /// that launchd did not load is removed, so the next read fails too.
+    #[test]
+    fn answerer_plist_sets_a_log_path_and_checks_its_cap() {
+        let install = test_install();
+        let cap = answerer_log_cap_plist(&install);
+        let root = Some(FileCustody {
+            owner: 0,
+            mode: 0o644,
+        });
+        let arguments =
+            plist_string_array(&cap, "ProgramArguments").expect("the cap names its arguments");
+        assert_eq!(arguments[2], answerer_log_cap_script(), "{cap}");
+        assert_eq!(answerer_log_cap_check(root, Some(&arguments)), None);
+
+        let check = answerer_log_cap_check(None, None).expect("a missing cap fails");
+        assert!(check.contains(ANSWERER_LOG_CAP_PLIST_PATH), "{check}");
+        assert!(check.contains("missing"), "{check}");
+
+        let foreign = Some(FileCustody {
+            owner: 501,
+            mode: 0o644,
+        });
+        assert!(answerer_log_cap_check(foreign, Some(&arguments)).is_some());
+
+        let other = cap.replace(&xml_escape(&answerer_log_cap_script()), "exit 0");
+        let other = plist_string_array(&other, "ProgramArguments").expect("still an array");
+        let check = answerer_log_cap_check(root, Some(&other)).expect("other arguments fail");
+        assert!(check.contains(MACOS_ANSWERER_LOG_PATH), "{check}");
+        assert!(answerer_log_cap_check(root, None).is_some());
+
+        let steps = macos_answerer_unit_steps(&install);
+        assert!(
+            steps.contains(&format!(
+                "launchctl bootstrap system {ANSWERER_LOG_CAP_PLIST_PATH} || \
+                 {{ rm -f {ANSWERER_LOG_CAP_PLIST_PATH} ;"
+            )),
+            "a cap that did not load is removed:\n{steps}"
+        );
+    }
+
     /// The answerer's launchd unit sends its stdout and stderr to a fixed,
     /// root-owned log, the file `min bug` collects, so a service that exits
     /// at start leaves its reason there. The step makes the log's directory
@@ -10227,6 +10363,16 @@ resolvectl domain minzone0 '~min.internal'
             channel_owner: Some(1000),
             operator_uid: Some(1000),
             installed_version: version,
+            // macOS's step installs the log's size cap as well.
+            log_cap: cfg!(target_os = "macos").then_some(FileCustody {
+                owner: 0,
+                mode: 0o644,
+            }),
+            log_cap_arguments: cfg!(target_os = "macos").then(|| {
+                ["/bin/sh", "-c", answerer_log_cap_script().as_str()]
+                    .map(str::to_string)
+                    .to_vec()
+            }),
         }
     }
 
@@ -11853,6 +11999,8 @@ resolvectl domain minzone0 '~min.internal'
             channel_owner: Some(1000),
             operator_uid: Some(1000),
             installed_version: Some(daemon),
+            log_cap: None,
+            log_cap_arguments: None,
         };
         let step = answerer_step_over(&facts, daemon);
         assert!(
