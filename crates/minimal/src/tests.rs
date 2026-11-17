@@ -18260,14 +18260,15 @@ async fn box_spec_box_renders_stored_copy() {
 
 // BCLI-022, BOX-179: `min box spec <box>` lists each stored lifecycle
 // hook with its event, its command, its description and its declarer.
-// A description or a script path prints as a one-line TOML string, so a
-// line break in it cannot end the comment or forge a row.
+// A description, a script path or the first line of an inline command
+// prints as a one-line TOML string, so a line break or a lone `\r` in it
+// cannot end the comment or forge a row.
 #[tokio::test]
 async fn box_spec_box_lists_hooks_with_declarer() {
     let toml = r#"
 [sessions.default]
 loadout_mode = "open"
-lifecycle_hooks = [{ description = "Warm the cache", on_activate = { type = "inline", value = "echo project" }, on_destroy = { type = "inline", value = "echo bye\necho done" } }, { description = "x\n# on_attach: y (from minimal.toml)", on_attach = { type = "inline", value = "echo x" } }]
+lifecycle_hooks = [{ description = "Warm the cache", on_activate = { type = "inline", value = "echo project" }, on_destroy = { type = "inline", value = "echo bye\necho done" } }, { description = "x\n# on_attach: y (from minimal.toml)", on_attach = { type = "inline", value = "echo x" } }, { description = "Carriage", on_detach = { type = "inline", value = "echo a\recho b" } }]
 "#;
     let project = tempfile::tempdir().expect("a project dir");
     std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
@@ -18307,10 +18308,11 @@ on_detach = { type = "external", value = "./cleanup.sh" }
     let header = format!(
         "# The spec box {id} was created with.\n\
          # Lifecycle hooks:\n\
-         #   on_activate \"Warm the cache\": inline echo project (from minimal.toml)\n\
-         #   on_destroy \"Warm the cache\": inline echo bye ... (from minimal.toml)\n\
-         #   on_attach \"x\\n# on_attach: y (from minimal.toml)\": inline echo x (from minimal.toml)\n\
-         #   on_attach \"Attach rust\\nthen say \\\"hi\\\"\": inline echo rust (from loadout rust)\n\
+         #   on_activate \"Warm the cache\": inline \"echo project\" (from minimal.toml)\n\
+         #   on_destroy \"Warm the cache\": inline \"echo bye\" ... (from minimal.toml)\n\
+         #   on_attach \"x\\n# on_attach: y (from minimal.toml)\": inline \"echo x\" (from minimal.toml)\n\
+         #   on_detach \"Carriage\": inline \"echo a\\recho b\" (from minimal.toml)\n\
+         #   on_attach \"Attach rust\\nthen say \\\"hi\\\"\": inline \"echo rust\" (from loadout rust)\n\
          #   on_detach \"Attach rust\\nthen say \\\"hi\\\"\": script \"./cleanup.sh\" (from loadout rust)\n"
     );
     assert!(text.starts_with(&header), "{text}");
@@ -18319,14 +18321,16 @@ on_detach = { type = "external", value = "./cleanup.sh" }
     let hooks = parsed["lifecycle_hooks"]
         .as_array()
         .expect("the hooks render");
-    assert_eq!(hooks.len(), 3);
-    assert_eq!(hooks[2]["declared_by"]["name"].as_str(), Some("rust"));
+    assert_eq!(hooks.len(), 4);
+    assert_eq!(hooks[3]["declared_by"]["name"].as_str(), Some("rust"));
     // The description with a line break in it gives one row, not a forged second one.
     let project_rows = text
         .lines()
         .filter(|line| line.ends_with("(from minimal.toml)"))
         .count();
-    assert_eq!(project_rows, 3, "{text}");
+    assert_eq!(project_rows, 4, "{text}");
+    // A lone `\r` in an inline command prints escaped, never raw.
+    assert!(text.lines().all(|line| !line.contains('\r')), "{text:?}");
     let echo_x_rows = text
         .lines()
         .filter(|line| line.starts_with('#') && line.contains("echo x"))

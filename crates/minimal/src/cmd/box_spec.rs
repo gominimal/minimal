@@ -1119,15 +1119,15 @@ fn write_hook_list(hooks: &[toml::Value], out: &mut Vec<u8>) -> anyhow::Result<(
             let command = match script.body() {
                 HookScriptBody::Inline(body) => {
                     let mut lines = body.trim().lines();
-                    let first = lines.next().unwrap_or_default();
+                    // `lines` splits only on `\n`, so a lone `\r` or another
+                    // control character stays. Escape it, as for the path.
+                    let first = one_line_string(lines.next().unwrap_or_default());
                     if lines.next().is_some() {
                         format!("inline {first} ...")
                     } else {
                         format!("inline {first}")
                     }
                 }
-                // `toml::Value::String` prints a string with a line break as a
-                // multi-line string, which ends the comment. So escape it here.
                 HookScriptBody::External(path) => {
                     format!("script {}", one_line_string(path.as_str()))
                 }
