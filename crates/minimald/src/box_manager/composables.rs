@@ -564,20 +564,36 @@ pub(crate) fn run_compose(
     Ok((outcome, graph_names))
 }
 
-/// The spec stored beside the box's workspace, `project_path`: the
-/// [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
-/// directory (BOX-068). `None` when the box stores no spec.
+/// The hooks of the spec stored beside a box's workspace, with the entry
+/// and the Box Type that the spec names (BOX-068, BOX-179).
+pub(crate) struct StoredHooks {
+    /// The spec's `entry`.
+    entry: String,
+    /// The spec's `box.type`.
+    box_type: String,
+    /// The spec's `lifecycle_hooks`, each with its `declared_by`.
+    hooks: Vec<mfile::spec::SpecHook>,
+}
+
+/// The hooks of the spec stored beside the box's workspace, `project_path`:
+/// the [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
+/// directory (BOX-068). `None` when the box stores no spec, or a spec with
+/// no `lifecycle_hooks` key.
+///
+/// It reads only the keys the compose uses: `v`, `entry`, `box.type` and
+/// `lifecycle_hooks`. A stored spec also carries keys that other readers of
+/// the daemon read one at a time, such as `io.exec_enabled`,
+/// `[[file_exports]]` and `network.vpn_network_names`. A whole-spec parse
+/// refuses those keys, so it is not used here.
 ///
 /// # Errors
 ///
 /// A stored spec that exists but cannot be read fails the compose, so the
 /// box never runs hooks from a source other than its stored spec. A stored
-/// spec that is not a v0 Box Spec, or has a hook with no valid
-/// `declared_by`, fails the compose with the `InvalidInput` refusal that a
-/// launch gives for the same spec (`crate::box_runtime::stored_spec`).
-fn stored_spec_beside(
-    project_path: &DaemonAbsPath,
-) -> Result<Option<mfile::spec::BoxSpec>, std::io::Error> {
+/// spec that is not JSON fails the compose with `InvalidInput`. So does a
+/// hook list in a spec that is not a v0 Box Spec, that names no `entry` or
+/// `box.type`, or that has a hook with no valid `declared_by`.
+fn stored_spec_beside(project_path: &DaemonAbsPath) -> Result<Option<StoredHooks>, std::io::Error> {
     let Some(dir) = project_path.as_utf8_path().parent() else {
         return Ok(None);
     };
@@ -593,44 +609,75 @@ fn stored_spec_beside(
             ));
         }
     };
-    crate::box_runtime::stored_spec(&bytes)
-        .inspect_err(|e| {
-            tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
-        })
-        .map(Some)
+    stored_hooks(&bytes).inspect_err(|e| {
+        tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
+    })
 }
 
-/// Composes the project's lifecycle hooks from the stored spec `spec`, not
-/// from the project's `minimal.toml` (BOX-068, BOX-179). The hooks whose
-/// `declared_by` names the project replace every project hook: the ones
-/// the daemon read from `[session]` and the ones the expanded entry sent.
-/// A loadout's hooks stay on the client's contribution, with their
-/// loadout, so the stored loadout hooks are not added a second time.
-///
-/// A spec with no hook list changes nothing.
+/// The hooks of the stored spec `bytes`, as [`stored_spec_beside`] reads
+/// them.
+fn stored_hooks(bytes: &[u8]) -> Result<Option<StoredHooks>, std::io::Error> {
+    let refused = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
+    let spec: serde_json_lenient::Value = serde_json_lenient::from_slice(bytes)
+        .map_err(|e| refused(format!("the stored box spec is not JSON: {e}")))?;
+    let Some(hooks) = spec.get("lifecycle_hooks") else {
+        return Ok(None);
+    };
+    let version = spec.get("v").and_then(serde_json_lenient::Value::as_u64);
+    if version != Some(u64::from(mfile::spec::BOX_SPEC_VERSION)) {
+        return Err(refused(format!(
+            "the stored box spec has lifecycle_hooks, and its version is not {}",
+            mfile::spec::BOX_SPEC_VERSION
+        )));
+    }
+    let text = |value: Option<&serde_json_lenient::Value>, key: &str| {
+        value
+            .and_then(serde_json_lenient::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                refused(format!(
+                    "the stored box spec has lifecycle_hooks and no {key}"
+                ))
+            })
+    };
+    let entry = text(spec.get("entry"), "entry")?;
+    let box_type = text(spec.get("box").and_then(|b| b.get("type")), "box.type")?;
+    let hooks: Vec<mfile::spec::SpecHook> = serde_json_lenient::from_value(hooks.clone())
+        .map_err(|e| refused(format!("the stored box spec's lifecycle_hooks: {e}")))?;
+    Ok(Some(StoredHooks {
+        entry,
+        box_type,
+        hooks,
+    }))
+}
+
+/// Composes the project's lifecycle hooks from the stored spec's hooks,
+/// `stored`, not from the project's `minimal.toml` (BOX-068, BOX-179). The
+/// hooks whose `declared_by` names the project replace every project hook:
+/// the ones the daemon read from `[session]` and the ones the expanded
+/// entry sent. A loadout's hooks stay on the client's contribution, with
+/// their loadout, so the stored loadout hooks are not added a second time.
 pub(crate) fn compose_hooks_from_stored_spec(
     contribution: &mut WireContribution,
     declared_path: &paths::HostAbsPath,
-    spec: &mfile::spec::BoxSpec,
+    stored: &StoredHooks,
 ) {
-    let Some(stored) = spec.lifecycle_hooks.as_ref() else {
-        return;
-    };
     let project: Vec<_> = stored
+        .hooks
         .iter()
         .filter(|h| h.declared_by == mfile::spec::HookDeclarer::Project)
         .map(|h| h.hook.clone())
         .collect();
     tracing::info!(
-        entry = %spec.entry,
-        stored_hooks = stored.len(),
+        entry = %stored.entry,
+        stored_hooks = stored.hooks.len(),
         project_hooks = project.len(),
         "compose: the project's lifecycle hooks come from the stored spec"
     );
     let entry = contribution.entry.get_or_insert_with(|| {
         Box::new(WireBoxEntry::new(
-            &spec.entry,
-            &spec.box_type,
+            &stored.entry,
+            &stored.box_type,
             declared_path.clone().into(),
         ))
     });

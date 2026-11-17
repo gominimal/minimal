@@ -7707,6 +7707,31 @@ async fn composes_from_stored_expanded_spec_not_minimal_toml() {
         "the stored spec's project hook replaces the minimal.toml hook"
     );
 
+    // A stored spec also carries keys that other daemon readers read one at
+    // a time. The compose reads past them.
+    let mut carried = serde_json_lenient::to_value(spec_with_declared_hooks()).unwrap();
+    carried["io"]["exec_enabled"] = serde_json_lenient::json!(false);
+    carried["file_exports"] = serde_json_lenient::json!([{"path": "out"}]);
+    carried["network"]["vpn_network_names"] = serde_json_lenient::json!(["corp"]);
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&carried).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pending_hooks(),
+        ["from-spec"],
+        "the keys the compose does not read do not refuse the spec"
+    );
+
+    // A stored spec with no hook list leaves the hooks of `minimal.toml`.
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        br#"{"v": 1, "io": {"pty_enabled": true}}"#,
+    )
+    .unwrap();
+    assert_eq!(pending_hooks(), ["from-toml"]);
+
     // Under --no-hooks, no hook composes from either place.
     let (outcome, _) = run_compose(
         &daemon,
