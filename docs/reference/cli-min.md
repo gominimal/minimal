@@ -306,6 +306,12 @@ That happens when someone destroys the session, another connection attaches
 to it, or the daemon shuts down. It exits 255 when the connection fails, or
 when the daemon disconnects a terminal that stopped keeping up with output.
 
+`min session attach`, `min box attach` and bare `min` exit 1 when the daemon
+refuses the attach. The reason stays on screen. One example is a session
+that still receives its workspace upload. Another is an `own_ip` box that
+cannot get its address back. The reason then names the command that checks
+the setup, such as `min finalize-install --show`.
+
 ### `session exec`
 
 ```

@@ -7841,6 +7841,87 @@ fn attach_error_printed_after_terminal_restore() {
     );
 }
 
+/// An attach that the daemon refuses ends with the exit status the daemon
+/// sends with the refusal, not ssh's 255. So the terminal guard writes no
+/// blind unwind, and its cursor restore cannot move the cursor back over
+/// the refusal line. The line stays the last thing on the screen.
+///
+/// This pins the client half. The daemon half, the exit status sent before
+/// the close, is `attach_refusal_sends_an_exit_status_before_the_close` in
+/// minimald. The last part shows what that status prevents: a refusal that
+/// ends with 255, as it did before the daemon sent a status, gets the blind
+/// unwind written after it.
+#[test]
+fn attach_error_stays_on_screen_after_the_unwind() {
+    use std::cell::RefCell;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::rc::Rc;
+
+    /// The user's terminal: everything written to it, in order.
+    #[derive(Clone, Default)]
+    struct Screen(Rc<RefCell<Vec<u8>>>);
+    impl std::io::Write for Screen {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const REFUSAL: &[u8] = b"Cannot attach to the box: the VM host daemon released this \
+        session's network addresses; run the same command again to restore them\r\n";
+    let refused_with = |raw_status: i32| {
+        let screen = Screen::default();
+        let code = interactive_attach(
+            std::process::Command::new("ssh"),
+            true,
+            || attach::TerminalUnwind::arm_on(screen.clone(), true),
+            |_| {
+                std::io::Write::write_all(&mut screen.clone(), REFUSAL).expect("print");
+                Ok(std::process::ExitStatus::from_raw(raw_status << 8))
+            },
+        )
+        .expect("a refused attach ends with a status");
+        (code, screen.0.borrow().clone())
+    };
+    let (code, seen) = refused_with(255);
+    assert_eq!(code, 255);
+    assert!(
+        !seen.ends_with(REFUSAL),
+        "without the daemon's status, the blind unwind follows the refusal: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    let screen = Screen::default();
+    let code = interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(screen.clone(), true),
+        |_| {
+            // The daemon's refusal reaches the terminal through ssh, and the
+            // daemon's exit status (1) ends ssh.
+            std::io::Write::write_all(&mut screen.clone(), REFUSAL).expect("print");
+            Ok(std::process::ExitStatus::from_raw(1 << 8))
+        },
+    )
+    .expect("a refused attach ends with the daemon's status");
+    assert_eq!(code, 1);
+    let seen = screen.0.borrow().clone();
+    assert!(
+        seen.ends_with(REFUSAL),
+        "the refusal is the last thing on the terminal: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !seen
+            .windows(boxes::terminal::LEAVE_ALT_SCREEN.len())
+            .any(|window| window == boxes::terminal::LEAVE_ALT_SCREEN.as_bytes()),
+        "no cursor restore after the refusal: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
 /// NET-154: the HOSTNAME PROXY row names every host port the VM's proxy
 /// serves on, the preferred first, and `--json` carries them as
 /// `hostname_proxy_ports`. One served port prints the row it always did.
