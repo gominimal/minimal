@@ -190,9 +190,12 @@ pub(crate) async fn vm_host_answerer_status_at(
 /// machine the session is about to rely on: which VM host daemon answers
 /// the zone decides where the names resolve from, and a start that said
 /// nothing left the holder discoverable only from `min ls`. The same line
-/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line`]),
-/// so the two surfaces name one holder the same way. Pure, so the test
-/// asserts the wording without capturing stderr.
+/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line_beside`]),
+/// so the two surfaces name one holder the same way. That includes a
+/// failing DNS service: when its job holds the port and is not running,
+/// both name it, and both name `min finalize-install` only when that
+/// command offers the reinstall. The service state is read only for the
+/// service's port held with no channel, so the other states stay pure.
 ///
 /// `None` for the pre-acquisition state — a daemon still bringing its
 /// answerer up has nothing to name yet, and the start prints nothing for
@@ -201,7 +204,47 @@ pub(crate) async fn vm_host_answerer_status_at(
 pub(crate) fn vm_host_answerer_start_line(
     status: minimald_rpc::ZoneAnswererStatus,
 ) -> Option<String> {
-    crate::resolver::vm_host_answerer_line(status).map(|line| format!("DNS service: {line}"))
+    let service = if crate::resolver::port_held_by_service_job(&status) {
+        dns_service_state_blocking(&status)
+    } else {
+        crate::resolver::DnsServiceState::default()
+    };
+    vm_host_answerer_start_line_beside(status, service)
+}
+
+/// [`vm_host_answerer_start_line`] over a DNS service state already read.
+/// Pure, so the test asserts the wording without capturing stderr.
+#[must_use]
+pub(crate) fn vm_host_answerer_start_line_beside(
+    status: minimald_rpc::ZoneAnswererStatus,
+    service: crate::resolver::DnsServiceState,
+) -> Option<String> {
+    crate::resolver::vm_host_answerer_line_beside(status, service)
+        .map(|line| format!("DNS service: {line}"))
+}
+
+/// [`crate::resolver::dns_service_state_on_this_host`] for the one status
+/// the session start prints, from a synchronous caller. The read runs on a
+/// thread of its own with its own runtime, so it works whether or not the
+/// caller runs inside one. A read that does not run claims nothing.
+fn dns_service_state_blocking(
+    status: &minimald_rpc::ZoneAnswererStatus,
+) -> crate::resolver::DnsServiceState {
+    let status = status.clone();
+    std::thread::Builder::new()
+        .name("dns-service-state".to_string())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| {
+                    runtime.block_on(crate::resolver::dns_service_state_on_this_host([&status]))
+                })
+                .unwrap_or_default()
+        })
+        .ok()
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default()
 }
 
 /// Releases the zone hold a destroyed session's activation made, when the
@@ -2060,6 +2103,21 @@ mod tests {
             None,
             "the pre-acquisition state prints nothing at session start"
         );
+        // D3472: a failing DNS service prints the line `min ls` prints.
+        let held = minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 };
+        for reinstall_offered in [true, false] {
+            let service = crate::resolver::DnsServiceState {
+                job: crate::resolver::AnswererJob::NotRunning,
+                reinstall_offered,
+            };
+            assert_eq!(
+                vm_host_answerer_start_line_beside(held.clone(), service),
+                Some(format!(
+                    "DNS service: {}",
+                    crate::resolver::failing_dns_service_line(7_656, reinstall_offered)
+                )),
+            );
+        }
     }
 
     /// T66's destroy side: the client holding a destroyed session's record
