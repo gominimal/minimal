@@ -160,8 +160,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 ///
 /// The interactive path (no `wire`) negotiates the configurable session
 /// keys from `config_dir` so the daemon adopts the user's detach/forward
-/// chord for that channel; the exec path (`wire` set) has no detach
-/// and sends none.
+/// chord for that channel. The exec path (`wire` set) sends no keys.
 ///
 /// `host_asks_for` names the box whose pending asks the interactive attach
 /// answers on a VM-backed host (NET-045): the attach subscribes on the VM
@@ -209,8 +208,8 @@ async fn box_via_ssh_with(
 ) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow. The interactive path resolves the
-    // session-key config from `config_dir` and forwards it per channel; the
-    // exec path has no detach and passes `None`.
+    // session-key config from `config_dir` and forwards it per channel. The
+    // `wire` path sends no session keys.
     let session_keys = if wire.is_none() {
         Some(minimal_client::attach::resolve_session_keys(config_dir)?)
     } else {
@@ -940,7 +939,14 @@ pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<
             exec_id,
             stdin_is_tty,
             async |target: &BoxAttachTarget, exec_id: &minimald_rpc::exec::ExecId| {
-                attach_exec_by_id(kind, &target.host.sock, target.box_id, exec_id).await
+                attach_exec_by_id(
+                    kind,
+                    &target.host.sock,
+                    target.box_id,
+                    exec_id,
+                    global.config_dir.as_deref(),
+                )
+                .await
             },
         )
         .await?;
@@ -984,6 +990,15 @@ async fn attach_command(
             Some(box_list_scope(cwd.as_ref())?)
         }
     };
+    // The command's own project root: exports are copied only when it is
+    // the box's (BOX-199). With none, nothing is copied.
+    let here = match &scope {
+        Some(scope) => Some(scope.clone()),
+        None => crate::attach::cwd_host_path(global)
+            .and_then(|cwd| box_list_scope(cwd.as_ref()))
+            .inspect_err(|e| tracing::info!("attach: no project root here: {e:#}"))
+            .ok(),
+    };
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
     let hosts = match target {
@@ -996,6 +1011,7 @@ async fn attach_command(
         hosts,
         target,
         scope.as_ref(),
+        here.as_ref(),
         stdin_is_tty,
         async |target: &BoxAttachTarget| {
             let host_asks = host_asks_box(global, target.name.as_deref());
@@ -1352,14 +1368,62 @@ pub(crate) fn exec_attach_ending(
     }
 }
 
+/// The `ssh -tt` command that attaches this terminal to the terminal exec
+/// `exec_id` in box `id` on the daemon at `sock`. It sends the session keys
+/// from `config_dir`, as the box attach does, so the detach keys end the
+/// attach and leave the exec running (BCLI-068).
+///
+/// # Errors
+///
+/// When the session-key config is not valid, or ssh's command cannot be
+/// built ([`minimal_client::attach::attach_command`]).
+pub(crate) fn exec_attach_ssh(
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    exec_id: &minimald_rpc::exec::ExecId,
+    config_dir: Option<&std::path::Path>,
+) -> Result<std::process::Command, anyhow::Error> {
+    let session_keys = minimal_client::attach::resolve_session_keys(config_dir)?;
+    exec_attach_ssh_with_keys(sock, id, exec_id, &session_keys)
+}
+
+/// [`exec_attach_ssh`] with the session keys already resolved. `min box
+/// exec -t` resolves them before it starts the exec, so a session-key
+/// config that is not valid never leaves an exec without its attach.
+///
+/// # Errors
+///
+/// When ssh's command cannot be built
+/// ([`minimal_client::attach::attach_command`]).
+pub(crate) fn exec_attach_ssh_with_keys(
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    exec_id: &minimald_rpc::exec::ExecId,
+    session_keys: &boxes::keys::SessionKeys,
+) -> Result<std::process::Command, anyhow::Error> {
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    let ssh = minimal_client::attach::attach_command(sock, id, Some(&wire), Some(session_keys))?;
+    // `-tt` before the other arguments, so ssh asks for a terminal.
+    let mut forced = std::process::Command::new(ssh.get_program());
+    forced.arg("-tt").args(ssh.get_args());
+    for (name, value) in ssh.get_envs() {
+        match value {
+            Some(value) => forced.env(name, value),
+            None => forced.env_remove(name),
+        };
+    }
+    Ok(forced)
+}
+
 /// Connects this terminal to the terminal exec `exec_id` in box `id` on
-/// the daemon at `sock`, through `ssh -tt`, as `min box exec -t` does after
-/// it starts one. Returns ssh's exit status, which is the exec's.
+/// the daemon at `sock`, through [`exec_attach_ssh`]. Returns ssh's exit
+/// status: the exec's, or 0 after a detach.
 async fn attach_exec_by_id(
     kind: paths::HostKind,
     sock: &std::path::Path,
     id: boxes::SessionId,
     exec_id: &minimald_rpc::exec::ExecId,
+    config_dir: Option<&std::path::Path>,
 ) -> Result<i32, anyhow::Error> {
     // A VM-backed box gets its row and its name hold back first, as
     // `min box exec` does.
@@ -1375,17 +1439,7 @@ async fn attach_exec_by_id(
     resume_box_row(sock, record.as_ref()).await?;
     rehold_held_name_before_attach(kind, sock, id, record.as_ref()).await;
 
-    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
-    let ssh = minimal_client::attach::attach_command(sock, id, Some(&wire), None)?;
-    // `-tt` before the other arguments, so ssh asks for a terminal.
-    let mut forced = std::process::Command::new(ssh.get_program());
-    forced.arg("-tt").args(ssh.get_args());
-    for (name, value) in ssh.get_envs() {
-        match value {
-            Some(value) => forced.env(name, value),
-            None => forced.env_remove(name),
-        };
-    }
+    let forced = exec_attach_ssh(sock, id, exec_id, config_dir)?;
     tokio::task::spawn_blocking(move || {
         interactive_attach(forced, true, crate::attach::TerminalUnwind::arm, |ssh| {
             let real = minimal_client::tty_relay::RealTty::acquire()
@@ -1419,6 +1473,7 @@ pub(crate) async fn attach_on_hosts<A>(
     hosts: Vec<crate::cmd::list::LocalHost>,
     address: Option<&str>,
     scope: Option<&paths::HostAbsPath>,
+    here: Option<&paths::HostAbsPath>,
     stdin_is_tty: bool,
     attach: A,
 ) -> Result<AttachEnding, anyhow::Error>
@@ -1444,8 +1499,54 @@ where
         }
         _ => BoxAfterAttach::Unread,
     };
+    // BOX-185: an attach that saw the box end copies its declared exports,
+    // whatever code the entrypoint ended with. A detach leaves the box
+    // running, and copies nothing (BOX-186). An entrypoint's own nonzero
+    // code is not read above, so the box is read here for the copy only.
+    // A box that still runs then waits for the settle bound only when it
+    // declares an export, so a shell that a person leaves with a nonzero
+    // code, or a lost connection, does not wait for nothing.
+    let ended = match &after {
+        BoxAfterAttach::Unread => {
+            let first = box_after_attach(&target.host, target.box_id).await;
+            let running =
+                matches!(&first, BoxAfterAttach::Listed(entry) if entry.state == "running");
+            if running && box_declares_exports_on_host(&target.host, target.box_id).await {
+                box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await
+            } else {
+                first
+            }
+        }
+        _ => after.clone(),
+    };
+    // The outcomes of the copy, and whether the box's entrypoint exited 0
+    // by itself. A skipped export then turns the attach's 0 into 125
+    // (BOX-193). A stop and any other code stand (BOX-194).
+    let mut copied = None;
+    if let BoxAfterAttach::Listed(entry) = &ended
+        && matches!(entry.state.as_str(), "stopped" | "exited")
+    {
+        let root = entry.project_root.as_ref();
+        // Interim: the outcomes go to no `file_exported` event, and no
+        // claim gates the copy (BOX-195 and BOX-198,
+        // gominimal/minimal#3446). See `copy_box_exports`.
+        let outcomes = copy_box_exports_on_host(
+            &target.host,
+            target.box_id,
+            target.name.as_deref().unwrap_or(&target.label),
+            root.map(|root| std::path::Path::new(root.as_str())),
+            here.map(|here| std::path::Path::new(here.as_str())),
+            &mut std::io::stderr(),
+        )
+        .await;
+        let exited_clean = entry.state == "exited" && entry.exit_code == Some(0);
+        copied = Some((exited_clean, outcomes));
+    }
     match attach_ending(&target, code, &after) {
-        Ok(ending) => {
+        Ok(mut ending) => {
+            if let Some((exited_clean, outcomes)) = &copied {
+                ending.code = exit_code_after_exports(ending.code, *exited_clean, outcomes);
+            }
             tracing::info!(
                 verb = name,
                 box_id = %target.box_id,

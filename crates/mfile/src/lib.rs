@@ -20,6 +20,7 @@ pub mod expand;
 pub mod legacy;
 pub mod network;
 mod package_composable;
+pub mod projection;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
 pub use project_composable::ProjectComposable;
@@ -1929,13 +1930,72 @@ impl File {
         OsString::from_vec(out)
     }
 
+    /// Validates a state key or state-dir name for use under the state base.
+    ///
+    /// The value is joined onto the state base as a single directory
+    /// component, so it must be exactly one component: non-empty, free of
+    /// `/` and NUL, and neither `.` nor `..`.
+    pub fn validate_state_component(component: &str) -> Result<(), String> {
+        if component.is_empty() {
+            Err("it is empty".to_string())
+        } else if component.contains('/') {
+            Err("it contains '/'".to_string())
+        } else if component.contains('\0') {
+            Err("it contains a NUL byte".to_string())
+        } else if component == "." || component == ".." {
+            Err(format!("it is {component:?}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Encodes a path component for [`Self::state_dir_under`]'s flat
+    /// directory name, injectively: `-` becomes `%2D` and `%` becomes `%25`,
+    /// so a `-` in the result is always a separator. [`Self::encode_component`]
+    /// is not injective across separators (`a-`,`b` and `a`,`-b` both give
+    /// `a---b`); it stays as it is so native `state_dir` keeps its names.
+    /// Non-UTF8 bytes are preserved as-is.
+    fn encode_component_escaped(s: &OsStr) -> OsString {
+        let mut out = Vec::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            match b {
+                b'-' => out.extend_from_slice(b"%2D"),
+                b'%' => out.extend_from_slice(b"%25"),
+                _ => out.push(b),
+            }
+        }
+        OsString::from_vec(out)
+    }
+
     /// Helper method for state_dir to simplify unit testing
     fn state_dir_from_path<P: AsRef<Path>>(
         state_key: &str,
         env_base_dir: P,
         home_dir: Option<&Path>,
         mfile_dir: &Path,
-    ) -> PathBuf {
+    ) -> Result<PathBuf, String> {
+        Self::state_dir_encoded(
+            state_key,
+            env_base_dir,
+            home_dir,
+            mfile_dir,
+            Self::encode_component,
+            None,
+        )
+    }
+
+    /// [`Self::state_dir_from_path`] with the component encoder chosen, and
+    /// what a `..` component becomes: `None` drops it, as the native names
+    /// always have; `Some(text)` keeps it as `text`, so that two paths that
+    /// differ only by a `..` get two directories.
+    fn state_dir_encoded<P: AsRef<Path>>(
+        state_key: &str,
+        env_base_dir: P,
+        home_dir: Option<&Path>,
+        mfile_dir: &Path,
+        encode: fn(&OsStr) -> OsString,
+        parent_dir: Option<&str>,
+    ) -> Result<PathBuf, String> {
         let (start_marker, components) = home_dir
             .map(|home| mfile_dir.strip_prefix(home))
             .and_then(|r| r.ok())
@@ -1945,7 +2005,8 @@ impl File {
         let mut tail = OsString::new();
         for (i, c) in components
             .filter_map(|c| match c {
-                Component::Normal(s) => Some(Self::encode_component(s)),
+                Component::Normal(s) => Some(encode(s)),
+                Component::ParentDir => parent_dir.map(OsString::from),
                 _ => None,
             })
             .enumerate()
@@ -1958,7 +2019,73 @@ impl File {
 
         let mut dir_name = OsString::from(start_marker.to_string());
         dir_name.push(&tail);
-        env_base_dir.as_ref().join(dir_name).join(state_key)
+        Self::validate_state_component(state_key)?;
+
+        let state_base = env_base_dir.as_ref();
+        let joined = state_base.join(&dir_name).join(state_key);
+        // The state key is one component, so `joined` can only leave the
+        // state base through a symlink planted in an existing component.
+        // Resolve the deepest existing prefix of `joined` and require its
+        // canonical form to stay under the canonical state base, so a
+        // symlinked parent cannot redirect a not-yet-created state
+        // directory outside the base. A state base that does not exist
+        // yet has no entries, so nothing on the path can be a planted
+        // symlink and the path is accepted as it stands.
+        let canonical_base = match state_base.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && state_base.symlink_metadata().is_err() =>
+            {
+                return Ok(joined);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot resolve the state base {}: {e}",
+                    state_base.display()
+                ));
+            }
+        };
+        let mut existing = joined.clone();
+        loop {
+            match existing.canonicalize() {
+                Ok(canonical) => {
+                    if !canonical.starts_with(&canonical_base) {
+                        return Err(format!(
+                            "resolves to {}, which is outside the state base {}",
+                            canonical.display(),
+                            canonical_base.display()
+                        ));
+                    }
+                    break;
+                }
+                // An entry that exists but resolves nowhere is a dangling
+                // symlink: where it points cannot be checked, so refuse
+                // the state key instead of creating a directory through
+                // it. Any other resolution error is refused for the same
+                // reason.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && existing.symlink_metadata().is_err() =>
+                {
+                    if !existing.pop() {
+                        return Err(format!(
+                            "cannot resolve {} under the state base {}: {e}",
+                            joined.display(),
+                            canonical_base.display()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "cannot resolve {} under the state base {}: {e}",
+                        joined.display(),
+                        canonical_base.display()
+                    ));
+                }
+            }
+        }
+        Ok(joined)
     }
 
     /// Returns the path to a durable state directory for this project.
@@ -1973,19 +2100,61 @@ impl File {
     /// For example, `~/src/my-project` with state key `"env"` becomes:
     ///   `<env_base_dir>/~src-my--project/env`
     ///
-    /// Returns `None` if the location of the minimal file on disk is not known.
-    /// Returns the path to the durable state directory for the given key.
+    /// The state key must be a single path component (see
+    /// [`File::validate_state_component`]); the returned path is guaranteed to
+    /// stay under `env_base_dir` even when earlier state directories were
+    /// replaced with symlinks.
+    ///
+    /// Returns `Ok(None)` if the location of the minimal file on disk is not
+    /// known. Returns the path to the durable state directory for the given
+    /// key.
     ///
     /// None is returned if the location of the minimal file on disk is not known.
-    pub fn state_dir<P: AsRef<Path>>(&self, state_key: &str, env_base_dir: P) -> Option<PathBuf> {
-        self.dir_path().map(|mfile_dir| {
-            Self::state_dir_from_path(
-                state_key,
-                env_base_dir,
-                env::home_dir().as_deref(),
-                mfile_dir,
-            )
-        })
+    pub fn state_dir<P: AsRef<Path>>(
+        &self,
+        state_key: &str,
+        env_base_dir: P,
+    ) -> Result<Option<PathBuf>, String> {
+        self.dir_path()
+            .map(|mfile_dir| {
+                Self::state_dir_from_path(
+                    state_key,
+                    env_base_dir,
+                    env::home_dir().as_deref(),
+                    mfile_dir,
+                )
+            })
+            .transpose()
+    }
+
+    /// Returns the path to the durable state directory for the given key,
+    /// keyed on `project_dir` instead of where this minimal file sits on disk.
+    ///
+    /// For a daemon that reads every box's project from a tree laid out
+    /// afresh each session, native or VM, whose path changes every time, so
+    /// the caller supplies the stable host path. The `~` prefix is never
+    /// used: the host's home is not this machine's. Components are encoded
+    /// with [`Self::encode_component_escaped`], so two project paths never
+    /// share a directory.
+    ///
+    /// The state key must be a single path component, and the returned path
+    /// stays under `env_base_dir`, as for [`Self::state_dir`].
+    pub fn state_dir_under<P: AsRef<Path>>(
+        &self,
+        state_key: &str,
+        env_base_dir: P,
+        project_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        Self::state_dir_encoded(
+            state_key,
+            env_base_dir,
+            None,
+            project_dir,
+            Self::encode_component_escaped,
+            // A `..` the caller did not resolve stays in the key, escaped
+            // like a name would be, so `/work/a/../b` and `/work/b` differ.
+            Some("%2E%2E"),
+        )
     }
 
     /// Resolves how the remote-cache reader should locate its index:
@@ -2816,7 +2985,8 @@ mod tests {
             "/tmp/state",
             Some(Path::new("/home/user")),
             Path::new("/home/user/src/my-project"),
-        );
+        )
+        .unwrap();
         assert_eq!(result, Path::new("/tmp/state/~src-my--project/env"));
     }
 
@@ -2827,14 +2997,16 @@ mod tests {
             "/tmp/state",
             Some(Path::new("/home/user")),
             Path::new("/opt/builds/foo"),
-        );
+        )
+        .unwrap();
         assert_eq!(result, Path::new("/tmp/state/-opt-builds-foo/cache"));
     }
 
     #[test]
     fn state_dir_no_home() {
         let result =
-            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/opt/builds/foo"));
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/opt/builds/foo"))
+                .unwrap();
         assert_eq!(result, Path::new("/tmp/state/-opt-builds-foo/env"));
     }
 
@@ -2845,7 +3017,8 @@ mod tests {
             "/tmp/state",
             Some(Path::new("/home/user")),
             Path::new("/home/user/my-org/my-project"),
-        );
+        )
+        .unwrap();
         assert_eq!(result, Path::new("/tmp/state/~my--org-my--project/env"));
     }
 
@@ -2856,8 +3029,84 @@ mod tests {
             "/tmp/state",
             Some(Path::new("/home/user")),
             Path::new("/home/user/project"),
-        );
+        )
+        .unwrap();
         assert_eq!(result, Path::new("/tmp/state/~project/env"));
+    }
+
+    #[test]
+    fn state_dir_under_ignores_where_the_mfile_sits() {
+        let at = |p: &str| File {
+            mfile_path: Some(PathBuf::from(p)),
+            ..Default::default()
+        };
+        let project = Path::new("/home/user/src/my-project");
+        let a = at("/var/lib/minimal/sessions/aaaa/tree/minimal.toml");
+        let b = at("/var/lib/minimal/sessions/bbbb/tree/.minimal/minimal.toml");
+        let dir_a = a.state_dir_under("env", "/tmp/state", project).unwrap();
+        let dir_b = b.state_dir_under("env", "/tmp/state", project).unwrap();
+        assert_eq!(dir_a, dir_b);
+        // Never `~`: the project's home is another machine's.
+        assert_eq!(
+            dir_a,
+            Path::new("/tmp/state/-home-user-src-my%2Dproject/env")
+        );
+    }
+
+    /// `encode_component` aliases `/work/a-/b` and `/work/a/-b` (both
+    /// `a---b`); `state_dir_under` must give two projects two directories.
+    #[test]
+    fn state_dir_under_never_aliases_two_projects() {
+        let f = File {
+            mfile_path: Some(PathBuf::from("/tree/minimal.toml")),
+            ..Default::default()
+        };
+        let one = f
+            .state_dir_under("env", "/tmp/state", Path::new("/work/a-/b"))
+            .unwrap();
+        let two = f
+            .state_dir_under("env", "/tmp/state", Path::new("/work/a/-b"))
+            .unwrap();
+        assert_ne!(one, two);
+        assert_eq!(one, Path::new("/tmp/state/-work-a%2D-b/env"));
+        assert_eq!(two, Path::new("/tmp/state/-work-a-%2Db/env"));
+        // `%` is escaped too, so a literal `%2D` cannot pose as an escaped `-`.
+        let three = f
+            .state_dir_under("env", "/tmp/state", Path::new("/work/a%2D/b"))
+            .unwrap();
+        assert_eq!(three, Path::new("/tmp/state/-work-a%252D-b/env"));
+        assert_ne!(three, one);
+        // A `..` the caller left in the path is kept, so it cannot pose as
+        // the path it would resolve to.
+        let up = f
+            .state_dir_under("env", "/tmp/state", Path::new("/work/a/../b"))
+            .unwrap();
+        let flat = f
+            .state_dir_under("env", "/tmp/state", Path::new("/work/b"))
+            .unwrap();
+        assert_ne!(up, flat);
+        assert_eq!(up, Path::new("/tmp/state/-work-a-%2E%2E-b/env"));
+        // The native names drop it, as they always have: `/work/a/../b` and
+        // `/work/a/b` share one directory there, the aliasing this encoder
+        // is for.
+        assert_eq!(
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/work/a/../b")),
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/work/a/b"))
+        );
+    }
+
+    #[test]
+    fn encode_component_escaped_escapes_dash_and_percent() {
+        assert_eq!(File::encode_component_escaped(OsStr::new("foo")), "foo");
+        assert_eq!(
+            File::encode_component_escaped(OsStr::new("my-pro%ject")),
+            "my%2Dpro%25ject"
+        );
+        let input = OsStr::from_bytes(b"a\x80-b");
+        assert_eq!(
+            File::encode_component_escaped(input).as_bytes(),
+            b"a\x80%2Db"
+        );
     }
 
     #[test]
@@ -2867,8 +3116,132 @@ mod tests {
             "/tmp/state",
             Some(Path::new("/home/user")),
             Path::new("/home/user"),
-        );
+        )
+        .unwrap();
         assert_eq!(result, Path::new("/tmp/state/~/env"));
+    }
+
+    #[test]
+    fn state_dir_absolute_state_key_is_rejected() {
+        let err = File::state_dir_from_path(
+            "/etc",
+            "/tmp/state",
+            Some(Path::new("/home/user")),
+            Path::new("/home/user/project"),
+        )
+        .unwrap_err();
+        assert_eq!(err, "it contains '/'");
+    }
+
+    #[test]
+    fn state_dir_parent_component_is_rejected() {
+        let err = File::state_dir_from_path(
+            "..",
+            "/tmp/state",
+            Some(Path::new("/home/user")),
+            Path::new("/home/user/project"),
+        )
+        .unwrap_err();
+        assert_eq!(err, "it is \"..\"");
+    }
+
+    /// A state directory replaced by a symlink pointing outside the state
+    /// base must be rejected, not mounted into the sandbox.
+    #[test]
+    fn state_dir_symlinked_parent_is_rejected() {
+        let state_base = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mfile_dir = tempfile::tempdir_in(home.path()).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::create_dir(target.path().join("env")).unwrap();
+
+        // `~<mfile-dir-name>` inside the state base is a symlink to a
+        // directory holding an `env` entry, so the joined path exists but
+        // resolves outside the state base.
+        let mfile_name = mfile_dir
+            .path()
+            .file_name()
+            .map(File::encode_component)
+            .unwrap();
+        let link_name = format!("~{}", mfile_name.to_string_lossy());
+        std::os::unix::fs::symlink(target.path(), state_base.path().join(link_name)).unwrap();
+
+        let err = File::state_dir_from_path(
+            "env",
+            state_base.path(),
+            Some(home.path()),
+            mfile_dir.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("resolves to"),
+            "the error must report the escape, got {err}"
+        );
+    }
+
+    /// A symlinked parent must also be caught when the state key names a
+    /// directory that does not exist yet, the usual case for a new state
+    /// key, so the escape is refused before anything is created through it.
+    #[test]
+    fn state_dir_symlinked_parent_with_missing_key_is_rejected() {
+        let state_base = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mfile_dir = tempfile::tempdir_in(home.path()).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        // The `env` state key does not exist under the symlink target.
+
+        let mfile_name = mfile_dir
+            .path()
+            .file_name()
+            .map(File::encode_component)
+            .unwrap();
+        let link_name = format!("~{}", mfile_name.to_string_lossy());
+        std::os::unix::fs::symlink(target.path(), state_base.path().join(link_name)).unwrap();
+
+        let err = File::state_dir_from_path(
+            "env",
+            state_base.path(),
+            Some(home.path()),
+            mfile_dir.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("resolves to"),
+            "the error must report the escape, got {err}"
+        );
+    }
+
+    /// A symlink on the path that points nowhere cannot be validated, so
+    /// the state key is refused rather than created through it.
+    #[test]
+    fn state_dir_dangling_symlink_on_path_is_rejected() {
+        let state_base = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mfile_dir = tempfile::tempdir_in(home.path()).unwrap();
+
+        let mfile_name = mfile_dir
+            .path()
+            .file_name()
+            .map(File::encode_component)
+            .unwrap();
+        let link_name = format!("~{}", mfile_name.to_string_lossy());
+        std::os::unix::fs::symlink(
+            state_base.path().join("nowhere"),
+            state_base.path().join(link_name),
+        )
+        .unwrap();
+
+        let err = File::state_dir_from_path(
+            "env",
+            state_base.path(),
+            Some(home.path()),
+            mfile_dir.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("cannot resolve"),
+            "the error must name the unresolvable path, got {err}"
+        );
     }
 
     /// A minimal.toml without a `[session]` block deserializes with
