@@ -1652,6 +1652,73 @@ mod tests {
         assert_refused(&stk, &stk_text);
     }
 
+    /// A source that imports `outside` in a way the lexical scan before
+    /// loading does not match (a comment between `import` and its path, which
+    /// Nickel skips), then evaluates `body` with the import bound to `leak`.
+    fn scan_missed_import(outside: &Path, body: &str) -> String {
+        format!(
+            "let leak = import # a comment the scan does not read past\n\"{}\" in\n{body}\n",
+            outside.to_str().unwrap()
+        )
+    }
+
+    /// Lays out [confined_layer] with `src` as both the package and the stack
+    /// source, and asserts that the scan before loading lets both through, so
+    /// only the check after loading can refuse them.
+    fn layer_the_scan_misses(dir: &Path, src: &str) -> (PathBuf, CheckCtx) {
+        let (layer, ctx) = confined_layer(dir, src, src);
+        for entry in ["packages/p/build.ncl", "stacks/s/stack.ncl"] {
+            let scanned = decode::Confinement::new(&layer, &[layer.join(entry)], &ctx.stdlib_dir);
+            assert!(scanned.is_ok(), "the scan refused {entry}: {scanned:?}");
+        }
+        (layer, ctx)
+    }
+
+    /// The package and the stack typecheck and compile; the check after
+    /// loading refuses the outside file they read.
+    #[tokio::test]
+    async fn check_refuses_an_import_the_scan_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = scan_missed_import(&dir.path().join("secret.ncl"), "{ name = leak.leaked }");
+        let (layer, ctx) = layer_the_scan_misses(dir.path(), &src);
+
+        let (pkg, pkg_text, stk, stk_text) = parse_results(&layer, ctx).await;
+        assert_refused(&pkg, &pkg_text);
+        assert_refused(&stk, &stk_text);
+    }
+
+    /// The package and the stack read the outside file, then fail to
+    /// typecheck: the refusal comes before the type error is reported.
+    #[tokio::test]
+    async fn check_refuses_an_import_the_scan_misses_when_typechecking_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = scan_missed_import(
+            &dir.path().join("secret.ncl"),
+            "{ name = leak.leaked, bad = (1 : String) }",
+        );
+        let (layer, ctx) = layer_the_scan_misses(dir.path(), &src);
+
+        let (pkg, pkg_text, stk, stk_text) = parse_results(&layer, ctx).await;
+        assert_refused(&pkg, &pkg_text);
+        assert_refused(&stk, &stk_text);
+    }
+
+    /// The outside file is JSON that does not parse. Typechecking skips it;
+    /// compiling parses it and fails with an error that would quote it. The
+    /// refusal comes before that error is reported.
+    #[tokio::test]
+    async fn check_refuses_an_import_the_scan_misses_when_compiling_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.json");
+        std::fs::write(&secret, format!("{SECRET} ) {{ not json")).unwrap();
+        let src = scan_missed_import(&secret, "{ name = leak }");
+        let (layer, ctx) = layer_the_scan_misses(dir.path(), &src);
+
+        let (pkg, pkg_text, stk, stk_text) = parse_results(&layer, ctx).await;
+        assert_refused(&pkg, &pkg_text);
+        assert_refused(&stk, &stk_text);
+    }
+
     /// A helper inside the package and a sibling package reached with `..`
     /// still evaluate.
     #[tokio::test]
