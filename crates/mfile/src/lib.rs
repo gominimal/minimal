@@ -1059,7 +1059,23 @@ fn legacy_hints_due(path: Option<&Path>, bytes: &[u8]) -> bool {
         .insert((path.to_path_buf(), hash_bytes(bytes)))
 }
 
-/// Whether a load refuses a task that sets `interactive = true` (BOX-054).
+/// Refuses a `state_key` from the project's own file that
+/// [`File::validate_state_component`] would refuse when the state directory
+/// is composed. An empty key means "no key": the task gets a temporary state
+/// directory, and a task can set it to opt out of a `[defaults.task]` key.
+fn refuse_state_key(entry: String, key: &str) -> Result<(), Error> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    File::validate_state_component(key).map_err(|reason| Error::InvalidStateKey {
+        entry,
+        value: key.to_owned(),
+        reason,
+    })
+}
+
+/// Whether a load refuses a task that sets `interactive = true` (BOX-054),
+/// and a `state_key` that is not one directory name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskCheck {
     /// Refuse it: the file is the project's own.
@@ -1194,14 +1210,16 @@ impl File {
     /// no `default` field, [`Error::HarnessTable`] if the file names the
     /// pre-v0.5.0 `harness` key, [`Error::MultipleTaskActions`] if a task
     /// sets more than one action key, [`Error::InteractiveTask`] if a
-    /// task sets `interactive = true`, or [`Error::InvalidSpecKey`] if
-    /// `[session]` or a task sets a `timeout` that is not a duration.
+    /// task sets `interactive = true`, [`Error::InvalidStateKey`] if a task
+    /// or `[defaults.task]` sets a non-empty `state_key` that is not one
+    /// directory name, or [`Error::InvalidSpecKey`] if `[session]` or a task
+    /// sets a `timeout` that is not a duration.
     pub fn validate(&self) -> Result<(), Error> {
         self.check(TaskCheck::Refuse)
     }
 
-    /// [`Self::validate`], with the interactive-task refusal as `tasks`
-    /// says.
+    /// [`Self::validate`], with the interactive-task and state-key refusals
+    /// as `tasks` says.
     fn check(&self, tasks: TaskCheck) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
@@ -1235,7 +1253,21 @@ impl File {
             }
             if tasks == TaskCheck::Refuse {
                 task.refuse_interactive(task_name)?;
+                if let Some(key) = &task.state_key {
+                    refuse_state_key(error::EntryHeader("tasks", task_name).to_string(), key)?;
+                }
             }
+        }
+        // A `state_key` names a directory under the project's state base, so
+        // it is refused here, by the rule the state directory applies, rather
+        // than when a task first runs. An upstream layer's tasks never run, so
+        // its keys are never used and are not checked. A legacy `[defaults]`
+        // key is settled into the same field, and its hint names
+        // `[defaults.task]` too.
+        if tasks == TaskCheck::Refuse
+            && let Some(key) = &self.defaults.state_key
+        {
+            refuse_state_key("[defaults.task]".to_owned(), key)?;
         }
         // BOX-049: an entry's `timeout` takes the duration grammar. A bad
         // value is refused here, before a spec is built from the entry.
@@ -3625,6 +3657,76 @@ mod tests {
         assert!(msg.contains("the `harness` key"), "{msg}");
         assert!(msg.contains("`name = \"x\"` under `[stack]`"), "{msg}");
         assert!(msg.starts_with(&path.display().to_string()), "{msg}");
+    }
+
+    /// The project's file is refused at load, with exit 3, when a task sets a
+    /// `state_key` that is not one directory name. The refusal names the task's
+    /// table and the key. A plain name loads, and so does an empty key, which
+    /// opts the task out of a default key.
+    #[test]
+    fn a_task_state_key_that_is_not_one_name_is_refused_at_load() {
+        let dir = tempdir().unwrap();
+        let load = |key: &str| {
+            std::fs::write(
+                dir.path().join(MFILE_NAME),
+                format!("[tasks.build]\nexec = \"true\"\nstate_key = {key:?}\n"),
+            )
+            .unwrap();
+            File::from_dir(dir.path())
+        };
+        for bad in ["../../etc", "/home/user", "a/b", "..", "."] {
+            let err = load(bad).expect_err(bad);
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            let msg = err.to_string();
+            assert!(msg.starts_with("`[tasks.build]` in minimal.toml"), "{msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{msg}");
+            assert!(msg.contains("one directory name"), "{msg}");
+        }
+        let file = load("dev").expect("a plain name loads");
+        assert_eq!(file.tasks["build"].state_key.as_deref(), Some("dev"));
+        load("").expect("an empty key means no key and loads");
+    }
+
+    /// A `[defaults.task]` `state_key` is checked as a task's is, and the
+    /// refusal names `[defaults.task]`.
+    #[test]
+    fn a_default_state_key_that_is_not_one_name_is_refused_at_load() {
+        let dir = tempdir().unwrap();
+        let load = |key: &str| {
+            std::fs::write(
+                dir.path().join(MFILE_NAME),
+                format!("[defaults.task]\nstate_key = {key:?}\n"),
+            )
+            .unwrap();
+            File::from_dir(dir.path())
+        };
+        let err = load("../up").expect_err("a path-shaped default key is refused");
+        assert_eq!(err.exit_code(), Some(3), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("`[defaults.task]` in minimal.toml"),
+            "{msg}"
+        );
+        assert!(msg.contains("\"../up\""), "{msg}");
+        let file = load("dev").expect("a plain default key loads");
+        assert_eq!(file.defaults.state_key.as_deref(), Some("dev"));
+    }
+
+    /// The package graph reads an upstream layer without the state-key check:
+    /// the layer's tasks never run, so its keys are never used, and the user
+    /// cannot fix that file.
+    #[test]
+    fn an_upstream_layer_with_a_bad_state_key_still_loads_for_the_graph() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[defaults.task]\nstate_key = \"../up\"\n\n\
+             [tasks.build]\nexec = \"true\"\nstate_key = \"a/b\"\n",
+        )
+        .unwrap();
+        File::from_dir(dir.path()).expect_err("the project's own file is refused");
+        let layer = File::from_dir_for_graph(dir.path()).expect("a graph layer loads");
+        assert_eq!(layer.tasks["build"].state_key.as_deref(), Some("a/b"));
     }
 
     /// A file parsed without a path (the wire/fuzz entry point) is still

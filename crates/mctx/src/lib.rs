@@ -1134,21 +1134,30 @@ impl Context {
             self.repo_dir()?.to_path_buf()
         };
         let state_base_dir = match state_key {
-            Some(name) if !name.is_empty() => durable_state_dir(
+            Some(key) if !key.is_empty() => durable_state_dir(
                 mfile,
-                name,
+                key,
                 self.daemon.config.state_base_dir(),
                 self.state_root(),
             )
             .map_err(|reason| {
+                // The file's load refuses such a key, so this is a key handed
+                // in some other way: name the task and where the key is set.
+                if mfile::File::validate_state_component(key).is_err() {
+                    return Error::Other(anyhow!(
+                        "Task `{name}` has the state key {key:?}, and {reason}. Set \
+                         `state_key` on the task or in `[defaults.task]` to one directory \
+                         name, such as \"dev\"."
+                    ));
+                }
                 Error::Other(anyhow!(
-                    "refusing to use state key {name:?}: {reason}. Choose a state key \
+                    "refusing to use state key {key:?}: {reason}. Choose a state key \
                      that is a single directory name"
                 ))
             })?
             .ok_or_else(|| {
                 Error::Other(anyhow!(
-                    "cannot determine state directory for state key {name:?}: \
+                    "cannot determine state directory for state key {key:?}: \
                      the location of the minimal file on disk is unknown"
                 ))
             })?,
