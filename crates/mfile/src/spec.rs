@@ -32,7 +32,7 @@
 //! Box Type, `[defaults]`, `[upstream]` and loadouts. The interim ends when
 //! that expander lands, writes this file, and bumps [`BOX_SPEC_VERSION`].
 
-use crate::expand::{ExpansionReport, Layer, ValueOrigin};
+use crate::expand::{ExpansionReport, Layer, Origin, ValueOrigin};
 use crate::{Session, Task};
 
 /// The version of the Box Spec shape that [`BoxSpec`] serializes.
@@ -227,24 +227,29 @@ impl BoxSpec {
     /// expansion, and each value the flags set from `flags`.
     ///
     /// `report` is the expansion's record of the layer that set each key.
+    /// `type_chain` names the types of the entry's type chain, the root
+    /// first, as [`crate::expand::Layers::type_defaults`] orders them.
     /// A setting that the expansion keeps both flat and under its section
-    /// takes the form that the later layer set. The packages take both
-    /// lists, in layer order, without duplicates.
+    /// takes the form that the later layer set. Within the type chain's
+    /// defaults, the more derived type is the later layer. The packages
+    /// take both lists, in that order, without duplicates.
     #[must_use]
     pub fn for_session_entry(
         entry: &str,
         expanded: &toml::Table,
         report: &ExpansionReport,
+        type_chain: &[String],
         flags: SpecFlags,
     ) -> Self {
-        let packages = layered_packages(expanded, report);
+        let ranking = Ranking { report, type_chain };
+        let packages = layered_packages(expanded, ranking);
         Self::build(
             boxes::SESSION_BOX_TYPE,
             entry,
             &packages,
             true,
             Entrypoint::Shell,
-            Some((expanded, Some(report))),
+            Some((expanded, Some(ranking))),
             flags,
         )
     }
@@ -276,19 +281,19 @@ impl BoxSpec {
         packages: &[String],
         pty_enabled: bool,
         entrypoint: Entrypoint,
-        // The entry's settings table, and the expansion's report for an
-        // expanded one.
-        extra: Option<(&toml::Table, Option<&ExpansionReport>)>,
+        // The entry's settings table, and the ranking of the expansion's
+        // origins for an expanded one.
+        extra: Option<(&toml::Table, Option<Ranking<'_>>)>,
         flags: SpecFlags,
     ) -> Self {
         // The entry's own keys that its table keeps among the ones it does
         // not read itself.
-        let hooks_on_resume = extra.is_some_and(|(t, report)| hooks_on_resume(t, report));
-        let timeout = extra.and_then(|(t, report)| entry_timeout(t, report));
+        let hooks_on_resume = extra.is_some_and(|(t, ranking)| hooks_on_resume(t, ranking));
+        let timeout = extra.and_then(|(t, ranking)| entry_timeout(t, ranking));
         // A spec that sets no lifetime keeps the `until_complete` that the
         // shipped `session` and `task` types declare.
         let lifetime = extra
-            .and_then(|(t, report)| entry_lifetime(t, report))
+            .and_then(|(t, ranking)| entry_lifetime(t, ranking))
             .unwrap_or(Lifetime::UntilComplete);
         let mut seen = std::collections::BTreeSet::new();
         let packages = packages
@@ -327,8 +332,8 @@ impl BoxSpec {
 /// Whether an entry's own table sets `hooks_on_resume = true` (BOX-028).
 /// The entry tables keep the key among the ones they do not read
 /// themselves, so it is read from there.
-fn hooks_on_resume(extra: &toml::Table, report: Option<&ExpansionReport>) -> bool {
-    later_value(extra, report, "hooks_on_resume", "execution")
+fn hooks_on_resume(extra: &toml::Table, ranking: Option<Ranking<'_>>) -> bool {
+    later_value(extra, ranking, "hooks_on_resume", "execution")
         .and_then(toml::Value::as_bool)
         .unwrap_or(false)
 }
@@ -337,18 +342,18 @@ fn hooks_on_resume(extra: &toml::Table, report: Option<&ExpansionReport>) -> boo
 /// when the entry sets none. The expansion refuses a value that is not
 /// one of [`Lifetime::ACCEPTED`] (see [`check_section`]), so an expanded
 /// spec never reaches here with a bad value.
-fn entry_lifetime(extra: &toml::Table, report: Option<&ExpansionReport>) -> Option<Lifetime> {
-    later_value(extra, report, "lifetime", "box").and_then(|value| value.clone().try_into().ok())
+fn entry_lifetime(extra: &toml::Table, ranking: Option<Ranking<'_>>) -> Option<Lifetime> {
+    later_value(extra, ranking, "lifetime", "box").and_then(|value| value.clone().try_into().ok())
 }
 
 /// The value of the setting `key`, written flat or under `section` with
 /// the same name. The expansion keeps the two forms as two top-level keys.
-/// The form that the later layer in `report` set wins, as for
-/// `loadout_mode` in [`crate::expand`]. Without a report, or when one
+/// The form that the later origin in `ranking` set wins, as for
+/// `loadout_mode` in [`crate::expand`]. Without a ranking, or when one
 /// layer sets both, the flat key wins.
 fn later_value<'a>(
     table: &'a toml::Table,
-    report: Option<&ExpansionReport>,
+    ranking: Option<Ranking<'_>>,
     key: &str,
     section: &str,
 ) -> Option<&'a toml::Value> {
@@ -359,7 +364,7 @@ fn later_value<'a>(
         .and_then(|t| t.get(key));
     match (flat, nested) {
         (Some(f), Some(n)) => {
-            let rank = |k: &str| report.and_then(|r| Some(r.values.get(k)?.first()?.layer));
+            let rank = |k: &str| ranking.and_then(|r| r.key(k));
             match (rank(key), rank(section)) {
                 (Some(f_at), Some(n_at)) if n_at > f_at => Some(n),
                 _ => Some(f),
@@ -369,12 +374,44 @@ fn later_value<'a>(
     }
 }
 
+/// How the stored spec orders the origins of an expansion's values: by
+/// layer, and within [`Layer::TypeDefaults`] by the type's position in
+/// the type chain, the root first. So a derived type's setting comes
+/// after its parent's, as the expansion's `loadout_mode` orders them.
+#[derive(Debug, Clone, Copy)]
+struct Ranking<'a> {
+    /// The expansion's record of the origin of each top-level key.
+    report: &'a ExpansionReport,
+    /// The entry's type chain, the root first.
+    type_chain: &'a [String],
+}
+
+impl Ranking<'_> {
+    /// The rank of `origin`. A later origin has a greater rank. An origin
+    /// outside the type chain's defaults, or of a type the chain does not
+    /// name, takes position 0 in its layer.
+    fn of(self, origin: &Origin) -> (Layer, usize) {
+        let at = origin
+            .box_type
+            .as_deref()
+            .and_then(|t| self.type_chain.iter().position(|c| c == t))
+            .unwrap_or(0);
+        (origin.layer, at)
+    }
+
+    /// The rank of the origin of the top-level key `key`, or of a list's
+    /// first item. `None` when the report does not name the key.
+    fn key(self, key: &str) -> Option<(Layer, usize)> {
+        Some(self.of(self.report.values.get(key)?.first()?))
+    }
+}
+
 /// The expanded spec's packages: the flat `packages` and the
 /// `install.packages` of its `[install]` section, merged in the order of
-/// the layers that set them, without duplicates. The fold already unions
-/// each form across its layers, and the report keeps the layer of each
+/// the origins that set them, without duplicates. The fold already unions
+/// each form across its layers, and the report keeps the origin of each
 /// flat item and of the `install` table.
-fn layered_packages(expanded: &toml::Table, report: &ExpansionReport) -> Vec<String> {
+fn layered_packages(expanded: &toml::Table, ranking: Ranking<'_>) -> Vec<String> {
     let strings = |value: Option<&toml::Value>| -> Vec<String> {
         value
             .and_then(toml::Value::as_array)
@@ -385,9 +422,9 @@ fn layered_packages(expanded: &toml::Table, report: &ExpansionReport) -> Vec<Str
             .collect()
     };
     let flat = strings(expanded.get("packages"));
-    let flat_layers: Vec<Option<Layer>> = match report.values.get("packages") {
-        Some(ValueOrigin::List(origins)) => origins.iter().map(|o| Some(o.layer)).collect(),
-        Some(ValueOrigin::Value(o)) => vec![Some(o.layer); flat.len()],
+    let flat_layers: Vec<Option<(Layer, usize)>> = match ranking.report.values.get("packages") {
+        Some(ValueOrigin::List(origins)) => origins.iter().map(|o| Some(ranking.of(o))).collect(),
+        Some(ValueOrigin::Value(o)) => vec![Some(ranking.of(o)); flat.len()],
         None => Vec::new(),
     };
     let nested = strings(
@@ -396,12 +433,8 @@ fn layered_packages(expanded: &toml::Table, report: &ExpansionReport) -> Vec<Str
             .and_then(toml::Value::as_table)
             .and_then(|t| t.get("packages")),
     );
-    let nested_layer = report
-        .values
-        .get("install")
-        .and_then(ValueOrigin::first)
-        .map(|o| o.layer);
-    let mut items: Vec<(Option<Layer>, String)> = flat
+    let nested_layer = ranking.key("install");
+    let mut items: Vec<(Option<(Layer, usize)>, String)> = flat
         .into_iter()
         .enumerate()
         .map(|(i, p)| (flat_layers.get(i).copied().flatten(), p))
@@ -431,8 +464,8 @@ fn settings_of(extra: &std::collections::HashMap<String, toml::Value>) -> toml::
 /// [`crate::duration::spec_timeout`]: `None` when the entry sets none or
 /// sets zero. [`crate::File::validate`] refuses a bad value before a spec
 /// is built, so a bad value here reads as `None`.
-fn entry_timeout(extra: &toml::Table, report: Option<&ExpansionReport>) -> Option<u64> {
-    later_value(extra, report, "timeout", "execution")
+fn entry_timeout(extra: &toml::Table, ranking: Option<Ranking<'_>>) -> Option<u64> {
+    later_value(extra, ranking, "timeout", "execution")
         .and_then(|value| crate::duration::spec_timeout(value).ok().flatten())
 }
 
@@ -1420,7 +1453,8 @@ mod tests {
             packages = ["ripgrep"]
         "#;
         let dev = expand_in(file, "dev").expect("dev expands");
-        let spec = BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, SpecFlags::default());
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
         assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
         assert_eq!(spec.entry, "dev");
         assert_eq!(spec.packages, vec!["git".to_string()]);
@@ -1435,8 +1469,13 @@ mod tests {
         );
 
         let plain = expand_in(file, "plain").expect("plain expands");
-        let spec =
-            BoxSpec::for_session_entry("plain", &plain.spec, &plain.report, SpecFlags::default());
+        let spec = BoxSpec::for_session_entry(
+            "plain",
+            &plain.spec,
+            &plain.report,
+            &[],
+            SpecFlags::default(),
+        );
         assert_eq!(spec.lifetime, Lifetime::UntilComplete, "{:?}", plain.spec);
         assert_eq!(spec.packages, vec!["ripgrep".to_string()]);
 
@@ -1446,9 +1485,34 @@ mod tests {
             "dev",
             &flat,
             &ExpansionReport::default(),
+            &[],
             SpecFlags::default(),
         );
         assert_eq!(spec.lifetime, Lifetime::UntilStopped);
+    }
+
+    // BCLI-029: within one type chain, a derived type's `[box] lifetime`
+    // beats the flat `lifetime` of the type it extends. Both are type
+    // defaults, so the type's position in the chain breaks the tie.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion_derived_type_wins() {
+        let file = r#"
+            [box_types.a]
+            extends = "session"
+            defaults = { lifetime = "until_complete" }
+
+            [box_types.b]
+            extends = "a"
+            defaults = { box = { lifetime = "until_stopped" } }
+
+            [boxes.dev]
+            type = "b"
+        "#;
+        let (dev, chain) = expand_typed(file, "dev");
+        assert_eq!(chain, ["session", "a", "b"]);
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &chain, SpecFlags::default());
+        assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
     }
 
     // BCLI-029: the entry's `[box] lifetime` beats a flat `lifetime` that
@@ -1463,7 +1527,8 @@ mod tests {
             lifetime = "until_stopped"
         "#;
         let dev = expand_in(file, "dev").expect("dev expands");
-        let spec = BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, SpecFlags::default());
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
         assert_eq!(spec.lifetime, Lifetime::UntilStopped, "{:?}", dev.spec);
 
         // The other way round: the entry's flat key beats a default's
@@ -1476,7 +1541,8 @@ mod tests {
             lifetime = "until_complete"
         "#;
         let dev = expand_in(file, "dev").expect("dev expands");
-        let spec = BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, SpecFlags::default());
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
         assert_eq!(spec.lifetime, Lifetime::UntilComplete, "{:?}", dev.spec);
     }
 
@@ -1492,7 +1558,8 @@ mod tests {
             packages = ["b", "a"]
         "#;
         let dev = expand_in(file, "dev").expect("dev expands");
-        let spec = BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, SpecFlags::default());
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
         assert_eq!(spec.packages, ["a", "c", "b"], "{:?}", dev.spec);
     }
 
@@ -1526,6 +1593,37 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// Expands the entry `name` of `file` over its type chain and the
+    /// file's `[defaults]`. Returns the expansion and the chain's type
+    /// names, the root first.
+    fn expand_typed(file: &str, name: &str) -> (crate::expand::Expansion, Vec<String>) {
+        let entries = crate::entry::read_entries(file.as_bytes()).expect("entries read");
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entry {name} read"));
+        let doc: toml::Table = toml::from_str(file).expect("test TOML parses");
+        let types = crate::box_types::BoxTypes::from_file(&doc).expect("the types resolve");
+        let resolved = types
+            .resolve_entry(entry)
+            .expect("the entry's type resolves");
+        let defaults = doc
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let project_types = types.project().keys().cloned().collect();
+        let layers = crate::expand::Layers {
+            type_defaults: resolved.defaults.clone(),
+            type_constraints: resolved.constraints.clone(),
+            ..crate::expand::Layers::default()
+        }
+        .with_file_defaults(&defaults, entry.box_type.as_deref(), &project_types);
+        let expansion = crate::expand::expand(entry, &layers).expect("the entry expands");
+        let chain = resolved.defaults.iter().map(|(t, _)| t.clone()).collect();
+        (expansion, chain)
     }
 
     /// Expands the entry `name` of `file`, with the file's `[defaults]`.

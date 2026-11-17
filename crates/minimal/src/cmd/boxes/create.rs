@@ -1786,6 +1786,10 @@ pub(crate) struct BoxEntryExpansion {
     /// The layer that set each top-level key of [`Self::spec`]. The stored
     /// spec reads it to choose between a flat key and its section's key.
     pub(crate) report: mfile::expand::ExpansionReport,
+    /// The types of the entry's type chain, the root first. The stored
+    /// spec reads it to rank two settings of the chain's type defaults, so
+    /// a derived type's setting beats its parent's.
+    pub(crate) type_chain: Vec<String>,
 }
 
 impl BoxEntryExpansion {
@@ -2055,10 +2059,16 @@ fn box_entry(
         packages = ?wire.packages,
         "expanded the box's entry"
     );
+    let type_chain = whole
+        .type_defaults
+        .iter()
+        .map(|(box_type, _)| box_type.clone())
+        .collect();
     Ok(BoxEntryExpansion {
         wire,
         spec: full.spec,
         report: full.report,
+        type_chain,
     })
 }
 
@@ -3600,6 +3610,7 @@ pub(crate) fn stamp_session_spec_as(
             &expanded.wire.name,
             &expanded.spec,
             &expanded.report,
+            &expanded.type_chain,
             flags,
         ),
         None => mfile::spec::BoxSpec::for_session(None, flags),
