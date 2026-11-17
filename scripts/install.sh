@@ -1687,14 +1687,17 @@ say "  ${dim}record: $(tilde "$prev_record")$rst"
 # differ from the root-owned copy `min finalize-install` installed: the
 # DNS service then runs the old program until the step runs again. False
 # when either file is missing or unreadable. The root is overridable for
-# install_test.sh.
+# install_test.sh. Sets $_ac_source to what the step's script copies from:
+# the shipped program on Linux, the app bundle around it on macOS.
 answerer_copy_differs() {
     _ac_root="${MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT:-}"
     if [ "$os" = darwin ]; then
-        _ac_shipped="$bindir/Minimal.app/Contents/MacOS/minzoned"
+        _ac_source="$bindir/Minimal.app"
+        _ac_shipped="$_ac_source/Contents/MacOS/minzoned"
         _ac_installed="$_ac_root/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
     else
         _ac_shipped="$bindir/minzoned"
+        _ac_source="$_ac_shipped"
         _ac_installed="$_ac_root/usr/local/lib/minimal/minzoned"
     fi
     [ -f "$_ac_shipped" ] && [ -f "$_ac_installed" ] && [ -r "$_ac_installed" ] || return 1
@@ -1707,15 +1710,7 @@ offer_finalize_install() {
     _fi_script="$tmpdir/finalize-script"
     "$bindir/min" finalize-install --show --script </dev/null \
         >"$_fi_script" 2>"$_fi_summary" || return 0
-    # An upgrade that ships a new minzoned leaves the installed DNS service
-    # on the old copy. The probe offers the step that replaces it; when the
-    # probe has no script to offer (it waits on a daemon), the installer
-    # still says what to run.
-    _fi_stale=0
-    answerer_copy_differs && _fi_stale=1
-    if ! grep -q '✗' "$_fi_summary" && [ "$_fi_stale" -eq 0 ]; then
-        return 0
-    fi
+    grep -q '✗' "$_fi_summary" || return 0
     case ":${PATH:-}:" in
         *":$bindir:"*) _fi_min=min ;;
         *)             _fi_min="\"$bindir/min\"" ;;
@@ -1725,13 +1720,17 @@ offer_finalize_install() {
     # summary; the installer prints the status lines and nothing else.
     grep -v '^warning: ' "$_fi_summary" >&2 || true
     if ! [ -s "$_fi_script" ]; then
-        if [ "$_fi_stale" -eq 1 ]; then
-            say "  Minimal's DNS service on this machine runs a different minzoned than this release ships."
-            say "  To replace it, run \`$_fi_min finalize-install\`."
-        elif grep -q 'waiting on a daemon' "$_fi_summary"; then
+        if grep -q 'waiting on a daemon' "$_fi_summary"; then
             say "  box names finish once a daemon runs: after your first \`min\`, run \`$_fi_min finalize-install\`."
         fi
         return 0
+    fi
+    # An upgrade that ships a new minzoned leaves the installed DNS service
+    # on the old copy. The replace line prints only when the probe's script
+    # copies this release's minzoned, so the run it names replaces the copy.
+    if answerer_copy_differs && grep -qF "\"$_ac_source" "$_fi_script"; then
+        say "  Minimal's DNS service on this machine runs a different minzoned than this release ships."
+        say "  To replace it, run \`$_fi_min finalize-install\`."
     fi
     _fi_tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
     if (exec <"$_fi_tty") 2>/dev/null; then

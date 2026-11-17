@@ -240,8 +240,14 @@ case "${1:-}" in
                 else
                     echo "Every part of the install is finished on this machine; there is nothing to run." >&2
                 fi
+                # $HOME/finalize.script, when present, is the script the
+                # probe prints in place of the stand-in one.
                 if [ -f "$HOME/finalize.summary" ]; then
-                    printf '#!/bin/sh\n# mock finalize-install script\n'
+                    if [ -f "$HOME/finalize.script" ]; then
+                        cat "$HOME/finalize.script"
+                    else
+                        printf '#!/bin/sh\n# mock finalize-install script\n'
+                    fi
                 fi
                 ;;
             " ")
@@ -1359,18 +1365,30 @@ case_installer_does_not_prompt_on_a_finished_host() {
 case_installer_offers_finalize_install_for_a_stale_answerer() {
     # An upgrade that ships a new minzoned leaves the installed DNS service on
     # the old root-owned copy. The probe reports the stale copy as a missing
-    # names item with a script, and the installer offers the step on a
-    # terminal: Enter runs `min finalize-install`, which replaces the copy.
+    # names item with a script that copies this release's minzoned, and the
+    # installer names the stale copy and offers the step on a terminal: Enter
+    # runs `min finalize-install`, which replaces the copy.
     fi_stale_line="DNS names for boxes (<box>.min.internal) in every program on this machine"
     fi_stale_fact="the installed DNS service runs a different minzoned than the one this version of Minimal ships; this step replaces it with this machine's own copy"
+    fi_stale_named="Minimal's DNS service on this machine runs a different minzoned than this release ships."
+    fi_stale_summary() {
+        printf '%s:\n  ✗ %s\n      today: %s\n      this step: %s\n' "$fi_status" \
+            "$fi_stale_line" "$fi_stale_fact" \
+            "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups to Minimal's DNS service on 127.0.0.1:7656 at every boot and installs that service" \
+            >"$1/finalize.summary"
+    }
+    # fi_copy_script <home> <source> — a probe script that copies <source>,
+    # as the real step's copy line names it.
+    fi_copy_script() {
+        # shellcheck disable=SC2016 # the script's own $t, not expanded here
+        printf '#!/bin/sh\ninstall -m 0755 -o root -g root "%s" "$t"\n' "$2" >"$1/finalize.script"
+    }
     HF10="$root/hf10"; mkdir -p "$HF10"
     fake_stale="$root/fake-stale-root"
     mkdir -p "$fake_stale/usr/local/lib/minimal"
     printf 'an-older-answerer-body\n' >"$fake_stale/usr/local/lib/minimal/minzoned"
-    printf '%s:\n  ✗ %s\n      today: %s\n      this step: %s\n' "$fi_status" \
-        "$fi_stale_line" "$fi_stale_fact" \
-        "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups to Minimal's DNS service on 127.0.0.1:7656 at every boot and installs that service" \
-        >"$HF10/finalize.summary"
+    fi_stale_summary "$HF10"
+    fi_copy_script "$HF10" "$HF10/bin/minzoned"
     FINALIZE_INSTALL_ROOT="$fake_stale"
     TTY_FILE="$root/tty-enter"
     printf '\n' >"$TTY_FILE"
@@ -1378,14 +1396,28 @@ case_installer_offers_finalize_install_for_a_stale_answerer() {
     TTY_FILE=
     check 0 "$rc" "an install over a stale DNS service exits 0"
     want_ok "the stale copy is shown as the probe reports it" grep -qF "$fi_stale_fact" "$OUT"
+    want_ok "the stale copy is named" grep -qF "$fi_stale_named" "$OUT"
+    want_ok "the command that replaces it is named" \
+        grep -qF "To replace it, run \`$(fi_min "$HF10") finalize-install\`." "$OUT"
     want_ok "the installer offers the step" grep -qF "$fi_prompt" "$OUT"
     check "$fi_probe
 finalize-install" "$(cat "$HF10/finalize.calls")" \
         "the probe runs once and Enter runs the step that replaces the copy"
     want_card_last "the card follows the offer over a stale copy (R10.4)"
 
-    # When the probe has no script to offer (it waits on a daemon), the
-    # installer still names the stale copy and the command that replaces it.
+    # The probe offers a script that does not copy minzoned: the run would
+    # not replace the copy, so the installer does not say it does.
+    HF13="$root/hf13"; mkdir -p "$HF13"
+    fi_stale_summary "$HF13"
+    run fi_stale_no_copy "$HF13"
+    check 0 "$rc" "a stale copy with a script that carries no copy exits 0"
+    want_ok "the summary is shown" grep -qF "$fi_stale_fact" "$OUT"
+    want_err "no replace line without the copy" grep -qF "$fi_stale_named" "$OUT"
+    want_err "no replace command without the copy" grep -qF "To replace it" "$OUT"
+
+    # When the probe has no script to offer (it waits on a daemon), a run of
+    # `min finalize-install` carries no replace step either: the installer
+    # keeps the come-back note and does not name a replace.
     HF11="$root/hf11"; mkdir -p "$HF11"
     printf '%s:\n  ✗ %s — waiting on a daemon (no daemon answered within 5s)\n' \
         "$fi_status" "$fi_stale_line" >"$HF11/finalize.waiting"
@@ -1393,21 +1425,49 @@ finalize-install" "$(cat "$HF10/finalize.calls")" \
     run fi_stale_waiting "$HF11"
     TTY_FILE=
     check 0 "$rc" "a waiting host with a stale copy exits 0"
-    want_ok "the stale copy is named" \
-        grep -qF "Minimal's DNS service on this machine runs a different minzoned than this release ships." "$OUT"
-    want_ok "the command that replaces it is named" \
-        grep -qF "To replace it, run \`$(fi_min "$HF11") finalize-install\`." "$OUT"
-    want_err "no come-back note beside it" grep -qF "after your first" "$OUT"
+    want_ok "the come-back note is kept" \
+        grep -qF "box names finish once a daemon runs: after your first \`min\`, run \`$(fi_min "$HF11") finalize-install\`." "$OUT"
+    want_err "no replace line while waiting" grep -qF "$fi_stale_named" "$OUT"
+    want_err "no replace command while waiting" grep -qF "To replace it" "$OUT"
     check "$fi_probe" "$(cat "$HF11/finalize.calls")" "a waiting host with a stale copy runs only the probe"
 
-    # The same bytes on both sides are no stale copy: a finished host stays quiet.
+    # The same bytes on both sides are no stale copy: the offer stays, with
+    # no replace line.
     HF12="$root/hf12"; mkdir -p "$HF12"
     cp "$mock/versions/v1/minzoned-linux-amd64" "$fake_stale/usr/local/lib/minimal/minzoned"
+    fi_stale_summary "$HF12"
+    fi_copy_script "$HF12" "$HF12/bin/minzoned"
     run fi_current "$HF12"
     FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "a host with the current copy exits 0"
-    want_err "a current copy is not named" grep -qF "runs a different minzoned" "$OUT"
-    want_err "a current copy sees no summary" grep -q "$fi_status" "$OUT"
+    want_err "a current copy is not named" grep -qF "$fi_stale_named" "$OUT"
+
+    # macOS: the copy lives in the app bundle, and the step copies the bundle.
+    HF14="$root/hf14"; mkdir -p "$HF14"
+    fake_dstale="$root/fake-darwin-stale-root"
+    mkdir -p "$fake_dstale/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS"
+    printf 'an-older-answerer-body\n' \
+        >"$fake_dstale/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
+    fi_stale_summary "$HF14"
+    fi_copy_script "$HF14" "$HF14/bin/Minimal.app/Contents/MacOS/minzoned"
+    FINALIZE_INSTALL_ROOT="$fake_dstale"
+    PLAT_S=Darwin; PLAT_M=arm64
+    run fi_darwin_stale "$HF14"
+    check 0 "$rc" "darwin: an install over a stale DNS service exits 0"
+    want_ok "darwin: the stale copy is named" grep -qF "$fi_stale_named" "$OUT"
+    want_ok "darwin: the command that replaces it is named" \
+        grep -qF "To replace it, run \`$(fi_min "$HF14") finalize-install\`." "$OUT"
+
+    # macOS, waiting on a daemon: the come-back note, no replace line.
+    HF15="$root/hf15"; mkdir -p "$HF15"
+    printf '%s:\n  ✗ %s — waiting on a daemon (no daemon answered within 5s)\n' \
+        "$fi_status" "$fi_stale_line" >"$HF15/finalize.waiting"
+    run fi_darwin_stale_waiting "$HF15"
+    PLAT_S=Linux; PLAT_M=x86_64
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "darwin: a waiting host with a stale copy exits 0"
+    want_ok "darwin: the come-back note is kept" grep -qF "after your first" "$OUT"
+    want_err "darwin: no replace line while waiting" grep -qF "$fi_stale_named" "$OUT"
 }
 
 case_checksum_mismatch() {
