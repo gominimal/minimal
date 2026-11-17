@@ -1875,7 +1875,7 @@ pub(crate) async fn run_entry(
         let (outcome, end, timed_out) = async {
             match open_task_box_run(&mut client, id, &args.entry, &task_cwd, &task_env).await {
                 Ok(channel) => {
-                    let outcome = bridge_exec(channel).await;
+                    let mut outcome = bridge_exec(channel).await;
                     run_guard.yield_to_handler().await;
                     let mut end = TaskBoxEnd::Keep;
                     let mut timed_out = false;
@@ -1896,7 +1896,7 @@ pub(crate) async fn run_entry(
                                 // nothing (BOX-186). The copy goes to the
                                 // project root on the record, not to the
                                 // folder the command ran in.
-                                let _outcomes = copy_ended_task_box_exports(
+                                let outcomes = copy_ended_task_box_exports(
                                     &mut client,
                                     id,
                                     &session_name,
@@ -1904,6 +1904,9 @@ pub(crate) async fn run_entry(
                                     &mut std::io::stderr(),
                                 )
                                 .await;
+                                // BOX-193, BOX-194: a skipped export turns
+                                // a 0 end into 125, and leaves other codes.
+                                outcome = Ok(exit_after_exports(exit, timed_out, &outcomes));
                             }
                             TaskBoxEnd::Remove => {
                                 tracing::info!(
@@ -2079,6 +2082,25 @@ pub fn run_outcome(exit: Option<u32>, timed_out: bool, entry: &str) -> Result<()
     exit_outcome(exit)
 }
 
+/// The exit status of an attached task run once it copied its box's
+/// exports: `exit`, the status the run bridged, unless the entrypoint
+/// exited 0 and an export was skipped. Then it is 125 (BOX-193). A run
+/// that its box's timeout ended keeps its status, so the command still
+/// exits 124, and so does any other end (BOX-194).
+pub(crate) fn exit_after_exports(
+    exit: Option<u32>,
+    timed_out: bool,
+    outcomes: &[crate::cmd::ExportOutcome],
+) -> Option<u32> {
+    match exit {
+        Some(0) => {
+            let code = crate::cmd::exit_code_after_exports(0, !timed_out, outcomes);
+            Some(u32::try_from(code).unwrap_or(0))
+        }
+        other => other,
+    }
+}
+
 /// Copies the declared exports of the task box `id` after an attached
 /// run, to `upload_root`: the project root that `stamp_project_root` put
 /// on the create request, so the record's project root (BOX-185). A run
@@ -2086,11 +2108,10 @@ pub fn run_outcome(exit: Option<u32>, timed_out: bool, entry: &str) -> Result<()
 /// A run with no exit status lost its connection, and the box can still
 /// run, so the copy happens only when the record shows that the box ended.
 ///
-/// Interim: the outcomes are not used yet. A skipped export does not turn
-/// a 0 end into 125 (BOX-193, gominimal/minimal#3445), and no
-/// `file_exported` event records them (BOX-195, gominimal/minimal#3446).
-/// This changes when those requirements land: the outcomes become the
-/// report and the exit code.
+/// The run sets its exit status from the outcomes with
+/// [`exit_after_exports`]. Interim: no `file_exported` event records them
+/// (BOX-195, gominimal/minimal#3446). This changes when that requirement
+/// lands: the outcomes become the report.
 pub(crate) async fn copy_ended_task_box_exports<E: std::io::Write>(
     client: &mut crate::client::Client,
     id: boxes::SessionId,

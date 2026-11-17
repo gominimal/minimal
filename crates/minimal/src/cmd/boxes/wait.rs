@@ -234,15 +234,20 @@ pub(crate) async fn box_wait_on_hosts(
             // every end, before it gives back the box's code. It copies
             // only into its own project (BOX-199).
             //
-            // Interim: each wait on an ended box copies again, and the
-            // outcomes are not used yet. The claim that stops a later
-            // wait from copying an export the record already holds is
-            // BOX-198 (gominimal/minimal#3446). The `file_exported` event
-            // is BOX-195 (gominimal/minimal#3446), and exit 125 for a
-            // skipped export is BOX-193 (gominimal/minimal#3445). All are
-            // later tasks.
+            // A skipped export turns the code 0 of an entrypoint that
+            // exited by itself into 125 (BOX-193). A stop, a timeout and
+            // any other code stand (BOX-194).
+            //
+            // Interim: each wait on an ended box copies again. The claim
+            // that stops a later wait from copying an export the record
+            // already holds is BOX-198 (gominimal/minimal#3446). The
+            // `file_exported` event is BOX-195 (gominimal/minimal#3446).
+            // Both are later tasks. Until the claim lands, each later
+            // `min box wait` or `min box attach` on the same end returns 125
+            // again when an export is still skipped, although BOX-198 says
+            // that a later command does not return 125.
             let root = shown.record.project_root.as_ref();
-            let _outcomes = copy_box_exports(
+            let outcomes = copy_box_exports(
                 &mut client,
                 id,
                 shown.record.name.as_deref().unwrap_or(target),
@@ -253,6 +258,9 @@ pub(crate) async fn box_wait_on_hosts(
             .await;
             return match ended {
                 Ok(code) => {
+                    let exited_clean =
+                        shown.record.state == "exited" && shown.record.exit_code == Some(0);
+                    let code = exit_code_after_exports(code, exited_clean, &outcomes);
                     tracing::info!(verb = "box wait", box_id = %id, exit_code = code, outcome = "ended");
                     Ok(code)
                 }

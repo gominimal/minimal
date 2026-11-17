@@ -1519,14 +1519,18 @@ where
         }
         _ => after.clone(),
     };
+    // The outcomes of the copy, and whether the box's entrypoint exited 0
+    // by itself. A skipped export then turns the attach's 0 into 125
+    // (BOX-193). A stop and any other code stand (BOX-194).
+    let mut copied = None;
     if let BoxAfterAttach::Listed(entry) = &ended
         && matches!(entry.state.as_str(), "stopped" | "exited")
     {
         let root = entry.project_root.as_ref();
-        // Interim: the outcomes are not used yet (BOX-193,
-        // gominimal/minimal#3445; BOX-195 and BOX-198,
+        // Interim: the outcomes go to no `file_exported` event, and no
+        // claim gates the copy (BOX-195 and BOX-198,
         // gominimal/minimal#3446). See `copy_box_exports`.
-        let _outcomes = copy_box_exports_on_host(
+        let outcomes = copy_box_exports_on_host(
             &target.host,
             target.box_id,
             target.name.as_deref().unwrap_or(&target.label),
@@ -1535,9 +1539,14 @@ where
             &mut std::io::stderr(),
         )
         .await;
+        let exited_clean = entry.state == "exited" && entry.exit_code == Some(0);
+        copied = Some((exited_clean, outcomes));
     }
     match attach_ending(&target, code, &after) {
-        Ok(ending) => {
+        Ok(mut ending) => {
+            if let Some((exited_clean, outcomes)) = &copied {
+                ending.code = exit_code_after_exports(ending.code, *exited_clean, outcomes);
+            }
             tracing::info!(
                 verb = name,
                 box_id = %target.box_id,
