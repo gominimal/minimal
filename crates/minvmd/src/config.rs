@@ -29,6 +29,11 @@ pub struct ResourceConfig {
     /// Persisted guest RAM in MiB, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_mib: Option<u32>,
+    /// Persisted per-box cap on the Box Egress Proxy connections a box can
+    /// hold at once, if set. Read at boot, so a change takes effect on the
+    /// next boot (see [`crate::cmd::effective_bep_per_box_cap`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bep_per_box_cap: Option<u32>,
 }
 
 impl ResourceConfig {
@@ -69,6 +74,7 @@ mod tests {
         let cfg = ResourceConfig::read(tmp.path()).expect("read");
         assert_eq!(cfg, ResourceConfig::default());
         assert!(cfg.vcpus.is_none() && cfg.ram_mib.is_none());
+        assert!(cfg.bep_per_box_cap.is_none());
     }
 
     #[test]
@@ -77,6 +83,7 @@ mod tests {
         let cfg = ResourceConfig {
             vcpus: Some(4),
             ram_mib: Some(6144),
+            bep_per_box_cap: Some(128),
         };
         cfg.write(tmp.path()).expect("write");
         let read_back = ResourceConfig::read(tmp.path()).expect("read");
@@ -90,6 +97,7 @@ mod tests {
         let cfg = ResourceConfig {
             vcpus: None,
             ram_mib: Some(3072),
+            bep_per_box_cap: None,
         };
         cfg.write(tmp.path()).expect("write");
         assert_eq!(ResourceConfig::read(tmp.path()).expect("read"), cfg);
@@ -101,6 +109,7 @@ mod tests {
         let cfg = ResourceConfig {
             vcpus: Some(2),
             ram_mib: None,
+            bep_per_box_cap: None,
         };
         cfg.write(tmp.path()).expect("write");
         let target = ResourceConfig::path(tmp.path());
