@@ -104,6 +104,13 @@ pub enum Error {
         name: String,
         layer: String,
     },
+    /// A `[[file_exports]]` path is absolute, has a `..` component, or
+    /// names the project root itself (BOX-189). Carries the path and the
+    /// layer that set it, as the message names it. Exits 3.
+    ExportOutsideProject {
+        path: String,
+        layer: String,
+    },
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -195,7 +202,8 @@ impl Error {
             | Error::ConstraintViolated { .. }
             | Error::BoxType(_)
             | Error::LoadoutVarConflict { .. }
-            | Error::DuplicateVar { .. } => Some(3),
+            | Error::DuplicateVar { .. }
+            | Error::ExportOutsideProject { .. } => Some(3),
             _ => None,
         }
     }
@@ -436,6 +444,12 @@ impl fmt::Display for Error {
                 "{layer} sets the variable `{name}` twice, to different values. \
                  Remove one of the two settings."
             ),
+            Error::ExportOutsideProject { path, layer } => write!(
+                f,
+                "{layer} exports `{path}`, which points outside the folder \
+                 that holds minimal.toml or names that folder itself. Give \
+                 the path of a file or folder inside that folder."
+            ),
         }
     }
 }
@@ -467,6 +481,7 @@ impl std::error::Error for Error {
             Error::BoxType(_) => None,
             Error::LoadoutVarConflict { .. } => None,
             Error::DuplicateVar { .. } => None,
+            Error::ExportOutsideProject { .. } => None,
         }
     }
 }

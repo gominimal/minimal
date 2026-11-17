@@ -268,6 +268,50 @@ async fn shutdown_rpc_returns_even_if_the_initiating_client_lingers() {
     drop(client);
 }
 
+/// While a connection held open across the shutdown keeps the drain going,
+/// a new connect is refused, not accepted into a backlog nobody serves: a
+/// queued connect would be reset when the listener closes at the end of the
+/// drain, and the client that made it would have read a live daemon.
+#[tokio::test]
+async fn a_connect_during_the_shutdown_drain_is_refused_not_queued() {
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    // The initiating client stays connected, so the drain lasts its whole
+    // grace period.
+    let mut client = connect_uds(&sock).await;
+    let resp = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    assert_eq!(resp, ShutdownResponse::ShuttingDown);
+
+    // The reply is written after the accept loop is told to stop, so the
+    // listener closes moments after it: poll briefly, well inside the grace.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let refused = loop {
+        match tokio::net::UnixStream::connect(&sock).await {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break true,
+            Err(e) => panic!("a connect during the drain failed with {e}, not a refusal"),
+            Ok(_) if tokio::time::Instant::now() >= deadline => break false,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    assert!(
+        refused,
+        "a connect during the drain must be refused, not accepted into the backlog"
+    );
+    assert!(
+        !run.is_finished(),
+        "the drain must still be running, or the refusal proves nothing about it"
+    );
+
+    let res = tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(3), run)
+        .await
+        .expect("run must return after the grace period aborts lingering connections");
+    assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
+    drop(client);
+}
+
 /// The first `conn` span `log` saw, once it has closed: its task has then
 /// recorded the outcome and logged how the connection ended.
 async fn first_conn_once_closed(
