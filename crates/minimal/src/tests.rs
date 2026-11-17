@@ -22016,10 +22016,13 @@ async fn multi_box_wait_copies_in_order_of_ends() {
 }
 
 // BOX-204: an attach that resumes a box with a terminal copies only an end
-// that comes after the resume, never the end the box resumed from. Here the
-// resume does not happen, as when its launch fails and the host writes back
-// the record it resumed from. The attach copies nothing and claims nothing,
-// so a later wait still copies that end once.
+// that comes after the resume, never the end the box resumed from. The box
+// stores a whole spec that declares the export, so a resume reads it. The
+// attach resumes the box through its shell. This crate's harness daemon has
+// no package store, so the launch fails after the spec is read, and the
+// host writes back the record the box resumed from. The attach copies
+// nothing and claims nothing, so a later wait still copies that end once.
+// minimald's own tests drive a resume that launches (BOX-025).
 #[tokio::test]
 async fn resumed_box_copies_at_next_end_only() {
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
@@ -22028,11 +22031,15 @@ async fn resumed_box_copies_at_next_end_only() {
     let project = tempfile::tempdir().expect("a temp project dir");
     let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
     let mut daemon = server.connect().await;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = true;
+    let mut spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    spec["file_exports"] = serde_json_lenient::json!([{ "path": "notes.md" }]);
     let dev = create_spec_box(
         &mut daemon,
         "dev",
         project.path(),
-        Some(export_spec(true, &["notes.md"])),
+        Some(spec),
         minimald_rpc::CreatingVerb::Session,
     )
     .await;
@@ -22048,6 +22055,7 @@ async fn resumed_box_copies_at_next_end_only() {
         .expect("the box stops");
 
     for code in [0, 1] {
+        let mut refusal = Vec::new();
         let _ = attach_on_hosts(
             AttachVerb::BoxResume,
             local_hosts(&global).unwrap(),
@@ -22055,9 +22063,28 @@ async fn resumed_box_copies_at_next_end_only() {
             None,
             Some(&here),
             true,
-            async |_target: &BoxAttachTarget| Ok(code),
+            async |_target: &BoxAttachTarget| {
+                let mut channel = daemon.open_shell(dev).await;
+                while let Ok(Some(msg)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), channel.wait()).await
+                {
+                    if let russh::ChannelMsg::Data { data } = msg {
+                        refusal.extend_from_slice(&data);
+                    }
+                }
+                Ok(code)
+            },
         )
         .await;
+        let refusal = String::from_utf8_lossy(&refusal);
+        assert!(
+            refusal.contains("no such package"),
+            "code {code}: the resume read the stored spec and reached the launch: {refusal:?}"
+        );
+        assert!(
+            !refusal.contains("settings it was created with"),
+            "code {code}: the stored spec with exports is read: {refusal:?}"
+        );
         assert!(
             !project.path().join("notes.md").exists(),
             "code {code}: the end the box resumes from gets no copy"
