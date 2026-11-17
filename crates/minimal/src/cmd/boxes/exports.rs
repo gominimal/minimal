@@ -568,9 +568,13 @@ pub(crate) fn copy_stopped_line(path: &str, label: &str) -> String {
 }
 
 /// The stderr line for an export that another command claimed for this
-/// end of the box (BOX-201).
-pub(crate) fn claimed_elsewhere_line(path: &str) -> String {
-    format!("Export {path} was not copied: another min command copied it or is copying it.")
+/// end of the box (BOX-201). The other command holds the claim or reported
+/// the export, copied or not, so the line says only that it claimed it.
+pub(crate) fn claimed_elsewhere_line(path: &str, label: &str) -> String {
+    format!(
+        "Export {path} of box {label} was not copied: another min command claimed it. \
+         Run `min box events {label}` to see what happened to it."
+    )
 }
 
 /// Why an export was not copied, as its stderr line says it.
@@ -1036,7 +1040,7 @@ where
         Err(reason) => return not_copied(err, &paths, &reason),
     };
     for path in &claim.refused {
-        let _ = writeln!(err, "{}", claimed_elsewhere_line(path));
+        let _ = writeln!(err, "{}", claimed_elsewhere_line(path, label));
     }
     let (end, granted) = (claim.end, claim.granted);
     if granted.is_empty() {
