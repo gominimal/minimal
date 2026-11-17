@@ -1175,6 +1175,21 @@ impl AnswererStep {
             }
         }
     }
+
+    /// Whether `min finalize-install --show` prints a script that
+    /// reinstalls the service for this step: the service is stale or
+    /// failing, the copy source passed its identity check, and the step
+    /// can carry it ([`answerer_install`]). A custody failure, a refused
+    /// source and an unavailable one are not offered, so a surface that
+    /// names the command for a failing service asks this first.
+    pub(crate) fn reinstall_offered(&self) -> bool {
+        match self {
+            AnswererStep::SourceVerified { service, source } => {
+                service.installed_but_stale_or_failing() && answerer_install(source).is_some()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The state of the installed DNS service's job, as the service manager
@@ -1239,8 +1254,8 @@ const ANSWERER_JOB_READ_BOUND: Duration = Duration::from_secs(1);
 
 /// The installed DNS service's job state, read from this host's service
 /// manager, blocking and bounded by [`ANSWERER_JOB_READ_BOUND`]. A read
-/// that does not finish in time, or does not run, is
-/// [`AnswererJob::Unknown`].
+/// that does not finish in time is killed. A read that does not finish,
+/// or does not run, is [`AnswererJob::Unknown`].
 pub(crate) fn answerer_job_blocking() -> AnswererJob {
     #[cfg(target_os = "macos")]
     let (program, args, parse): (&str, Vec<String>, fn(&str) -> AnswererJob) = (
@@ -1261,32 +1276,53 @@ pub(crate) fn answerer_job_blocking() -> AnswererJob {
         ],
         systemd_job_state,
     );
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("answerer-job-read".to_string())
-        .spawn(move || {
-            let output = std::process::Command::new(program)
-                .args(&args)
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output();
-            let _ = sender.send(output);
-        });
-    if spawned.is_err() {
-        return AnswererJob::Unknown;
-    }
-    match receiver.recv_timeout(ANSWERER_JOB_READ_BOUND) {
-        Ok(Ok(output)) if output.status.success() => {
-            parse(&String::from_utf8_lossy(&output.stdout))
+    let mut child = match std::process::Command::new(program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return AnswererJob::Unknown,
+    };
+    // The output is read on its own thread, so a report larger than the
+    // pipe buffer cannot stall the child while this thread waits on it.
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            text
+        })
+    });
+    let deadline = std::time::Instant::now() + ANSWERER_JOB_READ_BOUND;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    program,
+                    "the DNS service job state read did not finish in time; killed it and \
+                     claiming nothing"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
-        Ok(_) => AnswererJob::Unknown,
-        Err(_) => {
-            tracing::warn!(
-                program,
-                "the DNS service job state read did not finish in time; claiming nothing"
-            );
-            AnswererJob::Unknown
-        }
+    };
+    let text = reader.and_then(|reader| reader.join().ok());
+    match (status, text) {
+        (Some(status), Some(text)) if status.success() => parse(&text),
+        _ => AnswererJob::Unknown,
     }
 }
 
@@ -2085,6 +2121,12 @@ async fn installed_protocol_version() -> Option<u32> {
 /// range step it sits beside, and the command that fixes what it finds
 /// is the user's to run, never the session start's.
 pub(crate) async fn read_answerer_step() -> AnswererStep {
+    read_answerer_step_with_job(answerer_job().await).await
+}
+
+/// [`read_answerer_step`] over a job state the caller already read, so a
+/// command that read it once does not read it again.
+pub(crate) async fn read_answerer_step_with_job(job: AnswererJob) -> AnswererStep {
     let mut paths = vec![ANSWERER_PROGRAM_PATH];
     paths.extend(ANSWERER_UNIT_PATHS.iter().copied());
     let mut units = Vec::new();
@@ -2121,7 +2163,7 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
         installed_version: installed_protocol_version().await,
         installed_sha256: sha256_of(ANSWERER_PROGRAM_PATH).await.ok(),
         shipped_sha256,
-        job: answerer_job().await,
+        job,
     };
     let step = answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION);
     // The unit owns the channel socket by the operator's uid, so an
@@ -5038,55 +5080,91 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
     }
 }
 
-/// [`vm_host_answerer_line`] with the installed DNS service's job state
-/// read beside it: when another program holds the answerer's port, and
-/// that program is Minimal's own DNS service job — loaded, holding the
-/// port its unit binds, and not running — the line names that service
-/// and the command that reinstalls it, in place of "another program".
-/// `min ls` and the session start both print this line.
+/// The installed DNS service's state, as a command reads it once for every
+/// line it prints: its job state, and whether `min finalize-install
+/// --show` prints a script that reinstalls it
+/// ([`AnswererStep::reinstall_offered`]). The default claims nothing, so a
+/// line printed without the read names no failing service.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DnsServiceState {
+    /// The job state the service manager reports.
+    pub job: AnswererJob,
+    /// Whether `min finalize-install --show` offers the reinstall.
+    pub reinstall_offered: bool,
+}
+
+/// [`vm_host_answerer_line`] with the installed DNS service's state read
+/// beside it: when another program holds the answerer's port, and that
+/// program is Minimal's own DNS service job — loaded, holding the port its
+/// unit binds, and not running — the line names that service in place of
+/// "another program". It names `min finalize-install` only when that
+/// command offers the reinstall. `min ls` and the session start both print
+/// this line. Pure.
 #[must_use]
 pub fn vm_host_answerer_line_beside(
     status: ZoneAnswererStatus,
-    job: AnswererJob,
+    service: DnsServiceState,
 ) -> Option<String> {
     match status {
         ZoneAnswererStatus::PortHeldNoChannel { port }
-            if job == AnswererJob::NotRunning
+            if service.job == AnswererJob::NotRunning
                 && port == minvmd::net::answerer::DEFAULT_ANSWERER_PORT =>
         {
-            Some(failing_dns_service_line(port))
+            Some(failing_dns_service_line(port, service.reinstall_offered))
         }
         status => vm_host_answerer_line(status),
     }
 }
 
-/// The DNS SERVICE line `min ls` and the session start print for a
-/// control socket's status read, on this host: [`vm_host_answerer_line_beside`]
-/// with the job state read from this host's service manager. The read runs
-/// only when another program holds the DNS service's own port, so every
-/// other state prints without it.
-#[must_use]
-pub fn dns_service_line_on_this_host(status: ZoneAnswererStatus) -> Option<String> {
-    let job = match status {
+/// Whether a status read names the state where the DNS service's own job
+/// can hold the port: the port it binds, held with no channel behind it.
+pub(crate) fn port_held_by_service_job(status: &ZoneAnswererStatus) -> bool {
+    matches!(
+        status,
         ZoneAnswererStatus::PortHeldNoChannel { port }
-            if port == minvmd::net::answerer::DEFAULT_ANSWERER_PORT =>
-        {
-            answerer_job_blocking()
-        }
-        _ => AnswererJob::Unknown,
-    };
-    vm_host_answerer_line_beside(status, job)
+            if *port == minvmd::net::answerer::DEFAULT_ANSWERER_PORT
+    )
+}
+
+/// The installed DNS service's state on this host, read once for every
+/// status a command prints. The job state is read only when one of
+/// `statuses` is the port held with no channel, and the service step only
+/// when that job is not running. Every other read claims nothing.
+pub async fn dns_service_state_on_this_host<'a>(
+    statuses: impl IntoIterator<Item = &'a ZoneAnswererStatus>,
+) -> DnsServiceState {
+    if !statuses.into_iter().any(port_held_by_service_job) {
+        return DnsServiceState::default();
+    }
+    let job = answerer_job().await;
+    if job != AnswererJob::NotRunning {
+        return DnsServiceState {
+            job,
+            reinstall_offered: false,
+        };
+    }
+    DnsServiceState {
+        job,
+        reinstall_offered: read_answerer_step_with_job(job).await.reinstall_offered(),
+    }
 }
 
 /// The DNS SERVICE line for Minimal's own DNS service when its job holds
-/// the port and its program is not running. `min finalize-install`
-/// offers the reinstall for this state ([`AnswererStep::NotRunning`]).
+/// the port and its program is not running. The line names `min
+/// finalize-install` only when `reinstall_offered`: that command then
+/// offers the reinstall ([`AnswererStep::reinstall_offered`]). Otherwise
+/// the line states the situation and stops.
 #[must_use]
-pub fn failing_dns_service_line(port: u16) -> String {
-    format!(
-        "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} (UDP) but \
-         is not running. Run `min finalize-install` to reinstall it."
-    )
+pub fn failing_dns_service_line(port: u16, reinstall_offered: bool) -> String {
+    let line = format!(
+        "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} (UDP). The \
+         service is not running."
+    );
+    if reinstall_offered {
+        format!("{line} Run `min finalize-install` to reinstall it.")
+    } else {
+        line
+    }
 }
 
 /// The live surface from the reply a control socket answered — the VM host
@@ -5347,6 +5425,9 @@ pub struct HostInstall {
     /// scoping the plan applies (a VM-backed daemon carries no classifier
     /// item, a native one no KVM item).
     pub other_items_unfinished: bool,
+    /// The installed DNS service's state, which the `DNS SERVICE` line
+    /// reads to name a failing service. Read once per command.
+    pub dns_service: DnsServiceState,
 }
 
 /// Whether this host's install is unfinished (NET-018, NET-122): the names
@@ -6443,6 +6524,7 @@ pub(crate) mod tests {
     fn activate_prints_one_host_line_per_install_state() {
         let others_open = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
         let unfinished = host_line("web", &LiveSurface::Proxy, Some(7654), others_open);
         assert_eq!(
@@ -6613,6 +6695,7 @@ pub(crate) mod tests {
             HostInstall::default(),
             HostInstall {
                 other_items_unfinished: true,
+                ..HostInstall::default()
             },
         ] {
             let native = host_line("api", &LiveSurface::Native, Some(7654), host);
@@ -6664,6 +6747,7 @@ pub(crate) mod tests {
         const CLAUSE: &str = "; finish setup: min finalize-install";
         let others_open = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
         let cases = [
             (LiveSurface::Proxy, HostInstall::default(), true),
@@ -7757,6 +7841,7 @@ exit 0
     fn both_verbs_end_with_the_same_install_clause() {
         let host = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
         let clause = install_clause(install_unfinished(&LiveSurface::Proxy, host));
         assert_eq!(clause, "; finish setup: min finalize-install");
@@ -7829,6 +7914,7 @@ exit 0
                     HostInstall::default(),
                     HostInstall {
                         other_items_unfinished: true,
+                        ..HostInstall::default()
                     },
                 ] {
                     for at_own_address in [true, false] {
@@ -10634,35 +10720,99 @@ resolvectl domain minzone0 '~min.internal'
     fn vm_host_answerer_line_names_a_failing_dns_service() {
         let port = minvmd::net::answerer::DEFAULT_ANSWERER_PORT;
         let held = ZoneAnswererStatus::PortHeldNoChannel { port };
+        let failing = |reinstall_offered| DnsServiceState {
+            job: AnswererJob::NotRunning,
+            reinstall_offered,
+        };
+        // `min finalize-install --show` offers the reinstall: the line
+        // names the command.
         assert_eq!(
-            vm_host_answerer_line_beside(held.clone(), AnswererJob::NotRunning).as_deref(),
+            vm_host_answerer_line_beside(held.clone(), failing(true)).as_deref(),
             Some(
                 format!(
                     "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} \
-                     (UDP) but is not running. Run `min finalize-install` to reinstall it."
+                     (UDP). The service is not running. Run `min finalize-install` to \
+                     reinstall it."
                 )
                 .as_str()
             )
         );
-        // A running job, or no job, keeps the other-program line.
+        // No reinstall is offered (a custody failure, or no verified copy
+        // source): the line states the situation and stops.
+        assert_eq!(
+            vm_host_answerer_line_beside(held.clone(), failing(false)).as_deref(),
+            Some(
+                format!(
+                    "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} \
+                     (UDP). The service is not running."
+                )
+                .as_str()
+            )
+        );
+        // A running job, or no read, keeps the other-program line.
         for job in [AnswererJob::Running, AnswererJob::Unknown] {
+            let service = DnsServiceState {
+                job,
+                reinstall_offered: true,
+            };
             assert_eq!(
-                vm_host_answerer_line_beside(held.clone(), job),
+                vm_host_answerer_line_beside(held.clone(), service),
                 vm_host_answerer_line(held.clone()),
                 "{job:?}"
             );
         }
+        assert_eq!(
+            vm_host_answerer_line_beside(held.clone(), DnsServiceState::default()),
+            vm_host_answerer_line(held.clone())
+        );
         // A port the job does not bind is another program's.
         let other = ZoneAnswererStatus::PortHeldNoChannel { port: port + 1 };
         assert_eq!(
-            vm_host_answerer_line_beside(other.clone(), AnswererJob::NotRunning),
+            vm_host_answerer_line_beside(other.clone(), failing(true)),
             vm_host_answerer_line(other)
         );
         // The other states print as before.
         let holder = ZoneAnswererStatus::Holder { port };
         assert_eq!(
-            vm_host_answerer_line_beside(holder.clone(), AnswererJob::NotRunning),
+            vm_host_answerer_line_beside(holder.clone(), failing(true)),
             vm_host_answerer_line(holder)
+        );
+        // Only the service's own port held with no channel asks for a read.
+        assert!(port_held_by_service_job(&held));
+        assert!(!port_held_by_service_job(
+            &ZoneAnswererStatus::PortHeldNoChannel { port: port + 1 }
+        ));
+        assert!(!port_held_by_service_job(&ZoneAnswererStatus::Holder {
+            port
+        }));
+
+        // The reinstall is offered only over a verified copy source.
+        let source = VerifiedSource {
+            path: TEST_ANSWERER_SOURCE.to_string(),
+            sha256: "0".repeat(64),
+            bundle: Vec::new(),
+            requirement: None,
+        };
+        let over = |service: AnswererStep| AnswererStep::SourceVerified {
+            service: Box::new(service),
+            source: source.clone(),
+        };
+        assert!(over(AnswererStep::NotRunning).reinstall_offered());
+        assert!(over(AnswererStep::CopyDiffers).reinstall_offered());
+        assert!(!over(AnswererStep::Installed).reinstall_offered());
+        assert!(!AnswererStep::NotRunning.reinstall_offered());
+        assert!(
+            !AnswererStep::CustodyFailed {
+                failed_check: "its program is missing".to_string(),
+            }
+            .reinstall_offered()
+        );
+        assert!(
+            !AnswererStep::SourceUnavailable {
+                service: Box::new(AnswererStep::NotRunning),
+                reason: "no copy of minzoned ships beside min".to_string(),
+            }
+            .reinstall_offered()
         );
     }
 

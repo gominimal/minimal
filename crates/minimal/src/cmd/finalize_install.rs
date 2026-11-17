@@ -572,6 +572,7 @@ pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver
         other_items_unfinished: other_items_for_this_host(global, None)
             .iter()
             .any(|item| item.state != ItemState::Done),
+        ..crate::resolver::HostInstall::default()
     }
 }
 
@@ -653,44 +654,25 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
     let (answerer, held_no_channel) = match read {
         Ok(found) => found,
         Err(_) => {
-            return Item::waiting(
-                NAMES_ID,
-                NAMES_LABEL,
+            return reinstall_or_waiting(
+                global,
+                None,
                 format!(
                     "no daemon answered within {}s",
                     DAEMON_READ_DEADLINE.as_secs()
                 ),
-            );
+            )
+            .await;
         }
     };
     let Some((port, bound)) = answerer else {
-        // D3472: no daemon reports a port its channel reaches. When the
-        // installed DNS service is stale or not running, that service is
-        // what holds the port (or will, once it runs), so the item offers
-        // its reinstall at that port instead of waiting on a daemon.
-        let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
-        let service_port = held_no_channel.unwrap_or(minvmd::net::answerer::DEFAULT_ANSWERER_PORT);
-        if answerer_step.installed_but_stale_or_failing() {
-            let range_present = crate::resolver::live_name_surface_with_range_at(
-                &detection,
-                Some(service_port),
-                false,
-            )
-            .await
-            .and_then(|verdict| verdict.range_present);
-            if let Some(item) =
-                reinstall_item(&detection, service_port, range_present, &answerer_step)
-            {
-                return item;
-            }
-        }
         // No port to point a script at yet: the item waits on a daemon,
         // and never blocks the items the script can carry without one.
         let cause = match held_no_channel {
             Some(port) => crate::resolver::port_held_no_channel_warning(port),
             None => NO_PORT.to_string(),
         };
-        return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
+        return reinstall_or_waiting(global, held_no_channel, cause).await;
     };
     let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
     // The range read the live-surface verdict makes, so the item names the
@@ -712,11 +694,38 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
     names_item(verdict, port)
 }
 
+/// The names item when no daemon reports a port its channel reaches — no
+/// daemon answered in time, none runs, or none reports a port (D3472).
+/// When the installed DNS service is stale or not running and `min
+/// finalize-install` can reinstall it, that service is what holds the
+/// port (or will, once it runs), so the item offers its reinstall at that
+/// port. Otherwise the item waits on a daemon, for `cause`.
+async fn reinstall_or_waiting(
+    global: &GlobalArgs,
+    held_no_channel: Option<u16>,
+    cause: String,
+) -> Item {
+    let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
+    if answerer_step.reinstall_offered() {
+        let service_port = held_no_channel.unwrap_or(minvmd::net::answerer::DEFAULT_ANSWERER_PORT);
+        let range_present =
+            crate::resolver::live_name_surface_with_range_at(&detection, Some(service_port), false)
+                .await
+                .and_then(|verdict| verdict.range_present);
+        if let Some(item) = reinstall_item(&detection, service_port, range_present, &answerer_step)
+        {
+            return item;
+        }
+    }
+    Item::waiting(NAMES_ID, NAMES_LABEL, cause)
+}
+
 /// The names item when no daemon reports a port its channel reaches and
 /// the installed DNS service is stale or not running (D3472): the item the
 /// verdict decides at the service's port, so the script reinstalls the
-/// service. `None` when the service is not stale or failing: the caller
-/// then reports the item as waiting on a daemon. Pure over the reads.
+/// service. `None` when `min finalize-install` offers no reinstall
+/// ([`crate::resolver::AnswererStep::reinstall_offered`]): the caller then
+/// reports the item as waiting on a daemon. Pure over the reads.
 pub(crate) fn reinstall_item(
     detection: &(
         crate::resolver::Hook,
@@ -727,7 +736,7 @@ pub(crate) fn reinstall_item(
     range_present: Option<bool>,
     answerer_step: &crate::resolver::AnswererStep,
 ) -> Option<Item> {
-    if !answerer_step.installed_but_stale_or_failing() {
+    if !answerer_step.reinstall_offered() {
         return None;
     }
     let (hook, blocker, range_step) = detection;
@@ -2935,25 +2944,43 @@ mod tests {
             );
             let shown = plan.script().expect("--show --script prints a script");
             assert!(shown.starts_with("#!/bin/sh\n"), "{shown}");
-            if crate::resolver::answerer_install(&VerifiedSource {
-                path: crate::resolver::TEST_ANSWERER_SOURCE.to_string(),
-                sha256: "0".repeat(64),
-                bundle: Vec::new(),
-                requirement: None,
-            })
-            .is_some()
-            {
-                assert!(
-                    today.contains("; this step") && shown.contains(&"0".repeat(64)),
-                    "the script replaces the installed copy with the pinned one: {shown}"
-                );
-            }
+            // The fixture's copy source is a quotable path, so the step
+            // carries the copy: the script replaces the installed program
+            // with the pinned bytes.
+            assert!(today.contains("; this step"), "{today}");
+            let group = if cfg!(target_os = "macos") {
+                "wheel"
+            } else {
+                "root"
+            };
+            assert!(
+                shown.contains(&format!(
+                    "install -m 0755 -o root -g {group} \"{}\" \"$t\"",
+                    crate::resolver::TEST_ANSWERER_SOURCE
+                )),
+                "the script copies the shipped minzoned: {shown}"
+            );
+            assert!(
+                shown.contains(&format!("case \"$h\" in {}) ;;", "0".repeat(64))),
+                "the script checks the copy against the pinned hash: {shown}"
+            );
+            assert!(
+                shown.contains("mv -f \"$t\" \""),
+                "the script replaces the installed copy: {shown}"
+            );
         }
         // A service that holds, or none at all, is no reinstall: the caller
         // reports the item waiting on a daemon, as before.
         for service in [AnswererStep::Installed, AnswererStep::Absent] {
             assert!(reinstall_item(&detection, port, Some(true), &verified(service)).is_none());
         }
+        // A failing service with no verified copy source is no reinstall
+        // either: `--show` has no copy to carry.
+        let unavailable = AnswererStep::SourceUnavailable {
+            service: Box::new(AnswererStep::NotRunning),
+            reason: "no copy of minzoned ships beside min".to_string(),
+        };
+        assert!(reinstall_item(&detection, port, Some(true), &unavailable).is_none());
     }
 
     /// The names item's facts are a list in the summary and one line in
