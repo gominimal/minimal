@@ -158,9 +158,12 @@ contributors are deduplicated.
 packages = ["helix", "zellij"]
 ```
 
-Names are not checked at activation: an unknown package composes cleanly
-and fails later, when the session first spawns, with
-`no such package: <name>`.
+Activation checks each name against the packages that the project and its
+`[upstream]` pin declare. An unknown name stops the activation with
+`no such package: <name>`. When the project pins a git `[upstream]`, the
+refusal also names the upstream repo and the short `locked_commit`. A package
+that is newer than that commit is unknown until the pin moves. Run
+`min update` to move the pin, then activate again.
 
 ### `[vars]` - Environment variables {#vars}
 

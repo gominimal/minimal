@@ -129,7 +129,13 @@ pub async fn cmd_auth_login(_global: &GlobalArgs, args: AuthLoginArgs) -> anyhow
 
 /// `min auth status`.
 pub fn cmd_auth_status(_global: &GlobalArgs) -> anyhow::Result<()> {
-    write_status(&HostKeychain, now(), &mut std::io::stdout())
+    let identity = crate::mint::identity_path();
+    write_status(
+        &HostKeychain,
+        identity.as_deref(),
+        now(),
+        &mut std::io::stdout(),
+    )
 }
 
 /// `min auth logout`.
@@ -528,13 +534,62 @@ fn join(items: &[String]) -> String {
     }
 }
 
-/// Print the held sign-in's standing. Reads the item's metadata, never its
-/// token (BEP-004).
+/// Print the held sign-in's standing, then one line for each proxy key in
+/// Secret Service. Reads the item's metadata, never its token (BEP-004).
+/// Reads the proxy's published identity at `identity` for the keys
+/// (BEP-090).
 pub(crate) fn write_status(
     keychain: &dyn Keychain,
+    identity: Option<&std::path::Path>,
     now: u64,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    write_sign_in(keychain, now, out)?;
+    write_software_keys(identity, out)
+}
+
+/// One line for each proxy key that Secret Service holds (BEP-090). A key
+/// in the TPM or the keychain prints nothing. So does a missing identity
+/// file, because then no proxy published its keys here. Any other failure
+/// to read the file prints why, so silence never stands for safe custody.
+fn write_software_keys(
+    identity: Option<&std::path::Path>,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    use bep::publish::{Identity, PublishError};
+    let Some(path) = identity else {
+        return Ok(());
+    };
+    let identity = match Identity::read(path) {
+        Ok(identity) => identity,
+        Err(PublishError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(err) => {
+            writeln!(out, "{err}")?;
+            return Ok(());
+        }
+    };
+    let keys = [
+        ("sealing", &identity.sealing),
+        ("root", &identity.root),
+        ("signing", &identity.signing),
+    ];
+    for (role, key) in keys {
+        if key
+            .as_ref()
+            .is_some_and(bep::publish::PublishedKey::in_secret_service)
+        {
+            writeln!(
+                out,
+                "The proxy's {role} key is a software key in Secret Service. A program running as your user can copy it."
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_sign_in(keychain: &dyn Keychain, now: u64, out: &mut dyn Write) -> anyhow::Result<()> {
     let Some(meta) = keychain.metadata()? else {
         writeln!(
             out,
@@ -2662,7 +2717,7 @@ mod tests {
 
     fn status(keychain: &MemoryKeychain, now: u64) -> String {
         let mut out = Vec::new();
-        write_status(keychain, now, &mut out).expect("status");
+        write_status(keychain, None, now, &mut out).expect("status");
         String::from_utf8(out).expect("utf8")
     }
 
@@ -2701,6 +2756,84 @@ mod tests {
             "Signed in to GitHub as octocat. The token renews at the proxy on the next request that uses it.\n"
         );
         assert!(!out.contains(ACCESS) && !out.contains(REFRESH));
+    }
+
+    // BEP-090: each proxy key in Secret Service is named after the sign-in
+    // line. A key in the TPM or the keychain prints nothing.
+    #[test]
+    fn auth_status_reports_software_key_custody() {
+        use bep::publish::{Identity, PublishedKey};
+
+        let now = 1_792_411_200;
+        let keychain = held(now + 8 * 3600, now + 180 * 86_400);
+        let key = |store: Option<&str>| {
+            let public = bep::seal::ProxyKey::generate().unwrap().public();
+            Some(PublishedKey {
+                public: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(public.to_sec1_bytes()),
+                kid: public.kid(),
+                store: store.map(str::to_owned),
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let report = |identity: &Identity| {
+            identity.publish(&path).unwrap();
+            let mut out = Vec::new();
+            write_status(&keychain, Some(&path), now, &mut out).expect("status");
+            String::from_utf8(out).expect("utf8")
+        };
+        let sign_in =
+            "Signed in to GitHub as octocat. The token expires at 2026-10-19 20:00 UTC.\n";
+
+        let no_tpm = Identity {
+            sealing: key(Some("secret-service")),
+            root: key(Some("tpm")),
+            signing: key(Some("secret-service")),
+            ..Identity::default()
+        };
+        assert_eq!(
+            report(&no_tpm),
+            format!(
+                "{sign_in}\
+                 The proxy's sealing key is a software key in Secret Service. A program running as your user can copy it.\n\
+                 The proxy's signing key is a software key in Secret Service. A program running as your user can copy it.\n"
+            )
+        );
+
+        // Keys in the TPM, the keychain, or an identity file from an older
+        // `bep` that names no store, print nothing.
+        let hardware = Identity {
+            sealing: key(Some("tpm")),
+            root: key(Some("keychain")),
+            signing: key(None),
+            ..Identity::default()
+        };
+        assert_eq!(report(&hardware), sign_in);
+
+        // No identity file: the sign-in line alone.
+        let mut out = Vec::new();
+        write_status(
+            &keychain,
+            Some(&dir.path().join("none.json")),
+            now,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), sign_in);
+
+        // An identity file that does not read says why, after the sign-in
+        // line, so silence never stands for safe custody.
+        std::fs::write(&path, b"not json").unwrap();
+        let mut out = Vec::new();
+        write_status(&keychain, Some(&path), now, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{sign_in}The proxy's published identity at {} is not valid JSON. Delete it, then start `bep` to publish it again.\n",
+                path.display()
+            )
+        );
     }
 
     /// A memory keychain that counts the reads of the material and the
@@ -2761,7 +2894,7 @@ mod tests {
             stored.metadata.refresh_expires_at + 60,
         ] {
             let mut out = Vec::new();
-            write_status(&keychain, now, &mut out).expect("status");
+            write_status(&keychain, None, now, &mut out).expect("status");
             let out = String::from_utf8(out).expect("utf8");
             assert!(!out.contains(ACCESS) && !out.contains(REFRESH), "{out}");
         }

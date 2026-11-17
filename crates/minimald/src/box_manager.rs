@@ -1490,6 +1490,153 @@ enum AdmissionRootRefusal {
     Constraint(RootConstraintRefusal),
 }
 
+/// The two projection digests of a create's spec (BOX-071): the one the
+/// client sent, and the one the daemon recomputed from the spec it
+/// received.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectionDigests {
+    /// The client's digest, or why the create carries none.
+    client: ClientDigest,
+    /// The daemon's digest, `None` when the create carries no spec or the
+    /// spec has no projection.
+    daemon: Option<String>,
+    /// Why the daemon has no digest for a spec that the create carries.
+    unprojected: Option<String>,
+}
+
+/// The client's projection digest on a create (BOX-071).
+///
+/// A malformed value stays distinct from an absent one, so that BOX-072
+/// can refuse it as a differing digest and not accept it as a client that
+/// predates the key. The malformed value itself is never kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum ClientDigest {
+    /// The client sent no digest.
+    #[default]
+    Absent,
+    /// The client sent a value that is not a digest in form.
+    Malformed,
+    /// The client sent a digest in form.
+    Digest(String),
+}
+
+impl ProjectionDigests {
+    /// The client's digest as the span and the log name it: the digest,
+    /// `malformed`, or `none`. A malformed value is never named as sent.
+    fn client_word(&self) -> &str {
+        match &self.client {
+            ClientDigest::Absent => "none",
+            ClientDigest::Malformed => "malformed",
+            ClientDigest::Digest(digest) => digest.as_str(),
+        }
+    }
+
+    /// Records both digests on the create's span and writes them to the
+    /// daemon log.
+    fn record(&self, span: &tracing::Span, session_name: &str) {
+        let client = self.client_word();
+        let daemon = self.daemon.as_deref().unwrap_or("none");
+        span.record("client_projection_digest", client);
+        span.record("daemon_projection_digest", daemon);
+        match &self.unprojected {
+            Some(why) => tracing::warn!(
+                session_name,
+                client_projection_digest = client,
+                daemon_projection_digest = daemon,
+                reason = %why,
+                "the daemon computed no projection digest for the box spec"
+            ),
+            None => tracing::info!(
+                session_name,
+                client_projection_digest = client,
+                daemon_projection_digest = daemon,
+                policy = PROJECTION_POLICY_NONE,
+                "computed the box spec's projection digest"
+            ),
+        }
+    }
+}
+
+/// The projection digests of a create (BOX-071): the client's from
+/// `config`, and the daemon's recomputed from `spec`, the spec the create
+/// carries. A spec that names no type is of `verb_type`.
+fn projection_digests(
+    config: &minimald_rpc::BoxConfig,
+    spec: Option<&serde_json_lenient::Value>,
+    verb_type: &str,
+) -> ProjectionDigests {
+    let client = match config.client_projection_digest() {
+        None => ClientDigest::Absent,
+        Some(digest) if is_projection_digest(digest) => ClientDigest::Digest(digest.to_owned()),
+        Some(digest) => {
+            tracing::warn!(
+                digest_len = digest.len(),
+                "ignored a client projection digest that is not 43 base64url characters"
+            );
+            ClientDigest::Malformed
+        }
+    };
+    let (daemon, unprojected) = match spec.map(|s| mfile::projection::spec_digest(s, verb_type)) {
+        None => (None, None),
+        Some(Ok(digest)) => (Some(digest), None),
+        Some(Err(why)) => (None, Some(why.to_string())),
+    };
+    ProjectionDigests {
+        client,
+        daemon,
+        unprojected,
+    }
+}
+
+/// The refusal of a create whose client projection digest differs from
+/// the one the daemon recomputed from the spec it received (BOX-072).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectionDigestRefusal;
+
+impl std::fmt::Display for ProjectionDigestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "No box was created. minimald read different box settings from the box spec \
+             than the `min` that sent it. This can happen when `min` and minimald are \
+             different builds. Run `min stop` to stop minimald, then run the \
+             command again to start minimald from the same build as `min`.",
+        )
+    }
+}
+
+impl std::error::Error for ProjectionDigestRefusal {}
+
+impl ProjectionDigests {
+    /// Whether the create must be refused (BOX-072): the client sent a
+    /// digest, or a value that is not one, and it differs from the
+    /// daemon's. A client that sends no digest predates the key, and a
+    /// create with no spec has nothing to compare, so neither is refused.
+    fn mismatch(&self, has_spec: bool) -> bool {
+        has_spec
+            && match &self.client {
+                ClientDigest::Absent => false,
+                ClientDigest::Malformed => true,
+                ClientDigest::Digest(client) => self.daemon.as_deref() != Some(client.as_str()),
+            }
+    }
+}
+
+/// The policy that a create evaluates against the projection (BOX-073).
+/// No host this daemon runs on is enrolled, so the create evaluates no
+/// policy, and the span and the log say `none`.
+pub(crate) const PROJECTION_POLICY_NONE: &str = "none";
+
+/// Whether `digest` has the form of a projection digest: SHA-256 as
+/// base64url with no padding, 43 characters. A client value of any other
+/// form is not stored, logged or recorded on the span: the span and the
+/// log say `malformed` in its place.
+fn is_projection_digest(digest: &str) -> bool {
+    digest.len() == 43
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// The spec's Box Type and the built-in type it is built on (BOX-071): the
 /// type is `box.type`. A built-in type is its own root (Gatehouse §6.3.2),
 /// so the root of a built-in `box.type` is the type itself, and the root
@@ -1658,9 +1805,10 @@ fn builtin_root_refusal(
 /// The Box Spec sections that a spec can carry and that this daemon does
 /// not enforce (BOX-076): the top-level key, the key inside it when the
 /// section is one key of a table, and the section as the log names it.
-const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
+/// `[[file_exports]]` is not one: the command that waits for the box
+/// copies it on the client (BOX-185).
+const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 4] = [
     ("file_imports", None, "[[file_imports]]"),
-    ("file_exports", None, "[[file_exports]]"),
     ("github_imports", None, "[[github_imports]]"),
     ("otel", None, "[otel]"),
     (
@@ -1669,6 +1817,14 @@ const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
         "[network] vpn_network_names",
     ),
 ];
+
+/// How many `lifecycle_hooks` the received spec carries, each with its
+/// `declared_by` (BOX-179). `None` for a spec with no hook list.
+fn stored_hook_count(spec: &serde_json_lenient::Value) -> Option<usize> {
+    spec.get("lifecycle_hooks")
+        .and_then(serde_json_lenient::Value::as_array)
+        .map(Vec::len)
+}
 
 /// The sections of `spec` that the daemon carries in the stored spec but
 /// does not enforce, in the order of [`UNENFORCED_SECTIONS`], each once.
@@ -1770,6 +1926,9 @@ fn unenrolled_broker_refusal(
             // proxy is present and serves only GitHub grants. The cause
             // for that case lives in `crates/boxes` (#3277).
             boxes::core::bep::ProxyAbsence::NotServed,
+            // A spec comes from any entry, and not with the minimal.toml
+            // table that set its `secrets`, so the refusal names none.
+            None,
         ),
         grants,
     ))
@@ -4188,6 +4347,12 @@ impl BoxManager {
             fresh,
             // BOX-160: the admission refusal, when the create is refused.
             refusal = tracing::field::Empty,
+            // BOX-071: the client's and the daemon's projection digests.
+            client_projection_digest = tracing::field::Empty,
+            daemon_projection_digest = tracing::field::Empty,
+            // BOX-073: the host is not enrolled, so no policy is evaluated
+            // against the projection.
+            policy = PROJECTION_POLICY_NONE,
         )
     )]
     async fn create_session(
@@ -4291,6 +4456,9 @@ impl BoxManager {
         // BOX-076: the sections the daemon carries but does not enforce,
         // read before the spec becomes its stored bytes.
         let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
+        // BOX-068, BOX-179: the hooks the stored spec keeps, each with its
+        // declarer, counted for the log line that stores the spec.
+        let stored_hooks = spec.as_ref().and_then(stored_hook_count);
         // BOX-081: no identity plane is configured on this host, so a
         // brokered secret is refused unless a node-local proxy serves the
         // box and the secret is a GitHub grant. The refusal comes before the record exists, so it leaves no
@@ -4380,6 +4548,49 @@ impl BoxManager {
             }
             Some(Ok(())) | None => {}
         }
+        // BOX-071: the daemon recomputes the projection digest from the
+        // spec it received, and the record stores it beside the client's.
+        // The daemon's key is its own: a client that sends it has it
+        // dropped.
+        config
+            .attrs
+            .remove(minimald_rpc::DAEMON_PROJECTION_DIGEST_ATTR);
+        let digests = projection_digests(&config, spec.as_ref(), verb_type);
+        // A client value that is not a digest in form is not stored. A
+        // client digest is stored only beside a daemon digest: with no
+        // spec, or a spec the daemon cannot project, the record has
+        // nothing to compare it with. The log still names it.
+        if !matches!(digests.client, ClientDigest::Digest(_)) || digests.daemon.is_none() {
+            config
+                .attrs
+                .remove(minimald_rpc::CLIENT_PROJECTION_DIGEST_ATTR);
+        }
+        if let Some(daemon) = &digests.daemon {
+            config.attrs.insert(
+                minimald_rpc::DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
+                daemon.clone(),
+            );
+        }
+        digests.record(&span, session_name);
+        // BOX-072: a client that projected the spec to another digest
+        // read it otherwise. The refusal comes before the record exists,
+        // so it leaves no record, id or name behind.
+        if digests.mismatch(spec.is_some()) {
+            let refusal = ProjectionDigestRefusal;
+            span.record("refusal", "projection digest mismatch");
+            tracing::info!(
+                session_name,
+                client_projection_digest = digests.client_word(),
+                daemon_projection_digest = digests.daemon.as_deref().unwrap_or("none"),
+                "refused a create: the client's projection digest differs from the daemon's"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                refusal,
+            ));
+        }
+        // BOX-073: this host is not enrolled, so the create evaluates no
+        // policy against the projection. The span's `policy` field says so.
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -4572,6 +4783,7 @@ impl BoxManager {
                         session_id = %session_id,
                         spec_bytes = bytes.len(),
                         spec_path = %path.as_str(),
+                        lifecycle_hooks = ?stored_hooks,
                         "stored the box spec"
                     );
                     // BOX-076: one warning for each unenforced section.
@@ -5896,6 +6108,431 @@ pub(crate) fn write_box_event(
         "wrote a box event"
     );
     Ok(event)
+}
+
+/// The keys of the `data` object of a `file_exported` event (BOX-195).
+pub mod export_data {
+    /// The export's path, as the spec declares it.
+    pub const PATH: &str = "path";
+    /// Whether every file and folder of the export was written.
+    pub const COPIED: &str = "copied";
+    /// Each file the command wrote, with its `path`, `size` and `sha256`.
+    pub const FILES: &str = "files";
+    /// The end the export was claimed for: the count of `exited` events
+    /// on the record when the claim was granted.
+    pub const END: &str = "end";
+}
+
+/// Where one export of one end of a box stands (BOX-198): one line of the
+/// box's export claims file, written when the daemon grants the export.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExportClaimEntry {
+    /// The record id of the box.
+    #[serde(rename = "box")]
+    pub box_id: SessionId,
+    /// The end the export was granted for.
+    pub end: u64,
+    /// The export's path, as the spec declares it.
+    pub path: String,
+    /// The id, on this daemon run, of the connection that holds the claim.
+    pub connection: u64,
+    /// The id of the daemon run that granted the claim.
+    pub boot: String,
+}
+
+/// The name of the file beside a box's events that holds its export claims
+/// (BOX-198). It is part of the box's record, so it goes with the box.
+pub(crate) const EXPORT_CLAIMS_FILE: &str = "export_claims.jsonl";
+
+/// The id of this daemon run. A claim that an earlier run granted holds
+/// nothing, because its connection ended with that run (BOX-202).
+static BOOT_ID: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::now_v7().to_string());
+
+/// The connections of this daemon run that claimed exports, each with its
+/// id and its liveness. This is only a cache of liveness: the claims are
+/// on the box's record. A connection that ended leaves the cache, and its
+/// id is never given again, so its claims hold nothing (BOX-202).
+#[derive(Debug, Default)]
+pub(crate) struct ExportHolders {
+    /// The id the next new connection gets.
+    next: u64,
+    /// Each live connection's id and liveness.
+    live: Vec<(u64, std::sync::Weak<()>)>,
+}
+
+impl ExportHolders {
+    /// Drops each connection that ended.
+    fn prune(&mut self) {
+        self.live.retain(|(_, live)| live.strong_count() > 0);
+    }
+
+    /// The id of the connection whose liveness is `holder`, if it claimed
+    /// before and is live.
+    fn find(&self, holder: &std::sync::Weak<()>) -> Option<u64> {
+        self.live
+            .iter()
+            .find(|(_, live)| std::sync::Weak::ptr_eq(live, holder) && live.strong_count() > 0)
+            .map(|(id, _)| *id)
+    }
+
+    /// The id of the connection whose liveness is `holder`. A connection
+    /// seen for the first time gets a new id.
+    fn id_of(&mut self, holder: &std::sync::Weak<()>) -> u64 {
+        if let Some(id) = self.find(holder) {
+            return id;
+        }
+        self.next += 1;
+        self.live.push((self.next, holder.clone()));
+        self.next
+    }
+
+    /// Whether `entry` still holds its export: its daemon run is this one
+    /// and its connection is live.
+    fn holds(&self, entry: &ExportClaimEntry) -> bool {
+        entry.boot == *BOOT_ID
+            && self
+                .live
+                .iter()
+                .any(|(id, live)| *id == entry.connection && live.strong_count() > 0)
+    }
+}
+
+/// The cache of live claiming connections. Its lock is also held from the
+/// read of a box's claims and events to the write of a grant or a report,
+/// so two commands never both hold one export of an end.
+static EXPORT_CLAIMS: std::sync::LazyLock<std::sync::Mutex<ExportHolders>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Locks [`EXPORT_CLAIMS`]. A panic while the lock was held leaves the
+/// cache whole, so a poisoned lock is still used.
+pub(crate) fn export_claims() -> std::sync::MutexGuard<'static, ExportHolders> {
+    EXPORT_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The path of the export claims file of the box whose events are at
+/// `object`.
+fn export_claims_path(object: &boxes::store::DiskBox) -> camino::Utf8PathBuf {
+    object
+        .events_path()
+        .as_utf8_path()
+        .with_file_name(EXPORT_CLAIMS_FILE)
+}
+
+/// Every claim entry on the record of the box at `object`. A line that does
+/// not parse, torn by a crash, is skipped: the run that wrote it is over,
+/// so it holds nothing.
+fn read_export_claims(
+    object: &boxes::store::DiskBox,
+) -> Result<Vec<ExportClaimEntry>, std::io::Error> {
+    let path = export_claims_path(object);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json_lenient::from_str(line) {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                tracing::warn!(
+                    claims_path = %path,
+                    %error,
+                    "skipped an export claim line that does not parse"
+                );
+                None
+            }
+        })
+        .collect())
+}
+
+/// Appends `entries` to the export claims file of the box at `object`, and
+/// syncs it before this returns (BOX-198). The box's directory is never
+/// created here.
+fn append_export_claims(
+    object: &boxes::store::DiskBox,
+    entries: &[ExportClaimEntry],
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    for entry in entries {
+        serde_json_lenient::to_writer(&mut bytes, entry)?;
+        bytes.push(b'\n');
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(export_claims_path(object))?;
+    file.write_all(&bytes)?;
+    file.sync_data()
+}
+
+/// The paths of the exports of end `end` that a `file_exported` event in
+/// `events` reports.
+fn reported_exports(events: &[BoxEvent], end: u64) -> std::collections::HashSet<&str> {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind == BoxEventType::FileExported
+                && event
+                    .data
+                    .get(export_data::END)
+                    .and_then(serde_json_lenient::Value::as_u64)
+                    == Some(end)
+        })
+        .filter_map(|event| {
+            event
+                .data
+                .get(export_data::PATH)
+                .and_then(serde_json_lenient::Value::as_str)
+        })
+        .collect()
+}
+
+impl BoxManagerHandle {
+    /// The record of the ended box `id`, its events reader, and its last
+    /// end: the count of its `exited` events.
+    async fn ended_box_events(
+        &self,
+        id: SessionId,
+    ) -> Result<(boxes::Record, BoxEventsReader, Vec<BoxEvent>, u64), BoxManagerError> {
+        let Some(record) = self.retained_record(id).await? else {
+            return Err(unknown_box(id));
+        };
+        let mut reader = self.box_events(record.id).await?;
+        let events = reader.read_new()?;
+        let end = events
+            .iter()
+            .filter(|event| event.kind == BoxEventType::Exited)
+            .count() as u64;
+        Ok((record, reader, events, end))
+    }
+
+    /// Claims the exports `paths` of the last end of box `id` for the
+    /// connection whose liveness is `holder` (BOX-198). Each path that no
+    /// live connection holds and no command reported for that end is
+    /// granted, and the rest are refused. The grant is recorded before
+    /// this returns, so two callers never both hold one export of an end.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `InvalidInput` for a box that
+    /// is running or has never ended, or an I/O error if its events cannot
+    /// be read.
+    pub async fn claim_exports(
+        &self,
+        id: SessionId,
+        paths: &[String],
+        holder: &std::sync::Weak<()>,
+    ) -> Result<minimald_rpc::ClaimExportsResponse, BoxManagerError> {
+        let (record, mut reader, mut events, end) = self.ended_box_events(id).await?;
+        let ended = matches!(
+            record.status,
+            boxes::BoxState::Stopped | boxes::BoxState::Exited
+        );
+        if !ended || end == 0 {
+            tracing::info!(
+                session_id = %record.id,
+                status = ?record.status,
+                end,
+                "export claim: the box has not ended; nothing is granted"
+            );
+            // The client puts this reason after "because". A box with an
+            // end that runs now was resumed. Any other box has no end.
+            let reason = if end > 0 {
+                "the box is running again, so its files can change"
+            } else {
+                "the box has not ended"
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                reason,
+            ));
+        }
+        let mut granted = Vec::new();
+        let mut refused = Vec::new();
+        // The lock is held from the last read of the claims and the events
+        // to the write of the grant, so two callers never both hold one
+        // export of an end.
+        let mut holders = export_claims();
+        holders.prune();
+        events.extend(reader.read_new()?);
+        let reported = reported_exports(&events, end);
+        // An entry holds its export while its connection is live on this
+        // daemon run (BOX-202) and no report for the export is written.
+        let held: std::collections::HashSet<String> = read_export_claims(&reader.object)?
+            .into_iter()
+            .filter(|entry| entry.box_id == record.id && entry.end == end && holders.holds(entry))
+            .map(|entry| entry.path)
+            .collect();
+        for path in paths {
+            if granted.contains(path) || refused.contains(path) {
+                continue;
+            }
+            if reported.contains(path.as_str()) || held.contains(path) {
+                refused.push(path.clone());
+            } else {
+                granted.push(path.clone());
+            }
+        }
+        let connection = holders.id_of(holder);
+        let entries: Vec<ExportClaimEntry> = granted
+            .iter()
+            .map(|path| ExportClaimEntry {
+                box_id: record.id,
+                end,
+                path: path.clone(),
+                connection,
+                boot: BOOT_ID.clone(),
+            })
+            .collect();
+        // The grant is on the record before the command hears of it.
+        if let Err(error) = append_export_claims(&reader.object, &entries) {
+            tracing::warn!(
+                session_id = %record.id,
+                end,
+                %error,
+                "export claim: the claim was not written to the box's record; nothing is granted"
+            );
+            return Err(error);
+        }
+        drop(holders);
+        tracing::info!(
+            session_id = %record.id,
+            end,
+            connection,
+            granted = ?granted,
+            refused = ?refused,
+            "export claim"
+        );
+        Ok(minimald_rpc::ClaimExportsResponse {
+            end,
+            granted,
+            refused,
+        })
+    }
+
+    /// Appends the `file_exported` event of one export that the connection
+    /// whose liveness is `holder` claimed (BOX-195). The event keeps the
+    /// export refused for the end, so no later command copies it again. A
+    /// report that is not written leaves the claim held, so the end of the
+    /// connection releases it (BOX-200, BOX-202).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `PermissionDenied` when
+    /// `holder` does not hold the export for that end, or the I/O error of
+    /// the read of the claims or of the append.
+    pub async fn report_export(
+        &self,
+        report: &minimald_rpc::ReportExportRequest,
+        holder: &std::sync::Weak<()>,
+    ) -> Result<BoxEvent, BoxManagerError> {
+        let Some(record) = self.retained_record(report.id).await? else {
+            return Err(unknown_box(report.id));
+        };
+        let mut reader = self.box_events(record.id).await?;
+        // The lock is held from the check of the claim to the write of the
+        // event, so one claim is reported once.
+        let holders = export_claims();
+        let events = reader.read_new()?;
+        let connection = holders.find(holder);
+        // A claims file that cannot be read is an I/O error, not a refusal:
+        // the claim can still be held.
+        let holds = match connection {
+            Some(connection)
+                if !reported_exports(&events, report.end).contains(report.path.as_str()) =>
+            {
+                read_export_claims(&reader.object)
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            session_id = %record.id,
+                            export = %report.path,
+                            %error,
+                            "export report: the export claims could not be read"
+                        );
+                    })?
+                    .iter()
+                    .any(|entry| {
+                        entry.box_id == record.id
+                            && entry.end == report.end
+                            && entry.path == report.path
+                            && entry.connection == connection
+                            && holders.holds(entry)
+                    })
+            }
+            _ => false,
+        };
+        if !holds {
+            tracing::info!(
+                session_id = %record.id,
+                end = report.end,
+                export = %report.path,
+                connection = ?connection,
+                "export report refused: this connection does not hold the export"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "this command does not hold the export `{}` of the box",
+                    report.path
+                ),
+            ));
+        }
+        let files: Vec<serde_json_lenient::Value> = report
+            .files
+            .iter()
+            .map(|file| {
+                serde_json_lenient::json!({
+                    "path": file.path,
+                    "size": file.size,
+                    "sha256": file.sha256,
+                })
+            })
+            .collect();
+        let mut data = EventData::new();
+        data.insert(export_data::PATH.into(), report.path.clone().into());
+        data.insert(export_data::COPIED.into(), report.copied.into());
+        data.insert(export_data::FILES.into(), files.into());
+        data.insert(export_data::END.into(), report.end.into());
+        let written = write_box_event(&reader.object, BoxEventType::FileExported, data);
+        drop(holders);
+        written.inspect_err(|error| {
+            tracing::warn!(
+                session_id = %record.id,
+                export = %report.path,
+                %error,
+                "export report: the file_exported event was not written; the claim stays held"
+            );
+        })
+    }
+
+    /// Every export claim on the record of box `id` (BOX-198).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, or an I/O error if the claims
+    /// cannot be read.
+    #[cfg(test)]
+    pub(crate) async fn export_claim_entries(
+        &self,
+        id: SessionId,
+    ) -> Result<Vec<ExportClaimEntry>, BoxManagerError> {
+        let reader = self.box_events(id).await?;
+        read_export_claims(&reader.object)
+    }
 }
 
 /// A read of one box's events (BOX-162): every retained event in the order

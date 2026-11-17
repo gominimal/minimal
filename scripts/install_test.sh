@@ -240,8 +240,14 @@ case "${1:-}" in
                 else
                     echo "Every part of the install is finished on this machine; there is nothing to run." >&2
                 fi
+                # $HOME/finalize.script, when present, is the script the
+                # probe prints in place of the stand-in one.
                 if [ -f "$HOME/finalize.summary" ]; then
-                    printf '#!/bin/sh\n# mock finalize-install script\n'
+                    if [ -f "$HOME/finalize.script" ]; then
+                        cat "$HOME/finalize.script"
+                    else
+                        printf '#!/bin/sh\n# mock finalize-install script\n'
+                    fi
                 fi
                 ;;
             " ")
@@ -1354,6 +1360,114 @@ case_installer_does_not_prompt_on_a_finished_host() {
     want_err "a failed probe prints no pointer" grep -qF "$fi_route" "$OUT"
     want_err "a failed probe's stderr is hidden" grep -q "unrecognized subcommand" "$OUT"
     check "$fi_probe" "$(cat "$HF9/finalize.calls")" "a failed probe is the run's only call"
+}
+
+case_installer_offers_finalize_install_for_a_stale_answerer() {
+    # An upgrade that ships a new minzoned leaves the installed DNS service on
+    # the old root-owned copy. The probe reports the stale copy as a missing
+    # names item with a script that copies this release's minzoned, and the
+    # installer names the stale copy and offers the step on a terminal: Enter
+    # runs `min finalize-install`, which replaces the copy.
+    fi_stale_line="DNS names for boxes (<box>.min.internal) in every program on this machine"
+    fi_stale_fact="the installed DNS service runs a different minzoned than the one this version of Minimal ships; this step replaces it with this machine's own copy"
+    fi_stale_named="Minimal's DNS service on this machine runs a different minzoned than this release ships."
+    fi_stale_summary() {
+        printf '%s:\n  ✗ %s\n      today: %s\n      this step: %s\n' "$fi_status" \
+            "$fi_stale_line" "$fi_stale_fact" \
+            "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups to Minimal's DNS service on 127.0.0.1:7656 at every boot and installs that service" \
+            >"$1/finalize.summary"
+    }
+    # fi_copy_script <home> <source> — a probe script that copies <source>,
+    # as the real step's copy line names it.
+    fi_copy_script() {
+        # shellcheck disable=SC2016 # the script's own $t, not expanded here
+        printf '#!/bin/sh\ninstall -m 0755 -o root -g root "%s" "$t"\n' "$2" >"$1/finalize.script"
+    }
+    HF10="$root/hf10"; mkdir -p "$HF10"
+    fake_stale="$root/fake-stale-root"
+    mkdir -p "$fake_stale/usr/local/lib/minimal"
+    printf 'an-older-answerer-body\n' >"$fake_stale/usr/local/lib/minimal/minzoned"
+    fi_stale_summary "$HF10"
+    fi_copy_script "$HF10" "$HF10/bin/minzoned"
+    FINALIZE_INSTALL_ROOT="$fake_stale"
+    TTY_FILE="$root/tty-enter"
+    printf '\n' >"$TTY_FILE"
+    run fi_stale "$HF10"
+    TTY_FILE=
+    check 0 "$rc" "an install over a stale DNS service exits 0"
+    want_ok "the stale copy is shown as the probe reports it" grep -qF "$fi_stale_fact" "$OUT"
+    want_ok "the stale copy is named" grep -qF "$fi_stale_named" "$OUT"
+    want_ok "the command that replaces it is named" \
+        grep -qF "To replace it, run \`$(fi_min "$HF10") finalize-install\`." "$OUT"
+    want_ok "the installer offers the step" grep -qF "$fi_prompt" "$OUT"
+    check "$fi_probe
+finalize-install" "$(cat "$HF10/finalize.calls")" \
+        "the probe runs once and Enter runs the step that replaces the copy"
+    want_card_last "the card follows the offer over a stale copy (R10.4)"
+
+    # The probe offers a script that does not copy minzoned: the run would
+    # not replace the copy, so the installer does not say it does.
+    HF13="$root/hf13"; mkdir -p "$HF13"
+    fi_stale_summary "$HF13"
+    run fi_stale_no_copy "$HF13"
+    check 0 "$rc" "a stale copy with a script that carries no copy exits 0"
+    want_ok "the summary is shown" grep -qF "$fi_stale_fact" "$OUT"
+    want_err "no replace line without the copy" grep -qF "$fi_stale_named" "$OUT"
+    want_err "no replace command without the copy" grep -qF "To replace it" "$OUT"
+
+    # When the probe has no script to offer (it waits on a daemon), a run of
+    # `min finalize-install` carries no replace step either: the installer
+    # keeps the come-back note and does not name a replace.
+    HF11="$root/hf11"; mkdir -p "$HF11"
+    printf '%s:\n  ✗ %s — waiting on a daemon (no daemon answered within 5s)\n' \
+        "$fi_status" "$fi_stale_line" >"$HF11/finalize.waiting"
+    TTY_FILE="$root/tty-enter"
+    run fi_stale_waiting "$HF11"
+    TTY_FILE=
+    check 0 "$rc" "a waiting host with a stale copy exits 0"
+    want_ok "the come-back note is kept" \
+        grep -qF "box names finish once a daemon runs: after your first \`min\`, run \`$(fi_min "$HF11") finalize-install\`." "$OUT"
+    want_err "no replace line while waiting" grep -qF "$fi_stale_named" "$OUT"
+    want_err "no replace command while waiting" grep -qF "To replace it" "$OUT"
+    check "$fi_probe" "$(cat "$HF11/finalize.calls")" "a waiting host with a stale copy runs only the probe"
+
+    # The same bytes on both sides are no stale copy: the offer stays, with
+    # no replace line.
+    HF12="$root/hf12"; mkdir -p "$HF12"
+    cp "$mock/versions/v1/minzoned-linux-amd64" "$fake_stale/usr/local/lib/minimal/minzoned"
+    fi_stale_summary "$HF12"
+    fi_copy_script "$HF12" "$HF12/bin/minzoned"
+    run fi_current "$HF12"
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "a host with the current copy exits 0"
+    want_err "a current copy is not named" grep -qF "$fi_stale_named" "$OUT"
+
+    # macOS: the copy lives in the app bundle, and the step copies the bundle.
+    HF14="$root/hf14"; mkdir -p "$HF14"
+    fake_dstale="$root/fake-darwin-stale-root"
+    mkdir -p "$fake_dstale/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS"
+    printf 'an-older-answerer-body\n' \
+        >"$fake_dstale/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
+    fi_stale_summary "$HF14"
+    fi_copy_script "$HF14" "$HF14/bin/Minimal.app/Contents/MacOS/minzoned"
+    FINALIZE_INSTALL_ROOT="$fake_dstale"
+    PLAT_S=Darwin; PLAT_M=arm64
+    run fi_darwin_stale "$HF14"
+    check 0 "$rc" "darwin: an install over a stale DNS service exits 0"
+    want_ok "darwin: the stale copy is named" grep -qF "$fi_stale_named" "$OUT"
+    want_ok "darwin: the command that replaces it is named" \
+        grep -qF "To replace it, run \`$(fi_min "$HF14") finalize-install\`." "$OUT"
+
+    # macOS, waiting on a daemon: the come-back note, no replace line.
+    HF15="$root/hf15"; mkdir -p "$HF15"
+    printf '%s:\n  ✗ %s — waiting on a daemon (no daemon answered within 5s)\n' \
+        "$fi_status" "$fi_stale_line" >"$HF15/finalize.waiting"
+    run fi_darwin_stale_waiting "$HF15"
+    PLAT_S=Linux; PLAT_M=x86_64
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "darwin: a waiting host with a stale copy exits 0"
+    want_ok "darwin: the come-back note is kept" grep -qF "after your first" "$OUT"
+    want_err "darwin: no replace line while waiting" grep -qF "$fi_stale_named" "$OUT"
 }
 
 case_checksum_mismatch() {
@@ -2808,6 +2922,14 @@ STUB
 
     run_hc unenrolled "$root/mi-on" --user "$me"
     check 0 "$rc" "install exits 0 with neither identity"
+    want_ok "a parent with no memory controller is noted, and the install goes on" \
+        grep -q "parent offers it no memory controller" "$OUT"
+    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+    want_ok "no controller is enabled on the slice over such a parent (no file, or no +memory in it)" \
+        sh -c '[ ! -e "$1" ] || ! grep -q "+memory" "$1"' _ "$tree/cgroup.subtree_control"
+    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+    want_ok "nor on the box cohort below it" \
+        sh -c '[ ! -e "$1" ] || ! grep -q "+memory" "$1"' _ "$tree/boxes/cgroup.subtree_control"
     want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
     want_ok "the un-enrolled install lays out the QUIC block leaf" \
         test -d "$tree/boxes/quic443-blocked"
@@ -2833,6 +2955,10 @@ STUB
     # The QUIC block helper and its sudoers rule go under the scratch root,
     # through the step's own override knobs: a rehearsal writes nothing to
     # /usr/local or /etc.
+    # The stand-in mount root now offers the memory controller, as a systemd
+    # host's does: the step enables it on the slice, the one cgroup the
+    # daemon cannot enable it on itself.
+    printf 'cpuset cpu io memory pids\n' >"$cg/cgroup.subtree_control"
     HC_HELPER="$root/hclib/quic443-leaf"
     HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
     run_hc install "$root/mi-on" --user "$me" \
@@ -2846,6 +2972,21 @@ STUB
     want_ok "the host-address QUIC block leaf exists" test -d "$tree/boxes/quic443-blocked"
     want_ok "the table's marker exists once the transaction succeeded" \
         test -d "$tree/classifier-table"
+    want_ok "the memory controller is enabled on the slice for the leaves below" \
+        grep -q "^+memory$" "$tree/cgroup.subtree_control"
+    want_ok "install says it enabled the memory controller on the slice" \
+        grep -q "enabled the memory controller on the slice" "$OUT"
+    # The cohort and its two subtrees too, top down after the slice: a daemon that started before the
+    # slice offered the controller does not repeat its own cascade until its next start.
+    for _cg in boxes boxes/deny boxes/allow; do
+        want_ok "the memory controller is enabled on $_cg for the leaves below" \
+            grep -q "^+memory$" "$tree/$_cg/cgroup.subtree_control"
+    done
+    # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+    want_ok "the QUIC block leaf, a leaf, gets no controller for children it does not have" \
+        sh -c '! grep -q "+memory" "$1"' _ "$tree/boxes/quic443-blocked/cgroup.subtree_control"
+    want_ok "install names the cohort's subtrees among the cgroups it enabled the controller on" \
+        grep -q "enabled the memory controller on the slice, .*/boxes/allow\. Boxes can read" "$OUT"
     want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
     want_ok "install names the delegated account" grep -q "delegated to" "$OUT"
     want_ok "install names the contract it delegated" grep -q "v2 contract" "$OUT"
@@ -3016,6 +3157,87 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
     want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
     want_ok "check reports the recorded ct-mark mask" grep -q "ct-mark:  0x30000000" "$OUT"
+
+    # The write to the slice's cgroup.subtree_control fails for one of two kinds of reason, and the
+    # rehearsal stages both by making the file unwritable. With nothing in the slice's cgroup.procs, the
+    # note names the write's own error and no standing process. With a pid planted there (a sleep this
+    # rehearsal owns), the note names that pid and its command and the condition to rerun on, and
+    # claims no daemon by name: the step cannot tell whose process it is. The planted pid is taken out
+    # again before the next run, so the tree the later runs read is the first install's. After the
+    # section's own checks, so the print-ruleset and --check runs read that tree too. (Root ignores
+    # file modes, so neither case can be staged there.)
+    if [ "$(id -u)" -ne 0 ]; then
+        HC_HELPER="$root/hclib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        chmod 0444 "$tree/cgroup.subtree_control"
+        run_hc install-unwritable "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        check 0 "$rc" "install exits 0 when the slice's write fails"
+        # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+        want_ok "an unexplained failure is named as the write's own error, not as a standing process" \
+            sh -c 'grep -q "The write failed (" "$1" && ! grep -q "A process stands in the slice" "$1"' _ "$OUT"
+        want_err "an unexplained failure promises no rerun that would fail the same way" \
+            grep -q "The write failed (.*min finalize-install" "$OUT"
+
+        sleep 300 &
+        standing_pid=$!
+        procs_before=$(cat "$tree/cgroup.procs")
+        printf '%s\n' "$standing_pid" >"$tree/cgroup.procs"
+        run_hc install-standing "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        printf '%s' "$procs_before" >"$tree/cgroup.procs"
+        kill "$standing_pid" 2>/dev/null || :
+        wait "$standing_pid" 2>/dev/null || :
+        chmod 0644 "$tree/cgroup.subtree_control"
+        unset HC_HELPER HC_SUDOERS
+        check 0 "$rc" "install exits 0 when a process stands in the slice"
+        want_ok "a process standing in the slice is named by its pid" \
+            grep -q "A process stands in the slice itself rather than in a leaf: pid $standing_pid (" "$OUT"
+        if [ -d /proc/self ]; then
+            want_ok "and by the command it runs, read from /proc" grep -q "pid $standing_pid (sleep)" "$OUT"
+        fi
+        want_ok "the note says what to do: rerun once the slice's cgroup.procs is empty" \
+            grep -q "Once .*/cgroup.procs is empty (stop each of those processes, or move it into a leaf), run min finalize-install again\." "$OUT"
+        want_err "the note names no daemon or host it cannot prove" grep -q "min host stop" "$OUT"
+        want_err "a standing process is not reported as an unexplained write failure" \
+            grep -q "The write failed (" "$OUT"
+
+        # A refusal on one verdict subtree takes nothing from its sibling: the cohort above both
+        # has the controller, so the allow subtree is still tried after the deny subtree refuses,
+        # and each is reported. A refusal on the cohort itself still stops the walk, both
+        # subtrees below it unwritten.
+        HC_HELPER="$root/hclib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        : >"$tree/boxes/allow/cgroup.subtree_control"
+        chmod 0444 "$tree/boxes/deny/cgroup.subtree_control"
+        run_hc install-deny-refuses "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        chmod 0644 "$tree/boxes/deny/cgroup.subtree_control"
+        check 0 "$rc" "install exits 0 when the deny subtree refuses the controller"
+        want_ok "the deny subtree's refusal is reported with the path that refused" \
+            grep -q "could not enable it on $tree/boxes/deny/cgroup.subtree_control\. The write failed (" "$OUT"
+        want_ok "the allow subtree is still enabled after its sibling refuses" \
+            grep -q "^+memory$" "$tree/boxes/allow/cgroup.subtree_control"
+        want_ok "and reported as enabled on its own" \
+            grep -q "enabled the memory controller on $tree/boxes/allow too\." "$OUT"
+        want_err "a partial install claims no boxes read memory.max across the tree" \
+            grep -q "Boxes can read their own memory.max" "$OUT"
+
+        : >"$tree/boxes/deny/cgroup.subtree_control"
+        : >"$tree/boxes/allow/cgroup.subtree_control"
+        chmod 0444 "$tree/boxes/cgroup.subtree_control"
+        run_hc install-cohort-refuses "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        chmod 0644 "$tree/boxes/cgroup.subtree_control"
+        unset HC_HELPER HC_SUDOERS
+        check 0 "$rc" "install exits 0 when the cohort refuses the controller"
+        want_ok "the cohort's refusal is reported with the path that refused" \
+            grep -q "could not enable it on $tree/boxes/cgroup.subtree_control\. The write failed (" "$OUT"
+        # shellcheck disable=SC2016 # the positional reaches sh unexpanded
+        want_ok "neither subtree is tried below a cohort that refused" \
+            sh -c '! grep -q "+memory" "$1" && ! grep -q "+memory" "$2"' _ \
+            "$tree/boxes/deny/cgroup.subtree_control" "$tree/boxes/allow/cgroup.subtree_control"
+    fi
 
     # --user takes an account name too, resolved to the same uid and group;
     # only when the caller's uid has a passwd entry to name it by (a cross
@@ -3803,6 +4025,8 @@ case_for() {
         installer_prints_the_pointer_when_declined_or_without_tty)
             case_installer_prints_the_pointer_when_declined_or_without_tty ;;
         installer_does_not_prompt_on_a_finished_host) case_installer_does_not_prompt_on_a_finished_host ;;
+        installer_offers_finalize_install_for_a_stale_answerer)
+            case_installer_offers_finalize_install_for_a_stale_answerer ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;
@@ -3830,7 +4054,8 @@ case "${1:-}" in
             finalize_install_uninstall \
             installer_offers_finalize_install_on_a_tty \
             installer_prints_the_pointer_when_declined_or_without_tty \
-            installer_does_not_prompt_on_a_finished_host checksum_mismatch \
+            installer_does_not_prompt_on_a_finished_host \
+            installer_offers_finalize_install_for_a_stale_answerer checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \

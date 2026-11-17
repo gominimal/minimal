@@ -248,8 +248,9 @@ async fn box_via_ssh_with(
         None => None,
     };
     // A VM host that cannot be reached fails the attach or the exec
-    // closed (#1790); one that answers late or refuses is a warn line, and
-    // the attach or the exec goes on (NET-138).
+    // closed (#1790). One that refuses fails it with its own reason, which
+    // `main` prints before any terminal is taken, so it stays on screen.
+    // One that answers late is a warn line, and the attach goes on (NET-138).
     resume_box_row(sock, record.as_ref()).await?;
     // The name hold a `host_ip` session without a row depends on may not
     // have survived a VM host daemon restart; re-make it before the
@@ -495,6 +496,11 @@ pub(crate) fn mark_relay_not_started(
 /// terminal ([`crate::attach::TerminalNotTaken`]) or never started ssh's
 /// session on it ([`crate::attach::RelayNotStarted`]) stands the guard
 /// down, because nothing of the session reached the terminal.
+///
+/// An attach that the daemon refuses prints its refusal through ssh, and
+/// the daemon sends an exit status with it. So ssh does not end with 255,
+/// the guard is stood down, and no blind cursor restore moves the cursor
+/// back over the refusal line.
 pub(crate) fn interactive_attach<W: std::io::Write>(
     ssh: std::process::Command,
     stdin_is_tty: bool,
@@ -990,6 +996,15 @@ async fn attach_command(
             Some(box_list_scope(cwd.as_ref())?)
         }
     };
+    // The command's own project root: exports are copied only when it is
+    // the box's (BOX-199). With none, nothing is copied.
+    let here = match &scope {
+        Some(scope) => Some(scope.clone()),
+        None => crate::attach::cwd_host_path(global)
+            .and_then(|cwd| box_list_scope(cwd.as_ref()))
+            .inspect_err(|e| tracing::info!("attach: no project root here: {e:#}"))
+            .ok(),
+    };
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
     let hosts = match target {
@@ -1002,6 +1017,7 @@ async fn attach_command(
         hosts,
         target,
         scope.as_ref(),
+        here.as_ref(),
         stdin_is_tty,
         async |target: &BoxAttachTarget| {
             let host_asks = host_asks_box(global, target.name.as_deref());
@@ -1416,7 +1432,8 @@ async fn attach_exec_by_id(
     config_dir: Option<&std::path::Path>,
 ) -> Result<i32, anyhow::Error> {
     // A VM-backed box gets its row and its name hold back first, as
-    // `min box exec` does.
+    // `min box exec` does. A refused resume ends here with the VM host's
+    // reason, before the terminal is taken.
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
         Some(_) => attached_box_record(sock, id).await.unwrap_or_else(|error| {
             tracing::warn!(
@@ -1463,6 +1480,7 @@ pub(crate) async fn attach_on_hosts<A>(
     hosts: Vec<crate::cmd::list::LocalHost>,
     address: Option<&str>,
     scope: Option<&paths::HostAbsPath>,
+    here: Option<&paths::HostAbsPath>,
     stdin_is_tty: bool,
     attach: A,
 ) -> Result<AttachEnding, anyhow::Error>
@@ -1488,8 +1506,51 @@ where
         }
         _ => BoxAfterAttach::Unread,
     };
+    // BOX-185: an attach that saw the box end copies its declared exports,
+    // whatever code the entrypoint ended with. A detach leaves the box
+    // running, and copies nothing (BOX-186). An entrypoint's own nonzero
+    // code is not read above, so the box is read here for the copy only.
+    // A box that still runs then waits for the settle bound only when it
+    // declares an export, so a shell that a person leaves with a nonzero
+    // code, or a lost connection, does not wait for nothing.
+    let ended = match &after {
+        BoxAfterAttach::Unread => {
+            let first = box_after_attach(&target.host, target.box_id).await;
+            let running =
+                matches!(&first, BoxAfterAttach::Listed(entry) if entry.state == "running");
+            if running && box_declares_exports_on_host(&target.host, target.box_id).await {
+                box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await
+            } else {
+                first
+            }
+        }
+        _ => after.clone(),
+    };
+    // The outcomes of the copy, and whether the box's entrypoint exited 0
+    // by itself. A skipped export then turns the attach's 0 into 125
+    // (BOX-193). A stop and any other code stand (BOX-194).
+    let mut copied = None;
+    if let BoxAfterAttach::Listed(entry) = &ended
+        && matches!(entry.state.as_str(), "stopped" | "exited")
+    {
+        let root = entry.project_root.as_ref();
+        let outcomes = copy_box_exports_on_host(
+            &target.host,
+            target.box_id,
+            target.name.as_deref().unwrap_or(&target.label),
+            root.map(|root| std::path::Path::new(root.as_str())),
+            here.map(|here| std::path::Path::new(here.as_str())),
+            &mut std::io::stderr(),
+        )
+        .await;
+        let exited_clean = entry.state == "exited" && entry.exit_code == Some(0);
+        copied = Some((exited_clean, outcomes));
+    }
     match attach_ending(&target, code, &after) {
-        Ok(ending) => {
+        Ok(mut ending) => {
+            if let Some((exited_clean, outcomes)) = &copied {
+                ending.code = exit_code_after_exports(ending.code, *exited_clean, outcomes);
+            }
             tracing::info!(
                 verb = name,
                 box_id = %target.box_id,

@@ -391,7 +391,7 @@ async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding(
     let mut channel = client.open_shell(session_id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "expected an attach refusal, got: {refusal:?}"
     );
     assert!(
@@ -2307,7 +2307,7 @@ async fn a_mint_whose_host_dies_before_attach_reports_a_spawn_failure() {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
@@ -2330,7 +2330,7 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
@@ -4840,7 +4840,7 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
     let mut second = client.open_shell(id).await;
     let refusal = collect_to_close(&mut second).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
@@ -4872,7 +4872,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:")
+        refusal.contains("Cannot attach to the box:")
             && refusal.contains("the VM host daemon released this session's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
@@ -15090,6 +15090,34 @@ async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_pl
         .start_check(crate::box_ops::CheckOpts::from_args("").unwrap())
         .await
         .expect("a box that was never placed starts a check");
+}
+
+/// gominimal/minimal#1373: the context a box builds keys its task state on
+/// the record's host project, so a run's state survives the next session's
+/// freshly laid-out tree. A context made from the fixture repo carries no
+/// state root until the record keys it.
+#[test]
+fn a_box_context_keys_task_state_on_the_records_project() {
+    let state = tempfile::tempdir().unwrap();
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = mctx::ConfigBuilder::new()
+        .with_state_dir(state.path().to_path_buf())
+        .with_cache_dir(state.path().join("cache"))
+        .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
+        .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+        .with_no_fetch(true)
+        .build()
+        .unwrap();
+    let ctx = mctx::Context::new(config).unwrap();
+    assert_eq!(ctx.state_root(), None, "nothing keys a fresh context");
+
+    let record = build_record(boxes::NetworkMode::OwnIp, None);
+    let keyed = super::setup::keyed_on_project(ctx, &record);
+    assert_eq!(
+        keyed.state_root(),
+        Some(std::path::Path::new("/tmp/project")),
+        "the state root is the record's host project path"
+    );
 }
 
 /// A box record for the NET-155 tests, in `mode` and under `egress`.

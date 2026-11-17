@@ -372,6 +372,11 @@ fn ssh_command(
         // a bridge that accepts but never serves fails instead of hanging ssh.
         "-o",
         &format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs()),
+        // Quiet ssh's own status lines (BCLI-068): a detach or a box stop
+        // would otherwise print "Connection to … closed." after `min`'s own
+        // line. ERROR still lets ssh print its real failures.
+        "-o",
+        "LogLevel=ERROR",
     ]);
     // Negotiate the session-key config per channel: send each resolved key
     // as an env var the daemon reads back (alongside MINIMAL_SESSION_ID) and
@@ -832,6 +837,21 @@ pub fn withdraw_box_row_beside(
     withdraw_box_row_at(&control_sock, box_name, addresses, box_id);
 }
 
+/// The prefix minvmd puts on its refusal to give a box an address
+/// (`allocate_box_address_keeping` in `crates/minvmd/src/control.rs`). The
+/// reason after it comes from the zone answerer's allocator. It says why the
+/// box has no address: no DNS service for box names (it names
+/// `min finalize-install --show`), a full or quarantined box range, or a
+/// range bind check that failed. Some reasons name a step and some only state
+/// the situation. Each is plain text for the user, and a box without an
+/// address cannot go on, so a resume that it refuses fails the attach
+/// (NET-138).
+///
+/// This copies minvmd's literal, because minvmd's text is not in a crate
+/// that this one shares. A test in `box_registration` reads minvmd's source
+/// and fails when the two drift apart.
+pub const NO_ADDRESS_REFUSAL: &str = "could not give the box an address: ";
+
 /// Asks the VM host daemon whose control socket is `control_sock` for box
 /// `box_name`'s host row back (NET-138), before an attach or an exec runs
 /// in a box whose row may have been withdrawn while nothing carried its
@@ -842,16 +862,21 @@ pub fn withdraw_box_row_beside(
 /// keeps the one that stands. `box_id` narrows the proof to one creation,
 /// where the caller holds it.
 ///
-/// Blocking. A resume the daemon answers without the row — a daemon that
-/// predates the verb or holds no registration of the box — is a warn
-/// line, and the attach goes ahead: the in-VM daemon still refuses to
-/// relaunch a box whose row is gone. Returns whether the daemon answered
-/// with the row.
+/// Blocking. Any other reply is a warn line, and the attach goes ahead: a
+/// different pair, a refusal other than [`NO_ADDRESS_REFUSAL`], or the
+/// refusal of a daemon that predates the verb and cannot parse it. The
+/// in-VM daemon still refuses to relaunch a box whose row is gone. Returns
+/// whether the daemon answered with the row.
 ///
 /// # Errors
 ///
 /// [`crate::box_registration::HostUnreachable`] when the daemon cannot be
 /// reached at all (#1790): the caller fails closed on it.
+/// [`crate::box_registration::HostRefusal`] when the daemon refused to give
+/// the box an address ([`NO_ADDRESS_REFUSAL`]). It carries the daemon's
+/// reason after that prefix, for example the text that names
+/// `min finalize-install --show` when the VM cannot reach the DNS service
+/// for box names.
 pub fn resume_box_row_at(
     control_sock: &Path,
     box_name: &str,
@@ -880,8 +905,22 @@ pub fn resume_box_row_at(
             "the daemon answered with a different address pair, switch address {}",
             row.switch_address
         ),
+        // Only the no-address refusal fails the attach: its reason is plain
+        // text for the user. minvmd's other refusals carry internal text, and a daemon
+        // that predates the verb refuses a request it cannot parse. Those
+        // stay a warn line, and the in-VM daemon's own row check names the
+        // next step.
         Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
-            format!("the daemon refused it: {error}")
+            match error.strip_prefix(NO_ADDRESS_REFUSAL) {
+                Some(reason) => {
+                    tracing::debug!(
+                        box = %box_name,
+                        "the VM host daemon refused the box's host row resume ({error})"
+                    );
+                    return Err(crate::box_registration::HostRefusal::error(reason));
+                }
+                None => format!("the daemon refused it: {error}"),
+            }
         }
         Ok((other, _)) => format!("another verb's reply: {other:?}"),
         Err(error)
@@ -1451,6 +1490,34 @@ mod tests {
             assert!(
                 exec_args.iter().any(|a| a == &opt),
                 "missing {opt} in {exec_args:?}",
+            );
+        }
+    }
+
+    /// ssh prints no status line on a clean close, on an interactive
+    /// attach and on an exec alike, and still prints its errors (BCLI-068).
+    #[test]
+    fn ssh_command_quiets_ssh_status_lines() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let interactive = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
+        for cmd in [&interactive, &exec] {
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let at = args
+                .iter()
+                .position(|a| a == "LogLevel=ERROR")
+                .unwrap_or_else(|| panic!("missing LogLevel=ERROR in {args:?}"));
+            assert_eq!(
+                args[at - 1],
+                "-o",
+                "LogLevel=ERROR is an -o value: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a == "-q"),
+                "-q would hide ssh's errors too: {args:?}"
             );
         }
     }

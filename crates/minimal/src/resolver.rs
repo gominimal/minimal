@@ -297,13 +297,13 @@ const COMMAND_RESERVES_THE_RANGE: bool = false;
 /// launchd's job label for the answerer service: the plist file is named
 /// after it.
 #[cfg(any(test, target_os = "macos"))]
-const ANSWERER_LAUNCHD_LABEL: &str = "dev.gominimal.zone";
+pub(crate) const ANSWERER_LAUNCHD_LABEL: &str = "dev.gominimal.zone";
 
 /// systemd's unit name stem for the answerer service:
 /// `minzoned.socket` and `minzoned.service`, named after the program
 /// they run.
 #[cfg(any(test, not(target_os = "macos")))]
-const ANSWERER_SYSTEMD_UNIT: &str = "minzoned";
+pub(crate) const ANSWERER_SYSTEMD_UNIT: &str = "minzoned";
 
 /// The name of the app bundle `minzoned` ships in on macOS, and of the
 /// root-owned copy the step installs.
@@ -368,7 +368,46 @@ const LEGACY_MACOS_ANSWERER_PROGRAM_PATH: &str = "/Library/PrivilegedHelperTools
 /// The plist the answerer step installs: the file launchd scans at boot,
 /// which is what makes the service hold the sockets at every one.
 #[cfg(any(test, target_os = "macos"))]
-const ANSWERER_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.gominimal.zone.plist";
+pub(crate) const ANSWERER_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.gominimal.zone.plist";
+
+/// The root-owned directory the macOS answerer service's log lives in. The
+/// step makes it, root's with mode 0755, before it loads the unit, and
+/// `--undo` removes it. A fixed path, never one under the operator's home
+/// or read from the caller's environment: launchd does not create a
+/// missing parent, so a log under a directory that can vanish stops the
+/// job from starting, and every directory the unit names is in the custody
+/// walk. `/private/var/log` is root's with no group write on a stock
+/// macOS, which the walk requires and `/Library/Logs` does not give.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) const MACOS_ANSWERER_LOG_DIR: &str = "/private/var/log/minimal";
+
+/// The file the macOS answerer service's stdout and stderr go to
+/// (`StandardOutPath` and `StandardErrorPath`), and the file `min bug`
+/// collects. The step makes it the operator's, mode 0644, so the service
+/// and the size cap ([`ANSWERER_LOG_CAP_PLIST`]) both run as the operator.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) const MACOS_ANSWERER_LOG_PATH: &str = "/private/var/log/minimal/minzoned.log";
+
+/// The size past which the cap job cuts the log down
+/// ([`ANSWERER_LOG_KEEP_BYTES`]): 1 MiB.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// What the cap job keeps of an oversized log: its last 256 KiB.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_LOG_KEEP_BYTES: u64 = 256 * 1024;
+
+/// How often the cap job runs, in seconds: hourly.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_LOG_CAP_INTERVAL_SECS: u32 = 3600;
+
+/// launchd's job label for the log's size cap.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_LOG_CAP_LABEL: &str = "dev.gominimal.zone.logcap";
+
+/// The plist of the log's size cap ([`ANSWERER_LOG_CAP_TEMPLATE`]).
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_LOG_CAP_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.gominimal.zone.logcap.plist";
 
 /// The root-owned path the answerer program is copied to on Linux — never
 /// a user-writable binary, the same rule as [`MACOS_ANSWERER_PROGRAM_PATH`]'s
@@ -435,7 +474,10 @@ const ANSWERER_UNIT_PATHS: &[&str] = &[ANSWERER_UNIT_SOCKET_PATH, ANSWERER_UNIT_
 /// defence in depth rather than the only check.
 /// `AssociatedBundleIdentifiers` names the app bundle the program sits in
 /// ([`ANSWERER_BUNDLE_IDENTIFIER`]), the key by which macOS lists the job
-/// under the bundle's name and icon.
+/// under the bundle's name and icon. `StandardOutPath` and
+/// `StandardErrorPath` send the service's output to the root-owned
+/// [`MACOS_ANSWERER_LOG_PATH`], where `min bug` collects it: without them
+/// launchd drops it, and a service that exits at start leaves no record.
 ///
 /// Like [`RANGE_UNIT_PLIST`], the script writes the body under a quoted
 /// heredoc, so nothing in it expands.
@@ -457,6 +499,10 @@ const ANSWERER_PLIST_TEMPLATE: &str = "\
 \t<array>
 \t\t<string>__BUNDLE__</string>
 \t</array>
+\t<key>StandardOutPath</key>
+\t<string>/private/var/log/minimal/minzoned.log</string>
+\t<key>StandardErrorPath</key>
+\t<string>/private/var/log/minimal/minzoned.log</string>
 \t<key>Sockets</key>
 \t<dict>
 \t\t<key>Listener</key>
@@ -491,6 +537,45 @@ const ANSWERER_PLIST_TEMPLATE: &str = "\
 </dict>
 </plist>
 ";
+
+/// The launchd unit that keeps the answerer's log ([`MACOS_ANSWERER_LOG_PATH`])
+/// bounded. launchd has no size limit for `StandardOutPath`, and the
+/// service holds the file open for as long as it runs, so a rename-based
+/// rotation would leave it writing to the renamed file. launchd opens the
+/// log for append, so a cut in place is safe: every
+/// [`ANSWERER_LOG_CAP_INTERVAL_SECS`], a log over [`ANSWERER_LOG_MAX_BYTES`]
+/// is cut to its last [`ANSWERER_LOG_KEEP_BYTES`]. The job runs as the
+/// operator, who owns the log, never as root.
+///
+/// The script writes the body under a quoted heredoc, so nothing in it
+/// expands. `__SCRIPT__` is XML-escaped text.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_LOG_CAP_TEMPLATE: &str = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+\t<key>Label</key>
+\t<string>dev.gominimal.zone.logcap</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>/bin/sh</string>
+\t\t<string>-c</string>
+\t\t<string>__SCRIPT__</string>
+\t</array>
+\t<key>UserName</key>
+\t<string>__OPERATOR__</string>
+\t<key>StartInterval</key>
+\t<integer>__INTERVAL__</integer>
+\t<key>RunAtLoad</key>
+\t<true/>
+</dict>
+</plist>
+";
+
+/// The heredoc delimiter the cap's plist is written under.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_LOG_CAP_HEREDOC: &str = "MINIMAL_ANSWERER_LOGCAP_EOF";
 
 /// The systemd socket unit the answerer step installs, as the command
 /// writes it: both sockets held by the machine's service manager — the
@@ -1099,6 +1184,15 @@ pub(crate) enum AnswererStep {
         /// The protocol version this daemon speaks.
         daemon: u32,
     },
+    /// The installed copy passes every check and speaks this daemon's
+    /// protocol, but its bytes are not the `minzoned` this machine ships:
+    /// an upgrade shipped a new program and the root-owned copy is the old
+    /// one. The step re-runs to replace it.
+    CopyDiffers,
+    /// The installed service is loaded but its program is not running:
+    /// the service manager holds the port, and the program keeps exiting.
+    /// The step re-runs to reinstall it.
+    NotRunning,
     /// The step's copy source — this machine's `minzoned` — passed the
     /// identity check the advisory runs before offering the privileged step
     /// ([`answerer_step_with_source`]), and its bytes are pinned: the
@@ -1144,6 +1238,184 @@ impl AnswererStep {
     pub(crate) fn holds(&self) -> bool {
         matches!(self, AnswererStep::Installed)
     }
+
+    /// Whether the service is installed but stale or failing — a copy that
+    /// speaks another protocol, a copy that differs from the shipped
+    /// `minzoned`, or a job that is loaded and not running — read through
+    /// the copy source's verdict. These are the states where the installed
+    /// service can hold the port while no daemon's channel reaches it, and
+    /// where the step reinstalls the service instead of waiting on a daemon.
+    pub(crate) fn installed_but_stale_or_failing(&self) -> bool {
+        match self {
+            AnswererStep::ProtocolMismatch { .. }
+            | AnswererStep::CopyDiffers
+            | AnswererStep::NotRunning => true,
+            AnswererStep::SourceVerified { service, .. }
+            | AnswererStep::SourceRefused { service, .. }
+            | AnswererStep::SourceUnavailable { service, .. } => {
+                service.installed_but_stale_or_failing()
+            }
+            AnswererStep::Installed | AnswererStep::Absent | AnswererStep::CustodyFailed { .. } => {
+                false
+            }
+        }
+    }
+
+    /// Whether `min finalize-install --show` prints a script that
+    /// reinstalls the service for this step: the service is stale or
+    /// failing, the copy source passed its identity check, and the step
+    /// can carry it ([`answerer_install`]). A custody failure, a refused
+    /// source and an unavailable one are not offered, so a surface that
+    /// names the command for a failing service asks this first.
+    pub(crate) fn reinstall_offered(&self) -> bool {
+        match self {
+            AnswererStep::SourceVerified { service, source } => {
+                service.installed_but_stale_or_failing() && answerer_install(source).is_some()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The state of the installed DNS service's job, as the service manager
+/// reports it: launchd's `dev.gominimal.zone` job on macOS, systemd's
+/// `minzoned.service` on Linux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub enum AnswererJob {
+    /// No job is loaded, or the read did not decide: no claim either way.
+    #[default]
+    Unknown,
+    /// The job is loaded and its program runs.
+    Running,
+    /// The job is loaded and its program is not running: launchd's
+    /// `KeepAlive` job between respawns, or a systemd service that failed
+    /// or waits to restart. The service manager still holds the port.
+    NotRunning,
+}
+
+/// The job state `launchctl print system/dev.gominimal.zone` reports: the
+/// first `state = ` line, which is the job's own (nested sections follow
+/// it). `running` is running. Every other state of a loaded `KeepAlive`
+/// job — `not running`, `spawn scheduled`, `exited` — is a program that
+/// is not running. Pure over the output.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn launchd_job_state(output: &str) -> AnswererJob {
+    let state = output
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("state = "));
+    match state.map(str::trim) {
+        None => AnswererJob::Unknown,
+        Some("running") => AnswererJob::Running,
+        Some(_) => AnswererJob::NotRunning,
+    }
+}
+
+/// The job state `systemctl show minzoned.service
+/// --property=LoadState,ActiveState,SubState` reports. A failed service,
+/// or one waiting to restart, is not running. An active one runs. An
+/// inactive one is a socket-activated service that has not started yet,
+/// which claims nothing. Pure over the output.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn systemd_job_state(output: &str) -> AnswererJob {
+    let property = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(name)?.strip_prefix('='))
+            .map(str::trim)
+    };
+    if property("LoadState") != Some("loaded") {
+        return AnswererJob::Unknown;
+    }
+    match (property("ActiveState"), property("SubState")) {
+        (Some("failed"), _) | (_, Some("auto-restart")) => AnswererJob::NotRunning,
+        (Some("active"), _) => AnswererJob::Running,
+        _ => AnswererJob::Unknown,
+    }
+}
+
+/// The bound on the one service-manager read of the job state.
+const ANSWERER_JOB_READ_BOUND: Duration = Duration::from_secs(1);
+
+/// The installed DNS service's job state, read from this host's service
+/// manager, blocking and bounded by [`ANSWERER_JOB_READ_BOUND`]. A read
+/// that does not finish in time is killed. A read that does not finish,
+/// or does not run, is [`AnswererJob::Unknown`].
+pub(crate) fn answerer_job_blocking() -> AnswererJob {
+    #[cfg(target_os = "macos")]
+    let (program, args, parse): (&str, Vec<String>, fn(&str) -> AnswererJob) = (
+        "launchctl",
+        vec![
+            "print".to_string(),
+            format!("system/{ANSWERER_LAUNCHD_LABEL}"),
+        ],
+        launchd_job_state,
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (program, args, parse): (&str, Vec<String>, fn(&str) -> AnswererJob) = (
+        "systemctl",
+        vec![
+            "show".to_string(),
+            format!("{ANSWERER_SYSTEMD_UNIT}.service"),
+            "--property=LoadState,ActiveState,SubState".to_string(),
+        ],
+        systemd_job_state,
+    );
+    let mut child = match std::process::Command::new(program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return AnswererJob::Unknown,
+    };
+    // The output is read on its own thread, so a report larger than the
+    // pipe buffer cannot stall the child while this thread waits on it.
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            text
+        })
+    });
+    let deadline = std::time::Instant::now() + ANSWERER_JOB_READ_BOUND;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    program,
+                    "the DNS service job state read did not finish in time; killed it and \
+                     claiming nothing"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let text = reader.and_then(|reader| reader.join().ok());
+    match (status, text) {
+        (Some(status), Some(text)) if status.success() => parse(&text),
+        _ => AnswererJob::Unknown,
+    }
+}
+
+/// [`answerer_job_blocking`] on a blocking thread, for the async readers.
+pub(crate) async fn answerer_job() -> AnswererJob {
+    tokio::task::spawn_blocking(answerer_job_blocking)
+        .await
+        .unwrap_or(AnswererJob::Unknown)
 }
 
 /// The facts the answerer service's checks decide on, as the detection
@@ -1166,6 +1438,10 @@ pub(crate) struct AnswererFacts {
     /// plist's `ProgramArguments` on macOS, the service unit's
     /// `ExecStart` on Linux — when it names one.
     pub unit_program: Option<String>,
+    /// The log file the unit sends the service's output to — the plist's
+    /// `StandardErrorPath` on macOS — when it names one. Linux reads none:
+    /// the journal keeps the service's output there.
+    pub unit_log: Option<String>,
     /// The mode of the installed channel socket's node, when it exists.
     /// The unit the step installs binds it owner-only; an install that
     /// predates that — or one a foreign hand relaxed — is re-surfaced,
@@ -1182,6 +1458,21 @@ pub(crate) struct AnswererFacts {
     /// The channel protocol version the installed copy answered the
     /// probe with, when it exists, runs, and answers a number.
     pub installed_version: Option<u32>,
+    /// The owner and mode of the log's size-cap unit
+    /// ([`ANSWERER_LOG_CAP_PLIST_PATH`]), when it exists. macOS only:
+    /// Linux keeps the service's output in the journal, which has its
+    /// own cap.
+    pub log_cap: Option<FileCustody>,
+    /// The `ProgramArguments` the size-cap unit names, unescaped, when it
+    /// reads.
+    pub log_cap_arguments: Option<Vec<String>>,
+    /// The SHA-256 of the installed copy's bytes, when it reads.
+    pub installed_sha256: Option<String>,
+    /// The SHA-256 of the `minzoned` this machine ships — the copy source
+    /// beside this `min` or on `PATH` — when there is one and it reads.
+    pub shipped_sha256: Option<String>,
+    /// The installed service's job state, as the service manager reports it.
+    pub job: AnswererJob,
 }
 
 /// The program path a systemd service unit's `ExecStart=` names: the
@@ -1231,15 +1522,36 @@ pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> Answerer
     if facts.program.is_none() && facts.units.iter().all(Option::is_none) {
         return AnswererStep::Absent;
     }
+    let mut checks = Vec::new();
+    // The log the unit names: an install from before the unit kept a log
+    // is re-surfaced, so the step re-runs and adds it.
+    #[cfg(target_os = "macos")]
+    if facts.units.iter().all(Option::is_some)
+        && let Some(check) = answerer_log_check(facts.unit_log.as_deref())
+    {
+        checks.push(check);
+    }
+    // The log's size cap: a missing cap unit, one root does not own, or
+    // one that runs other arguments leaves the log without a bound, so
+    // the step re-runs and writes it again.
+    #[cfg(target_os = "macos")]
+    if facts.units.iter().all(Option::is_some)
+        && let Some(check) =
+            answerer_log_cap_check(facts.log_cap, facts.log_cap_arguments.as_deref())
+    {
+        checks.push(check);
+    }
     let mut walked = Vec::new();
-    for path in std::iter::once(ANSWERER_PROGRAM_PATH).chain(ANSWERER_UNIT_PATHS.iter().copied()) {
+    for path in std::iter::once(ANSWERER_PROGRAM_PATH)
+        .chain(ANSWERER_UNIT_PATHS.iter().copied())
+        .chain(answerer_log_walk(facts.unit_log.as_deref()))
+    {
         for component in path_components(path) {
             if !walked.contains(&component) {
                 walked.push(component);
             }
         }
     }
-    let mut checks = Vec::new();
     for component in &walked {
         let Some(custody) = facts
             .components
@@ -1314,13 +1626,146 @@ pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> Answerer
     }
     match checks.first() {
         None => match facts.installed_version {
-            Some(installed) if installed == daemon => AnswererStep::Installed,
-            installed => AnswererStep::ProtocolMismatch { installed, daemon },
+            Some(installed) if installed != daemon => AnswererStep::ProtocolMismatch {
+                installed: Some(installed),
+                daemon,
+            },
+            None => AnswererStep::ProtocolMismatch {
+                installed: None,
+                daemon,
+            },
+            // The copy speaks this daemon's protocol. An upgrade can still
+            // ship a new program that speaks the same protocol, so the copy
+            // is compared with the shipped bytes, and a job that keeps
+            // exiting is reinstalled too.
+            Some(_) => match (&facts.installed_sha256, &facts.shipped_sha256) {
+                (Some(installed), Some(shipped)) if installed != shipped => {
+                    AnswererStep::CopyDiffers
+                }
+                _ if facts.job == AnswererJob::NotRunning => AnswererStep::NotRunning,
+                _ => AnswererStep::Installed,
+            },
         },
         Some(check) => AnswererStep::CustodyFailed {
             failed_check: check.clone(),
         },
     }
+}
+
+/// The check on the log the macOS unit names (`unit_log`, its
+/// `StandardErrorPath`): `None` when it is [`MACOS_ANSWERER_LOG_PATH`],
+/// else the check that failed. Pure, so it is unit-tested on every
+/// platform the suite runs on.
+#[cfg(any(test, target_os = "macos"))]
+fn answerer_log_check(unit_log: Option<&str>) -> Option<String> {
+    match unit_log {
+        Some(MACOS_ANSWERER_LOG_PATH) => None,
+        None => Some(format!(
+            "its unit keeps no log at {MACOS_ANSWERER_LOG_PATH}"
+        )),
+        Some(other) => Some(format!(
+            "its unit logs to {other}, not {MACOS_ANSWERER_LOG_PATH}"
+        )),
+    }
+}
+
+/// The check on the log's size-cap unit (`custody` and `arguments`, its
+/// file and its `ProgramArguments`): `None` when the unit is root-owned
+/// and runs the cap ([`answerer_log_cap_script`]), else the check that
+/// failed. Pure, so it is unit-tested on every platform the suite runs on.
+#[cfg(any(test, target_os = "macos"))]
+fn answerer_log_cap_check(
+    custody: Option<FileCustody>,
+    arguments: Option<&[String]>,
+) -> Option<String> {
+    let Some(custody) = custody else {
+        return Some(format!(
+            "its log size cap {ANSWERER_LOG_CAP_PLIST_PATH} is missing"
+        ));
+    };
+    if !custody.root_owned() {
+        return Some(not_root_owned(
+            "its log size cap",
+            ANSWERER_LOG_CAP_PLIST_PATH,
+            &custody,
+        ));
+    }
+    let script = answerer_log_cap_script();
+    let expected = ["/bin/sh", "-c", script.as_str()];
+    match arguments {
+        Some(arguments) if arguments.iter().map(String::as_str).eq(expected) => None,
+        _ => Some(format!(
+            "its log size cap {ANSWERER_LOG_CAP_PLIST_PATH} does not run the cap on {MACOS_ANSWERER_LOG_PATH}"
+        )),
+    }
+}
+
+/// The `<string>` values of the plist array under the key `key`, with the
+/// XML escapes undone, as launchd reads them. `None` when the key is not
+/// there or its value is not an array. Pure, so the parse is unit-tested
+/// on every platform the suite runs on.
+#[cfg(any(test, target_os = "macos"))]
+fn plist_string_array(text: &str, key: &str) -> Option<Vec<String>> {
+    let marker = format!("<key>{key}</key>");
+    let at = text.find(&marker)? + marker.len();
+    let body = text[at..].trim_start().strip_prefix("<array>")?;
+    let body = &body[..body.find("</array>")?];
+    let mut values = Vec::new();
+    let mut rest = body.trim_start();
+    while !rest.is_empty() {
+        let value = rest.strip_prefix("<string>")?;
+        let end = value.find("</string>")?;
+        values.push(xml_unescape(&value[..end]));
+        rest = value[end + "</string>".len()..].trim_start();
+    }
+    Some(values)
+}
+
+/// `text` with the five XML escapes [`xml_escape`] writes undone.
+#[cfg(any(test, target_os = "macos"))]
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The log paths whose directories the custody walk covers: the macOS log
+/// when the unit names it. A unit that names no log, or another one, fails
+/// [`answerer_log_check`] first, so its directories are not walked. Linux
+/// keeps the service's output in the journal and walks none.
+fn answerer_log_walk(unit_log: Option<&str>) -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    if unit_log == Some(MACOS_ANSWERER_LOG_PATH) {
+        return Some(MACOS_ANSWERER_LOG_PATH);
+    }
+    let _ = unit_log;
+    None
+}
+
+/// The log file the unit names: the plist's `StandardErrorPath` on macOS.
+/// Linux's units name none.
+#[cfg(target_os = "macos")]
+fn unit_log_path(text: &str) -> Option<&str> {
+    plist_string_value(text, "StandardErrorPath")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unit_log_path(_text: &str) -> Option<&str> {
+    None
+}
+
+/// The `<string>` value right after the plist key `key`, as launchd reads
+/// it. `None` when the key is not there or its value is not a string.
+/// Pure over the file's bytes, so the parse is unit-tested on every
+/// platform the suite runs on.
+pub(crate) fn plist_string_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("<key>{key}</key>");
+    let at = text.find(&marker)? + marker.len();
+    let value = text[at..].trim_start().strip_prefix("<string>")?;
+    let end = value.find("</string>")?;
+    Some(value[..end].trim())
 }
 
 /// The inputs the answerer install renders from that only the running
@@ -1549,7 +1994,7 @@ async fn bundle_files_of(source: &str) -> std::io::Result<Vec<BundleFile>> {
 /// The answerer program this machine's step copies ([`answerer_source_in`]
 /// over this `min`'s directory and `PATH`); the not-found arm is asserted
 /// on the pure half.
-fn answerer_source() -> Option<String> {
+pub(crate) fn answerer_source() -> Option<String> {
     let exe = std::env::current_exe().ok();
     answerer_source_in(
         exe.as_deref().and_then(std::path::Path::parent),
@@ -1804,7 +2249,7 @@ async fn answerer_source_identity(_source: String) -> Result<Option<String>, Sou
 }
 
 /// The lowercase hex SHA-256 of `path`'s bytes.
-async fn sha256_of(path: &str) -> std::io::Result<String> {
+pub(crate) async fn sha256_of(path: &str) -> std::io::Result<String> {
     use sha2::Digest as _;
     let bytes = tokio::fs::read(path).await?;
     Ok(hex::encode(sha2::Sha256::digest(&bytes)))
@@ -1910,8 +2355,12 @@ async fn installed_protocol_version() -> Option<u32> {
 /// range step it sits beside, and the command that fixes what it finds
 /// is the user's to run, never the session start's.
 pub(crate) async fn read_answerer_step() -> AnswererStep {
-    let mut paths = vec![ANSWERER_PROGRAM_PATH];
-    paths.extend(ANSWERER_UNIT_PATHS.iter().copied());
+    read_answerer_step_with_job(answerer_job().await).await
+}
+
+/// [`read_answerer_step`] over a job state the caller already read, so a
+/// command that read it once does not read it again.
+pub(crate) async fn read_answerer_step_with_job(job: AnswererJob) -> AnswererStep {
     let mut units = Vec::new();
     for path in ANSWERER_UNIT_PATHS {
         units.push(file_custody(path).await);
@@ -1919,6 +2368,11 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     let unit_text = tokio::fs::read_to_string(ANSWERER_UNIT_PATHS[ANSWERER_UNIT_PATHS.len() - 1])
         .await
         .ok();
+    let mut paths = vec![ANSWERER_PROGRAM_PATH];
+    paths.extend(ANSWERER_UNIT_PATHS.iter().copied());
+    paths.extend(answerer_log_walk(
+        unit_text.as_deref().and_then(unit_log_path),
+    ));
     let channel = file_custody(
         &minvmd::net::answerer::resolve_channel_sock()
             .display()
@@ -1927,6 +2381,21 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     .await;
     let operator = operator_name();
     let operator_uid = account_uid(&operator);
+    #[cfg(target_os = "macos")]
+    let (log_cap, log_cap_arguments) = (
+        file_custody(ANSWERER_LOG_CAP_PLIST_PATH).await,
+        tokio::fs::read_to_string(ANSWERER_LOG_CAP_PLIST_PATH)
+            .await
+            .ok()
+            .and_then(|text| plist_string_array(&text, "ProgramArguments")),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (log_cap, log_cap_arguments) = (None, None);
+    let shipped = answerer_source();
+    let shipped_sha256 = match &shipped {
+        Some(path) => sha256_of(path).await.ok(),
+        None => None,
+    };
     let facts = AnswererFacts {
         components: path_component_custody(&paths).await,
         program: file_custody(ANSWERER_PROGRAM_PATH).await,
@@ -1935,10 +2404,19 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
             .as_deref()
             .and_then(unit_program_argument)
             .map(str::to_string),
+        unit_log: unit_text
+            .as_deref()
+            .and_then(unit_log_path)
+            .map(str::to_string),
         channel_mode: channel.map(|custody| custody.mode),
         channel_owner: channel.map(|custody| custody.owner),
         operator_uid,
         installed_version: installed_protocol_version().await,
+        log_cap,
+        log_cap_arguments,
+        installed_sha256: sha256_of(ANSWERER_PROGRAM_PATH).await.ok(),
+        shipped_sha256,
+        job,
     };
     let step = answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION);
     // The unit owns the channel socket by the operator's uid, so an
@@ -1961,7 +2439,7 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     // (NET-122's privileged step copies this program as root): checked
     // unprivileged before the step is ever offered, and pinned by hash for
     // the privileged step to re-check ([`answerer_step_with_source`]).
-    answerer_step_with_source(step, answerer_source(), answerer_source_identity).await
+    answerer_step_with_source(step, shipped, answerer_source_identity).await
 }
 
 /// `/etc/resolv.conf`: the file every host process's lookup reads (through
@@ -3259,6 +3737,15 @@ fn macos_answerer_unit_steps(install: &AnswererInstall) -> String {
          chown root:wheel {ANSWERER_PLIST_PATH}\n\
          chmod 0644 {ANSWERER_PLIST_PATH}\n\
          \n\
+         # The service's log: a root-owned directory, and a file the service's\n\
+         # user owns. launchd does not make a missing directory.\n\
+         mkdir -p {MACOS_ANSWERER_LOG_DIR}\n\
+         chown root:wheel {MACOS_ANSWERER_LOG_DIR}\n\
+         chmod 0755 {MACOS_ANSWERER_LOG_DIR}\n\
+         touch {MACOS_ANSWERER_LOG_PATH}\n\
+         chown \"{operator}\" {MACOS_ANSWERER_LOG_PATH}\n\
+         chmod 0644 {MACOS_ANSWERER_LOG_PATH}\n\
+         \n\
          {handover}\
          {release}\
          rm -f \"{channel}\"\n\
@@ -3267,8 +3754,23 @@ fn macos_answerer_unit_steps(install: &AnswererInstall) -> String {
          \x20 if [ -S \"{channel}\" ] ; then break ; fi\n\
          \x20 sleep 0.25\n\
          done\n\
-         [ -S \"{channel}\" ] || {not_up}\n",
+         [ -S \"{channel}\" ] || {not_up}\n\
+         \n\
+         # The log's size cap: an hourly job, run as {operator}, that cuts\n\
+         # {MACOS_ANSWERER_LOG_PATH} to its last {keep_kib} KiB once it passes {max_kib} KiB.\n\
+         (launchctl bootout system/{ANSWERER_LOG_CAP_LABEL} 2>/dev/null || true)\n\
+         cat > {ANSWERER_LOG_CAP_PLIST_PATH} <<\\{ANSWERER_LOG_CAP_HEREDOC}\n\
+         {cap_plist}\
+         {ANSWERER_LOG_CAP_HEREDOC}\n\
+         chown root:wheel {ANSWERER_LOG_CAP_PLIST_PATH}\n\
+         chmod 0644 {ANSWERER_LOG_CAP_PLIST_PATH}\n\
+         launchctl bootstrap system {ANSWERER_LOG_CAP_PLIST_PATH} || \
+         {{ rm -f {ANSWERER_LOG_CAP_PLIST_PATH} ; \
+         echo \"minimal: the hourly size cap on {MACOS_ANSWERER_LOG_PATH} did not load, so the log can grow without a limit. Run min finalize-install to try again.\" >&2 ; }}\n",
         handover = handover_comment(&controls, "launchd loads the service"),
+        cap_plist = answerer_log_cap_plist(install),
+        keep_kib = ANSWERER_LOG_KEEP_BYTES / 1024,
+        max_kib = ANSWERER_LOG_MAX_BYTES / 1024,
         operator = install.operator,
         channel_dir = install.channel_dir,
         answerer_plist = answerer_unit_plist(install),
@@ -3290,6 +3792,42 @@ fn answerer_unit_plist(install: &AnswererInstall) -> String {
         .replace("__OPERATOR__", &install.operator)
         .replace("__OPERATOR_UID__", &install.operator_uid.to_string())
         .replace("__CHANNEL__", &install.channel)
+}
+
+/// The shell line the cap job runs ([`ANSWERER_LOG_CAP_TEMPLATE`]): when
+/// the log is over [`ANSWERER_LOG_MAX_BYTES`], copy its tail to a temp
+/// file and write it back over the log. The operator cannot create a file
+/// in the root-owned log directory, so the temp file is `mktemp`'s.
+#[cfg(any(test, target_os = "macos"))]
+fn answerer_log_cap_script() -> String {
+    format!(
+        "f={MACOS_ANSWERER_LOG_PATH}; \
+         [ \"$(stat -f %z \"$f\" 2>/dev/null || echo 0)\" -gt {ANSWERER_LOG_MAX_BYTES} ] || exit 0; \
+         t=$(mktemp) || exit 1; \
+         tail -c {ANSWERER_LOG_KEEP_BYTES} \"$f\" > \"$t\" && cat \"$t\" > \"$f\"; \
+         rm -f \"$t\""
+    )
+}
+
+/// The cap's launchd unit, rendered from [`ANSWERER_LOG_CAP_TEMPLATE`]
+/// for the operator the answerer runs as.
+#[cfg(any(test, target_os = "macos"))]
+fn answerer_log_cap_plist(install: &AnswererInstall) -> String {
+    ANSWERER_LOG_CAP_TEMPLATE
+        .replace("__SCRIPT__", &xml_escape(&answerer_log_cap_script()))
+        .replace("__OPERATOR__", &install.operator)
+        .replace("__INTERVAL__", &ANSWERER_LOG_CAP_INTERVAL_SECS.to_string())
+}
+
+/// `text` with the five XML special characters escaped, for a value the
+/// plist carries inside a `<string>`.
+#[cfg(any(test, target_os = "macos"))]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// The answerer's systemd socket unit, rendered from
@@ -3821,6 +4359,12 @@ fn macos_undo_command_under(root: &str, channel: &str) -> String {
          {service}\
          {channel_dirs}\
          \n\
+         # The box-name service's log: unload its size cap, then remove the\n\
+         # cap's plist and the log's directory.\n\
+         (launchctl bootout system/{ANSWERER_LOG_CAP_LABEL} 2>/dev/null || true)\n\
+         rm -f {root}{ANSWERER_LOG_CAP_PLIST_PATH}\n\
+         rm -rf {root}{MACOS_ANSWERER_LOG_DIR}\n\
+         \n\
          # The local range unit: unload it, remove its program and plist, and\n\
          # take the aliases it added to lo0 off, unless a VM is running: its\n\
          # boxes use them, so they stay until the VM stops.\n\
@@ -4039,6 +4583,15 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
         } => Some(format!(
             "the installed DNS service speaks protocol {installed}, not \
              this daemon's {daemon}{}",
+            remedy("reinstalls it from this machine's own copy")
+        )),
+        AnswererStep::CopyDiffers => Some(format!(
+            "the installed DNS service runs a different {ANSWERER_PROGRAM_NAME} than the one \
+             this version of Minimal ships{}",
+            remedy("replaces it with this machine's own copy")
+        )),
+        AnswererStep::NotRunning => Some(format!(
+            "Minimal's DNS service is installed but not running{}",
             remedy("reinstalls it from this machine's own copy")
         )),
         // The refusal itself is said beside this one (see [`advisory_at`]):
@@ -4846,6 +5399,93 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
     }
 }
 
+/// The installed DNS service's state, as a command reads it once for every
+/// line it prints: its job state, and whether `min finalize-install
+/// --show` prints a script that reinstalls it
+/// ([`AnswererStep::reinstall_offered`]). The default claims nothing, so a
+/// line printed without the read names no failing service.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DnsServiceState {
+    /// The job state the service manager reports.
+    pub job: AnswererJob,
+    /// Whether `min finalize-install --show` offers the reinstall.
+    pub reinstall_offered: bool,
+}
+
+/// [`vm_host_answerer_line`] with the installed DNS service's state read
+/// beside it: when another program holds the answerer's port, and that
+/// program is Minimal's own DNS service job — loaded, holding the port its
+/// unit binds, and not running — the line names that service in place of
+/// "another program". It names `min finalize-install` only when that
+/// command offers the reinstall. `min ls` and the session start both print
+/// this line. Pure.
+#[must_use]
+pub fn vm_host_answerer_line_beside(
+    status: ZoneAnswererStatus,
+    service: DnsServiceState,
+) -> Option<String> {
+    match status {
+        ZoneAnswererStatus::PortHeldNoChannel { port }
+            if service.job == AnswererJob::NotRunning
+                && port == minvmd::net::answerer::DEFAULT_ANSWERER_PORT =>
+        {
+            Some(failing_dns_service_line(port, service.reinstall_offered))
+        }
+        status => vm_host_answerer_line(status),
+    }
+}
+
+/// Whether a status read names the state where the DNS service's own job
+/// can hold the port: the port it binds, held with no channel behind it.
+pub(crate) fn port_held_by_service_job(status: &ZoneAnswererStatus) -> bool {
+    matches!(
+        status,
+        ZoneAnswererStatus::PortHeldNoChannel { port }
+            if *port == minvmd::net::answerer::DEFAULT_ANSWERER_PORT
+    )
+}
+
+/// The installed DNS service's state on this host, read once for every
+/// status a command prints. The job state is read only when one of
+/// `statuses` is the port held with no channel, and the service step only
+/// when that job is not running. Every other read claims nothing.
+pub async fn dns_service_state_on_this_host<'a>(
+    statuses: impl IntoIterator<Item = &'a ZoneAnswererStatus>,
+) -> DnsServiceState {
+    if !statuses.into_iter().any(port_held_by_service_job) {
+        return DnsServiceState::default();
+    }
+    let job = answerer_job().await;
+    if job != AnswererJob::NotRunning {
+        return DnsServiceState {
+            job,
+            reinstall_offered: false,
+        };
+    }
+    DnsServiceState {
+        job,
+        reinstall_offered: read_answerer_step_with_job(job).await.reinstall_offered(),
+    }
+}
+
+/// The DNS SERVICE line for Minimal's own DNS service when its job holds
+/// the port and its program is not running. The line names `min
+/// finalize-install` only when `reinstall_offered`: that command then
+/// offers the reinstall ([`AnswererStep::reinstall_offered`]). Otherwise
+/// the line states the situation and stops.
+#[must_use]
+pub fn failing_dns_service_line(port: u16, reinstall_offered: bool) -> String {
+    let line = format!(
+        "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} (UDP). The \
+         service is not running."
+    );
+    if reinstall_offered {
+        format!("{line} Run `min finalize-install` to reinstall it.")
+    } else {
+        line
+    }
+}
+
 /// The live surface from the reply a control socket answered — the VM host
 /// daemon's, or a native minimald's beside its ssh socket, which answers
 /// the same status verb — `min ls`'s form. The no-channel state
@@ -4896,38 +5536,37 @@ pub fn serving_proxy_port(reported: Option<u16>, proxy_down: Option<&ProxyDown>)
 }
 
 /// The surface verdict with a proxy-down sibling folded in (T93): a
-/// `Proxy` verdict beside the VM host daemon's cause becomes
-/// [`LiveSurface::ProxyNotServing`] with that cause, so the BOX NAMES
-/// line names why the live surface is not serving. Any other verdict is
-/// returned unchanged; its cause prints on a line of its own
-/// ([`proxy_down_line_beside`]).
+/// `Proxy` or `ProxyNotServing` verdict beside the VM host daemon's cause
+/// becomes a plain [`LiveSurface::Proxy`], so the BOX NAMES line
+/// ([`name_surface_line_beside`]) says the cause's headline and does not
+/// repeat its detail. The cause prints once, on the HOSTNAME PROXY row
+/// ([`proxy_down_line_beside`]), as NET-020 says (#3046). A `Native`
+/// verdict is returned unchanged.
 #[must_use]
 pub fn surface_beside_proxy_down(
     surface: LiveSurface,
     proxy_down: Option<&ProxyDown>,
 ) -> LiveSurface {
     match (surface, proxy_down) {
-        (LiveSurface::Proxy, Some(down)) => LiveSurface::ProxyNotServing {
-            port: down.port,
-            cause: down.cause.clone(),
-        },
+        (LiveSurface::Proxy | LiveSurface::ProxyNotServing { .. }, Some(_)) => LiveSurface::Proxy,
         (surface, _) => surface,
     }
 }
 
-/// The standalone proxy-down line beside a (folded) surface verdict, so
-/// the cause is named exactly once: `None` when the verdict is
-/// [`LiveSurface::ProxyNotServing`], whose BOX NAMES line already names
-/// the cause, and the [`proxy_down_line`] beside a `Native` verdict or no
-/// verdict at all.
+/// The standalone proxy-down line for the HOSTNAME PROXY row (NET-020):
+/// the [`proxy_down_line`] whenever the VM host daemon reports a cause,
+/// whatever the surface verdict. The BOX NAMES line beside it never names
+/// the cause, because [`surface_beside_proxy_down`] folds the cause out of
+/// it, so the cause is named exactly once.
 #[must_use]
 pub fn proxy_down_line_beside(
     surface: Option<&LiveSurface>,
     proxy_down: Option<&ProxyDown>,
 ) -> Option<String> {
-    if matches!(surface, Some(LiveSurface::ProxyNotServing { .. })) {
-        return None;
-    }
+    debug_assert!(
+        !(proxy_down.is_some() && matches!(surface, Some(LiveSurface::ProxyNotServing { .. }))),
+        "fold the surface with surface_beside_proxy_down first"
+    );
     proxy_down.map(proxy_down_line)
 }
 
@@ -5105,6 +5744,9 @@ pub struct HostInstall {
     /// scoping the plan applies (a VM-backed daemon carries no classifier
     /// item, a native one no KVM item).
     pub other_items_unfinished: bool,
+    /// The installed DNS service's state, which the `DNS SERVICE` line
+    /// reads to name a failing service. Read once per command.
+    pub dns_service: DnsServiceState,
 }
 
 /// Whether this host's install is unfinished (NET-018, NET-122): the names
@@ -5329,6 +5971,33 @@ pub fn name_surface_line_at(
         proxy_port,
         at_own_address,
     )
+}
+
+/// [`name_surface_line_at`] beside a proxy-down sibling (NET-020, #3046):
+/// pass the surface folded by [`surface_beside_proxy_down`]. A `Proxy`
+/// verdict beside a cause keeps the cause's headline, "not serving" or
+/// "not confirmed yet", so the row agrees with the HOSTNAME PROXY row. It
+/// leaves out the detail, because that row names it once. Any other
+/// verdict, or no cause, reads as [`name_surface_line_at`].
+#[must_use]
+pub fn name_surface_line_beside(
+    surface: LiveSurface,
+    proxy_port: Option<u16>,
+    at_own_address: bool,
+    proxy_down: Option<&ProxyDown>,
+) -> String {
+    match (&surface, proxy_down) {
+        (LiveSurface::Proxy, Some(down)) => {
+            let headline = match down.cause {
+                ProxyDownCause::PublishUnconfirmed => "not confirmed yet",
+                ProxyDownCause::PortHeld
+                | ProxyDownCause::RedrawsRanOut
+                | ProxyDownCause::PortHeldAfterStart { .. } => "not serving",
+            };
+            format!("<box>.{ZONE}: the hostname proxy is {headline}")
+        }
+        _ => name_surface_line_at(surface, proxy_port, at_own_address),
+    }
 }
 
 /// The reserved range as `network/prefix`, the form the advisory and the
@@ -6174,6 +6843,7 @@ pub(crate) mod tests {
     fn activate_prints_one_host_line_per_install_state() {
         let others_open = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
         let unfinished = host_line("web", &LiveSurface::Proxy, Some(7654), others_open);
         assert_eq!(
@@ -6344,6 +7014,7 @@ pub(crate) mod tests {
             HostInstall::default(),
             HostInstall {
                 other_items_unfinished: true,
+                ..HostInstall::default()
             },
         ] {
             let native = host_line("api", &LiveSurface::Native, Some(7654), host);
@@ -6395,6 +7066,7 @@ pub(crate) mod tests {
         const CLAUSE: &str = "; finish setup: min finalize-install";
         let others_open = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
         let cases = [
             (LiveSurface::Proxy, HostInstall::default(), true),
@@ -7214,6 +7886,158 @@ exit 0
         }
     }
 
+    /// The log's size-cap unit is one of the step's custody checks: the
+    /// unit the step writes passes, and a missing unit, one root does not
+    /// own, or one that runs other arguments re-surfaces the step. A cap
+    /// that launchd did not load is removed, so the next read fails too.
+    #[test]
+    fn answerer_plist_sets_a_log_path_and_checks_its_cap() {
+        let install = test_install();
+        let cap = answerer_log_cap_plist(&install);
+        let root = Some(FileCustody {
+            owner: 0,
+            mode: 0o644,
+        });
+        let arguments =
+            plist_string_array(&cap, "ProgramArguments").expect("the cap names its arguments");
+        assert_eq!(arguments[2], answerer_log_cap_script(), "{cap}");
+        assert_eq!(answerer_log_cap_check(root, Some(&arguments)), None);
+
+        let check = answerer_log_cap_check(None, None).expect("a missing cap fails");
+        assert!(check.contains(ANSWERER_LOG_CAP_PLIST_PATH), "{check}");
+        assert!(check.contains("missing"), "{check}");
+
+        let foreign = Some(FileCustody {
+            owner: 501,
+            mode: 0o644,
+        });
+        assert!(answerer_log_cap_check(foreign, Some(&arguments)).is_some());
+
+        let other = cap.replace(&xml_escape(&answerer_log_cap_script()), "exit 0");
+        let other = plist_string_array(&other, "ProgramArguments").expect("still an array");
+        let check = answerer_log_cap_check(root, Some(&other)).expect("other arguments fail");
+        assert!(check.contains(MACOS_ANSWERER_LOG_PATH), "{check}");
+        assert!(answerer_log_cap_check(root, None).is_some());
+
+        let steps = macos_answerer_unit_steps(&install);
+        assert!(
+            steps.contains(&format!(
+                "launchctl bootstrap system {ANSWERER_LOG_CAP_PLIST_PATH} || \
+                 {{ rm -f {ANSWERER_LOG_CAP_PLIST_PATH} ;"
+            )),
+            "a cap that did not load is removed:\n{steps}"
+        );
+    }
+
+    /// The answerer's launchd unit sends its stdout and stderr to a fixed,
+    /// root-owned log, the file `min bug` collects, so a service that exits
+    /// at start leaves its reason there. The step makes the log's directory
+    /// before it loads the unit, caps the log's size, and `--undo` removes
+    /// both. A unit from before the log re-surfaces the step.
+    #[test]
+    fn answerer_plist_sets_a_log_path() {
+        let install = test_install();
+        let plist = answerer_unit_plist(&install);
+        let log = MACOS_ANSWERER_LOG_PATH;
+        assert_eq!(
+            log,
+            format!("{MACOS_ANSWERER_LOG_DIR}/minzoned.log"),
+            "the log sits in its own directory"
+        );
+        assert!(
+            log.starts_with("/private/var/log/"),
+            "the log is root's, never the caller's: {log}"
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(
+            home.is_empty() || !log.starts_with(&home),
+            "the log is not under $HOME: {log}"
+        );
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            assert_eq!(
+                plist_string_value(&plist, key),
+                Some(log),
+                "{key}:\n{plist}"
+            );
+        }
+        assert_eq!(
+            answerer_log_check(plist_string_value(&plist, "StandardErrorPath")),
+            None
+        );
+
+        // A unit from before the log names none, and re-surfaces the step.
+        let old = plist.replace(
+            &format!("\t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n"),
+            "",
+        );
+        assert_eq!(plist_string_value(&old, "StandardErrorPath"), None);
+        let check = answerer_log_check(None).expect("a unit with no log fails");
+        assert!(check.contains(log), "{check}");
+        let check = answerer_log_check(Some("/Users/u/.local/state/minimal/logs/minzoned.log"))
+            .expect("a unit with another log fails");
+        assert!(check.contains(log), "{check}");
+
+        // The step makes the directory root's and the file the operator's,
+        // before launchd loads the unit that names them.
+        let steps = macos_answerer_unit_steps(&install);
+        let load = steps
+            .find(&format!("launchctl bootstrap system {ANSWERER_PLIST_PATH}"))
+            .expect("the step loads the unit");
+        for line in [
+            format!("mkdir -p {MACOS_ANSWERER_LOG_DIR}\n"),
+            format!("chown root:wheel {MACOS_ANSWERER_LOG_DIR}\n"),
+            format!("chmod 0755 {MACOS_ANSWERER_LOG_DIR}\n"),
+            format!("touch {log}\n"),
+            format!("chown \"{}\" {log}\n", install.operator),
+            format!("chmod 0644 {log}\n"),
+        ] {
+            let at = steps
+                .find(&line)
+                .unwrap_or_else(|| panic!("{line}:\n{steps}"));
+            assert!(at < load, "{line} runs before the unit loads:\n{steps}");
+        }
+
+        // The size cap: written root's, loaded, and run as the operator.
+        let cap = answerer_log_cap_plist(&install);
+        assert!(steps.contains(&cap), "{steps}");
+        assert!(
+            steps.contains(&format!(
+                "launchctl bootstrap system {ANSWERER_LOG_CAP_PLIST_PATH}"
+            )),
+            "{steps}"
+        );
+        assert_eq!(
+            plist_string_value(&cap, "UserName"),
+            Some(install.operator.as_str())
+        );
+        assert!(!cap.contains("__"), "{cap}");
+        let script = answerer_log_cap_script();
+        assert!(cap.contains(&xml_escape(&script)), "{cap}");
+        assert!(
+            !xml_escape(&script).contains('>'),
+            "the script is escaped: {cap}"
+        );
+        for part in [
+            format!("f={log};"),
+            format!("-gt {ANSWERER_LOG_MAX_BYTES} ]"),
+            format!("tail -c {ANSWERER_LOG_KEEP_BYTES} \"$f\""),
+            "t=$(mktemp)".to_string(),
+        ] {
+            assert!(script.contains(&part), "{part}: {script}");
+        }
+
+        // `--undo` unloads the cap and removes its plist and the log.
+        let undo = macos_undo_command("/run/answerer.sock");
+        for line in [
+            format!("(launchctl bootout system/{ANSWERER_LOG_CAP_LABEL} 2>/dev/null || true)\n"),
+            format!("rm -f {ANSWERER_LOG_CAP_PLIST_PATH}\n"),
+            format!("rm -rf {MACOS_ANSWERER_LOG_DIR}\n"),
+        ] {
+            assert!(undo.contains(&line), "{line}:\n{undo}");
+        }
+        assert_eq!(xml_escape("a&b<c>'\""), "a&amp;b&lt;c&gt;&apos;&quot;");
+    }
+
     #[test]
     fn native_surface_needs_all_three_facts() {
         let port = 15353;
@@ -7395,12 +8219,11 @@ exit 0
         );
     }
 
-    /// One proxy verdict per surface (T93): with a proxy-down sibling, the
-    /// lines a session start or a listing prints — the standalone cause
-    /// line, when any, and the BOX NAMES line — name the cause exactly
-    /// once, whatever the verdict (Native, Proxy, none, or the
-    /// pre-acquisition `ProxyNotServing` arm), and never name the reported
-    /// port as serving or routing.
+    /// One proxy verdict per surface (T93, NET-020): with a proxy-down
+    /// sibling, the standalone cause line always prints, and the BOX NAMES
+    /// line beside it never repeats the cause, whatever the verdict
+    /// (Native, Proxy, none, or the pre-acquisition `ProxyNotServing`
+    /// arm). No line names the reported port as serving or routing.
     #[test]
     fn a_proxy_down_sibling_is_named_once_beside_any_verdict() {
         let causes = [
@@ -7427,11 +8250,32 @@ exit 0
             ];
             for verdict in verdicts {
                 let folded = verdict.map(|surface| surface_beside_proxy_down(surface, Some(&down)));
-                let mut lines: Vec<String> = proxy_down_line_beside(folded.as_ref(), Some(&down))
-                    .into_iter()
-                    .collect();
+                let cause_line = proxy_down_line_beside(folded.as_ref(), Some(&down))
+                    .expect("the cause always has its own row");
+                assert!(
+                    cause_line.contains("127.0.0.1:19911"),
+                    "the cause row names the port: {cause_line}"
+                );
+                let mut lines = vec![cause_line];
                 if let Some(surface) = folded.clone() {
-                    lines.push(name_surface_line(surface, serving));
+                    let names = name_surface_line_beside(surface, serving, true, Some(&down));
+                    if folded == Some(LiveSurface::Proxy) {
+                        // The headline agrees with the HOSTNAME PROXY row.
+                        let headline = match cause {
+                            ProxyDownCause::PublishUnconfirmed => {
+                                "<box>.min.internal: the hostname proxy is not confirmed yet"
+                            }
+                            _ => "<box>.min.internal: the hostname proxy is not serving",
+                        };
+                        assert_eq!(names, headline, "the BOX NAMES row for {cause:?}");
+                    }
+                    assert!(
+                        !names.contains("127.0.0.1:19911")
+                            && !names.contains("holds")
+                            && !names.contains("by itself"),
+                        "the BOX NAMES line does not repeat the cause: {names}"
+                    );
+                    lines.push(names);
                 }
                 let all = lines.join("\n");
                 assert_eq!(
@@ -7445,8 +8289,8 @@ exit 0
                     "no line names the down proxy as serving for {folded:?}: {all}"
                 );
                 assert!(
-                    !matches!(folded, Some(LiveSurface::Proxy)),
-                    "a Proxy verdict beside a cause must fold: {all}"
+                    !matches!(folded, Some(LiveSurface::ProxyNotServing { .. })),
+                    "a verdict beside a cause folds the cause out: {all}"
                 );
             }
         }
@@ -7468,6 +8312,7 @@ exit 0
     fn both_verbs_end_with_the_same_install_clause() {
         let host = HostInstall {
             other_items_unfinished: true,
+            ..HostInstall::default()
         };
         let clause = install_clause(install_unfinished(&LiveSurface::Proxy, host));
         assert_eq!(clause, "; finish setup: min finalize-install");
@@ -7540,6 +8385,7 @@ exit 0
                     HostInstall::default(),
                     HostInstall {
                         other_items_unfinished: true,
+                        ..HostInstall::default()
                     },
                 ] {
                     for at_own_address in [true, false] {
@@ -7837,10 +8683,11 @@ exit 0
     }
 
     /// NET-021, NET-022: a held proxy port, at the start or after it, reads
-    /// the same on the activate `names:` line, the `min ls` HOSTNAME PROXY
-    /// row and the folded BOX NAMES row: the holder, the port, and that
-    /// the proxy serves by itself once the port frees. No surface tells
-    /// the user to run `min stop` or to restart the VM.
+    /// the same on the activate `names:` line and the `min ls` HOSTNAME
+    /// PROXY row: the holder, the port, and that the proxy serves by itself
+    /// once the port frees. The folded BOX NAMES row does not repeat it
+    /// (NET-020). No surface tells the user to run `min stop` or to restart
+    /// the VM.
     #[test]
     fn proxy_held_line_names_holder_without_restart() {
         let named = ProxyDown {
@@ -7863,11 +8710,11 @@ exit 0
             );
             // The `min ls` HOSTNAME PROXY row.
             assert_eq!(proxy_down_line(down), sentence);
-            // The row folded beside a Proxy verdict.
+            // The BOX NAMES row folded beside a Proxy verdict: no cause.
             let folded = surface_beside_proxy_down(LiveSurface::Proxy, Some(down));
             assert_eq!(
-                name_surface_line(folded, None),
-                format!("<box>.min.internal: {sentence}")
+                name_surface_line_beside(folded, None, true, Some(down)),
+                "<box>.min.internal: the hostname proxy is not serving"
             );
             // The `min session activate` names: line, on a finished host and
             // on one whose install pointer rides after the sentence.
@@ -8190,8 +9037,13 @@ exit 0
         // The range's steps outside the two bodies substitute nothing — no
         // `$`, no backtick — and the bodies themselves are quoted-delimiter
         // (asserted above), so a backtick inside one (the program's comments
-        // carry markdown) writes rather than runs.
-        let steps_only = command.replace(&program, "").replace(RANGE_UNIT_PLIST, "");
+        // carry markdown) writes rather than runs. The log cap's plist is a
+        // quoted-delimiter body too: its shell line runs under launchd, not
+        // here.
+        let steps_only = command
+            .replace(&program, "")
+            .replace(RANGE_UNIT_PLIST, "")
+            .replace(&answerer_log_cap_plist(&install), "");
         let (range_steps, answerer_steps) = steps_only
             .split_once("\n# The box-name service's program")
             .expect("the answerer service's step follows the range's");
@@ -9802,9 +10654,12 @@ resolvectl domain minzone0 '~min.internal'
     /// file root's, the unit naming the copy, and the copy answering
     /// `version` to the protocol probe.
     fn root_owned_answerer_facts(version: Option<u32>) -> AnswererFacts {
+        // macOS's unit names its log, and the walk covers its directory.
+        let unit_log = cfg!(target_os = "macos").then(|| MACOS_ANSWERER_LOG_PATH.to_string());
         let mut components = Vec::new();
-        for path in
-            std::iter::once(ANSWERER_PROGRAM_PATH).chain(ANSWERER_UNIT_PATHS.iter().copied())
+        for path in std::iter::once(ANSWERER_PROGRAM_PATH)
+            .chain(ANSWERER_UNIT_PATHS.iter().copied())
+            .chain(answerer_log_walk(unit_log.as_deref()))
         {
             for component in path_components(path) {
                 components.push((
@@ -9832,10 +10687,22 @@ resolvectl domain minzone0 '~min.internal'
                 })
                 .collect(),
             unit_program: Some(ANSWERER_PROGRAM_PATH.to_string()),
+            unit_log,
             channel_mode: Some(0o600),
             channel_owner: Some(1000),
             operator_uid: Some(1000),
             installed_version: version,
+            // macOS's step installs the log's size cap as well.
+            log_cap: cfg!(target_os = "macos").then_some(FileCustody {
+                owner: 0,
+                mode: 0o644,
+            }),
+            log_cap_arguments: cfg!(target_os = "macos").then(|| {
+                ["/bin/sh", "-c", answerer_log_cap_script().as_str()]
+                    .map(str::to_string)
+                    .to_vec()
+            }),
+            ..AnswererFacts::default()
         }
     }
 
@@ -10213,6 +11080,229 @@ resolvectl domain minzone0 '~min.internal'
         assert!(
             advise(&current).is_none(),
             "a matching copy lets it fall quiet"
+        );
+    }
+
+    // D3472: an upgrade that ships a new `minzoned` speaking the same
+    // protocol leaves the old root-owned copy in place. The step compares
+    // the copy's SHA-256 with the shipped program's, and a copy that
+    // differs is a step that replaces it.
+    #[test]
+    fn answerer_step_over_reinstalls_a_copy_that_differs_from_the_shipped_minzoned() {
+        let daemon = minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION;
+        let port = 15353;
+        let stale = AnswererFacts {
+            installed_sha256: Some("a".repeat(64)),
+            shipped_sha256: Some("b".repeat(64)),
+            ..root_owned_answerer_facts(Some(daemon))
+        };
+        let step = answerer_step_over(&stale, daemon);
+        assert_eq!(step, AnswererStep::CopyDiffers);
+        assert!(!step.holds());
+        assert!(step.installed_but_stale_or_failing());
+        let advisory = advisory_at(
+            &Hook::configured("test", Some(port), "routes the zone"),
+            port,
+            false,
+            Some(true),
+            &range_step_on_this_os(),
+            &verified(step),
+            None,
+        )
+        .expect("a stale copy re-surfaces the advisory");
+        assert!(
+            advisory.contains(
+                "the installed DNS service runs a different minzoned than the one this \
+                 version of Minimal ships; this step replaces it with this machine's own copy"
+            ),
+            "{advisory}"
+        );
+        assert!(
+            advisory.contains(&command(port, verified_install().as_ref())),
+            "the advisory carries the step that replaces the copy: {advisory}"
+        );
+
+        // The same bytes on both sides, or a side that did not read, holds.
+        let current = AnswererFacts {
+            installed_sha256: Some("a".repeat(64)),
+            shipped_sha256: Some("a".repeat(64)),
+            ..root_owned_answerer_facts(Some(daemon))
+        };
+        assert!(answerer_step_over(&current, daemon).holds());
+        let unread = AnswererFacts {
+            installed_sha256: Some("a".repeat(64)),
+            shipped_sha256: None,
+            ..root_owned_answerer_facts(Some(daemon))
+        };
+        assert!(answerer_step_over(&unread, daemon).holds());
+    }
+
+    // D3472: a loaded job whose program keeps exiting holds the port with
+    // no channel behind it. The step reads the job state and reinstalls.
+    #[test]
+    fn answerer_step_over_reinstalls_a_job_that_keeps_exiting() {
+        let daemon = minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION;
+        let exiting = AnswererFacts {
+            job: AnswererJob::NotRunning,
+            ..root_owned_answerer_facts(Some(daemon))
+        };
+        let step = answerer_step_over(&exiting, daemon);
+        assert_eq!(step, AnswererStep::NotRunning);
+        assert!(!step.holds());
+        assert!(verified(step.clone()).installed_but_stale_or_failing());
+        assert_eq!(
+            answerer_fact(&step, true).as_deref(),
+            Some(
+                "Minimal's DNS service is installed but not running; this step reinstalls \
+                 it from this machine's own copy"
+            )
+        );
+        for job in [AnswererJob::Running, AnswererJob::Unknown] {
+            let facts = AnswererFacts {
+                job,
+                ..root_owned_answerer_facts(Some(daemon))
+            };
+            assert!(answerer_step_over(&facts, daemon).holds(), "{job:?}");
+        }
+        assert!(!AnswererStep::Installed.installed_but_stale_or_failing());
+        assert!(!AnswererStep::Absent.installed_but_stale_or_failing());
+
+        // The service managers' own reports of such a job.
+        let launchd = "system/dev.gominimal.zone = {\n\tactive count = 0\n\tpath = \
+                       /Library/LaunchDaemons/dev.gominimal.zone.plist\n\tstate = not running\n\
+                       \n\truns = 41\n\tlast exit code = 1\n\tsockets = {\n\t\tstate = active\n\t}\n}\n";
+        assert_eq!(launchd_job_state(launchd), AnswererJob::NotRunning);
+        assert_eq!(
+            launchd_job_state(&launchd.replace("not running", "spawn scheduled")),
+            AnswererJob::NotRunning
+        );
+        assert_eq!(
+            launchd_job_state(&launchd.replace("state = not running", "state = running")),
+            AnswererJob::Running
+        );
+        assert_eq!(launchd_job_state(""), AnswererJob::Unknown);
+        assert_eq!(
+            systemd_job_state("LoadState=loaded\nActiveState=failed\nSubState=failed\n"),
+            AnswererJob::NotRunning
+        );
+        assert_eq!(
+            systemd_job_state("LoadState=loaded\nActiveState=activating\nSubState=auto-restart\n"),
+            AnswererJob::NotRunning
+        );
+        assert_eq!(
+            systemd_job_state("LoadState=loaded\nActiveState=active\nSubState=running\n"),
+            AnswererJob::Running
+        );
+        assert_eq!(
+            systemd_job_state("LoadState=loaded\nActiveState=inactive\nSubState=dead\n"),
+            AnswererJob::Unknown
+        );
+        assert_eq!(
+            systemd_job_state("LoadState=not-found\nActiveState=failed\nSubState=failed\n"),
+            AnswererJob::Unknown
+        );
+    }
+
+    // D3472: when the port is held with no channel and the holder is
+    // Minimal's own DNS service job, loaded and not running, the DNS
+    // SERVICE line names that service and the command that fixes it.
+    #[test]
+    fn vm_host_answerer_line_names_a_failing_dns_service() {
+        let port = minvmd::net::answerer::DEFAULT_ANSWERER_PORT;
+        let held = ZoneAnswererStatus::PortHeldNoChannel { port };
+        let failing = |reinstall_offered| DnsServiceState {
+            job: AnswererJob::NotRunning,
+            reinstall_offered,
+        };
+        // `min finalize-install --show` offers the reinstall: the line
+        // names the command.
+        assert_eq!(
+            vm_host_answerer_line_beside(held.clone(), failing(true)).as_deref(),
+            Some(
+                format!(
+                    "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} \
+                     (UDP). The service is not running. Run `min finalize-install` to \
+                     reinstall it."
+                )
+                .as_str()
+            )
+        );
+        // No reinstall is offered (a custody failure, or no verified copy
+        // source): the line states the situation and stops.
+        assert_eq!(
+            vm_host_answerer_line_beside(held.clone(), failing(false)).as_deref(),
+            Some(
+                format!(
+                    "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} \
+                     (UDP). The service is not running."
+                )
+                .as_str()
+            )
+        );
+        // A running job, or no read, keeps the other-program line.
+        for job in [AnswererJob::Running, AnswererJob::Unknown] {
+            let service = DnsServiceState {
+                job,
+                reinstall_offered: true,
+            };
+            assert_eq!(
+                vm_host_answerer_line_beside(held.clone(), service),
+                vm_host_answerer_line(held.clone()),
+                "{job:?}"
+            );
+        }
+        assert_eq!(
+            vm_host_answerer_line_beside(held.clone(), DnsServiceState::default()),
+            vm_host_answerer_line(held.clone())
+        );
+        // A port the job does not bind is another program's.
+        let other = ZoneAnswererStatus::PortHeldNoChannel { port: port + 1 };
+        assert_eq!(
+            vm_host_answerer_line_beside(other.clone(), failing(true)),
+            vm_host_answerer_line(other)
+        );
+        // The other states print as before.
+        let holder = ZoneAnswererStatus::Holder { port };
+        assert_eq!(
+            vm_host_answerer_line_beside(holder.clone(), failing(true)),
+            vm_host_answerer_line(holder)
+        );
+        // Only the service's own port held with no channel asks for a read.
+        assert!(port_held_by_service_job(&held));
+        assert!(!port_held_by_service_job(
+            &ZoneAnswererStatus::PortHeldNoChannel { port: port + 1 }
+        ));
+        assert!(!port_held_by_service_job(&ZoneAnswererStatus::Holder {
+            port
+        }));
+
+        // The reinstall is offered only over a verified copy source.
+        let source = VerifiedSource {
+            path: TEST_ANSWERER_SOURCE.to_string(),
+            sha256: "0".repeat(64),
+            bundle: Vec::new(),
+            requirement: None,
+        };
+        let over = |service: AnswererStep| AnswererStep::SourceVerified {
+            service: Box::new(service),
+            source: source.clone(),
+        };
+        assert!(over(AnswererStep::NotRunning).reinstall_offered());
+        assert!(over(AnswererStep::CopyDiffers).reinstall_offered());
+        assert!(!over(AnswererStep::Installed).reinstall_offered());
+        assert!(!AnswererStep::NotRunning.reinstall_offered());
+        assert!(
+            !AnswererStep::CustodyFailed {
+                failed_check: "its program is missing".to_string(),
+            }
+            .reinstall_offered()
+        );
+        assert!(
+            !AnswererStep::SourceUnavailable {
+                service: Box::new(AnswererStep::NotRunning),
+                reason: "no copy of minzoned ships beside min".to_string(),
+            }
+            .reinstall_offered()
         );
     }
 
@@ -11457,10 +12547,12 @@ resolvectl domain minzone0 '~min.internal'
                 })
                 .collect(),
             unit_program: Some(LEGACY_MACOS_ANSWERER_PROGRAM_PATH.to_string()),
+            unit_log: None,
             channel_mode: Some(0o600),
             channel_owner: Some(1000),
             operator_uid: Some(1000),
             installed_version: Some(daemon),
+            ..AnswererFacts::default()
         };
         let step = answerer_step_over(&facts, daemon);
         assert!(
