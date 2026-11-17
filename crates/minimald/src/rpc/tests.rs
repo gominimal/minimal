@@ -130,6 +130,8 @@ async fn clean_cache_streams_progress_then_a_terminal_done() {
     let mut client = server.connect().await;
 
     // Two cold entries — nothing has read them, and no session needs them.
+    // Written a minute before the cutoff the request sets, so their write
+    // times — the only ages they have — put them in scope.
     let cache = server.state.daemon_context().await.local_cache();
     for byte in [1u8, 2] {
         let w = cache
@@ -142,6 +144,13 @@ async fn clean_cache_streams_progress_then_a_terminal_done() {
             ..Default::default()
         })
         .unwrap();
+        let cold = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap();
+        std::fs::File::open(cache.entry_path(&common::SpecHash::from_bytes([byte; 32])))
+            .unwrap()
+            .set_modified(cold)
+            .unwrap();
     }
 
     // `older_than_secs` of 1 rather than the daemon default, so entries

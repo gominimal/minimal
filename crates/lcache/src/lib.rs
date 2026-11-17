@@ -277,6 +277,17 @@ impl Cache<LocalDir> {
         })
     }
 
+    /// The path on the filesystem where the entry with `hash` lives, whether
+    /// or not it exists yet.
+    pub fn entry_path(&self, hash: &SpecHash) -> PathBuf {
+        let hash_hex = hash.0.to_hex();
+        // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
+        let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
+            .iter()
+            .collect();
+        self.inner().fs.path().join(subpath)
+    }
+
     /// Invalidates (deletes) a directory cache entry with the given spec hash.
     pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
         let hash_hex = hash.0.to_hex();

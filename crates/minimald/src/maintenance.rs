@@ -421,8 +421,9 @@ mod tests {
         (dir, state, maintenance)
     }
 
-    /// Writes an entry into the daemon's local cache under `hash`. No read is
-    /// ever recorded against it, so a clean sees it as cold.
+    /// Writes an entry into the daemon's local cache under `hash`, rewinding
+    /// its directory's mtime past the clean's cutoff: no read is ever recorded
+    /// against it, so its write time is what a clean judges it by.
     fn write_entry(cache: &mctx::Cache, hash: &SpecHash) {
         let w = cache.write_dir(hash).unwrap();
         w.open_write("f").unwrap().write_all(b"x").unwrap();
@@ -432,6 +433,13 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        let cold = std::time::SystemTime::now()
+            .checked_sub(UNUSED_FOR + Duration::from_secs(60))
+            .unwrap();
+        std::fs::File::open(cache.entry_path(hash))
+            .unwrap()
+            .set_modified(cold)
+            .unwrap();
     }
 
     /// A clean reclaims cold cache entries but not the ones a live session

@@ -83,13 +83,15 @@ pub struct CleanReport {
 }
 
 /// Deletes cache entries whose last recorded read is older than `older_than` —
-/// or that have no recorded read at all — then removes the leftover execution
-/// directories under `sweep` whose owner is gone.
+/// and entries never read at all once their most recent write is that old —
+/// then removes the leftover execution directories under `sweep` whose owner
+/// is gone.
 ///
 /// Entries in `keep` are never deleted, whatever their age, and directories
 /// stamped with `daemon_id` are never swept.
 pub struct CleanCache {
-    /// Only delete entries last read at least this long ago.
+    /// Only delete entries last read at least this long ago; an entry nothing
+    /// has read yet is judged by when it was written.
     pub older_than: Duration,
     /// Entries to keep regardless of age.
     pub keep: HashSet<SpecHash>,
@@ -125,10 +127,22 @@ impl CleanCache {
 
         // Collected up front: deleting an entry removes the very directory
         // `iter_entries` is walking to find the next one.
+        //
+        // A fresh entry often has no recorded read yet — writing one does not
+        // count as using it — so it is judged by when it was written: its
+        // directory's mtime. A read, however stale, still wins: the entry has
+        // been used at least once, and the access log is the record of that.
+        // An entry whose mtime cannot be read cannot be proven fresh, so it
+        // goes rather than being kept forever.
         let stale: Vec<SpecHash> = cache
             .iter_entries()
             .filter(|hash| !self.keep.contains(hash))
-            .filter(|hash| atimes.last_read(hash).is_none_or(|last| last < cutoff))
+            .filter(|hash| {
+                atimes
+                    .last_read(hash)
+                    .or_else(|| written_at(cache, hash))
+                    .is_none_or(|last| last < cutoff)
+            })
             .collect();
 
         let mut report = CleanReport::default();
@@ -213,6 +227,14 @@ impl CleanCache {
 /// hours; a dead daemon's stamp never changes again, so a few days apart tells
 /// the two cases apart without any way to ask the other daemon.
 const FOREIGN_OWNER_IDLE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// When the cache entry with `hash` was last written: its directory's
+/// modification time, absent when that cannot be read.
+fn written_at(cache: &Cache<LocalDir>, hash: &SpecHash) -> Option<SystemTime> {
+    std::fs::metadata(cache.entry_path(hash))
+        .and_then(|m| m.modified())
+        .ok()
+}
 
 /// The newest modification time of `root` or anything under it, or `None`
 /// when that can't be told: `root` itself or an entry under it can't be read
@@ -366,17 +388,28 @@ mod tests {
             .as_secs()
     }
 
+    /// Rewinds an entry's directory mtime to `ago`, as if it had been written
+    /// that long ago and never touched since.
+    fn backdate_entry(cache: &Cache<LocalDir>, hash: &SpecHash, ago: Duration) {
+        let then = SystemTime::now().checked_sub(ago).unwrap();
+        std::fs::File::open(cache.entry_path(hash))
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
     #[test]
     fn deletes_only_unused_unkept_entries() {
         let tmp = TempDir::new().unwrap();
         let cache = Cache::at_dir(tmp.path()).unwrap();
 
-        let (recent, old, never_read, kept) = (hash(1), hash(2), hash(3), hash(4));
+        let (recent, old, never_read, kept, fresh) = (hash(1), hash(2), hash(3), hash(4), hash(5));
         for (h, name) in [
             (&recent, "recent"),
             (&old, "old"),
             (&never_read, "never-read"),
             (&kept, "kept"),
+            (&fresh, "fresh"),
         ] {
             write_entry(&cache, h, name);
         }
@@ -395,6 +428,8 @@ mod tests {
                 ),
             ],
         );
+        // Written ages ago, never read: still reclaimable by its write time.
+        backdate_entry(&cache, &never_read, Duration::from_secs(30 * 24 * 60 * 60));
 
         let report = CleanCache {
             older_than: Duration::from_secs(14 * 24 * 60 * 60),
@@ -413,9 +448,11 @@ mod tests {
                 dirs: 0
             }
         );
+        // `fresh` was written moments ago and nothing has read it yet: it
+        // survives until the cutoff passes on its write time.
         let mut left: Vec<SpecHash> = cache.iter_entries().collect();
         left.sort();
-        let mut want = vec![recent, kept];
+        let mut want = vec![recent, kept, fresh];
         want.sort();
         assert_eq!(left, want);
     }
@@ -426,6 +463,8 @@ mod tests {
         let cache = Cache::at_dir(tmp.path()).unwrap();
         let gone = hash(7);
         write_entry(&cache, &gone, "curl");
+        // Old enough on its write time alone: nothing has ever read it.
+        backdate_entry(&cache, &gone, Duration::from_secs(30 * 24 * 60 * 60));
 
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         CleanCache {
