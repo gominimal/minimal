@@ -724,7 +724,7 @@ async fn activate_creates_session() {
         name: Some("test-session".to_string()),
         path: Some(project.path().to_string_lossy().to_string()),
         sync: Some(SyncMode::Tarball),
-        network: CliNetworkMode::NoNet,
+        network: Some(CliNetworkMode::NoNet),
         ingress: vec![],
         dynamic_ingress: None,
         dynamic_range: None,
@@ -771,7 +771,7 @@ async fn activate_uploads_project_files() {
         name: Some("upload-test".to_string()),
         path: Some(project.path().to_string_lossy().to_string()),
         sync: Some(SyncMode::Tarball),
-        network: CliNetworkMode::NoNet,
+        network: Some(CliNetworkMode::NoNet),
         ingress: vec![],
         dynamic_ingress: None,
         dynamic_range: None,
@@ -925,7 +925,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         name: Some("repo-dir-test".to_string()),
         path: None,
         sync: Some(SyncMode::Tarball),
-        network: CliNetworkMode::NoNet,
+        network: Some(CliNetworkMode::NoNet),
         ingress: vec![],
         dynamic_ingress: None,
         dynamic_range: None,
@@ -998,7 +998,7 @@ async fn create_carries_dynamic_ingress() {
                 name: Some(name.to_string()),
                 path: Some(project.path().to_string_lossy().to_string()),
                 sync: Some(SyncMode::Tarball),
-                network: CliNetworkMode::OwnIp,
+                network: Some(CliNetworkMode::OwnIp),
                 ingress: vec![],
                 dynamic_ingress,
                 dynamic_range,
@@ -1651,61 +1651,6 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
     assert!(
         !stdout.contains("warning:"),
         "a plain-mode warning must not pollute stdout, got: {stdout}"
-    );
-}
-
-/// `min session attach` with no session argument and `--no-input` errors cleanly when
-/// no sessions exist, rather than hanging or shelling out to ssh. The error
-/// surfaces before any ssh exec, so it is deterministic in a test environment.
-#[tokio::test]
-async fn attach_with_no_session_errors_when_no_sessions_exist() {
-    let (_daemon, mut global) = setup().await;
-    global.no_input = true;
-
-    let err = cmd_attach(&global, AttachArgs { session: None })
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("no sessions exist"),
-        "expected a 'no sessions' error, got: {err}"
-    );
-}
-
-/// `min session attach` with no session argument and `--no-input` errors with a list
-/// of candidates when more than one session shares the current directory,
-/// rather than opening a picker. Both sessions are built from the same
-/// canonicalized tempdir so the cwd match is deterministic across platforms.
-#[tokio::test]
-async fn attach_with_no_session_errors_when_ambiguous_and_no_input() {
-    let (daemon, mut global) = setup().await;
-
-    // Two sessions built from the same directory make the choice ambiguous.
-    let cwd = tempfile::TempDir::new().unwrap();
-    let cwd_canon = cwd.path().canonicalize().unwrap();
-    let cwd_str = camino::Utf8PathBuf::from_path_buf(cwd_canon).unwrap();
-    let abs_path = paths::HostAbsPath::try_new(cwd_str).unwrap();
-    create_session_at(&daemon, "amb-1", abs_path.clone()).await;
-    create_session_at(&daemon, "amb-2", abs_path).await;
-
-    global.no_input = true;
-    // `--repo-dir` overrides the cwd used for matching; canonicalized by the
-    // resolver, it equals the sessions' project_path above.
-    global.repo_dir = Some(cwd.path().to_path_buf());
-
-    let err = cmd_attach(&global, AttachArgs { session: None })
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("Multiple sessions match"),
-        "expected an ambiguity error, got: {err}"
-    );
-    assert!(err.contains("amb-1"), "candidates list names: {err}");
-    assert!(err.contains("amb-2"), "candidates list names: {err}");
-    assert!(
-        err.contains("min session attach <id>"),
-        "should suggest explicit attach, got: {err}"
     );
 }
 
@@ -2609,7 +2554,7 @@ async fn deny_all_egress_flag_declares_every_allow_list_empty() {
             name: Some("flag-declared-deny-all".to_string()),
             path: Some(project.path().to_string_lossy().to_string()),
             sync: Some(SyncMode::Tarball),
-            network: CliNetworkMode::HostNet,
+            network: Some(CliNetworkMode::HostNet),
             ingress: vec![],
             dynamic_ingress: None,
             dynamic_range: None,
@@ -2705,7 +2650,7 @@ async fn empty_egress_flag_value_is_a_validation_error() {
             name: Some("empty-egress-value".to_string()),
             path: Some(project_path.clone()),
             sync: Some(SyncMode::Tarball),
-            network: CliNetworkMode::HostNet,
+            network: Some(CliNetworkMode::HostNet),
             ingress: vec![],
             dynamic_ingress: None,
             dynamic_range: None,
@@ -4288,17 +4233,12 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
         )
         .unwrap();
         let ls = String::from_utf8(out).unwrap();
-        // One proxy verdict per VM: beside a Native verdict the cause is
-        // its own HOSTNAME PROXY row; a Proxy verdict folds the cause into
-        // the BOX NAMES row and prints no separate cause row.
-        let cause_rows = match surface {
-            resolver::LiveSurface::Proxy => 0,
-            _ => 1,
-        };
+        // One proxy verdict per VM (NET-020): beside any verdict the cause
+        // is its own HOSTNAME PROXY row, and BOX NAMES does not repeat it.
         assert_eq!(
             ls.matches("HOSTNAME PROXY:").count(),
-            cause_rows,
-            "the cause prints on at most one proxy row: {ls}"
+            1,
+            "the cause prints on one proxy row: {ls}"
         );
         assert_eq!(
             ls.matches("another program on this machine holds 127.0.0.1:19911")
@@ -4324,9 +4264,8 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
 /// The multi-VM listing keeps one proxy verdict per VM, as the single-VM
 /// one does: the VM whose reply carries a proxy-down sibling gets no
 /// `listening on` row for its reported port, its cause is named exactly
-/// once (its own `HOSTNAME PROXY` row beside a Native verdict, folded into
-/// its BOX NAMES row beside a Proxy verdict), and its surface row never
-/// names the down proxy as serving. The other VM's rows are untouched.
+/// once, on its own `HOSTNAME PROXY` row beside any verdict (NET-020), and
+/// its surface row never names the down proxy as serving. The other VM's rows are untouched.
 #[test]
 fn ls_across_vms_names_one_proxy_verdict_per_vm() {
     let listing = |vm: &str, proxy_port: u16| VmListing {
@@ -4387,14 +4326,10 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
 
         // The down VM: no listening row, the cause named exactly once.
         let default_proxy = rows_of("HOSTNAME PROXY:", "default");
-        let cause_rows = match down_surface {
-            resolver::LiveSurface::Proxy => 0,
-            _ => 1,
-        };
         assert_eq!(
             default_proxy.len(),
-            cause_rows,
-            "the down VM's cause prints on at most one proxy row:\n{text}"
+            1,
+            "the down VM's cause prints on one proxy row:\n{text}"
         );
         assert!(
             default_proxy

@@ -39,6 +39,8 @@ pub use error::Error;
 pub use hakoniwa::Command;
 
 mod listener;
+#[cfg(target_os = "linux")]
+mod session_bind;
 
 /// Something that handles line-oriented RPCs from within the sandbox.
 pub trait Channel: Send {
@@ -250,21 +252,25 @@ impl<C: Channel> Sandbox<C> {
         fs::create_dir_all(&rootfs)
             .map_err(|e| Error::IO("create rootfs dir", rootfs.clone(), e))?;
         let hardlinking_start = SystemTime::now();
-        let mut collisions = common::LinkCollisions::default();
+        // The record names each differing path with the layer that lost;
+        // the layers, in link order, are what finds the one that won
+        // (`log_rootfs_collisions`).
+        let mut collisions = common::LinkCollisions::recording();
+        let mut layers: Vec<PathBuf> = Vec::with_capacity(config.rootfs.len() + 2);
         for i in config.rootfs.iter() {
-            match i {
-                config::SandboxMapped::Dir(p) => {
-                    hardlink_dir_contents_counted(p, &rootfs, &mut collisions)?;
-                }
-                config::SandboxMapped::TempDir(td) => {
-                    hardlink_dir_contents_counted(td.path(), &rootfs, &mut collisions)?;
-                }
+            let layer = match i {
+                config::SandboxMapped::Dir(p) => p.as_path(),
+                config::SandboxMapped::TempDir(td) => td.path(),
                 config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
                     return Err(Error::MappedFile(p.clone()));
                 }
-            }
+            };
+            hardlink_dir_contents_counted(layer, &rootfs, &mut collisions)?;
+            layers.push(layer.to_path_buf());
         }
-        hardlink_dir_contents_counted(&base_dir.join("synth"), &rootfs, &mut collisions)?;
+        let synth = base_dir.join("synth");
+        hardlink_dir_contents_counted(&synth, &rootfs, &mut collisions)?;
+        layers.push(synth);
 
         // MINIMAL_INTERNAL_CS_BUILD bundle: when the env var is "1"
         // AND the convention path exists on host, hardlink that
@@ -287,9 +293,10 @@ impl<C: Channel> Sandbox<C> {
             let cs_mirror = Path::new("/root/.cache/minimal/cs-mirror");
             if cs_mirror.exists() {
                 hardlink_dir_contents_counted(cs_mirror, &rootfs, &mut collisions)?;
+                layers.push(cs_mirror.to_path_buf());
             }
         }
-        log_rootfs_collisions(&collisions);
+        log_rootfs_collisions(&collisions, &layers, &rootfs);
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
         // On aarch64, autotools/libtool defaults to installing libraries
@@ -490,6 +497,11 @@ pub struct Container {
     /// pre-exec closure, without taking a controlling terminal. Set by
     /// [`Container::set_session_leader_without_terminal`].
     new_session: bool,
+    /// The patches whose mount point is in the session's home or workbench,
+    /// bound by a command's pre-exec closure through handles rather than by
+    /// hakoniwa by path, sorted by where they land (inbox#1152; see the
+    /// `session_bind` module).
+    session_binds: Vec<session_bind::SessionBind>,
 }
 
 /// The prefix of a start gate's FIFO name in the box's `/run`; each gate adds
@@ -592,6 +604,7 @@ impl Container {
             sandbox.config.force_cover_fallback,
             self.start_gate.clone(),
             self.new_session,
+            self.session_binds.clone(),
         )?;
 
         Ok(command)
@@ -1100,14 +1113,15 @@ pub mod classifier {
     /// error to report but the common case to build on. Every other errno is
     /// the caller's, unchanged: a `NotFound` is a parent this entry could not
     /// make, a `PermissionDenied` a tree this account has no privilege over.
-    fn make_cgroup(dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir(dir).or_else(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })
+    ///
+    /// Says whether this call made the level: `true` for a cgroup that was
+    /// not there, `false` for one found made.
+    fn make_cgroup(dir: &Path) -> std::io::Result<bool> {
+        match std::fs::create_dir(dir) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Moves this process into `root`'s [`DAEMON_LEAF`], as the daemon does at
@@ -1133,7 +1147,13 @@ pub mod classifier {
     /// internal-process rule. A leaf without it carries no `memory.max` at
     /// all, so no reader — a diagnostics bundle on the host side, or the box
     /// itself under the design's own cover — can name the limit a box's
-    /// verdict is decided on.
+    /// verdict is decided on. The controller reaches the cohort only from
+    /// the tree root, and the tree root only from the cgroup above it: a root
+    /// this entry made (the guest's) gets both, since nothing stands in a
+    /// cgroup it just made and the cgroup2 mount root above it, which holds
+    /// this process, is the one cgroup exempt from the internal-process rule.
+    /// A root that was already there is the installer's to enable, as root,
+    /// before anything is placed in it.
     pub fn enter_daemon_leaf(root: &Path) -> std::io::Result<()> {
         // The layout, top down: the tree root, the cohort, both of its
         // subtrees, then this daemon's own leaf. `create_dir` makes no
@@ -1145,7 +1165,7 @@ pub mod classifier {
         // that is not there is the guest's to build and a native host's to
         // be left outside. Already-there is the common case everywhere else
         // (the installer made the root, a previous daemon made the rest).
-        make_cgroup(root)?;
+        let made_root = make_cgroup(root)?;
         let mut tree = vec![root.join(BOXES_DIR)];
         for dir in &tree {
             make_cgroup(dir)?;
@@ -1160,15 +1180,26 @@ pub mod classifier {
         // Over a stand-in tree (a test's) this writes a plain file; over a
         // real tree the kernel takes `+memory` as a subtree_control command
         // and may refuse it — a host without the memory controller, or one
-        // that has it threaded off, still gets its boxes placed. The cohort
-        // comes first and the subtrees after it: over a real tree a
-        // controller reaches a cgroup only once the cgroup above it has
-        // enabled it, so the cascade order is the only one that works. The
-        // tree root is not in the cascade and must not be: this process is
-        // still a member of it until the `place_pid` below moves it out, and
-        // a controller enabled on a cgroup that holds a process makes its
-        // children `domain invalid` — the daemon's own leaf among them, the
-        // very cgroup this entry exists to take.
+        // that has it threaded off, still gets its boxes placed. Top down:
+        // over a real tree a controller reaches a cgroup only once the cgroup
+        // above it has enabled it, so the cascade order is the only one that
+        // works. A tree root that was already there is not in the cascade
+        // and must not be: this process is still a member of it until the
+        // `place_pid` below moves it out, and a controller enabled on a
+        // cgroup that holds a process makes its children `domain invalid` —
+        // the daemon's own leaf among them, the very cgroup this entry exists
+        // to take. A root this entry made holds nothing, so it joins the
+        // cascade, and so does the cgroup above it: the guest's pid 1 made
+        // the root under the cgroup2 mount root it boots in, whose children
+        // get a controller only once it is enabled there, and the mount root
+        // is the one cgroup the internal-process rule exempts.
+        if made_root {
+            let mut above: Vec<PathBuf> =
+                root.parent().map(Path::to_path_buf).into_iter().collect();
+            above.push(root.to_path_buf());
+            above.append(&mut tree);
+            tree = above;
+        }
         for dir in &tree {
             if let Err(e) = std::fs::write(dir.join("cgroup.subtree_control"), "+memory\n")
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -1301,6 +1332,7 @@ fn install_box_credentials(
     force_cover_fallback: bool,
     start_gate: Option<PathBuf>,
     new_session: bool,
+    session_binds: Vec<session_bind::SessionBind>,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
@@ -1351,6 +1383,7 @@ fn install_box_credentials(
                 closure_report.as_deref(),
                 start_gate.as_deref(),
                 new_session,
+                &session_binds,
             )
         })
     };
@@ -1534,7 +1567,19 @@ fn exec_box_program(
     closure_report: Option<&Path>,
     start_gate: Option<&Path>,
     new_session: bool,
+    session_binds: &[session_bind::SessionBind],
 ) -> ! {
+    // The patches in the session's home and workbench first, before anything
+    // else the box is given: each source and each mount point is opened once
+    // beneath its tree, refusing a path out of it, and the bind goes through
+    // those handles, so a link the box swaps in after any check cannot
+    // redirect it (inbox#1152). The box's user namespace still holds
+    // CAP_SYS_ADMIN over this mount namespace here. A patch that cannot be
+    // bound so ends the box: it must not run with a patch missing or
+    // misplaced.
+    if let Err((what, e)) = session_bind::bind_all(session_binds) {
+        exit_child(&what, &e, closure_report);
+    }
     // A new session and process group for the program, with no controlling
     // terminal: the box's own processes then share neither with the daemon,
     // and none of them can open the daemon's terminal as `/dev/tty`.
@@ -1956,7 +2001,10 @@ fn exit_child_hinted(
 ) -> ! {
     write_closure_report(
         report,
-        &format!("failed {what} errno {}", err.raw_os_error().unwrap_or(0)),
+        &format!(
+            "failed {what} errno {}",
+            session_bind::errno_of(err).unwrap_or(0)
+        ),
     );
     let msg = match hint {
         Some(hint) => format!("minimal: sandbox: {what} failed: {err}: {hint}\n"),
@@ -1976,6 +2024,62 @@ fn exit_child_hinted(
 struct BindOpts {
     read_only: bool,
     recursive: bool,
+}
+
+/// Called with the stdin pipe of a run's first invocation, once that process
+/// runs and before its output is read. An error kills the process and fails
+/// the run.
+pub type StdinSlot = Box<dyn FnOnce(fs::File) -> std::io::Result<()> + Send>;
+
+/// How [`Sandbox::run_with_cancel`] runs its invocations.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Kills the running invocation and ends the run when it fires.
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// The directory, inside the sandbox, that every invocation starts in.
+    /// `None` keeps the sandbox's own working directory.
+    pub current_dir: Option<String>,
+    /// Gives the first invocation a stdin pipe, and receives it.
+    pub stdin: Option<StdinSlot>,
+}
+
+impl From<tokio_util::sync::CancellationToken> for RunOptions {
+    fn from(cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            cancel,
+            ..Self::default()
+        }
+    }
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("cancel", &self.cancel)
+            .field("current_dir", &self.current_dir)
+            .field("stdin", &self.stdin.is_some())
+            .finish()
+    }
+}
+
+/// Sets the [`RunOptions`] on the command of one invocation. The command
+/// starts in `current_dir` when it is set. The command gets a stdin pipe when
+/// `stdin` still holds a slot, and the slot moves out to the caller. So only
+/// the first invocation of a run gets the slot, and the later ones get none.
+#[cfg(target_os = "linux")]
+fn apply_run_options(
+    cmd: &mut hakoniwa::Command,
+    current_dir: Option<&str>,
+    stdin: &mut Option<StdinSlot>,
+) -> Option<StdinSlot> {
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    let slot = stdin.take();
+    if slot.is_some() {
+        cmd.stdin(hakoniwa::Stdio::piped());
+    }
+    slot
 }
 
 // Sandbox usage
@@ -2378,20 +2482,53 @@ impl<C: Channel> Sandbox<C> {
             }
         }
         // Mount in any file mappings. hakoniwa applies mounts sorted by
-        // target, so a mapping inside a session's `/home` or `/workbench`
-        // lands on top of that directory's own mount.
-        for m in self.config.wd.fs_mappings() {
+        // target, and the closure's binds below follow the same order.
+        //
+        // A mapping whose source or mount point is in a session's home or
+        // workbench is not given to hakoniwa by that path: the box owns those
+        // trees and can swap any path in them for a link between a check and
+        // a bind made by path. The command's pre-exec closure binds it through
+        // handles instead (inbox#1152; see [`session_bind`]), after every
+        // mount here; one from outside the trees is bound here onto a stage
+        // the closure moves it from. hakoniwa makes no mount in a tree, so
+        // the order of the closure's binds among themselves is the whole of
+        // the layering under `/home` and `/workbench`.
+        let trees = match &self.config.wd {
+            WdSetup::Session {
+                home,
+                working,
+                working_name_override,
+                ..
+            } => session_bind::Tree::session(
+                home,
+                working,
+                working_name_override
+                    .as_deref()
+                    .unwrap_or(SESSION_DEFAULT_WD),
+            ),
+            _ => Vec::new(),
+        };
+        // Not `plan`: that is the network plan this function was given, whose
+        // resolver and hosts are written below.
+        let mounts = session_bind::plan(&trees, self.config.wd.fs_mappings(), locked_ms_flags)
+            .map_err(|path| {
+                Error::Execution(ExecutionError::MountError {
+                    msg: "a patch read from the session's home or workbench must land in the \
+                          home or workbench. Put the entry's path under one of them",
+                    path,
+                })
+            })?;
+        if mounts.stages() {
+            container.tmpfsmount(session_bind::STAGE);
+        }
+        for (m, target) in &mounts.by_path {
             let opts = BindOpts {
                 recursive: !m.is_file,
                 read_only: m.read_only,
             };
-            Self::bind_mount(
-                Path::new(&m.host_path),
-                &m.path_in_sandbox(),
-                opts,
-                &mut container,
-            )?;
+            Self::bind_mount(Path::new(&m.host_path), target, opts, &mut container)?;
         }
+        let session_binds = mounts.binds;
 
         if let Some(hn) = &self.config.hostname {
             let etc_hostname = self.rootfs().join("etc").join("hostname");
@@ -2449,6 +2586,7 @@ impl<C: Channel> Sandbox<C> {
             fresh_netns: isolate,
             start_gate: None,
             new_session: false,
+            session_binds,
         })
     }
 
@@ -2527,18 +2665,29 @@ impl<C: Channel> Sandbox<C> {
     /// on the caller's. That thread is never retired, so this future may be
     /// driven from any runtime thread, worker or blocking-pool; see the
     /// [`forker`] module docs for the failure the fork thread rules out.
+    ///
+    /// `options` is a [`RunOptions`], or only its cancellation token. Every
+    /// invocation starts in [`RunOptions::current_dir`] when it is set. The
+    /// first invocation gets a stdin pipe when [`RunOptions::stdin`] is set,
+    /// and the slot gets that pipe once the process runs. The later
+    /// invocations get no stdin.
     #[cfg(target_os = "linux")]
     pub async fn run_with_cancel<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
         mut stdout_writer: Option<W1>,
         mut stderr_writer: Option<W2>,
-        cancel: tokio_util::sync::CancellationToken,
+        options: impl Into<RunOptions>,
     ) -> Result<(), Error>
     where
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
+        let RunOptions {
+            cancel,
+            current_dir,
+            mut stdin,
+        } = options.into();
         for (i, exec) in invocations.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Execution(ExecutionError::Cancelled));
@@ -2550,6 +2699,7 @@ impl<C: Channel> Sandbox<C> {
             let container = self.new_container(planned.plan())?;
 
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
+            let stdin_slot = apply_run_options(&mut cmd, current_dir.as_deref(), &mut stdin);
             cmd.stderr(hakoniwa::Stdio::MakePipe);
             cmd.stdout(hakoniwa::Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
@@ -2571,6 +2721,23 @@ impl<C: Channel> Sandbox<C> {
                     return Err(e);
                 }
             };
+
+            // Hand the stdin pipe to its slot before the output is read, so
+            // what the slot sends its caller comes before any output line.
+            if let Some(slot) = stdin_slot {
+                let started = match child.stdin.take() {
+                    Some(pipe) => slot(fs::File::from(std::os::fd::OwnedFd::from(pipe))),
+                    None => Err(std::io::Error::other("the process has no stdin pipe")),
+                };
+                if let Err(e) = started {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(net_guard) = net_guard {
+                        net_guard.teardown().await;
+                    }
+                    return Err(Error::IO("passing stdin to the process", PathBuf::new(), e));
+                }
+            }
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
             // files, as well as to the caller-provided writers if applicable.
@@ -2881,15 +3048,41 @@ fn hardlink_dir_contents_counted(
         .map_err(Error::HardlinkFailed)
 }
 
-/// One line for the paths that more than one rootfs layer shipped. It is
-/// INFO only when some of them differ (each of those also has its own
-/// WARN); an overlap where every path matches is the usual case, at debug.
-fn log_rootfs_collisions(c: &common::LinkCollisions) {
+/// The lines for the paths that more than one rootfs layer shipped. Each
+/// differing path on record gets a WARN naming both layers: the one whose
+/// file stays, found by the inode the assembled path carries among
+/// `layers` in link order, and the one whose copy was refused
+/// (gominimal/inbox#1226: the per-file line used to name the loser alone,
+/// and finding the pair meant re-assembling the box). The summary is INFO
+/// when some paths differ, and names the layers; an overlap where every
+/// path matches is the usual case, at debug.
+fn log_rootfs_collisions(c: &common::LinkCollisions, layers: &[PathBuf], rootfs: &Path) {
+    for d in &c.differing {
+        let winner = collision_winner(rootfs, layers, &d.rel);
+        tracing::warn!(
+            path = %d.rel.display(),
+            winner = winner.map(|w| w.display().to_string()).as_deref().unwrap_or("unknown"),
+            loser = %d.loser.display(),
+            why = d.why,
+            "rootfs: two layers ship this path with different contents; the \
+             first-linked file, the winner's, stays"
+        );
+    }
     if c.differ > 0 {
+        // the record holds the first `DIFFERING_KEPT` differing paths; past
+        // that a path is counted, and `unnamed` says how many got no line
+        let kept = c.differing.len();
         tracing::info!(
             same = c.same,
             unchecked = c.unchecked,
             differ = c.differ,
+            named = kept,
+            unnamed = c.differ.saturating_sub(kept as u64),
+            layers = %layers
+                .iter()
+                .map(|l| l.file_name().map_or_else(|| l.display().to_string(), |n| n.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>()
+                .join(","),
             "rootfs: paths shipped by more than one layer; the first-linked file stays"
         );
     } else if c.total() > 0 {
@@ -2900,6 +3093,32 @@ fn log_rootfs_collisions(c: &common::LinkCollisions) {
             "rootfs: paths shipped by more than one layer; the first-linked file stays"
         );
     }
+}
+
+/// The layer whose file stands at `rel` in the assembled `rootfs`: the
+/// first of `layers`, in link order, whose own `rel` is the same inode as
+/// the assembled one (the link pass hardlinks, so the winner's file and
+/// the rootfs path are one). A symlink is made anew in the rootfs, not
+/// linked, so it shares no inode with its layer: its winner is the first
+/// layer whose link points where the placed one does. `None` when no
+/// layer matches, as for a file the assembly copied across filesystems.
+fn collision_winner<'a>(rootfs: &Path, layers: &'a [PathBuf], rel: &Path) -> Option<&'a Path> {
+    use std::os::unix::fs::MetadataExt as _;
+    let placed = fs::symlink_metadata(rootfs.join(rel)).ok()?;
+    if placed.is_symlink() {
+        let target = fs::read_link(rootfs.join(rel)).ok()?;
+        return layers
+            .iter()
+            .find(|layer| fs::read_link(layer.join(rel)).is_ok_and(|t| t == target))
+            .map(PathBuf::as_path);
+    }
+    layers
+        .iter()
+        .find(|layer| {
+            fs::symlink_metadata(layer.join(rel))
+                .is_ok_and(|m| m.dev() == placed.dev() && m.ino() == placed.ino())
+        })
+        .map(PathBuf::as_path)
 }
 
 /// Logs a working input that was not placed at `dest` because something is
@@ -2933,6 +3152,29 @@ fn log_input_collision(verb: &str, src: &Path, dest: &Path) {
 /// restrictions like RDONLY).
 #[cfg(target_os = "linux")]
 fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
+    let ms = locked_ms_flags(path);
+    let mut opts = hakoniwa::MountOptions::empty();
+    for (bit, opt) in [
+        (libc::MS_RDONLY, hakoniwa::MountOptions::RDONLY),
+        (libc::MS_NOSUID, hakoniwa::MountOptions::NOSUID),
+        (libc::MS_NODEV, hakoniwa::MountOptions::NODEV),
+        (libc::MS_NOEXEC, hakoniwa::MountOptions::NOEXEC),
+    ] {
+        if ms & bit != 0 {
+            opts |= opt;
+        }
+    }
+    opts
+}
+
+/// The kernel-locked flags of the mount `path` is on, as `MS_*` bits:
+/// read-only, `nosuid`, `nodev`, `noexec`. The one reading of them, for
+/// hakoniwa's binds ([`locked_mount_flags`]) and for the session binds the
+/// pre-exec closure remounts itself (`session_bind`). A path whose mount
+/// cannot be read gives none, with a warning; the remount then says whether
+/// one was needed.
+#[cfg(target_os = "linux")]
+pub(crate) fn locked_ms_flags(path: &Path) -> libc::c_ulong {
     use nix::sys::statfs::statfs;
     use nix::sys::statvfs::FsFlags;
 
@@ -2943,25 +3185,23 @@ fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
                 "statfs({}) failed: {e}, not adding locked mount flags",
                 path.to_string_lossy()
             );
-            return hakoniwa::MountOptions::empty();
+            return 0;
         }
     };
 
     let flags = stat.flags();
-    let mut opts = hakoniwa::MountOptions::empty();
-    if flags.contains(FsFlags::ST_RDONLY) {
-        opts |= hakoniwa::MountOptions::RDONLY;
+    let mut ms = 0;
+    for (flag, bit) in [
+        (FsFlags::ST_RDONLY, libc::MS_RDONLY),
+        (FsFlags::ST_NOSUID, libc::MS_NOSUID),
+        (FsFlags::ST_NODEV, libc::MS_NODEV),
+        (FsFlags::ST_NOEXEC, libc::MS_NOEXEC),
+    ] {
+        if flags.contains(flag) {
+            ms |= bit;
+        }
     }
-    if flags.contains(FsFlags::ST_NOSUID) {
-        opts |= hakoniwa::MountOptions::NOSUID;
-    }
-    if flags.contains(FsFlags::ST_NODEV) {
-        opts |= hakoniwa::MountOptions::NODEV;
-    }
-    if flags.contains(FsFlags::ST_NOEXEC) {
-        opts |= hakoniwa::MountOptions::NOEXEC;
-    }
-    opts
+    ms
 }
 
 /// Best-effort probe for whether this host can create network namespaces.
@@ -4153,6 +4393,83 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Two layers ship one path with different bytes: the record names the
+    /// loser, and the winner is the layer whose inode the assembled path
+    /// carries, found in link order (gominimal/inbox#1226).
+    #[test]
+    fn collision_winner_is_the_layer_whose_inode_the_rootfs_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let rootfs = tmp.path().join("rootfs");
+        for layer in [&a, &b] {
+            std::fs::create_dir_all(layer.join("usr/lib/node_modules/npm")).unwrap();
+        }
+        std::fs::write(
+            a.join("usr/lib/node_modules/npm/package.json"),
+            b"{\"v\":1}",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("usr/lib/node_modules/npm/package.json"),
+            b"{\"v\":22}",
+        )
+        .unwrap();
+        let mut counts = common::LinkCollisions::recording();
+        super::hardlink_dir_contents_counted(&a, &rootfs, &mut counts).unwrap();
+        super::hardlink_dir_contents_counted(&b, &rootfs, &mut counts).unwrap();
+        assert_eq!(counts.differ, 1);
+        let d = &counts.differing[0];
+        assert_eq!(
+            d.rel,
+            std::path::Path::new("usr/lib/node_modules/npm/package.json")
+        );
+        assert_eq!(d.loser, b);
+        assert_eq!(d.why, "different size");
+        let layers = [a.clone(), b.clone()];
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, &d.rel),
+            Some(a.as_path()),
+            "the first-linked layer's inode is the one the rootfs carries"
+        );
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, std::path::Path::new("usr/lib/none")),
+            None
+        );
+    }
+
+    /// Two layers ship one path as symlinks to different targets. The link
+    /// pass makes the rootfs symlink anew rather than linking it, so no
+    /// layer shares its inode: the winner is the layer whose link points
+    /// where the placed one does, in link order.
+    #[test]
+    fn collision_winner_of_a_symlink_is_the_layer_whose_target_the_rootfs_carries() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let rootfs = tmp.path().join("rootfs");
+        for layer in [&a, &b] {
+            std::fs::create_dir_all(layer.join("usr/bin")).unwrap();
+        }
+        symlink("python3.12", a.join("usr/bin/python3")).unwrap();
+        symlink("python3.13", b.join("usr/bin/python3")).unwrap();
+        let mut counts = common::LinkCollisions::recording();
+        super::hardlink_dir_contents_counted(&a, &rootfs, &mut counts).unwrap();
+        super::hardlink_dir_contents_counted(&b, &rootfs, &mut counts).unwrap();
+        assert_eq!(counts.differ, 1);
+        let d = &counts.differing[0];
+        assert_eq!(d.rel, std::path::Path::new("usr/bin/python3"));
+        assert_eq!(d.loser, b);
+        assert_eq!(d.why, "another target");
+        let layers = [a.clone(), b.clone()];
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, &d.rel),
+            Some(a.as_path()),
+            "the first-linked layer's target is the one the rootfs link carries"
+        );
+    }
+
     use super::*;
 
     /// gominimal/inbox#1219: a refused join of a box's leaf says why on the
@@ -4854,6 +5171,207 @@ ff02::2\tip6-allrouters
     fn userns_restricted_with_unreadable_label_is_diagnosed() {
         let got = userns_restriction_from(Some("15000\n".into()), Some("1\n".into()), false, None);
         assert_eq!(got, Some(UsernsRestriction::ApparmorUnconfined));
+    }
+
+    /// A program that prints its working directory on one line, then copies
+    /// its stdin to its stdout when its one argument is `stdin`.
+    #[cfg(target_os = "linux")]
+    const CWD_PROBE_C: &str = r#"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    char dir[4096];
+    if (!getcwd(dir, sizeof dir)) return 2;
+    printf("cwd:%s\n", dir);
+    fflush(stdout);
+    if (argc > 1 && strcmp(argv[1], "stdin") == 0) {
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(0, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)n, stdout);
+    }
+    return 0;
+}
+"#;
+
+    /// A directory that can hold a sandbox: one that is not `nodev` or
+    /// `noexec`, since the sandbox remounts its rootfs and runs from it.
+    #[cfg(target_os = "linux")]
+    fn sandbox_base_dir() -> Option<PathBuf> {
+        use nix::sys::statvfs::{FsFlags, statvfs};
+        let target_tmp = std::env::var_os("CARGO_TARGET_DIR")
+            .map(|dir| PathBuf::from(dir).join("tmp"))
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
+        let _ = fs::create_dir_all(&target_tmp);
+        [
+            std::env::temp_dir(),
+            PathBuf::from("/var/tmp"),
+            PathBuf::from("/run"),
+            PathBuf::from("/state"),
+            target_tmp,
+        ]
+        .into_iter()
+        .find(|dir| {
+            tempfile::tempdir_in(dir).is_ok()
+                && statvfs(dir).is_ok_and(|st| {
+                    !st.flags()
+                        .intersects(FsFlags::ST_NODEV | FsFlags::ST_NOEXEC)
+                })
+        })
+    }
+
+    /// The options of `run_with_cancel` reach the command that each
+    /// invocation builds. Every command starts in the run's working
+    /// directory. Only the first command takes the stdin slot, and it is the
+    /// slot the caller gave. This test builds commands and spawns nothing, so
+    /// it needs no user namespace and runs on every Linux host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_with_cancel_starts_in_the_given_dir_on_each_built_command() {
+        let container = hakoniwa::Container::new();
+        let given = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let slot_saw = given.clone();
+        let mut stdin: Option<StdinSlot> = Some(Box::new(move |mut pipe: fs::File| {
+            pipe.write_all(b"from the slot\n")?;
+            slot_saw.lock().unwrap().extend_from_slice(b"called");
+            Ok(())
+        }));
+
+        let mut first = container.command("/usr/bin/probe");
+        let first_slot = apply_run_options(&mut first, Some("/start/here"), &mut stdin);
+        let mut second = container.command("/usr/bin/probe");
+        let second_slot = apply_run_options(&mut second, Some("/start/here"), &mut stdin);
+
+        assert_eq!(first.get_current_dir(), Some(Path::new("/start/here")));
+        assert_eq!(second.get_current_dir(), Some(Path::new("/start/here")));
+        assert!(
+            second_slot.is_none(),
+            "a later invocation gets no stdin slot"
+        );
+        assert!(
+            stdin.is_none(),
+            "the run keeps no slot after the first command"
+        );
+
+        let pipe = tempfile::tempfile().unwrap();
+        first_slot.expect("the first invocation gets the slot")(pipe)
+            .expect("the slot takes the pipe");
+        assert_eq!(
+            &*given.lock().unwrap(),
+            b"called",
+            "it is the caller's slot"
+        );
+
+        let mut plain = container.command("/usr/bin/probe");
+        let mut none: Option<StdinSlot> = None;
+        assert!(apply_run_options(&mut plain, None, &mut none).is_none());
+        assert_eq!(
+            plain.get_current_dir(),
+            None,
+            "no dir keeps the sandbox's own"
+        );
+    }
+
+    /// `run_with_cancel` starts every invocation in the run's working
+    /// directory, and gives the first one a stdin pipe through its slot. The
+    /// later invocation reads no stdin. An inherit_cwd task and a task that
+    /// forwards its stdin run through this one path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_with_cancel_starts_in_the_given_dir() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping run_with_cancel_starts_in_the_given_dir: this host denies the \
+                 unprivileged user namespace every sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+        let Some(base_dir) = sandbox_base_dir() else {
+            eprintln!("no directory on this host can hold a sandbox — skipping");
+            return;
+        };
+        let base = tempfile::tempdir_in(&base_dir).unwrap();
+        let src = base.path().join("probe.c");
+        fs::write(&src, CWD_PROBE_C).unwrap();
+        let rootfs = base.path().join("rootfs-src");
+        let usr_bin = rootfs.join("usr").join("bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::create_dir_all(rootfs.join("usr").join("lib")).unwrap();
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::create_dir_all(rootfs.join("start").join("here")).unwrap();
+        match std::process::Command::new("gcc")
+            .args(["-static", "-o"])
+            .arg(usr_bin.join("probe"))
+            .arg(&src)
+            .status()
+        {
+            Ok(status) => assert!(status.success(), "gcc failed: {status:?}"),
+            Err(e) => {
+                eprintln!("no gcc to build the probe with — skipping: {e}");
+                return;
+            }
+        }
+
+        let mut sandbox = Config::new("cwd-probe")
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(rootfs)))
+            .with_dns(false)
+            .with_plan(network::NetPlan::isolated())
+            .build(base.path().join("sandbox"), ())
+            .await
+            .expect("building the sandbox");
+
+        let given = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let slot_saw = given.clone();
+        let options = RunOptions {
+            current_dir: Some("/start/here".to_string()),
+            stdin: Some(Box::new(move |mut pipe: fs::File| {
+                *slot_saw.lock().unwrap() = true;
+                pipe.write_all(b"from the slot\n")
+            })),
+            ..RunOptions::default()
+        };
+        let invocation = |arg: &str| Invocation {
+            executable: "/usr/bin/probe".to_string(),
+            args: vec![arg.to_string()],
+            envs: Default::default(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        sandbox
+            .run_with_cancel(
+                vec![invocation("stdin"), invocation("stdin")],
+                Some(&mut out),
+                Some(&mut err),
+                options,
+            )
+            .await
+            .expect("the run passes");
+
+        assert!(*given.lock().unwrap(), "the slot gets the stdin pipe");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "cwd:/start/here\nfrom the slot\ncwd:/start/here\n",
+            "both invocations start in the given dir, and only the first reads the slot's \
+             stdin; stderr: {}",
+            String::from_utf8_lossy(&err),
+        );
+
+        // Only a cancellation token: the sandbox's own working directory.
+        let mut out = Vec::new();
+        sandbox
+            .run_with_cancel(
+                vec![invocation("none")],
+                Some(&mut out),
+                None::<Vec<u8>>,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the run passes");
+        assert!(
+            !String::from_utf8_lossy(&out).contains("/start/here"),
+            "a run without a dir keeps the sandbox's own: {}",
+            String::from_utf8_lossy(&out),
+        );
     }
 
     /// Creates a tempdir with the `synth/usr/` structure required by
@@ -5997,6 +6515,120 @@ ff02::2\tip6-allrouters
             .expect("minenv_sock should be connectable after a bound-dir Sandbox::new");
     }
 
+    /// inbox#1152's wiring: in a session layout, no mapping whose source or
+    /// mount point is in the home or the workbench reaches hakoniwa's mount
+    /// list by that path. The container carries them for the pre-exec
+    /// closure instead, and hakoniwa binds the one from outside the trees
+    /// only onto its stage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_tree_patch_never_reaches_hakoniwas_mount_list() {
+        let (_tmp, base) = make_base_with_synth();
+        let trees = tempfile::TempDir::new().unwrap();
+        let home = trees.path().join("home");
+        let working = trees.path().join("working");
+        let outside = trees.path().join("outside");
+        for dir in [&home, &working, &outside] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let mapping = |host: &Path, sandbox: &str| common::FsMapping {
+            host_path: host.to_str().unwrap().to_string(),
+            sandbox_path: Some(sandbox.to_string()),
+            read_only: true,
+            ..Default::default()
+        };
+        let mappings = vec![
+            mapping(&home.join(".config/x"), "/home/.config/x"),
+            mapping(&working.join("w"), "/workbench/w"),
+            mapping(&outside, "/home/o"),
+        ];
+        let config = Config::new("test-session-binds")
+            .with_dns(false)
+            .with_session_dirs_mapped(home.clone(), working.clone(), mappings);
+        let sandbox = Sandbox::new(base, config, ()).expect("a session sandbox");
+        let container = sandbox
+            .new_container(&network::NetPlan::host())
+            .expect("the session's container");
+
+        let mounts = format!("{:?}", container.container);
+        let source = |path: &Path| format!("source: {:?}", path.to_str().unwrap());
+        let target = |path: &str| format!("target: {path:?}");
+        assert!(
+            mounts.contains(&source(&home)) && mounts.contains(&target("/home")),
+            "the home itself is still hakoniwa's: {mounts}"
+        );
+        for (host, sandbox_path) in [
+            (home.join(".config/x"), "/home/.config/x"),
+            (working.join("w"), "/workbench/w"),
+        ] {
+            assert!(
+                !mounts.contains(&source(&host)) && !mounts.contains(&target(sandbox_path)),
+                "{sandbox_path} is not hakoniwa's to bind by path: {mounts}"
+            );
+        }
+        assert!(
+            mounts.contains(&source(&outside))
+                && mounts.contains(&target("/.minimal-patch/0"))
+                && !mounts.contains(&target("/home/o")),
+            "the mapping from outside lands on its stage, not under /home: {mounts}"
+        );
+        let binds: Vec<&str> = container
+            .session_binds
+            .iter()
+            .map(|b| b.target.as_str())
+            .collect();
+        assert_eq!(
+            binds,
+            vec!["/home/.config/x", "/home/o", "/workbench/w"],
+            "the closure binds every one of them, in target order"
+        );
+    }
+
+    /// inbox#1152, the daemon's side: a mapping it must create in the
+    /// session's home is made beneath the home, so a dangling link there that
+    /// leaves the home refuses the sandbox and makes nothing outside it. The
+    /// create is `Config::build`'s, before `Sandbox::new`, so the build is
+    /// what is refused here. A revert of that path to `fs::write` would
+    /// follow the link out, and this is the test that fails then.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_created_mapping_never_follows_a_link_out_of_the_home() {
+        let trees = tempfile::TempDir::new().unwrap();
+        let home = trees.path().join("home");
+        let working = trees.path().join("working");
+        let outside = trees.path().join("outside");
+        for dir in [&home, &working, &outside] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink("../outside/x.json", home.join("x.json")).unwrap();
+        let mapping = common::FsMapping {
+            host_path: home.join("x.json").to_str().unwrap().to_string(),
+            sandbox_path: Some("/home/x.json".to_string()),
+            read_only: false,
+            is_file: true,
+            create_if_missing: true,
+        };
+        let config = Config::new("test-create-beneath")
+            .with_dns(false)
+            .with_session_dirs_mapped(home.clone(), working, vec![mapping]);
+        let Err(err) = config.build(trees.path().join("base"), ()).await else {
+            panic!("a link out of the home refuses the sandbox");
+        };
+        let text = err.to_string();
+        assert!(text.contains("session's home or workbench"), "{text}");
+        assert!(
+            !outside.join("x.json").exists(),
+            "nothing is made outside the home"
+        );
+        assert!(
+            fs::symlink_metadata(home.join("x.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link is left as the box made it"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
@@ -6579,6 +7211,20 @@ int main(int argc, char **argv) {
         force_cover_fallback: bool,
         plan: Option<network::NetPlan>,
     ) -> HeldProbe {
+        launch_box_probe_configured(name, leaf, probe_args, force_cover_fallback, plan, |c| c).await
+    }
+
+    /// [`launch_box_probe_under`], with the box's configuration passed
+    /// through `configure` before it is built: a session layout, say.
+    #[cfg(target_os = "linux")]
+    async fn launch_box_probe_configured(
+        name: &str,
+        leaf: Option<config::ClassifierLeaf>,
+        probe_args: &[String],
+        force_cover_fallback: bool,
+        plan: Option<network::NetPlan>,
+        configure: impl FnOnce(Config) -> Config,
+    ) -> HeldProbe {
         use std::io::Read as _;
 
         let base_dir = box_base_dir(name);
@@ -6588,9 +7234,10 @@ int main(int argc, char **argv) {
         let source = build.path().join("rootfs-src");
         probe_rootfs(&source, &probe);
 
-        let mut config = Config::new(name)
+        let config = Config::new(name)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
             .with_dns(false);
+        let mut config = configure(config);
         if let Some(leaf) = leaf {
             config = config.with_classifier_leaf(leaf);
         }
@@ -6817,6 +7464,95 @@ int main(int argc, char **argv) {
             first_mark.exists(),
             "the released program never ran: no mark at {}",
             first_mark.display()
+        );
+    }
+
+    /// inbox#1152, end to end through the production launch: a session box
+    /// with a read-only patch in its home, one in its workbench, and one from
+    /// outside both that lands under `/home` has each of them mounted
+    /// read-only at its place by the pre-exec closure before the program
+    /// runs, and the stage the outside one came through is gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_closure_binds_a_session_boxs_patches_at_their_place() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping the_closure_binds_a_session_boxs_patches_at_their_place: this host \
+                 denies the unprivileged user namespace every sandbox starts by unsharing: \
+                 {reason}"
+            );
+            return;
+        }
+        let name = "session-binds";
+        let base_dir = box_base_dir(name);
+        let trees = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let home = trees.path().join("home");
+        let working = trees.path().join("working");
+        let outside = trees.path().join("outside");
+        for (dir, token) in [
+            (home.join("x"), "IN"),
+            (working.join("w"), "WB"),
+            (outside.clone(), "OUT"),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("token"), token).unwrap();
+        }
+        let mapping = |host: &Path, sandbox: &str| common::FsMapping {
+            host_path: host.to_str().unwrap().to_string(),
+            sandbox_path: Some(sandbox.to_string()),
+            read_only: true,
+            ..Default::default()
+        };
+        let mappings = vec![
+            mapping(&home.join("x"), "/home/x"),
+            mapping(&working.join("w"), "/workbench/w"),
+            mapping(&outside, "/home/o"),
+        ];
+        let patches = ["/home/x", "/workbench/w", "/home/o"];
+        let mut probe_args: Vec<String> = patches
+            .iter()
+            .flat_map(|p| [format!("MOUNTINFO:{p}"), format!("WRITE:{p}/token")])
+            .collect();
+        probe_args.push("MOUNTINFO:/.minimal-patch".to_string());
+        let (session_home, session_working) = (home.clone(), working.clone());
+        let held = launch_box_probe_configured(name, None, &probe_args, false, None, |config| {
+            config.with_session_dirs_mapped(session_home, session_working, mappings)
+        })
+        .await;
+        let report = held.release_and_report().await;
+
+        for patch in patches {
+            let mount = report
+                .get(&format!("mountinfo {patch}"))
+                .cloned()
+                .unwrap_or_else(|| "no report".to_string());
+            let flags: Vec<&str> = mount
+                .split_whitespace()
+                .nth(5)
+                .unwrap_or_default()
+                .split(',')
+                .collect();
+            assert!(
+                mount != "absent" && flags.contains(&"ro") && flags.contains(&"nosuid"),
+                "{patch} is a read-only, nosuid mount of its own in the box: {mount:?}"
+            );
+            assert_eq!(
+                report
+                    .get(&format!("open {patch}/token"))
+                    .map(String::as_str),
+                Some("errno 30"),
+                "{patch}/token cannot be opened for writing (EROFS): {report:?}"
+            );
+        }
+        assert_eq!(
+            report.get("mountinfo /.minimal-patch").map(String::as_str),
+            Some("absent"),
+            "the stage is unmounted before the program runs: {report:?}"
+        );
+        assert!(
+            home.join("o").is_dir() && !outside.join("o").exists(),
+            "the outside mapping's mount point was made in the home, beneath it"
         );
     }
 

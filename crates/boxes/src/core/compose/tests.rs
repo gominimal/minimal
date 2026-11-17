@@ -2276,6 +2276,7 @@ mod extend_from_wire {
             requested_packages: vec![],
             lifecycle_hooks: vec![],
             orientation: WireOrientation::default(),
+            entry: None,
         }
     }
 
@@ -2307,6 +2308,7 @@ mod extend_from_wire {
                 source: WireSource::UserLoadout { name: "dev".into() },
             }],
             orientation: WireOrientation::default(),
+            entry: None,
         };
 
         let before = Composition::default();
@@ -2414,6 +2416,7 @@ mod extend_from_wire {
             }],
             lifecycle_hooks: vec![],
             orientation: WireOrientation::default(),
+            entry: None,
         };
         let err = composition.extend_from_wire(wire).unwrap_err();
         assert!(
@@ -2502,6 +2505,7 @@ mod extend_from_wire {
             ],
             lifecycle_hooks: vec![],
             orientation: WireOrientation::default(),
+            entry: None,
         };
         composition.extend_from_wire(wire).unwrap();
         let names: Vec<&str> = composition

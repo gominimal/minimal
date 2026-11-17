@@ -216,6 +216,13 @@ int main(void) {
     printf("raw_socket_errno: %d\n", raw >= 0 ? 0 : errno);
     if (raw >= 0) close(raw);
 
+    /* A packet socket: the one raw family a none box's seal refuses before
+       the kernel's capability check, and the one an open box's seal admits
+       so that the missing CAP_NET_RAW is what refuses it. */
+    int packet = socket(AF_PACKET, SOCK_RAW, 0);
+    printf("packet_socket_errno: %d\n", packet >= 0 ? 0 : errno);
+    if (packet >= 0) close(packet);
+
     int stream = socket(AF_INET, SOCK_STREAM, 0);
     printf("stream_socket_errno: %d\n", stream >= 0 ? 0 : errno);
     if (stream >= 0) close(stream);
@@ -485,13 +492,15 @@ async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
 /// hold are dropped from the bounding set — the one set an exec does not clear
 /// — so they cannot come back.
 ///
-/// Both halves matter. An open box has no socket-family filter, so a raw socket
-/// there is refused by the missing capability alone, while a stream socket
-/// still works — the refusal is about the capability, not a broken network
-/// stack. A none box carries the family filter on top of the same credentials,
-/// so the raw socket is refused by the seal before the capability check is
-/// reached, and what its report adds is that the credentials and the filter
-/// hold together in the one launch closure that applies both.
+/// Both halves matter. An open box's seal admits the inet and packet families,
+/// so a raw socket of either there is refused by the missing capability alone,
+/// while a stream socket still works — the refusal is about the capability,
+/// not a broken network stack. A none box carries the full seal on top of the
+/// same credentials: its inet raw socket is still the capability's refusal
+/// (the seal admits inet so the box can use its own loopback), and its packet
+/// socket is the seal's, refused by family before the capability check is
+/// reached. What the none box's report adds is that the credentials and the
+/// filter hold together in the one launch closure that applies both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boxes_lack_cap_net_raw() {
     if let Some(reason) = sandbox::user_namespaces_restriction() {
@@ -519,14 +528,27 @@ async fn boxes_lack_cap_net_raw() {
          but not stream is the refusal about the capability, not a broken \
          network stack"
     );
+    assert_eq!(
+        reported_errno(&open, "packet_socket_errno", "an open box"),
+        libc::EPERM,
+        "an open box's seal admits the packet family, so the missing \
+         CAP_NET_RAW is what refuses a packet socket"
+    );
 
     let none = box_report(NetPlan::none()).await;
     assert_box_credentials(&none, "a none box");
     assert_eq!(
         reported_errno(&none, "raw_socket_errno", "a none box"),
+        libc::EPERM,
+        "a none box's seal admits inet for its own loopback, so an inet raw \
+         socket there is the capability's refusal, as in an open box"
+    );
+    assert_eq!(
+        reported_errno(&none, "packet_socket_errno", "a none box"),
         libc::EAFNOSUPPORT,
-        "a none box's family filter must still refuse the socket family \
-         itself, seal and credentials together in the same launch"
+        "a none box's family filter must refuse the packet family itself, \
+         before the capability check: seal and credentials together in the \
+         same launch"
     );
 }
 

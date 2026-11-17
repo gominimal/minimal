@@ -2039,6 +2039,92 @@ async fn finalize_without_compose_time_names_evaluates_the_graph() {
     assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
 }
 
+/// A local git repo holding an empty upstream layer, committed once.
+/// Returns the repo dir and the full commit, for an `[upstream]` pin
+/// that resolves offline.
+fn local_upstream_repo() -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join(mfile::MFILE_NAME), "").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "upstream"]);
+    let commit = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    (dir, commit)
+}
+
+/// A refusal for a package the pinned upstream does not declare keeps
+/// its old text and adds one note naming the `[upstream]` repo, the
+/// short `locked_commit` and `min update` — on the fast path (names
+/// captured at compose) and on the fallback that evaluates the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_refusal_names_the_upstream_pin() {
+    let (upstream, commit) = local_upstream_repo();
+    let repo = upstream.path().to_str().unwrap().to_owned();
+    for fallback in [false, true] {
+        let (_state, _cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_config(), None).await.unwrap();
+        seed_workspace_package(&mngr, id, "pkg-ok").await;
+        seed_workspace_mfile(
+            &mngr,
+            id,
+            &format!(
+                "[upstream]\nrepo = \"{repo}\"\nlocked_commit = \"{commit}\"\n\n\
+                 [session]\npackages = [\"pkg-ok\", \"no-such-pkg-up\"]\n"
+            ),
+        )
+        .await;
+        let handle = session(&mngr, id).await;
+        handle
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect("packages gate nothing at compose");
+        handle
+            .check_packages_at_finalize(PACKAGE_CHECK_DEADLINE)
+            .await;
+        if fallback {
+            handle.forget_composed_graph_names().await;
+        }
+        let err = handle
+            .finalize()
+            .await
+            .expect_err("a package absent at the pin must not activate");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-up (declared by project")
+                && msg.contains("; the session was not activated"),
+            "the old refusal text stays (fallback: {fallback}), got {msg:?}"
+        );
+        assert!(
+            msg.contains(&repo) && msg.contains(&commit[..7]) && !msg.contains(&commit),
+            "the note names the repo and the short pin (fallback: {fallback}), got {msg:?}"
+        );
+        assert_eq!(
+            msg.matches("min update").count(),
+            1,
+            "the note appears once (fallback: {fallback}), got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
+    }
+}
+
 async fn status_of(mngr: &BoxManagerHandle, id: SessionId) -> boxes::BoxState {
     mngr.get_record(BoxKeyPredicate::Id(id))
         .await
@@ -3323,6 +3409,7 @@ async fn show_returns_record_state_identity_and_live_execs() {
             signal: None,
             // A session filed with no spec has a terminal.
             pty_enabled: true,
+            lifetime: None,
         }
     );
     assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
@@ -3397,7 +3484,7 @@ async fn box_listing_and_show_carry_pty_enabled() {
         .unwrap();
     let headless = mngr
         .create_box_with_spec(
-            rooted_config("headless", "/home/dev/proj"),
+            as_task(rooted_config("headless", "/home/dev/proj")),
             Some(spec(false)),
             None,
             None,
@@ -3440,6 +3527,59 @@ async fn box_listing_and_show_carry_pty_enabled() {
             .unwrap()
             .expect("the box is retained");
         assert_eq!(shown.record.pty_enabled, pty, "read: {:?}", shown.record);
+        assert_eq!(&shown.record, listed, "the read and the listing agree");
+    }
+}
+
+/// BCLI-009: the listing and the read carry the `lifetime` the box's
+/// stored spec sets, so a client can choose its hint by it. A spec that
+/// sets no lifetime, and a box filed with no spec, carry none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_and_list_replies_carry_lifetime() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = |lifetime: Option<&str>| match lifetime {
+        Some(lifetime) => serde_json_lenient::json!({
+            "v": 1,
+            "io": {"pty_enabled": false},
+            "box": {"lifetime": lifetime},
+        }),
+        None => serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": false}}),
+    };
+    let mut boxes = Vec::new();
+    for (name, lifetime) in [
+        ("agent", Some("until_stopped")),
+        ("job", Some("until_exit")),
+        ("plain", None),
+    ] {
+        let id = mngr
+            .create_box_with_spec(
+                as_task(rooted_config(name, "/home/dev/proj")),
+                Some(spec(lifetime)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        boxes.push((id, lifetime));
+    }
+    let unspecced = mngr
+        .create_session(rooted_config("unspecced", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    boxes.push((unspecced, None));
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    for (id, lifetime) in boxes {
+        let listed = listing
+            .iter()
+            .find(|entry| entry.box_id == id)
+            .unwrap_or_else(|| panic!("the listing holds {id}"));
+        assert_eq!(listed.lifetime.as_deref(), lifetime, "listing: {listed:?}");
+        let shown = mngr
+            .show_box(id)
+            .await
+            .unwrap()
+            .expect("the box is retained");
         assert_eq!(&shown.record, listed, "the read and the listing agree");
     }
 }
@@ -3661,6 +3801,13 @@ fn unnamed_config() -> minimald_rpc::BoxConfig {
     config
 }
 
+/// `config` under the task verb. A spec with no terminal is refused under
+/// the session verb, whose built-in root allows only a terminal (BOX-160).
+fn as_task(mut config: minimald_rpc::BoxConfig) -> minimald_rpc::BoxConfig {
+    config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    config
+}
+
 /// The JSON spec of a `[tasks.<entry>]` box, with `name` as its
 /// `[box] name` when set.
 fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
@@ -3675,6 +3822,8 @@ fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
 /// BOX-076: a spec with sections the daemon does not enforce is stored
 /// whole, the box is created, and the daemon log warns once for each such
 /// section, naming it. A spec with none of them warns nothing.
+/// `[[file_exports]]` is stored and warns nothing, since the client
+/// copies it (BOX-185).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unenforced_sections_warn_once_each_naming_section() {
     let log = crate::test_harness::captured_log();
@@ -3700,7 +3849,7 @@ async fn unenforced_sections_warn_once_each_naming_section() {
             serde_json_lenient::json!(["corp"]),
         );
     let id = mngr
-        .create_box_with_spec(unnamed_config(), Some(spec.clone()), None, None)
+        .create_box_with_spec(as_task(unnamed_config()), Some(spec.clone()), None, None)
         .await
         .expect("a spec with unenforced sections creates its box");
 
@@ -3711,7 +3860,12 @@ async fn unenforced_sections_warn_once_each_naming_section() {
     assert_eq!(stored, spec, "the stored spec carries every section");
 
     let plain = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("fmt", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("fmt", None)),
+            None,
+            None,
+        )
         .await
         .expect("a plain spec creates its box");
 
@@ -3730,7 +3884,6 @@ async fn unenforced_sections_warn_once_each_naming_section() {
     let warned = warnings(id);
     for section in [
         "[[file_imports]]",
-        "[[file_exports]]",
         "[[github_imports]]",
         "[otel]",
         "[network] vpn_network_names",
@@ -3741,7 +3894,11 @@ async fn unenforced_sections_warn_once_each_naming_section() {
             .count();
         assert_eq!(naming, 1, "one warning names {section}:\n{logged}");
     }
-    assert_eq!(warned.len(), 5, "one warning per section:\n{logged}");
+    assert!(
+        !warned.iter().any(|line| line.contains("[[file_exports]]")),
+        "the client copies [[file_exports]], so no warning names it:\n{logged}"
+    );
+    assert_eq!(warned.len(), 4, "one warning per section:\n{logged}");
     assert!(
         warnings(plain).is_empty(),
         "a spec with no unenforced section warns nothing:\n{logged}"
@@ -3765,7 +3922,7 @@ async fn create_names_box_from_box_name_else_entry() {
 
     let named = mngr
         .create_box_with_spec(
-            unnamed_config(),
+            as_task(unnamed_config()),
             Some(task_spec("lint", Some("dev"))),
             None,
             None,
@@ -3775,7 +3932,12 @@ async fn create_names_box_from_box_name_else_entry() {
     assert_eq!(record_name(&mngr, named).await.as_deref(), Some("dev"));
 
     let entry = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("lint", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("lint", None)),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -3785,7 +3947,7 @@ async fn create_names_box_from_box_name_else_entry() {
     );
 
     // The spec's `[box] name` comes before a name the request sends.
-    let mut config = unnamed_config();
+    let mut config = as_task(unnamed_config());
     config.name = Some("given".to_string());
     let over = mngr
         .create_box_with_spec(config, Some(task_spec("other", Some("web"))), None, None)
@@ -3793,7 +3955,7 @@ async fn create_names_box_from_box_name_else_entry() {
         .unwrap();
     assert_eq!(record_name(&mngr, over).await.as_deref(), Some("web"));
 
-    let mut config = unnamed_config();
+    let mut config = as_task(unnamed_config());
     config.name = Some("legacy".to_string());
     let legacy = mngr
         .create_box_with_spec(config, None, None, None)
@@ -3810,14 +3972,19 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     let log = crate::test_harness::captured_log();
     let (state, _cache, mngr) = manager().await;
     let holder = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
     for asked in ["dev", "DEV"] {
         let err = mngr
             .create_box_with_spec(
-                unnamed_config(),
+                as_task(unnamed_config()),
                 Some(task_spec("lint", Some(asked))),
                 None,
                 None,
@@ -3870,7 +4037,12 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     )
     .await;
     let reuse = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .expect("a stopped holder leaves the name free");
     assert_ne!(reuse, holder);
@@ -3884,7 +4056,7 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
     let (_state, _cache, mngr) = manager().await;
     let refused = mngr
         .create_box_with_spec(
-            unnamed_config(),
+            as_task(unnamed_config()),
             Some(task_spec("lint", Some("My_Box"))),
             None,
             None,
@@ -3893,7 +4065,7 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
         .expect_err("an invalid `[box] name` is refused");
     let text = format!("{refused:#}");
     assert!(
-        text.contains("invalid session name") && text.contains("DNS label"),
+        text.contains("invalid box name") && text.contains("DNS label"),
         "the refusal says the name is invalid: {text}"
     );
     assert!(
@@ -3903,7 +4075,7 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
 
     let id = mngr
         .create_box_with_spec(
-            unnamed_config(),
+            as_task(unnamed_config()),
             Some(task_spec("build_all", None)),
             None,
             None,
@@ -3925,7 +4097,7 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
         async move {
             let id = mngr
                 .create_fresh_box_with_spec(
-                    unnamed_config(),
+                    as_task(unnamed_config()),
                     Some(task_spec(entry, None)),
                     None,
                     None,
@@ -3938,7 +4110,12 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
 
     // A running `dev` holds the name: a fresh run is not refused.
     let dev = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(fresh("dev").await, "dev-1");
@@ -3947,7 +4124,7 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
     // A gap is filled first, and a stopped record still uses its suffix.
     let three = mngr
         .create_box_with_spec(
-            unnamed_config(),
+            as_task(unnamed_config()),
             Some(task_spec("lint", Some("Dev-4"))),
             None,
             None,
@@ -4020,7 +4197,12 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
 
     // Stop a box named `dev`.
     let old = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(answers_to(&mngr, "dev").await, Some(old));
@@ -4034,7 +4216,12 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
 
     // Start a new `dev`: the stopped one leaves the name free.
     let new = mngr
-        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .create_box_with_spec(
+            as_task(unnamed_config()),
+            Some(task_spec("dev", None)),
+            None,
+            None,
+        )
         .await
         .expect("a stopped `dev` does not hold the name");
     assert_ne!(new, old, "the new `dev` has an id of its own");
@@ -4296,7 +4483,7 @@ async fn fresh_instance_mint_finds_its_registration_after_the_rename() {
     crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
 
     let grant_config = |key: &str| {
-        let mut config = unnamed_config();
+        let mut config = as_task(unnamed_config());
         config.network = boxes::NetworkMode::HostNet;
         config.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
         config.host_ip_registration = Some(key.to_string());
@@ -6327,4 +6514,1425 @@ async fn a_hand_over_and_a_publish_move_join_the_requests_trace() {
     let lookup = logged(&log, "sessions.manager.message", "kind", "GetRunning").await;
     assert_eq!(lookup.field("trace_id"), Some(CLIENT_TRACE));
     assert_eq!(lookup.field("parent_span_id"), moved.field("span_id"));
+}
+
+/// A task spec whose `[secrets]` table holds `secrets`, as the client
+/// expands it (BOX-071).
+fn spec_with_secrets(entry: &str, secrets: serde_json_lenient::Value) -> serde_json_lenient::Value {
+    let mut spec = task_spec(entry, None);
+    spec.as_object_mut()
+        .expect("a spec is an object")
+        .insert("secrets".to_string(), secrets);
+    spec
+}
+
+/// A brokered secret, as `[secrets.<name>] source = "broker"` expands.
+fn broker_secret() -> serde_json_lenient::Value {
+    serde_json_lenient::json!({ "source": "broker", "scopes": ["github:repo"] })
+}
+
+/// A store reference with the `upstream` and `inject` expansion written
+/// into it (BOX-071, BOX-141).
+fn store_secret() -> serde_json_lenient::Value {
+    serde_json_lenient::json!({
+        "source": "store",
+        "store": "keychain",
+        "id": "npm-token",
+        "upstream": ["registry.npmjs.org"],
+        "inject": { "header": "Authorization", "format": "Bearer {}" },
+    })
+}
+
+/// BOX-081: on a host with no identity plane, a create whose spec carries
+/// a `source = "broker"` secret is refused with exit 5 and the
+/// `gatehouse_unenrolled_node` code when no node-local proxy serves the
+/// box. The refusal files no record, and the daemon log names the
+/// refused secret. The host is never enrolled here, so the enumeration
+/// covers the other two facts: whether a proxy serves the box, and
+/// whether the spec carries a brokered secret, a store reference or none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_secret_unenrolled_exit5() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    const ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n";
+    // The secret names are unique to this test, so the log lines it counts
+    // are its own when tests share one subscriber (libtest).
+    let gh = || serde_json_lenient::json!({ "x5-gh": broker_secret() });
+    let cases = [
+        // (secrets, the create's root certificate, the refused secrets)
+        (gh(), None, vec!["x5-gh"]),
+        (
+            serde_json_lenient::json!({ "x5-gh": broker_secret(), "npm": store_secret() }),
+            None,
+            vec!["x5-gh"],
+        ),
+        (gh(), Some(ROOT_PEM), vec![]),
+        (
+            serde_json_lenient::json!({ "npm": store_secret() }),
+            None,
+            vec![],
+        ),
+        (
+            serde_json_lenient::json!({ "npm": store_secret() }),
+            Some(ROOT_PEM),
+            vec![],
+        ),
+        (serde_json_lenient::json!({}), None, vec![]),
+        (serde_json_lenient::json!({}), Some(ROOT_PEM), vec![]),
+        // A certificate that is not one well-formed block does not count
+        // as the proxy's, so the brokered secret is still refused.
+        (gh(), Some(""), vec!["x5-gh"]),
+        (gh(), Some("not a certificate"), vec!["x5-gh"]),
+        // A node-local proxy serves only a GitHub grant, so a brokered
+        // secret with no `github:` scope is refused beside it.
+        (
+            serde_json_lenient::json!({ "x5-aws": broker_secret_aws() }),
+            Some(ROOT_PEM),
+            vec!["x5-aws"],
+        ),
+        (
+            serde_json_lenient::json!({ "x5-gh": broker_secret(), "x5-aws": broker_secret_aws() }),
+            Some(ROOT_PEM),
+            vec!["x5-aws"],
+        ),
+        (
+            serde_json_lenient::json!({ "x5-aws": broker_secret_aws() }),
+            None,
+            vec!["x5-aws"],
+        ),
+    ];
+    let expected_lines = cases.iter().filter(|(_, _, r)| !r.is_empty()).count();
+    for (n, (secrets, certificate, refused)) in cases.into_iter().enumerate() {
+        let entry = format!("case-{n}");
+        let mut config = as_task(unnamed_config());
+        config.root_certificate = certificate.map(str::to_string);
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let created = mngr
+            .create_box_with_spec(config, Some(spec_with_secrets(&entry, secrets)), None, None)
+            .await;
+        if refused.is_empty() {
+            let id = created.unwrap_or_else(|e| panic!("{entry} is created: {e}"));
+            let filed = mngr.get_record(BoxKeyPredicate::Id(id)).await.unwrap();
+            assert!(filed.is_some(), "{entry} files its record");
+            continue;
+        }
+        let err = created.expect_err("a brokered secret nothing serves is refused");
+        let refusal = unenrolled_refusal(&err).expect("the error is the un-enrolled refusal");
+        assert_eq!(refusal.exit_code(), 5, "{entry}");
+        assert_eq!(
+            refusal
+                .refusals
+                .iter()
+                .map(|r| r.code())
+                .collect::<Vec<_>>(),
+            vec![Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)],
+            "{entry}"
+        );
+        let text = err.to_string();
+        for name in ["x5-gh", "x5-aws"] {
+            assert_eq!(
+                text.contains(name),
+                refused.contains(&name),
+                "{entry}: the refusal names only the refused secrets: {text}"
+            );
+        }
+        assert!(
+            !text.contains("npm"),
+            "the refusal does not name a store reference: {text}"
+        );
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{entry}: a refused create files no record"
+        );
+    }
+
+    let logged = log.contents();
+    let refusals: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains("the spec carries a brokered secret"))
+        .filter(|line| line.contains("x5-"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        expected_lines,
+        "one log line per refusal:\n{logged}"
+    );
+    for line in refusals {
+        assert!(
+            line.contains("\"x5-gh\"") || line.contains("\"x5-aws\""),
+            "the log names the secret: {line}"
+        );
+        assert!(
+            line.contains("gatehouse_unenrolled_node"),
+            "the log names the code: {line}"
+        );
+        assert!(line.contains("exit_code=5"), "{line}");
+        assert!(line.contains("identity=\"none\""), "{line}");
+    }
+}
+
+// BCLI-021, BCLI-078: the daemon gets a spec from any entry, and not the
+// minimal.toml table that set its `secrets`. Its refusal of a task entry's
+// GitHub grant names the entry's secrets, and no `[defaults.session.secrets]`.
+#[test]
+fn unenrolled_refusal_of_a_task_entry_names_no_session_table() {
+    let spec = spec_with_secrets(
+        "ci",
+        serde_json_lenient::json!({ "GH_TOKEN": broker_secret() }),
+    );
+    let (refusal, grants) =
+        unenrolled_broker_refusal(&spec, false).expect("a GitHub grant nothing serves is refused");
+    assert_eq!(grants, vec!["GH_TOKEN"]);
+    let text = refusal.to_string();
+    assert!(!text.contains("[defaults.session.secrets]"), "{text}");
+    assert!(
+        text.ends_with(
+            "To create the box without the grant, remove GH_TOKEN from the secrets of \
+             this box's entry in minimal.toml."
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        refusal.refusals[0].next_step().as_deref(),
+        Some(
+            "to create the box without the grant, remove GH_TOKEN from the secrets of \
+             this box's entry in minimal.toml"
+        )
+    );
+}
+
+/// A brokered secret with no `github:` scope.
+fn broker_secret_aws() -> serde_json_lenient::Value {
+    serde_json_lenient::json!({ "source": "broker", "scopes": ["aws:s3"] })
+}
+
+/// BOX-081 over the socket: the create reply carries the refusal's text,
+/// and the daemon files no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_secret_unenrolled_exit5_reply_over_socket() {
+    use crate::test_harness::{TestServer, create_session_req};
+    use minimald_rpc::{CreateSession, Errorable};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut req = create_session_req("brokered", "/uwu");
+    req.config.name = None;
+    req.spec = Some(spec_with_secrets(
+        "brokered",
+        serde_json_lenient::json!({ "gh": broker_secret() }),
+    ));
+    match client.call::<CreateSession>(&req).await {
+        Errorable::Err { error } => {
+            assert!(error.contains("gh"), "{error}");
+            assert!(
+                error.contains("no Box Egress Proxy serves boxes on this machine"),
+                "{error}"
+            );
+        }
+        Errorable::Ok(reply) => panic!("the create is refused, not {reply:?}"),
+    }
+    let mngr = server.state.sessions_manager().await;
+    assert!(mngr.list_boxes(None).await.unwrap().is_empty());
+}
+
+/// BOX-141: on a host with no identity plane, a `source = "store"`
+/// reference, with its `upstream` and `inject` expansion, passes through
+/// to the daemon unchanged: the box is created and its stored spec holds
+/// the reference key for key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_secret_passed_through_unenrolled() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = spec_with_secrets(
+        "stored",
+        serde_json_lenient::json!({ "npm": store_secret() }),
+    );
+    let id = mngr
+        .create_box_with_spec(as_task(unnamed_config()), Some(spec.clone()), None, None)
+        .await
+        .expect("a store reference creates its box");
+
+    let spec_path = mngr.box_events(id).await.unwrap().object.spec_path();
+    let bytes = std::fs::read(spec_path.as_utf8_path()).expect("the spec is stored");
+    let stored: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&bytes).expect("the stored spec is JSON");
+    assert_eq!(stored["secrets"]["npm"], store_secret());
+    assert_eq!(stored, spec, "the stored spec is the spec the create sent");
+    let shown = mngr
+        .show_box(id)
+        .await
+        .unwrap()
+        .expect("the box is retained");
+    assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
+}
+
+/// BOX-140: on a host with no identity plane, every operation on a box
+/// runs over the local socket, which only its owner can open: creation,
+/// listing and reading the record, exec, rename, stop, reading the events
+/// and a stopped box's files, resume, restart, reaping and pruning. The
+/// record reports the identity none, and no file named `identity.sock` is
+/// in the box.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unenrolled_operations_over_file_mode_trust() {
+    use crate::test_harness::{TestServer, connect_uds};
+    use minimald_rpc::exec::{ExecMode, ExecRequest, ExecSpec};
+    use minimald_rpc::{
+        Errorable, PruneBoxes, PruneBoxesRequest, ReadEventsUpdate, ReapBox, ReapBoxRequest,
+        RenameSession, RenameSessionRequest, RenameSessionResponse, RestartBox, RestartBoxRequest,
+        RestartBoxResponse, ShowBox, ShowBoxRequest, StopBox, StopBoxRequest,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let server = TestServer::new().await;
+    // The daemon's local socket, open to its owner alone: the file mode is
+    // the only trust the un-enrolled host has.
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("minimald.sock");
+    server.listen_on_uds(&sock).await;
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let mut client = connect_uds(&sock).await;
+
+    let stop = |id: SessionId| StopBoxRequest { id, force: true };
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.pty_enabled = true;
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+
+    // Creation, listing, and the record with the identity none.
+    let id = create_box_by_verb(
+        &mut client,
+        "plain",
+        minimald_rpc::CreatingVerb::Session,
+        Some(spec),
+    )
+    .await;
+    assert_eq!(listed(&mut client, id).await.state, "running");
+    let shown = match client.call::<ShowBox>(&ShowBoxRequest { id }).await {
+        Errorable::Ok(shown) => shown,
+        Errorable::Err { error } => panic!("ShowBox failed: {error}"),
+    };
+    assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
+    assert_eq!(
+        serde_json_lenient::to_value(shown.identity).unwrap()["kind"],
+        "none",
+        "the record reports `identity: none`"
+    );
+
+    // Attach, then exec into the box.
+    attach_until_echo(&mut client, id).await;
+    let exec = ExecRequest::Exec(ExecSpec {
+        argv: vec!["/bin/sh".into(), "-c".into(), "echo exec-ran".into()],
+        mode: ExecMode::Attached,
+        timeout_secs: None,
+    });
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &exec.encode(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the exec ends")
+    .expect("the daemon takes the exec");
+    assert_eq!(outcome.exit_status, Some(0), "{outcome:?}");
+    assert!(
+        String::from_utf8_lossy(&outcome.stdout).contains("exec-ran"),
+        "{outcome:?}"
+    );
+
+    // No identity socket anywhere in the box's directories.
+    let mngr = server.state.sessions_manager().await;
+    let paths = session(&mngr, id).await.paths().await.unwrap();
+    let box_dir = mngr.box_events(id).await.unwrap().object.spec_path();
+    let box_dir = box_dir
+        .as_utf8_path()
+        .parent()
+        .unwrap()
+        .as_std_path()
+        .to_path_buf();
+    let roots = [
+        std::path::Path::new(paths.working.as_str()),
+        std::path::Path::new(paths.home.as_str()),
+        std::path::Path::new(paths.cache.as_str()),
+        box_dir.as_path(),
+    ];
+    assert_eq!(crate::env::find_identity_socket(&roots), None);
+
+    // Rename.
+    let reply = client
+        .call::<RenameSession>(&RenameSessionRequest {
+            id,
+            new_name: "renamed".to_string(),
+        })
+        .await;
+    assert_eq!(reply, Errorable::Ok(RenameSessionResponse));
+    assert_eq!(
+        listed(&mut client, id).await.name.as_deref(),
+        Some("renamed")
+    );
+
+    // Stop, then read the events and the stopped box's files.
+    let workspace_file = std::path::Path::new(paths.working.as_str()).join("kept.txt");
+    std::fs::write(&workspace_file, "kept").unwrap();
+    match client.call::<StopBox>(&stop(id)).await {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("StopBox failed: {error}"),
+    }
+    assert_eq!(listed(&mut client, id).await.state, "stopped");
+    let mut lines = open_events_read(&mut client, id, false).await;
+    let mut kinds = Vec::new();
+    while let Some(update) = next_update(&mut lines).await {
+        match update {
+            ReadEventsUpdate::Event { event } => kinds.push(event.kind),
+            ReadEventsUpdate::Done => break,
+            other => panic!("the read ends with Done, not {other:?}"),
+        }
+    }
+    for kind in [
+        BoxEventType::Created,
+        BoxEventType::Renamed,
+        BoxEventType::Exited,
+    ] {
+        assert!(kinds.contains(&kind), "{kind:?} in {kinds:?}");
+    }
+    let sftp = client.open_sftp(id).await;
+    let read = sftp
+        .read(format!("{}/kept.txt", crate::env::WORKSPACE_ROOT))
+        .await
+        .expect("a stopped box's file reads");
+    assert_eq!(read, b"kept");
+    drop(sftp);
+
+    // Resume by attach, then restart.
+    attach_until_echo(&mut client, id).await;
+    assert_eq!(listed(&mut client, id).await.state, "running");
+    let reply = client.call::<RestartBox>(&RestartBoxRequest { id }).await;
+    assert!(
+        matches!(reply, Errorable::Ok(RestartBoxResponse::Restarted { .. })),
+        "{reply:?}"
+    );
+    assert_eq!(listed(&mut client, id).await.state, "running");
+
+    // Reap.
+    let reply = client
+        .call::<ReapBox>(&ReapBoxRequest { id, force: true })
+        .await;
+    match reply {
+        Errorable::Ok(reaped) => assert_eq!(reaped.reaped.box_id, id),
+        Errorable::Err { error } => panic!("ReapBox failed: {error}"),
+    }
+
+    // Prune.
+    let pruned = create_box_by_verb(
+        &mut client,
+        "pruned",
+        minimald_rpc::CreatingVerb::Task,
+        None,
+    )
+    .await;
+    match client.call::<StopBox>(&stop(pruned)).await {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("StopBox failed: {error}"),
+    }
+    match client
+        .call::<PruneBoxes>(&PruneBoxesRequest::default())
+        .await
+    {
+        Errorable::Ok(reply) => {
+            let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+            assert_eq!(reaped, vec![pruned]);
+        }
+        Errorable::Err { error } => panic!("PruneBoxes failed: {error}"),
+    }
+    assert!(mngr.list_boxes(None).await.unwrap().is_empty());
+}
+
+/// BOX-160: the daemon re-checks a create's spec against the constraints
+/// of its type's built-in root at admission, whatever the client checked.
+/// A spec that breaks one is refused with exit 3 naming the type, its root
+/// and the key, files no record, and the daemon log names the refusal. A
+/// spec inside its root's constraints is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    // A spec of `box_type` whose entry is `entry`, edited by `edit`.
+    let spec_of = |entry: &str, box_type: &str, edit: &dyn Fn(&mut serde_json_lenient::Value)| {
+        let mut spec = task_spec(entry, None);
+        spec["box"]["type"] = serde_json_lenient::json!(box_type);
+        edit(&mut spec);
+        spec
+    };
+    let pty = |on: bool| {
+        move |spec: &mut serde_json_lenient::Value| {
+            spec["io"]["pty_enabled"] = serde_json_lenient::json!(on);
+        }
+    };
+    // The refused type, root, key and value.
+    type Refused = Option<(&'static str, &'static str, &'static str, &'static str)>;
+    let session = unnamed_config;
+    let task = || as_task(unnamed_config());
+    let cases: Vec<(minimald_rpc::BoxConfig, serde_json_lenient::Value, Refused)> = vec![
+        // (the creating verb's config, spec, the refused type, root, key
+        // and value)
+        (
+            task(),
+            spec_of("rc-task-pty", "task", &pty(true)),
+            Some(("task", "task", "io.pty_enabled", "true")),
+        ),
+        (
+            task(),
+            spec_of("rc-task-flat", "task", &|spec| {
+                spec["pty_enabled"] = serde_json_lenient::json!(true);
+            }),
+            Some(("task", "task", "pty_enabled", "true")),
+        ),
+        (
+            session(),
+            spec_of("rc-session-nopty", "session", &pty(false)),
+            Some(("session", "session", "io.pty_enabled", "false")),
+        ),
+        // A project type is checked against its built-in root.
+        (
+            task(),
+            spec_of("rc-derived", "ci", &|spec| {
+                pty(true)(spec);
+                spec["type"] = serde_json_lenient::json!({ "root": "task" });
+            }),
+            Some(("ci", "task", "io.pty_enabled", "true")),
+        ),
+        (
+            task(),
+            spec_of("rc-build-nesting", "build", &|spec| {
+                spec["nesting"] = serde_json_lenient::json!({ "allowed": true });
+            }),
+            Some(("build", "build", "nesting.allowed", "true")),
+        ),
+        // A spec with no `box.type` is checked as the creating verb's
+        // type, here `session`.
+        (
+            session(),
+            spec_of("rc-no-type", "session", &|spec| {
+                pty(false)(spec);
+                spec["box"].as_object_mut().unwrap().remove("type");
+            }),
+            Some(("session", "session", "io.pty_enabled", "false")),
+        ),
+        // The session verb files the box as `session` whatever `box.type`
+        // says, so a `task` spec under it is checked against `session` too.
+        (
+            session(),
+            spec_of("rc-task-as-session", "task", &pty(false)),
+            Some(("session", "session", "io.pty_enabled", "false")),
+        ),
+        // Inside the root's constraints: created.
+        (task(), spec_of("rc-task-ok", "task", &pty(false)), None),
+        (
+            session(),
+            spec_of("rc-session-ok", "session", &pty(true)),
+            None,
+        ),
+    ];
+    for (config, spec, refused) in cases {
+        let entry = spec["entry"].as_str().unwrap_or_default().to_owned();
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let created = mngr
+            .create_box_with_spec(config, Some(spec), None, None)
+            .await;
+        let Some((box_type, root, key, value)) = refused else {
+            created.unwrap_or_else(|e| panic!("{entry} is created: {e}"));
+            continue;
+        };
+        let err = created.expect_err("a spec its root excludes is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{entry}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<RootConstraintRefusal>())
+            .unwrap_or_else(|| panic!("{entry}: the error is the root refusal: {err}"));
+        assert_eq!(refusal.exit_code(), 3, "{entry}");
+        assert_eq!(
+            (
+                refusal.box_type.as_str(),
+                refusal.root.as_str(),
+                refusal.key.as_str(),
+                refusal.value.as_str()
+            ),
+            (box_type, root, key, value),
+            "{entry}"
+        );
+        let text = err.to_string();
+        for word in [
+            format!("`{box_type}`"),
+            format!("`{root}`"),
+            format!("`{key}`"),
+        ] {
+            assert!(
+                text.contains(&word),
+                "{entry}: the refusal names {word}: {text}"
+            );
+        }
+        assert!(!text.contains("BOX-"), "{entry}: {text}");
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{entry}: a refused create files no record"
+        );
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("its type's built-in root excludes")
+                    && line.contains(&format!("box_type={box_type} root={root} key={key} "))
+            })
+            .unwrap_or_else(|| panic!("{entry}: the daemon log names the refusal:\n{logged}"));
+        assert!(line.contains("exit_code=3"), "{line}");
+        assert!(
+            line.contains("refusal="),
+            "the create span records it: {line}"
+        );
+    }
+
+    // A spec that names a type with no built-in root, or the wrong one, is
+    // refused: it has no root to trust, so it never passes unchecked. A
+    // built-in type is its own root, so a `task` spec cannot claim the
+    // `session` root and keep a terminal.
+    let unknown: [(serde_json_lenient::Value, &str, &str); 3] = [
+        (
+            spec_of("rc-custom-no-root", "ci", &pty(true)),
+            "box.type",
+            "ci",
+        ),
+        (
+            spec_of("rc-root-not-builtin", "ci", &|spec| {
+                spec["type"] = serde_json_lenient::json!({ "root": "nope" });
+            }),
+            "type.root",
+            "nope",
+        ),
+        (
+            spec_of("rc-builtin-other-root", "task", &|spec| {
+                pty(true)(spec);
+                spec["type"] = serde_json_lenient::json!({ "root": "session" });
+            }),
+            "type.root",
+            "session",
+        ),
+    ];
+    for (spec, key, value) in unknown {
+        let entry = spec["entry"].as_str().unwrap_or_default().to_owned();
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let err = mngr
+            .create_box_with_spec(unnamed_config(), Some(spec), None, None)
+            .await
+            .expect_err("a type with no built-in root is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{entry}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<UnknownRootRefusal>())
+            .unwrap_or_else(|| panic!("{entry}: the error is the root refusal: {err}"));
+        assert_eq!(refusal.exit_code(), 3, "{entry}");
+        assert_eq!(
+            (refusal.key, refusal.value.as_str()),
+            (key, value),
+            "{entry}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("`{key}`")) && text.contains(&format!("`{value}`")),
+            "{entry}: the refusal names the key and the value: {text}"
+        );
+        assert!(
+            text.contains("`session`") && !text.contains("BOX-"),
+            "{text}"
+        );
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{entry}: a refused create files no record"
+        );
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("does not name its type's built-in root")
+                    && line.contains(&format!("key=\"{key}\" value={value} "))
+            })
+            .unwrap_or_else(|| panic!("{entry}: the daemon log names the refusal:\n{logged}"));
+        assert!(line.contains("exit_code=3"), "{line}");
+    }
+}
+
+/// BOX-059, BOX-061, BOX-156, BOX-160 end to end: a project Box Type that
+/// extends `task` only narrows it. A type that tries to loosen the root's
+/// constraint does not resolve. An entry of the narrowing type that breaks
+/// a constraint is refused at expansion, with exit 3. The spec that the
+/// client did not check is refused again at the daemon, with exit 3,
+/// naming the type, its root `task` and the key. The daemon log names both
+/// refusals (the flat key and the key under its section), and the create
+/// span records each one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn derived_task_type_refused_at_expansion_and_admission() {
+    use mfile::box_types::{BoxTypeError, BoxTypes};
+    use mfile::expand::{Layers, check_constraints, expand, expandable_type};
+
+    const FILE: &str = r#"
+        [box_types.ci]
+        extends = "task"
+        constraints = { pty_enabled = false, restart = "never" }
+
+        [boxes.lint-flat]
+        type = "ci"
+        pty_enabled = true
+
+        [boxes.lint-nested]
+        type = "ci"
+        io = { pty_enabled = true }
+    "#;
+
+    // A type cannot loosen the constraint of the root it extends.
+    let loose = format!(
+        "{FILE}\n[box_types.ci-loose]\nextends = \"task\"\n\
+         constraints = {{ pty_enabled = [false, true] }}\n"
+    );
+    let doc = loose.parse().expect("the file is TOML");
+    let err = BoxTypes::from_file(&doc).expect_err("a loosening type does not resolve");
+    assert!(
+        matches!(&err, BoxTypeError::Loosening { name, key, parent, .. }
+            if name == "ci-loose" && key == "pty_enabled" && parent == "task"),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 3);
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let doc = FILE.parse().expect("the file is TOML");
+    let types = BoxTypes::from_file(&doc).expect("the narrowing type resolves");
+    let entries = mfile::entry::read_entries(FILE.as_bytes()).expect("the entries read");
+
+    for (name, key) in [
+        ("lint-flat", "pty_enabled"),
+        ("lint-nested", "io.pty_enabled"),
+    ] {
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"));
+        let resolved = expandable_type(entry, &types).expect("a task-rooted type expands");
+        assert_eq!((resolved.name.as_str(), resolved.root), ("ci", "task"));
+        let layers = Layers {
+            type_defaults: resolved.defaults.clone(),
+            ..Layers::default()
+        };
+        let expansion = expand(entry, &layers).expect("the entry expands");
+
+        // Refused at expansion.
+        let err = check_constraints(entry, &expansion, &resolved)
+            .expect_err("the entry breaks the type's constraint");
+        assert_eq!(err.exit_code(), 3, "{name}");
+        let text = err.to_string();
+        for word in [
+            format!("`[boxes.{name}]`"),
+            format!("`{key}`"),
+            "`[box_types.ci]`".to_owned(),
+        ] {
+            assert!(
+                text.contains(&word),
+                "{name}: expansion names {word}: {text}"
+            );
+        }
+
+        // Refused again at the daemon, which receives the spec unchecked.
+        let mut spec = task_spec(name, None);
+        let expanded =
+            serde_json_lenient::to_value(&expansion.spec).expect("a TOML table serializes");
+        for (k, v) in expanded.as_object().expect("the spec is a table") {
+            match (spec.get_mut(k), v) {
+                (
+                    Some(serde_json_lenient::Value::Object(base)),
+                    serde_json_lenient::Value::Object(over),
+                ) => base.extend(over.clone()),
+                _ => {
+                    spec[k.as_str()] = v.clone();
+                }
+            }
+        }
+        spec["box"]["type"] = serde_json_lenient::json!(resolved.name);
+        spec["type"] = serde_json_lenient::json!({ "root": resolved.root });
+
+        let before = mngr.list_boxes(None).await.unwrap().len();
+        let err = mngr
+            .create_box_with_spec(as_task(unnamed_config()), Some(spec), None, None)
+            .await
+            .expect_err("the daemon refuses the spec its root excludes");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{name}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<RootConstraintRefusal>())
+            .unwrap_or_else(|| panic!("{name}: the error is the root refusal: {err}"));
+        assert_eq!(refusal.exit_code(), 3, "{name}");
+        assert_eq!(
+            (
+                refusal.box_type.as_str(),
+                refusal.root.as_str(),
+                refusal.key.as_str(),
+                refusal.value.as_str()
+            ),
+            ("ci", "task", key, "true"),
+            "{name}"
+        );
+        let text = err.to_string();
+        for word in ["`ci`", "`task`", &format!("`{key}`")] {
+            assert!(
+                text.contains(word),
+                "{name}: the daemon names {word}: {text}"
+            );
+        }
+        assert!(!text.contains("BOX-"), "{name}: {text}");
+        assert_eq!(
+            mngr.list_boxes(None).await.unwrap().len(),
+            before,
+            "{name}: a refused create files no record"
+        );
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("its type's built-in root excludes")
+                    && line.contains(&format!("box_type=ci root=task key={key} "))
+            })
+            .unwrap_or_else(|| panic!("{name}: the daemon log names the refusal:\n{logged}"));
+        assert!(line.contains("exit_code=3"), "{line}");
+        assert!(
+            line.contains("refusal="),
+            "the create span records it: {line}"
+        );
+    }
+}
+
+/// BOX-071: a created box's record holds the client's projection digest
+/// beside the one the daemon recomputed from the spec it received. The
+/// daemon's key is its own: a digest a client sends under it is dropped.
+/// The daemon log names both digests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_digests_stored_side_by_side() {
+    use minimald_rpc::{CLIENT_PROJECTION_DIGEST_ATTR, DAEMON_PROJECTION_DIGEST_ATTR};
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let spec = spec_with_secrets(
+        "digest",
+        serde_json_lenient::json!({ "npm": store_secret() }),
+    );
+    let expected =
+        mfile::projection::spec_digest(&spec, boxes::TASK_BOX_TYPE).expect("the spec projects");
+    let digests_of = |record: boxes::Record| {
+        (
+            record.attrs.get(CLIENT_PROJECTION_DIGEST_ATTR).cloned(),
+            record.attrs.get(DAEMON_PROJECTION_DIGEST_ATTR).cloned(),
+        )
+    };
+    let create = |config: minimald_rpc::BoxConfig| {
+        let mngr = mngr.clone();
+        let spec = spec.clone();
+        async move {
+            let id = mngr
+                .create_box_with_spec(as_task(config), Some(spec), None, None)
+                .await
+                .expect("the box is created");
+            let record = mngr
+                .get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .expect("the record is filed");
+            (id, record)
+        }
+    };
+
+    // A client that projected the same spec: both digests, equal.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    let (agreed, record) = create(config).await;
+    assert_eq!(
+        digests_of(record),
+        (Some(expected.clone()), Some(expected.clone()))
+    );
+
+    // A digest a client sends under the daemon's key is dropped.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    config.attrs.insert(
+        DAEMON_PROJECTION_DIGEST_ATTR.to_owned(),
+        "asserted-by-client".to_owned(),
+    );
+    let (_, record) = create(config).await;
+    assert_eq!(
+        digests_of(record),
+        (Some(expected.clone()), Some(expected.clone()))
+    );
+
+    // A client digest that differs, or a client value that is not a
+    // digest in form, refuses the create (BOX-072), so nothing is stored.
+    for client in [&"A".repeat(43), "client-digest", "A\nB", &"A".repeat(44)] {
+        let mut config = unnamed_config();
+        config.set_client_projection_digest(client);
+        mngr.create_box_with_spec(as_task(config), Some(spec.clone()), None, None)
+            .await
+            .expect_err("a differing client digest refuses the create");
+    }
+
+    // A client that predates the digest sends none: the daemon's alone.
+    let (_, record) = create(unnamed_config()).await;
+    assert_eq!(digests_of(record), (None, Some(expected.clone())));
+
+    // A create with no spec has no daemon digest, so the client's is not
+    // stored alone.
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    let id = mngr
+        .create_box_with_spec(as_task(config), None, None, None)
+        .await
+        .expect("the box is created");
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is filed");
+    assert_eq!(digests_of(record), (None, None));
+
+    // The daemon log names both digests.
+    let logged = log.contents();
+    // A malformed client value logs as `malformed`, never as `none` and
+    // never as sent.
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains("client_projection_digest=\"malformed\"")
+        }),
+        "a log line names a malformed client digest:\n{logged}"
+    );
+    assert!(!logged.contains("client-digest"), "{logged}");
+    let line = logged
+        .lines()
+        .find(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains(&format!("client_projection_digest=\"{expected}\""))
+        })
+        .unwrap_or_else(|| panic!("a log line names both digests of {agreed}:\n{logged}"));
+    assert!(
+        line.contains(&format!("daemon_projection_digest=\"{expected}\"")),
+        "{line}"
+    );
+}
+
+/// BOX-072: for every pair of specs, one standing for the client's and one
+/// for the spec the daemon receives, the create is refused iff their
+/// projection digests differ. A refused create leaves no record, the
+/// reply says how to recover, and the daemon log and the create span name
+/// both digests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_digest_mismatch_refuses_create() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let other_upstream = {
+        let mut secret = store_secret();
+        secret["upstream"] = serde_json_lenient::json!(["npm.example.com"]);
+        secret
+    };
+    let unprojected_note = {
+        let mut secret = store_secret();
+        secret["note"] = serde_json_lenient::json!("outside the projection");
+        secret
+    };
+    // The specs differ pairwise. The last one differs from the second
+    // only outside the projection, so its digest is the second's.
+    let specs = [
+        task_spec("x72", None),
+        spec_with_secrets("x72", serde_json_lenient::json!({ "npm": store_secret() })),
+        spec_with_secrets("x72", serde_json_lenient::json!({ "npm": other_upstream })),
+        spec_with_secrets(
+            "x72",
+            serde_json_lenient::json!({ "npm": unprojected_note }),
+        ),
+    ];
+    let digest = |spec: &serde_json_lenient::Value| {
+        mfile::projection::spec_digest(spec, boxes::TASK_BOX_TYPE).expect("the spec projects")
+    };
+    assert_eq!(digest(&specs[1]), digest(&specs[3]));
+    assert_ne!(digest(&specs[0]), digest(&specs[1]));
+    assert_ne!(digest(&specs[1]), digest(&specs[2]));
+
+    let mut refused = 0;
+    for (c, client_spec) in specs.iter().enumerate() {
+        for (d, sent) in specs.iter().enumerate() {
+            let client = digest(client_spec);
+            let daemon = digest(sent);
+            let mut config = unnamed_config();
+            config.set_client_projection_digest(client.clone());
+            let before = mngr.list_boxes(None).await.unwrap().len();
+            let created = mngr
+                .create_box_with_spec(as_task(config), Some(sent.clone()), None, None)
+                .await;
+            let after = mngr.list_boxes(None).await.unwrap().len();
+            if client == daemon {
+                created.unwrap_or_else(|e| panic!("({c}, {d}): equal digests create: {e}"));
+                assert_eq!(after, before + 1, "({c}, {d}): the create files a record");
+                continue;
+            }
+            refused += 1;
+            let error = created.expect_err("differing digests refuse the create");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "({c}, {d})");
+            assert_eq!(
+                error.to_string(),
+                "No box was created. minimald read different box settings from the box spec \
+                 than the `min` that sent it. This can happen when `min` and minimald are \
+                 different builds. Run `min stop` to stop minimald, then run the \
+                 command again to start minimald from the same build as `min`."
+            );
+            assert_eq!(
+                after, before,
+                "({c}, {d}): a refused create files no record"
+            );
+            let logged = log.contents();
+            let line = logged
+                .lines()
+                .find(|line| {
+                    line.contains("the client's projection digest differs from the daemon's")
+                        && line.contains(&format!("client_projection_digest=\"{client}\""))
+                        && line.contains(&format!("daemon_projection_digest=\"{daemon}\""))
+                })
+                .unwrap_or_else(|| panic!("({c}, {d}): the log names both digests:\n{logged}"));
+            assert!(
+                line.contains("refusal=\"projection digest mismatch\"")
+                    || line.contains("refusal=projection digest mismatch"),
+                "the create span records the refusal: {line}"
+            );
+        }
+    }
+    assert!(refused > 0, "the pairs include differing digests");
+
+    // A client that sends no digest predates the key, so its create is
+    // not compared and goes ahead.
+    mngr.create_box_with_spec(
+        as_task(unnamed_config()),
+        Some(specs[2].clone()),
+        None,
+        None,
+    )
+    .await
+    .expect("a create without a client digest goes ahead");
+}
+
+/// BOX-073: this host is not enrolled, so a create evaluates no policy
+/// against the projection: a spec any policy could refuse still creates
+/// its box, and the daemon log and the create span say the policy is
+/// `none`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unenrolled_evaluates_no_policy() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let spec = spec_with_secrets("x73", serde_json_lenient::json!({ "npm": store_secret() }));
+    let expected =
+        mfile::projection::spec_digest(&spec, boxes::TASK_BOX_TYPE).expect("the spec projects");
+    let mut config = unnamed_config();
+    config.set_client_projection_digest(expected.clone());
+    mngr.create_box_with_spec(as_task(config), Some(spec), None, None)
+        .await
+        .expect("an un-enrolled host creates the box with no policy check");
+
+    let logged = log.contents();
+    let line = logged
+        .lines()
+        .find(|line| {
+            line.contains("computed the box spec's projection digest")
+                && line.contains(&format!("daemon_projection_digest=\"{expected}\""))
+        })
+        .unwrap_or_else(|| panic!("a log line names the digest:\n{logged}"));
+    assert!(
+        line.contains("policy=\"none\""),
+        "no policy is evaluated: {line}"
+    );
+    assert!(
+        !logged.contains("evaluated policy"),
+        "nothing says a policy was evaluated:\n{logged}"
+    );
+}
+
+/// One hook table of an expanded spec: an `on_activate` script, the
+/// `description` that names it, and its `declared_by` table (BOX-179).
+fn declared_hook(
+    description: &str,
+    declared_by: serde_json_lenient::Value,
+) -> mfile::spec::SpecHook {
+    serde_json_lenient::from_value(serde_json_lenient::json!({
+        "description": description,
+        "on_activate": {"type": "inline", "value": format!("echo {description}")},
+        "declared_by": declared_by,
+    }))
+    .unwrap()
+}
+
+/// A session spec whose hooks are a project hook `from-spec` and a hook
+/// of the loadout `dev`, each with its declarer.
+fn spec_with_declared_hooks() -> mfile::spec::BoxSpec {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifecycle_hooks = Some(vec![
+        declared_hook("from-spec", serde_json_lenient::json!({"kind": "project"})),
+        declared_hook(
+            "from-dev",
+            serde_json_lenient::json!({"kind": "loadout", "name": "dev"}),
+        ),
+    ]);
+    spec
+}
+
+/// BOX-068, BOX-179: the daemon stores the spec it receives as
+/// `spec.json`, and each hook in it keeps the `declared_by` that names its
+/// declarer: the project for one, the loadout for the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stored_spec_keeps_each_hook_with_its_declarer_in_spec_json() {
+    let (state, _cache, mngr) = manager().await;
+    let sent = serde_json_lenient::to_value(spec_with_declared_hooks()).unwrap();
+    let id = mngr
+        .create_box_with_spec(
+            rooted_config("hooked", "/home/dev/proj"),
+            Some(sent.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Read the file itself, beside the box's record.
+    let mut stored = None;
+    for dir in std::fs::read_dir(state.path().join("sessions")).unwrap() {
+        let dir = dir.unwrap().path();
+        let Ok(record) = std::fs::read_to_string(dir.join("record.json")) else {
+            continue;
+        };
+        if record.contains(&id.to_string()) {
+            stored = Some(std::fs::read(dir.join(boxes::store::SPEC_FILE)).unwrap());
+        }
+    }
+    let stored: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&stored.expect("spec.json is beside the record")).unwrap();
+    assert_eq!(stored, sent);
+    let declarers: Vec<_> = stored["lifecycle_hooks"]
+        .as_array()
+        .expect("spec.json carries lifecycle_hooks")
+        .iter()
+        .map(|hook| hook["declared_by"].clone())
+        .collect();
+    assert_eq!(
+        declarers,
+        [
+            serde_json_lenient::json!({"kind": "project"}),
+            serde_json_lenient::json!({"kind": "loadout", "name": "dev"}),
+        ]
+    );
+    let back: mfile::spec::BoxSpec = serde_json_lenient::from_value(stored).unwrap();
+    assert_eq!(back, spec_with_declared_hooks());
+}
+
+/// BOX-068: the daemon composes the project's hooks from the spec stored
+/// beside the box's workspace, not from the `[session]` hooks of the
+/// workspace's `minimal.toml`. The loadout hook in the stored spec is not
+/// added a second time: it reaches the daemon on the contribution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composes_from_stored_expanded_spec_not_minimal_toml() {
+    let root = TempDir::new().unwrap();
+    let tree = root.path().join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(
+        tree.join(mfile::MFILE_NAME),
+        "[[session.lifecycle_hooks]]\n\
+         description = \"from-toml\"\n\
+         on_activate = { type = \"inline\", value = \"echo from-toml\" }\n",
+    )
+    .unwrap();
+
+    let cache = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let mctx_config = mctx::ConfigBuilder::new()
+        .with_cache_dir(cache.path())
+        .with_state_dir(state.path())
+        .with_daemon_id("test".to_string())
+        .build()
+        .unwrap();
+    let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+    let path = DaemonAbsPath::try_new(tree.to_str().unwrap()).unwrap();
+
+    let pending_hooks = || {
+        let (outcome, _) = run_compose(
+            &daemon,
+            &path,
+            &declared_path(),
+            WireContribution::default(),
+            true,
+        )
+        .expect("the project composes");
+        match outcome {
+            ComposeOutcome::Pending { response, .. } => response
+                .lifecycle_hooks
+                .into_iter()
+                .map(|pending| pending.hook.description.unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ComposeOutcome::Ready(composition) => {
+                assert!(composition.lifecycle_hooks().is_empty());
+                Vec::new()
+            }
+        }
+    };
+
+    // With no stored spec, the hook comes from `minimal.toml`.
+    assert_eq!(pending_hooks(), ["from-toml"]);
+
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&spec_with_declared_hooks()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pending_hooks(),
+        ["from-spec"],
+        "the stored spec's project hook replaces the minimal.toml hook"
+    );
+
+    // A stored spec also carries keys that other daemon readers read one at
+    // a time. The compose reads past them.
+    let mut carried = serde_json_lenient::to_value(spec_with_declared_hooks()).unwrap();
+    carried["io"]["exec_enabled"] = serde_json_lenient::json!(false);
+    carried["file_exports"] = serde_json_lenient::json!([{"path": "out"}]);
+    carried["network"]["vpn_network_names"] = serde_json_lenient::json!(["corp"]);
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&carried).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pending_hooks(),
+        ["from-spec"],
+        "the keys the compose does not read do not refuse the spec"
+    );
+
+    // A stored spec with no hook list leaves the hooks of `minimal.toml`.
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        br#"{"v": 1, "io": {"pty_enabled": true}}"#,
+    )
+    .unwrap();
+    assert_eq!(pending_hooks(), ["from-toml"]);
+
+    // Under --no-hooks, no hook composes from either place.
+    let (outcome, _) = run_compose(
+        &daemon,
+        &path,
+        &declared_path(),
+        WireContribution::default(),
+        false,
+    )
+    .unwrap();
+    let ComposeOutcome::Ready(composition) = outcome else {
+        panic!("with hooks off nothing is pending");
+    };
+    assert!(composition.lifecycle_hooks().is_empty());
+
+    // A stored spec that cannot be read fails the compose: the hooks never
+    // fall back to `minimal.toml` for a box that stores a spec.
+    std::fs::remove_file(root.path().join(boxes::store::SPEC_FILE)).unwrap();
+    std::fs::create_dir(root.path().join(boxes::store::SPEC_FILE)).unwrap();
+    let err = run_compose(
+        &daemon,
+        &path,
+        &declared_path(),
+        WireContribution::default(),
+        true,
+    )
+    .expect_err("an unreadable stored spec fails the compose");
+    assert!(
+        err.to_string().contains("reading the stored box spec"),
+        "{err}"
+    );
+
+    // A v0 spec with a hook that has no `declared_by` fails the compose,
+    // as a launch refuses it: the hooks never fall back to `minimal.toml`.
+    std::fs::remove_dir(root.path().join(boxes::store::SPEC_FILE)).unwrap();
+    let mut undeclared = serde_json_lenient::to_value(spec_with_declared_hooks()).unwrap();
+    assert_eq!(undeclared["v"], 0, "the fixture is a v0 spec");
+    undeclared["lifecycle_hooks"][0]
+        .as_object_mut()
+        .expect("each hook is a table")
+        .remove(mfile::spec::DECLARED_BY)
+        .expect("the fixture's hook names its declarer");
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&undeclared).unwrap(),
+    )
+    .unwrap();
+    let err = run_compose(
+        &daemon,
+        &path,
+        &declared_path(),
+        WireContribution::default(),
+        true,
+    )
+    .expect_err("a stored hook with no declared_by fails the compose");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+}
+
+/// BOX-071, BOX-072, end to end over the golden vectors that
+/// `crates/mfile/tests/golden.rs` pins. For each expanded spec there, the
+/// client's projection (a TOML table, as `min` projects it) and the
+/// daemon's (the JSON the create carries) both equal the pinned digest,
+/// and the record stores the two side by side. A create whose client
+/// digest is another vector's is refused and leaves no record. The daemon
+/// log names both digests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_and_daemon_digests_match_vectors_and_mismatch_refused() {
+    use minimald_rpc::{CLIENT_PROJECTION_DIGEST_ATTR, DAEMON_PROJECTION_DIGEST_ATTR};
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mfile/tests/golden/vectors.json");
+    let text = std::fs::read_to_string(&path).expect("the golden vectors read");
+    let vectors: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&text).expect("the golden vectors are JSON");
+    let vectors = vectors.as_object().expect("the vectors are an object");
+
+    // (name, verb type, the spec as the daemon receives it, client digest,
+    // golden digest)
+    let mut cases = Vec::new();
+    for (name, vector) in vectors {
+        let (Some(spec), Some(golden)) = (
+            vector.get("spec").and_then(|v| v.as_str()),
+            vector.get("digest").and_then(|v| v.as_str()),
+        ) else {
+            // The built-in type vectors carry no spec.
+            continue;
+        };
+        // The vector's projection names the built-in root, which is the
+        // type of the verb that creates the box.
+        let projection: serde_json_lenient::Value = serde_json_lenient::from_str(
+            vector["projection"]
+                .as_str()
+                .expect("the vector has a projection"),
+        )
+        .expect("the projection is JSON");
+        let verb_type = match projection["type"]["root"].as_str() {
+            Some(boxes::SESSION_BOX_TYPE) => boxes::SESSION_BOX_TYPE,
+            _ => boxes::TASK_BOX_TYPE,
+        };
+        // The client's path: project the spec as a TOML table. This crate
+        // does not depend on `toml`, so the table's type comes from
+        // `of_spec`.
+        let table = spec.parse().expect("the golden spec is TOML");
+        let facts = mfile::projection::TypeFacts::of_spec(&table, verb_type)
+            .unwrap_or_else(|| panic!("{name}: the client projects the spec"));
+        let client = mfile::projection::project(&table, &facts).digest();
+        assert_eq!(
+            client, golden,
+            "{name}: the client's digest is the vector's"
+        );
+        // The expanded spec has no `v` yet. The typed spec that `min`
+        // sends carries it, and the daemon refuses a spec without it. `v`
+        // is outside the projection, so the daemon's digest is unchanged.
+        let mut wire = serde_json_lenient::to_value(&table).expect("the spec encodes as JSON");
+        wire["v"] = serde_json_lenient::json!(mfile::spec::BOX_SPEC_VERSION);
+        cases.push((name.clone(), verb_type, wire, client, golden.to_owned()));
+    }
+    assert!(cases.len() >= 2, "the golden file holds specs to compare");
+
+    let config_for = |verb_type: &str, digest: &str| {
+        let mut config = unnamed_config();
+        if verb_type == boxes::TASK_BOX_TYPE {
+            config = as_task(config);
+        }
+        config.set_client_projection_digest(digest.to_owned());
+        config
+    };
+
+    for (name, verb_type, wire, client, golden) in &cases {
+        let id = mngr
+            .create_box_with_spec(
+                config_for(verb_type, client),
+                Some(wire.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: equal digests create the box: {e}"));
+        let record = mngr
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the record is filed");
+        assert_eq!(
+            (
+                record
+                    .attrs
+                    .get(CLIENT_PROJECTION_DIGEST_ATTR)
+                    .map(String::as_str),
+                record
+                    .attrs
+                    .get(DAEMON_PROJECTION_DIGEST_ATTR)
+                    .map(String::as_str),
+            ),
+            (Some(golden.as_str()), Some(golden.as_str())),
+            "{name}: the record stores both digests, equal to the vector's"
+        );
+    }
+
+    // A client digest of another vector's spec is refused.
+    let mut refused = 0;
+    for (name, verb_type, wire, _, golden) in &cases {
+        for (other, _, _, other_digest, _) in &cases {
+            if other_digest == golden {
+                continue;
+            }
+            let before = mngr.list_boxes(None).await.unwrap().len();
+            let error = mngr
+                .create_box_with_spec(
+                    config_for(verb_type, other_digest),
+                    Some(wire.clone()),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("differing digests refuse the create");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "{name} vs {other}");
+            assert!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<ProjectionDigestRefusal>())
+                    .is_some(),
+                "{name} vs {other}: the refusal is the digest mismatch: {error}"
+            );
+            assert_eq!(
+                mngr.list_boxes(None).await.unwrap().len(),
+                before,
+                "{name} vs {other}: a refused create files no record"
+            );
+            let logged = log.contents();
+            assert!(
+                logged.lines().any(|line| {
+                    line.contains("the client's projection digest differs from the daemon's")
+                        && line.contains(&format!("client_projection_digest=\"{other_digest}\""))
+                        && line.contains(&format!("daemon_projection_digest=\"{golden}\""))
+                }),
+                "{name} vs {other}: the log names both digests:\n{logged}"
+            );
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "the vectors include differing digests");
 }

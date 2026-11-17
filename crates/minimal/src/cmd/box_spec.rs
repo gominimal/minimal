@@ -1,23 +1,29 @@
-//! `min box spec`: what a project's box gets from the local Box Egress
-//! Proxy (BEP-038). It prints the proxy's root CA fingerprint, each broker
-//! grant with its upstream hosts and the `full` marker, each store
-//! reference, the resolved steering mode, and the `quic443` stance when it
-//! lets HTTP/3 past the proxy.
+//! `min box spec`: what a box is created from.
 //!
-//! The rows come from [`render`], which is pure. [`cmd_box_spec`] gathers
-//! its inputs: the project's `minimal.toml`, the proxy's published identity
-//! and the client configuration's full-breadth acknowledgement (BEP-057).
+//! With no argument it shows what a project's box gets from the local Box
+//! Egress Proxy (BEP-038). It prints the proxy's root CA fingerprint, each
+//! broker grant with its upstream hosts and the `full` marker, each store
+//! reference, the resolved steering mode, and the `quic443` stance when it
+//! lets HTTP/3 past the proxy. The rows come from [`render`], which is pure.
+//!
+//! With an argument that names an entry of the project, it shows the
+//! entry's expanded spec, with the layer that set each value (BCLI-021).
+//! Else the argument is a box address, and it shows the spec stored for
+//! that box (BCLI-022). Every section of the spec shows, whether or not
+//! the host enforces it (BCLI-023).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use boxes::core::bep::{
-    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals, store_references,
+    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepTables, BepWarning, HostFacts,
+    Quic443, SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals,
+    store_references,
 };
 
-use crate::{BoxSpecArgs, GlobalArgs};
+use crate::output::ObjectType;
+use crate::{BoxSpecArgs, BoxSpecOutputFormat, GlobalArgs};
 
 /// What [`render`] reads.
 pub(crate) struct SpecInputs<'a> {
@@ -46,6 +52,9 @@ pub(crate) struct SpecInputs<'a> {
     /// The client's `[secret-store-rules]`, merged and with refused rules
     /// left out.
     pub store_rules: &'a StoreRules,
+    /// The minimal.toml tables that set [`Self::secrets`] and
+    /// [`Self::bep`], which a refusal names.
+    pub tables: BepTables<'a>,
 }
 
 /// Writes the `min box spec` rows for `inputs`.
@@ -81,6 +90,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         egress,
         bep: inputs.bep,
         secrets: inputs.secrets,
+        tables: inputs.tables,
     };
     let narrow: Vec<BepRefusal> = refusals(&spec, host, inputs.github_hosts)
         .into_iter()
@@ -206,12 +216,174 @@ pub(crate) fn root_fingerprint(path: Option<&Path>) -> Option<String> {
     }
 }
 
-/// `min box spec [PATH]`.
-pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Result<()> {
-    let project = args
-        .path
+/// `min box spec [<entry>|<box>]`: with no argument, the Box Egress Proxy
+/// rows of the project that `--repo-dir` names, else the current one
+/// (BEP-038). With an argument, the expanded spec of that entry of the
+/// project (BCLI-021), else the spec stored for the box it addresses
+/// (BCLI-022). The argument is never read as a directory.
+pub(crate) async fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Result<()> {
+    let mut out = Vec::new();
+    box_spec_to(global, args, true, &mut out).await?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&out)
+        .context("failed to write to stdout")?;
+    stdout.flush().context("failed to write to stdout")
+}
+
+/// [`cmd_box_spec`], written to `out`. `spawn` says whether the box form
+/// starts the local daemon when it does not run. Nothing is written when
+/// the command fails.
+pub(crate) async fn box_spec_to(
+    global: &GlobalArgs,
+    args: BoxSpecArgs,
+    spawn: bool,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    let Some(target) = args.target.clone() else {
+        // BCLI-021: the project form keeps only `--network`.
+        if let Some(flag) = given_override_flags(&args, false).first() {
+            return Err(spec_flag_refusal(flag, "the project's proxy rows", "min box spec").into());
+        }
+        return project_rows(global, &args, out);
+    };
+    let project = global
+        .repo_dir
         .clone()
-        .or_else(|| global.repo_dir.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let entries = project_file_bytes(&project).and_then(|bytes| match bytes {
+        Some((_, bytes)) => mfile::entry::read_entries(&bytes)
+            .map_err(|error| crate::ProjectFileInvalid { error }.into()),
+        None => Ok(Vec::new()),
+    });
+    let entries = match entries {
+        Ok(entries) => entries,
+        // A project file that does not load blocks the entry form. Only a
+        // target that cannot name an entry reads as a box address: a
+        // qualified address, a full box id, or `self`. When no box answers
+        // to it, the project file error is the useful one.
+        Err(project_error) => {
+            if !given_override_flags(&args, true).is_empty() {
+                return Err(project_error);
+            }
+            let only_a_box = matches!(
+                super::box_verbs::parse_box_address(&target),
+                super::box_verbs::BoxAddress::Qualified { .. }
+            ) || boxes::SessionId::parse_str(&target).is_ok()
+                || target == "self";
+            if !only_a_box {
+                tracing::info!(verb = "box spec", target = %target, outcome = "project file invalid");
+                return Err(project_error);
+            }
+            let format = args.output.unwrap_or_default();
+            if spawn && crate::cmd::ensure_daemon(global).is_err() {
+                return Err(project_error);
+            }
+            return match box_spec(global, &target, format, out).await {
+                Err(error)
+                    if !matches!(
+                        error.downcast_ref::<super::box_verbs::BoxAddressRefusal>(),
+                        Some(
+                            super::box_verbs::BoxAddressRefusal::Ambiguous { .. }
+                                | super::box_verbs::BoxAddressRefusal::AmbiguousIdStart { .. }
+                        )
+                    ) =>
+                {
+                    tracing::info!(verb = "box spec", target = %target, outcome = "project file invalid");
+                    Err(project_error)
+                }
+                result => result,
+            };
+        }
+    };
+    // BCLI-022: an entry of the project first, else a box address.
+    let is_entry = entries.iter().any(|entry| entry.name == target)
+        || (target == mfile::entry::DEFAULT_ENTRY_NAME
+            && super::box_verbs::pick_box_start_entry(&entries, Some(&target)).is_ok());
+    if is_entry {
+        let entry = super::box_verbs::pick_box_start_entry(&entries, Some(&target))?;
+        tracing::info!(verb = "box spec", entry = %entry.name, "rendering an entry's spec");
+        return entry_spec(global, &project, &entry, &args, out);
+    }
+    if let Some(flag) = given_override_flags(&args, true).first() {
+        tracing::info!(verb = "box spec", target = %target, outcome = "refused", flag = %flag);
+        return Err(spec_flag_refusal(
+            flag,
+            "a box's stored spec",
+            &format!("min box spec {target}"),
+        )
+        .into());
+    }
+    if spawn {
+        crate::cmd::ensure_daemon(global)?;
+    }
+    box_spec(global, &target, args.output.unwrap_or_default(), out).await
+}
+
+/// The override flags `args` gives, as the person typed them. `--network`
+/// is left out unless `network` is set.
+fn given_override_flags(args: &BoxSpecArgs, network: bool) -> Vec<&'static str> {
+    let overrides = &args.overrides;
+    let egress = &overrides.egress;
+    [
+        (network && overrides.network.is_some(), "--network"),
+        (!overrides.ingress.is_empty(), "--ingress"),
+        (!egress.allow_subnets.is_empty(), "--allow-subnets"),
+        (!egress.deny_subnets.is_empty(), "--deny-subnets"),
+        (!egress.allow_dns_hosts.is_empty(), "--allow-dns-hosts"),
+        (!egress.allow_protocols.is_empty(), "--allow-protocols"),
+        (egress.deny_all_egress, "--deny-all-egress"),
+        (!overrides.loadout.is_empty(), "--loadout"),
+    ]
+    .into_iter()
+    .filter_map(|(given, flag)| given.then_some(flag))
+    .collect()
+}
+
+/// The exit-2 refusal of `flag` for a form of `min box spec` that takes
+/// no override flag. `form` is what that form shows, and `remedy` the
+/// command to run without the flag.
+fn spec_flag_refusal(flag: &str, form: &str, remedy: &str) -> crate::InitRefusal {
+    crate::InitRefusal {
+        code: 2,
+        message: format!(
+            "min box spec does not take {flag} when it shows {form}. \
+             Run {remedy} without {flag}."
+        ),
+    }
+}
+
+/// The project directory that holds the `minimal.toml` for `project`, and
+/// the file's bytes. `None` when the project has no `minimal.toml`.
+fn project_file_bytes(project: &Path) -> anyhow::Result<Option<(PathBuf, Vec<u8>)>> {
+    let file = match mfile::File::from_dir_recursive(project) {
+        Ok(file) => file,
+        Err(mfile::Error::NotFound) => return Ok(None),
+        Err(error) => return Err(crate::ProjectFileInvalid { error }.into()),
+    };
+    let Some(root) = file.repo_path() else {
+        return Ok(None);
+    };
+    let Some(path) = [
+        root.join(mfile::MFILE_NAME),
+        root.join(".minimal").join(mfile::MFILE_NAME),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path).map_err(|e| crate::ProjectFileInvalid {
+        error: mfile::Error::IO("minimal file", path.clone(), e),
+    })?;
+    Ok(Some((root.to_path_buf(), bytes)))
+}
+
+/// `min box spec` with no argument: the Box Egress Proxy rows of the
+/// project (BEP-038).
+fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> anyhow::Result<()> {
+    let project = global
+        .repo_dir
+        .clone()
         .unwrap_or_else(|| PathBuf::from("."));
     let session = match mfile::File::from_dir_recursive(&project) {
         Ok(file) => file.session,
@@ -232,43 +404,69 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             session.secrets,
         )
     });
+    tracing::debug!(project = %project.display(), "rendering min box spec");
+    let (network, _) = preview_host(crate::daemon_host_kind(global), args);
+    // This path reads `[defaults.session]`, as `min box start` does.
+    proxy_rows(
+        global,
+        &bep,
+        quic443,
+        &secrets,
+        network,
+        BepTables::SESSION,
+        None,
+        out,
+    )
+}
+
+/// Writes the Box Egress Proxy rows for `secrets` (BEP-038) to `out`, for
+/// a box of `network` on this host. `read_rules` holds the client's
+/// `[secret-store-rules]` when the caller already read them, and the rows
+/// then do not read them again. `tables` holds the minimal.toml tables
+/// that a refusal names.
+#[allow(clippy::too_many_arguments)]
+fn proxy_rows(
+    global: &GlobalArgs,
+    bep: &BepSettings,
+    quic443: Option<Quic443>,
+    secrets: &SecretGrants,
+    network: boxes::NetworkMode,
+    tables: BepTables<'_>,
+    read_rules: Option<&StoreRules>,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     let acknowledged = crate::config::full_breadth_acknowledged(global)?;
-    let store_rules = if boxes::core::bep::store_references(&secrets)
-        .next()
-        .is_some()
-    {
-        crate::config::read_client_config_and_store_rules(global)?.1
-    } else {
-        StoreRules::new()
+    let store_rules = match read_rules {
+        Some(rules) => rules.clone(),
+        None if boxes::core::bep::store_references(secrets).next().is_some() => {
+            crate::config::read_client_config_and_store_rules(global)?.1
+        }
+        None => StoreRules::new(),
     };
     let root = root_fingerprint(identity_path().as_deref());
-    tracing::debug!(
-        project = %project.display(),
-        root_found = root.is_some(),
-        "rendering min box spec"
-    );
+    tracing::debug!(root_found = root.is_some(), "rendering the proxy rows");
     let github_hosts: Vec<&str> = bep::module::GITHUB
         .hosts
         .iter()
         .map(|authority| authority.host)
         .collect();
-    let (network, box_zone_resolver) = preview_host(crate::daemon_host_kind(global), &args);
-    let mut stdout = std::io::stdout().lock();
+    let box_zone_resolver =
+        super::box_verbs::host_resolves_box_names(crate::daemon_host_kind(global), network);
     render(
         &SpecInputs {
             root_fingerprint: root.as_deref(),
-            bep: &bep,
+            bep,
             quic443,
-            secrets: &secrets,
+            secrets,
             acknowledged,
             network,
             box_zone_resolver,
             github_hosts: &github_hosts,
             store_rules: &store_rules,
+            tables,
         },
-        &mut stdout,
-    )?;
-    stdout.flush().context("failed to write to stdout")
+        out,
+    )
 }
 
 /// The network and the host fact the preview reads, for a host of `kind`:
@@ -281,11 +479,754 @@ pub(crate) fn preview_host(
     kind: paths::HostKind,
     args: &BoxSpecArgs,
 ) -> (boxes::NetworkMode, bool) {
-    let network: boxes::NetworkMode = args.network.into();
+    let network: boxes::NetworkMode = args
+        .overrides
+        .network
+        .unwrap_or_else(crate::cli::default_network_mode)
+        .into();
     (
         network,
         super::box_verbs::host_resolves_box_names(kind, network),
     )
+}
+
+/// The label of the layer that `origin` names, in the words of
+/// `minimal.toml`, for `entry`'s expansion.
+fn origin_label(origin: &mfile::expand::Origin, entry: &mfile::entry::BoxEntry) -> String {
+    use mfile::expand::Layer;
+    match origin.layer {
+        Layer::Upstream => "[upstream]".to_owned(),
+        Layer::TypeDefaults => format!(
+            "type {} defaults",
+            origin.box_type.as_deref().unwrap_or("-")
+        ),
+        Layer::Defaults => "[defaults]".to_owned(),
+        Layer::DefaultsType => format!("[defaults.{}]", entry.box_type.as_deref().unwrap_or("-")),
+        Layer::Entry if entry.implicit => "the implicit default entry".to_owned(),
+        Layer::Entry => format!("[{}.{}]", entry.table.key(), entry.name),
+        Layer::Loadouts => "loadouts".to_owned(),
+        Layer::Overrides => COMMAND_LINE.to_owned(),
+    }
+}
+
+/// Where a refusal tells the person to edit `key` of `entry`'s expansion,
+/// with its minimal.toml table at `path` (BCLI-021). A value from
+/// `[defaults]` or `[defaults.<type>]` names that table. A value from a
+/// selected loadout names that loadout, or "a selected loadout" when the
+/// report does not record which one. A value from a flag names the
+/// command line. An edit to the entry's own table does not change either
+/// of those two, because they sit above the entry. Every other value
+/// names the entry's own table, or `[defaults.<type>]` for the implicit
+/// default entry: a value from the upstream or the type's defaults sits
+/// below the entry, so an edit there replaces it.
+fn setting_table(
+    report: &mfile::expand::ExpansionReport,
+    entry: &mfile::entry::BoxEntry,
+    key: &str,
+    path: &str,
+) -> String {
+    use mfile::expand::{Layer, ValueOrigin};
+    let box_type = entry.box_type.as_deref().unwrap_or(boxes::SESSION_BOX_TYPE);
+    let origin = match report.values.get(key) {
+        Some(ValueOrigin::Value(origin)) => Some(origin),
+        _ => None,
+    };
+    match origin.map(|origin| (origin.layer, origin.loadout.as_deref())) {
+        Some((Layer::Defaults, _)) => format!("[defaults.{path}]"),
+        Some((Layer::DefaultsType, _)) => format!("[defaults.{box_type}.{path}]"),
+        Some((Layer::Loadouts, Some(name))) => format!("the loadout `{name}`"),
+        Some((Layer::Loadouts, None)) => "a selected loadout".to_owned(),
+        Some((Layer::Overrides, _)) => COMMAND_LINE.to_owned(),
+        _ if entry.implicit => format!("[defaults.{box_type}.{path}]"),
+        _ => format!("[{}.{}.{path}]", entry.table.key(), entry.name),
+    }
+}
+
+/// The source of a value that an override flag sets.
+const COMMAND_LINE: &str = "the command line";
+/// The source of a value that no layer sets: the creating command's
+/// default.
+const DEFAULT_SOURCE: &str = "the default";
+
+/// The labels of the layers in `origin`, each once, in layer order.
+fn origin_labels(
+    origin: &mfile::expand::ValueOrigin,
+    entry: &mfile::entry::BoxEntry,
+) -> Vec<String> {
+    let origins: Vec<&mfile::expand::Origin> = match origin {
+        mfile::expand::ValueOrigin::Value(origin) => vec![origin],
+        mfile::expand::ValueOrigin::List(items) => items.iter().collect(),
+    };
+    let mut labels: Vec<String> = Vec::new();
+    for origin in origins {
+        let label = origin_label(origin, entry);
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+/// The keys of a `[secrets.<VAR>]` grant that name where its value comes
+/// from, and where a store reference's value goes: its `upstream` and
+/// `inject`. Every other key is left out of a render, so a secret shows as
+/// its reference only.
+const SECRET_REFERENCE_KEYS: [&str; 7] = [
+    "source", "store", "id", "scopes", "mode", "upstream", "inject",
+];
+
+/// The source of a store reference's `upstream` and `inject`: the client's
+/// `[secret-store-rules]`, never `minimal.toml`.
+const STORE_RULES_SOURCE: &str = "[secret-store-rules]";
+
+/// Each `[secrets.<VAR>]` store reference of `spec`, as its variable name
+/// and the item identifier its `id` names.
+fn store_reference_ids(spec: &toml::Table) -> Vec<(String, String)> {
+    let Some(secrets) = spec.get("secrets").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    secrets
+        .iter()
+        .filter_map(|(var, grant)| {
+            let grant = grant.as_table()?;
+            if grant.get("source").and_then(toml::Value::as_str) != Some("store") {
+                return None;
+            }
+            let id = grant.get("id").and_then(toml::Value::as_str)?.trim();
+            Some((var.clone(), id.to_owned()))
+        })
+        .collect()
+}
+
+/// The client's `[secret-store-rules]` as expansion writes them into a
+/// store reference (BOX-071): each rule's `upstream`, and its `header`,
+/// `prefix` and `basic_auth` as `inject`, as the rule sets them.
+pub(crate) fn expansion_store_rules(
+    rules: &StoreRules,
+) -> std::collections::BTreeMap<String, mfile::expand::StoreRule> {
+    rules
+        .iter()
+        .map(|(id, rule)| {
+            let mut inject = toml::Table::new();
+            for (key, value) in [
+                ("header", &rule.header),
+                ("prefix", &rule.prefix),
+                ("basic_auth", &rule.basic_auth),
+            ] {
+                if let Some(value) = value {
+                    inject.insert(key.to_owned(), toml::Value::String(value.clone()));
+                }
+            }
+            let rule = mfile::expand::StoreRule {
+                upstream: rule.upstream.clone(),
+                inject,
+            };
+            (id.clone(), rule)
+        })
+        .collect()
+}
+
+/// An entry's expanded spec, the source of each value, and the proxy rows
+/// of an entry with a credentialed upstream.
+struct EntrySpec {
+    entry: String,
+    box_type: String,
+    spec: toml::Table,
+    sources: std::collections::BTreeMap<String, Vec<String>>,
+    proxy_rows: Vec<String>,
+    /// The names of the loadouts `min box start` selects for the entry, in
+    /// the order it applies them, for a task entry too. Empty for a sealed
+    /// box, which selects no loadout.
+    loadouts: Option<Vec<String>>,
+}
+
+/// `min box spec <entry>` (BCLI-021): the entry's expanded spec in the
+/// `-o` format, with the layer that set each value.
+fn entry_spec(
+    global: &GlobalArgs,
+    project: &Path,
+    entry: &mfile::entry::BoxEntry,
+    args: &BoxSpecArgs,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    let rendered = expand_entry(global, project, entry, args)?;
+    let mut text = Vec::new();
+    match args.output.unwrap_or_default() {
+        BoxSpecOutputFormat::Toml => {
+            writeln!(
+                text,
+                "# The spec of entry {} (type {}). The comment before each \
+                 value names the layer that set it.",
+                rendered.entry, rendered.box_type
+            )?;
+            if let Some(loadouts) = &rendered.loadouts {
+                if loadouts.is_empty() {
+                    writeln!(text, "# Loadouts: none.")?;
+                } else {
+                    writeln!(text, "# Loadouts: {}.", loadouts.join(", "))?;
+                }
+            }
+            write_toml(&rendered.spec, &rendered.sources, &mut text)?;
+            if !rendered.proxy_rows.is_empty() {
+                writeln!(text, "\n# Box Egress Proxy:")?;
+                for row in &rendered.proxy_rows {
+                    writeln!(text, "# {row}")?;
+                }
+            }
+        }
+        format => {
+            let mut doc = serde_json_lenient::Map::new();
+            doc.insert("schema".to_owned(), ObjectType::Spec.schema().into());
+            doc.insert("entry".to_owned(), rendered.entry.clone().into());
+            doc.insert("type".to_owned(), rendered.box_type.clone().into());
+            if let Some(loadouts) = &rendered.loadouts {
+                doc.insert(
+                    "loadouts".to_owned(),
+                    serde_json_lenient::to_value(loadouts).context("Cannot encode the loadouts")?,
+                );
+            }
+            doc.insert(
+                "spec".to_owned(),
+                serde_json_lenient::to_value(&rendered.spec).context("Cannot encode the spec")?,
+            );
+            doc.insert(
+                "sources".to_owned(),
+                serde_json_lenient::to_value(&rendered.sources)
+                    .context("Cannot encode the sources")?,
+            );
+            if !rendered.proxy_rows.is_empty() {
+                doc.insert(
+                    "egress_proxy".to_owned(),
+                    serde_json_lenient::to_value(&rendered.proxy_rows)
+                        .context("Cannot encode the proxy rows")?,
+                );
+            }
+            write_document(&serde_json_lenient::Value::Object(doc), format, &mut text)?;
+        }
+    }
+    tracing::info!(verb = "box spec", entry = %rendered.entry, outcome = "ok");
+    out.extend_from_slice(&text);
+    Ok(())
+}
+
+/// Expands `entry` of the project at `project` as `min box start` does,
+/// with the override flags of `args` applied to its `[network]` table.
+fn expand_entry(
+    global: &GlobalArgs,
+    project: &Path,
+    entry: &mfile::entry::BoxEntry,
+    args: &BoxSpecArgs,
+) -> anyhow::Result<EntrySpec> {
+    let invalid = |error| crate::ProjectFileInvalid { error };
+    let Some((root, bytes)) = project_file_bytes(project)? else {
+        anyhow::bail!(
+            "No {} found in {} or its parent directories.",
+            mfile::MFILE_NAME,
+            project.display()
+        );
+    };
+    let root = camino::Utf8PathBuf::from_path_buf(root)
+        .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))?;
+    let mut doc: toml::Table =
+        toml::from_slice(&bytes).map_err(|e| invalid(mfile::Error::Format(e)))?;
+    mfile::legacy::canonicalize(&mut doc, mfile::legacy::this_release()).map_err(invalid)?;
+    let defaults = doc
+        .get("defaults")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let project_types: std::collections::BTreeSet<String> = doc
+        .get("box_types")
+        .and_then(toml::Value::as_table)
+        .map(|types| types.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut layers = mfile::expand::Layers::default().with_file_defaults(
+        &defaults,
+        entry.box_type.as_deref(),
+        &project_types,
+    );
+    let mut expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
+    // BOX-071: the client's `[secret-store-rules]` write each store
+    // reference's `upstream` and `inject` into the expanded spec. They are
+    // read once, only for a spec with a store reference, and the proxy rows
+    // below use the same read.
+    // Gap: the v0 spec that a create sends has no `[secrets]` table, so
+    // these values do not reach the daemon yet. #2410 moves the wire to the
+    // expanded spec.
+    let store_ids = store_reference_ids(&expansion.spec);
+    let mut read_rules = None;
+    if !store_ids.is_empty() {
+        let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
+        layers.store_rules = expansion_store_rules(&rules);
+        expansion = mfile::expand::expand(entry, &layers).map_err(invalid)?;
+        read_rules = Some(rules);
+    }
+    let mut spec = expansion.spec;
+    let mut sources = std::collections::BTreeMap::new();
+    for (key, origin) in &expansion.report.values {
+        sources.insert(key.clone(), origin_labels(origin, entry));
+    }
+    // The tables a refusal names: the layer that set `secrets`, and the
+    // layer that set `network`, whose `bep` table the proxy reads.
+    let secrets_table = setting_table(&expansion.report, entry, "secrets", "secrets");
+    let bep_table = setting_table(&expansion.report, entry, "network", "network.bep");
+    for (var, id) in &store_ids {
+        if layers.store_rules.contains_key(id) {
+            for key in ["upstream", "inject"] {
+                sources.insert(
+                    format!("secrets.{var}.{key}"),
+                    vec![STORE_RULES_SOURCE.to_owned()],
+                );
+            }
+        }
+    }
+    let box_type = entry
+        .box_type
+        .clone()
+        .unwrap_or_else(|| boxes::SESSION_BOX_TYPE.to_owned());
+
+    // BCLI-021: the network that `min box start` sends with the same
+    // flags, from the functions it calls.
+    let overrides = &args.overrides;
+    let network_label = sources.get("network").cloned();
+    if box_type == boxes::TASK_BOX_TYPE {
+        // `min box start` refuses these two flags for a task entry, so the
+        // spec refuses them the same way (`StartEntryRefusal::FlagUnsupported`).
+        let unsupported = [
+            (!overrides.ingress.is_empty(), "--ingress"),
+            (!overrides.loadout.is_empty(), "--loadout"),
+        ];
+        if let Some((_, flag)) = unsupported.into_iter().find(|(given, _)| *given) {
+            tracing::info!(verb = "box spec", entry = %entry.name, outcome = "refused", flag = %flag);
+            return Err(crate::InitRefusal {
+                code: 2,
+                message: format!(
+                    "min box spec does not take {flag} for {name}. A box from a task \
+                     entry does not take {flag}. Run min box spec {name} without {flag}.",
+                    name = entry.name
+                ),
+            }
+            .into());
+        }
+    }
+    // The loadouts `min box start` or `min task run` selects, read from
+    // the same client config. A missing or malformed loadout fails here as
+    // it fails the start. Folding their values into the spec is #3236.
+    // The box's loadout mode, read before any loadout as the start reads
+    // it, for a task entry too. A sealed box selects no loadout (BOX-171,
+    // BOX-173).
+    let loadout_mode = crate::loadouts::entry_loadout_gate(Some(&bytes), entry, &overrides.loadout)
+        .map_err(invalid)?;
+    let cfg = crate::config::read_client_config(global)?;
+    let active = crate::loadouts::resolve_active_loadouts(
+        crate::loadouts::gate_selection(
+            crate::loadouts::LoadoutSelection::from_flags(&overrides.loadout, false),
+            loadout_mode,
+        ),
+        &cfg,
+        global,
+    )?;
+    // BOX-172: a loadout that sets `loadout_mode` fails the start, so it
+    // fails the spec the same way.
+    if let Some(loadout) = active.loadouts.iter().find(|l| l.sets_loadout_mode()) {
+        return Err(invalid(mfile::Error::LoadoutSetsLoadoutMode {
+            loadout: Some(loadout.name().as_ref().to_owned()),
+        })
+        .into());
+    }
+    let loadouts = Some(
+        active
+            .loadouts
+            .iter()
+            .map(|loadout| loadout.name().as_ref().to_owned())
+            .collect(),
+    );
+    let mut ingress_sources = vec![COMMAND_LINE.to_owned()];
+    let (mode, mode_source, egress, ingress) = if box_type == boxes::TASK_BOX_TYPE {
+        let project_egress = super::box_verbs::task_project_egress(&root, &entry.name)?;
+        let flags = super::box_verbs::flag_egress(&overrides.egress)?;
+        let egress = super::box_verbs::effective_egress(
+            project_egress.policy,
+            flags,
+            overrides.egress.deny_all_egress,
+        );
+        let (mode, source) = match (overrides.network, project_egress.mode) {
+            (Some(flag), _) => (flag.into(), vec![COMMAND_LINE.to_owned()]),
+            (None, Some(mode)) => (mode, network_label.clone().unwrap_or_default()),
+            (None, None) => (
+                crate::cli::default_network_mode().into(),
+                vec![DEFAULT_SOURCE.to_owned()],
+            ),
+        };
+        (mode, source, egress.policy, None)
+    } else {
+        let mut activate = crate::ActivateArgs::unflagged();
+        activate.network = overrides.network;
+        activate.ingress.clone_from(&overrides.ingress);
+        activate.egress.clone_from(&overrides.egress);
+        let (port_mappings, flags) = super::box_verbs::flag_network_overrides(&activate)?;
+        let mut project_egress = super::box_verbs::project_egress(&root, Some(&entry.name))?;
+        // #3238: as `min box start` sends them, the entry's `network.mode`
+        // applies when no `--network` replaces it, and each `--ingress` adds
+        // a mapping after the entry's `network.ingress`.
+        let file_ingress = project_egress.ingress.take();
+        let (mode, source) = match (overrides.network, project_egress.mode) {
+            (Some(flag), _) => (flag.into(), vec![COMMAND_LINE.to_owned()]),
+            (None, Some(mode)) => (mode, network_label.clone().unwrap_or_default()),
+            (None, None) => (
+                activate.network_mode().into(),
+                vec![DEFAULT_SOURCE.to_owned()],
+            ),
+        };
+        let mut ingress_source = Vec::new();
+        if file_ingress.is_some() {
+            ingress_source.extend(network_label.clone().unwrap_or_default());
+        }
+        if file_ingress.is_none() || !overrides.ingress.is_empty() {
+            ingress_source.push(COMMAND_LINE.to_owned());
+        }
+        let port_mappings = match file_ingress {
+            Some(file_mappings) => super::box_verbs::union_ingress(file_mappings, port_mappings),
+            None => port_mappings,
+        };
+        let egress = super::box_verbs::effective_egress(
+            project_egress.policy,
+            flags,
+            activate.egress.deny_all_egress,
+        );
+        let policy =
+            super::box_verbs::network_override_policy(&activate, port_mappings, egress.policy);
+        ingress_sources = ingress_source;
+        (mode, source, policy.egress, policy.ingress)
+    };
+    let mut network = spec
+        .get("network")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    network.insert("mode".to_owned(), mode.word().into());
+    sources.insert("network.mode".to_owned(), mode_source);
+    let egress_flagged = overrides.egress != crate::EgressArgs::default();
+    match egress {
+        Some(egress) => {
+            let had = network.contains_key("egress");
+            network.insert(
+                "egress".to_owned(),
+                toml::Value::try_from(&egress).context("Cannot encode the egress")?,
+            );
+            let mut source = if had {
+                network_label.clone().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if egress_flagged {
+                source.push(COMMAND_LINE.to_owned());
+            }
+            sources.insert("network.egress".to_owned(), source);
+        }
+        None => {
+            network.remove("egress");
+        }
+    }
+    if let Some(ingress) = ingress {
+        network.insert(
+            "ingress".to_owned(),
+            toml::Value::try_from(&ingress).context("Cannot encode the ingress")?,
+        );
+        sources.insert("network.ingress".to_owned(), ingress_sources);
+    }
+    spec.insert("network".to_owned(), toml::Value::Table(network.clone()));
+    if network_label.is_none() {
+        sources.insert("network".to_owned(), sources["network.mode"].clone());
+    }
+
+    // A secret shows as its reference only, never a value.
+    // The grants parse first, so a grant that `min box start` refuses is
+    // refused here too.
+    let mut grants = SecretGrants::new();
+    if let Some(toml::Value::Table(secrets)) = spec.get_mut("secrets") {
+        // The `upstream` and `inject` that the client's store rules wrote
+        // into a store reference are not grant keys, so the grants parse
+        // without them. Expansion refuses a layer that sets either.
+        let mut declared = secrets.clone();
+        for (_, grant) in declared.iter_mut() {
+            if let toml::Value::Table(fields) = grant
+                && fields.get("source").and_then(toml::Value::as_str) == Some("store")
+            {
+                fields.remove("upstream");
+                fields.remove("inject");
+            }
+        }
+        grants = toml::Value::Table(declared)
+            .try_into()
+            .map_err(|e| invalid(mfile::Error::Format(e)))?;
+        for (_, grant) in secrets.iter_mut() {
+            if let toml::Value::Table(fields) = grant {
+                fields.retain(|key, _| SECRET_REFERENCE_KEYS.contains(&key));
+            }
+        }
+    }
+    let mut rows_text = Vec::new();
+    if grants.values().any(SecretGrant::is_credentialed) {
+        let bep: BepSettings = network
+            .get("bep")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|e| invalid(mfile::Error::Format(e)))?
+            .unwrap_or_default();
+        let quic443: Option<Quic443> = network
+            .get("quic443")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|e| invalid(mfile::Error::Format(e)))?;
+        let mut rows = Vec::new();
+        let tables = BepTables {
+            secrets: &secrets_table,
+            network_bep: &bep_table,
+        };
+        proxy_rows(
+            global,
+            &bep,
+            quic443,
+            &grants,
+            mode,
+            tables,
+            read_rules.as_ref(),
+            &mut rows,
+        )?;
+        rows_text = String::from_utf8_lossy(&rows)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    }
+    Ok(EntrySpec {
+        entry: entry.name.clone(),
+        box_type,
+        spec,
+        sources,
+        proxy_rows: rows_text,
+        loadouts,
+    })
+}
+
+/// `min box spec <box>` (BCLI-022): the spec stored for the box that
+/// `target` addresses, in `format`.
+async fn box_spec(
+    global: &GlobalArgs,
+    target: &str,
+    format: BoxSpecOutputFormat,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    use minimald_rpc::{Errorable, GetBoxSpec, GetBoxSpecRequest};
+    let super::box_verbs::ResolvedBox { host, box_id: id } =
+        super::box_verbs::resolve_box_on_local_hosts(global, target, "box spec").await?;
+    let mut client = super::box_verbs::box_host_client(&host).await?;
+    let stored = match client
+        .oneshot_rpc::<GetBoxSpec>(GetBoxSpecRequest { id })
+        .await
+        .context("GetBoxSpec RPC failed")?
+    {
+        Errorable::Ok(reply) => reply.spec,
+        Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) => {
+            // The box was removed after the address resolved.
+            tracing::info!(verb = "box spec", box_id = %id, outcome = "not found");
+            return Err(super::box_verbs::BoxAddressRefusal::NotFound {
+                address: target.to_owned(),
+            }
+            .into());
+        }
+        Errorable::Err { error } => {
+            tracing::info!(verb = "box spec", box_id = %id, outcome = "error", "{error}");
+            anyhow::bail!("{error}")
+        }
+    };
+    let Some(mut stored) = stored else {
+        tracing::info!(verb = "box spec", box_id = %id, outcome = "no stored spec");
+        anyhow::bail!(
+            "Box {id} has no stored spec. Its host stores none for a box created \
+             before boxes stored their spec."
+        );
+    };
+    // A secret shows as its reference only, whatever the stored copy holds.
+    if let Some(serde_json_lenient::Value::Object(secrets)) = stored.get_mut("secrets") {
+        for grant in secrets.values_mut() {
+            if let serde_json_lenient::Value::Object(fields) = grant {
+                fields.retain(|key, _| SECRET_REFERENCE_KEYS.contains(&key.as_str()));
+            }
+        }
+    }
+    let mut text = Vec::new();
+    match format {
+        BoxSpecOutputFormat::Toml => {
+            writeln!(text, "# The spec box {id} was created with.")?;
+            let spec = match json_to_toml(&stored) {
+                Some(toml::Value::Table(table)) => table,
+                _ => anyhow::bail!("The stored spec of box {id} is not a table."),
+            };
+            write_toml(&spec, &std::collections::BTreeMap::new(), &mut text)?;
+        }
+        format => {
+            let mut doc = serde_json_lenient::Map::new();
+            doc.insert("schema".to_owned(), ObjectType::Spec.schema().into());
+            doc.insert("box".to_owned(), id.to_string().into());
+            doc.insert("spec".to_owned(), stored);
+            write_document(&serde_json_lenient::Value::Object(doc), format, &mut text)?;
+        }
+    }
+    tracing::info!(verb = "box spec", box_id = %id, outcome = "ok", host = %host.host);
+    out.extend_from_slice(&text);
+    Ok(())
+}
+
+/// `value` as TOML, with each `null` left out. `None` for a `null`.
+fn json_to_toml(value: &serde_json_lenient::Value) -> Option<toml::Value> {
+    use serde_json_lenient::Value;
+    Some(match value {
+        Value::Null => return None,
+        Value::Bool(b) => toml::Value::Boolean(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => toml::Value::Integer(i),
+            None => toml::Value::Float(n.as_f64().unwrap_or_default()),
+        },
+        Value::String(s) => toml::Value::String(s.clone()),
+        Value::Array(items) => toml::Value::Array(items.iter().filter_map(json_to_toml).collect()),
+        Value::Object(map) => toml::Value::Table(
+            map.iter()
+                .filter_map(|(k, v)| json_to_toml(v).map(|v| (k.clone(), v)))
+                .collect(),
+        ),
+    })
+}
+
+/// Whether `value` writes as a TOML table or an array of tables, which
+/// must follow every plain key of its parent.
+fn is_table_like(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(_) => true,
+        toml::Value::Array(items) => !items.is_empty() && items.iter().all(toml::Value::is_table),
+        _ => false,
+    }
+}
+
+/// Writes `spec` as TOML, each top-level key with a comment line before it
+/// that names its sources from `sources`: the key itself, then each dotted
+/// key below it.
+fn write_toml(
+    spec: &toml::Table,
+    sources: &std::collections::BTreeMap<String, Vec<String>>,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    let (plain, tables): (Vec<_>, Vec<_>) = spec.iter().partition(|(_, v)| !is_table_like(v));
+    for (key, value) in plain.into_iter().chain(tables) {
+        let prefix = format!("{key}.");
+        for (path, labels) in sources
+            .iter()
+            .filter(|(path, _)| *path == key || path.starts_with(&prefix))
+        {
+            writeln!(out, "# {path}: from {}", labels.join(", "))?;
+        }
+        let one = toml::Table::from_iter([(key.clone(), value.clone())]);
+        let text = toml::to_string(&one).context("Cannot write the spec as TOML")?;
+        out.extend_from_slice(text.as_bytes());
+        if is_table_like(value) {
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes `doc` as JSON or YAML.
+fn write_document(
+    doc: &serde_json_lenient::Value,
+    format: BoxSpecOutputFormat,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    match format {
+        BoxSpecOutputFormat::Json | BoxSpecOutputFormat::Toml => {
+            serde_json_lenient::to_writer_pretty(&mut *out, doc)
+                .context("Cannot write the spec as JSON")?;
+            writeln!(out)?;
+        }
+        BoxSpecOutputFormat::Yaml => {
+            let mut text = String::new();
+            write_yaml(doc, 0, &mut text);
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// A YAML scalar or key for `text`: plain when it is safe, else quoted.
+fn yaml_string(text: &str) -> String {
+    // Plain only in a narrow safe set: a letter, `_` or `/` first, so no
+    // number, date, `-` or `.inf` reads as another type, and no word that
+    // YAML 1.1 or 1.2 reads as a bool or null in any case.
+    const TYPED_WORDS: [&str; 12] = [
+        "true", "false", "null", "yes", "no", "on", "off", "y", "n", "nan", "inf", "infinity",
+    ];
+    let plain = text
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '/'))
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+        && !TYPED_WORDS
+            .iter()
+            .any(|word| text.eq_ignore_ascii_case(word));
+    if plain {
+        text.to_owned()
+    } else {
+        serde_json_lenient::to_string(text).unwrap_or_else(|_| format!("{text:?}"))
+    }
+}
+
+/// Writes `value` as block YAML at `indent` spaces into `out`.
+fn write_yaml(value: &serde_json_lenient::Value, indent: usize, out: &mut String) {
+    use serde_json_lenient::Value;
+    let pad = " ".repeat(indent);
+    let inline = |value: &Value| -> Option<String> {
+        match value {
+            Value::Null => Some("null".to_owned()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::String(s) => Some(yaml_string(s)),
+            Value::Array(items) if items.is_empty() => Some("[]".to_owned()),
+            Value::Object(map) if map.is_empty() => Some("{}".to_owned()),
+            _ => None,
+        }
+    };
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                match inline(value) {
+                    Some(text) => out.push_str(&format!("{pad}{}: {text}\n", yaml_string(key))),
+                    None => {
+                        out.push_str(&format!("{pad}{}:\n", yaml_string(key)));
+                        write_yaml(value, indent + 2, out);
+                    }
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                match inline(item) {
+                    Some(text) => out.push_str(&format!("{pad}- {text}\n")),
+                    None => {
+                        out.push_str(&format!("{pad}-\n"));
+                        write_yaml(item, indent + 2, out);
+                    }
+                }
+            }
+        }
+        scalar => {
+            if let Some(text) = inline(scalar) {
+                out.push_str(&format!("{pad}{text}\n"));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +1240,51 @@ mod tests {
         "uploads.github.com",
         "codeload.github.com",
     ];
+
+    // BCLI-021: a value that a layer above the entry sets names that
+    // layer, because an edit to the entry's own table does not change it.
+    #[test]
+    fn setting_table_names_the_layer_above_the_entry() {
+        use mfile::expand::{ExpansionReport, Layer, Origin, ValueOrigin};
+        let entries = mfile::entry::read_entries(b"[tasks.ci]\necho = 'x'\n").unwrap();
+        let entry = &entries[0];
+        let table_for = |origin: Origin| {
+            let mut report = ExpansionReport::default();
+            report
+                .values
+                .insert("secrets".into(), ValueOrigin::Value(origin));
+            setting_table(&report, entry, "secrets", "secrets")
+        };
+        assert_eq!(table_for(Origin::loadout("gh")), "the loadout `gh`");
+        assert_eq!(table_for(Origin::of(Layer::Loadouts)), "a selected loadout");
+        assert_eq!(table_for(Origin::of(Layer::Overrides)), COMMAND_LINE);
+        // A layer below the entry names the entry's own table.
+        assert_eq!(table_for(Origin::of(Layer::Entry)), "[tasks.ci.secrets]");
+        assert_eq!(table_for(Origin::of(Layer::Upstream)), "[tasks.ci.secrets]");
+        assert_eq!(table_for(Origin::of(Layer::Defaults)), "[defaults.secrets]");
+    }
+
+    #[test]
+    fn yaml_string_quotes_text_that_reads_as_another_type() {
+        for text in [
+            "True",
+            "NO",
+            "Yes",
+            "Null",
+            "y",
+            "-",
+            "0x1F",
+            "1_000",
+            ".inf",
+            "2026-11-11",
+            "",
+        ] {
+            assert!(yaml_string(text).starts_with('"'), "{text}");
+        }
+        for text in ["client_env", "min/v1/spec", "own_ip", "api.github.com"] {
+            assert_eq!(yaml_string(text), text);
+        }
+    }
 
     fn grant(scopes: &[&str]) -> SecretGrant {
         SecretGrant {
@@ -344,6 +1330,7 @@ mod tests {
                 box_zone_resolver: true,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )?;
@@ -380,6 +1367,7 @@ mod tests {
                     box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
+                    tables: BepTables::SESSION,
                 },
                 &mut out,
             )
@@ -443,6 +1431,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -471,6 +1460,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -483,6 +1473,7 @@ mod tests {
             vec![BepRefusal::BrokerScopeNotGithub {
                 grant: "OLD".into(),
                 scope: "claude".into(),
+                table: "[defaults.session.secrets]".into(),
             }]
         );
         assert!(out.is_empty(), "no rows before the refusal");
@@ -522,6 +1513,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )
@@ -588,6 +1580,7 @@ mod tests {
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
+                tables: BepTables::SESSION,
             },
             &mut out,
         )

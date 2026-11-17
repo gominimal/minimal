@@ -30,7 +30,7 @@ use boxes::{
     SessionId,
     core::compose::ComposeOptions,
     daemon::composer::{ComposeOutcome, SessionComposer},
-    wire::request::WireContribution,
+    wire::request::{WireBoxEntry, WireContribution},
 };
 use graph::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
 use paths::DaemonAbsPath;
@@ -345,9 +345,21 @@ pub(crate) fn build_composables(
     // below — once folded into `top_level_names` for the closure
     // walk, once moved into the effective Session block so those
     // packages actually land in the sandbox.
+    //
+    // When the client sent the box's expanded entry (BOX-068), the entry
+    // is the only source of the project's `[session]` items. The client
+    // already expanded a legacy `[session]` table into a session entry,
+    // and a task entry must not inherit it. So `[session]` is not read
+    // here, and the entry's own packages join the closure walk below.
+    let entry = contribution.entry.as_deref();
+    let session_table = if entry.is_some() {
+        None
+    } else {
+        mfile.session.as_ref()
+    };
     let project_declared_packages: std::collections::BTreeSet<String> = {
         let mut all = std::collections::BTreeSet::<String>::new();
-        if let Some(s) = mfile.session.as_ref() {
+        if let Some(s) = session_table {
             all.extend(s.packages.iter().cloned());
         }
         if let Some(stack) = mfile.stack.as_ref() {
@@ -372,6 +384,12 @@ pub(crate) fn build_composables(
                 .iter()
                 .map(|p| p.name.clone()),
         );
+        // An entry package gets its `env_state_wiring` and fs mappings,
+        // the same as a `[session]` package. The composer adds the
+        // package itself to the box when it reads the entry.
+        if let Some(packages) = entry.and_then(|e| e.packages.as_ref()) {
+            set.extend(packages.iter().cloned());
+        }
         set.into_iter().collect()
     };
 
@@ -381,16 +399,16 @@ pub(crate) fn build_composables(
     // graph-Stack `build_env_vars`. Skips the `mfile.session.clone()`
     // allocation on the common bare-mfile path.
     let has_material = !project_declared_packages.is_empty()
-        || mfile.session.as_ref().is_some_and(|s| !s.is_empty())
+        || session_table.is_some_and(|s| !s.is_empty())
         || graph_stack.is_some_and(|g| !g.build_env_vars.is_empty());
     let project_composable = if !has_material {
         None
     } else {
         // Starts from the on-disk `[session]` block (or an empty
-        // default), then folds in the union package list and any
+        // default, always when the client sent an entry), then folds in the union package list and any
         // graph-Stack `build_env_vars`. Session-declared vars win
         // over stack-inherited ones for the same name.
-        let mut effective = mfile.session.clone().unwrap_or_default();
+        let mut effective = session_table.cloned().unwrap_or_default();
         effective.packages = project_declared_packages.into_iter().collect();
         if let Some(gstack) = graph_stack {
             fold_stack_vars_into_session(&mut effective, &gstack.name, &gstack.build_env_vars);
@@ -421,6 +439,8 @@ pub(crate) fn build_composables(
     tracing::info!(
         project_path = %project_path,
         top_level_names = ?top_level_names,
+        entry = ?entry.map(|e| e.name.as_str()),
+        reads_session_table = session_table.is_some(),
         "compose: walking top-level packages for env_state_wiring + \
          env_dir/file_mappings",
     );
@@ -485,6 +505,16 @@ pub(crate) fn build_composables(
     Ok((project_composable, package_composables))
 }
 
+/// What [`run_compose`] learned about the compose-time graph for the
+/// finalize-time package check.
+#[derive(Debug)]
+pub(crate) struct ComposedGraph {
+    /// The package names the graph declared.
+    pub(crate) names: std::collections::HashSet<String>,
+    /// The project's `[upstream]` pin, if it has one.
+    pub(crate) pin: Option<crate::env::UpstreamPin>,
+}
+
 /// The full compose chain for a create flow: resolve the project,
 /// build its composables, and run the composer. Synchronous and
 /// potentially expensive (nickel evaluation, graph resolution) —
@@ -502,18 +532,22 @@ pub(crate) fn build_composables(
 /// among the most expensive steps of this chain, and the finalize-time
 /// package check asks the same question of the same workspace:
 /// handing the names back lets its caller answer from them instead of
-/// evaluating the graph a second time.
+/// evaluating the graph a second time. The project's `[upstream]` pin
+/// rides along, so that check can name the commit it judged against.
 pub(crate) fn run_compose(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
     declared_path: &paths::HostAbsPath,
     contribution: WireContribution,
     hooks_enabled: bool,
-) -> Result<(ComposeOutcome, Option<std::collections::HashSet<String>>), std::io::Error> {
+) -> Result<(ComposeOutcome, Option<ComposedGraph>), std::io::Error> {
     let resolution = resolve_project_ctx_and_graph(daemon_ctx, project_path)?;
     let graph_names = match &resolution {
         ProjectResolution::NoMFile => None,
-        ProjectResolution::Full(_, graph) => Some(graph.names().map(str::to_owned).collect()),
+        ProjectResolution::Full(ctx, graph) => Some(ComposedGraph {
+            names: graph.names().map(str::to_owned).collect(),
+            pin: crate::env::UpstreamPin::of(ctx.minimal_file()),
+        }),
     };
     let (project_composable, package_composables) = build_composables(
         project_path,
@@ -522,8 +556,132 @@ pub(crate) fn run_compose(
         &contribution,
         hooks_enabled,
     )?;
+    let mut contribution = contribution;
+    if hooks_enabled && let Some(spec) = stored_spec_beside(project_path)? {
+        compose_hooks_from_stored_spec(&mut contribution, declared_path, &spec);
+    }
     let outcome = run_composer(contribution, project_composable, package_composables)?;
     Ok((outcome, graph_names))
+}
+
+/// The hooks of the spec stored beside a box's workspace, with the entry
+/// and the Box Type that the spec names (BOX-068, BOX-179).
+pub(crate) struct StoredHooks {
+    /// The spec's `entry`.
+    entry: String,
+    /// The spec's `box.type`.
+    box_type: String,
+    /// The spec's `lifecycle_hooks`, each with its `declared_by`.
+    hooks: Vec<mfile::spec::SpecHook>,
+}
+
+/// The hooks of the spec stored beside the box's workspace, `project_path`:
+/// the [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
+/// directory (BOX-068). `None` when the box stores no spec, or a spec with
+/// no `lifecycle_hooks` key.
+///
+/// It reads only the keys the compose uses: `v`, `entry`, `box.type` and
+/// `lifecycle_hooks`. A stored spec also carries keys that other readers of
+/// the daemon read one at a time, such as `io.exec_enabled`,
+/// `[[file_exports]]` and `network.vpn_network_names`. A whole-spec parse
+/// refuses those keys, so it is not used here.
+///
+/// # Errors
+///
+/// A stored spec that exists but cannot be read fails the compose, so the
+/// box never runs hooks from a source other than its stored spec. A stored
+/// spec that is not JSON fails the compose with `InvalidInput`. So does a
+/// hook list in a spec that is not a v0 Box Spec, that names no `entry` or
+/// `box.type`, or that has a hook with no valid `declared_by`.
+fn stored_spec_beside(project_path: &DaemonAbsPath) -> Result<Option<StoredHooks>, std::io::Error> {
+    let Some(dir) = project_path.as_utf8_path().parent() else {
+        return Ok(None);
+    };
+    let path = dir.join(boxes::store::SPEC_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            tracing::error!(spec_path = %path, error = %e, "could not read the stored box spec");
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("reading the stored box spec at {path}: {e}"),
+            ));
+        }
+    };
+    stored_hooks(&bytes).inspect_err(|e| {
+        tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
+    })
+}
+
+/// The hooks of the stored spec `bytes`, as [`stored_spec_beside`] reads
+/// them.
+fn stored_hooks(bytes: &[u8]) -> Result<Option<StoredHooks>, std::io::Error> {
+    let refused = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
+    let spec: serde_json_lenient::Value = serde_json_lenient::from_slice(bytes)
+        .map_err(|e| refused(format!("the stored box spec is not JSON: {e}")))?;
+    let Some(hooks) = spec.get("lifecycle_hooks") else {
+        return Ok(None);
+    };
+    let version = spec.get("v").and_then(serde_json_lenient::Value::as_u64);
+    if version != Some(u64::from(mfile::spec::BOX_SPEC_VERSION)) {
+        return Err(refused(format!(
+            "the stored box spec has lifecycle_hooks, and its version is not {}",
+            mfile::spec::BOX_SPEC_VERSION
+        )));
+    }
+    let text = |value: Option<&serde_json_lenient::Value>, key: &str| {
+        value
+            .and_then(serde_json_lenient::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                refused(format!(
+                    "the stored box spec has lifecycle_hooks and no {key}"
+                ))
+            })
+    };
+    let entry = text(spec.get("entry"), "entry")?;
+    let box_type = text(spec.get("box").and_then(|b| b.get("type")), "box.type")?;
+    let hooks: Vec<mfile::spec::SpecHook> = serde_json_lenient::from_value(hooks.clone())
+        .map_err(|e| refused(format!("the stored box spec's lifecycle_hooks: {e}")))?;
+    Ok(Some(StoredHooks {
+        entry,
+        box_type,
+        hooks,
+    }))
+}
+
+/// Composes the project's lifecycle hooks from the stored spec's hooks,
+/// `stored`, not from the project's `minimal.toml` (BOX-068, BOX-179). The
+/// hooks whose `declared_by` names the project replace every project hook:
+/// the ones the daemon read from `[session]` and the ones the expanded
+/// entry sent. A loadout's hooks stay on the client's contribution, with
+/// their loadout, so the stored loadout hooks are not added a second time.
+pub(crate) fn compose_hooks_from_stored_spec(
+    contribution: &mut WireContribution,
+    declared_path: &paths::HostAbsPath,
+    stored: &StoredHooks,
+) {
+    let project: Vec<_> = stored
+        .hooks
+        .iter()
+        .filter(|h| h.declared_by == mfile::spec::HookDeclarer::Project)
+        .map(|h| h.hook.clone())
+        .collect();
+    tracing::info!(
+        entry = %stored.entry,
+        stored_hooks = stored.hooks.len(),
+        project_hooks = project.len(),
+        "compose: the project's lifecycle hooks come from the stored spec"
+    );
+    let entry = contribution.entry.get_or_insert_with(|| {
+        Box::new(WireBoxEntry::new(
+            &stored.entry,
+            &stored.box_type,
+            declared_path.clone().into(),
+        ))
+    });
+    entry.lifecycle_hooks = Some(project);
 }
 
 /// Assemble the [`SessionComposer`], `add()` the daemon-side
@@ -864,5 +1022,91 @@ mod tests {
             msg.contains("cache/artifacts"),
             "error should name the offending prefix: {msg}"
         );
+    }
+
+    /// BOX-068: when the client sends an expanded entry, the daemon
+    /// reads no `[session]` table, and each entry package joins the
+    /// closure walk. An entry-only package with `env_state_wiring` then
+    /// contributes its var, as a `[session]` package does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entry_only_package_contributes_its_state_wiring() {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"cargo\"]\n",
+        )
+        .unwrap();
+        let pkg_dir = project.path().join("packages").join("wired");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("build.ncl"),
+            indoc! {"
+                let {build, ..} = import \"minimal.ncl\" in
+                build {
+                    name = \"wired\",
+                    build_deps = [],
+                    cmd = \"\",
+                    attrs.env_state_wiring = [
+                      { env_var = \"WIRED_CACHE\", prefix = \"wired\" },
+                    ],
+                }
+            "},
+        )
+        .unwrap();
+
+        let cache = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+        let declared = paths::HostAbsPath::try_new("/home/dev/myproject").unwrap();
+        let resolution = resolve_project_ctx_and_graph(&daemon, &path)
+            .expect("a project with one local package resolves offline");
+
+        let mut entry =
+            boxes::wire::request::WireBoxEntry::new("check", "task", declared.clone().into());
+        entry.packages = Some(vec!["wired".into()]);
+        let contribution = WireContribution {
+            entry: Some(Box::new(entry)),
+            ..WireContribution::default()
+        };
+        let (project_composable, packages) =
+            build_composables(&path, &declared, &resolution, &contribution, true).unwrap();
+
+        assert!(
+            project_composable.is_none(),
+            "with an entry, the `[session]` table contributes nothing",
+        );
+        let names: Vec<&str> = packages.iter().map(|p| p.package_name()).collect();
+        assert_eq!(names, ["wired"], "the entry package is walked");
+        let env = |_: &str| Err(std::env::VarError::NotPresent);
+        let wired = packages
+            .into_iter()
+            .next()
+            .unwrap()
+            .contribute(&env)
+            .unwrap();
+        let vars: Vec<(&str, &str)> = wired
+            .vars()
+            .iter()
+            .map(|pv| (pv.var().name(), pv.var().value()))
+            .collect();
+        assert_eq!(vars, [("WIRED_CACHE", "/state/wired")]);
+
+        // With no entry, the same project still reads `[session]`.
+        let (project_composable, _) = build_composables(
+            &path,
+            &declared,
+            &resolution,
+            &WireContribution::default(),
+            true,
+        )
+        .unwrap();
+        assert!(project_composable.is_some());
     }
 }

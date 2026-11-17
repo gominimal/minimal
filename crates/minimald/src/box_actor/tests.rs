@@ -391,7 +391,7 @@ async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding(
     let mut channel = client.open_shell(session_id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "expected an attach refusal, got: {refusal:?}"
     );
     assert!(
@@ -2307,7 +2307,7 @@ async fn a_mint_whose_host_dies_before_attach_reports_a_spawn_failure() {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
@@ -2330,7 +2330,7 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
@@ -4840,7 +4840,7 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
     let mut second = client.open_shell(id).await;
     let refusal = collect_to_close(&mut second).await;
     assert!(
-        refusal.contains("Error attaching to session:"),
+        refusal.contains("Cannot attach to the box:"),
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
@@ -4872,7 +4872,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let mut channel = client.open_shell(id).await;
     let refusal = collect_to_close(&mut channel).await;
     assert!(
-        refusal.contains("Error attaching to session:")
+        refusal.contains("Cannot attach to the box:")
             && refusal.contains("the VM host daemon released this session's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
@@ -7757,13 +7757,11 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
         .expect("the daemon walks the range through the forwarder");
     assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
 
-    // The box's table is this test process's network namespace, which every
-    // concurrently running test shares: another test's listener on the any
-    // address inside the range is the box's listener too. The watcher moves
-    // its forwards one port at a time, so such a port can still stand at the
-    // interim when this test's own two have moved. Its move is awaited; this
-    // test's own ports are held to the assertion below at once.
-    let ours = [exposed, listened];
+    // Every row is this test's: the mock box's leader is a host child, so its
+    // table is the host's, but under test the watcher keeps it to the
+    // listeners this test process holds (`box_listening_ports`) — a listener
+    // another process opens inside the range is never the box's, so it is
+    // never published at the interim for the move to leave behind.
     let rows = listed_once(&handle, |rows| {
         rows.exposed
             .iter()
@@ -7772,12 +7770,6 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
                 .listened
                 .iter()
                 .any(|row| row.local == at(handed, listened))
-            && rows
-                .exposed
-                .iter()
-                .chain(&rows.listened)
-                .filter(|row| !ours.contains(&row.internal_port))
-                .all(|row| !row.local.starts_with("127.0.0.1:"))
     })
     .await;
     assert!(
@@ -15100,6 +15092,34 @@ async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_pl
         .expect("a box that was never placed starts a check");
 }
 
+/// gominimal/minimal#1373: the context a box builds keys its task state on
+/// the record's host project, so a run's state survives the next session's
+/// freshly laid-out tree. A context made from the fixture repo carries no
+/// state root until the record keys it.
+#[test]
+fn a_box_context_keys_task_state_on_the_records_project() {
+    let state = tempfile::tempdir().unwrap();
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = mctx::ConfigBuilder::new()
+        .with_state_dir(state.path().to_path_buf())
+        .with_cache_dir(state.path().join("cache"))
+        .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
+        .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+        .with_no_fetch(true)
+        .build()
+        .unwrap();
+    let ctx = mctx::Context::new(config).unwrap();
+    assert_eq!(ctx.state_root(), None, "nothing keys a fresh context");
+
+    let record = build_record(boxes::NetworkMode::OwnIp, None);
+    let keyed = super::setup::keyed_on_project(ctx, &record);
+    assert_eq!(
+        keyed.state_root(),
+        Some(std::path::Path::new("/tmp/project")),
+        "the state root is the record's host project path"
+    );
+}
+
 /// A box record for the NET-155 tests, in `mode` and under `egress`.
 fn build_record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -> boxes::Record {
     boxes::Record {
@@ -15850,11 +15870,16 @@ fn of_container_on_a_pid_the_daemon_did_not_spawn_signals_nothing() {
     shell.wait().expect("reap the stand-in shell");
 }
 
-/// A session spec as a create sends it (BOX-068), with `pty_enabled` as
-/// given and every other setting at its default.
+/// A spec as a create sends it (BOX-068), with `pty_enabled` as given and
+/// every other setting at its default. A spec with no terminal is of the
+/// `task` type, as the `session` root allows only a terminal (BOX-160).
+/// Create it with [`create_task_with_spec`].
 fn resume_spec(pty_enabled: bool) -> serde_json_lenient::Value {
     let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
     spec.pty_enabled = pty_enabled;
+    if !pty_enabled {
+        spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+    }
     serde_json_lenient::to_value(&spec).expect("a spec serializes")
 }
 
@@ -15862,6 +15887,42 @@ fn resume_spec(pty_enabled: bool) -> serde_json_lenient::Value {
 /// carries `spec`, and `name: None` creates an unnamed session.
 async fn create_session_with_spec(
     client: &mut TestClient,
+    name: Option<&str>,
+    project: &str,
+    spec: Option<serde_json_lenient::Value>,
+) -> SessionId {
+    create_box_with_spec(
+        client,
+        minimald_rpc::CreatingVerb::Session,
+        name,
+        project,
+        spec,
+    )
+    .await
+}
+
+/// Creates an `Active` box through the whole create flow under the task
+/// verb, as a `task` spec needs (BOX-160). Its create carries `spec`.
+async fn create_task_with_spec(
+    client: &mut TestClient,
+    name: Option<&str>,
+    project: &str,
+    spec: Option<serde_json_lenient::Value>,
+) -> SessionId {
+    create_box_with_spec(
+        client,
+        minimald_rpc::CreatingVerb::Task,
+        name,
+        project,
+        spec,
+    )
+    .await
+}
+
+/// Creates an `Active` box through the whole create flow under `verb`.
+async fn create_box_with_spec(
+    client: &mut TestClient,
+    verb: minimald_rpc::CreatingVerb,
     name: Option<&str>,
     project: &str,
     spec: Option<serde_json_lenient::Value>,
@@ -15876,6 +15937,7 @@ async fn create_session_with_spec(
     if name.is_none() {
         req.config.name = None;
     }
+    req.config.creating_verb = verb;
     req.spec = spec;
     let id = client.call::<CreateSession>(&req).await.unwrap().id;
     unwrap_ready(
@@ -16397,7 +16459,7 @@ async fn resume_non_pty_box_refuses_keeps_state() {
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = create_session_with_spec(
+    let id = create_task_with_spec(
         &mut client,
         Some("no-pty"),
         "/uwu",
@@ -18010,12 +18072,17 @@ async fn timeout_record_write_failure_refuses_resume_and_stop_keeps_timeout() {
     assert_eq!(exited[0].data["reason"], "timeout");
 }
 
-/// A session spec as a create sends it (BOX-068) for a box that runs until
-/// it is stopped, with `pty_enabled` as given.
+/// A spec as a create sends it (BOX-068) for a box that runs until it is
+/// stopped, with `pty_enabled` as given. A spec with no terminal is of the
+/// `task` type, as the `session` root allows only a terminal (BOX-160).
+/// Create it with [`create_task_with_spec`].
 fn until_stopped_spec(pty_enabled: bool) -> serde_json_lenient::Value {
     let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
     spec.lifetime = mfile::spec::Lifetime::UntilStopped;
     spec.pty_enabled = pty_enabled;
+    if !pty_enabled {
+        spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+    }
     serde_json_lenient::to_value(&spec).expect("a spec serializes")
 }
 
@@ -18233,7 +18300,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     // The name: two running boxes answer to `pair`. A create and a launch
     // refuse a held name, so the first box takes it in its record after
     // both run.
-    let first = create_session_with_spec(
+    let first = create_task_with_spec(
         &mut client,
         Some("pair-first"),
         "/a/x",
@@ -18241,7 +18308,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
     )
     .await;
     launch_host_for(&server, first).await;
-    let holder = create_session_with_spec(
+    let holder = create_task_with_spec(
         &mut client,
         Some("pair"),
         "/b/y",
@@ -18282,7 +18349,7 @@ async fn restart_takes_resume_refusals_before_it_stops_anything() {
 
     // The spec: the box's own name does not trip the name check, and a
     // stored spec this daemon cannot start from is refused with exit 3.
-    let alone = create_session_with_spec(
+    let alone = create_task_with_spec(
         &mut client,
         Some("alone"),
         "/c/alone",
@@ -18341,7 +18408,7 @@ async fn restart_start_failure_leaves_box_stopped_with_its_stop_recorded() {
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = create_session_with_spec(
+    let id = create_task_with_spec(
         &mut client,
         Some("start-fails"),
         "/uwu",

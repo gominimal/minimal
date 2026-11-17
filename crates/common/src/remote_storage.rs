@@ -1289,6 +1289,22 @@ mod placed {
     mod tests {
         use super::*;
 
+        /// A loopback address that refuses every connection for as long as
+        /// the returned socket lives: the socket holds the port bound and
+        /// never listens, so a connect is refused, and no other process on
+        /// the host can bind the port meanwhile. A port probed free and then
+        /// released is not that: a parallel test or any daemon can take it
+        /// and accept the connection the test expects refused.
+        #[cfg(target_os = "linux")]
+        fn refusing_addr() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket
+                .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .unwrap();
+            let addr = socket.local_addr().unwrap();
+            (socket, addr)
+        }
+
         /// Serves `body` to every HTTP request on a loopback port.
         async fn serve_body(body: &'static [u8]) -> std::net::SocketAddr {
             let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1377,11 +1393,7 @@ mod placed {
             assert_eq!(std::fs::read_to_string(&procs).unwrap(), "");
 
             // A destination the placed socket cannot reach names itself.
-            let closed = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let closed_addr = closed.local_addr().unwrap();
-            drop(closed);
+            let (_closed, closed_addr) = refusing_addr();
             let refused = download(
                 &cache,
                 &format!("http://{closed_addr}/other-1.0.tar.gz"),
@@ -1924,11 +1936,7 @@ mod placed {
             let relay_addr = listener.local_addr().unwrap();
             let _serving = AbortOnDrop(tokio::spawn(serve(listener, relay.clone())));
 
-            let closed = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let closed_addr = closed.local_addr().unwrap();
-            drop(closed);
+            let (_closed, closed_addr) = refusing_addr();
             assert_eq!(
                 tunnel_status(relay_addr, closed_addr).await,
                 "HTTP/1.1 502 Bad Gateway"

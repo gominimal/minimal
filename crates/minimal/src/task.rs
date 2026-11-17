@@ -22,7 +22,7 @@ use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
 use tracing::Instrument as _;
 
-use crate::{BoxRunArgs, GlobalArgs, TaskListArgs, TaskRunArgs};
+use crate::{BoxListArgs, BoxRmArgs, BoxRunArgs, BoxStopArgs, GlobalArgs, TaskRunArgs};
 
 /// A task's non-zero exit status, carried as a typed error so `main.rs` can
 /// downcast it and terminate with the task's own code instead of printing an
@@ -90,7 +90,7 @@ fn entrypoint_run_request(task: &str, cwd: &str) -> minimald_rpc::exec::ExecRequ
 /// spec, with the arguments the user typed after the task name appended to
 /// its entrypoint, `min task run <task> <args...>`. `None` for an
 /// interactive task, whose type denies a terminal.
-fn task_box_spec(
+pub(crate) fn task_box_spec(
     task: &str,
     declared: &mfile::Task,
     flags: mfile::spec::SpecFlags,
@@ -161,35 +161,14 @@ fn task_box_network(
             None,
         ),
     };
-    // Where the box's egress came from, for the refusals below: each egress
-    // flag given, and the file's table whenever it declares egress, since
-    // the box would still have egress without the flags.
-    let file_layer = project_egress
-        .layer
-        .as_deref()
-        .filter(|_| file_policy)
-        .map(|layer| format!("{layer} in {}", mfile::MFILE_NAME));
-    if mode == boxes::NetworkMode::NoNet && egress.policy.is_some() {
-        let given = given_egress_flags(flags);
-        let sources = given
-            .iter()
-            .map(|flag| (*flag).to_owned())
-            .chain(file_layer.clone())
-            .collect::<Vec<_>>();
-        let mut remedy = if kind == paths::HostKind::Minvmd {
-            "Run it with --network host_ip".to_owned()
-        } else {
-            "Run it with --network host_ip or --network own_ip".to_owned()
-        };
-        if file_layer.is_none() {
-            remedy.push_str(&format!(", or without {}", and_list(&given)));
-        }
-        bail!(
-            "{refusal}. The box's egress rules come from {sources}. {remedy}.",
-            refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
-            sources = and_list(&sources),
-        );
-    }
+    let own_ip_available = kind != paths::HostKind::Minvmd;
+    refuse_egress_on_none(
+        mode,
+        egress.policy.is_some(),
+        flags,
+        project_egress.layer.as_deref().filter(|_| file_policy),
+        own_ip_available,
+    )?;
     // An own-address box on a VM host registers with the VM host daemon
     // under the name it will have, before its create (T66). A task box is a
     // fresh instance, which the daemon names only at the create, so the
@@ -224,6 +203,93 @@ fn task_box_network(
         hints: project_egress.hints,
         mode_layer,
     })
+}
+
+/// Applies the run's other `[network]` override flags to the box's
+/// network (BCLI-024): `--dynamic-ingress` and `--dynamic-range` set the
+/// ingress policy, `--credentialed-upstream` declares the lane to the
+/// Box Egress Proxy, and `--quic443` sets the stance on UDP to port 443.
+/// Each flag changes only its own key. `--vpn-network-names` is applied to
+/// the spec, by [`crate::add_vpn_network_names`], which refuses it when
+/// the box has no spec.
+///
+/// # Errors
+///
+/// A dynamic ingress flag on a box that is not `own_ip`, as an activation
+/// refuses it.
+pub(crate) fn apply_run_overrides(
+    network: &mut TaskBoxNetwork,
+    other: &crate::BoxOverrideArgs,
+) -> Result<(), anyhow::Error> {
+    crate::refuse_dynamic_ingress_off_own_ip(
+        network.mode,
+        other.dynamic_ingress,
+        other.dynamic_range,
+    )?;
+    if other.dynamic_ingress.is_some() || other.dynamic_range.is_some() {
+        let ingress = network
+            .policy
+            .ingress
+            .get_or_insert_with(boxes::IngressPolicy::default);
+        ingress.dynamic_ingress = other.dynamic_ingress;
+        ingress.dynamic_allowed_range = other.dynamic_range;
+    }
+    // A task entry declares no secret grants on this path, so the flag is
+    // the only source of the declaration, with the default proxy settings.
+    if other.credentialed_upstream && network.policy.credentialed_upstream.is_none() {
+        network.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+    }
+    // `--quic443` replaces the stance, and no flag keeps the declared one.
+    if other.quic443.is_some() {
+        network.policy.quic443 = other.quic443;
+    }
+    Ok(())
+}
+
+/// Refuses egress rules on a `none` box (NET-065), before the daemon and in
+/// the daemon's own words. The refusal names each place the egress came
+/// from: each egress flag given, and `file_layer` in minimal.toml when the
+/// file declares egress, since the box keeps that egress without the flags.
+/// `own_ip_available` says whether the remedy can offer `--network own_ip`.
+/// `min task run`, `min box run` and a session start share it.
+///
+/// # Errors
+///
+/// The refusal, when `mode` is `none` and `has_egress` is true.
+pub(crate) fn refuse_egress_on_none(
+    mode: boxes::NetworkMode,
+    has_egress: bool,
+    flags: &crate::EgressArgs,
+    file_layer: Option<&str>,
+    own_ip_available: bool,
+) -> Result<(), anyhow::Error> {
+    if mode != boxes::NetworkMode::NoNet || !has_egress {
+        return Ok(());
+    }
+    let file_layer = file_layer.map(|layer| format!("{layer} in {}", mfile::MFILE_NAME));
+    let given = given_egress_flags(flags);
+    let sources = given
+        .iter()
+        .map(|flag| (*flag).to_owned())
+        .chain(file_layer.clone())
+        .collect::<Vec<_>>();
+    let mut remedy = if own_ip_available {
+        "Run it with --network host_ip or --network own_ip".to_owned()
+    } else {
+        "Run it with --network host_ip".to_owned()
+    };
+    if file_layer.is_none() {
+        remedy.push_str(&format!(", or without {}", and_list(&given)));
+    }
+    // BCLI-034: a usage error, exit 2.
+    Err(crate::NetworkFlagRefusal {
+        message: format!(
+            "{refusal}. The box's egress rules come from {sources}. {remedy}.",
+            refusal = boxes::PolicyError::EgressRequiresNetwork { mode },
+            sources = and_list(&sources),
+        ),
+    }
+    .into())
 }
 
 /// The egress flags `flags` holds, by name.
@@ -476,6 +542,8 @@ pub(crate) struct RunEntry {
     pub detach: bool,
     pub network: Option<crate::CliNetworkMode>,
     pub egress: crate::EgressArgs,
+    /// The rest of activate's override flags (BCLI-024, BCLI-075, BCLI-076).
+    pub other: crate::BoxOverrideArgs,
     pub args: Vec<String>,
 }
 
@@ -488,6 +556,7 @@ impl From<TaskRunArgs> for RunEntry {
             detach: args.detach,
             network: args.network,
             egress: args.egress,
+            other: args.other,
             args: args.args,
         }
     }
@@ -502,6 +571,7 @@ impl From<BoxRunArgs> for RunEntry {
             detach: args.detach,
             network: args.network,
             egress: args.egress,
+            other: args.other,
             args: args.args,
         }
     }
@@ -553,6 +623,79 @@ pub(crate) async fn detach_run(
     Ok(())
 }
 
+/// `min task run` or `min box run` in a directory with no `minimal.toml`
+/// in it or above it. The run ends with exit 4 (`main.rs`), the
+/// architecture's code for a thing not found.
+#[derive(Debug)]
+pub struct ProjectFileNotFound {
+    /// The refusal, with the command that creates the file.
+    pub message: String,
+}
+
+impl ProjectFileNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for ProjectFileNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProjectFileNotFound {}
+
+/// `min task run` or `min box run` with a task name that the project's
+/// `minimal.toml` does not declare. The run ends with exit 4 (`main.rs`),
+/// the architecture's code for a thing not found.
+#[derive(Debug)]
+pub struct TaskNotFound {
+    /// The refusal, with the tasks the file declares.
+    pub message: String,
+}
+
+impl TaskNotFound {
+    /// The architecture's exit code for a thing not found.
+    pub const EXIT_CODE: u8 = 4;
+}
+
+impl std::fmt::Display for TaskNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TaskNotFound {}
+
+/// `min task run` or `min box run` with a `minimal.toml` that does not
+/// load. The run ends with exit 3 (`main.rs`), the code the architecture
+/// gives an invalid project file, as for `crate::ProjectFileInvalid`.
+#[derive(Debug)]
+pub struct TaskFileInvalid {
+    /// Why the file did not load.
+    pub error: mfile::Error,
+}
+
+impl TaskFileInvalid {
+    /// The architecture's exit code for an invalid project file.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for TaskFileInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cause is in this text and `source()` returns none, so the
+        // printer's `{:#}` shows it once.
+        write!(
+            f,
+            "found a broken {name} while resolving tasks: {error}",
+            name = mfile::MFILE_NAME,
+            error = self.error,
+        )
+    }
+}
+
+impl std::error::Error for TaskFileInvalid {}
+
 /// Look up `task` in the project's `minimal.toml`, walking up from `dir`
 /// like the activate config discovery does, and return its declaration.
 /// Errors name the fix: untrimmed name → the whitespace rejection; no
@@ -561,7 +704,10 @@ pub(crate) async fn detach_run(
 /// The declaration comes back rather than being discarded because the
 /// client needs its `env_vars` to resolve them here — see
 /// [`resolve_task_env`].
-fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyhow::Error> {
+pub(crate) fn declared_task(
+    dir: &camino::Utf8Path,
+    task: &str,
+) -> Result<mfile::Task, anyhow::Error> {
     // Rejected before any lookup: the daemon trims the task name out of the
     // exec command string, so a name with leading/trailing whitespace can
     // never round-trip into the box — even if minimal.toml declares it.
@@ -570,19 +716,30 @@ fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyh
     }
     let file = match mfile::File::from_dir_recursive(dir.as_std_path()) {
         Ok(f) => f,
-        Err(mfile::Error::NotFound) => bail!(
-            "no {name} found at {dir} (or any parent directory); \
-             run `min init` to create one",
-            name = mfile::MFILE_NAME,
-        ),
-        Err(e) => bail!(
-            "found a broken {name} while resolving tasks: {e}",
-            name = mfile::MFILE_NAME,
-        ),
+        // BCLI-034: no project file is a thing not found (exit 4).
+        Err(mfile::Error::NotFound) => {
+            return Err(ProjectFileNotFound {
+                message: format!(
+                    "no {name} found at {dir} (or any parent directory); \
+                     run `min init` to create one",
+                    name = mfile::MFILE_NAME,
+                ),
+            }
+            .into());
+        }
+        // BCLI-078: a project file that does not load exits 3. This path
+        // also serves `min task run`, which starts no box, so the refusal
+        // keeps its own text.
+        Err(error) => return Err(TaskFileInvalid { error }.into()),
     };
     match file.task(task) {
         Some(t) => Ok(t),
-        None => bail!(unknown_task_message(&file, task)),
+        // BCLI-034: a task name the file does not declare is a thing not
+        // found (exit 4). The text is the same as before.
+        None => Err(TaskNotFound {
+            message: unknown_task_message(&file, task),
+        }
+        .into()),
     }
 }
 
@@ -1259,75 +1416,23 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     run_entry(global, args.into()).await.map(drop)
 }
 
-/// `min task list [--all]` (BCLI-015): the task boxes of the current
-/// project, or of every project, in any state. The daemon keeps a task's
-/// record after the task ends, so an exited task stays in the list until
-/// `min box prune` or `min box rm` removes it.
-pub async fn cmd_task_list(global: &GlobalArgs, args: TaskListArgs) -> Result<(), anyhow::Error> {
-    let scope = if args.all {
-        None
-    } else {
-        let cwd = crate::attach::cwd_host_path(global)?;
-        Some(crate::cmd::box_list_scope(cwd.as_ref())?)
-    };
-    crate::cmd::ensure_daemon(global)?;
-    let hosts = crate::cmd::local_hosts(global)?;
-    let mut out = std::io::stdout().lock();
-    let mut err = std::io::stderr().lock();
-    task_list_on_hosts(hosts, scope, &mut out, &mut err).await
+/// `min task list [--all]` (BCLI-015, BCLI-030): `min box list`, with
+/// only the task boxes of the current project, or of every project. The
+/// daemon keeps a task's record after the task ends, so an exited task
+/// stays in the list until `min box prune` or `min box rm` removes it.
+pub async fn cmd_task_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), anyhow::Error> {
+    crate::cmd::cmd_typed_box_list(global, args, boxes::TASK_BOX_TYPE, "task list").await
 }
 
-/// `min task list` over the local `hosts`: the `min box list` listing,
-/// filtered to the task boxes of `project_root`, or of every project when
-/// it is `None`. It prints the same table, state labels and empty-list
-/// lines as `min box list`. A host that does not answer is named on `err`,
-/// and the list goes on without it. The selected host that does not answer
-/// ends the command, as it does for `min box list`.
-pub(crate) async fn task_list_on_hosts(
-    hosts: Vec<crate::cmd::LocalHost>,
-    project_root: Option<paths::HostAbsPath>,
-    out: &mut dyn std::io::Write,
-    err: &mut dyn std::io::Write,
-) -> Result<(), anyhow::Error> {
-    let mut tasks = Vec::new();
-    for host in hosts {
-        let records = match crate::cmd::read_host_boxes(&host).await? {
-            Ok(records) => records,
-            Err(why) if host.selected => {
-                tracing::info!(verb = "task list", outcome = "error", host = %host.host, "{why}");
-                bail!("{why}");
-            }
-            Err(why) => {
-                tracing::info!(
-                    verb = "task list",
-                    outcome = "host unreachable",
-                    host = %host.host,
-                    "{why}"
-                );
-                writeln!(err, "{}", crate::cmd::unreachable_host_line(&host.host))?;
-                continue;
-            }
-        };
-        tasks.extend(
-            records
-                .into_iter()
-                .filter(|entry| entry.box_type.as_deref() == Some(boxes::TASK_BOX_TYPE))
-                .filter(|entry| {
-                    project_root
-                        .as_ref()
-                        .is_none_or(|root| entry.project_root.as_ref() == Some(root))
-                })
-                .map(|record| crate::cmd::ListedBox {
-                    provider: host.provider.to_string(),
-                    host: host.host.clone(),
-                    record,
-                }),
-        );
-    }
-    tracing::info!(verb = "task list", outcome = "ok", tasks = tasks.len());
-    let mut out = out;
-    crate::cmd::render_box_list(&mut out, &tasks, project_root.is_some())?;
-    Ok(())
+/// `min task stop <box>` (BCLI-030): `min box stop`, filtered to task
+/// boxes.
+pub async fn cmd_task_stop(global: &GlobalArgs, args: BoxStopArgs) -> Result<(), anyhow::Error> {
+    crate::cmd::cmd_typed_box_stop(global, args, boxes::TASK_BOX_TYPE, "task stop").await
+}
+
+/// `min task rm <box>` (BCLI-030): `min box rm`, filtered to task boxes.
+pub async fn cmd_task_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyhow::Error> {
+    crate::cmd::cmd_typed_box_rm(global, args, boxes::TASK_BOX_TYPE, "task rm").await
 }
 
 /// `min box run <entry>`: the run of [`cmd_task_run`], from an entry the
@@ -1391,6 +1496,8 @@ pub(crate) async fn run_entry(
         &args.egress,
         crate::daemon_host_kind(global),
     )?;
+    let mut box_network = box_network;
+    apply_run_overrides(&mut box_network, &args.other)?;
     // A legacy key spelling still loads, with its hint. This command prints
     // its own lines on stderr, and runs no shell for them to precede.
     for hint in &box_network.hints {
@@ -1426,9 +1533,9 @@ pub(crate) async fn run_entry(
 
     crate::ensure_daemon(global)?;
 
-    // Same default as an activate with no flags, matching the loadout
-    // handling below: `min task run` has no `--no-hooks` of its own, so its
-    // hooks behave like any other session's. The constructor turns them on.
+    // The constructor turns hooks on. `--no-hooks` turns them off, as on
+    // an activation (BCLI-076): the stored spec and the expanded entry then
+    // carry no hook.
     //
     // BCLI-070, BOX-163: every run is a fresh instance. The daemon names the
     // box `<task>-<n>` from the spec's entry, with the smallest `n` no
@@ -1440,6 +1547,7 @@ pub(crate) async fn run_entry(
         box_network.policy,
     );
     crate::request_fresh_instance(&mut request);
+    request.config.hooks_enabled = !args.other.no_hooks;
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
     request.must_match_version = minimal_client::version_assertion();
@@ -1473,30 +1581,28 @@ pub(crate) async fn run_entry(
         // cleaned as the daemon cleans a spec's entry.
         request.config.name = Some(interactive_task_box_name(&args.entry));
     }
+    // With no spec, a `--vpn-network-names` value has no place to go, so
+    // the helper refuses it rather than drop it.
+    crate::add_vpn_network_names(&mut request, &args.other.vpn_network_names)?;
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
     let upload_root = crate::resolve_upload_root(&utf8_path)?;
     crate::stamp_project_root(&mut request, &upload_root)?;
 
-    // Loadouts and user policy: the same defaults as an activate with no
-    // loadout flags — the config's `default_loadouts` apply. Resolved before
-    // the daemon connection so a broken loadout fails loudly client-side, and
-    // through the same shared helper an activate uses so the staged hook
-    // scripts and the finalize budget match. The helper gets the resolved
-    // project root, not the directory `min task run` was invoked from, so a
-    // task started in a subdirectory still finds the project's config.
-    //
-    // `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
-    // reach the daemon inside the uploaded mfile, and this command never
-    // refused a project whose hook script the staging check rejects.
-    let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
-    let inputs = crate::loadouts::prepare_activation_inputs(
+    // Loadouts and user policy, resolved before the daemon connection so a
+    // broken loadout fails loudly client-side, and through the same shared
+    // helper an activate uses so the staged hook scripts and the finalize
+    // budget match. The helper gets the resolved project root, not the
+    // directory `min task run` was invoked from, so a task started in a
+    // subdirectory still finds the project's config.
+    let inputs = task_activation_inputs(
         global,
         &upload_root,
-        selection,
-        crate::loadouts::HookPrep::StageOnly,
-        Some(amended_policy),
+        &args.entry,
+        args.other.no_loadouts,
+        args.other.no_hooks,
+        amended_policy,
     )?;
     inputs.announce_loadouts();
 
@@ -1504,8 +1610,17 @@ pub(crate) async fn run_entry(
     let compose_options = inputs.compose_options;
     let hook_scripts = inputs.hook_scripts;
     let finalize_hook_budget = inputs.hook_budget;
-    let contribution = inputs.contribution;
+    let mut contribution = inputs.contribution;
     let user_policy = inputs.user_policy;
+    // BOX-068: the task's expanded entry rides on the contribution, and the
+    // daemon composes the project's part of the box from it. One span
+    // covers the expansion and the compose call that sends it.
+    let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
+    contribution.entry = entry_span
+        .in_scope(|| {
+            crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
+        })?
+        .map(Box::new);
     // Sent only for a task that declares `inherit_cwd`; any other task
     // starts at the root of the uploaded tree.
     let task_cwd = if declared.inherit_cwd {
@@ -1556,7 +1671,7 @@ pub(crate) async fn run_entry(
     // before it runs anything (NET-085), or the host gate drops
     // every frame it sends outside the VM. The guard retires it on an early
     // return; the run's end retires it through `release_task_name_hold`.
-    let mut host_ip_residency = crate::HostIpResidency::admit(
+    let mut host_ip_residency = crate::HostIpResidency::admit_declaring(
         crate::vm_host_control_sock(
             crate::daemon_host_kind(global),
             global.minimal_dir.as_deref(),
@@ -1564,6 +1679,7 @@ pub(crate) async fn run_entry(
         id,
         request.config.network,
         request.config.policy.egress.as_ref(),
+        request.config.policy.credentialed_upstream.is_some(),
     )
     .await;
     // The daemon named the box `<task>-<n>`. A box whose name cannot be read
@@ -1593,7 +1709,12 @@ pub(crate) async fn run_entry(
         &utf8_path,
         &upload_root,
         decision,
-        crate::DroppedHooksPolicy::Warn,
+        // `--no-hooks` already turned the hooks off, so a skip drops none.
+        if args.other.no_hooks {
+            crate::DroppedHooksPolicy::Ignore
+        } else {
+            crate::DroppedHooksPolicy::Warn
+        },
     )
     .await?;
 
@@ -1607,6 +1728,7 @@ pub(crate) async fn run_entry(
             session_id: id,
             contribution,
         })
+        .instrument(entry_span)
         .await
         .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error))?;
     let configured = match configured {
@@ -1753,7 +1875,7 @@ pub(crate) async fn run_entry(
         let (outcome, end, timed_out) = async {
             match open_task_box_run(&mut client, id, &args.entry, &task_cwd, &task_env).await {
                 Ok(channel) => {
-                    let outcome = bridge_exec(channel).await;
+                    let mut outcome = bridge_exec(channel).await;
                     run_guard.yield_to_handler().await;
                     let mut end = TaskBoxEnd::Keep;
                     let mut timed_out = false;
@@ -1768,6 +1890,23 @@ pub(crate) async fn run_entry(
                                 for line in kept_box_lines(why, &session_name) {
                                     eprintln!("{line}");
                                 }
+                                // BOX-185: an attached run copies the box's
+                                // declared exports once the box ended. A
+                                // `--detach` run returned above and copies
+                                // nothing (BOX-186). The copy goes to the
+                                // project root on the record, not to the
+                                // folder the command ran in.
+                                let outcomes = copy_ended_task_box_exports(
+                                    &mut client,
+                                    id,
+                                    &session_name,
+                                    &upload_root,
+                                    &mut std::io::stderr(),
+                                )
+                                .await;
+                                // BOX-193, BOX-194: a skipped export turns
+                                // a 0 end into 125, and leaves other codes.
+                                outcome = Ok(exit_after_exports(exit, timed_out, &outcomes));
                             }
                             TaskBoxEnd::Remove => {
                                 tracing::info!(
@@ -1943,6 +2082,59 @@ pub fn run_outcome(exit: Option<u32>, timed_out: bool, entry: &str) -> Result<()
     exit_outcome(exit)
 }
 
+/// The exit status of an attached task run once it copied its box's
+/// exports: `exit`, the status the run bridged, unless the entrypoint
+/// exited 0 and an export was skipped. Then it is 125 (BOX-193). A run
+/// that its box's timeout ended keeps its status, so the command still
+/// exits 124, and so does any other end (BOX-194).
+pub(crate) fn exit_after_exports(
+    exit: Option<u32>,
+    timed_out: bool,
+    outcomes: &[crate::cmd::ExportOutcome],
+) -> Option<u32> {
+    match exit {
+        Some(0) => {
+            let code = crate::cmd::exit_code_after_exports(0, !timed_out, outcomes);
+            Some(u32::try_from(code).unwrap_or(0))
+        }
+        other => other,
+    }
+}
+
+/// Copies the declared exports of the task box `id` after an attached
+/// run, to `upload_root`: the project root that `stamp_project_root` put
+/// on the create request, so the record's project root (BOX-185). A run
+/// that starts in a folder below the project root copies to the root too.
+/// A run with no exit status lost its connection, and the box can still
+/// run, so the copy happens only when the record shows that the box ended.
+///
+/// The run sets its exit status from the outcomes with
+/// [`exit_after_exports`]. Interim: no `file_exported` event records them
+/// (BOX-195, gominimal/minimal#3446). This changes when that requirement
+/// lands: the outcomes become the report.
+pub(crate) async fn copy_ended_task_box_exports<E: std::io::Write>(
+    client: &mut crate::client::Client,
+    id: boxes::SessionId,
+    label: &str,
+    upload_root: &camino::Utf8Path,
+    err: &mut E,
+) -> Vec<crate::cmd::ExportOutcome> {
+    use boxes::core::record::RecordState;
+    let box_ended = matches!(
+        record_state(client, id).await,
+        Some(RecordState::Stopped(_) | RecordState::Exited(_))
+    );
+    if !box_ended {
+        tracing::info!(
+            box_id = %id,
+            "file exports: the task box has not ended; nothing was copied"
+        );
+        return Vec::new();
+    }
+    let root = upload_root.as_std_path();
+    crate::cmd::copy_box_exports(client, id, label, Some(root), Some(root), err).await
+}
+
 /// The state of the box's record, or `None` when the daemon cannot read it.
 async fn record_state(
     client: &mut crate::client::Client,
@@ -2027,6 +2219,40 @@ pub(crate) async fn release_task_name_hold(
     name: &str,
 ) {
     crate::release_held_box_name(control_sock, id, Some(name), None).await;
+}
+
+/// The loadouts and user policy of the box `min task run` creates for task
+/// `entry` in the project at `project`. The config's `default_loadouts`
+/// apply, unless `--no-loadouts` (`no_loadouts`) selects none (BCLI-075).
+/// `--no-hooks` (`no_hooks`) disables every hook.
+///
+/// BOX-175: the task's loadout mode is read first, before any loadout
+/// file. A sealed task, the task type's default, selects none. So a broken
+/// default loadout cannot fail it, and nothing prints about the skipped
+/// defaults (BOX-171).
+///
+/// `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
+/// reach the daemon inside the uploaded mfile, and this command never
+/// refused a project whose hook script the staging check rejects.
+pub(crate) fn task_activation_inputs(
+    global: &crate::GlobalArgs,
+    project: &camino::Utf8Path,
+    entry: &str,
+    no_loadouts: bool,
+    no_hooks: bool,
+    policy: boxes::core::policy::UserPolicy,
+) -> anyhow::Result<crate::loadouts::ActivationInputs> {
+    let mode = crate::task_loadout_mode(project, entry)?;
+    let selection = crate::loadouts::gate_selection(
+        crate::loadouts::LoadoutSelection::from_flags(&[], no_loadouts),
+        mode,
+    );
+    let hook_prep = if no_hooks {
+        crate::loadouts::HookPrep::Disabled
+    } else {
+        crate::loadouts::HookPrep::StageOnly
+    };
+    crate::loadouts::prepare_activation_inputs(global, project, selection, hook_prep, Some(policy))
 }
 
 #[cfg(test)]
@@ -2813,6 +3039,7 @@ mod tests {
             path: None,
             network: None,
             egress: crate::EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
             detach: false,
             args: vec![],
         };
@@ -2862,6 +3089,7 @@ mod tests {
             path: None,
             network: None,
             egress: crate::EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
             detach: false,
             args: vec![],
         };
@@ -3097,6 +3325,7 @@ mod tests {
             path: None,
             network: None,
             egress: crate::EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
             detach: false,
             args: vec![],
         };

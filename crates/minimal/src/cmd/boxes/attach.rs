@@ -78,29 +78,16 @@ pub(crate) async fn resolve_named_box_version_gated(
     }
 }
 
-/// [`resolve_named_box_version_gated`] for `min session attach`: the attach
-/// target, announced as one.
-pub(crate) async fn resolve_attach_target_version_gated(
-    global: &GlobalArgs,
-    client: &mut client::Client,
-    sock: std::path::PathBuf,
-    name: &str,
-) -> Result<(boxes::Record, std::path::PathBuf), anyhow::Error> {
-    let example = format!("session attach {name}");
-    resolve_named_box_version_gated(global, client, sock, name, "Attaching to", &example).await
-}
-
 /// Resolve a session to attach to when the user supplied no explicit session
 /// reference. Matches an already-fetched session list against the current
 /// working directory, and either attaches directly (unambiguous), opens the
 /// interactive picker (ambiguous), or errors (ambiguous but non-interactive).
 ///
-/// Takes the list rather than fetching it so its two callers can assert the
+/// Takes the list rather than fetching it so its caller can assert the
 /// daemon's build off the `ListSessions` reply — before the picker blocks on a
 /// human, not after.
 ///
-/// Returns [`SmartAttach::NoSessions`] when no sessions exist at all, which
-/// `min session attach` reports as an error pointing at `min session activate`.
+/// Returns [`SmartAttach::NoSessions`] when no sessions exist at all.
 pub(crate) fn resolve_smart_attach(
     sessions: &[minimald_rpc::ListSessionsEntry],
     global: &GlobalArgs,
@@ -146,36 +133,6 @@ pub(crate) enum SmartAttach {
     NoSessions,
 }
 
-/// The picker's `+ Create a new session` arm: activate a fresh session for the
-/// cwd and attach. A thin wrapper over [`cmd_activate`] with an autogen name
-/// and default sync, so the create-then-attach path stays the one that
-/// `min session activate --attach .` runs.
-pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    // `Box::pin` breaks the async recursion cycle: `cmd_activate` chains into
-    // `cmd_attach` (on `--attach`), which reaches back here — an unboxed cycle
-    // is an infinitely sized future (E0733).
-    Box::pin(cmd_activate(
-        global,
-        ActivateArgs {
-            name: None,
-            path: None,
-            sync: None,
-            network: CliNetworkMode::HostNet,
-            ingress: Vec::new(),
-            dynamic_ingress: None,
-            dynamic_range: None,
-            egress: crate::EgressArgs::default(),
-            credentialed_upstream: false,
-            loadout: Vec::new(),
-            no_loadouts: false,
-            no_hooks: false,
-            no_prompt: false,
-            attach: true,
-        },
-    ))
-    .await
-}
-
 /// Guard for the interactive attach path: the PTY-backed session shell must be
 /// driven from a real terminal. When stdin is not a TTY there is nothing to
 /// drive the remote shell and no EOF ever reaches it through the forced `-tt`
@@ -203,8 +160,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 ///
 /// The interactive path (no `wire`) negotiates the configurable session
 /// keys from `config_dir` so the daemon adopts the user's detach/forward
-/// chord for that channel; the exec path (`wire` set) has no detach
-/// and sends none.
+/// chord for that channel. The exec path (`wire` set) sends no keys.
 ///
 /// `host_asks_for` names the box whose pending asks the interactive attach
 /// answers on a VM-backed host (NET-045): the attach subscribes on the VM
@@ -252,8 +208,8 @@ async fn box_via_ssh_with(
 ) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow. The interactive path resolves the
-    // session-key config from `config_dir` and forwards it per channel; the
-    // exec path has no detach and passes `None`.
+    // session-key config from `config_dir` and forwards it per channel. The
+    // `wire` path sends no session keys.
     let session_keys = if wire.is_none() {
         Some(minimal_client::attach::resolve_session_keys(config_dir)?)
     } else {
@@ -604,6 +560,46 @@ pub enum BoxAttachRefusal {
     },
     /// With no box named, no box of the project has a terminal. Exit 4.
     NoCandidate,
+    /// The named box is stopped or exited and has no terminal, so it
+    /// cannot resume. Exit 2.
+    NoTerminalToResume {
+        /// The box as the caller named it.
+        address: String,
+        /// Whether the box's spec sets `lifetime = "until_stopped"`, so
+        /// `min box restart` starts it again. Else `min box run` does.
+        until_stopped: bool,
+    },
+    /// `min box resume` named a box that is not stopped or exited. Exit 2.
+    NotResumable {
+        /// The box as the caller named it.
+        address: String,
+        /// The box's state.
+        state: String,
+        /// Whether the box has a terminal, so `min box attach` can attach
+        /// a running box. Else `min box logs` shows its output.
+        pty_enabled: bool,
+    },
+    /// A running box on the same host holds the name of the stopped or
+    /// exited box to resume. Exit 2.
+    NameHeld {
+        /// The box as the caller named it.
+        address: String,
+        /// The name both boxes have.
+        name: String,
+        /// The id of the running box that holds the name.
+        holder: boxes::SessionId,
+        /// The id of the box to resume.
+        box_id: boxes::SessionId,
+    },
+    /// With no session named, more than one of the project's session boxes
+    /// can be attached. Exit 2.
+    AmbiguousSessions {
+        /// Each session box that can be attached.
+        candidates: Vec<AddressCandidate>,
+    },
+    /// With no session named, no session box of the project has a
+    /// terminal. Exit 4.
+    NoSessionCandidate,
     /// With no box named, a host did not answer the lookup. Exit 7.
     Unreachable {
         /// Each host that did not answer.
@@ -648,8 +644,15 @@ impl BoxAttachRefusal {
             Self::NoTerminal
             | Self::NoTerminalInBox { .. }
             | Self::NoTerminalInExec { .. }
-            | Self::Ambiguous { .. } => 2,
-            Self::NoCandidate | Self::NoSuchExec { .. } | Self::ExecEnded { .. } => 4,
+            | Self::NoTerminalToResume { .. }
+            | Self::NotResumable { .. }
+            | Self::NameHeld { .. }
+            | Self::Ambiguous { .. }
+            | Self::AmbiguousSessions { .. } => 2,
+            Self::NoCandidate
+            | Self::NoSessionCandidate
+            | Self::NoSuchExec { .. }
+            | Self::ExecEnded { .. } => 4,
             Self::Unreachable { .. } | Self::ConnectionLost { .. } => 7,
         }
     }
@@ -659,8 +662,11 @@ impl BoxAttachRefusal {
         match self {
             Self::NoTerminal => "no client terminal",
             Self::NoTerminalInBox { .. } => "box has no terminal",
-            Self::Ambiguous { .. } => "ambiguous",
-            Self::NoCandidate => "no candidate",
+            Self::NoTerminalToResume { .. } => "box has no terminal to resume",
+            Self::NotResumable { .. } => "box not stopped",
+            Self::NameHeld { .. } => "name held by a running box",
+            Self::Ambiguous { .. } | Self::AmbiguousSessions { .. } => "ambiguous",
+            Self::NoCandidate | Self::NoSessionCandidate => "no candidate",
             Self::NoSuchExec { .. } => "exec not found",
             Self::ExecEnded { .. } => "exec ended",
             Self::NoTerminalInExec { .. } => "exec has no terminal",
@@ -684,24 +690,77 @@ impl std::fmt::Display for BoxAttachRefusal {
             ),
             Self::Ambiguous { candidates } => {
                 writeln!(f, "More than one box in this project has a terminal:")?;
-                for c in candidates {
-                    let name = if c.name.is_empty() {
-                        c.box_id.to_string()
-                    } else {
-                        c.name.clone()
-                    };
-                    writeln!(
-                        f,
-                        "  {}/{}/{}  {}  {}",
-                        c.provider, c.host, name, c.state, c.box_id
-                    )?;
-                }
+                write_candidates(f, candidates)?;
                 write!(f, "Name one with `min box attach <box>`.")
+            }
+            Self::AmbiguousSessions { candidates } => {
+                writeln!(
+                    f,
+                    "More than one session box in this project has a terminal:"
+                )?;
+                write_candidates(f, candidates)?;
+                write!(f, "Name one with `min session attach <box>`.")
             }
             Self::NoCandidate => write!(
                 f,
                 "No box with a terminal in this project. Start one with min box start."
             ),
+            Self::NoSessionCandidate => write!(
+                f,
+                "No session box with a terminal in this project. \
+                 Start one with min session start."
+            ),
+            // BCLI-009: the exact wording the plan task fixes.
+            Self::NoTerminalToResume {
+                address,
+                until_stopped,
+            } => {
+                writeln!(f, "{address} has no terminal to resume.")?;
+                if *until_stopped {
+                    write!(f, "Restart it with min box restart {address}.")
+                } else {
+                    write!(f, "Run it again with min box run <entry>.")
+                }
+            }
+            Self::NotResumable {
+                address,
+                state,
+                pty_enabled,
+            } => {
+                writeln!(f, "Cannot resume {address}: the box is {state}.")?;
+                if state == "running" && *pty_enabled {
+                    write!(f, "Attach to it with min box attach {address}.")
+                } else if state == "running" {
+                    // The same next step as `NoTerminalInBox`: an attach
+                    // to a running box with no terminal is refused.
+                    write!(f, "Run min box logs {address} to see its output.")
+                } else {
+                    write!(f, "Only a stopped or exited box can resume.")
+                }
+            }
+            // BCLI-007: names the running box, and the renames that free
+            // the name.
+            Self::NameHeld {
+                address,
+                name,
+                holder,
+                box_id,
+            } => {
+                writeln!(
+                    f,
+                    "Cannot resume {address}: the running box {holder} has the name {name}."
+                )?;
+                writeln!(
+                    f,
+                    "Rename the running box with min box rename {holder} <new-name>, \
+                     or rename this box with min box rename {box_id} <new-name>."
+                )?;
+                writeln!(f, "Then resume this box with min box resume {box_id}.")?;
+                write!(
+                    f,
+                    "A resume is also refused when another box holds a volume that this box declares."
+                )
+            }
             // BCLI-068: the exact wording the plan task fixes.
             Self::NoSuchExec { address, exec_id } => {
                 write!(f, "{address} has no exec {exec_id}.")
@@ -741,6 +800,73 @@ impl std::fmt::Display for BoxAttachRefusal {
 }
 
 impl std::error::Error for BoxAttachRefusal {}
+
+/// One line for each candidate of an ambiguous bare attach.
+fn write_candidates(
+    f: &mut std::fmt::Formatter<'_>,
+    candidates: &[AddressCandidate],
+) -> std::fmt::Result {
+    for c in candidates {
+        let name = if c.name.is_empty() {
+            c.box_id.to_string()
+        } else {
+            c.name.clone()
+        };
+        writeln!(
+            f,
+            "  {}/{}/{}  {}  {}",
+            c.provider, c.host, name, c.state, c.box_id
+        )?;
+    }
+    Ok(())
+}
+
+/// The verb that attaches: `min box attach`, `min box resume`, or
+/// `min session attach`, which sees only boxes of type session (BCLI-032).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachVerb {
+    /// `min box attach`.
+    BoxAttach,
+    /// `min box resume`.
+    BoxResume,
+    /// `min session attach`.
+    SessionAttach,
+}
+
+impl AttachVerb {
+    /// The verb as the tracing events record it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::BoxAttach => "box attach",
+            Self::BoxResume => "box resume",
+            Self::SessionAttach => "session attach",
+        }
+    }
+
+    /// The only Box Type the verb sees, or `None` for every type.
+    fn box_type(self) -> Option<&'static str> {
+        match self {
+            Self::SessionAttach => Some(boxes::SESSION_BOX_TYPE),
+            Self::BoxAttach | Self::BoxResume => None,
+        }
+    }
+
+    /// `listing` with the boxes this verb does not see dropped.
+    fn visible(self, listing: &HostListing) -> HostListing {
+        let Some(box_type) = self.box_type() else {
+            return listing.clone();
+        };
+        HostListing {
+            host: listing.host.clone(),
+            boxes: listing.boxes.clone().map(|boxes| {
+                boxes
+                    .into_iter()
+                    .filter(|entry| entry.box_type.as_deref() == Some(box_type))
+                    .collect()
+            }),
+        }
+    }
+}
 
 /// The box `min box attach` attaches to, and the host that keeps it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -813,7 +939,14 @@ pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<
             exec_id,
             stdin_is_tty,
             async |target: &BoxAttachTarget, exec_id: &minimald_rpc::exec::ExecId| {
-                attach_exec_by_id(kind, &target.host.sock, target.box_id, exec_id).await
+                attach_exec_by_id(
+                    kind,
+                    &target.host.sock,
+                    target.box_id,
+                    exec_id,
+                    global.config_dir.as_deref(),
+                )
+                .await
             },
         )
         .await?;
@@ -822,20 +955,63 @@ pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<
         }
         return Err(Handoff::Exit(ending.code).into());
     }
-    let scope = match args.target {
+    attach_command(global, AttachVerb::BoxAttach, args.target.as_deref()).await
+}
+
+/// `min box resume <box>`: attaches this terminal to the box, which
+/// resumes a stopped or exited box that has a terminal (BCLI-007). A box
+/// in any other state is refused.
+pub async fn cmd_box_resume(global: &GlobalArgs, args: BoxResumeArgs) -> Result<(), anyhow::Error> {
+    attach_command(global, AttachVerb::BoxResume, Some(&args.target)).await
+}
+
+/// `min session attach [<box>]`: `min box attach` that sees only boxes of
+/// type session (BCLI-032).
+pub async fn cmd_session_attach(
+    global: &GlobalArgs,
+    target: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    attach_command(global, AttachVerb::SessionAttach, target).await
+}
+
+/// The attach of `verb` to the box `target` names, else to the current
+/// project's box with a terminal. A stopped or exited box resumes.
+async fn attach_command(
+    global: &GlobalArgs,
+    verb: AttachVerb,
+    target: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    ensure_box_attach_tty(stdin_is_tty)?;
+    let scope = match target {
         Some(_) => None,
         None => {
             let cwd = crate::attach::cwd_host_path(global)?;
             Some(box_list_scope(cwd.as_ref())?)
         }
     };
+    // The command's own project root: exports are copied only when it is
+    // the box's (BOX-199). With none, nothing is copied.
+    let here = match &scope {
+        Some(scope) => Some(scope.clone()),
+        None => crate::attach::cwd_host_path(global)
+            .and_then(|cwd| box_list_scope(cwd.as_ref()))
+            .inspect_err(|e| tracing::info!("attach: no project root here: {e:#}"))
+            .ok(),
+    };
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
+    let hosts = match target {
+        Some(address) => named_attach_hosts(global, hosts, verb, address).await?,
+        None => hosts,
+    };
     let kind = daemon_host_kind(global);
-    let ending = box_attach_on_hosts(
+    let ending = attach_on_hosts(
+        verb,
         hosts,
-        args.target.as_deref(),
+        target,
         scope.as_ref(),
+        here.as_ref(),
         stdin_is_tty,
         async |target: &BoxAttachTarget| {
             let host_asks = host_asks_box(global, target.name.as_deref());
@@ -857,6 +1033,82 @@ pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<
         eprintln!("{notice}");
     }
     Err(Handoff::Exit(ending.code).into())
+}
+
+/// The hosts a named attach of `verb` looks on (NET-058). For a name or an
+/// id with no `--vm`, the selected VM's daemon is asked first, and its
+/// answer is gated on the daemon's build. A name that a second VM also
+/// holds is refused as ambiguous. When the selected VM does not know the
+/// name, [`crate::attach::resolve_box_vm`] finds the VM that owns it. The
+/// process then acts on that VM, as `--vm` makes it, and the attach
+/// announces the VM. A box only a stopped VM holds is refused with the
+/// command that starts that VM. The attach then looks only on the host
+/// that holds the box. When no VM knows the name, every host stays, and
+/// [`attach_target`] refuses the address. A `provider/host/name` address
+/// names its host, so it keeps every host.
+pub(crate) async fn named_attach_hosts(
+    global: &GlobalArgs,
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    verb: AttachVerb,
+    address: &str,
+) -> Result<Vec<crate::cmd::list::LocalHost>, anyhow::Error> {
+    let BoxAddress::Unqualified(name) = parse_box_address(address) else {
+        return Ok(hosts);
+    };
+    if global.vm.is_some() {
+        return Ok(hosts);
+    }
+    let Some(selected) = hosts.iter().find(|h| h.selected).cloned() else {
+        return Ok(hosts);
+    };
+    let mut client = client::Client::connect(&selected.sock)
+        .await
+        .context("Failed to connect to minimald")?;
+    let sock = match resolve_session_version_gated(&mut client, name).await {
+        Ok(record) => {
+            // A second VM that holds the name makes it ambiguous.
+            ensure_selected_holds_box_alone(global, name, &record).await?;
+            selected.sock
+        }
+        Err(missed) => match crate::attach::resolve_box_vm(global, name).await? {
+            Some(resolved) => {
+                // From here the process acts on the owning VM, as `--vm`
+                // makes it. A second set is a no-op.
+                let _ = client::set_vm_name(&resolved.vm);
+                tracing::info!(
+                    verb = verb.name(),
+                    box_id = %resolved.record.id,
+                    vm = %resolved.vm,
+                    outcome = "resolved on another VM"
+                );
+                // The user did not choose the VM, so say which one it is.
+                if should_announce_box(global) {
+                    let noun = match verb {
+                        AttachVerb::SessionAttach => "session",
+                        AttachVerb::BoxAttach | AttachVerb::BoxResume => "box",
+                    };
+                    eprintln!(
+                        "Attaching to {noun} {} on VM {}",
+                        box_announce_label(&resolved.record.id, resolved.record.name.as_deref()),
+                        resolved.vm
+                    );
+                }
+                resolved.sock
+            }
+            // No VM knows the name: the address refusal of every host is
+            // the answer.
+            None if missed.downcast_ref::<crate::cmd::BoxNotFound>().is_some() => {
+                return Ok(hosts);
+            }
+            // The selected daemon's own failure, such as a version skew.
+            None => return Err(missed),
+        },
+    };
+    if hosts.iter().any(|h| h.sock == sock) {
+        Ok(hosts.into_iter().filter(|h| h.sock == sock).collect())
+    } else {
+        Ok(hosts)
+    }
 }
 
 /// What the box's records say of an exec id that `min box attach --exec`
@@ -1116,14 +1368,62 @@ pub(crate) fn exec_attach_ending(
     }
 }
 
+/// The `ssh -tt` command that attaches this terminal to the terminal exec
+/// `exec_id` in box `id` on the daemon at `sock`. It sends the session keys
+/// from `config_dir`, as the box attach does, so the detach keys end the
+/// attach and leave the exec running (BCLI-068).
+///
+/// # Errors
+///
+/// When the session-key config is not valid, or ssh's command cannot be
+/// built ([`minimal_client::attach::attach_command`]).
+pub(crate) fn exec_attach_ssh(
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    exec_id: &minimald_rpc::exec::ExecId,
+    config_dir: Option<&std::path::Path>,
+) -> Result<std::process::Command, anyhow::Error> {
+    let session_keys = minimal_client::attach::resolve_session_keys(config_dir)?;
+    exec_attach_ssh_with_keys(sock, id, exec_id, &session_keys)
+}
+
+/// [`exec_attach_ssh`] with the session keys already resolved. `min box
+/// exec -t` resolves them before it starts the exec, so a session-key
+/// config that is not valid never leaves an exec without its attach.
+///
+/// # Errors
+///
+/// When ssh's command cannot be built
+/// ([`minimal_client::attach::attach_command`]).
+pub(crate) fn exec_attach_ssh_with_keys(
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    exec_id: &minimald_rpc::exec::ExecId,
+    session_keys: &boxes::keys::SessionKeys,
+) -> Result<std::process::Command, anyhow::Error> {
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    let ssh = minimal_client::attach::attach_command(sock, id, Some(&wire), Some(session_keys))?;
+    // `-tt` before the other arguments, so ssh asks for a terminal.
+    let mut forced = std::process::Command::new(ssh.get_program());
+    forced.arg("-tt").args(ssh.get_args());
+    for (name, value) in ssh.get_envs() {
+        match value {
+            Some(value) => forced.env(name, value),
+            None => forced.env_remove(name),
+        };
+    }
+    Ok(forced)
+}
+
 /// Connects this terminal to the terminal exec `exec_id` in box `id` on
-/// the daemon at `sock`, through `ssh -tt`, as `min box exec -t` does after
-/// it starts one. Returns ssh's exit status, which is the exec's.
+/// the daemon at `sock`, through [`exec_attach_ssh`]. Returns ssh's exit
+/// status: the exec's, or 0 after a detach.
 async fn attach_exec_by_id(
     kind: paths::HostKind,
     sock: &std::path::Path,
     id: boxes::SessionId,
     exec_id: &minimald_rpc::exec::ExecId,
+    config_dir: Option<&std::path::Path>,
 ) -> Result<i32, anyhow::Error> {
     // A VM-backed box gets its row and its name hold back first, as
     // `min box exec` does.
@@ -1139,17 +1439,7 @@ async fn attach_exec_by_id(
     resume_box_row(sock, record.as_ref()).await?;
     rehold_held_name_before_attach(kind, sock, id, record.as_ref()).await;
 
-    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
-    let ssh = minimal_client::attach::attach_command(sock, id, Some(&wire), None)?;
-    // `-tt` before the other arguments, so ssh asks for a terminal.
-    let mut forced = std::process::Command::new(ssh.get_program());
-    forced.arg("-tt").args(ssh.get_args());
-    for (name, value) in ssh.get_envs() {
-        match value {
-            Some(value) => forced.env(name, value),
-            None => forced.env_remove(name),
-        };
-    }
+    let forced = exec_attach_ssh(sock, id, exec_id, config_dir)?;
     tokio::task::spawn_blocking(move || {
         interactive_attach(forced, true, crate::attach::TerminalUnwind::arm, |ssh| {
             let real = minimal_client::tty_relay::RealTty::acquire()
@@ -1173,30 +1463,34 @@ pub(crate) fn ssh_exit_code(attached: Result<(), anyhow::Error>) -> Result<i32, 
     }
 }
 
-/// `min box attach` over the local `hosts`: refuses a caller with no
-/// terminal, finds the box ([`box_attach_target`]), runs `attach` on it,
-/// and reads how the attach ended ([`attach_ending`]). `scope` is the
-/// current project's root, which the bare form reads.
-pub(crate) async fn box_attach_on_hosts<A>(
+/// An attach of `verb` over the local `hosts`: `min box attach`,
+/// `min box resume` or `min session attach`. It refuses a caller with no
+/// terminal, finds the box ([`attach_target`]), runs `attach` on it, and
+/// reads how the attach ended ([`attach_ending`]). `scope` is the current
+/// project's root, which the bare form reads.
+pub(crate) async fn attach_on_hosts<A>(
+    verb: AttachVerb,
     hosts: Vec<crate::cmd::list::LocalHost>,
     address: Option<&str>,
     scope: Option<&paths::HostAbsPath>,
+    here: Option<&paths::HostAbsPath>,
     stdin_is_tty: bool,
     attach: A,
 ) -> Result<AttachEnding, anyhow::Error>
 where
     A: AsyncFnOnce(&BoxAttachTarget) -> Result<i32, anyhow::Error>,
 {
+    let name = verb.name();
     ensure_box_attach_tty(stdin_is_tty)?;
-    let target = box_attach_target(hosts, address, scope).await?;
+    let target = attach_target(verb, hosts, address, scope).await?;
     tracing::info!(
-        verb = "box attach",
+        verb = name,
         box_id = %target.box_id,
         host = %target.host.host,
         outcome = "attaching"
     );
     let code = attach(&target).await.inspect_err(|err| {
-        tracing::info!(verb = "box attach", box_id = %target.box_id, outcome = "error", "{err:#}");
+        tracing::info!(verb = name, box_id = %target.box_id, outcome = "error", "{err:#}");
     })?;
     let after = match code {
         0 => box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await,
@@ -1205,10 +1499,56 @@ where
         }
         _ => BoxAfterAttach::Unread,
     };
+    // BOX-185: an attach that saw the box end copies its declared exports,
+    // whatever code the entrypoint ended with. A detach leaves the box
+    // running, and copies nothing (BOX-186). An entrypoint's own nonzero
+    // code is not read above, so the box is read here for the copy only.
+    // A box that still runs then waits for the settle bound only when it
+    // declares an export, so a shell that a person leaves with a nonzero
+    // code, or a lost connection, does not wait for nothing.
+    let ended = match &after {
+        BoxAfterAttach::Unread => {
+            let first = box_after_attach(&target.host, target.box_id).await;
+            let running =
+                matches!(&first, BoxAfterAttach::Listed(entry) if entry.state == "running");
+            if running && box_declares_exports_on_host(&target.host, target.box_id).await {
+                box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await
+            } else {
+                first
+            }
+        }
+        _ => after.clone(),
+    };
+    // The outcomes of the copy, and whether the box's entrypoint exited 0
+    // by itself. A skipped export then turns the attach's 0 into 125
+    // (BOX-193). A stop and any other code stand (BOX-194).
+    let mut copied = None;
+    if let BoxAfterAttach::Listed(entry) = &ended
+        && matches!(entry.state.as_str(), "stopped" | "exited")
+    {
+        let root = entry.project_root.as_ref();
+        // Interim: the outcomes go to no `file_exported` event, and no
+        // claim gates the copy (BOX-195 and BOX-198,
+        // gominimal/minimal#3446). See `copy_box_exports`.
+        let outcomes = copy_box_exports_on_host(
+            &target.host,
+            target.box_id,
+            target.name.as_deref().unwrap_or(&target.label),
+            root.map(|root| std::path::Path::new(root.as_str())),
+            here.map(|here| std::path::Path::new(here.as_str())),
+            &mut std::io::stderr(),
+        )
+        .await;
+        let exited_clean = entry.state == "exited" && entry.exit_code == Some(0);
+        copied = Some((exited_clean, outcomes));
+    }
     match attach_ending(&target, code, &after) {
-        Ok(ending) => {
+        Ok(mut ending) => {
+            if let Some((exited_clean, outcomes)) = &copied {
+                ending.code = exit_code_after_exports(ending.code, *exited_clean, outcomes);
+            }
             tracing::info!(
-                verb = "box attach",
+                verb = name,
                 box_id = %target.box_id,
                 exit = ending.code,
                 outcome = if ending.code == DAEMON_ENDED_ATTACH { "ended by the host" } else { "ended" },
@@ -1218,7 +1558,7 @@ where
         }
         Err(refusal) => {
             tracing::info!(
-                verb = "box attach",
+                verb = name,
                 box_id = %target.box_id,
                 outcome = refusal.outcome(),
                 "{refusal}"
@@ -1228,34 +1568,94 @@ where
     }
 }
 
-/// The box an attach goes to. A named box is resolved as every `min box`
-/// verb resolves an address, and a running box with no terminal is
-/// refused. With no box named, the current project's running box with a
-/// terminal is the one, else its only stopped or exited box with a
-/// terminal, which the attach resumes. Every host must answer that lookup.
-pub(crate) async fn box_attach_target(
-    hosts: Vec<crate::cmd::list::LocalHost>,
+/// The box an attach of `verb` goes to, among the boxes the verb sees. A
+/// named box is resolved as every `min box` verb resolves an address. A
+/// running box with no terminal is refused, and so is a stopped or exited
+/// one, with the command that starts it again (BCLI-009). With no box
+/// named, the current project's running box with a terminal is the one,
+/// else its only stopped or exited box with a terminal. Every host must
+/// answer that lookup. `min box resume` of a named box that is not stopped
+/// or exited is refused before the box's terminal checks. A stopped or
+/// exited box with a terminal resumes in the attach, so it is refused here
+/// when a running box on its host holds its name (BCLI-007). That check
+/// comes after the box's terminal checks, as the host checks. The caller's
+/// terminal is checked before this lookup ([`attach_on_hosts`]).
+pub(crate) async fn attach_target(
+    verb: AttachVerb,
+    mut hosts: Vec<crate::cmd::list::LocalHost>,
     address: Option<&str>,
     scope: Option<&paths::HostAbsPath>,
 ) -> Result<BoxAttachTarget, anyhow::Error> {
     use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
 
-    let Some(address) = address else {
-        let mut listings = Vec::with_capacity(hosts.len());
-        for host in hosts {
-            let boxes = read_host_boxes(&host).await?;
-            listings.push(HostListing { host, boxes });
+    let name = verb.name();
+    let refuse = |refusal: BoxAttachRefusal, box_id: Option<boxes::SessionId>| {
+        match box_id {
+            Some(box_id) => {
+                tracing::info!(verb = name, box_id = %box_id, outcome = refusal.outcome(), "{refusal}");
+            }
+            None => tracing::info!(verb = name, outcome = refusal.outcome(), "{refusal}"),
         }
-        return project_attach_target(&listings, scope).map_err(|refusal| {
-            tracing::info!(
-                verb = "box attach",
-                outcome = refusal.outcome(),
-                "{refusal}"
-            );
-            refusal.into()
-        });
+        anyhow::Error::from(refusal)
     };
-    let ResolvedBox { host, box_id } = resolve_box_on_hosts(hosts, address, "box attach").await?;
+    if let Some(BoxAddress::Qualified { provider, host, .. }) = address.map(parse_box_address) {
+        hosts.retain(|h| h.provider == provider && h.host == host);
+    }
+    let mut listings = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let boxes = read_host_boxes(&host).await.inspect_err(|err| {
+            tracing::info!(verb = name, outcome = "error", host = %host.host, "{err:#}");
+        })?;
+        listings.push(HostListing { host, boxes });
+    }
+    let visible: Vec<HostListing> = listings.iter().map(|l| verb.visible(l)).collect();
+
+    let Some(address) = address else {
+        let target = project_attach_target(&visible, scope).map_err(|refusal| {
+            let refusal = match (verb, refusal) {
+                (AttachVerb::SessionAttach, BoxAttachRefusal::NoCandidate) => {
+                    BoxAttachRefusal::NoSessionCandidate
+                }
+                (AttachVerb::SessionAttach, BoxAttachRefusal::Ambiguous { candidates }) => {
+                    BoxAttachRefusal::AmbiguousSessions { candidates }
+                }
+                (_, refusal) => refusal,
+            };
+            refuse(refusal, None)
+        })?;
+        let state = visible
+            .iter()
+            .filter(|l| l.host == target.host)
+            .filter_map(|l| l.boxes.as_ref().ok())
+            .flatten()
+            .find(|e| e.box_id == target.box_id)
+            .map(|e| e.state.clone())
+            .unwrap_or_default();
+        if let Some(refusal) = name_held(&listings, &target, &state) {
+            return Err(refuse(refusal, Some(target.box_id)));
+        }
+        return Ok(target);
+    };
+    let ResolvedBox { host, box_id } = match resolve_box_address(address, &visible) {
+        Ok(resolved) => {
+            tracing::info!(
+                verb = name,
+                box_id = %resolved.box_id,
+                host = %resolved.host.host,
+                outcome = "resolved"
+            );
+            resolved
+        }
+        Err(refusal) => {
+            for listing in &listings {
+                if let Err(why) = &listing.boxes {
+                    tracing::info!(verb = name, host = %listing.host.host, "host did not answer: {why}");
+                }
+            }
+            tracing::info!(verb = name, address, outcome = "refused", "{refusal}");
+            return Err(refusal.into());
+        }
+    };
     let mut client = box_host_client(&host).await?;
     let shown = match client
         .oneshot_rpc::<ShowBox>(ShowBoxRequest { id: box_id })
@@ -1265,7 +1665,7 @@ pub(crate) async fn box_attach_target(
         Errorable::Ok(shown) => shown,
         Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) => {
             // The box was removed after the address resolved.
-            tracing::info!(verb = "box attach", box_id = %box_id, outcome = "not found");
+            tracing::info!(verb = name, box_id = %box_id, outcome = "not found");
             return Err(BoxAddressRefusal::NotFound {
                 address: address.to_owned(),
             }
@@ -1273,20 +1673,71 @@ pub(crate) async fn box_attach_target(
         }
         Errorable::Err { error } => bail!("{error}"),
     };
-    // A stopped or exited box with no terminal goes on to the attach, where
-    // the host refuses its restart.
-    if !shown.record.pty_enabled && shown.record.state == "running" {
+    let record = shown.record;
+    let retained = matches!(record.state.as_str(), "stopped" | "exited");
+    // Only a stopped or exited box resumes. This check comes before the
+    // box's terminal checks, so a running box is sent to `min box attach`.
+    if verb == AttachVerb::BoxResume && !retained {
+        let refusal = BoxAttachRefusal::NotResumable {
+            address: address.to_owned(),
+            state: record.state.clone(),
+            pty_enabled: record.pty_enabled,
+        };
+        return Err(refuse(refusal, Some(box_id)));
+    }
+    if !record.pty_enabled && record.state == "running" {
         let refusal = BoxAttachRefusal::NoTerminalInBox {
             address: address.to_owned(),
         };
-        tracing::info!(verb = "box attach", box_id = %box_id, outcome = refusal.outcome());
-        return Err(refusal.into());
+        return Err(refuse(refusal, Some(box_id)));
     }
-    Ok(BoxAttachTarget {
+    // BCLI-009: a stopped or exited box with no terminal cannot resume.
+    // The hint follows the spec's lifetime, not the Box Type.
+    if !record.pty_enabled && retained {
+        let refusal = BoxAttachRefusal::NoTerminalToResume {
+            address: address.to_owned(),
+            until_stopped: record.lifetime.as_deref() == Some("until_stopped"),
+        };
+        return Err(refuse(refusal, Some(box_id)));
+    }
+    let target = BoxAttachTarget {
         host,
         box_id,
-        name: shown.record.name,
+        name: record.name,
         label: address.to_owned(),
+    };
+    if let Some(refusal) = name_held(&listings, &target, &record.state) {
+        return Err(refuse(refusal, Some(box_id)));
+    }
+    Ok(target)
+}
+
+/// The refusal for a resume of `target`, in `state`, whose name a running
+/// box on the same host holds (BCLI-007). Boxes of every type hold names,
+/// so `listings` is every box each host listed. `None` for a box that is
+/// not stopped or exited, a box with no name, and a name nobody holds.
+fn name_held(
+    listings: &[HostListing],
+    target: &BoxAttachTarget,
+    state: &str,
+) -> Option<BoxAttachRefusal> {
+    if !matches!(state, "stopped" | "exited") {
+        return None;
+    }
+    let name = target.name.as_deref().filter(|name| !name.is_empty())?;
+    let holder = listings
+        .iter()
+        .filter(|l| l.host == target.host)
+        .filter_map(|l| l.boxes.as_ref().ok())
+        .flatten()
+        .find(|e| {
+            e.state == "running" && e.box_id != target.box_id && e.name.as_deref() == Some(name)
+        })?;
+    Some(BoxAttachRefusal::NameHeld {
+        address: target.label.clone(),
+        name: name.to_owned(),
+        holder: holder.box_id,
+        box_id: target.box_id,
     })
 }
 

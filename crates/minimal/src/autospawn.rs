@@ -60,8 +60,20 @@ const BOOT_NARRATION: &str = "Starting the Minimal VM (first run only, ~1 min)â€
 /// The actionable error for a failed or timed-out `minvmd run --detach`: it
 /// names the daemon, tells the user to retry, and points at `min bug` for a
 /// diagnostic bundle. `stderr` is minvmd's own captured failure output.
+/// When it carries the proxy's refusal over an unreadable audit log, the
+/// error keeps that whole refusal, with its `--quarantine-unreadable` step,
+/// and asks for that step before a retry: a bare retry meets the same
+/// refusal.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn boot_failure_error(stderr: &str) -> io::Error {
+    if stderr.contains(bep::UNREADABLE_AUDIT_LOG_REFUSAL) {
+        return io::Error::other(format!(
+            "the Minimal VM (minvmd) failed to start: {}\n\
+             Do the `--quarantine-unreadable` step above, then re-run your command. \
+             If it keeps failing, run `min bug` to collect a diagnostic bundle.",
+            stderr.trim()
+        ));
+    }
     io::Error::other(format!(
         "the Minimal VM (minvmd) failed to start: {}. Re-run your command to retry; \
          if it keeps failing, run `min bug` to collect a diagnostic bundle.",
@@ -274,9 +286,11 @@ pub fn wait_for_minvmd_stopped(minimal_dir: Option<&Path>) -> io::Result<()> {
     }
 }
 
-/// Wait for the daemon the CLI talks to to finish shutting down. Only the
-/// minvmd backend has a VM to tear down (and lifecycle state to observe); a
-/// native minimald just exits, so there is nothing to wait for.
+/// Wait for the daemon the CLI talks to to finish shutting down. The minvmd
+/// backend has a VM to tear down, and its lifecycle state to observe. A native
+/// minimald has no lifecycle file, so the wait is for its socket to stop
+/// accepting: until then the next command would connect to the departing
+/// daemon instead of starting a fresh one.
 #[cfg(target_os = "macos")]
 pub fn wait_for_daemon_stopped(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
     let _ = use_minvmd;
@@ -288,7 +302,37 @@ pub fn wait_for_daemon_stopped(use_minvmd: bool, minimal_dir: Option<&Path>) -> 
     if use_minvmd {
         return wait_for_minvmd_stopped(minimal_dir);
     }
-    Ok(())
+    let sock = crate::client::resolve_socket_path(minimal_dir, false)
+        .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
+    // A daemon of this build closes its listener as soon as it answers
+    // `Shutdown`; an older one keeps it bound through its connection drain,
+    // so the drain and a margin bound the wait.
+    wait_for_minimald_unlistening(&sock, minimald_rpc::SHUTDOWN_DEPARTURE_WAIT)
+}
+
+/// Linux native (DM2): wait, bounded by `wait`, until the daemon's socket no
+/// longer accepts a connection ([`minimald_socket_live`] reads it as not
+/// running). The socket is `local-minimald<N>/ssh.sock`, which no minvmd
+/// bridge serves (the two backends own distinct host dirs), so what answers
+/// there is the daemon that was asked to stop.
+#[cfg(target_os = "linux")]
+fn wait_for_minimald_unlistening(socket_path: &Path, wait: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if !minimald_socket_live(socket_path) {
+            tracing::debug!("native minimald has stopped listening");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "the daemon is still listening on {} after {}s; run `min stop` again, \
+                 and if it still listens, end the minimald process",
+                socket_path.display(),
+                wait.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(STOPPING_POLL_MS));
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -392,15 +436,38 @@ fn is_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<bool> {
 /// live: the caller then attempts its own connect and surfaces the real error,
 /// instead of this probe converting a broken socket path into a confident (and
 /// wrong) "the daemon is not running".
+///
+/// The connect never waits. A listener whose accept queue is full would make
+/// a blocking connect wait for room, without a bound; asked without waiting,
+/// it answers would-block, which is a listener and so reads as live.
 #[cfg(target_os = "linux")]
 fn minimald_socket_live(socket_path: &Path) -> bool {
-    match std::os::unix::net::UnixStream::connect(socket_path) {
+    match connect_without_waiting(socket_path) {
         Ok(_) => true,
         Err(e) => !matches!(
             e.kind(),
             io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
         ),
     }
+}
+
+/// One connect to the Unix socket at `socket_path` that returns at once: the
+/// connection, or the error, which is `WouldBlock` when a listener is there
+/// and its accept queue is full.
+#[cfg(target_os = "linux")]
+fn connect_without_waiting(socket_path: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    use std::os::fd::AsRawFd as _;
+
+    let addr = UnixAddr::new(socket_path)?;
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    )?;
+    connect(fd.as_raw_fd(), &addr)?;
+    Ok(fd)
 }
 
 /// Linux native (DM2): if the SSH socket is not already accepting connections,
@@ -485,6 +552,26 @@ mod tests {
             "points at the diagnostic bundle: {msg}"
         );
         assert!(msg.contains("Re-run"), "suggests retrying: {msg}");
+    }
+
+    /// D1229: minvmd's report of the proxy's unreadable audit log refusal
+    /// reaches the user whole, with the step that names the flag.
+    #[test]
+    fn boot_failure_error_keeps_the_quarantine_step() {
+        let stderr = format!(
+            "Error: the detached supervisor exited during startup (exit status: 1).\n\
+             {}\nTo move that segment into /a/quarantine and start, \
+             run `bep serve` again with `--quarantine-unreadable`.\n",
+            bep::UNREADABLE_AUDIT_LOG_REFUSAL
+        );
+        let msg = boot_failure_error(&stderr).to_string();
+        assert!(msg.contains(bep::UNREADABLE_AUDIT_LOG_REFUSAL), "{msg}");
+        assert!(
+            msg.contains("run `bep serve` again with `--quarantine-unreadable`"),
+            "{msg}"
+        );
+        assert!(!msg.contains("Re-run your command to retry"), "{msg}");
+        assert!(msg.contains("min bug"), "{msg}");
     }
 
     /// The state dir a `--minimal-dir` override resolves to.
@@ -635,5 +722,122 @@ mod tests {
             "this test is only meaningful while the path is rejected for its length"
         );
         assert!(is_daemon_running(false, Some(&long)).unwrap());
+    }
+
+    /// `min stop` against a native daemon returns only once its socket stops
+    /// accepting: the wait ends when the listener closes, not before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_stop_waits_until_the_socket_stops_accepting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let closed_after = std::time::Duration::from_millis(400);
+        std::thread::spawn(move || {
+            std::thread::sleep(closed_after);
+            drop(listener);
+        });
+
+        let started = std::time::Instant::now();
+        super::wait_for_minimald_unlistening(&sock, std::time::Duration::from_secs(5))
+            .expect("the wait ends once the listener closes");
+        let waited = started.elapsed();
+        assert!(
+            waited >= closed_after,
+            "returned after {waited:?}, while the socket still accepted"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(3),
+            "kept waiting {waited:?} after the listener closed"
+        );
+    }
+
+    /// A socket that nothing listens on (the file a stopped daemon leaves) is
+    /// a stopped daemon at once.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_stop_wait_returns_at_once_on_a_refusing_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let started = std::time::Instant::now();
+        super::wait_for_minimald_unlistening(&sock, std::time::Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A socket that keeps accepting is a daemon that did not stop: the wait
+    /// gives up at its bound and says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_stop_wait_is_bounded_and_reports_a_daemon_still_listening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let wait = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = super::wait_for_minimald_unlistening(&sock, wait)
+            .expect_err("a socket that still accepts is not a stopped daemon");
+        assert!(started.elapsed() >= wait);
+        assert!(
+            err.to_string().contains("still listening"),
+            "the error names the cause: {err}"
+        );
+        assert!(
+            err.to_string().contains("run `min stop` again"),
+            "the error names a next step: {err}"
+        );
+    }
+
+    /// The probe never waits for room in a listener's accept queue. A full
+    /// queue is a listener: it reads as live at once, and the bounded wait
+    /// still ends at its bound. A blocking connect would wait there for as
+    /// long as the daemon accepted nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_liveness_probe_does_not_wait_on_a_full_accept_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Shrink the accept queue so a couple of connects fill it.
+        nix::sys::socket::listen(
+            &listener,
+            nix::sys::socket::Backlog::new(0).expect("a zero backlog"),
+        )
+        .expect("shrink the backlog");
+        let mut held = Vec::new();
+        loop {
+            match super::connect_without_waiting(&sock) {
+                Ok(connection) => {
+                    held.push(connection);
+                    assert!(held.len() < 64, "the accept queue never filled");
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("filling the accept queue: {err}"),
+            }
+        }
+
+        // A probe that waited for room would not come back: it is asked on
+        // a thread, and the answer is waited for with a bound.
+        let (answer, answered) = std::sync::mpsc::channel();
+        let probed = sock.clone();
+        std::thread::spawn(move || {
+            let _ = answer.send(super::minimald_socket_live(&probed));
+        });
+        let live = answered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the probe returns although the accept queue is full");
+        assert!(
+            live,
+            "a listener with a full accept queue is still a daemon"
+        );
+
+        let wait = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        super::wait_for_minimald_unlistening(&sock, wait)
+            .expect_err("a listener with a full accept queue has not stopped");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+
+        drop(listener);
+        assert!(!super::minimald_socket_live(&sock));
     }
 }
