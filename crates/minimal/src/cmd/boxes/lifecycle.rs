@@ -456,28 +456,24 @@ pub(crate) fn wedged_vm_unreachable(
 /// Whether the daemon can be *observed* to have stopped — the question the
 /// failed-RPC arm of [`stop_outcome`] turns on.
 ///
-/// The shutdown wait, then the liveness probe this command opened with. On a VM
-/// backend the wait IS the observation — it polls the lifecycle state — but a
-/// native minimald has no lifecycle file and its wait returns at once, saying
-/// nothing, so only the probe can answer for that backend. Anything we cannot
-/// read is not a confirmed stop.
-///
-/// Which makes the recovery a VM-backend one in practice: the native probe fires
-/// once, immediately, and minimald keeps its listener bound through the 5s drain
-/// grace it takes after its accept loop exits (minimald's `SHUTDOWN_GRACE`), so
-/// a connect in that window still succeeds and reports "running". Native
-/// therefore keeps today's fail-on-RPC-error behaviour — which is right for it:
-/// a native daemon is not pid-1 and does not take the transport down with it, so
-/// the lost reply this recovers from is not a failure mode it has.
+/// On a VM backend: the shutdown wait, then the liveness probe this command
+/// opened with. There the wait IS the observation — it polls the lifecycle
+/// state. On a native minimald only the probe runs, once: its wait polls the
+/// socket for up to the daemon's drain grace, and a native daemon is not pid-1
+/// and does not take the transport down with it, so the lost reply this
+/// recovers from is not a failure mode it has, and a failed RPC is not worth
+/// that wait before its error is reported. Anything we cannot read is not a
+/// confirmed stop.
 pub(crate) async fn daemon_confirmed_stopped(
     use_minvmd: bool,
     minimal_dir: Option<PathBuf>,
 ) -> bool {
+    let native = cfg!(target_os = "linux") && !use_minvmd;
     // Both calls can sleep-poll, so they go on the blocking pool rather than
     // stalling an async worker (rust-coding-standards: no blocking in an async
     // context). A panicked probe observed nothing, which is not a confirmation.
     tokio::task::spawn_blocking(move || {
-        autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref()).is_ok()
+        (native || autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref()).is_ok())
             && !autospawn::is_daemon_running(use_minvmd, minimal_dir.as_deref()).unwrap_or(true)
     })
     .await
