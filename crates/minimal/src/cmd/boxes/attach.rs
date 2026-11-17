@@ -1489,6 +1489,9 @@ where
         host = %target.host.host,
         outcome = "attaching"
     );
+    // BOX-204: a box that ended before the attach resumes in it. The
+    // attach then copies only a later end, never the end it resumed from.
+    let ends_before = ended_box_end_count(&target).await;
     let code = attach(&target).await.inspect_err(|err| {
         tracing::info!(verb = name, box_id = %target.box_id, outcome = "error", "{err:#}");
     })?;
@@ -1525,6 +1528,7 @@ where
     let mut copied = None;
     if let BoxAfterAttach::Listed(entry) = &ended
         && matches!(entry.state.as_str(), "stopped" | "exited")
+        && ended_again(&target, ends_before).await
     {
         let root = entry.project_root.as_ref();
         let outcomes = copy_box_exports_on_host(
@@ -1563,6 +1567,48 @@ where
             Err(refusal.into())
         }
     }
+}
+
+/// How many times the box `target` ended, when it is stopped or exited
+/// before the attach. `None` for a running box, and for a host that does
+/// not answer.
+async fn ended_box_end_count(target: &BoxAttachTarget) -> Option<u64> {
+    let BoxAfterAttach::Listed(entry) = box_after_attach(&target.host, target.box_id).await else {
+        return None;
+    };
+    if !matches!(entry.state.as_str(), "stopped" | "exited") {
+        return None;
+    }
+    let mut client = box_host_client(&target.host)
+        .await
+        .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
+        .ok()?;
+    box_ends(&mut client, target.box_id).await.map(|ends| ends.count)
+}
+
+/// Whether the box `target`, which ended `before` times when the attach
+/// started, ended again since. A box that ran when the attach started
+/// (`before` is `None`) counts as ended again. A count that the host does
+/// not give counts as no new end, so the attach copies nothing, and a later
+/// `min box wait` can copy that end (BOX-204).
+async fn ended_again(target: &BoxAttachTarget, before: Option<u64>) -> bool {
+    let Some(before) = before else {
+        return true;
+    };
+    let mut after = None;
+    if let Ok(mut client) = box_host_client(&target.host).await {
+        after = box_ends(&mut client, target.box_id).await.map(|ends| ends.count);
+    }
+    let again = after.is_some_and(|after| after > before);
+    if !again {
+        tracing::info!(
+            box_id = %target.box_id,
+            ends_before = before,
+            ends_after = ?after,
+            "file exports: the resumed box did not end again, so the attach copies nothing"
+        );
+    }
+    again
 }
 
 /// The box an attach of `verb` goes to, among the boxes the verb sees. A

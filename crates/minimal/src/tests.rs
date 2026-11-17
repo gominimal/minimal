@@ -21932,6 +21932,191 @@ async fn exports_not_copied_from_another_project() {
     );
 }
 
+// BOX-203: one wait on several boxes copies their exports box by box in
+// the order the boxes ended, so where two boxes export one path, the file
+// of the later end stays. The wait names the boxes in the other order. A
+// wait from another project copies nothing of either box (BOX-199).
+#[tokio::test]
+async fn multi_box_wait_copies_in_order_of_ends() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let other = tempfile::tempdir().expect("a temp folder of another project");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let other_root = paths::HostAbsPath::try_new(other.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let mut ids = Vec::new();
+    for name in ["early", "late"] {
+        let id = create_spec_box(
+            &mut daemon,
+            name,
+            project.path(),
+            Some(export_spec(false, &["report.txt"])),
+            minimald_rpc::CreatingVerb::Task,
+        )
+        .await;
+        let contents = format!("from {name}");
+        put_box_files(
+            &mut daemon,
+            id,
+            &[],
+            &[("/workbench/report.txt", contents.as_bytes())],
+        )
+        .await;
+        ids.push(id);
+    }
+    let (early, late) = (ids[0], ids[1]);
+    for name in ["early", "late"] {
+        cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), name, false)
+            .await
+            .expect("the box stops");
+        // The ends are written in whole milliseconds, so they must differ.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    let targets = ["late".to_owned(), "early".to_owned()];
+
+    // From another project, the wait copies nothing and claims no end.
+    let elsewhere = cmd::box_wait_all_on_hosts(
+        local_hosts(&global).unwrap(),
+        &targets,
+        Some(&other_root),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees both boxes end");
+    assert_eq!(elsewhere.len(), 2);
+    assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+    assert!(file_exported_lines(&global, "early").await.is_empty());
+    assert!(file_exported_lines(&global, "late").await.is_empty());
+
+    let waited = cmd::box_wait_all_on_hosts(
+        local_hosts(&global).unwrap(),
+        &targets,
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees both boxes end");
+    let order: Vec<_> = waited.iter().map(|one| one.box_id).collect();
+    assert_eq!(order, vec![early, late], "copied in the order of the ends");
+    assert_eq!(
+        std::fs::read(project.path().join("report.txt")).unwrap(),
+        b"from late",
+        "the file of the later end stays"
+    );
+    for name in ["early", "late"] {
+        let events = file_exported_lines(&global, name).await;
+        assert_eq!(events.len(), 1, "{name}: {events:?}");
+        assert_eq!(events[0]["data"]["copied"], true, "{name}");
+    }
+}
+
+// BOX-204: a box with a terminal that ended and is resumed before any
+// command claimed that end copies at its next end only, what its files hold
+// then. An attach whose resume did not happen copies nothing of the end the
+// box resumed from.
+#[tokio::test]
+async fn resumed_box_copies_at_next_end_only() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let dev = create_spec_box(
+        &mut daemon,
+        "dev",
+        project.path(),
+        Some(export_spec(true, &["notes.md"])),
+        minimald_rpc::CreatingVerb::Session,
+    )
+    .await;
+    put_box_files(&mut daemon, dev, &[], &[("/workbench/notes.md", b"first end")]).await;
+    cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "dev", false)
+        .await
+        .expect("the box stops");
+
+    // A resume whose launch did not happen leaves the box at its first
+    // end. The attach copies nothing of that end.
+    let _ = attach_on_hosts(
+        AttachVerb::BoxResume,
+        local_hosts(&global).unwrap(),
+        Some("dev"),
+        None,
+        Some(&here),
+        true,
+        async |_target: &BoxAttachTarget| Ok(1),
+    )
+    .await;
+    assert!(
+        !project.path().join("notes.md").exists(),
+        "the end the box resumes from gets no copy"
+    );
+    assert!(file_exported_lines(&global, "dev").await.is_empty());
+
+    // The box resumes, its file changes, and it ends again.
+    let hosts = local_hosts(&global).unwrap();
+    let stop_hosts = hosts.clone();
+    let shell = std::sync::Mutex::new(None);
+    attach_on_hosts(
+        AttachVerb::BoxResume,
+        hosts,
+        Some("dev"),
+        None,
+        Some(&here),
+        true,
+        async |_target: &BoxAttachTarget| {
+            *shell.lock().unwrap() = Some(daemon.open_shell(dev).await);
+            let mut seen = String::new();
+            for _ in 0..200 {
+                let shown = daemon
+                    .call::<minimald_rpc::ShowBox>(&minimald_rpc::ShowBoxRequest { id: dev })
+                    .await;
+                if let minimald_rpc::Errorable::Ok(shown) = shown {
+                    seen = shown.record.state;
+                    if seen == "running" {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(seen, "running", "the shell resumes the box");
+            put_box_files(&mut daemon, dev, &[], &[("/workbench/notes.md", b"next end")]).await;
+            cmd::stop_box_on_hosts(stop_hosts, &mut Vec::new(), "dev", false)
+                .await
+                .expect("the box stops");
+            Ok(0)
+        },
+    )
+    .await
+    .expect("the attach ends");
+    assert_eq!(
+        std::fs::read(project.path().join("notes.md")).unwrap(),
+        b"next end",
+        "the copy holds the files of the next end"
+    );
+    let events = file_exported_lines(&global, "dev").await;
+    assert_eq!(events.len(), 1, "one copy, at the next end: {events:?}");
+
+    // A later wait finds that end claimed, and copies nothing again.
+    std::fs::remove_file(project.path().join("notes.md")).unwrap();
+    cmd::box_wait_on_hosts(
+        local_hosts(&global).unwrap(),
+        "dev",
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees the box end");
+    assert!(!project.path().join("notes.md").exists());
+    assert_eq!(file_exported_lines(&global, "dev").await.len(), 1);
+}
+
 /// The harness host that `global` selects.
 fn selected_host(global: &GlobalArgs) -> LocalHost {
     local_hosts(global)

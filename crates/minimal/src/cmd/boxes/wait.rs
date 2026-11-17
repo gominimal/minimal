@@ -188,6 +188,137 @@ fn wait_label(after: std::time::Duration) -> String {
     }
 }
 
+/// Reads the record of box `id` over `client`. A box that its host no
+/// longer keeps is the not-found refusal for `target`.
+async fn show_box(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+    target: &str,
+) -> Result<minimald_rpc::ShowBoxResponse, anyhow::Error> {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    match client
+        .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
+        .await
+        .context("ShowBox RPC failed")?
+    {
+        Errorable::Ok(shown) => Ok(shown),
+        Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) => {
+            // The box was removed after the address resolved.
+            tracing::info!(verb = "box wait", box_id = %id, outcome = "not found");
+            Err(BoxAddressRefusal::NotFound {
+                address: target.to_owned(),
+            }
+            .into())
+        }
+        Errorable::Err { error } => {
+            tracing::info!(verb = "box wait", box_id = %id, outcome = "error", "{error}");
+            bail!("{error}")
+        }
+    }
+}
+
+/// Copies the declared exports of the box `id`, which `shown` shows ended,
+/// and gives the code of the end as [`wait_exit`] gives it, after the
+/// exports. `here` is the command's own project root.
+async fn copy_after_end(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+    shown: &minimald_rpc::ShowBoxResponse,
+    ended: Result<i32, BoxTimedOut>,
+    target: &str,
+    here: Option<&paths::HostAbsPath>,
+) -> Result<i32, BoxTimedOut> {
+    // BOX-185: the wait copies the box's declared exports, on every end,
+    // before it gives back the box's code. It copies only into its own
+    // project (BOX-199).
+    //
+    // A skipped export turns the code 0 of an entrypoint that exited by
+    // itself into 125 (BOX-193). A stop, a timeout and any other code
+    // stand (BOX-194).
+    //
+    // `copy_box_exports` claims each export first (BOX-198). So a later
+    // wait copies, and returns 125, only for an export with no result on
+    // the record.
+    let root = shown.record.project_root.as_ref();
+    let outcomes = copy_box_exports(
+        client,
+        id,
+        shown.record.name.as_deref().unwrap_or(target),
+        root.map(|root| std::path::Path::new(root.as_str())),
+        here.map(|here| std::path::Path::new(here.as_str())),
+        &mut std::io::stderr(),
+    )
+    .await;
+    match ended {
+        Ok(code) => {
+            let exited_clean = shown.record.state == "exited" && shown.record.exit_code == Some(0);
+            let code = exit_code_after_exports(code, exited_clean, &outcomes);
+            tracing::info!(verb = "box wait", box_id = %id, exit_code = code, outcome = "ended");
+            Ok(code)
+        }
+        Err(timed_out) => {
+            tracing::info!(verb = "box wait", box_id = %id, outcome = "box timeout");
+            Err(timed_out)
+        }
+    }
+}
+
+/// The ends on the record of a box, as its `exited` events give them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct BoxEnds {
+    /// How many times the box ended: the count of its `exited` events.
+    pub count: u64,
+    /// When the last end was written, in milliseconds since the Unix
+    /// epoch. `None` for a box that never ended.
+    pub last_at: Option<u64>,
+}
+
+/// The ends on the record of box `id`, read from its events over
+/// `client`. `None` when the host does not give every event.
+pub(crate) async fn box_ends(client: &mut client::Client, id: boxes::SessionId) -> Option<BoxEnds> {
+    use minimald_rpc::ReadEventsUpdate;
+
+    let mut lines = match client.read_box_events(id, false).await {
+        Ok(lines) => lines,
+        Err(e) => {
+            tracing::warn!(box_id = %id, "box ends: open the events read: {e:#}");
+            return None;
+        }
+    };
+    let mut ends = BoxEnds::default();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                tracing::warn!(box_id = %id, "box ends: the events read ended early");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(box_id = %id, "box ends: read the events: {e:#}");
+                return None;
+            }
+        };
+        match serde_json_lenient::from_str::<ReadEventsUpdate>(&line) {
+            Ok(ReadEventsUpdate::Event { event }) => {
+                if event.kind == boxes::events::BoxEventType::Exited {
+                    ends.count += 1;
+                    ends.last_at = Some(event.ts);
+                }
+            }
+            Ok(ReadEventsUpdate::Done) => return Some(ends),
+            Ok(other) => {
+                tracing::warn!(box_id = %id, "box ends: the events read stopped: {other:?}");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(box_id = %id, "box ends: an events line did not parse: {e}");
+                return None;
+            }
+        }
+    }
+}
+
 /// Waits until the box `target` names on `hosts` ends, copies its declared
 /// file exports into its project when `here`, the command's own project
 /// root, is the one the box's record names, and returns its exit code as
@@ -201,86 +332,106 @@ pub(crate) async fn box_wait_on_hosts(
     timeout: Option<std::time::Duration>,
     poll: std::time::Duration,
 ) -> Result<i32, anyhow::Error> {
-    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+    let waited = box_wait_all_on_hosts(hosts, &[target.to_owned()], here, timeout, poll).await?;
+    let one = waited.into_iter().next().expect("one box for one target");
+    tracing::debug!(verb = "box wait", box_id = %one.box_id, "the wait ended");
+    one.ended.map_err(Into::into)
+}
 
-    let ResolvedBox { host, box_id: id } = resolve_box_on_hosts(hosts, target, "box wait").await?;
-    crate::output::record_box_id(&id.to_string());
+/// One box of a wait on several boxes, after it ended and its exports
+/// were copied.
+#[derive(Debug)]
+pub(crate) struct BoxWaited {
+    /// The box's id.
+    pub box_id: boxes::SessionId,
+    /// The code of its end after its exports, as [`box_wait_on_hosts`]
+    /// gives it.
+    pub ended: Result<i32, BoxTimedOut>,
+}
+
+/// Waits until every box `targets` names on `hosts` ended, then copies the
+/// declared exports of each box in the order the boxes ended, so the file
+/// of the later end stays where two boxes export one path (BOX-203). The
+/// result is in the same order. `here`, `timeout` and `poll` are as
+/// [`box_wait_on_hosts`] takes them. A wait that runs out names the first
+/// box that still runs, and copies nothing.
+pub(crate) async fn box_wait_all_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    targets: &[String],
+    here: Option<&paths::HostAbsPath>,
+    timeout: Option<std::time::Duration>,
+    poll: std::time::Duration,
+) -> Result<Vec<BoxWaited>, anyhow::Error> {
+    struct Waiting {
+        target: String,
+        id: boxes::SessionId,
+        client: client::Client,
+        shown: Option<(minimald_rpc::ShowBoxResponse, Result<i32, BoxTimedOut>)>,
+    }
+
+    let mut waiting = Vec::with_capacity(targets.len());
+    for target in targets {
+        let ResolvedBox { host, box_id: id } =
+            resolve_box_on_hosts(hosts.clone(), target, "box wait").await?;
+        crate::output::record_box_id(&id.to_string());
+        let client = box_host_client(&host).await?;
+        waiting.push(Waiting {
+            target: target.clone(),
+            id,
+            client,
+            shown: None,
+        });
+    }
     let deadline = timeout.map(|after| (tokio::time::Instant::now() + after, after));
-    let mut client = box_host_client(&host).await?;
     loop {
-        let shown = match client
-            .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
-            .await
-            .context("ShowBox RPC failed")?
-        {
-            Errorable::Ok(shown) => shown,
-            Errorable::Err { error }
-                if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) =>
-            {
-                // The box was removed after the address resolved.
-                tracing::info!(verb = "box wait", box_id = %id, outcome = "not found");
-                return Err(BoxAddressRefusal::NotFound {
-                    address: target.to_owned(),
+        let mut running = None;
+        for one in waiting.iter_mut().filter(|one| one.shown.is_none()) {
+            let shown = show_box(&mut one.client, one.id, &one.target).await?;
+            match wait_exit(&shown.record, &one.target) {
+                Some(ended) => one.shown = Some((shown, ended)),
+                None => {
+                    running.get_or_insert((one.id, shown.record.name));
                 }
-                .into());
             }
-            Errorable::Err { error } => {
-                tracing::info!(verb = "box wait", box_id = %id, outcome = "error", "{error}");
-                bail!("{error}")
-            }
-        };
-        if let Some(ended) = wait_exit(&shown.record, target) {
-            // BOX-185: the wait copies the box's declared exports, on
-            // every end, before it gives back the box's code. It copies
-            // only into its own project (BOX-199).
-            //
-            // A skipped export turns the code 0 of an entrypoint that
-            // exited by itself into 125 (BOX-193). A stop, a timeout and
-            // any other code stand (BOX-194).
-            //
-            // `copy_box_exports` claims each export first (BOX-198). So a
-            // later wait copies, and returns 125, only for an export with
-            // no result on the record.
-            let root = shown.record.project_root.as_ref();
-            let outcomes = copy_box_exports(
-                &mut client,
-                id,
-                shown.record.name.as_deref().unwrap_or(target),
-                root.map(|root| std::path::Path::new(root.as_str())),
-                here.map(|here| std::path::Path::new(here.as_str())),
-                &mut std::io::stderr(),
-            )
-            .await;
-            return match ended {
-                Ok(code) => {
-                    let exited_clean =
-                        shown.record.state == "exited" && shown.record.exit_code == Some(0);
-                    let code = exit_code_after_exports(code, exited_clean, &outcomes);
-                    tracing::info!(verb = "box wait", box_id = %id, exit_code = code, outcome = "ended");
-                    Ok(code)
-                }
-                Err(timed_out) => {
-                    tracing::info!(verb = "box wait", box_id = %id, outcome = "box timeout");
-                    Err(timed_out.into())
-                }
-            };
         }
+        let Some((id, name)) = running else { break };
         let mut pause = poll;
         if let Some((at, after)) = deadline {
             let now = tokio::time::Instant::now();
             if now >= at {
                 tracing::info!(verb = "box wait", box_id = %id, outcome = "wait timeout");
-                return Err(BoxTimedOut::waited(
-                    shown.record.name.as_deref(),
-                    &id.to_string(),
-                    &wait_label(after),
-                )
-                .into());
+                return Err(
+                    BoxTimedOut::waited(name.as_deref(), &id.to_string(), &wait_label(after)).into(),
+                );
             }
             pause = pause.min(at - now);
         }
         tokio::time::sleep(pause).await;
     }
+    // BOX-203: the order of the ends, as the time of each box's last
+    // `exited` event gives it. A box whose events are not readable goes
+    // last, and boxes with one time keep the order of `targets`.
+    let several = waiting.len() > 1;
+    let mut ordered = Vec::with_capacity(waiting.len());
+    for mut one in waiting {
+        let mut ended_at = u64::MAX;
+        if several && let Some(ends) = box_ends(&mut one.client, one.id).await {
+            ended_at = ends.last_at.unwrap_or(u64::MAX);
+        }
+        ordered.push((ended_at, one));
+    }
+    ordered.sort_by_key(|(ended_at, _)| *ended_at);
+    let mut waited = Vec::with_capacity(ordered.len());
+    for (ended_at, mut one) in ordered {
+        let (shown, ended) = one.shown.take().expect("every box ended");
+        tracing::info!(verb = "box wait", box_id = %one.id, ended_at, "copying exports in the order of the ends");
+        let ended = copy_after_end(&mut one.client, one.id, &shown, ended, &one.target, here).await;
+        waited.push(BoxWaited {
+            box_id: one.id,
+            ended,
+        });
+    }
+    Ok(waited)
 }
 
 /// Waits until the exec `exec_text` names in the box `target` names on
