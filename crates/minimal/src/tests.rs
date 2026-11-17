@@ -2342,8 +2342,7 @@ async fn start_off_tty_exit2_names_detach() {
         cmd_session_start(
             &global,
             SessionStartArgs {
-                // A bare start picks the only session entry, `dev`. A typed
-                // `dev` is refused until gominimal/minimal#3204.
+                // A bare start picks the only session entry, `dev`.
                 entry: None,
                 name: None,
                 new: false,
@@ -2764,9 +2763,8 @@ fn entry_egress(toml: &str, entry: &str) -> Option<boxes::EgressPolicy> {
 }
 
 // BCLI-069: a session entry starts with its own egress, not with the egress
-// of the `default` entry. A typed session entry other than `default` is
-// refused until gominimal/minimal#3204 gives the box that entry's body, so
-// the activation's egress lookup of a named entry is checked directly.
+// of the `default` entry. The activation's egress lookup of a named entry
+// is checked directly.
 #[test]
 fn session_start_typed_entry_reads_its_own_egress() {
     let with_default = "[sessions.default]\n\
@@ -2806,44 +2804,153 @@ fn session_start_typed_entry_reads_its_own_egress() {
     assert_eq!(a.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
 }
 
-// BCLI-069: until gominimal/minimal#3204, both verbs refuse a typed session
-// entry other than `default` with exit 2, before anything is created. A
-// typed `default` and a bare start of the only session entry still start.
-#[test]
-fn start_typed_session_entry_other_than_default_exit2_until_its_body_applies() {
-    let entries = start_entries("[sessions.default]\n[sessions.ci]\n");
+/// A project with a typed session entry `dev` that declares its own
+/// packages, secret, hook and lifetime, beside a `default` entry that
+/// declares others.
+const TYPED_DEV_PROJECT: &str = "[sessions.default]\n\
+     packages = [\"from-default\"]\n\n\
+     [sessions.dev]\n\
+     packages = [\"git\", \"ripgrep\"]\n\
+     loadout_mode = \"sealed\"\n\
+     [sessions.dev.box]\n\
+     lifetime = \"until_stopped\"\n\
+     [sessions.dev.secrets.DEV_TOKEN]\n\
+     source = \"broker\"\n\
+     scopes = [\"github:repo:read\"]\n\
+     [[sessions.dev.lifecycle_hooks]]\n\
+     on_activate = { type = \"inline\", value = \"echo dev\" }\n";
+
+/// The spec a planned start of `entry` by `verb` stores, for the project
+/// in `root`, with the expanded entry's hooks put on it as the activation
+/// puts them.
+fn planned_entry_spec(
+    verb: StartVerb,
+    entry: &str,
+    root: &camino::Utf8Path,
+) -> (PlannedRequest, mfile::spec::BoxSpec) {
+    let entries = start_entries(&std::fs::read_to_string(root.join(mfile::MFILE_NAME)).unwrap());
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&typed_start(verb, Some(entry)), &entries, true)
+            .unwrap_or_else(|e| panic!("{verb:?}: {entry} starts: {e:#}"))
+    else {
+        panic!("{verb:?}: {entry} is a session entry");
+    };
+    assert_eq!(options.entry.as_deref(), Some(entry));
+    let mut request = planned_session_request(&args, &options, root);
+    let expanded = crate::session_box_expansion(
+        root,
+        options.entry.as_deref(),
+        !args.no_hooks,
+        &crate::SelectedLoadouts::default(),
+    )
+    .expect("the entry expands")
+    .expect("the project has a minimal.toml");
+    crate::put_spec_hooks(&mut request, expanded.spec_hooks().expect("the hooks read"))
+        .expect("the hooks go on the spec");
+    let spec = serde_json_lenient::from_value(request.spec.clone().expect("a spec"))
+        .expect("the spec reads");
+    (request, spec)
+}
+
+// BCLI-029, BCLI-071: both verbs start a typed session entry other than
+// `default`. Its stored spec names the entry and carries the entry's own
+// packages, hook and lifetime, not the `default` entry's. The activation
+// grants the entry's own secrets. The box the daemon creates stores that
+// spec, and `min box spec <box>` renders it.
+#[tokio::test]
+async fn start_typed_session_entry_stores_its_own_body() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), TYPED_DEV_PROJECT).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let mut specs = Vec::new();
     for verb in [StartVerb::Session, StartVerb::Box] {
-        let error = plan_start(&typed_start(verb, Some("ci")), &entries, true)
-            .expect_err("a typed session entry other than default is refused");
-        let refusal = error
-            .downcast_ref::<StartEntryRefusal>()
-            .expect("a start refusal");
+        let (request, spec) = planned_entry_spec(verb, "dev", root);
+        assert_eq!(spec.entry, "dev", "{verb:?}");
+        assert_eq!(spec.box_name(), "dev", "{verb:?}");
+        assert_eq!(spec.box_type, boxes::SESSION_BOX_TYPE, "{verb:?}");
+        assert!(spec.pty_enabled, "{verb:?}");
         assert_eq!(
-            refusal,
-            &StartEntryRefusal::NamedSessionUnsupported {
-                verb,
-                entry: "ci".into()
-            }
+            spec.packages,
+            vec!["git".to_owned(), "ripgrep".to_owned()],
+            "{verb:?}: dev's packages, not default's"
         );
-        assert_eq!(refusal.exit_code(), 2);
-        assert!(matches!(
-            plan_start(&typed_start(verb, Some("default")), &entries, true),
-            Ok(StartPlan::Session { ref entry, .. }) if entry == "default"
-        ));
+        assert_eq!(
+            spec.lifetime,
+            mfile::spec::Lifetime::UntilStopped,
+            "{verb:?}"
+        );
+        let hooks = toml::to_string(&spec).unwrap();
+        assert!(hooks.contains("echo dev"), "{verb:?}: dev's hook\n{hooks}");
+        specs.push((request, spec));
     }
+    assert_eq!(specs[0].1, specs[1].1, "both verbs store the same spec");
+
+    // The activation grants dev's own secret.
+    let (_, secrets, _, _) =
+        crate::project_bep_and_grants(root, Some("dev")).expect("the project loads");
     assert_eq!(
-        plan_start(&typed_start(StartVerb::Session, Some("ci")), &entries, true)
-            .unwrap_err()
-            .to_string(),
-        "Cannot start ci. min session start cannot start a session entry by name yet, \
-         except the entry named \"default\". Rename ci to \"default\" in minimal.toml, \
-         then run min session start."
+        secrets.keys().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["DEV_TOKEN".to_owned()]
     );
+    let (_, secrets, _, _) =
+        crate::project_bep_and_grants(root, Some("default")).expect("the project loads");
+    assert!(secrets.is_empty(), "default has no secret: {secrets:?}");
+
+    // The `default` entry keeps its own body.
+    let (_, default) = planned_entry_spec(StartVerb::Session, "default", root);
+    assert_eq!(default.entry, "default");
+    assert_eq!(default.packages, vec!["from-default".to_owned()]);
+    assert_eq!(default.lifetime, mfile::spec::Lifetime::UntilComplete);
+
+    // The daemon stores the spec with the box, and `min box spec` renders
+    // it.
+    let (_state, mut global, server) = show_network_daemon().await;
+    global.repo_dir = Some(project.path().to_path_buf());
+    let (request, _) = &specs[0];
+    let id = create_box_from(&server, request).await;
+    let id_text = id.to_string();
+    let stored = box_spec_text(&global, &["min", "box", "spec", &id_text, "-o", "json"])
+        .await
+        .expect("the stored spec renders");
+    let doc: serde_json_lenient::Value = serde_json_lenient::from_str(&stored).unwrap();
+    assert_eq!(Some(doc["spec"].clone()), request.spec, "{stored}");
+    assert_eq!(doc["spec"]["entry"], "dev", "{stored}");
+    assert_eq!(doc["spec"]["box"]["lifetime"], "until_stopped", "{stored}");
+
+    // The plan no longer refuses a typed session entry, and a bare start of
+    // the only session entry still picks it.
     let entries = start_entries("[boxes.dev]\ntype = \"session\"\n");
     assert!(matches!(
         plan_start(&typed_start(StartVerb::Session, None), &entries, true),
         Ok(StartPlan::Session { ref entry, .. }) if entry == "dev"
     ));
+}
+
+// BCLI-029: a session entry whose `[box]` sets `lifetime = "until_stopped"`
+// stores `until_stopped` in its spec, by both verbs. One that sets none
+// stores `until_complete`.
+#[test]
+fn session_entry_until_stopped_stores_until_stopped() {
+    for (toml, lifetime) in [
+        (
+            "[sessions.dev.box]\nlifetime = \"until_stopped\"\n",
+            mfile::spec::Lifetime::UntilStopped,
+        ),
+        (
+            "[sessions.dev]\nlifetime = \"until_stopped\"\n",
+            mfile::spec::Lifetime::UntilStopped,
+        ),
+        ("[sessions.dev]\n", mfile::spec::Lifetime::UntilComplete),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+        let root = camino::Utf8Path::from_path(project.path()).unwrap();
+        for verb in [StartVerb::Session, StartVerb::Box] {
+            let (_, spec) = planned_entry_spec(verb, "dev", root);
+            assert_eq!(spec.lifetime, lifetime, "{verb:?}: {toml}");
+            assert_eq!(spec.entry, "dev", "{verb:?}: {toml}");
+        }
+    }
 }
 
 // BCLI-069: a start without `--new` whose name a running box holds exits
@@ -20225,9 +20332,8 @@ async fn spec_type_init_end_to_end() {
 
     // A box created from an entry on the test daemon renders the spec
     // stored with its record.
-    // The box comes from the session entry `default`: a start by name takes
-    // only that entry today (#3204), and an entry of a project type is
-    // refused (#3140).
+    // The box comes from the session entry `default`. An entry of a project
+    // type is refused (#3140).
     let start = parsed_start(&["min", "session", "start", "default", "--network", "own_ip"]);
     let entries = mfile::entry::read_entries(std::fs::read(&toml_path).unwrap().as_slice())
         .expect("the entries read");
