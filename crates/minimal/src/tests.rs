@@ -15381,6 +15381,86 @@ lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo project" } }
     assert!(composed[0].contains("echo project"), "{composed:?}");
 }
 
+// BOX-068, BOX-179: a box created with a project hook and a loadout hook
+// stores both hooks in its spec.json, each with its declarer. The create
+// sends the expanded spec's hooks on the spec, and the client digest stays
+// the one the daemon computes.
+#[tokio::test]
+async fn created_box_spec_json_names_each_hook_declarer() {
+    use minimald_rpc::{CreateSession, Errorable, GetBoxSpec, GetBoxSpecRequest};
+
+    let toml = r#"
+[sessions.default]
+loadout_mode = "open"
+lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo project" } }]
+"#;
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    let selected = crate::SelectedLoadouts {
+        loadouts: vec![named_loadout(
+            "rust",
+            "[[lifecycle_hooks]]\non_activate = { type = \"inline\", value = \"echo rust\" }\n",
+        )],
+        ignore: None,
+    };
+    let expanded = crate::session_box_expansion(root, None, true, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+
+    // The request as `min box start` plans it, with the expanded hooks.
+    let start = parsed_start(&["min", "box", "start"]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+    else {
+        panic!("the default entry is a session");
+    };
+    let mut request = planned_session_request(&args, &options, root);
+    crate::put_spec_hooks(&mut request, expanded.spec_hooks().expect("the hooks read"))
+        .expect("the hooks go on the spec");
+
+    let server = minimald::test_harness::TestServer::new().await;
+    let mut daemon = server.connect().await;
+    let id = match daemon.call::<CreateSession>(&request).await {
+        Errorable::Ok(created) => created.id,
+        Errorable::Err { error } => panic!("the create failed: {error}"),
+    };
+    let stored = match daemon.call::<GetBoxSpec>(&GetBoxSpecRequest { id }).await {
+        Errorable::Ok(reply) => reply.spec.expect("the box stores a spec"),
+        Errorable::Err { error } => panic!("the spec read failed: {error}"),
+    };
+    let declared: Vec<(String, serde_json_lenient::Value)> = stored["lifecycle_hooks"]
+        .as_array()
+        .expect("spec.json carries lifecycle_hooks")
+        .iter()
+        .map(|hook| {
+            (
+                hook["on_activate"]["value"].as_str().unwrap().to_owned(),
+                hook["declared_by"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        declared,
+        [
+            (
+                "echo project".to_owned(),
+                serde_json_lenient::json!({"kind": "project"})
+            ),
+            (
+                "echo rust".to_owned(),
+                serde_json_lenient::json!({"kind": "loadout", "name": "rust"})
+            ),
+        ]
+    );
+
+    // Under `--no-hooks` the spec stores an empty hook list.
+    let unhooked = crate::session_box_expansion(root, None, false, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+    assert!(unhooked.spec_hooks().unwrap().is_empty());
+}
+
 // BOX-183: a selected loadout that sets a project variable to another
 // value refuses the start with exit 3 when the client expands the entry.
 // The start expands it before it sends the create request, so no record
