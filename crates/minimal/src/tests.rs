@@ -19356,6 +19356,69 @@ fn type_commands_refuse_invalid_project_types_with_exit_3() {
     assert_eq!(cmd::types::BoxTypesInvalid::EXIT_CODE, 3);
 }
 
+/// gominimal/inbox#1237: `min type list` refuses a `[box_types.<name>]`
+/// with a key a type does not take, with exit 3 and the type's message,
+/// and lists a type that carries all four keys.
+#[test]
+fn type_list_refuses_unknown_box_type_key_with_exit_3() {
+    let control = tempfile::tempdir().unwrap();
+    std::fs::write(
+        control.path().join(mfile::MFILE_NAME),
+        "[box_types.ci]\ndescription = \"Bounded CI run\"\nextends = \"task\"\n\
+         defaults = { timeout = \"10m\" }\nconstraints = { pty_enabled = false }\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(
+        &type_globals(control.path()),
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect("a type with all four keys lists");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>()
+                == ["ci", "project", "task", "task"]),
+        "{text}"
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        "[box_types.ci]\nextends = \"task\"\ndefault = { timeout = \"10m\" }\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let err = cmd::types::cmd_type_list(
+        &type_globals(project.path()),
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect_err("the list refuses");
+    let invalid = err
+        .downcast_ref::<cmd::types::BoxTypesInvalid>()
+        .unwrap_or_else(|| panic!("not a typed refusal: {err:#}"));
+    assert!(
+        matches!(
+            &invalid.cause,
+            cmd::types::BoxTypesCause::Resolve(mfile::box_types::BoxTypeError::UnknownKey {
+                name,
+                key,
+            }) if name == "ci" && key == "default"
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Cannot list the box types: `[box_types.ci]` in minimal.toml sets `default`, \
+         which is not a key of a box type. A box type takes `extends`, `defaults`, \
+         `constraints` and `description`. Remove the key or correct its name."
+    );
+    assert_eq!(cmd::types::BoxTypesInvalid::EXIT_CODE, 3);
+    assert!(out.is_empty(), "a refusal writes nothing to stdout");
+}
+
 /// What `min type show <name>` resolves in `project`: the same load and
 /// resolution the command runs, so the `-o` tests follow the built-in
 /// defaults that ship, not a literal list.
