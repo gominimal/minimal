@@ -91,6 +91,14 @@ pub struct BoxSpec {
     pub timeout: Option<u64>,
     /// The box's network settings.
     pub network: SpecNetwork,
+    /// The expanded spec's `lifecycle_hooks`, each with the `declared_by`
+    /// table that names its declarer (BOX-068, BOX-179). Serialized as the
+    /// top-level `lifecycle_hooks` list, and left out when `None`.
+    ///
+    /// `None` when the client sent no hook list: a task create, a create
+    /// with no `minimal.toml`, or a spec stored before the key existed. The
+    /// daemon then composes the project's hooks as before.
+    pub lifecycle_hooks: Option<Vec<SpecHook>>,
 }
 
 /// What a box runs as its first process: the program its launch starts.
@@ -264,6 +272,7 @@ impl BoxSpec {
                 mode: flags.network,
                 policy: flags.policy,
             },
+            lifecycle_hooks: None,
         }
     }
 
@@ -322,6 +331,9 @@ struct SpecDoc {
     execution: Option<DocExecution>,
     install: DocInstall,
     network: DocNetwork,
+    /// Absent from a spec that carries no hook list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lifecycle_hooks: Option<Vec<SpecHook>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -434,6 +446,7 @@ impl From<BoxSpec> for SpecDoc {
                 mode: spec.network.mode,
                 policy: spec.network.policy,
             },
+            lifecycle_hooks: spec.lifecycle_hooks,
         }
     }
 }
@@ -463,6 +476,7 @@ impl From<SpecDoc> for BoxSpec {
                 mode: doc.network.mode,
                 policy: doc.network.policy,
             },
+            lifecycle_hooks: doc.lifecycle_hooks,
         }
     }
 }
@@ -722,6 +736,117 @@ fn check_table(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The declarer of a lifecycle hook (BOX-179).
+// ---------------------------------------------------------------------------
+
+/// The key of a lifecycle hook table that names who declared the hook.
+/// The expansion writes it into each hook of the spec's `lifecycle_hooks`.
+pub const DECLARED_BY: &str = "declared_by";
+
+/// Who declared one lifecycle hook of an expanded spec: the `declared_by`
+/// table of the hook (BOX-179).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum HookDeclarer {
+    /// The project's `minimal.toml`, in any of its layers. It carries no
+    /// host path.
+    Project,
+    /// The selected loadout `name`.
+    Loadout {
+        /// The loadout's name.
+        name: String,
+    },
+}
+
+impl HookDeclarer {
+    /// The `declared_by` table: `{ kind = "project" }` or
+    /// `{ kind = "loadout", name = "<name>" }`.
+    #[must_use]
+    pub fn to_value(&self) -> toml::Value {
+        let mut table = toml::Table::new();
+        match self {
+            HookDeclarer::Project => {
+                table.insert("kind".to_owned(), "project".into());
+            }
+            HookDeclarer::Loadout { name } => {
+                table.insert("kind".to_owned(), "loadout".into());
+                table.insert("name".to_owned(), name.as_str().into());
+            }
+        }
+        toml::Value::Table(table)
+    }
+
+    /// The declarer of `hook`, a hook table of an expanded spec. `None`
+    /// for a hook with no `declared_by`, or one of another shape.
+    #[must_use]
+    pub fn of(hook: &toml::Value) -> Option<Self> {
+        hook.get(DECLARED_BY)?.clone().try_into().ok()
+    }
+}
+
+/// One lifecycle hook of a stored spec, with its declarer (BOX-179). It
+/// serializes as the hook's own table with a `declared_by` table beside
+/// its keys, the shape the expansion writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecHook {
+    /// The hook as the project or the loadout wrote it.
+    pub hook: boxes::core::lifecyclehook::LifecycleHook,
+    /// Who declared the hook.
+    pub declared_by: HookDeclarer,
+}
+
+impl SpecHook {
+    /// The stored hook of `value`, a hook table of an expanded spec.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the table has no `declared_by` table of a known shape,
+    /// or when the rest of it is not a valid lifecycle hook.
+    pub fn from_value(value: &toml::Value) -> Result<Self, String> {
+        let declared_by = HookDeclarer::of(value)
+            .ok_or_else(|| format!("the hook has no valid `{DECLARED_BY}` table"))?;
+        let hook = hook_without_declarer(value)
+            .try_into()
+            .map_err(|e: toml::de::Error| e.message().to_owned())?;
+        Ok(Self { hook, declared_by })
+    }
+
+    /// The hook's table with its `declared_by` table.
+    fn to_table<E: serde::ser::Error>(&self) -> Result<toml::Table, E> {
+        let mut table = toml::Table::try_from(&self.hook).map_err(E::custom)?;
+        table.insert(DECLARED_BY.to_owned(), self.declared_by.to_value());
+        Ok(table)
+    }
+}
+
+impl serde::Serialize for SpecHook {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_table::<S::Error>()?.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SpecHook {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = toml::Value::deserialize(deserializer)?;
+        Self::from_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `hook`, a hook table of an expanded spec, without its `declared_by`:
+/// the hook as the project or the loadout wrote it.
+#[must_use]
+pub fn hook_without_declarer(hook: &toml::Value) -> toml::Value {
+    match hook {
+        toml::Value::Table(table) => {
+            let mut table = table.clone();
+            table.remove(DECLARED_BY);
+            toml::Value::Table(table)
+        }
+        other => other.clone(),
+    }
+}
+
 /// The warning for a project section that the expansion leaves out of the
 /// spec ([`crate::expand::IGNORED_SECTIONS`]). Each of these sections is
 /// client configuration, which only the user's own `config.toml` sets.
@@ -754,6 +879,37 @@ pub fn ignored_section_warnings(expansion: &crate::expand::Expansion) -> Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // BOX-068, BOX-179: the stored spec keeps each hook with its declarer,
+    // and a spec with no hook list writes no key.
+    #[test]
+    fn spec_lifecycle_hooks_round_trip_with_declared_by() {
+        let mut spec = BoxSpec::for_session(None, SpecFlags::default());
+        let table = toml::Table::try_from(&spec).unwrap();
+        assert!(!table.contains_key("lifecycle_hooks"));
+
+        let hook: toml::Value = toml::from_str(
+            r#"
+            on_activate = { type = "inline", value = "echo hi" }
+            declared_by = { kind = "loadout", name = "dev" }
+            "#,
+        )
+        .unwrap();
+        spec.lifecycle_hooks = Some(vec![SpecHook::from_value(&hook).unwrap()]);
+        let table = toml::Table::try_from(&spec).unwrap();
+        let stored = &table["lifecycle_hooks"][0];
+        assert_eq!(
+            HookDeclarer::of(stored),
+            Some(HookDeclarer::Loadout { name: "dev".into() })
+        );
+        let back: BoxSpec = table.try_into().unwrap();
+        assert_eq!(back, spec);
+
+        // A hook with no declarer is refused.
+        let bare: toml::Value =
+            toml::from_str(r#"on_activate = { type = "inline", value = "echo hi" }"#).unwrap();
+        assert!(SpecHook::from_value(&bare).is_err());
+    }
 
     // BOX-068: the first spec comes from the `[session]` table or a task,
     // with the flags as the last layer.
@@ -803,6 +959,7 @@ mod tests {
                     mode: boxes::NetworkMode::OwnIp,
                     policy: policy.clone(),
                 },
+                lifecycle_hooks: None,
             }
         );
 
