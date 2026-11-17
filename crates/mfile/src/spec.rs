@@ -149,6 +149,11 @@ pub enum Lifetime {
     UntilStopped,
 }
 
+impl Lifetime {
+    /// The values `lifetime` accepts, as a project writes them.
+    pub const ACCEPTED: &'static [&'static str] = &["until_complete", "until_stopped"];
+}
+
 /// The lifetime a v0 spec stored without `box.lifetime` reads as.
 fn until_complete() -> Lifetime {
     Lifetime::UntilComplete
@@ -326,9 +331,9 @@ fn hooks_on_resume(extra: &toml::Table) -> bool {
 }
 
 /// The entry's own `lifetime`, from `lifetime` or `box.lifetime`. `None`
-/// when the entry sets none. [`crate::File::validate`] and the expansion
-/// refuse a bad value before a spec is built, so a bad value here reads as
-/// `None`.
+/// when the entry sets none. The expansion refuses a value that is not
+/// one of [`Lifetime::ACCEPTED`] (see [`check_section`]), so an expanded
+/// spec never reaches here with a bad value.
 fn entry_lifetime(extra: &toml::Table) -> Option<Lifetime> {
     first_value(extra, &[&["lifetime"], &["box", "lifetime"]])
         .and_then(|value| value.clone().try_into().ok())
@@ -555,6 +560,8 @@ enum KeyShape {
     StrOrInt,
     StrList,
     StrOrStrList,
+    /// A string that is one of the listed values.
+    Word(&'static [&'static str]),
     /// A table whose keys are the ones listed.
     Keys(&'static [SectionKey]),
     /// Any value. Another check owns the value's shape, so this schema
@@ -571,7 +578,7 @@ impl KeyShape {
     /// [`crate::expand`]'s top-level check.
     const fn words(self) -> &'static str {
         match self {
-            KeyShape::Str => "a string",
+            KeyShape::Str | KeyShape::Word(_) => "a string",
             KeyShape::Bool => "true or false",
             KeyShape::Int => "a whole number",
             KeyShape::StrOrInt => "a string or a whole number",
@@ -588,7 +595,7 @@ impl KeyShape {
     fn mismatch(self, value: &toml::Value) -> Option<&'static str> {
         use toml::Value as V;
         let fits = match (self, value) {
-            (KeyShape::Str | KeyShape::StrOrInt, V::String(_))
+            (KeyShape::Str | KeyShape::Word(_) | KeyShape::StrOrInt, V::String(_))
             | (KeyShape::Bool, V::Boolean(_))
             | (KeyShape::Int | KeyShape::StrOrInt, V::Integer(_))
             | (KeyShape::StrOrStrList, V::String(_))
@@ -621,7 +628,7 @@ const fn value_words(value: &toml::Value) -> &'static str {
 
 /// `[box]`: the box's type, name, lifetime, loadout mode and volumes.
 const BOX_KEYS: &[SectionKey] = &[
-    ("lifetime", KeyShape::Str),
+    ("lifetime", KeyShape::Word(Lifetime::ACCEPTED)),
     ("loadout_mode", KeyShape::Str),
     ("name", KeyShape::Str),
     ("type", KeyShape::Str),
@@ -750,6 +757,20 @@ pub struct SectionProblem {
 /// A [`SectionProblem`] for the first key that is not a key of its
 /// section, or whose value has the wrong shape.
 pub fn check_section(key: &str, value: &toml::Value) -> Result<(), SectionProblem> {
+    // A flat setting that a section also carries, such as `lifetime`,
+    // takes the same values as the section's key.
+    if let Some(section) = flat_key_section(key) {
+        let shape = SECTIONS.iter().find_map(|(k, shape)| match shape {
+            KeyShape::Keys(keys) if *k == section => {
+                keys.iter().find(|(name, _)| *name == key).map(|(_, s)| *s)
+            }
+            _ => None,
+        });
+        if let Some(shape) = shape {
+            check_word(key, shape, value)?;
+        }
+        return Ok(());
+    }
     let Some((_, KeyShape::Keys(keys))) = SECTIONS.iter().find(|(k, _)| *k == key) else {
         return Ok(());
     };
@@ -784,6 +805,7 @@ fn check_table(
                 },
             });
         }
+        check_word(&key, *shape, value)?;
         match (shape, value) {
             (KeyShape::Keys(inner), toml::Value::Table(inner_table)) => {
                 check_table(&key, inner_table, inner)?;
@@ -795,6 +817,25 @@ fn check_table(
         }
     }
     Ok(())
+}
+
+/// Refuses a string that a [`KeyShape::Word`] key does not accept, such
+/// as `lifetime = "until-stopped"`. Any other shape or value passes.
+fn check_word(key: &str, shape: KeyShape, value: &toml::Value) -> Result<(), SectionProblem> {
+    match (shape, value) {
+        (KeyShape::Word(accepted), toml::Value::String(found))
+            if !accepted.contains(&found.as_str()) =>
+        {
+            Err(SectionProblem {
+                key: key.to_owned(),
+                problem: crate::SpecKeyProblem::UnknownValue {
+                    found: found.clone(),
+                    accepted,
+                },
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,6 +1377,38 @@ mod tests {
         let flat: toml::Table = toml::from_str(r#"lifetime = "until_stopped""#).unwrap();
         let spec = BoxSpec::for_session_entry("dev", &flat, SpecFlags::default());
         assert_eq!(spec.lifetime, Lifetime::UntilStopped);
+    }
+
+    // BCLI-029: the expansion refuses a lifetime that is not one of the
+    // accepted values, flat or under `[box]`, so no box silently stores
+    // `until_complete` for a typo.
+    #[test]
+    fn box_spec_takes_lifetime_from_expansion_refuses_unknown_value() {
+        for (file, key) in [
+            ("[sessions.dev]\nlifetime = \"until-stopped\"\n", "lifetime"),
+            (
+                "[sessions.dev.box]\nlifetime = \"forever\"\n",
+                "box.lifetime",
+            ),
+        ] {
+            let err = expand_in(file, "dev").expect_err("a bad lifetime is refused");
+            match &err {
+                crate::Error::InvalidSpecKey {
+                    key: got,
+                    problem: crate::SpecKeyProblem::UnknownValue { accepted, .. },
+                    ..
+                } => {
+                    assert_eq!(got, key, "{err}");
+                    assert_eq!(*accepted, Lifetime::ACCEPTED);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            let text = err.to_string();
+            assert!(
+                text.contains("`until_complete` or `until_stopped`"),
+                "{text}"
+            );
+        }
     }
 
     /// Expands the entry `name` of `file`, with the file's `[defaults]`.
