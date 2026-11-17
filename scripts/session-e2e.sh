@@ -19579,7 +19579,7 @@ GOA_PROBE_EOF
 
   # The effective rules, shown: the four-field rendering the egress proof
   # pins has its own case; here it is the declaration's own receipt — the
-  # dead CIDR, every one of the ten hosts, and tcp alone.
+  # dead CIDR, every one of the hosts, and tcp alone.
   goa_policy="$(mnl session policy "$goa_t_sid" 2>"$WORK/goa-policy.err")" || {
     echo "::error::'min session policy' failed for the hostname-only box"
     cat "$WORK/goa-policy.err" 2>/dev/null || true
