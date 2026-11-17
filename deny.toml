@@ -18,6 +18,10 @@ ignore = [
     # serde_yaml 0.9 (deprecated) -> unsafe-libyaml, unmaintained; reached via
     # nickel-lang-core. Drop once nickel moves off serde_yaml.
     "RUSTSEC-2024-0449",
+    # chrono is unmaintained (a notice, not a vulnerability). It is a direct
+    # workspace dependency of minimald, minimald-rpc, minimal and diagnostics.
+    # Drop once gominimal/minimal#3494 moves them off it.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
