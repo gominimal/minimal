@@ -18260,8 +18260,10 @@ async fn box_spec_box_renders_stored_copy() {
 
 // BCLI-022, BOX-179: `min box spec <box>` lists each stored lifecycle
 // hook with its event, its command, its description and its declarer.
+// Each value prints as a one-line TOML string, so a line break in a
+// description or a path cannot end the comment that holds it.
 #[tokio::test]
-async fn box_spec_box_lists_hooks() {
+async fn box_spec_box_lists_hooks_with_declarer() {
     let toml = r#"
 [sessions.default]
 loadout_mode = "open"
@@ -18273,7 +18275,11 @@ lifecycle_hooks = [{ description = "Warm the cache", on_activate = { type = "inl
     let selected = crate::SelectedLoadouts {
         loadouts: vec![named_loadout(
             "rust",
-            "[[lifecycle_hooks]]\non_attach = { type = \"inline\", value = \"echo rust\" }\n",
+            r#"[[lifecycle_hooks]]
+description = "Attach rust\nthen say \"hi\""
+on_attach = { type = "inline", value = "echo rust" }
+on_detach = { type = "external", value = "./cleanup.sh" }
+"#,
         )],
         ignore: None,
     };
@@ -18301,9 +18307,10 @@ lifecycle_hooks = [{ description = "Warm the cache", on_activate = { type = "inl
     let header = format!(
         "# The spec box {id} was created with.\n\
          # Lifecycle hooks:\n\
-         #   on_activate \"Warm the cache\": echo project (from minimal.toml)\n\
-         #   on_destroy \"Warm the cache\": echo bye ... (from minimal.toml)\n\
-         #   on_attach: echo rust (from loadout rust)\n"
+         #   on_activate \"Warm the cache\": inline \"echo project\" (from minimal.toml)\n\
+         #   on_destroy \"Warm the cache\": inline \"echo bye\" ... (from minimal.toml)\n\
+         #   on_attach \"Attach rust\\nthen say \\\"hi\\\"\": inline \"echo rust\" (from loadout rust)\n\
+         #   on_detach \"Attach rust\\nthen say \\\"hi\\\"\": script \"./cleanup.sh\" (from loadout rust)\n"
     );
     assert!(text.starts_with(&header), "{text}");
     // The list is comments, so the render stays TOML with the hooks in it.

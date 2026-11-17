@@ -1119,23 +1119,45 @@ fn write_hook_list(hooks: &[toml::Value], out: &mut Vec<u8>) -> anyhow::Result<(
             let command = match script.body() {
                 HookScriptBody::Inline(body) => {
                     let mut lines = body.trim().lines();
-                    let first = lines.next().unwrap_or_default().to_owned();
+                    let first = one_line_string(lines.next().unwrap_or_default());
                     if lines.next().is_some() {
-                        format!("{first} ...")
+                        format!("inline {first} ...")
                     } else {
-                        first
+                        format!("inline {first}")
                     }
                 }
-                HookScriptBody::External(path) => format!("script {}", path.as_str()),
+                HookScriptBody::External(path) => {
+                    format!("script {}", one_line_string(path.as_str()))
+                }
             };
             let description = hook
                 .description()
-                .map(|d| format!(" \"{d}\""))
+                .map(|d| format!(" {}", one_line_string(d)))
                 .unwrap_or_default();
             writeln!(out, "#   {event}{description}: {command} ({declarer})")?;
         }
     }
     Ok(())
+}
+
+/// `s` as a TOML basic string on one line: a line break or another control
+/// character is escaped, so the text cannot end the comment that holds it.
+fn one_line_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `value` as TOML, with each `null` left out. `None` for a `null`.
