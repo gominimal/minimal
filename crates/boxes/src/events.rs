@@ -37,6 +37,8 @@ pub enum BoxEventType {
     Resumed,
     /// A client detached from the box.
     Detached,
+    /// A command that waited for the box reported one declared export.
+    FileExported,
 }
 
 impl BoxEventType {
@@ -53,6 +55,7 @@ impl BoxEventType {
             Self::Renamed => "renamed",
             Self::Resumed => "resumed",
             Self::Detached => "detached",
+            Self::FileExported => "file_exported",
         }
     }
 }
