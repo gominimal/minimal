@@ -21195,7 +21195,7 @@ async fn directory_export_copies_its_tree_and_deletes_nothing() {
     assert!(!outcomes[1].copied);
     assert_eq!(
         String::from_utf8(err).unwrap(),
-        "min did not copy `missing.txt` from box web, because it was not found in the box.\n"
+        "Export missing.txt was not copied: it was not found in the box.\n"
     );
 }
 
@@ -21377,8 +21377,7 @@ async fn export_writes_each_file_atomically() {
     assert!(hidden_names(&root.join("out")).is_empty());
     assert_eq!(
         String::from_utf8(err).unwrap(),
-        "min did not copy all of `out/report.txt` from box web: \
-         could not read all of it from the box.\n"
+        "Export out/report.txt was not copied: could not read all of it from the box.\n"
     );
 
     // A whole read replaces the file. While it is read, the destination
@@ -21797,6 +21796,26 @@ async fn exports_not_copied_from_another_project() {
         .await
         .expect("the box stops");
 
+    // A copy from another project gives no outcome, so an entrypoint that
+    // exited 0 still gives 0 (BOX-194), not the 125 of a skipped export.
+    let hosts = local_hosts(&global).unwrap();
+    let mut err = Vec::new();
+    let outcomes = cmd::copy_box_exports_on_host(
+        &hosts[0],
+        build,
+        "build",
+        Some(project.path()),
+        Some(other.path()),
+        &mut err,
+    )
+    .await;
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+    assert_eq!(cmd::exit_code_after_exports(0, true, &outcomes), 0);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        format!("{}\n", cmd::exports_elsewhere_line("build", project.path()))
+    );
+
     let elsewhere = cmd::box_wait_on_hosts(
         local_hosts(&global).unwrap(),
         "build",
@@ -21991,8 +22010,8 @@ async fn unreadable_box_files_report_each_granted_export() {
     );
     assert_eq!(
         String::from_utf8_lossy(&err),
-        "min did not copy `out/report.txt` from box build, because min could not read the box's files.\n\
-         min did not copy `dist` from box build, because min could not read the box's files.\n"
+        "Export out/report.txt was not copied: min could not read the box's files.\n\
+         Export dist was not copied: min could not read the box's files.\n"
     );
 
     let events = file_exported_lines(&global, "build").await;
@@ -22122,8 +22141,8 @@ async fn lost_export_report_named_exit_unchanged() {
     );
     assert_eq!(
         cmd::copy_stopped_line("b.txt", "web"),
-        "min did not copy `b.txt` from box web, because min could not confirm an earlier \
-         export with the box's host. Run `min box wait web` in this project to copy it."
+        "Export b.txt was not copied: min could not confirm an earlier export with \
+         the box's host. Run `min box wait web` in this project to copy it."
     );
 
     // BOX-195: granted exports that min could not read are reported as
@@ -22149,9 +22168,9 @@ async fn lost_export_report_named_exit_unchanged() {
     assert_eq!(
         String::from_utf8_lossy(&err),
         format!(
-            "min did not copy `a.txt` from box web, because min could not read the box's files.\n\
+            "Export a.txt was not copied: min could not read the box's files.\n\
              {}\n\
-             min did not copy `b.txt` from box web, because min could not read the box's files.\n",
+             Export b.txt was not copied: min could not read the box's files.\n",
             cmd::report_lost_line("a.txt", "web"),
         )
     );
@@ -22222,15 +22241,12 @@ async fn refused_export_claim_copies_nothing() {
     let outcomes = copy(&mut err).await;
     assert_eq!(
         String::from_utf8_lossy(&err),
-        format!(
-            "{}\n",
-            cmd::claimed_elsewhere_line("out/report.txt", "build")
-        )
+        format!("{}\n", cmd::claimed_elsewhere_line("out/report.txt"))
     );
     assert_eq!(
-        cmd::claimed_elsewhere_line("out/report.txt", "build"),
-        "min did not copy `out/report.txt` from box build, because another min command \
-         copied it or is copying it."
+        cmd::claimed_elsewhere_line("out/report.txt"),
+        "Export out/report.txt was not copied: another min command copied it or is \
+         copying it."
     );
     assert_eq!(outcomes.len(), 1, "a refused export has no outcome");
     assert_eq!(outcomes[0].path, "notes.txt");
@@ -22284,4 +22300,272 @@ async fn refused_export_claim_copies_nothing() {
         ["notes.txt", "out/report.txt"],
         "one event for each export"
     );
+}
+
+/// A box for the export exit-code tests: one export of each kind that is
+/// skipped, a missing one, one whose destination is a link out of the
+/// project, and one whose source leaves /workbench, beside one that is
+/// copied. It returns the outcomes and the stderr text.
+async fn copy_with_each_skip(
+    root: &std::path::Path,
+    outside: &std::path::Path,
+) -> (Vec<cmd::ExportOutcome>, String) {
+    std::os::unix::fs::symlink(outside, root.join("out")).unwrap();
+    let mut source = ExportBox::default()
+        .file("/workbench/out/report.txt", b"report")
+        .file("/workbench/key.txt", b"the box's key")
+        .link("/workbench/key.txt", "/root/.ssh/id_ed25519")
+        .file("/workbench/inside.txt", b"copied");
+    let mut err = Vec::new();
+    let outcomes = cmd::copy_exports(
+        &mut source,
+        &[
+            "missing.txt".to_owned(),
+            "out/report.txt".to_owned(),
+            "key.txt".to_owned(),
+            "inside.txt".to_owned(),
+        ],
+        root,
+        "build",
+        &mut err,
+    )
+    .await;
+    (outcomes, String::from_utf8(err).unwrap())
+}
+
+// BOX-190: an export that the box does not hold is skipped with one
+// stderr line that names its path and says it was not found in the box.
+// The exports before and after it, a file and a folder, are still copied.
+#[tokio::test]
+async fn missing_export_named_and_others_copied() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    let mut source = ExportBox::default()
+        .file("/workbench/first.txt", b"one")
+        .dir("/workbench/dist")
+        .file("/workbench/dist/app.bin", b"binary");
+    let mut err = Vec::new();
+    let outcomes = cmd::copy_exports(
+        &mut source,
+        &[
+            "first.txt".to_owned(),
+            "out/missing.txt".to_owned(),
+            "dist".to_owned(),
+        ],
+        root,
+        "build",
+        &mut err,
+    )
+    .await;
+
+    let copied: Vec<_> = outcomes.iter().map(|o| o.copied).collect();
+    assert_eq!(copied, [true, false, true]);
+    assert!(outcomes[1].files.is_empty());
+    assert!(cmd::any_export_skipped(&outcomes));
+    assert_eq!(std::fs::read(root.join("first.txt")).unwrap(), b"one");
+    assert_eq!(std::fs::read(root.join("dist/app.bin")).unwrap(), b"binary");
+    assert!(
+        !root.join("out").exists(),
+        "a missing export makes no folder for itself"
+    );
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "Export out/missing.txt was not copied: it was not found in the box.\n"
+    );
+}
+
+// BOX-191: a write that fails changes nothing where it failed and leaves
+// no temporary file. A file export that meets a folder, a folder export
+// that meets a file, and a file of a folder export whose folder cannot be
+// made each get one stderr line with the export's path and the reason. A
+// folder export keeps the files it wrote, and counts as skipped. The next
+// export is still copied.
+#[tokio::test]
+async fn failed_export_file_leaves_its_destination_unchanged() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    // A file export whose destination is a folder.
+    std::fs::create_dir_all(root.join("report.txt/kept")).unwrap();
+    // A folder export whose destination is a file.
+    std::fs::write(root.join("dist"), b"a file, not a folder").unwrap();
+    // A folder export whose subfolder is a file in the project.
+    std::fs::create_dir_all(root.join("site")).unwrap();
+    std::fs::write(root.join("site/css"), b"was here").unwrap();
+    // A file export whose read fails half way.
+    std::fs::write(root.join("log.txt"), b"earlier log").unwrap();
+
+    let mut source = ExportBox::default()
+        .file("/workbench/report.txt", b"new report")
+        .dir("/workbench/dist")
+        .file("/workbench/dist/app.bin", b"binary")
+        .dir("/workbench/site")
+        .dir("/workbench/site/css")
+        .file("/workbench/site/index.html", b"page")
+        .file("/workbench/site/css/main.css", b"body{}")
+        .file("/workbench/log.txt", b"the new log")
+        .file("/workbench/inside.txt", b"copied");
+    source.fails = Some("/workbench/log.txt".to_owned());
+    let mut err = Vec::new();
+    let outcomes = cmd::copy_exports(
+        &mut source,
+        &[
+            "report.txt".to_owned(),
+            "dist".to_owned(),
+            "site".to_owned(),
+            "log.txt".to_owned(),
+            "inside.txt".to_owned(),
+        ],
+        root,
+        "build",
+        &mut err,
+    )
+    .await;
+
+    let copied: Vec<_> = outcomes.iter().map(|o| o.copied).collect();
+    assert_eq!(copied, [false, false, false, false, true]);
+    assert!(root.join("report.txt/kept").is_dir());
+    assert_eq!(
+        std::fs::read_dir(root.join("report.txt")).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read(root.join("dist")).unwrap(),
+        b"a file, not a folder"
+    );
+    assert_eq!(std::fs::read(root.join("site/css")).unwrap(), b"was here");
+    assert_eq!(
+        std::fs::read(root.join("site/index.html")).unwrap(),
+        b"page",
+        "a folder export keeps the files it already wrote"
+    );
+    let site_files: Vec<_> = outcomes[2].files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(site_files, ["site/index.html"]);
+    assert_eq!(std::fs::read(root.join("log.txt")).unwrap(), b"earlier log");
+    assert_eq!(std::fs::read(root.join("inside.txt")).unwrap(), b"copied");
+    assert!(hidden_names(root).is_empty(), "no temporary file is left");
+    assert!(hidden_names(&root.join("site")).is_empty());
+
+    let err = String::from_utf8(err).unwrap();
+    let lines: Vec<_> = err.lines().collect();
+    assert_eq!(lines.len(), 4, "{err}");
+    for (line, path) in lines.iter().zip(["report.txt", "dist", "site", "log.txt"]) {
+        assert!(
+            line.starts_with(&format!("Export {path} was not copied: ")),
+            "{line}"
+        );
+    }
+    assert!(lines[0].contains(&root.join("report.txt").display().to_string()));
+    assert!(lines[1].contains(&root.join("dist").display().to_string()));
+    assert!(lines[2].contains(&root.join("site/css").display().to_string()));
+    assert!(lines[3].ends_with("could not read all of it from the box."));
+}
+
+// BOX-193: a run whose entrypoint exited 0 exits 125 when an export is
+// missing, leads out of the project through a link, or leads out of
+// /workbench in the box. The other exports are still copied. With no
+// skipped export, the run still exits 0.
+#[tokio::test]
+async fn skipped_export_exit125_when_task_succeeded() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let outside = tempfile::tempdir().expect("a temp folder outside the project");
+    let (outcomes, err) = copy_with_each_skip(project.path(), outside.path()).await;
+    let copied: Vec<_> = outcomes.iter().map(|o| o.copied).collect();
+    assert_eq!(copied, [false, false, false, true]);
+    assert_eq!(
+        std::fs::read(project.path().join("inside.txt")).unwrap(),
+        b"copied"
+    );
+    assert_eq!(
+        err,
+        "Export missing.txt was not copied: it was not found in the box.\n\
+         Export out/report.txt was not copied: it leads outside the project folder.\n\
+         Export key.txt was not copied: it leads outside the box's copy of the project.\n"
+    );
+
+    // `min task run` and `min box run`, attached.
+    for one in [&outcomes[0..1], &outcomes[1..2], &outcomes[2..3]] {
+        let exit = task::exit_after_exports(Some(0), false, one);
+        assert_eq!(exit, Some(125), "{one:?}");
+        let error = task::run_outcome(exit, false, "build").expect_err("the run fails");
+        assert_eq!(
+            error.downcast_ref::<task::TaskExit>(),
+            Some(&task::TaskExit(125))
+        );
+    }
+    // `min box wait` and `min box attach`.
+    assert_eq!(cmd::exit_code_after_exports(0, true, &outcomes), 125);
+
+    // Every export copied, or none declared: the code stays 0.
+    let all_copied = &outcomes[3..];
+    assert_eq!(
+        task::exit_after_exports(Some(0), false, all_copied),
+        Some(0)
+    );
+    assert_eq!(task::exit_after_exports(Some(0), false, &[]), Some(0));
+    assert!(task::run_outcome(Some(0), false, "build").is_ok());
+    assert_eq!(cmd::exit_code_after_exports(0, true, all_copied), 0);
+    assert_eq!(cmd::exit_code_after_exports(0, true, &[]), 0);
+}
+
+// BOX-194: a skipped export leaves every code that is not the 0 of an
+// entrypoint that exited by itself. A failed entrypoint keeps its code, a
+// timed-out run still exits 124 as a box timeout, and a stopped box keeps
+// the code `min box wait` gives it.
+#[tokio::test]
+async fn skipped_export_keeps_failed_task_exit_code() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let outside = tempfile::tempdir().expect("a temp folder outside the project");
+    let (outcomes, _) = copy_with_each_skip(project.path(), outside.path()).await;
+    assert!(cmd::any_export_skipped(&outcomes));
+
+    assert_eq!(task::exit_after_exports(Some(3), false, &outcomes), Some(3));
+    assert_eq!(task::exit_after_exports(None, false, &outcomes), None);
+    let exit = task::exit_after_exports(Some(124), true, &outcomes);
+    assert_eq!(exit, Some(124));
+    let error = task::run_outcome(exit, true, "build").expect_err("the run timed out");
+    assert!(error.downcast_ref::<BoxTimedOut>().is_some(), "{error:#}");
+    // A timeout that the record shows with a 0 still is not a clean exit.
+    assert_eq!(task::exit_after_exports(Some(0), true, &outcomes), Some(0));
+
+    // `min box wait` and `min box attach`: an entrypoint that failed, or a
+    // box that was stopped, ran out of memory or timed out, keeps its code.
+    assert_eq!(cmd::exit_code_after_exports(3, true, &outcomes), 3);
+    assert_eq!(cmd::exit_code_after_exports(137, false, &outcomes), 137);
+    assert_eq!(cmd::exit_code_after_exports(0, false, &outcomes), 0);
+
+    // A stopped box whose only export is missing: the wait names it, and
+    // gives the code of the stop, not 125.
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    create_spec_box(
+        &mut daemon,
+        "build",
+        project.path(),
+        Some(export_spec(false, &["never-made.txt"])),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        &mut Vec::new(),
+        "build",
+        false,
+    )
+    .await
+    .expect("the box stops");
+    let code = cmd::box_wait_on_hosts(
+        local_hosts(&global).unwrap(),
+        "build",
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees the box end");
+    assert_ne!(code, 0, "a stop is not a clean exit");
+    assert_ne!(code, 125, "a stop keeps its own code");
+    assert!(!project.path().join("never-made.txt").exists());
 }

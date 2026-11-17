@@ -205,6 +205,39 @@ pub(crate) struct ExportOutcome {
     pub files: Vec<ExportedFile>,
 }
 
+/// The exit code of a command whose box's entrypoint exited 0 when the
+/// command skipped one of the box's exports (BOX-193). It is the code
+/// that a run-style command gives to a failure on `min`'s side.
+pub(crate) const EXPORT_SKIPPED_EXIT_CODE: u8 = 125;
+
+/// Whether any export in `outcomes` was skipped. An export that wrote
+/// only part of its files is skipped (BOX-191).
+pub(crate) fn any_export_skipped(outcomes: &[ExportOutcome]) -> bool {
+    outcomes.iter().any(|outcome| !outcome.copied)
+}
+
+/// The exit code of a command that copied a box's exports, from `code`,
+/// the code it gives without exports. `entrypoint_succeeded` is true only
+/// when the box's entrypoint exited 0, and the box did not time out, run
+/// out of memory or get stopped. Then a skipped export turns `code` into
+/// [`EXPORT_SKIPPED_EXIT_CODE`] (BOX-193). Every other code stands
+/// (BOX-194). The box's record keeps the entrypoint's own code (BOX-197).
+pub(crate) fn exit_code_after_exports(
+    code: i32,
+    entrypoint_succeeded: bool,
+    outcomes: &[ExportOutcome],
+) -> i32 {
+    if code == 0 && entrypoint_succeeded && any_export_skipped(outcomes) {
+        tracing::info!(
+            skipped = outcomes.iter().filter(|outcome| !outcome.copied).count(),
+            "a file export was skipped; the command exits 125 in place of 0"
+        );
+        i32::from(EXPORT_SKIPPED_EXIT_CODE)
+    } else {
+        code
+    }
+}
+
 /// The export paths of a stored spec, in list order: each
 /// `[[file_exports]]` item's `path`, or the item itself when it is a
 /// string, as the expansion reads them ([`mfile::expand::file_export_path`]).
@@ -450,7 +483,7 @@ where
         match &reason {
             None => outcome.copied = true,
             Some(line) => {
-                let _ = writeln!(err, "{}", line.text(path, label));
+                let _ = writeln!(err, "{}", line.text(path));
             }
         }
         tracing::info!(
@@ -496,10 +529,7 @@ where
     let mut outcomes = Vec::with_capacity(paths.len());
     let mut reporting = true;
     for path in paths {
-        let _ = writeln!(
-            err,
-            "min did not copy `{path}` from box {label}, because {reason}."
-        );
+        let _ = writeln!(err, "Export {path} was not copied: {reason}.");
         let outcome = ExportOutcome {
             path: path.clone(),
             copied: false,
@@ -532,19 +562,15 @@ pub(crate) fn report_lost_line(path: &str, label: &str) -> String {
 /// exits, and that releases the export for the next wait.
 pub(crate) fn copy_stopped_line(path: &str, label: &str) -> String {
     format!(
-        "min did not copy `{path}` from box {label}, because min could not confirm an \
-         earlier export with the box's host. Run `min box wait {label}` in this project \
-         to copy it."
+        "Export {path} was not copied: min could not confirm an earlier export with \
+         the box's host. Run `min box wait {label}` in this project to copy it."
     )
 }
 
 /// The stderr line for an export that another command claimed for this
 /// end of the box (BOX-201).
-pub(crate) fn claimed_elsewhere_line(path: &str, label: &str) -> String {
-    format!(
-        "min did not copy `{path}` from box {label}, because another min command copied \
-         it or is copying it."
-    )
+pub(crate) fn claimed_elsewhere_line(path: &str) -> String {
+    format!("Export {path} was not copied: another min command copied it or is copying it.")
 }
 
 /// Why an export was not copied, as its stderr line says it.
@@ -564,25 +590,18 @@ enum NotCopied {
 }
 
 impl NotCopied {
-    fn text(&self, path: &str, label: &str) -> String {
-        match self {
-            NotCopied::Outside => format!(
-                "min did not copy `{path}` from box {label}, because the path points \
-                 outside the folder that holds minimal.toml."
-            ),
-            NotCopied::LeadsOutsideProject => {
-                format!("Export {path} was not copied: it leads outside the project folder.")
+    // BOX-190, BOX-191: every skip line has the one form
+    // `Export <path> was not copied: <why>.`
+    fn text(&self, path: &str) -> String {
+        let why = match self {
+            NotCopied::Outside | NotCopied::LeadsOutsideProject => {
+                "it leads outside the project folder"
             }
-            NotCopied::LeadsOutsideBox => format!(
-                "Export {path} was not copied: it leads outside the box's copy of the project."
-            ),
-            NotCopied::NotFound => format!(
-                "min did not copy `{path}` from box {label}, because it was not found in the box."
-            ),
-            NotCopied::Failed(reason) => {
-                format!("min did not copy all of `{path}` from box {label}: {reason}.")
-            }
-        }
+            NotCopied::LeadsOutsideBox => "it leads outside the box's copy of the project",
+            NotCopied::NotFound => "it was not found in the box",
+            NotCopied::Failed(reason) => reason.as_str(),
+        };
+        format!("Export {path} was not copied: {why}.")
     }
 }
 
@@ -826,8 +845,10 @@ impl ExportSource for BoxFiles {
 /// Copies the declared exports of the ended box `id` on `host` into
 /// `project_root`, the project the box came from (BOX-185). `here` is the
 /// project root of the command that waited, and nothing is copied unless
-/// it is `project_root` (BOX-199). `label` names the box on `err`. A box whose spec declares no export copies nothing,
-/// and reads nothing more from its host.
+/// it is `project_root` (BOX-199). Then it gives no outcome, so the exit
+/// code does not change (BOX-194). `label` names the box on `err`. A box
+/// whose spec declares no export copies nothing, and reads nothing more
+/// from its host.
 pub(crate) async fn copy_box_exports_on_host<E: std::io::Write>(
     host: &crate::cmd::list::LocalHost,
     id: boxes::SessionId,
@@ -883,11 +904,13 @@ pub(crate) fn exports_elsewhere_line(label: &str, project_root: &std::path::Path
 /// The copy first claims the exports of the box's end from its host
 /// (BOX-198). It copies only the exports the host grants, and names each
 /// refused one on `err` (BOX-201). A refused export has no outcome, so it
-/// changes no exit code. Each copied or skipped export is reported to the
-/// host, which records a `file_exported` event for it (BOX-195).
+/// changes no exit code, and a later command on the same end does not
+/// return 125 for an export that an earlier command reported. Each copied
+/// or skipped export is reported to the host, which records a
+/// `file_exported` event for it (BOX-195).
 ///
-/// Interim: the callers do not use the outcomes yet. A skipped export
-/// does not turn a 0 end into exit 125 (BOX-193, gominimal/minimal#3445).
+/// The callers set their exit code from the outcomes, with
+/// [`exit_code_after_exports`] (BOX-193, BOX-194).
 pub(crate) async fn copy_box_exports<E: std::io::Write>(
     client: &mut client::Client,
     id: boxes::SessionId,
@@ -985,10 +1008,7 @@ where
     };
     let not_copied = |err: &mut E, which: &[String], reason: &str| {
         for path in which {
-            let _ = writeln!(
-                err,
-                "min did not copy `{path}` from box {label}, because {reason}."
-            );
+            let _ = writeln!(err, "Export {path} was not copied: {reason}.");
         }
         none_copied(which)
     };
@@ -1005,7 +1025,9 @@ where
             "file exports: the waiting command is in another project"
         );
         let _ = writeln!(err, "{}", exports_elsewhere_line(label, project_root));
-        return none_copied(&paths);
+        // No outcome: this is not a skipped export, and it changes no exit
+        // code (BOX-194).
+        return Vec::new();
     }
     // BOX-198: the claim comes after the project check of BOX-199, so a
     // command in another project never claims the end.
@@ -1014,7 +1036,7 @@ where
         Err(reason) => return not_copied(err, &paths, &reason),
     };
     for path in &claim.refused {
-        let _ = writeln!(err, "{}", claimed_elsewhere_line(path, label));
+        let _ = writeln!(err, "{}", claimed_elsewhere_line(path));
     }
     let (end, granted) = (claim.end, claim.granted);
     if granted.is_empty() {
