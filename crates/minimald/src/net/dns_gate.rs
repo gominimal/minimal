@@ -1764,7 +1764,7 @@ pub(crate) mod tests {
             ),
             (
                 "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com.",
-                Ipv4Addr::new(52, 217, 161, 40),
+                Ipv4Addr::new(52, 216, 8, 147),
             ),
         ];
         // The names here pair each host with a representative address, so

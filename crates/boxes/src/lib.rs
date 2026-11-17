@@ -103,10 +103,11 @@ pub struct PortMapping {
 /// list and cannot drift.
 ///
 /// Docker Hub serves image blobs through a 307 redirect that lands on one of
-/// three hosts: its CDNs `production.cloudflare.docker.com` and
-/// `production.cloudfront.docker.com`, or its S3 bucket
-/// `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`. A container
-/// pull needs all three.
+/// three places: its CDNs, `production.cloudflare.docker.com` and
+/// `production.cloudfront.docker.com`, or the bucket behind them,
+/// `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`. The registry
+/// picks per request, so a container pull needs all three: with only the two
+/// CDNs listed, a pull that was sent to the bucket failed at the name lookup.
 #[doc(hidden)]
 pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "github.com",
