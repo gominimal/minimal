@@ -543,8 +543,9 @@ fn read_package_file(
     let canon = full_path
         .canonicalize()
         .map_err(|e| refuse(full_path.clone(), why_io(&e)))?;
+    // The path has no `..` and no leading `/`, so only a link can lead out.
     if !canon.starts_with(&canon_root) {
-        return Err(refuse(full_path, LocalInputWhy::Outside));
+        return Err(refuse(full_path, LocalInputWhy::LinkOutside));
     }
     let meta = std::fs::metadata(&canon).map_err(|e| refuse(full_path.clone(), why_io(&e)))?;
     if !meta.is_file() {
@@ -1394,6 +1395,7 @@ mod tests {
         assert_eq!(why, LocalInputWhy::Outside, "{text}");
         assert!(!text.contains(SECRET), "{text}");
         assert!(text.contains("outside the package directory"), "{text}");
+        assert!(text.contains(LocalInputWhy::Outside.note()), "{text}");
     }
 
     #[test]
@@ -1420,8 +1422,10 @@ mod tests {
         std::os::unix::fs::symlink(&secret, pkg.join("link.txt")).unwrap();
 
         let (why, text) = refusal(decode_file_input(dir.path(), "Local", "link.txt"));
-        assert_eq!(why, LocalInputWhy::Outside, "{text}");
+        assert_eq!(why, LocalInputWhy::LinkOutside, "{text}");
         assert!(!text.contains(SECRET), "{text}");
+        assert!(text.contains("through a symlink"), "{text}");
+        assert!(text.contains(LocalInputWhy::LinkOutside.note()), "{text}");
     }
 
     #[test]
@@ -1431,6 +1435,7 @@ mod tests {
 
         let (why, text) = refusal(decode_file_input(dir.path(), "Local", "sub"));
         assert_eq!(why, LocalInputWhy::NotAFile, "{text}");
+        assert!(text.contains(LocalInputWhy::NotAFile.note()), "{text}");
     }
 
     #[test]
@@ -1440,6 +1445,7 @@ mod tests {
         let (why, text) = refusal(decode_file_input(dir.path(), "Local", "missing.txt"));
         assert_eq!(why, LocalInputWhy::NotFound, "{text}");
         assert!(text.contains("missing.txt"), "{text}");
+        assert!(text.contains(LocalInputWhy::NotFound.note()), "{text}");
     }
 
     #[test]
