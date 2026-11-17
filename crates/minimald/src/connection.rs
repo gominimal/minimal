@@ -1050,7 +1050,7 @@ mod tests {
     /// ends with its transport status 255. A row that minvmd released keeps
     /// its text, and a refused resume keeps its own status.
     #[test]
-    fn attach_refusal_sends_an_exit_status() {
+    fn attach_refusal_sends_an_exit_status_for_every_refusal() {
         use crate::box_actor::AttachError;
         let (line, code) = super::attach_refusal(&AttachError::BoxHostRowEnded);
         assert_eq!(code, 1);
@@ -1076,6 +1076,59 @@ mod tests {
         let (_, code) =
             super::attach_refusal(&AttachError::ResumeRefused(std::io::Error::other("x"), 3));
         assert_eq!(code, 3, "a refused resume keeps its own status");
+    }
+
+    /// The shell handler sends a refused attach's exit status on the
+    /// channel before it closes it, so the client's ssh ends with that
+    /// status, never with its transport status 255. The refusal here is an
+    /// attach while the box's workspace upload still streams.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_refusal_sends_an_exit_status_before_the_close() {
+        use crate::test_harness::{TestServer, create_session_req};
+        use minimald_rpc::CreateSession;
+        use russh::ChannelMsg;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = client
+            .call::<CreateSession>(&create_session_req("uploading-box", "/uwu"))
+            .await
+            .unwrap()
+            .id;
+        let handle = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        let upload = crate::rpc::WorkspaceUploadInFlight::begin(handle)
+            .await
+            .expect("the upload mark lands");
+
+        let mut channel = client.open_shell(session_id).await;
+        let mut text = Vec::new();
+        let mut exit_status = None;
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), channel.wait())
+                .await
+                .expect("the refused channel closes within the timeout");
+            match message {
+                Some(ChannelMsg::Data { data }) => text.extend_from_slice(&data),
+                Some(ChannelMsg::ExitStatus { exit_status: code }) => exit_status = Some(code),
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            }
+        }
+        let text = String::from_utf8_lossy(&text);
+        assert!(text.starts_with("Cannot attach to the box:"), "{text:?}");
+        assert_eq!(
+            exit_status,
+            Some(1),
+            "the exit status arrives before the close: {text:?}"
+        );
+        upload.finish().await.expect("the upload mark clears");
     }
 
     /// A refused attach names the box and its cause, not the session.
