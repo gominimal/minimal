@@ -591,11 +591,13 @@ pub async fn withdraw_box_row(
 /// [`HostUnreachable`] when the VM host daemon cannot be reached — the
 /// control socket cannot be connected to or exchanged with: the box's row
 /// cannot be asked back, so the attach or the exec fails closed.
-/// [`HostRefusal`] when the daemon answers with a refusal: the attach or the
-/// exec fails with the daemon's reason, which names the remedy, for example
-/// `min finalize-install --show` when the VM cannot reach the DNS service
-/// for box names. Without it, the attach goes on and the in-VM daemon
-/// refuses the launch with a text that hides the cause. A daemon that
+/// [`HostRefusal`] when the daemon refuses to give the box an address: the
+/// attach or the exec fails with the daemon's reason, which names the
+/// remedy, for example `min finalize-install --show` when the VM cannot
+/// reach the DNS service for box names. Without it, the attach goes on and
+/// the in-VM daemon refuses the launch with a text that hides the cause.
+/// The daemon's other refusals, and the refusal of a daemon that predates
+/// the resume, stay a warn line, and the attach or the exec goes on. A daemon that
 /// answers nothing within [`BOX_CONTROL_TIMEOUT`] stays a warn line
 /// (NET-138): this is a session that already exists, and the in-VM daemon's
 /// own row check before it relaunches the box's host is the gate that fails
@@ -621,9 +623,11 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
     .await;
     match resumed {
         Ok(Ok(Ok(_))) => Ok(()),
-        Ok(Ok(Err(error))) if error.downcast_ref::<HostRefusal>().is_some() => Err(error.context(
-            format!("the running VM refused to restore the network addresses of box {name}"),
-        )),
+        // The daemon's reason is a whole sentence that names the remedy, so
+        // the context adds only the box it is about.
+        Ok(Ok(Err(error))) if error.downcast_ref::<HostRefusal>().is_some() => {
+            Err(error.context(format!("box {name}")))
+        }
         Ok(Ok(Err(error))) => Err(error.context(format!(
             "asking the VM host daemon for box {name}'s host row back failed"
         ))),
@@ -1029,14 +1033,17 @@ mod tests {
         );
     }
 
-    /// A resume that the VM host daemon refuses fails the attach or the exec
-    /// with the daemon's reason, word for word, not a warn line.
-    #[tokio::test]
-    async fn resume_refusal_carries_the_vm_host_reason() {
+    /// minvmd's refusal to give a box an address, as it crosses the wire:
+    /// `allocate_box_address_keeping`'s prefix and minvmd's `NO_ANSWERER`.
+    const NO_ANSWERER: &str = "the running VM cannot reach Minimal's DNS service for box names, \
+                               so this box cannot be given an address; run `min \
+                               finalize-install --show` to check the service's setup, or see \
+                               minvmd.log for the cause (`min dirs` shows where logs are kept)";
+
+    /// Runs `resume_box_row` against a VM host daemon that answers the
+    /// resume with `reply`.
+    async fn resume_answered_with(reply: minimald_rpc::BoxControlReply) -> anyhow::Result<()> {
         use std::io::{BufRead as _, Write as _};
-        const REASON: &str = "the running VM cannot reach Minimal's DNS service for box \
-                              names, so this box cannot be given an address; run `min \
-                              finalize-install --show` to check the service's setup";
         let dir = tempfile::TempDir::new().unwrap();
         let (_, listener) = silent_vm_host(&dir);
         let daemon = std::thread::spawn(move || {
@@ -1050,29 +1057,49 @@ mod tests {
                 matches!(request, minimald_rpc::BoxControlRequest::ResumeBox(_)),
                 "{request:?}"
             );
-            let reply = minimald_rpc::BoxControlReply::Error {
-                error: REASON.to_string(),
-            };
             let mut reply = serde_json_lenient::to_string(&reply).unwrap();
             reply.push('\n');
             (&stream).write_all(reply.as_bytes()).unwrap();
         });
-        let error = resume_box_row(
+        let resumed = resume_box_row(
             &dir.path().join(paths::SSH_SOCK_FILE),
             Some(&own_ip_record(PAIR)),
         )
-        .await
-        .expect_err("a refused resume fails the attach");
+        .await;
         daemon.join().unwrap();
+        resumed
+    }
+
+    /// A resume that the VM host daemon refuses because it cannot give the
+    /// box an address fails the attach or the exec with the daemon's
+    /// reason, once, not a warn line. Its other refusals, and the refusal
+    /// of a daemon that cannot parse the resume, stay a warn line.
+    #[tokio::test]
+    async fn resume_refusal_carries_the_vm_host_reason() {
+        let wire = format!("{}{NO_ANSWERER}", crate::attach::NO_ADDRESS_REFUSAL);
+        assert!(wire.starts_with("could not give the box an address: the running VM"));
+        let error = resume_answered_with(minimald_rpc::BoxControlReply::Error { error: wire })
+            .await
+            .expect_err("a refused resume fails the attach");
         let refusal = error
             .downcast_ref::<HostRefusal>()
             .expect("the error is the daemon's refusal");
-        assert_eq!(refusal.reason(), REASON);
+        assert_eq!(refusal.reason(), NO_ANSWERER);
         assert!(error.downcast_ref::<HostUnreachable>().is_none());
-        assert_eq!(
-            format!("{error:#}"),
-            format!("the running VM refused to restore the network addresses of box web: {REASON}")
-        );
+        assert_eq!(format!("{error:#}"), format!("box web: {NO_ANSWERER}"));
+
+        for other in [
+            // minvmd's refusal when it holds no creation for the box.
+            "no box \"web\" is registered on this host to resume",
+            // A minvmd from before the resume cannot parse it.
+            "unknown variant `ResumeBox`, expected one of `RegisterBox`",
+        ] {
+            resume_answered_with(minimald_rpc::BoxControlReply::Error {
+                error: other.to_string(),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{other}: the attach goes on, not {error:#}"));
+        }
     }
 
     /// The blocking exchange behind a box row withdrawal ends with the

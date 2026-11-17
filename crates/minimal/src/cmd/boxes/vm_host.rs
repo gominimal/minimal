@@ -1453,14 +1453,17 @@ mod tests {
     /// reason, which names `min finalize-install --show`.
     #[tokio::test]
     async fn resume_refused_by_vm_host_names_its_reason() {
-        const REASON: &str = "the running VM cannot reach Minimal's DNS service for box \
-                              names, so this box cannot be given an address; run `min \
-                              finalize-install --show` to check the service's setup";
+        // minvmd's `NO_ANSWERER`, word for word.
+        const REASON: &str = "the running VM cannot reach Minimal's DNS service for box names, \
+                              so this box cannot be given an address; run `min \
+                              finalize-install --show` to check the service's setup, or see \
+                              minvmd.log for the cause (`min dirs` shows where logs are kept)";
         let dir = tempfile::TempDir::new().unwrap();
         let requests = fake_vm_host(
             dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
             serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error {
-                error: REASON.to_string(),
+                // minvmd's refusal as it crosses the wire.
+                error: format!("could not give the box an address: {REASON}"),
             })
             .unwrap(),
         )
@@ -1502,11 +1505,8 @@ mod tests {
             .downcast_ref::<minimal_client::box_registration::HostRefusal>()
             .expect("the error carries the VM host's refusal");
         assert_eq!(refusal.reason(), REASON);
-        let printed = format!("{error:#}");
-        assert!(
-            printed.contains("min finalize-install --show") && printed.contains("box web"),
-            "{printed}"
-        );
+        // The reason prints once, after the box it is about.
+        assert_eq!(format!("{error:#}"), format!("box web: {REASON}"));
     }
 
     /// NET-045/NET-138: the host-side registration carries the box's
