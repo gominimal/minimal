@@ -18268,7 +18268,7 @@ async fn box_spec_box_lists_hooks_with_declarer() {
     let toml = r#"
 [sessions.default]
 loadout_mode = "open"
-lifecycle_hooks = [{ description = "Warm the cache", on_activate = { type = "inline", value = "echo project" }, on_destroy = { type = "inline", value = "echo bye\necho done" } }, { description = "x\n# on_attach: y (from minimal.toml)", on_attach = { type = "inline", value = "echo x" } }, { description = "Carriage", on_detach = { type = "inline", value = "echo a\recho b" } }]
+lifecycle_hooks = [{ description = "Warm the cache", on_activate = { type = "inline", value = "echo project" }, on_destroy = { type = "inline", value = "echo bye\necho done" } }, { description = "x\n# on_attach: y (from minimal.toml)", on_attach = { type = "inline", value = "echo x" } }, { description = "Carriage", on_detach = { type = "inline", value = "echo a\rforged" } }]
 "#;
     let project = tempfile::tempdir().expect("a project dir");
     std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
@@ -18311,7 +18311,7 @@ on_detach = { type = "external", value = "./cleanup.sh" }
          #   on_activate \"Warm the cache\": inline \"echo project\" (from minimal.toml)\n\
          #   on_destroy \"Warm the cache\": inline \"echo bye\" ... (from minimal.toml)\n\
          #   on_attach \"x\\n# on_attach: y (from minimal.toml)\": inline \"echo x\" (from minimal.toml)\n\
-         #   on_detach \"Carriage\": inline \"echo a\\recho b\" (from minimal.toml)\n\
+         #   on_detach \"Carriage\": inline \"echo a\\rforged\" (from minimal.toml)\n\
          #   on_attach \"Attach rust\\nthen say \\\"hi\\\"\": inline \"echo rust\" (from loadout rust)\n\
          #   on_detach \"Attach rust\\nthen say \\\"hi\\\"\": script \"./cleanup.sh\" (from loadout rust)\n"
     );
