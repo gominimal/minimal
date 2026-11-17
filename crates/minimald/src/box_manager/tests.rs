@@ -7784,6 +7784,17 @@ async fn export_claim_granted_once_for_each_end() {
     assert_eq!(claim.end, 1);
     assert_eq!(claim.granted, paths(&["a.txt", "dist"]));
     assert!(claim.refused.is_empty());
+    // The box's record holds each grant before any report.
+    let entries = mngr.export_claim_entries(id).await.unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.box_id, entry.end, entry.path.as_str()))
+            .collect::<Vec<_>>(),
+        [(id, 1, "a.txt"), (id, 1, "dist")]
+    );
+    assert_eq!(entries[0].connection, entries[1].connection);
+    assert!(file_exported_events(&mngr, id).await.is_empty());
 
     // A second command that waits on the same end gets only what is free.
     let second = std::sync::Arc::new(());
@@ -7825,12 +7836,15 @@ async fn export_claim_granted_once_for_each_end() {
         serde_json_lenient::json!([{"path": "a.txt", "size": 9, "sha256": "ab".repeat(32)}])
     );
     assert_eq!(file_exported_events(&mngr, id).await, [event]);
-    // The event refuses the export from now on, so the daemon keeps no
-    // entry for it in memory.
-    assert!(
-        !super::export_claims().contains_key(&(id, 1, "a.txt".to_string())),
-        "a written report leaves no claim entry"
-    );
+    // A second report of the same export is refused.
+    let again = mngr
+        .report_export(
+            &export_report(id, 1, "a.txt"),
+            &std::sync::Arc::downgrade(&first),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(again.kind(), ErrorKind::PermissionDenied, "{again}");
 
     // A reported export stays refused for this end, even after its
     // command is gone.
@@ -7909,7 +7923,6 @@ async fn export_claim_released_for_unreported_exports_on_disconnect() {
     // The record keeps the report across a daemon restart, which starts
     // with no claim in memory.
     drop(mngr);
-    export_claims().retain(|(box_id, _, _), _| *box_id != id);
     let mngr = manager_over(state.path(), cache.path()).await;
     let after = std::sync::Arc::new(());
     let claim = mngr
@@ -7917,4 +7930,28 @@ async fn export_claim_released_for_unreported_exports_on_disconnect() {
         .await
         .unwrap();
     assert_eq!(claim.refused, paths(&["a.txt"]));
+
+    // A claim that an earlier daemon run wrote holds nothing, even when
+    // its connection id is live on this run.
+    let connection = super::export_claims()
+        .find(&std::sync::Arc::downgrade(&after))
+        .unwrap();
+    let reader = mngr.box_events(id).await.unwrap();
+    super::append_export_claims(
+        &reader.object,
+        &[super::ExportClaimEntry {
+            box_id: id,
+            end: claim.end,
+            path: "c.txt".to_string(),
+            connection,
+            boot: "an earlier run".to_string(),
+        }],
+    )
+    .unwrap();
+    let other = std::sync::Arc::new(());
+    let claim = mngr
+        .claim_exports(id, &paths(&["c.txt"]), &std::sync::Arc::downgrade(&other))
+        .await
+        .unwrap();
+    assert_eq!(claim.granted, paths(&["c.txt"]));
 }
