@@ -216,8 +216,7 @@ impl BoxSpec {
             packages,
             true,
             Entrypoint::Shell,
-            extra.as_ref(),
-            None,
+            extra.as_ref().map(|t| (t, None)),
             flags,
         )
     }
@@ -245,8 +244,7 @@ impl BoxSpec {
             &packages,
             true,
             Entrypoint::Shell,
-            Some(expanded),
-            Some(report),
+            Some((expanded, Some(report))),
             flags,
         )
     }
@@ -267,8 +265,7 @@ impl BoxSpec {
             &task.packages,
             false,
             Entrypoint::for_task(name),
-            Some(&settings_of(&task.extra)),
-            None,
+            Some((&settings_of(&task.extra), None)),
             flags,
         ))
     }
@@ -279,18 +276,19 @@ impl BoxSpec {
         packages: &[String],
         pty_enabled: bool,
         entrypoint: Entrypoint,
-        extra: Option<&toml::Table>,
-        report: Option<&ExpansionReport>,
+        // The entry's settings table, and the expansion's report for an
+        // expanded one.
+        extra: Option<(&toml::Table, Option<&ExpansionReport>)>,
         flags: SpecFlags,
     ) -> Self {
         // The entry's own keys that its table keeps among the ones it does
         // not read itself.
-        let hooks_on_resume = extra.is_some_and(|t| hooks_on_resume(t, report));
-        let timeout = extra.and_then(|t| entry_timeout(t, report));
+        let hooks_on_resume = extra.is_some_and(|(t, report)| hooks_on_resume(t, report));
+        let timeout = extra.and_then(|(t, report)| entry_timeout(t, report));
         // A spec that sets no lifetime keeps the `until_complete` that the
         // shipped `session` and `task` types declare.
         let lifetime = extra
-            .and_then(|t| entry_lifetime(t, report))
+            .and_then(|(t, report)| entry_lifetime(t, report))
             .unwrap_or(Lifetime::UntilComplete);
         let mut seen = std::collections::BTreeSet::new();
         let packages = packages
