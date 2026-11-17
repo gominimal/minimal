@@ -478,6 +478,47 @@ where
     outcomes
 }
 
+/// Names each granted export in `paths` on `err` as not copied, for
+/// `reason`, and reports each one to `reporter` with no files (BOX-195).
+/// A report that fails gets one line on `err` (BOX-200), and the reports
+/// stop there: the end of the connection releases the rest (BOX-202).
+pub(crate) async fn report_not_copied<E, R>(
+    reporter: &mut R,
+    paths: &[String],
+    label: &str,
+    reason: &str,
+    err: &mut E,
+) -> Vec<ExportOutcome>
+where
+    E: std::io::Write,
+    R: ExportReporter,
+{
+    let mut outcomes = Vec::with_capacity(paths.len());
+    let mut reporting = true;
+    for path in paths {
+        let _ = writeln!(
+            err,
+            "min did not copy `{path}` from box {label}, because {reason}."
+        );
+        let outcome = ExportOutcome {
+            path: path.clone(),
+            copied: false,
+            files: Vec::new(),
+        };
+        if reporting && let Err(why) = reporter.report(&outcome).await {
+            tracing::warn!(
+                box_label = label,
+                export = %path,
+                "file export: the report to the box's host failed: {why}"
+            );
+            let _ = writeln!(err, "{}", report_lost_line(path, label));
+            reporting = false;
+        }
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
 /// The stderr line for an export whose report the box's host did not
 /// confirm (BOX-200).
 pub(crate) fn report_lost_line(path: &str, label: &str) -> String {
@@ -924,18 +965,21 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
     if granted.is_empty() {
         return Vec::new();
     }
+    let unreadable = "min could not read the box's files";
     let channel = match client.open_box_subsystem(id, "sftp").await {
         Ok(channel) => channel,
         Err(e) => {
             tracing::warn!(box_id = %id, "file exports: open the box's files: {e:#}");
-            return not_copied(err, &granted, "min could not read the box's files");
+            let mut reporter = HostReport { client, id, end };
+            return report_not_copied(&mut reporter, &granted, label, unreadable, err).await;
         }
     };
     let sftp = match russh_sftp::client::SftpSession::new(channel.into_stream()).await {
         Ok(sftp) => sftp,
         Err(e) => {
             tracing::warn!(box_id = %id, "file exports: start the file conversation: {e}");
-            return not_copied(err, &granted, "min could not read the box's files");
+            let mut reporter = HostReport { client, id, end };
+            return report_not_copied(&mut reporter, &granted, label, unreadable, err).await;
         }
     };
     let mut files = BoxFiles { sftp };

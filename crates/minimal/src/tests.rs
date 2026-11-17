@@ -22060,6 +22060,36 @@ async fn lost_export_report_named_exit_unchanged() {
         "min did not copy `b.txt` from box web, because min could not confirm an earlier \
          export with the box's host. Run `min box wait web` in this project to copy it."
     );
+
+    // BOX-195: granted exports that min could not read are reported as
+    // skipped, with no files. The first lost report is named, and the
+    // reports stop there.
+    let mut err = Vec::new();
+    let mut reporter = LostReport(0);
+    let outcomes = cmd::report_not_copied(
+        &mut reporter,
+        &paths,
+        "web",
+        "min could not read the box's files",
+        &mut err,
+    )
+    .await;
+    assert_eq!(reporter.0, 1, "the reports stop after the first lost one");
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| !outcome.copied && outcome.files.is_empty())
+    );
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        format!(
+            "min did not copy `a.txt` from box web, because min could not read the box's files.\n\
+             {}\n\
+             min did not copy `b.txt` from box web, because min could not read the box's files.\n",
+            cmd::report_lost_line("a.txt", "web"),
+        )
+    );
 }
 
 // BOX-198, BOX-201, BOX-202: two commands wait on one end of a box. Each
