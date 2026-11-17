@@ -22328,8 +22328,8 @@ async fn refused_export_claim_copies_nothing() {
     );
     assert_eq!(
         cmd::claimed_elsewhere_line("out/report.txt", "build"),
-        "Export out/report.txt of box build was not copied: another min command claimed \
-         it. Run `min box events build` to see what happened to it."
+        "Export out/report.txt was not copied: another min command holds it or has \
+         already reported its result. Run `min box events build` to see that result."
     );
     assert_eq!(outcomes.len(), 1, "a refused export has no outcome");
     assert_eq!(outcomes[0].path, "notes.txt");

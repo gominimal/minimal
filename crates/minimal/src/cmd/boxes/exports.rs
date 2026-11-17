@@ -569,11 +569,11 @@ pub(crate) fn copy_stopped_line(path: &str, label: &str) -> String {
 
 /// The stderr line for an export that another command claimed for this
 /// end of the box (BOX-201). The other command holds the claim or reported
-/// the export, copied or not, so the line says only that it claimed it.
+/// the export, copied or not, so the line does not say that it was copied.
 pub(crate) fn claimed_elsewhere_line(path: &str, label: &str) -> String {
     format!(
-        "Export {path} of box {label} was not copied: another min command claimed it. \
-         Run `min box events {label}` to see what happened to it."
+        "Export {path} was not copied: another min command holds it or has already \
+         reported its result. Run `min box events {label}` to see that result."
     )
 }
 

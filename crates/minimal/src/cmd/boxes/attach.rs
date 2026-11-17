@@ -1527,9 +1527,6 @@ where
         && matches!(entry.state.as_str(), "stopped" | "exited")
     {
         let root = entry.project_root.as_ref();
-        // Interim: the outcomes go to no `file_exported` event, and no
-        // claim gates the copy (BOX-195 and BOX-198,
-        // gominimal/minimal#3446). See `copy_box_exports`.
         let outcomes = copy_box_exports_on_host(
             &target.host,
             target.box_id,
