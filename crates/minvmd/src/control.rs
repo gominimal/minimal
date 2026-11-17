@@ -206,6 +206,11 @@ const GUEST_REPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// name, a port list, and a policy; anything past this bound is not one.
 const MAX_REQUEST_LINE: usize = 64 * 1024;
 
+/// How much of a parse refusal's message the debug line names: the
+/// parser's own words, and the verb list an unknown verb is answered with,
+/// fit; a line's worth of a guest's quoted bytes does not.
+const MAX_LOGGED_PARSE_ERROR: usize = 512;
+
 /// How many times one VM start may ask the guest to publish the hostname
 /// proxy (T93): the first boot plus every redraw an address-in-use publish
 /// forced. A constant, not a configuration: the bound exists to end a start
@@ -869,7 +874,14 @@ fn serve_connection(
         Ok(request) => request,
         Err(error) => {
             let error = error.to_string();
-            tracing::debug!(error = %error, "box control request did not parse");
+            // The parser's message can quote the line's own words — an
+            // unknown verb or field is named as it was spelled — and on the
+            // guest door the line is the guest's, so the log names it
+            // escaped. The reply carries it as JSON does, escaped already.
+            tracing::debug!(
+                error = %crate::loggable::text_within(&error, MAX_LOGGED_PARSE_ERROR),
+                "box control request did not parse"
+            );
             return write_reply(&mut stream, &BoxControlReply::Error { error });
         }
     };

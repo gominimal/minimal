@@ -67,5 +67,29 @@ else
   bad "long sleep: got exit $rc after ${elapsed}s, want 124 well before 30s"
 fi
 
+# The watcher ends CMD and then says so with its exit code. The caller stops
+# the watcher as soon as CMD is gone, so that stop can land between the two.
+# This case holds that moment open: every kill that succeeds is followed by a
+# pause, so the caller's stop always arrives while the watcher is between its
+# kill and its exit. The answer must still be 124.
+rc=0
+t0=$SECONDS
+(
+  PATH="$root/bin"
+  # The helper calls it: a function of this name stands in for the builtin.
+  # shellcheck disable=SC2329
+  kill() {
+    builtin kill "$@" || return
+    sleep 1
+  }
+  e2e_timeout 1 sleep 30
+) || rc=$?
+elapsed=$((SECONDS - t0))
+if [ "$rc" -eq 124 ] && [ "$elapsed" -lt 10 ]; then
+  ok "a stop that lands after the watcher's kill still ends with 124"
+else
+  bad "stop after the kill: got exit $rc after ${elapsed}s, want 124 well before 30s"
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

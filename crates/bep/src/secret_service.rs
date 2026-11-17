@@ -417,6 +417,10 @@ impl HeldKey for SecretServiceKey {
         self.role
     }
 
+    fn store(&self) -> Option<&'static str> {
+        Some("secret-service")
+    }
+
     fn public(&self) -> ProxyPublicKey {
         ProxyPublicKey::from_sec1_bytes(&self.secret.public_key().to_sec1_bytes())
             .expect("a P-256 public key")
@@ -594,6 +598,17 @@ esac
             ]
         );
         assert_eq!(kids(&store), first, "a restart loads the held keys");
+    }
+
+    // BEP-090
+    #[test]
+    fn each_held_key_names_its_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fake(dir.path());
+        let keys = load(&store, &[]).unwrap();
+        for role in Role::ALL {
+            assert_eq!(keys.get(role).store(), Some("secret-service"));
+        }
     }
 
     // BEP-060, BEP-089

@@ -1034,12 +1034,14 @@ where
 }
 
 /// What the attach channel carries for a refused attach: the line the
-/// client's terminal shows, and the exit status its ssh ends with.
+/// client's terminal shows (BCLI-068), and the exit status its ssh ends with.
 fn attach_refusal(error: &crate::box_actor::AttachError) -> (String, u32) {
-    (
-        format!("Error attaching to session: {error}\r\n"),
-        error.exit_code(),
-    )
+    (attach_refusal_line(error), error.exit_code())
+}
+
+/// The line a refused attach writes to the client's terminal (BCLI-068).
+fn attach_refusal_line(cause: &impl std::fmt::Display) -> String {
+    format!("Cannot attach to the box: {cause}\r\n")
 }
 
 #[cfg(test)]
@@ -1074,6 +1076,15 @@ mod tests {
         let (_, code) =
             super::attach_refusal(&AttachError::ResumeRefused(std::io::Error::other("x"), 3));
         assert_eq!(code, 3, "a refused resume keeps its own status");
+    }
+
+    /// A refused attach names the box and its cause, not the session.
+    #[test]
+    fn attach_refusal_line_names_the_box() {
+        assert_eq!(
+            super::attach_refusal_line(&"the box is stopping"),
+            "Cannot attach to the box: the box is stopping\r\n"
+        );
     }
 
     /// A direct-tcpip open from the native client carries the CLI's

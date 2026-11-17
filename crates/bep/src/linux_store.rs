@@ -66,6 +66,12 @@ impl<T: HeldKey, S: HeldKey> HeldKey for LinuxKey<T, S> {
         }
     }
 
+    fn store(&self) -> Option<&'static str> {
+        // The inherent `store` names the variant, so a test key inside a
+        // variant still reports the store that variant stands for.
+        Some(LinuxKey::store(self))
+    }
+
     fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
         match self {
             Self::Tpm(key) => key.agree(peer),
@@ -441,6 +447,22 @@ mod tests {
             let keys = load(&headless, &[]).expect("a first start");
             assert_eq!(stores(&keys), [TPM; 3]);
         }
+    }
+
+    // BEP-090: the trait names the store each key is in, so the published
+    // identity can carry it. A key outside a host store names none.
+    #[test]
+    fn each_held_key_names_its_store() {
+        let partial = store();
+        partial.tpm.fail_generation_of(Role::Root);
+        let keys = load(&partial, &[]).expect("a first start");
+        let named: Vec<_> = Role::ALL
+            .map(|role| HeldKey::store(keys.get(role)))
+            .to_vec();
+        assert_eq!(named, [Some("tpm"), Some("secret-service"), Some("tpm")]);
+
+        let memory = load(&MemoryStore::default(), &[]).expect("a first start");
+        assert_eq!(HeldKey::store(&memory.sealing), None);
     }
 
     // BEP-088

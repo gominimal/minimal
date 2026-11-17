@@ -2135,6 +2135,17 @@ pub struct PolicyWarnLimiter {
     last: Mutex<HashMap<String, HashMap<String, Instant>>>,
 }
 
+/// Who a violation line is about: the box's switch address, the
+/// `session_id` the line and the rate limit are keyed on, and the box's own
+/// name when the gate has one (`None` for a gate built with none). The
+/// address means nothing once the box is gone, so a reader gets the name
+/// beside it (gominimal/inbox#1228).
+#[derive(Debug, Clone, Copy)]
+pub struct Offender<'a> {
+    pub session_id: &'a str,
+    pub box_name: Option<&'a str>,
+}
+
 impl PolicyWarnLimiter {
     /// A fresh limiter that has never emitted for any box or rule.
     #[must_use]
@@ -2167,7 +2178,8 @@ impl PolicyWarnLimiter {
     }
 
     /// Emits a rate-limited `tracing::warn!` for a policy violation, carrying
-    /// R2.7's required structured fields: the `session_id`, the `direction` of
+    /// R2.7's required structured fields: the `session_id` and `box` the
+    /// [`Offender`] carries, the `direction` of
     /// the offending traffic, the `remote_addr` it was to/from (rendered as
     /// `none` when the frame had no IP destination to read, as for an IPv6 or
     /// truncated drop), its `proto`, the `dst_port` the traffic targeted
@@ -2177,17 +2189,22 @@ impl PolicyWarnLimiter {
     /// was emitted (vs. suppressed by the rate limit).
     pub fn warn(
         &self,
-        session_id: &str,
+        offender: Offender<'_>,
         direction: Direction,
         remote_addr: Option<SocketAddr>,
         proto: Proto,
         dst_port: Option<u16>,
         rule_matched: &str,
     ) -> bool {
+        let Offender {
+            session_id,
+            box_name,
+        } = offender;
         if self.should_warn_at(session_id, rule_matched, Instant::now()) {
             let remote_addr = remote_addr.map_or_else(|| "none".to_string(), |a| a.to_string());
             tracing::warn!(
                 session_id,
+                box = box_name,
                 %direction,
                 %remote_addr,
                 %proto,
@@ -2699,7 +2716,10 @@ mod tests {
             .into_iter()
             .filter(|&dst_port| {
                 limiter.warn(
-                    "box",
+                    Offender {
+                        session_id: "box",
+                        box_name: Some("b"),
+                    },
                     Direction::Ingress,
                     src,
                     Proto::from_ipproto(IpProto::Tcp),
