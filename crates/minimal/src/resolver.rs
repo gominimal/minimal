@@ -5094,12 +5094,14 @@ pub struct DnsServiceState {
 }
 
 /// [`vm_host_answerer_line`] with the installed DNS service's state read
-/// beside it: when another program holds the answerer's port, and that
-/// program is Minimal's own DNS service job — loaded, holding the port its
-/// unit binds, and not running — the line names that service in place of
-/// "another program". It names `min finalize-install` only when that
-/// command offers the reinstall. `min ls` and the session start both print
-/// this line. Pure.
+/// beside it: when the answerer's port is held with no channel behind it,
+/// and Minimal's own DNS service job is loaded and not running, the line
+/// names that service in place of "another program". It says only that
+/// the port is in use, not who holds it: the service manager binds the
+/// port for the job, but a socket that failed to bind leaves the job
+/// loaded while another program holds the port. It names `min
+/// finalize-install` only when that command offers the reinstall. `min
+/// ls` and the session start both print this line. Pure.
 #[must_use]
 pub fn vm_host_answerer_line_beside(
     status: ZoneAnswererStatus,
@@ -5149,16 +5151,16 @@ pub async fn dns_service_state_on_this_host<'a>(
     }
 }
 
-/// The DNS SERVICE line for Minimal's own DNS service when its job holds
-/// the port and its program is not running. The line names `min
+/// The DNS SERVICE line for Minimal's own DNS service when its port is in
+/// use and its program is not running. It does not name the holder. The line names `min
 /// finalize-install` only when `reinstall_offered`: that command then
 /// offers the reinstall ([`AnswererStep::reinstall_offered`]). Otherwise
 /// the line states the situation and stops.
 #[must_use]
 pub fn failing_dns_service_line(port: u16, reinstall_offered: bool) -> String {
     let line = format!(
-        "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} (UDP). The \
-         service is not running."
+        "box names are not answered: Minimal's DNS service is not running. Port \
+         127.0.0.1:{port} (UDP) is in use."
     );
     if reinstall_offered {
         format!("{line} Run `min finalize-install` to reinstall it.")
@@ -10730,8 +10732,8 @@ resolvectl domain minzone0 '~min.internal'
             vm_host_answerer_line_beside(held.clone(), failing(true)).as_deref(),
             Some(
                 format!(
-                    "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} \
-                     (UDP). The service is not running. Run `min finalize-install` to \
+                    "box names are not answered: Minimal's DNS service is not running. Port \
+                     127.0.0.1:{port} (UDP) is in use. Run `min finalize-install` to \
                      reinstall it."
                 )
                 .as_str()
@@ -10743,8 +10745,8 @@ resolvectl domain minzone0 '~min.internal'
             vm_host_answerer_line_beside(held.clone(), failing(false)).as_deref(),
             Some(
                 format!(
-                    "box names are not answered: Minimal's DNS service holds 127.0.0.1:{port} \
-                     (UDP). The service is not running."
+                    "box names are not answered: Minimal's DNS service is not running. Port \
+                     127.0.0.1:{port} (UDP) is in use."
                 )
                 .as_str()
             )
