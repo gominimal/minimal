@@ -17,6 +17,7 @@ use std::path::Path;
 
 use common::setup;
 use minimal::GlobalArgs;
+use minimal::diag::answerer;
 use minimal::diag::upload::DEFAULT_ENDPOINT;
 use minimal::diag::{BugArgs, PortalArgs, cmd_bug};
 
@@ -288,6 +289,211 @@ async fn the_answerer_service_is_described() {
             }
         }
     }
+    // macOS: the service's log, or a skip that says why it is absent.
+    if cfg!(target_os = "macos") && find(&files, answerer::LOG_ENTRY).is_none() {
+        let (_, reason) = skips
+            .iter()
+            .find(|(what, _)| what == answerer::LOG_ENTRY)
+            .unwrap_or_else(|| panic!("the log is collected or skipped: {skips:?}"));
+        assert!(
+            reason.starts_with("absent") || reason.starts_with("unreadable"),
+            "{reason}"
+        );
+    }
+}
+
+/// A fixture `minzoned` that prints `version` for `--version`.
+fn fixture_program(dir: &Path, name: &str, version: &str) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// A command that prints the fixture file `name` holding `text`.
+fn fixture_transcript(dir: &Path, name: &str, text: &str) -> answerer::CommandSpec {
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    answerer::CommandSpec {
+        program: "cat".to_string(),
+        args: vec![path.to_str().unwrap().to_string()],
+    }
+}
+
+/// Collects the answerer entries from `sources` alone, and returns the
+/// unpacked bundle and its manifest's skips.
+async fn answerer_bundle(
+    sources: &answerer::AnswererSources,
+) -> (BTreeMap<String, Vec<u8>>, Vec<(String, String)>) {
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    let mut w = diagnostics::BundleWriter::create(&out, "r", "v")
+        .await
+        .unwrap();
+    answerer::answerer_from(&mut w, sources, diagnostics::LOG_TAIL_CAP)
+        .await
+        .unwrap();
+    w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    let files = unpack(&out).await;
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let skips = manifest["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["what"].as_str().unwrap().to_string(),
+                s["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    (files, skips)
+}
+
+/// The answerer service as a host that will not start it shows it: an
+/// installed copy and a shipped copy that differ, a service manager that
+/// reports exit 1, a journal, and a log with the service's last words. The
+/// bundle carries each copy's version and SHA-256, both transcripts and
+/// the log, byte for byte.
+#[tokio::test]
+async fn the_answerer_service_is_described_from_fixtures() {
+    use sha2::Digest as _;
+    let dir = tempfile::TempDir::new().unwrap();
+    let installed = fixture_program(dir.path(), "installed-minzoned", "minzoned 0.9.0");
+    let shipped = fixture_program(dir.path(), "shipped-minzoned", "minzoned 1.0.0");
+    let service_text =
+        "system/dev.gominimal.zone = {\n\tstate = not running\n\tlast exit code = 1\n}\n";
+    let journal_text = "2026-11-17T10:00:00+0000 host systemd[1]: minzoned.service: Failed with result 'exit-code'.\n";
+    let log_text = "2026-11-17T10:00:00Z ERROR minzoned: no socket named Listener\n";
+    let log = dir.path().join("minzoned.log");
+    std::fs::write(&log, log_text).unwrap();
+    let unit = dir.path().join("dev.gominimal.zone.plist");
+    std::fs::write(
+        &unit,
+        format!(
+            "<key>StandardErrorPath</key>\n<string>{}</string>\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    let sources = answerer::AnswererSources {
+        installed: Some(installed.clone()),
+        shipped: Some(shipped.clone()),
+        service: fixture_transcript(dir.path(), "service.txt", service_text),
+        journal: Some(fixture_transcript(dir.path(), "journal.txt", journal_text)),
+        log: Some(answerer::LogSource {
+            path: log.to_str().unwrap().to_string(),
+            unit: unit.to_str().unwrap().to_string(),
+        }),
+    };
+    let (files, skips) = answerer_bundle(&sources).await;
+    assert!(skips.is_empty(), "nothing is skipped: {skips:?}");
+
+    let report: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "host/answerer.json").expect("answerer.json"))
+            .unwrap();
+    for (copy, path, version) in [
+        ("installed", &installed, "minzoned 0.9.0"),
+        ("shipped", &shipped, "minzoned 1.0.0"),
+    ] {
+        let entry = &report[copy];
+        let sha = hex::encode(sha2::Sha256::digest(std::fs::read(path).unwrap()));
+        assert_eq!(entry["path"].as_str(), Some(path.as_str()), "{entry}");
+        assert_eq!(entry["version"].as_str(), Some(version), "{entry}");
+        assert_eq!(entry["sha256"].as_str(), Some(sha.as_str()), "{entry}");
+        assert_eq!(entry["errors"].as_array().map(Vec::len), Some(0), "{entry}");
+    }
+    assert_eq!(report["same_bytes"].as_bool(), Some(false), "{report}");
+
+    for (entry, text) in [
+        ("host/answerer-service.txt", service_text),
+        ("host/answerer-journal.txt", journal_text),
+    ] {
+        let got = String::from_utf8_lossy(find(&files, entry).expect(entry)).into_owned();
+        assert!(
+            got.starts_with("$ cat "),
+            "{entry} names its command: {got}"
+        );
+        assert!(got.contains(text), "{entry} holds the transcript: {got}");
+        assert!(got.ends_with("--- exit status: 0 ---\n"), "{entry}: {got}");
+    }
+    assert_eq!(
+        find(&files, answerer::LOG_ENTRY).map(|b| String::from_utf8_lossy(b).into_owned()),
+        Some(log_text.to_string()),
+        "the bundle holds the service's log"
+    );
+}
+
+/// A log that is not there is a skip that says why. A unit from before
+/// the log names none, and the skip names the command that adds it.
+#[tokio::test]
+async fn the_answerer_service_is_described_when_its_log_is_absent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let log = dir
+        .path()
+        .join("minzoned.log")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let unit = dir.path().join("dev.gominimal.zone.plist");
+    let mut sources = answerer::AnswererSources {
+        installed: None,
+        shipped: None,
+        service: fixture_transcript(dir.path(), "service.txt", "state = running\n"),
+        journal: None,
+        log: Some(answerer::LogSource {
+            path: log.clone(),
+            unit: unit.to_str().unwrap().to_string(),
+        }),
+    };
+    let skip_of = |skips: &[(String, String)]| {
+        skips
+            .iter()
+            .find(|(what, _)| what == answerer::LOG_ENTRY)
+            .map(|(_, reason)| reason.clone())
+            .unwrap_or_else(|| panic!("the log is skipped: {skips:?}"))
+    };
+
+    // No unit at all: the service is not installed.
+    let (_, skips) = answerer_bundle(&sources).await;
+    let reason = skip_of(&skips);
+    assert!(reason.contains("not installed"), "{reason}");
+
+    // A unit from before the log.
+    std::fs::write(&unit, "<key>ProgramArguments</key>\n").unwrap();
+    let (files, skips) = answerer_bundle(&sources).await;
+    assert!(find(&files, answerer::LOG_ENTRY).is_none());
+    let reason = skip_of(&skips);
+    assert!(
+        reason.contains("predates its log") && reason.contains("min finalize-install"),
+        "{reason}"
+    );
+
+    // A unit that names the log, whose file is gone.
+    std::fs::write(
+        &unit,
+        format!("<key>StandardErrorPath</key>\n<string>{log}</string>\n"),
+    )
+    .unwrap();
+    let (_, skips) = answerer_bundle(&sources).await;
+    let reason = skip_of(&skips);
+    assert!(
+        reason.contains(&log) && reason.contains("min finalize-install"),
+        "{reason}"
+    );
+
+    // No log source: no entry and no skip.
+    sources.log = None;
+    let (files, skips) = answerer_bundle(&sources).await;
+    assert!(find(&files, answerer::LOG_ENTRY).is_none());
+    assert!(
+        skips.iter().all(|(what, _)| what != answerer::LOG_ENTRY),
+        "{skips:?}"
+    );
 }
 
 /// A project laid out under `.minimal/`.

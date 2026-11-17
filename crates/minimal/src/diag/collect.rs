@@ -270,19 +270,13 @@ pub struct LogPrefix {
 }
 
 /// The prefixes [`logs`] harvests from `<state>/logs`.
-const LOG_PREFIXES: [LogPrefix; 3] = [
+const LOG_PREFIXES: [LogPrefix; 2] = [
     LogPrefix {
         name: "minimald.log",
         locality: Locality::HostOrGuest,
     },
     LogPrefix {
         name: "minvmd.log",
-        locality: Locality::Host,
-    },
-    // The answerer service's stdout and stderr, which its launchd unit
-    // sends here on macOS (`resolver::ANSWERER_LOG_FILE`).
-    LogPrefix {
-        name: crate::resolver::ANSWERER_LOG_FILE,
         locality: Locality::Host,
     },
 ];
@@ -1352,11 +1346,7 @@ mod tests {
         logs(&mut w, &paths, diagnostics::LOG_TAIL_CAP, &mut absent)
             .await
             .unwrap();
-        assert_eq!(
-            absent.len(),
-            LOG_PREFIXES.len(),
-            "no prefix matched anything on the host"
-        );
+        assert_eq!(absent.len(), 2, "both prefixes matched nothing on the host");
 
         // The guest fetch nested the daemon's own bundle, which carries the
         // very files the host state dir lacks.
