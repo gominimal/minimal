@@ -23,7 +23,7 @@ an unconfined program from creating a user namespace. The sandbox child dies
 writing its uid map before it runs anything, so *no* session can start:
 
 ```
-DIAG hakoniwa container/process exited non-zero code=125 exit_code=None
+session process exited non-zero code=125 exit_code=None
   reason=write("/proc/self/uid_map", ..) => Operation not permitted (os error 1)
 ```
 

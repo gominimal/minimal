@@ -1155,6 +1155,62 @@ async fn an_unrequested_kill_still_warns_abnormal() {
     );
 }
 
+/// The level a box's exit is logged at. A box the daemon killed reaps with
+/// the same SIGKILL account an out-of-memory kill gives, so only the kill
+/// the daemon sent turns it into a debug line; the same account with no kill
+/// sent stays a warning, and so does a non-zero exit the command made itself.
+#[test]
+fn a_box_the_daemon_killed_logs_its_exit_at_debug() {
+    let sigkill = signalled("container received signal SIGKILL");
+    assert_eq!(exit_log_level(&sigkill, true), tracing::Level::DEBUG);
+    assert_eq!(exit_log_level(&sigkill, false), tracing::Level::WARN);
+    assert_eq!(exit_log_level(&exited(1), false), tracing::Level::WARN);
+    // The command exited before the kill reached it: its own failure.
+    assert_eq!(exit_log_level(&exited(1), true), tracing::Level::WARN);
+    assert_eq!(exit_log_level(&exited(0), false), tracing::Level::INFO);
+    assert_eq!(exit_log_level(&exited(0), true), tracing::Level::INFO);
+}
+
+/// The kill flag the level rests on is set by the process handle's own
+/// `kill` and by nothing else: a process killed through the handle reaps as
+/// a debug exit, the same process killed from outside reaps as a warning.
+#[test]
+fn only_a_kill_through_the_handle_marks_the_exit_as_requested() {
+    let spawn = || {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn sleep");
+        MockProcess::new(MockBackend { child })
+    };
+
+    let mut requested = spawn();
+    requested.kill().expect("kill through the handle");
+    requested.wait().expect("reap the killed process");
+    let reason = requested.exit_reason().expect("reaped");
+    assert_eq!(
+        exit_log_level(&reason, requested.killed),
+        tracing::Level::DEBUG
+    );
+
+    let mut unrequested = spawn();
+    let pid = libc::pid_t::try_from(unrequested.container_pid()).expect("pid fits in pid_t");
+    // SAFETY: `kill` takes plain integers; `pid` is the child this test
+    // spawned, which has not been reaped yet.
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(rc, 0, "failed to SIGKILL the child");
+    unrequested.wait().expect("reap the killed process");
+    let reason = unrequested.exit_reason().expect("reaped");
+    assert!(
+        reason.is_abnormal(),
+        "a SIGKILL is an abnormal end: {reason:?}"
+    );
+    assert_eq!(
+        exit_log_level(&reason, unrequested.killed),
+        tracing::Level::WARN
+    );
+}
+
 /// Precedence: the launcher `baseline` sits below the client-forwarded
 /// `inherited`, which sits below the composition, which sits below the
 /// per-connection `connection` facts. Later layers win on a shared key;

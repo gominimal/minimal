@@ -89,10 +89,32 @@ pub(crate) trait ProcessBackend: Send + 'static {
     fn wait(&mut self) -> io::Result<ExitReport>;
     /// See [`BoxProcess::kill`].
     fn kill(&mut self) -> io::Result<()>;
-    /// Logs the backend's account of an observed exit. Called exactly once per
-    /// session by [`HostProcess::record_exit`]; the default is silent, so a
-    /// backend with nothing to say (the mock) need not implement it.
-    fn log_exit(_reason: &ExitReason) {}
+    /// Logs the backend's account of an observed exit, `killed` saying whether
+    /// the daemon itself had killed the process (see [`exit_log_level`]).
+    /// Called exactly once per session by [`HostProcess::record_exit`]; the
+    /// default is silent, so a backend with nothing to say (the mock) need not
+    /// implement it.
+    fn log_exit(_reason: &ExitReason, _killed: bool) {}
+}
+
+/// The level a box's exit is logged at.
+///
+/// A clean exit is info. A non-zero one is a warning unless the daemon ended
+/// the box itself: a destroy, a forced stop or a daemon shutdown kills the
+/// process, which then reaps as `container received signal SIGKILL` with
+/// code 125, the same account an out-of-memory kill or any other outside
+/// SIGKILL gives. So the reason cannot tell them apart, and the decision rests
+/// on `killed`, which is set only when [`BoxProcess::kill`] succeeded. An
+/// exit the process made on its own (`exit_code` is `Some`) stays a warning
+/// even then: it ended before the kill could reach it.
+pub(super) fn exit_log_level(reason: &ExitReason, killed: bool) -> tracing::Level {
+    if reason.code == 0 {
+        tracing::Level::INFO
+    } else if killed && reason.is_abnormal() {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    }
 }
 
 /// The single [`BoxProcess`] implementation, generic over the backend that
@@ -103,6 +125,9 @@ pub(crate) struct HostProcess<B: ProcessBackend> {
     backend: B,
     /// The reason captured at the reap; `None` until then.
     exit: Option<ExitReason>,
+    /// Whether the daemon killed the process: set when [`BoxProcess::kill`]
+    /// succeeds, and read when the exit is logged (see [`exit_log_level`]).
+    pub(super) killed: bool,
 }
 
 impl<B: ProcessBackend> HostProcess<B> {
@@ -110,6 +135,7 @@ impl<B: ProcessBackend> HostProcess<B> {
         Self {
             backend,
             exit: None,
+            killed: false,
         }
     }
 
@@ -121,7 +147,7 @@ impl<B: ProcessBackend> HostProcess<B> {
     /// already saw the death would otherwise log the same end twice.
     fn record_exit(&mut self, report: ExitReport) -> i32 {
         if self.exit.is_none() {
-            B::log_exit(&report.reason);
+            B::log_exit(&report.reason, self.killed);
             self.exit = Some(report.reason);
         }
         report.code
@@ -144,7 +170,9 @@ impl<B: ProcessBackend> BoxProcess for HostProcess<B> {
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        self.backend.kill()
+        self.backend.kill()?;
+        self.killed = true;
+        Ok(())
     }
 
     fn exit_reason(&self) -> Option<ExitReason> {
@@ -209,20 +237,28 @@ impl ProcessBackend for SandboxBackend {
     /// (gated by [`HostProcess::record_exit`]'s cache): `hakoniwa` caches the
     /// status, so a `wait` following a `try_wait` that already saw it would
     /// otherwise log the same death twice.
-    fn log_exit(reason: &ExitReason) {
-        if reason.code != 0 {
-            tracing::warn!(
-                code = reason.code,
-                exit_code = ?reason.exit_code,
-                reason = %reason.reason,
-                "DIAG hakoniwa container/process exited non-zero"
-            );
-        } else {
+    fn log_exit(reason: &ExitReason, killed: bool) {
+        let level = exit_log_level(reason, killed);
+        if level == tracing::Level::INFO {
             tracing::info!(
                 code = reason.code,
                 exit_code = ?reason.exit_code,
                 reason = %reason.reason,
                 "hakoniwa container/process exited"
+            );
+        } else if level == tracing::Level::DEBUG {
+            tracing::debug!(
+                code = reason.code,
+                exit_code = ?reason.exit_code,
+                reason = %reason.reason,
+                "session process ended after the daemon killed it"
+            );
+        } else {
+            tracing::warn!(
+                code = reason.code,
+                exit_code = ?reason.exit_code,
+                reason = %reason.reason,
+                "session process exited non-zero"
             );
         }
     }
