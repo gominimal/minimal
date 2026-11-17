@@ -554,6 +554,11 @@ FORCE_STOP=
 # already reached.
 BIN_ON_PATH=
 
+# XDG_CACHE_HOME the installer sees. Empty means $hp/xdg-cache; a scenario sets
+# a relative value (from inside its own home, so nothing resolves outside it)
+# to drive the purge's absolute-path rule.
+CACHE_HOME=
+
 # run <label> <homeprefix> [args...] ; sets rc, captures combined output in $OUT.
 OUT=
 run() {
@@ -568,7 +573,7 @@ run() {
         MINIMAL_BIN="$hp/bin" \
         XDG_DATA_HOME="$hp/xdg-data" \
         XDG_STATE_HOME="$hp/xdg-state" \
-        XDG_CACHE_HOME="$hp/xdg-cache" \
+        XDG_CACHE_HOME="${CACHE_HOME:-$hp/xdg-cache}" \
         XDG_CONFIG_HOME="$hp/xdg-config" \
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
         STUB_UNAME_S="$PLAT_S" \
@@ -2239,6 +2244,57 @@ case_uninstall() {
     run u5_purge "$HU5" --uninstall --purge
     check 0 "$rc" "uninstall --purge exits 0"
     want_err "purge removes the cache tree (R8.2)" test -e "$HU5/xdg-cache/minimal"
+    want_err "purge removes the data tree (R8.2)" test -e "$HU5/xdg-data/minimal"
+    want_err "purge removes the state tree (R8.2)" test -e "$HU5/xdg-state/minimal"
+
+    # R8.2 on macOS — the runtime's cache is ~/Library/Caches/minimal (the
+    # platform cache dir), not the XDG path, so --purge removes it too, and the
+    # XDG one as before. Another app's cache beside it is never touched.
+    HU5D="$root/hu5_darwin"; mkdir -p "$HU5D"
+    PLAT_S=Darwin; PLAT_M=arm64
+    run u5d_install "$HU5D"
+    check 0 "$rc" "darwin: purge seed install exits 0"
+    mac_stray="$HU5D/Library/Caches/minimal/built/deadbeef"
+    xdg_stray="$HU5D/xdg-cache/minimal/built/deadbeef"
+    other_app="$HU5D/Library/Caches/other-app/keep"
+    mkdir -p "${mac_stray%/*}" "${xdg_stray%/*}" "${other_app%/*}"
+    printf 'artifact\n' >"$mac_stray"
+    printf 'artifact\n' >"$xdg_stray"
+    printf 'theirs\n' >"$other_app"
+    run u5d_dry "$HU5D" --uninstall --purge --dry-run
+    check 0 "$rc" "darwin: uninstall --purge --dry-run exits 0"
+    want_ok "darwin: dry-run names the platform cache tree" \
+        grep -qF "would purge $HU5D/Library/Caches/minimal" "$OUT"
+    want_ok "darwin: dry-run keeps the platform cache tree" test -f "$mac_stray"
+    run u5d_purge "$HU5D" --uninstall --purge
+    check 0 "$rc" "darwin: uninstall --purge exits 0"
+    want_err "darwin: purge removes ~/Library/Caches/minimal (R8.2)" \
+        test -e "$HU5D/Library/Caches/minimal"
+    want_err "darwin: purge removes the XDG cache tree (R8.2)" test -e "$HU5D/xdg-cache/minimal"
+    want_ok "darwin: purge leaves another app's cache" test -f "$other_app"
+    PLAT_S=Linux; PLAT_M=x86_64
+
+    # R8.2 — a relative XDG_CACHE_HOME is not a cache dir: the runtime ignores
+    # it and writes ~/.cache/minimal, so --purge removes that and never the
+    # relative path (which would resolve against the current directory). Runs
+    # from inside the scenario home, so a regression stays inside it.
+    HU5R="$root/hu5_relative"; mkdir -p "$HU5R"
+    run u5r_install "$HU5R"
+    rel_keep="$HU5R/rel-cache/minimal/keep"
+    home_stray="$HU5R/.cache/minimal/built/deadbeef"
+    mkdir -p "${rel_keep%/*}" "${home_stray%/*}"
+    printf 'not ours\n' >"$rel_keep"
+    printf 'artifact\n' >"$home_stray"
+    _u5r_cwd="$(pwd)"
+    cd "$HU5R" || exit 1
+    CACHE_HOME=rel-cache
+    run u5r_purge "$HU5R" --uninstall --purge
+    CACHE_HOME=
+    cd "$_u5r_cwd" || exit 1
+    check 0 "$rc" "relative XDG_CACHE_HOME: uninstall --purge exits 0"
+    want_err "relative XDG_CACHE_HOME: purge removes ~/.cache/minimal (R8.2)" \
+        test -e "$HU5R/.cache/minimal"
+    want_ok "relative XDG_CACHE_HOME: purge leaves the relative path" test -f "$rel_keep"
 
     # R7.3 — a non-regular file now occupying a recorded path is never removed, even
     # with --force (the installer only ever wrote regular files there).
