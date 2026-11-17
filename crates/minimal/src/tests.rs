@@ -21796,6 +21796,26 @@ async fn exports_not_copied_from_another_project() {
         .await
         .expect("the box stops");
 
+    // A copy from another project gives no outcome, so an entrypoint that
+    // exited 0 still gives 0 (BOX-194), not the 125 of a skipped export.
+    let hosts = local_hosts(&global).unwrap();
+    let mut err = Vec::new();
+    let outcomes = cmd::copy_box_exports_on_host(
+        &hosts[0],
+        build,
+        "build",
+        Some(project.path()),
+        Some(other.path()),
+        &mut err,
+    )
+    .await;
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+    assert_eq!(cmd::exit_code_after_exports(0, true, &outcomes), 0);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        format!("{}\n", cmd::exports_elsewhere_line("build", project.path()))
+    );
+
     let elsewhere = cmd::box_wait_on_hosts(
         local_hosts(&global).unwrap(),
         "build",

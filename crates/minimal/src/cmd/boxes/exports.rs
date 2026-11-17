@@ -724,8 +724,10 @@ impl ExportSource for BoxFiles {
 /// Copies the declared exports of the ended box `id` on `host` into
 /// `project_root`, the project the box came from (BOX-185). `here` is the
 /// project root of the command that waited, and nothing is copied unless
-/// it is `project_root` (BOX-199). `label` names the box on `err`. A box whose spec declares no export copies nothing,
-/// and reads nothing more from its host.
+/// it is `project_root` (BOX-199). Then it gives no outcome, so the exit
+/// code does not change (BOX-194). `label` names the box on `err`. A box
+/// whose spec declares no export copies nothing, and reads nothing more
+/// from its host.
 pub(crate) async fn copy_box_exports_on_host<E: std::io::Write>(
     host: &crate::cmd::list::LocalHost,
     id: boxes::SessionId,
@@ -845,7 +847,9 @@ pub(crate) async fn copy_box_exports<E: std::io::Write>(
             "file exports: the waiting command is in another project"
         );
         let _ = writeln!(err, "{}", exports_elsewhere_line(label, project_root));
-        return none_copied();
+        // No outcome: this is not a skipped export, and it changes no exit
+        // code (BOX-194).
+        return Vec::new();
     }
     let channel = match client.open_box_subsystem(id, "sftp").await {
         Ok(channel) => channel,
