@@ -788,6 +788,9 @@ pub(crate) fn exports_elsewhere_line(label: &str, project_root: &std::path::Path
 /// gominimal/minimal#3446). No `file_exported` event goes to the record
 /// (BOX-195, gominimal/minimal#3446). This changes when those requirements
 /// land: the claim gates this call, and the outcomes become the report.
+/// Until the claim lands, each later `min box wait` or `min box attach` on
+/// the same end copies again. It returns 125 again when an export is still
+/// skipped, although BOX-198 says that a later command does not return 125.
 pub(crate) async fn copy_box_exports<E: std::io::Write>(
     client: &mut client::Client,
     id: boxes::SessionId,
