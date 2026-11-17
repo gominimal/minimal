@@ -581,10 +581,10 @@ box that holds it returns to `running`. These terms follow the decision in
   tier:     T0
   verify:   cargo nextest run -p minvmd hostname_allowlist_toolchain_completes
   <!-- S8b/AC3; prose 44; state-driven; the story's list also names apt, which the composed base (the gominimal/pkgs base, no Debian userland) does not ship, so no box can run it; the container pull keeps the rotating-CDN shape apt stood for, and git, npm and pip cover the pinned-name shape; the five-tool list came from the egress-gateway spike as an illustration, not as a requirement in itself. The
-       allowlist the verify uses names both CDNs Docker Hub's blob redirect lands
-       on (cloudflare and cloudfront): every host the pull may contact is a host
-       it contacts, and two exact names are preferred to a CIDR fallback, so
-       the list is the union and must not be trimmed to one CDN. The proof is a
+       allowlist the verify uses names every host Docker Hub's blob redirect lands
+       on (cloudflare, cloudfront and its S3 bucket): every host the pull may contact is a host
+       it contacts, and exact names are preferred to a CIDR fallback, so
+       the list is the union and must not be trimmed to one host. The proof is a
        local VM run until the VM lanes export the switch binary to the harness
        step; then it is verified in CI. -->
 
