@@ -7707,6 +7707,37 @@ async fn composes_from_stored_expanded_spec_not_minimal_toml() {
         "the stored spec's project hook replaces the minimal.toml hook"
     );
 
+    // A stored spec keeps sections the typed spec does not read, such as
+    // `[[file_exports]]` and `io.exec_enabled`. The compose still reads
+    // its hooks.
+    let mut wider = serde_json_lenient::to_value(spec_with_declared_hooks()).unwrap();
+    wider["file_exports"] = serde_json_lenient::json!([{ "path": "out" }]);
+    wider["io"]["exec_enabled"] = serde_json_lenient::json!(false);
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&wider).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pending_hooks(),
+        ["from-spec"],
+        "the compose reads the hooks of a spec with sections it does not read"
+    );
+
+    // A stored spec with no hook list changes nothing: the hook comes from
+    // `minimal.toml`, as before the spec carried hooks.
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        br#"{"v": 1, "io": {"pty_enabled": true}}"#,
+    )
+    .unwrap();
+    assert_eq!(pending_hooks(), ["from-toml"]);
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&spec_with_declared_hooks()).unwrap(),
+    )
+    .unwrap();
+
     // Under --no-hooks, no hook composes from either place.
     let (outcome, _) = run_compose(
         &daemon,
@@ -7761,6 +7792,25 @@ async fn composes_from_stored_expanded_spec_not_minimal_toml() {
         true,
     )
     .expect_err("a stored hook with no declared_by fails the compose");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+    // A spec with a hook list of a version this daemon does not read fails
+    // the compose too.
+    let mut other = serde_json_lenient::to_value(spec_with_declared_hooks()).unwrap();
+    other["v"] = serde_json_lenient::json!(mfile::spec::BOX_SPEC_VERSION + 1);
+    std::fs::write(
+        root.path().join(boxes::store::SPEC_FILE),
+        serde_json_lenient::to_vec(&other).unwrap(),
+    )
+    .unwrap();
+    let err = run_compose(
+        &daemon,
+        &path,
+        &declared_path(),
+        WireContribution::default(),
+        true,
+    )
+    .expect_err("a hook list of another version fails the compose");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
 }
 

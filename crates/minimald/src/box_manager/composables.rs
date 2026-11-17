@@ -564,20 +564,40 @@ pub(crate) fn run_compose(
     Ok((outcome, graph_names))
 }
 
-/// The spec stored beside the box's workspace, `project_path`: the
-/// [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
-/// directory (BOX-068). `None` when the box stores no spec.
+/// The part of a stored spec the compose reads: the entry and Box Type a
+/// spec names, and its `lifecycle_hooks`, each with its declarer
+/// (BOX-068, BOX-179).
+#[derive(Debug)]
+pub(crate) struct StoredSpecHooks {
+    /// The spec's `entry`.
+    pub(crate) entry: String,
+    /// The spec's `box.type`.
+    pub(crate) box_type: String,
+    /// The spec's `lifecycle_hooks`.
+    pub(crate) hooks: Vec<mfile::spec::SpecHook>,
+}
+
+/// The hooks of the spec stored beside the box's workspace, `project_path`:
+/// the [`boxes::store::SPEC_FILE`] in the workspace's parent, the box's own
+/// directory (BOX-068). `None` when the box stores no spec, or a spec with
+/// no `lifecycle_hooks` list.
+///
+/// It reads only the keys the compose needs. A stored spec keeps the
+/// sections the client sent that [`mfile::spec::BoxSpec`] does not read,
+/// such as `[[file_exports]]` and `io.exec_enabled`, so the whole-spec
+/// reader of a launch is not the reader here.
 ///
 /// # Errors
 ///
 /// A stored spec that exists but cannot be read fails the compose, so the
-/// box never runs hooks from a source other than its stored spec. A stored
-/// spec that is not a v0 Box Spec, or has a hook with no valid
-/// `declared_by`, fails the compose with the `InvalidInput` refusal that a
-/// launch gives for the same spec (`crate::box_runtime::stored_spec`).
+/// box never runs hooks from a source other than its stored spec. A spec
+/// that is not JSON, or that has a hook list but is not a v0 spec, names
+/// no `entry` or `box.type`, or has a hook with no valid `declared_by`,
+/// fails the compose with `InvalidInput`, as a create gives for a spec it
+/// refuses.
 fn stored_spec_beside(
     project_path: &DaemonAbsPath,
-) -> Result<Option<mfile::spec::BoxSpec>, std::io::Error> {
+) -> Result<Option<StoredSpecHooks>, std::io::Error> {
     let Some(dir) = project_path.as_utf8_path().parent() else {
         return Ok(None);
     };
@@ -593,11 +613,47 @@ fn stored_spec_beside(
             ));
         }
     };
-    crate::box_runtime::stored_spec(&bytes)
-        .inspect_err(|e| {
-            tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
-        })
-        .map(Some)
+    stored_spec_hooks(&bytes).inspect_err(|e| {
+        tracing::error!(spec_path = %path, error = %e, "the stored box spec is refused");
+    })
+}
+
+/// The hooks of `bytes`, a stored spec, as [`stored_spec_beside`] reads
+/// them.
+fn stored_spec_hooks(bytes: &[u8]) -> Result<Option<StoredSpecHooks>, std::io::Error> {
+    let refused = |why: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("The settings it was created with cannot be read: {why}."),
+        )
+    };
+    let spec: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(bytes).map_err(|e| refused(e.to_string()))?;
+    let Some(hooks) = spec.get("lifecycle_hooks") else {
+        return Ok(None);
+    };
+    let version = spec.get("v").and_then(serde_json_lenient::Value::as_u64);
+    if version != Some(u64::from(mfile::spec::BOX_SPEC_VERSION)) {
+        return Err(refused(format!(
+            "they carry lifecycle hooks, and they are not version {}",
+            mfile::spec::BOX_SPEC_VERSION
+        )));
+    }
+    let text = |value: Option<&serde_json_lenient::Value>, key: &str| {
+        value
+            .and_then(serde_json_lenient::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| refused(format!("`{key}` is missing")))
+    };
+    let entry = text(spec.get("entry"), "entry")?;
+    let box_type = text(spec.get("box").and_then(|b| b.get("type")), "box.type")?;
+    let hooks: Vec<mfile::spec::SpecHook> =
+        serde_json_lenient::from_value(hooks.clone()).map_err(|e| refused(e.to_string()))?;
+    Ok(Some(StoredSpecHooks {
+        entry,
+        box_type,
+        hooks,
+    }))
 }
 
 /// Composes the project's lifecycle hooks from the stored spec `spec`, not
@@ -607,15 +663,14 @@ fn stored_spec_beside(
 /// A loadout's hooks stay on the client's contribution, with their
 /// loadout, so the stored loadout hooks are not added a second time.
 ///
-/// A spec with no hook list changes nothing.
+/// [`stored_spec_beside`] gives no hooks for a spec with no hook list, so
+/// such a spec changes nothing.
 pub(crate) fn compose_hooks_from_stored_spec(
     contribution: &mut WireContribution,
     declared_path: &paths::HostAbsPath,
-    spec: &mfile::spec::BoxSpec,
+    spec: &StoredSpecHooks,
 ) {
-    let Some(stored) = spec.lifecycle_hooks.as_ref() else {
-        return;
-    };
+    let stored = &spec.hooks;
     let project: Vec<_> = stored
         .iter()
         .filter(|h| h.declared_by == mfile::spec::HookDeclarer::Project)
