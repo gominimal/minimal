@@ -87,6 +87,11 @@ const RUNNING_TIMEOUT: Duration = Duration::from_secs(90);
 /// a wedged daemon fails the test instead of hanging it.
 const SUBPROC_TIMEOUT: Duration = Duration::from_secs(180);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the guest boot log must not grow before the tools run, so the
+/// boot's last console lines are in it.
+const BOOT_LOG_QUIET: Duration = Duration::from_secs(1);
+/// The longest wait for the guest boot log to stop growing.
+const BOOT_LOG_SETTLE: Duration = Duration::from_secs(10);
 
 /// Env var the server reads to scope an exec to a session.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
@@ -294,9 +299,26 @@ impl Guest {
     /// only what a tool's run appends. The boot's own lines stay out of it:
     /// the guest's effect probe connects to its own loopback listener from a
     /// deny leaf at boot, and the table logs that refusal on `lo`.
-    fn skip_boot_log(&mut self) {
-        if let Ok(meta) = std::fs::metadata(&self.boot_log_path) {
-            self.boot_log_offset = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    ///
+    /// The kernel logs that refusal, and the console can write it after the
+    /// probe returns. So the offset moves only when the log stops growing for
+    /// [`BOOT_LOG_QUIET`], or when [`BOOT_LOG_SETTLE`] ends. Then a late boot
+    /// line is not read as a refusal from a tool's run.
+    async fn skip_boot_log(&mut self) {
+        let len = |path: &Path| std::fs::metadata(path).map(|meta| meta.len()).ok();
+        let deadline = tokio::time::Instant::now() + BOOT_LOG_SETTLE;
+        let mut last = len(&self.boot_log_path);
+        loop {
+            tokio::time::sleep(BOOT_LOG_QUIET).await;
+            let now = len(&self.boot_log_path);
+            let quiet = now == last;
+            last = now;
+            if quiet || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        if let Some(total) = last {
+            self.boot_log_offset = usize::try_from(total).unwrap_or(usize::MAX);
         }
     }
 
@@ -437,7 +459,7 @@ async fn hostname_allowlist_toolchain_completes() {
     ];
 
     // Only what the tools' runs append is read from here on.
-    guest.skip_boot_log();
+    guest.skip_boot_log().await;
     let mut failures = Vec::new();
     for (name, command) in &tools {
         let encoded = minimald_rpc::exec::ExecRequest::Shell((*command).to_string()).encode();
