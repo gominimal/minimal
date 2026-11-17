@@ -6434,7 +6434,7 @@ impl BoxManagerHandle {
     ///
     /// `NotFound` for an id no record names, `PermissionDenied` when
     /// `holder` does not hold the export for that end, or the I/O error of
-    /// the append.
+    /// the read of the claims or of the append.
     pub async fn report_export(
         &self,
         report: &minimald_rpc::ReportExportRequest,
@@ -6449,18 +6449,32 @@ impl BoxManagerHandle {
         let holders = export_claims();
         let events = reader.read_new()?;
         let connection = holders.find(holder);
-        let holds = connection.is_some_and(|connection| {
-            !reported_exports(&events, report.end).contains(report.path.as_str())
-                && read_export_claims(&reader.object).is_ok_and(|entries| {
-                    entries.iter().any(|entry| {
+        // A claims file that cannot be read is an I/O error, not a refusal:
+        // the claim can still be held.
+        let holds = match connection {
+            Some(connection)
+                if !reported_exports(&events, report.end).contains(report.path.as_str()) =>
+            {
+                read_export_claims(&reader.object)
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            session_id = %record.id,
+                            export = %report.path,
+                            %error,
+                            "export report: the export claims could not be read"
+                        );
+                    })?
+                    .iter()
+                    .any(|entry| {
                         entry.box_id == record.id
                             && entry.end == report.end
                             && entry.path == report.path
                             && entry.connection == connection
                             && holders.holds(entry)
                     })
-                })
-        });
+            }
+            _ => false,
+        };
         if !holds {
             tracing::info!(
                 session_id = %record.id,

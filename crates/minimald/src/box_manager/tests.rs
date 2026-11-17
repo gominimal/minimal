@@ -8068,6 +8068,33 @@ async fn export_claim_granted_once_for_each_end() {
         .unwrap_err();
     assert_eq!(again.kind(), ErrorKind::PermissionDenied, "{again}");
 
+    // A claims file that cannot be read fails the report with its I/O
+    // error, not with a refusal: the claim can still be held.
+    let claims = super::export_claims_path(&mngr.box_events(id).await.unwrap().object);
+    let aside = claims.with_extension("aside");
+    std::fs::rename(&claims, &aside).unwrap();
+    std::fs::create_dir(&claims).unwrap();
+    let unreadable = mngr
+        .report_export(
+            &export_report(id, 1, "dist"),
+            &std::sync::Arc::downgrade(&first),
+        )
+        .await
+        .unwrap_err();
+    assert_ne!(
+        unreadable.kind(),
+        ErrorKind::PermissionDenied,
+        "{unreadable}"
+    );
+    std::fs::remove_dir(&claims).unwrap();
+    std::fs::rename(&aside, &claims).unwrap();
+    mngr.report_export(
+        &export_report(id, 1, "dist"),
+        &std::sync::Arc::downgrade(&first),
+    )
+    .await
+    .unwrap();
+
     // A reported export stays refused for this end, even after its
     // command is gone.
     drop(first);
