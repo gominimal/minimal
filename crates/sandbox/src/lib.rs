@@ -3020,9 +3020,12 @@ fn log_rootfs_collisions(c: &common::LinkCollisions, layers: &[PathBuf], rootfs:
 /// A file the assembly copied (the cache and the rootfs on different
 /// filesystems) has an inode of its own, so no layer matches it that way.
 /// The first-linked file stays, so its winner is the first layer, in link
-/// order, that ships the path, and that layer is named when its file agrees
-/// with the placed one by the link pass's own comparison. `None` when it
-/// does not: the placed file came from somewhere other than `layers`.
+/// order, that ships the path, and that layer is named only when the link
+/// pass's own comparison calls its file the same as the placed one. `None`
+/// otherwise: the placed file came from somewhere other than `layers`, or
+/// the two have equal sizes above the compare limit
+/// ([`common::LinkCollision::Unchecked`]), which proves nothing about who
+/// placed it, so no layer is named rather than a possibly wrong one.
 fn collision_winner<'a>(rootfs: &Path, layers: &'a [PathBuf], rel: &Path) -> Option<&'a Path> {
     use std::os::unix::fs::MetadataExt as _;
     let at = rootfs.join(rel);
@@ -3046,10 +3049,7 @@ fn collision_winner<'a>(rootfs: &Path, layers: &'a [PathBuf], rel: &Path) -> Opt
         .find(|layer| fs::symlink_metadata(layer.join(rel)).is_ok())?;
     let shipped = first.join(rel);
     let is_the_copy = fs::symlink_metadata(&shipped).is_ok_and(|m| m.is_file())
-        && matches!(
-            common::link_collision(&shipped, &at),
-            common::LinkCollision::Same | common::LinkCollision::Unchecked
-        );
+        && common::link_collision(&shipped, &at) == common::LinkCollision::Same;
     is_the_copy.then_some(first.as_path())
 }
 
@@ -4406,6 +4406,42 @@ mod tests {
 
         // what stands in the rootfs is not the first shipper's file
         std::fs::write(rootfs.join(rel), b"placed by something else").unwrap();
+        assert_eq!(super::collision_winner(&rootfs, &layers, rel), None);
+    }
+
+    /// A copied file above the compare limit, of the same size as the first
+    /// shipper's, is only `Unchecked` by the link pass's comparison: equal
+    /// sizes prove nothing about who placed it, so no layer is named.
+    #[test]
+    fn collision_winner_of_an_unchecked_copy_names_no_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("usr/lib/libbig.so");
+        let [a, b] = ["a", "b"].map(|name| tmp.path().join(name));
+        let rootfs = tmp.path().join("rootfs");
+        for dir in [&a, &b, &rootfs] {
+            std::fs::create_dir_all(dir.join(rel.parent().unwrap())).unwrap();
+        }
+        // sparse files well above the compare limit, so the test writes no
+        // more than a few bytes: `a` ships zeros, `b` ships the path too, and
+        // the placed file is another source's, of equal size, other bytes
+        let size = 64 << 20;
+        std::fs::write(rootfs.join(rel), b"another source").unwrap();
+        for dir in [&a, &b, &rootfs] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join(rel))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        assert_eq!(
+            common::link_collision(&a.join(rel), &rootfs.join(rel)),
+            common::LinkCollision::Unchecked,
+            "the comparison must reach the unchecked branch"
+        );
+        let layers = [a.clone(), b.clone()];
         assert_eq!(super::collision_winner(&rootfs, &layers, rel), None);
     }
 
