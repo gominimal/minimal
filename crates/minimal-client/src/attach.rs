@@ -33,9 +33,9 @@ const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 /// termios-special leader) surfaces its error loudly so the user fixes the
 /// config rather than silently attaching with the wrong chord.
 ///
-/// Only the interactive attach path needs the keys (non-interactive exec
-/// channels have no detach); callers pass `None` to [`attach_command`] for
-/// those.
+/// The interactive attach and an attach to a terminal exec need the keys.
+/// Non-interactive exec channels have no detach, and callers pass `None` to
+/// [`attach_command`] for those.
 pub fn resolve_session_keys(
     config_dir: Option<&Path>,
 ) -> Result<boxes::keys::SessionKeys, anyhow::Error> {
@@ -217,8 +217,10 @@ fn sweep_stale_owner_locks(dir: &Path) {
 /// `session_keys` negotiates the configurable detach/forward chord per
 /// channel: when `Some`, each resolved key is sent as an env var (with a
 /// matching `SendEnv` option) the daemon reads back alongside
-/// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass `None`
-/// for non-interactive exec channels, which have no detach.
+/// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass the
+/// keys for an `ExecAttach` `wire` too: the daemon runs the same detach on
+/// a terminal exec's attach. Pass `None` for non-interactive exec channels,
+/// which have no detach.
 ///
 /// Returns the command without spawning ssh. Configures the proxy to close
 /// when this process exits, using a process-lifetime owner lock when available
@@ -370,13 +372,19 @@ fn ssh_command(
         // a bridge that accepts but never serves fails instead of hanging ssh.
         "-o",
         &format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs()),
+        // Quiet ssh's own status lines (BCLI-068): a detach or a box stop
+        // would otherwise print "Connection to … closed." after `min`'s own
+        // line. ERROR still lets ssh print its real failures.
+        "-o",
+        "LogLevel=ERROR",
     ]);
     // Negotiate the session-key config per channel: send each resolved key
     // as an env var the daemon reads back (alongside MINIMAL_SESSION_ID) and
     // re-validates as a silent backstop. ssh's `SendEnv` forwards a var only
     // when it's present in the child environment, so each `SendEnv` option is
-    // paired with its `env` set above. Only the interactive attach path sends
-    // these — exec/task channels pass `None`.
+    // paired with its `env` set above. The interactive attach and the
+    // `ExecAttach` channel send these. Other exec and task channels pass
+    // `None`.
     if let Some(keys) = session_keys {
         ssh.env(boxes::keys::LEADER_ENV, keys.leader.as_config_str())
             .env(boxes::keys::DETACH_KEY_ENV, keys.detach_key.as_config_str())
@@ -1448,6 +1456,34 @@ mod tests {
             assert!(
                 exec_args.iter().any(|a| a == &opt),
                 "missing {opt} in {exec_args:?}",
+            );
+        }
+    }
+
+    /// ssh prints no status line on a clean close, on an interactive
+    /// attach and on an exec alike, and still prints its errors (BCLI-068).
+    #[test]
+    fn ssh_command_quiets_ssh_status_lines() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let interactive = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
+        for cmd in [&interactive, &exec] {
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let at = args
+                .iter()
+                .position(|a| a == "LogLevel=ERROR")
+                .unwrap_or_else(|| panic!("missing LogLevel=ERROR in {args:?}"));
+            assert_eq!(
+                args[at - 1],
+                "-o",
+                "LogLevel=ERROR is an -o value: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a == "-q"),
+                "-q would hide ssh's errors too: {args:?}"
             );
         }
     }
