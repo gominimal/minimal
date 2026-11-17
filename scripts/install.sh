@@ -480,8 +480,10 @@ maybe_remove_finalize_install() {
         # Minimal.app is the app bundle the service's program is installed
         # in, a directory (so the remedy removes it, and only it and the
         # .old a replaced bundle leaves, with -r); the bare minzoned is where
-        # an install from before the bundle put the program.
-        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
+        # an install from before the bundle put the program. The logcap
+        # plist and /private/var/log/minimal are the service's log and the
+        # unit that caps its size; the log directory goes with -r too.
+        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range /Library/LaunchDaemons/dev.gominimal.zone.logcap.plist /private/var/log/minimal/minzoned.log /private/var/log/minimal"
         _ns_paths="$_ns_files"
         _ns_chan="$_fi_root/Library/Application Support/minimal/run/answerer.sock"
     else
@@ -495,13 +497,13 @@ maybe_remove_finalize_install() {
     _ns_rm_r=
     for _ns_p in $_ns_files; do
         case "$_ns_p" in
-            */Minimal.app|*/Minimal.app.old) _ns_rm_r="$_ns_rm_r $(shq "$_fi_root$_ns_p")" ;;
+            */Minimal.app|*/Minimal.app.old|*/var/log/minimal) _ns_rm_r="$_ns_rm_r $(shq "$_fi_root$_ns_p")" ;;
             *) _ns_rm="$_ns_rm $(shq "$_fi_root$_ns_p")" ;;
         esac
     done
     _ns_rm="$_ns_rm $(shq "$_ns_chan")"
     if [ "$os" = darwin ]; then
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo launchctl bootout system/dev.gominimal.zone.logcap; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
     else
         _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
     fi
