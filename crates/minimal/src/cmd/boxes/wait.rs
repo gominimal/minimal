@@ -188,13 +188,16 @@ fn wait_label(after: std::time::Duration) -> String {
     }
 }
 
-/// Waits until the box `target` names on `hosts` ends, and returns its exit
-/// code as [`wait_exit`] gives it. With `timeout`, the wait stops when the
+/// Waits until the box `target` names on `hosts` ends, copies its declared
+/// file exports into its project when `here`, the command's own project
+/// root, is the one the box's record names, and returns its exit code as
+/// [`wait_exit`] gives it. With `timeout`, the wait stops when the
 /// box still runs after it, with a [`BoxTimedOut`], and leaves the box
 /// running. The record is read again every `poll`.
 pub(crate) async fn box_wait_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     target: &str,
+    here: Option<&paths::HostAbsPath>,
     timeout: Option<std::time::Duration>,
     poll: std::time::Duration,
 ) -> Result<i32, anyhow::Error> {
@@ -227,6 +230,27 @@ pub(crate) async fn box_wait_on_hosts(
             }
         };
         if let Some(ended) = wait_exit(&shown.record, target) {
+            // BOX-185: the wait copies the box's declared exports, on
+            // every end, before it gives back the box's code. It copies
+            // only into its own project (BOX-199).
+            //
+            // Interim: each wait on an ended box copies again, and the
+            // outcomes are not used yet. The claim that stops a later
+            // wait from copying an export the record already holds is
+            // BOX-198 (gominimal/minimal#3446). The `file_exported` event
+            // is BOX-195 (gominimal/minimal#3446), and exit 125 for a
+            // skipped export is BOX-193 (gominimal/minimal#3445). All are
+            // later tasks.
+            let root = shown.record.project_root.as_ref();
+            let _outcomes = copy_box_exports(
+                &mut client,
+                id,
+                shown.record.name.as_deref().unwrap_or(target),
+                root.map(|root| std::path::Path::new(root.as_str())),
+                here.map(|here| std::path::Path::new(here.as_str())),
+                &mut std::io::stderr(),
+            )
+            .await;
             return match ended {
                 Ok(code) => {
                     tracing::info!(verb = "box wait", box_id = %id, exit_code = code, outcome = "ended");
@@ -313,7 +337,15 @@ pub async fn cmd_box_wait(global: &GlobalArgs, args: BoxWaitArgs) -> Result<(), 
             let mut err = tokio::io::stderr();
             box_wait_exec_on_hosts(hosts, &args.target, exec, timeout, &mut err).await?
         }
-        None => box_wait_on_hosts(hosts, &args.target, timeout, POLL_INTERVAL).await?,
+        None => {
+            // The command's own project root, found from its folder as a
+            // create finds it (BOX-199). With none, nothing is copied.
+            let here = crate::attach::cwd_host_path(global)
+                .and_then(|cwd| box_list_scope(cwd.as_ref()))
+                .inspect_err(|e| tracing::info!("box wait: no project root here: {e:#}"))
+                .ok();
+            box_wait_on_hosts(hosts, &args.target, here.as_ref(), timeout, POLL_INTERVAL).await?
+        }
     };
     if code == 0 {
         Ok(())
