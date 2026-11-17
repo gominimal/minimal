@@ -249,9 +249,14 @@ pub fn effective_resources() -> (u8, u32) {
 ///
 /// On Linux, libkrun drives KVM, which needs a readable `/dev/kvm`. Probe it
 /// with an `O_RDONLY` open so `boot`/`run` fail fast with an actionable message
-/// instead of an opaque libkrun error from `krun_start_enter`. On macOS the
-/// check is skipped — Hypervisor.framework availability is verified by
-/// `krun_create_ctx` itself.
+/// instead of an opaque libkrun error from `krun_start_enter`.
+///
+/// On macOS, libkrun drives Hypervisor.framework, which a Mac that is itself a
+/// virtual machine without nested virtualization does not have. libkrun only
+/// finds that out in the VMM child, after the supervisor has detached, so the
+/// caller waited out the whole spawn timeout before a vague failure
+/// (gominimal/inbox#1178). Read `kern.hv_support` here instead and refuse at
+/// once when it is a clear 0 ([`hv_support_refusal`]).
 #[cfg(minvmd_libkrun)]
 pub(crate) fn ensure_hypervisor_accessible() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
@@ -263,8 +268,58 @@ pub(crate) fn ensure_hypervisor_accessible() -> anyhow::Result<()> {
             .map_err(|e| kvm_access_error(&e))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        match hv_support_refusal(read_hv_support()) {
+            Some(refusal) => Err(anyhow::anyhow!(refusal)),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     Ok(())
+}
+
+/// The refusal for a macOS host whose `kern.hv_support` sysctl reads `value`,
+/// or `None` to go on with the boot.
+///
+/// Only a clear 0 refuses: the kernel says this Mac has no hypervisor, and no
+/// VM can start on it. A 1 goes on, and so does a value that could not be
+/// read (`None`) or one this code does not know: an unreadable sysctl is not
+/// evidence that the hypervisor is missing, and libkrun still reports a real
+/// failure later. Kept platform-independent so the decision and its wording
+/// are unit-tested on every host, though only macOS calls it.
+#[cfg(any(test, all(minvmd_libkrun, target_os = "macos")))]
+fn hv_support_refusal(value: Option<i32>) -> Option<&'static str> {
+    match value {
+        Some(0) => Some(
+            "this Mac has no hypervisor support (`sysctl kern.hv_support` is 0), so the \
+             Minimal VM cannot start. Run on a physical Mac, or on a virtual Mac whose host \
+             turns on nested virtualization.",
+        ),
+        _ => None,
+    }
+}
+
+/// Read the integer sysctl `kern.hv_support`: 1 when this Mac can run a
+/// hypervisor, 0 when it cannot. `None` when the sysctl is absent or cannot
+/// be read.
+#[cfg(all(minvmd_libkrun, target_os = "macos"))]
+fn read_hv_support() -> Option<i32> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is a NUL-terminated C string, and `value`/`size`
+    // describe a writable `c_int` the kernel fills in; no new value is set.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.hv_support".as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && size == std::mem::size_of::<libc::c_int>()).then_some(value)
 }
 
 /// Map a `/dev/kvm` open failure to an actionable, user-facing error (R2.4).
@@ -534,6 +589,37 @@ mod tests {
         let msg = kvm_access_error(&Error::from(ErrorKind::PermissionDenied)).to_string();
         assert!(msg.contains("permission denied"), "got: {msg}");
         assert!(msg.contains("`kvm` group"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod hv_support_tests {
+    use super::hv_support_refusal;
+
+    #[test]
+    fn a_clear_zero_refuses_and_says_why_and_what_to_do() {
+        let msg = hv_support_refusal(Some(0)).expect("kern.hv_support = 0 refuses");
+        assert!(msg.contains("no hypervisor support"), "got: {msg}");
+        assert!(msg.contains("kern.hv_support"), "got: {msg}");
+        assert!(msg.contains("nested virtualization"), "got: {msg}");
+        assert!(!msg.contains('\n'), "one line: {msg}");
+    }
+
+    #[test]
+    fn a_host_with_a_hypervisor_boots() {
+        assert_eq!(hv_support_refusal(Some(1)), None);
+    }
+
+    #[test]
+    fn an_absent_or_unreadable_sysctl_does_not_refuse() {
+        assert_eq!(hv_support_refusal(None), None);
+    }
+
+    #[test]
+    fn only_zero_refuses() {
+        for value in [-1, 2, i32::MAX] {
+            assert_eq!(hv_support_refusal(Some(value)), None, "value {value}");
+        }
     }
 }
 
