@@ -866,16 +866,16 @@ pub struct ChainLink {
 }
 
 /// Whether a package's `env_state_wiring` prefix names one directory under
-/// /state. The prefix is joined onto the state directory and is sent to the
-/// shell helpers on a `set_env:` line, so it is refused when it is empty, `.`
-/// or `..`, or holds `/`, `\`, `:` or a control character (Unicode category
-/// Cc, as [`char::is_control`] has it).
+/// /state. The prefix is joined onto the state directory, so it must first
+/// pass [`File::validate_state_component`], the rule for every state key and
+/// state dir name (not empty, `.` or `..`, and no `/` or NUL). It is also sent
+/// to the shell helpers on a `set_env:` line, so it is further refused when it
+/// holds `\`, `:` or a control character (Unicode category Cc, as
+/// [`char::is_control`] has it).
 #[must_use]
 pub fn is_state_prefix(prefix: &str) -> bool {
-    !prefix.is_empty()
-        && prefix != "."
-        && prefix != ".."
-        && !prefix.contains(['/', '\\', ':'])
+    File::validate_state_component(prefix).is_ok()
+        && !prefix.contains(['\\', ':'])
         && !prefix.chars().any(char::is_control)
 }
 

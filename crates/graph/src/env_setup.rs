@@ -117,7 +117,9 @@ impl SetupForPackages {
                     let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
                     let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
                     // the prefix is joined onto the state dir and sent to the
-                    // shell helpers: one directory name only
+                    // shell helpers: one directory name only. This is the one
+                    // prefix check here; `is_state_prefix` applies
+                    // `mfile::File::validate_state_component` first.
                     if !mfile::is_state_prefix(&prefix) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -139,17 +141,6 @@ impl SetupForPackages {
                             env_var_refusal(&b.name, &env_var),
                         ));
                     }
-
-                    mfile::File::validate_state_component(&prefix).map_err(|reason| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "package {} declares a state dir prefix {prefix:?} that cannot \
-                                 be used: {reason}",
-                                b.name
-                            ),
-                        )
-                    })?;
 
                     state_dirs.insert(prefix.clone());
 
@@ -307,36 +298,45 @@ mod tests {
 
     /// A state-dir prefix that is not a single directory name would be
     /// joined onto the host state base, so it is refused rather than
-    /// mounted.
+    /// mounted. The spec is inserted by hand, so the graph's own check is
+    /// what refuses it, whatever the nickel contract does; every value
+    /// `mfile::File::validate_state_component` refuses gets the one prefix
+    /// refusal.
     #[test]
     fn a_state_dir_prefix_that_is_not_a_single_component_fails_the_whole_setup() {
-        let layer = Layer::new_for_test(
-            indoc! {
-                "
-            let {BuildSpec, ..} = import \"minimal.ncl\" in
+        for prefix in ["..", ".", "", "a/b", "/abs", "a\0b"] {
+            assert!(
+                mfile::File::validate_state_component(prefix).is_err(),
+                "{prefix:?}"
+            );
+            let mut g = Graph::new();
+            let b1 = g.insert_build(BuildSpec {
+                name: "b1".into(),
+                attrs: IndexMap::from_iter([(
+                    "env_state_wiring".to_string(),
+                    decode::AttrValue::List(vec![decode::AttrValue::Map(IndexMap::from_iter([
+                        (
+                            "env_var".to_string(),
+                            decode::AttrValue::String("GOCACHE".to_string(), None),
+                        ),
+                        (
+                            "prefix".to_string(),
+                            decode::AttrValue::String(prefix.to_string(), None),
+                        ),
+                    ]))]),
+                )]),
+                ..Default::default()
+            });
 
-            {
-                name = \"b1\",
-                build_deps = [],
-                cmd = \"\",
-                attrs = {
-                    env_state_wiring = [{ env_var = \"GOCACHE\", prefix = \"..\" }],
-                },
-            } | BuildSpec
-            "
-            }
-            .to_string(),
-        )
-        .expect("nickel accepts a `..` prefix");
-        let g = Graph::new().ingest(layer).unwrap();
-
-        let err = SetupForPackages::build(&g, [g.by_name("b1").unwrap()])
-            .expect_err("a `..` prefix must not become a state dir");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string().contains("b1") && err.to_string().contains("prefix"),
-            "the error must name the package and the offending field, got {err}"
-        );
+            let err = SetupForPackages::build(&g, [&b1])
+                .expect_err("a prefix that is not one directory name must not become a state dir");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{prefix:?}");
+            assert_eq!(
+                err.to_string(),
+                mfile::state_prefix_refusal("b1", prefix),
+                "the one prefix refusal"
+            );
+        }
     }
 
     #[test]
@@ -523,8 +523,8 @@ mod tests {
             assert!(mfile::is_state_prefix(ok), "{ok}");
         }
         for bad in [
-            "", ".", "..", "a/b", "a\\b", "a:b", "a\nb", "a\rb", "a\tb", "a\u{7f}b", "a\u{85}b",
-            "a\u{9f}b",
+            "", ".", "..", "a/b", "/abs", "a\0b", "a\\b", "a:b", "a\nb", "a\rb", "a\tb",
+            "a\u{7f}b", "a\u{85}b", "a\u{9f}b",
         ] {
             assert!(!mfile::is_state_prefix(bad), "{bad:?}");
         }
