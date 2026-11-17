@@ -290,9 +290,12 @@ impl BoxSpec {
         // not read itself.
         let hooks_on_resume = extra.is_some_and(|(t, ranking)| hooks_on_resume(t, ranking));
         let timeout = extra.and_then(|(t, ranking)| entry_timeout(t, ranking));
-        // A spec that sets no lifetime keeps the `until_complete` that the
-        // shipped `session` and `task` types declare.
+        // Only an expanded entry carries a ranking, and only the expansion
+        // refuses a bad lifetime. A task or a `[session]` table keeps the
+        // `until_complete` that the shipped `session` and `task` types
+        // declare, as does a spec that sets no lifetime.
         let lifetime = extra
+            .and_then(|(t, ranking)| ranking.map(|r| (t, r)))
             .and_then(|(t, ranking)| entry_lifetime(t, ranking))
             .unwrap_or(Lifetime::UntilComplete);
         let mut seen = std::collections::BTreeSet::new();
@@ -338,12 +341,14 @@ fn hooks_on_resume(extra: &toml::Table, ranking: Option<Ranking<'_>>) -> bool {
         .unwrap_or(false)
 }
 
-/// The entry's own `lifetime`, from `lifetime` or `box.lifetime`. `None`
-/// when the entry sets none. The expansion refuses a value that is not
-/// one of [`Lifetime::ACCEPTED`] (see [`check_section`]), so an expanded
-/// spec never reaches here with a bad value.
-fn entry_lifetime(extra: &toml::Table, ranking: Option<Ranking<'_>>) -> Option<Lifetime> {
-    later_value(extra, ranking, "lifetime", "box").and_then(|value| value.clone().try_into().ok())
+/// An expanded entry's own `lifetime`, from `lifetime` or `box.lifetime`.
+/// `None` when the entry sets none. The expansion refuses a value that is
+/// not one of [`Lifetime::ACCEPTED`] (see [`check_section`]), so only an
+/// expanded entry reaches here. [`BoxSpec::build`] never reads the lifetime
+/// of a task or a `[session]` table, which no check refuses.
+fn entry_lifetime(extra: &toml::Table, ranking: Ranking<'_>) -> Option<Lifetime> {
+    later_value(extra, Some(ranking), "lifetime", "box")
+        .and_then(|value| value.clone().try_into().ok())
 }
 
 /// The value of the setting `key`, written flat or under `section` with
@@ -1489,6 +1494,24 @@ mod tests {
             SpecFlags::default(),
         );
         assert_eq!(spec.lifetime, Lifetime::UntilStopped);
+
+        // A task and a `[session]` table are not expanded, so no check
+        // refuses their lifetime. Their spec keeps `until_complete`.
+        let file: crate::File = toml::from_str(
+            r#"
+            [session]
+            lifetime = "until_stopped"
+
+            [tasks.lint]
+            exec = ["true"]
+            lifetime = "until_stopped"
+            "#,
+        )
+        .unwrap();
+        let session = BoxSpec::for_session(file.session.as_ref(), SpecFlags::default());
+        assert_eq!(session.lifetime, Lifetime::UntilComplete);
+        let lint = BoxSpec::for_task("lint", &file.tasks["lint"], SpecFlags::default()).unwrap();
+        assert_eq!(lint.lifetime, Lifetime::UntilComplete);
     }
 
     // BCLI-029: within one type chain, a derived type's `[box] lifetime`
