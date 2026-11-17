@@ -6306,6 +6306,7 @@ mod tests {
         let published = |key: &ProxyPublicKey| PublishedKey {
             public: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.to_sec1_bytes()),
             kid: key.kid(),
+            store: None,
         };
         let sealing = ProxyKey::generate().unwrap();
         let identity = Identity {
