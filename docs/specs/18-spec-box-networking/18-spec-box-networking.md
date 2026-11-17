@@ -589,10 +589,12 @@ box that holds it returns to `running`. These terms follow the decision in
        the effect probe's, from its deny leaf at boot, so the verify reads the
        log only from the first tool on and fails on a refusal on lo there. -->
   <!-- S8b/AC3; prose 44; state-driven; the story's list also names apt, which the composed base (the gominimal/pkgs base, no Debian userland) does not ship, so no box can run it; the container pull keeps the rotating-CDN shape apt stood for, and git, npm and pip cover the pinned-name shape; the five-tool list came from the egress-gateway spike as an illustration, not as a requirement in itself. The
-       allowlist the verify uses names both CDNs Docker Hub's blob redirect lands
-       on (cloudflare and cloudfront): every host the pull may contact is a host
-       it contacts, and two exact names are preferred to a CIDR fallback, so
-       the list is the union and must not be trimmed to one CDN. The proof is a
+       allowlist the verify uses names all three hosts Docker Hub's blob redirect
+       lands on (the cloudflare and cloudfront CDNs, and the S3 bucket
+       docker-images-prod.s3.dualstack.us-east-1.amazonaws.com): every host the
+       pull may contact is a host it contacts, and exact names are preferred to
+       a CIDR fallback, so the list is the union and must not be trimmed to one
+       of them. The proof is a
        local VM run until the VM lanes export the switch binary to the harness
        step; then it is verified in CI. -->
 
