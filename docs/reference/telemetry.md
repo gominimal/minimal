@@ -35,7 +35,7 @@ The line goes to stderr only when stderr is a terminal, and it waits for a
 short command whose output leaves it in view: `min ls`, `min stop`,
 `min dirs`, `min init`, `min add`, `min update`, `min login`, `min loadout`,
 `min net`, `min bug` or `min diag`. Other commands never print it, among
-them those that take the terminal (bare `min`, `min run`,
+them those that take the terminal (bare `min`,
 `min session attach`, `min task run`, `min dash`, `min proxy`), so if you
 only use those, the line is not shown. `min version` and shell completion
 never take part in the check.
@@ -120,7 +120,7 @@ where `<state>` is `$XDG_STATE_HOME` when it is set to an absolute path, and
 |---|---|
 | `update-check.json` | the install id, when the last check ran, the last answer, and whether the disclosure and the notice for that answer were shown |
 | `install.toml` | written by the installer: the channel, the method, the release it installed (the key) and the path of the `min` it describes |
-| `update-check.lock` | present only while a check is running |
+| `update-check.lock` | present while a check is running; one left by a check that died is taken over after an hour |
 
 Uninstalling with the installer's `--uninstall` removes `install.toml`;
 `--purge` also removes the state directory, and with it the install id.
