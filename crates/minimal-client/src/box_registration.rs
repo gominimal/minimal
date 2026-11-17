@@ -1102,6 +1102,27 @@ mod tests {
         }
     }
 
+    /// [`crate::attach::NO_ADDRESS_REFUSAL`] copies the prefix that minvmd
+    /// writes on its no-address refusal. minvmd's source must still write
+    /// that prefix, or a reworded refusal goes back to a warn line and the
+    /// attach goes on without the reason (NET-138).
+    #[test]
+    fn resume_refusal_carries_the_vm_host_reason_prefix_minvmd_writes() {
+        let control =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../minvmd/src/control.rs");
+        let source = std::fs::read_to_string(&control)
+            .unwrap_or_else(|error| panic!("read {}: {error}", control.display()));
+        let written = format!(
+            "error: format!(\"{}{{reason}}\")",
+            crate::attach::NO_ADDRESS_REFUSAL
+        );
+        assert!(
+            source.contains(&written),
+            "{} no longer writes `{written}`: update NO_ADDRESS_REFUSAL to match",
+            control.display()
+        );
+    }
+
     /// The blocking exchange behind a box row withdrawal ends with the
     /// caller's deadline, so a silent daemon cannot hold the runtime's
     /// shutdown — and `min`'s exit — for the ask bound past it.
