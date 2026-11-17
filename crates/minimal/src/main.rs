@@ -1033,16 +1033,19 @@ mod tests {
             grants,
             stored: false,
             cause: ProxyAbsence::NotInstalled { path: None },
+            table: Some("[defaults.session.secrets]".into()),
         });
         assert_eq!(failure.code(), "gatehouse_unenrolled_node");
         assert_eq!(
             failure.hint(),
-            "to create the box without the grant, remove GH_TOKEN from [session.secrets] \
-             in minimal.toml"
+            "to create the box without the grant, remove GH_TOKEN from \
+             [defaults.session.secrets] in minimal.toml"
         );
 
         // A refusal with no defined error stays `unspecified`.
-        let failure = answer(BepRefusal::SteeringOffWithProxyEnv);
+        let failure = answer(BepRefusal::SteeringOffWithProxyEnv {
+            table: "[defaults.session.network.bep]".into(),
+        });
         assert_eq!(failure.code(), "unspecified");
         assert!(failure.hint().is_empty());
     }
@@ -1099,7 +1102,8 @@ mod tests {
         }
         let object: serde_json_lenient::Value = {
             let mut stderr = Vec::new();
-            answer_failure(&failures[0], true, false, None, &mut stderr);
+            let code = answer_failure(&failures[0], true, false, None, &mut stderr);
+            assert_eq!(code, ExitCode::from(1));
             serde_json_lenient::from_slice(&stderr).unwrap()
         };
         assert_eq!(object["code"], "not_found");
@@ -1115,14 +1119,16 @@ mod tests {
         let hint = "local-minimald is now called local.";
         let e = anyhow::anyhow!("the daemon went away");
         let mut stderr = Vec::new();
-        answer_failure(&e, true, false, Some(hint), &mut stderr);
+        let code = answer_failure(&e, true, false, Some(hint), &mut stderr);
+        assert_eq!(code, ExitCode::from(1));
         let text = String::from_utf8(stderr).unwrap();
         assert_eq!(text.lines().count(), 1, "one object, one line: {text}");
         let object: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
         assert_eq!(object["hint"], hint);
 
         let mut stderr = Vec::new();
-        answer_failure(&e, false, false, Some(hint), &mut stderr);
+        let code = answer_failure(&e, false, false, Some(hint), &mut stderr);
+        assert_eq!(code, ExitCode::from(1));
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             format!("error: the daemon went away\n{hint}\n")

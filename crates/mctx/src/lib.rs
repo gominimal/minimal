@@ -1157,6 +1157,12 @@ impl Context {
                 self.daemon.config.state_base_dir(),
                 self.state_root(),
             )
+            .map_err(|reason| {
+                Error::Other(anyhow!(
+                    "refusing to use state key {name:?}: {reason}. Choose a state key \
+                     that is a single directory name"
+                ))
+            })?
             .ok_or_else(|| {
                 Error::Other(anyhow!(
                     "cannot determine state directory for state key {name:?}: \
@@ -1683,15 +1689,16 @@ fn detach_array_close(arr: &mut Array) -> String {
 
 /// The durable state directory for `state_key`: keyed on `state_root` when
 /// one is set, else on the directory `mfile` was read from. `None` when
-/// neither is known.
+/// neither is known. An error when the state key is not a single directory
+/// name, or when the directory resolves outside `base`.
 fn durable_state_dir(
     mfile: &mfile::File,
     state_key: &str,
     base: PathBuf,
     state_root: Option<&Path>,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>, String> {
     match state_root {
-        Some(root) => Some(mfile.state_dir_under(state_key, base, root)),
+        Some(root) => mfile.state_dir_under(state_key, base, root).map(Some),
         None => mfile.state_dir(state_key, base),
     }
 }
@@ -1789,7 +1796,9 @@ mod tests {
         let root = Path::new("/home/user/src/my-project");
         assert_eq!(
             durable_state_dir(&mfile, "env", base.clone(), Some(root)),
-            Some(PathBuf::from("/state/-home-user-src-my%2Dproject/env"))
+            Ok(Some(PathBuf::from(
+                "/state/-home-user-src-my%2Dproject/env"
+            )))
         );
     }
 

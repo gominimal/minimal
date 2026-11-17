@@ -1805,9 +1805,10 @@ fn builtin_root_refusal(
 /// The Box Spec sections that a spec can carry and that this daemon does
 /// not enforce (BOX-076): the top-level key, the key inside it when the
 /// section is one key of a table, and the section as the log names it.
-const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
+/// `[[file_exports]]` is not one: the command that waits for the box
+/// copies it on the client (BOX-185).
+const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 4] = [
     ("file_imports", None, "[[file_imports]]"),
-    ("file_exports", None, "[[file_exports]]"),
     ("github_imports", None, "[[github_imports]]"),
     ("otel", None, "[otel]"),
     (
@@ -1816,6 +1817,14 @@ const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
         "[network] vpn_network_names",
     ),
 ];
+
+/// How many `lifecycle_hooks` the received spec carries, each with its
+/// `declared_by` (BOX-179). `None` for a spec with no hook list.
+fn stored_hook_count(spec: &serde_json_lenient::Value) -> Option<usize> {
+    spec.get("lifecycle_hooks")
+        .and_then(serde_json_lenient::Value::as_array)
+        .map(Vec::len)
+}
 
 /// The sections of `spec` that the daemon carries in the stored spec but
 /// does not enforce, in the order of [`UNENFORCED_SECTIONS`], each once.
@@ -1917,6 +1926,9 @@ fn unenrolled_broker_refusal(
             // proxy is present and serves only GitHub grants. The cause
             // for that case lives in `crates/boxes` (#3277).
             boxes::core::bep::ProxyAbsence::NotServed,
+            // A spec comes from any entry, and not with the minimal.toml
+            // table that set its `secrets`, so the refusal names none.
+            None,
         ),
         grants,
     ))
@@ -4444,6 +4456,9 @@ impl BoxManager {
         // BOX-076: the sections the daemon carries but does not enforce,
         // read before the spec becomes its stored bytes.
         let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
+        // BOX-068, BOX-179: the hooks the stored spec keeps, each with its
+        // declarer, counted for the log line that stores the spec.
+        let stored_hooks = spec.as_ref().and_then(stored_hook_count);
         // BOX-081: no identity plane is configured on this host, so a
         // brokered secret is refused unless a node-local proxy serves the
         // box and the secret is a GitHub grant. The refusal comes before the record exists, so it leaves no
@@ -4768,6 +4783,7 @@ impl BoxManager {
                         session_id = %session_id,
                         spec_bytes = bytes.len(),
                         spec_path = %path.as_str(),
+                        lifecycle_hooks = ?stored_hooks,
                         "stored the box spec"
                     );
                     // BOX-076: one warning for each unenforced section.

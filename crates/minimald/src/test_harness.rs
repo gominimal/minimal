@@ -347,12 +347,25 @@ impl TestServer {
     /// through the same russh stack `connect()` uses, so external clients
     /// (e.g. an OpenSSH process driven by `git push`) can dial the test
     /// server over a real UDS rather than the in-memory pair.
+    ///
+    /// Like the daemon's own accept loop, it ends, closing the listener, once
+    /// a `Shutdown` RPC is accepted, so a client that waits for the socket to
+    /// refuse (`min stop` against a native daemon) sees it do so.
     pub async fn listen_on_uds(&self, sock: &Path) {
         let listener = UnixListener::bind(sock).unwrap();
         let russh_config = self.russh_config.clone();
         let state = self.state.clone();
+        let shutdown = state.shutdown_token().await;
         crate::traced::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
+            loop {
+                let socket = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok((socket, _)) => socket,
+                        Err(_) => break,
+                    },
+                };
                 let russh_config = russh_config.clone();
                 let state = state.clone();
                 crate::traced::spawn(async move {

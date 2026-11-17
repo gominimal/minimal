@@ -88,6 +88,17 @@ impl SetupForPackages {
                     let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
                     let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
 
+                    mfile::File::validate_state_component(&prefix).map_err(|reason| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "package {} declares a state dir prefix {prefix:?} that cannot \
+                                 be used: {reason}",
+                                b.name
+                            ),
+                        )
+                    })?;
+
                     state_dirs.insert(prefix.clone());
 
                     env_vars.insert(
@@ -236,6 +247,40 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("b1") && err.to_string().contains("class"),
+            "the error must name the package and the offending field, got {err}"
+        );
+    }
+
+    /// A state-dir prefix that is not a single directory name would be
+    /// joined onto the host state base, so it is refused rather than
+    /// mounted.
+    #[test]
+    fn a_state_dir_prefix_that_is_not_a_single_component_fails_the_whole_setup() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+            let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+            {
+                name = \"b1\",
+                build_deps = [],
+                cmd = \"\",
+                attrs = {
+                    env_state_wiring = [{ env_var = \"GOCACHE\", prefix = \"..\" }],
+                },
+            } | BuildSpec
+            "
+            }
+            .to_string(),
+        )
+        .expect("nickel accepts a `..` prefix");
+        let g = Graph::new().ingest(layer).unwrap();
+
+        let err = SetupForPackages::build(&g, [g.by_name("b1").unwrap()])
+            .expect_err("a `..` prefix must not become a state dir");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("b1") && err.to_string().contains("prefix"),
             "the error must name the package and the offending field, got {err}"
         );
     }

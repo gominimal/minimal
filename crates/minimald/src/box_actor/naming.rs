@@ -42,6 +42,7 @@ async fn await_name_change(
     let generation = waiter.generation();
     if !waiter.wait(NAME_CHANGE_BOUND).await {
         tracing::warn!(
+            component = crate::net::answerer::COMPONENT,
             session_id = %session_id,
             session_name = name,
             generation,
