@@ -16395,6 +16395,100 @@ async fn resume_refuses_unsatisfiable_spec_keeps_state() {
     .await;
 }
 
+/// BOX-025, BOX-160: a resume meets the admission check a create of its
+/// stored spec meets, against the constraints of the spec's built-in root
+/// and of the type the record is filed under. A stored spec that check
+/// refuses is refused with the create's exit status 3, and the record stays
+/// as it was, byte for byte. Each refused spec keeps `pty_enabled`, so the
+/// terminal check passes it on. The control: the spec the create accepted
+/// resumes once it is stored again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_stored_spec_its_root_excludes_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("root-spec"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+    let record_path = record_dir(&server, id).await.join("record.json");
+    let pty_spec_of_type = |box_type: &str| {
+        let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+        spec.pty_enabled = true;
+        spec.box_type = box_type.to_string();
+        serde_json_lenient::to_value(&spec).expect("a spec serializes")
+    };
+
+    // The `task` root allows no terminal.
+    rewrite_spec(&server, id, &pty_spec_of_type(boxes::TASK_BOX_TYPE)).await;
+    let before = std::fs::read(&record_path).unwrap();
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &[
+            "session `root-spec`",
+            "`io.pty_enabled` to `true`",
+            "the built-in type `task` allows only `false`",
+            "min session destroy root-spec",
+        ],
+        3,
+    )
+    .await;
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+
+    // A type with no built-in root.
+    rewrite_spec(&server, id, &pty_spec_of_type("no-such-root")).await;
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &["`box.type` to `no-such-root`", "names no built-in type"],
+        3,
+    )
+    .await;
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+
+    // A `session` spec on a record filed as a `task`: the record's type is
+    // checked as a create checks the creating verb's.
+    rewrite_spec(&server, id, &resume_spec(true)).await;
+    rewrite_record(&server, id, |record| {
+        record.box_type = Some(boxes::TASK_BOX_TYPE.to_string());
+    })
+    .await;
+    let before = std::fs::read(&record_path).unwrap();
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &["the built-in type `task` allows only `false`"],
+        3,
+    )
+    .await;
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+
+    // The control: the box as the create filed it resumes.
+    rewrite_record(&server, id, |record| {
+        record.box_type = Some(boxes::SESSION_BOX_TYPE.to_string());
+    })
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("a stored spec the create accepted resumes");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
 /// BOX-025: a resume is refused while a running box holds the box's name,
 /// naming that box, and the name check comes before the spec check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
