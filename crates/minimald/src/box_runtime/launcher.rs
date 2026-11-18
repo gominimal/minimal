@@ -1903,9 +1903,12 @@ impl BoxLauncher for SandboxLauncher {
         // process. The program placed itself already, in the pre-exec closure
         // it ran inside the box, before it unshared the cgroup namespace onto
         // the leaf; the supervisor is the one process that never ran that
-        // closure. Never fatal: a supervisor the host could not place runs in
-        // the daemon's leaf, at the cost of being classified as the daemon
-        // rather than its box.
+        // closure. Fatal, like the program's own join and an injected exec's:
+        // every process of a host-address box stays in the cgroup its verdict
+        // is decided on, so a supervisor the host could not place, or did not
+        // find in the leaf after the write, fails the launch. The `Err` drops
+        // `process` first, which reaps the box before its program leaves the
+        // gate.
         if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get) {
             let supervisor = process.get_mut().id();
             match place_box_processes(leaf, supervisor) {
@@ -1916,12 +1919,17 @@ impl BoxLauncher for SandboxLauncher {
                     "placed the session's box in its classifier leaf: the \
                      supervisor here, the program in its own pre-exec closure",
                 ),
-                Err(e) => tracing::warn!(
-                    session = %session_label,
-                    leaf = %leaf.dir().display(),
-                    error = %e,
-                    "placing the session's supervisor in its classifier leaf",
-                ),
+                Err(e) => {
+                    tracing::warn!(
+                        session = %session_label,
+                        leaf = %leaf.dir().display(),
+                        supervisor,
+                        error = %e,
+                        "placing the session's supervisor in its classifier leaf \
+                         failed; the launch is refused",
+                    );
+                    return Err(supervisor_placement_refusal());
+                }
             }
         }
 

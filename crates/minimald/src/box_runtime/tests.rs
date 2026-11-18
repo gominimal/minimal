@@ -9250,3 +9250,40 @@ async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
         let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
     }
 }
+
+/// NET-079: the supervisor's placement is confirmed by the leaf's own
+/// members, never assumed from the write. A pid counts only as a whole line,
+/// so a pid that shares digits with a member is not taken for it.
+#[test]
+fn a_supervisor_placement_is_confirmed_by_the_leafs_members() {
+    assert!(super::leaf_lists_pid("41\n4242\n", 4242).is_ok());
+    assert!(super::leaf_lists_pid("4242", 4242).is_ok());
+    for members in ["", "424\n", "42420\n", "14242\n"] {
+        assert!(
+            super::leaf_lists_pid(members, 4242).is_err(),
+            "{members:?} does not list 4242"
+        );
+    }
+}
+
+/// NET-079: a supervisor the daemon could not write into its leaf is an
+/// error, which the launch turns into a refused start. A stand-in leaf with
+/// no `cgroup.procs` refuses the write the way a removed leaf does.
+#[test]
+fn a_supervisor_placement_the_leaf_refuses_is_an_error() {
+    let dir = tempfile::tempdir().expect("a stand-in tree");
+    let leaf = sandbox::config::ClassifierLeaf::new(dir.path().join("boxes/deny/b1"));
+    let err = super::place_box_processes(&leaf, std::process::id())
+        .expect_err("no cgroup.procs to write the supervisor into");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// The text a launch fails with when its supervisor could not be placed.
+#[test]
+fn the_supervisor_placement_refusal_says_the_box_did_not_start() {
+    assert_eq!(
+        super::supervisor_placement_refusal().to_string(),
+        "the box did not start: Minimal could not move the box's supervisor \
+         process into the cgroup that decides the box's network access"
+    );
+}
