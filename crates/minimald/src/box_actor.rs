@@ -1688,6 +1688,11 @@ impl BoxActor {
             return Ok(None);
         };
         let spec = box_runtime::stored_spec(bytes)?;
+        // BOX-160 at admission: the spec meets its type's built-in root as
+        // a create of it would, under the type the record is filed under.
+        // A record filed with no type has only the spec's own to go by.
+        let record_type = record.box_type.as_deref().unwrap_or(spec.box_type.as_str());
+        crate::box_manager::stored_spec_root_refusal(bytes, record_type)?;
         let mut started = record.clone();
         box_runtime::restart_from_stored_spec(&mut started, &spec);
         // The start's launches start the box from this spec.

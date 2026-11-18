@@ -1384,26 +1384,32 @@ impl RootConstraintRefusal {
     pub(crate) fn exit_code(&self) -> i32 {
         Self::EXIT_CODE
     }
+
+    /// The box the refusal speaks of, after its article: its type, and the
+    /// built-in type that type extends when the two differ.
+    fn kind(&self) -> String {
+        let Self { box_type, root, .. } = self;
+        if box_type == root {
+            format!("box of the built-in type `{root}`")
+        } else {
+            format!("box of type `{box_type}`, which extends the built-in type `{root}`,")
+        }
+    }
 }
 
 impl std::fmt::Display for RootConstraintRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
-            box_type,
-            root,
             key,
             value,
             allowed,
+            ..
         } = self;
-        let kind = if box_type == root {
-            format!("A box of the built-in type `{root}`")
-        } else {
-            format!("A box of type `{box_type}`, which extends the built-in type `{root}`,")
-        };
+        let kind = self.kind();
         write!(
             f,
             "The box spec sets `{key}` to `{value}`. \
-             {kind} allows {allowed} for `{key}`. \
+             A {kind} allows {allowed} for `{key}`. \
              No box was created. Change the value in minimal.toml, then create the box again."
         )
     }
@@ -1761,6 +1767,56 @@ fn root_constraint_refusal(
         }
         _ => Ok(()),
     }
+}
+
+/// The admission check of BOX-160 for a start from a box's stored spec
+/// (BOX-025, BOX-176): the stored bytes go through
+/// [`root_constraint_refusal`], the check a create of the same spec meets,
+/// with the record's type in the place of the creating verb's. A start is
+/// refused wherever a create of that spec would be.
+///
+/// # Errors
+///
+/// Why the stored spec breaks its type's built-in root, worded for a start
+/// from it rather than a create. A create refuses it with exit 3, and so
+/// does the start.
+pub(crate) fn stored_spec_root_refusal(
+    stored: &[u8],
+    record_type: &str,
+) -> Result<(), std::io::Error> {
+    let refused = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
+    let spec =
+        serde_json_lenient::from_slice::<serde_json_lenient::Value>(stored).map_err(|e| {
+            refused(format!(
+                "The settings it was created with cannot be read: {e}."
+            ))
+        })?;
+    let why = match root_constraint_refusal(&spec, record_type) {
+        Ok(()) => return Ok(()),
+        Err(AdmissionRootRefusal::Constraint(refusal)) => format!(
+            "The settings it was created with set `{key}` to `{value}`, and a {kind} \
+             allows {allowed} for `{key}`.",
+            key = refusal.key,
+            value = refusal.value,
+            kind = refusal.kind(),
+            allowed = refusal.allowed,
+        ),
+        Err(AdmissionRootRefusal::UnknownRoot(UnknownRootRefusal {
+            key,
+            value,
+            builtin_type: Some(builtin_type),
+        })) => format!(
+            "The settings it was created with set `box.type` to `{builtin_type}` and \
+             `{key}` to `{value}`, and the built-in type `{builtin_type}` is its own root."
+        ),
+        Err(AdmissionRootRefusal::UnknownRoot(UnknownRootRefusal { key, value, .. })) => {
+            format!(
+                "The settings it was created with set `{key}` to `{value}`, which names no \
+                 built-in type."
+            )
+        }
+    };
+    Err(refused(why))
 }
 
 /// Checks `spec` against the constraints of the built-in `root`, for a

@@ -610,14 +610,6 @@ pub enum StartEntryRefusal {
         entry: String,
         box_type: Option<String>,
     },
-    /// A typed session entry not named `default`. The box's spec would name
-    /// the entry, but its body still comes from the project's `[session]`
-    /// table, not from the entry (see [`stamp_session_spec_as`]). This
-    /// refusal is an interim.
-    /// <https://github.com/gominimal/minimal/issues/3204> tracks the entry's
-    /// own body. Remove this refusal when the start expands the typed
-    /// entry's body into its spec.
-    NamedSessionUnsupported { verb: StartVerb, entry: String },
 }
 
 impl StartEntryRefusal {
@@ -635,8 +627,7 @@ impl StartEntryRefusal {
             | Self::NameUnsupported { .. }
             | Self::FlagUnsupported { .. }
             | Self::TaskNotInTasks { .. }
-            | Self::UnsupportedType { .. }
-            | Self::NamedSessionUnsupported { .. } => 2,
+            | Self::UnsupportedType { .. } => 2,
         }
     }
 }
@@ -746,14 +737,6 @@ impl std::fmt::Display for StartEntryRefusal {
                  starts session and task entries only.",
                 entry = printable(entry),
                 kind = entry_kind(box_type.as_deref()),
-            ),
-            Self::NamedSessionUnsupported { verb, entry } => write!(
-                f,
-                "Cannot start {entry}. {command} cannot start a session entry by name \
-                 yet, except the entry named \"default\". Rename {entry} to \"default\" \
-                 in {file}, then run {command}.",
-                entry = printable(entry),
-                command = verb.command(),
             ),
         }
     }
@@ -900,22 +883,9 @@ pub(crate) fn plan_start(
         }
     };
     match entry.box_type.as_deref() {
-        // A typed session entry other than `default` would get the body of
-        // the `[session]` table under its own name. That refusal is the
-        // #3204 interim: remove it when the start expands the entry's body.
-        // A bare start that picks the only session entry still starts it,
-        // as BCLI-071 requires.
-        Some(boxes::SESSION_BOX_TYPE)
-            if start.entry.is_some() && entry.name != mfile::entry::DEFAULT_ENTRY_NAME =>
-        {
-            Err(StartEntryRefusal::NamedSessionUnsupported {
-                verb: start.verb,
-                entry: entry.name,
-            }
-            .into())
-        }
         // A session box has a terminal: its spec sets `pty_enabled`
-        // (`BoxSpec::for_session`).
+        // (`BoxSpec::for_session_entry`). The activation builds the spec
+        // from the picked entry's own expansion (`stamp_session_spec_as`).
         Some(boxes::SESSION_BOX_TYPE) => {
             if !start.detach && !has_terminal {
                 return Err(StartNeedsTerminal::new(&entry.name).into());
@@ -1255,54 +1225,92 @@ impl std::fmt::Display for GrantNotDelivered {
 
 impl std::error::Error for GrantNotDelivered {}
 
-/// The project's `[session.network.bep]` settings, `[session.secrets]`
-/// grants, the box spec's own variable names and the `[session.network]
-/// quic443` stance. Only a missing project file reads as empty. A file that
-/// exists but does not load refuses the activation, so a broken file can
-/// never skip the grant checks (BEP-008).
-fn project_bep_and_grants(
+/// The session entry's Box Egress Proxy settings (`network.bep`), its
+/// secret grants (`secrets`), the names of the variables its own spec sets
+/// and its `network.quic443` stance. Each comes from the expansion of the
+/// entry `entry` ([`session_box_expansion`]), or of the picked session
+/// entry when `entry` is `None`. So a typed entry such as `[sessions.dev]`
+/// grants its own secrets, and a project with only a `[session]` table
+/// grants that table's through the implicit `default` entry.
+///
+/// Only a missing project file reads as empty. A file that exists but does
+/// not load or expand refuses the activation, so a broken file can never
+/// skip the grant checks (BEP-008).
+pub(crate) fn project_bep_and_grants(
     project: &camino::Utf8Path,
-) -> Result<
-    (
-        boxes::core::bep::BepSettings,
-        boxes::core::bep::SecretGrants,
-        Vec<String>,
-        Option<boxes::core::bep::Quic443>,
-    ),
-    ProjectFileInvalid,
-> {
-    let session = match mfile::File::from_dir_recursive(project.as_std_path()) {
-        Ok(file) => file.session,
-        Err(mfile::Error::NotFound) => None,
+    entry: Option<&str>,
+) -> anyhow::Result<(
+    boxes::core::bep::BepSettings,
+    boxes::core::bep::SecretGrants,
+    Vec<String>,
+    Option<boxes::core::bep::Quic443>,
+)> {
+    let expanded = match session_box_expansion(project, entry, true, &SelectedLoadouts::default()) {
+        Ok(expanded) => expanded,
         Err(error) => {
             tracing::debug!(
                 rule = "BEP-008",
                 project = %project,
-                error = %error,
-                "activation refused: the project file does not load"
+                error = %format!("{error:#}"),
+                "activation refused: the project file does not load or expand"
             );
-            return Err(ProjectFileInvalid { error });
+            return Err(error);
         }
     };
-    Ok(session.map_or_else(Default::default, |session| {
-        // BEP-011: the names of the variables the box spec's own
-        // environment sets, so the activation can warn for a trust variable.
-        let spec_env = session
-            .vars
-            .keys()
-            .map(|name| name.as_ref().to_string())
-            .chain(
-                session
-                    .vars_lenient
-                    .iter()
-                    .map(|entry| entry.name().as_ref().to_string()),
-            )
-            .collect();
-        let (bep, quic443) = session
-            .network
-            .map_or_else(Default::default, |n| (n.bep.unwrap_or_default(), n.quic443));
-        (bep, session.secrets, spec_env, quic443)
-    }))
+    let Some(expanded) = expanded else {
+        return Ok(Default::default());
+    };
+    let spec = &expanded.spec;
+    let format_error = |error| ProjectFileInvalid {
+        error: mfile::Error::Format(error),
+    };
+    let secrets = match spec.get("secrets") {
+        Some(value) => {
+            boxes::core::bep::deserialize_project_secrets(value.clone()).map_err(format_error)?
+        }
+        None => boxes::core::bep::SecretGrants::default(),
+    };
+    // BEP-011: the names of the variables the box spec's own environment
+    // sets, so the activation can warn for a trust variable.
+    let vars_lenient: Vec<boxes::core::primitives::LenientVarEntry> = spec
+        .get("vars_lenient")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?
+        .unwrap_or_default();
+    let spec_env = spec
+        .get("vars")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|vars| vars.keys().cloned())
+        .chain(
+            vars_lenient
+                .iter()
+                .map(|entry| entry.name().as_ref().to_string()),
+        )
+        .collect();
+    let network = spec.get("network").and_then(toml::Value::as_table);
+    let bep = network
+        .and_then(|network| network.get("bep"))
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?
+        .unwrap_or_default();
+    let quic443 = network
+        .and_then(|network| network.get("quic443"))
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(format_error)?;
+    tracing::debug!(
+        entry = %expanded.wire.name,
+        secrets = secrets.len(),
+        spec_env = ?spec_env,
+        "read the session entry's secrets and Box Egress Proxy settings from its expansion"
+    );
+    Ok((bep, secrets, spec_env, quic443))
 }
 
 /// Where one field of a box's effective egress came from.
@@ -1775,6 +1783,13 @@ pub(crate) struct BoxEntryExpansion {
     /// Each of its hooks names its declarer (BOX-179). Its hooks reach the
     /// daemon in the stored spec ([`Self::spec_hooks`]).
     pub(crate) spec: toml::Table,
+    /// The layer that set each top-level key of [`Self::spec`]. The stored
+    /// spec reads it to choose between a flat key and its section's key.
+    pub(crate) report: mfile::expand::ExpansionReport,
+    /// The types of the entry's type chain, the root first. The stored
+    /// spec reads it to rank two settings of the chain's type defaults, so
+    /// a derived type's setting beats its parent's.
+    pub(crate) type_chain: Vec<String>,
 }
 
 impl BoxEntryExpansion {
@@ -2044,9 +2059,16 @@ fn box_entry(
         packages = ?wire.packages,
         "expanded the box's entry"
     );
+    let type_chain = whole
+        .type_defaults
+        .iter()
+        .map(|(box_type, _)| box_type.clone())
+        .collect();
     Ok(BoxEntryExpansion {
         wire,
         spec: full.spec,
+        report: full.report,
+        type_chain,
     })
 }
 
@@ -3214,17 +3236,27 @@ impl ActivationStep {
         let span = tracing::info_span!(
             "activation_step",
             step = self.name(),
-            otel.status_code = tracing::field::Empty
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty
         );
         let result = work.instrument(span.clone()).await;
         if let Err(error) = &result {
-            // The status, so a trace query for failed steps finds them; the
-            // event stays at INFO, since a failed step is often expected.
+            // The status, so a trace query for failed steps finds them, and
+            // its message, so the query reads why without the event
+            // (gominimal/minimal#3223); the event stays at INFO, since a
+            // failed step is often expected. A daemon reply that did not
+            // decode is named, never quoted, in the status.
             span.record("otel.status_code", "ERROR");
+            span.record(
+                "otel.status_description",
+                minimal_client::span_status_description(error).as_str(),
+            );
+            // The event is exported as a log record, so it takes the same
+            // text as the status: a reply that did not decode is not quoted.
             span.in_scope(|| {
                 tracing::info!(
                     step = self.name(),
-                    error = %format!("{error:#}"),
+                    error = %minimal_client::span_status_description(error),
                     "activation step failed"
                 );
             });
@@ -3536,9 +3568,8 @@ pub(crate) fn registration_held_name_refusal(
 }
 
 /// Puts the spec of a session box from `dir` on the create request
-/// (BOX-068): the project's `[session]` table, with the request's network
-/// mode, policy and hooks choice as the flags. A project with no
-/// `minimal.toml` has no `[session]` table.
+/// (BOX-068): the expansion of the project's session entry, with the
+/// request's network mode, policy and hooks choice as the flags.
 ///
 /// Known gap: the dashboard's activation in `crates/minimal/src/dash/rpc.rs`
 /// builds its own `CreateSessionRequest` and does not call this yet, so a
@@ -3556,41 +3587,56 @@ pub(crate) fn stamp_session_spec(
     stamp_session_spec_as(request, dir, None, None)
 }
 
-/// [`stamp_session_spec`] for the session entry `entry`, when it is not
-/// `default`, with `name` as the spec's `[box] name` (BCLI-069).
+/// [`stamp_session_spec`] for the session entry `entry`, with `name` as the
+/// spec's `[box] name` (BCLI-069).
 ///
-/// The spec names the typed entry, but its body still comes from the
-/// project's `[session]` table through `BoxSpec::for_session`. The body of
-/// `[sessions.<entry>]` is not applied yet. That is the interim of
-/// gominimal/minimal#3204, and until then `plan_start` refuses a typed
-/// session entry other than `default`
-/// ([`StartEntryRefusal::NamedSessionUnsupported`]). A bare start of the
-/// only session entry still reaches this function with that entry's name.
-/// Flip it when box creation reads entries
-/// (gominimal/minimal#2418): then expand the typed entry's body into the
-/// spec through BOX-064's layers.
+/// The spec comes from the entry's expansion ([`session_box_expansion`])
+/// over its layers, without the selected loadouts. So a typed entry such as
+/// `[sessions.dev]` stores its own packages, lifetime, timeout and
+/// `hooks_on_resume`, and a project with only a `[session]` table stores
+/// that table's, through the implicit `default` entry (BOX-165). With no
+/// `entry`, the session entry pick applies. A project with no
+/// `minimal.toml` gets the spec of an empty `[session]` table.
 ///
 /// # Errors
 ///
-/// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+/// Fails on a `minimal.toml` in `dir` or a parent of it that does not load
+/// or does not expand, and when no single session entry can be picked.
 pub(crate) fn stamp_session_spec_as(
     request: &mut minimald_rpc::CreateSessionRequest,
     dir: &camino::Utf8Path,
     entry: Option<&str>,
     name: Option<&str>,
 ) -> Result<(), anyhow::Error> {
-    let session = match mfile::File::from_dir_recursive(dir.as_std_path()) {
-        Ok(file) => file.session,
-        Err(mfile::Error::NotFound) => None,
-        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+    let flags = spec_flags(request);
+    let expanded = session_box_expansion(
+        dir,
+        entry,
+        flags.hooks_enabled,
+        &SelectedLoadouts::default(),
+    )?;
+    let mut spec = match &expanded {
+        Some(expanded) => mfile::spec::BoxSpec::for_session_entry(
+            &expanded.wire.name,
+            &expanded.spec,
+            &expanded.report,
+            &expanded.type_chain,
+            flags,
+        ),
+        None => mfile::spec::BoxSpec::for_session(None, flags),
     };
-    let mut spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
     if let Some(entry) = entry {
         spec.entry = entry.to_string();
     }
     if let Some(name) = name {
         spec.name = Some(name.to_string());
     }
+    tracing::debug!(
+        entry = %spec.entry,
+        lifetime = ?spec.lifetime,
+        packages = spec.packages.len(),
+        "built the session box's spec from its expanded entry"
+    );
     put_spec(request, &spec)
 }
 
@@ -3835,7 +3881,7 @@ pub(crate) async fn activate_box(
     let (policy, github_grants, store_grants) = ActivationStep::CheckProject
         .run(async {
             let (project_bep, project_secrets, project_env, project_quic443) =
-                project_bep_and_grants(&utf8_path)?;
+                project_bep_and_grants(&utf8_path, options.entry.as_deref())?;
             // NET-060: the project's egress, with each field a flag names
             // replaced by the flag.
             let mut project_egress = project_egress(&utf8_path, options.entry.as_deref())?;
@@ -5229,10 +5275,6 @@ mod tests {
                 entry: bad.clone(),
                 box_type: Some("agent".to_owned()),
             },
-            StartEntryRefusal::NamedSessionUnsupported {
-                verb: StartVerb::Session,
-                entry: bad.clone(),
-            },
         ];
         let mut texts: Vec<String> = refusals.iter().map(ToString::to_string).collect();
         texts.push(StartNeedsTerminal::new(&bad).to_string());
@@ -6053,7 +6095,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path, None).expect("loads");
         // The egress here is unset, so both runs refuse for that too. Only
         // the narrow-scope refusal depends on the acknowledgement.
         let narrow = |acknowledged: bool| {
@@ -6099,7 +6141,7 @@ mod tests {
             )
             .expect("write minimal.toml");
             let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+            let (bep, secrets, spec_env, _) = project_bep_and_grants(path, None).expect("loads");
             let egress = boxes::EgressPolicy {
                 allow_dns_hosts: Some(
                     bep::module::GITHUB
@@ -6146,7 +6188,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path, None).expect("loads");
         assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
         refuse_unhonourable_grants(
@@ -6712,7 +6754,7 @@ mod tests {
             )
             .expect("write minimal.toml");
             let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+            let (bep, secrets, spec_env, _) = project_bep_and_grants(path, None).expect("loads");
             assert!(credentialed_upstream_for(false, &bep, &secrets).is_some());
             assert_eq!(bep.resolved_steering().word(), word);
             assert_eq!(bep.resolved_steering() == Steering::Both, word == "both");
@@ -7473,13 +7515,15 @@ mod activation_step_tests {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     /// What the capture layer saw: each `activation_step` span's step, in
-    /// creation order, each failure record's step and error, and the step
-    /// of each span that recorded an ERROR status.
+    /// creation order, each failure record's step and error, the step of
+    /// each span that recorded an ERROR status, and the step and text of
+    /// each span that recorded a status description.
     #[derive(Default)]
     struct Seen {
         spans: Vec<String>,
         failures: Vec<(String, String)>,
         errored: Vec<String>,
+        described: Vec<(String, String)>,
         /// The step of each open `activation_step` span, by span id.
         by_id: std::collections::HashMap<u64, String>,
     }
@@ -7490,6 +7534,7 @@ mod activation_step_tests {
         error: Option<String>,
         message: Option<String>,
         status: Option<String>,
+        description: Option<String>,
     }
 
     impl tracing::field::Visit for Fields {
@@ -7499,6 +7544,7 @@ mod activation_step_tests {
                 "error" => self.error = Some(value.to_owned()),
                 "message" => self.message = Some(value.to_owned()),
                 "otel.status_code" => self.status = Some(value.to_owned()),
+                "otel.status_description" => self.description = Some(value.to_owned()),
                 _ => {}
             }
         }
@@ -7540,6 +7586,11 @@ mod activation_step_tests {
                 && let Some(step) = seen.by_id.get(&id.into_u64()).cloned()
             {
                 seen.errored.push(step);
+            }
+            if let Some(description) = fields.description
+                && let Some(step) = seen.by_id.get(&id.into_u64()).cloned()
+            {
+                seen.described.push((step, description));
             }
         }
 
@@ -7646,8 +7697,16 @@ mod activation_step_tests {
                 "Failed to upload project files".to_owned()
             )]
         );
-        // Only the failing step's span carries the ERROR status.
+        // Only the failing step's span carries the ERROR status, and its
+        // status description is the step's error (gominimal/minimal#3223).
         assert_eq!(seen.errored, ["upload_files"]);
+        assert_eq!(
+            seen.described,
+            [(
+                "upload_files".to_owned(),
+                "Failed to upload project files".to_owned()
+            )]
+        );
     }
 
     #[derive(clap::Parser)]
@@ -7684,5 +7743,12 @@ mod activation_step_tests {
             seen.failures[0].1
         );
         assert_eq!(seen.errored, ["check_arguments"]);
+        assert_eq!(seen.described.len(), 1);
+        assert_eq!(seen.described[0].0, "check_arguments");
+        assert!(
+            seen.described[0].1.starts_with(&expected),
+            "status description: {:?}",
+            seen.described[0].1
+        );
     }
 }

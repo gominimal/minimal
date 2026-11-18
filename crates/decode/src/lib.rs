@@ -30,6 +30,8 @@ pub use attrs::AttrValue;
 pub mod builds;
 use builds::BuildDecl;
 mod decl_tests;
+#[cfg(test)]
+mod field_contract_tests;
 pub use decl_tests::Test;
 mod stacks;
 pub use stacks::{PackageMatcherPredicate, Stack, StackMatcher};
@@ -40,7 +42,8 @@ pub use container::{Container, ExposedPort, ExposedPortProto};
 // keys get invalidated.
 //
 // Version 1: Switch from harnesses/ to stacks/.
-const FORMAT_VERSION: u8 = 1;
+// Version 2: BuildSpec's `attrs` and `needs` contracts are applied (inbox#1268).
+const FORMAT_VERSION: u8 = 2;
 
 /// The start and end bytes where a string was defined.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -625,8 +628,6 @@ mod tests {
                 "builder `build_args`",
                 "a record of strings",
             ),
-            ("attrs = 1", "builder `attrs`", "a record of attributes"),
-            ("needs = 1", "builder `needs`", "a record of attributes"),
             ("tests = 1", "builder `tests`", "a record of tests"),
             ("cmds = 1", "builder `cmds`", "an array of commands"),
             (
