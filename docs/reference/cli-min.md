@@ -315,8 +315,8 @@ min session exec <SESSION> <COMMAND>...
 Runs a command in an existing session, non-interactively, relaying its
 stdout, stderr and exit code.
 When a daemon shutdown stops the command, `min` prints
-`minimald is shutting down; the command was stopped` on stderr and exits with
-the command's own status.
+`the daemon is shutting down, so the command was stopped` on stderr and
+exits with the command's own status.
 
 How `COMMAND` is read depends on how many arguments you give it:
 

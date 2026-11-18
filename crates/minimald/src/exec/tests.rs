@@ -1132,7 +1132,7 @@ async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
         let mut err = Vec::new();
         client_stderr.read_to_end(&mut err).await.unwrap();
         let expected: &[u8] = if shutting_down {
-            b"err!minimald is shutting down; the command was stopped\n"
+            b"err!the daemon is shutting down, so the command was stopped\n"
         } else {
             b"err!"
         };
@@ -1358,7 +1358,7 @@ async fn an_exec_that_exits_on_its_own_gets_no_notice() {
         let mut err = Vec::new();
         client_stderr.read_to_end(&mut err).await.unwrap();
         let expected: &[u8] = if noticed {
-            b"err!minimald is shutting down; the command was stopped\n"
+            b"err!the daemon is shutting down, so the command was stopped\n"
         } else {
             b"err!"
         };
@@ -5692,6 +5692,13 @@ fn client_stderr_lines_do_not_name_the_daemon() {
         super::bridge::unstarted_input_notice(HeldBound::Exec),
         super::bridge::unstarted_input_notice(HeldBound::Daemon),
         super::sandbox_failure_notice("mount /home/h810: ENOENT"),
+        super::bridge::spawn_failed_notice(&"No such file or directory (os error 2)"),
+        super::git::NO_REPOSITORY_NOTICE.to_owned(),
+        super::run::start_failed_notice("build", &"the session is gone"),
+        super::run::start_failed_notice("check", &"the session is gone"),
+        super::run::check_args_notice(&"unknown flag `--nope`"),
+        String::from_utf8(SHUTDOWN_NOTICE.to_vec()).unwrap(),
+        String::from_utf8(super::bridge::DESTROYED_NOTICE.to_vec()).unwrap(),
     ];
     for line in &lines {
         assert!(
@@ -5699,7 +5706,7 @@ fn client_stderr_lines_do_not_name_the_daemon() {
             "a client line names the daemon: {line:?}"
         );
         assert!(
-            line.ends_with('\n'),
+            line.ends_with('\n') && line.matches('\n').count() == 1,
             "a client line is one whole line: {line:?}"
         );
     }

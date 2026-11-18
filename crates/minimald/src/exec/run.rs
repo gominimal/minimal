@@ -168,7 +168,7 @@ pub(super) async fn run_build_exec(
         }
         Err(err) => {
             let _ = e
-                .write_all(format!("failed to start build: {err}\n").as_bytes())
+                .write_all(start_failed_notice("build", &err).as_bytes())
                 .await;
             1
         }
@@ -202,7 +202,7 @@ pub(super) async fn run_check_exec(
     let opts = match CheckOpts::from_args(&args) {
         Ok(opts) => opts,
         Err(msg) => {
-            let _ = e.write_all(format!("{msg}\n").as_bytes()).await;
+            let _ = e.write_all(check_args_notice(&msg).as_bytes()).await;
             let _ = e.flush().await;
             let _ = ws.eof().await;
             let _ = ws.exit_status(1).await;
@@ -239,7 +239,7 @@ pub(super) async fn run_check_exec(
         }
         Err(err) => {
             let _ = e
-                .write_all(format!("failed to start check: {err}\n").as_bytes())
+                .write_all(start_failed_notice("check", &err).as_bytes())
                 .await;
             1
         }
@@ -250,4 +250,16 @@ pub(super) async fn run_check_exec(
     let _ = ws.eof().await;
     let _ = ws.exit_status(exit_status).await; // otherwise considered -1
     let _ = ws.close().await; // needed to release the remote
+}
+
+/// The line a build or check exec leaves on stderr when its side-op cannot
+/// start; `what` is `build` or `check`.
+pub(super) fn start_failed_notice(what: &str, err: &impl Display) -> String {
+    format!("failed to start {what}: {err}\n")
+}
+
+/// The line a check exec leaves on stderr when its arguments do not parse:
+/// the parser's message alone.
+pub(super) fn check_args_notice(msg: &impl Display) -> String {
+    format!("{msg}\n")
 }

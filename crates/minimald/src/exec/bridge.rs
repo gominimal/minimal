@@ -124,7 +124,14 @@ where
 
 /// The line an exec the daemon's shutdown ended leaves on stderr, so the
 /// client is told why its command stopped rather than handed a bare 137.
-pub(super) const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
+pub(super) const SHUTDOWN_NOTICE: &[u8] =
+    b"the daemon is shutting down, so the command was stopped\n";
+
+/// The line an exec leaves on stderr when the next process of its sequence
+/// fails to spawn.
+pub(super) fn spawn_failed_notice(err: &impl Display) -> String {
+    format!("failed to spawn process: {err}\n")
+}
 
 /// The line an exec the session's destroy ended leaves on stderr, for the
 /// same reason: the client is told why its command stopped, not handed a
@@ -1164,9 +1171,7 @@ where
                     %channel_id, error = %err,
                     "exec: failed to spawn next process in sequence; reporting exit 1",
                 );
-                let _ = e
-                    .write_all(format!("failed to spawn process: {err}\n").as_bytes())
-                    .await;
+                let _ = e.write_all(spawn_failed_notice(&err).as_bytes()).await;
                 last_exit = 1;
                 break;
             }
