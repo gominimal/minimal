@@ -1375,10 +1375,10 @@ impl BoxActor {
             Ok(restarted_from_stored_spec) => {
                 self.resume_in_flight = true;
                 Ok(Some(PendingResume {
-                from,
-                before,
-                span,
-                restarted_from_stored_spec,
+                    from,
+                    before,
+                    span,
+                    restarted_from_stored_spec,
                     minted_host: !had_host
                         && matches!(self.inner, BoxInner::Active { host: Some(_), .. }),
                 }))
