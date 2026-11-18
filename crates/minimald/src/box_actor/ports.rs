@@ -1417,11 +1417,12 @@ impl BoxActor {
     /// the port is served the whole way through. A bind at `to` that failed
     /// leaves the old forward as it is.
     ///
-    /// On a VM-backed host the host refuses a declared port's withdrawal and
-    /// unbinds the box's declared forwards itself
-    /// ([`crate::net::policy::ControlChannel::host_unbinds_declared_forwards`]),
-    /// so nothing is asked there. An unbind that fails is logged, and the
-    /// spawn's end unbinds the forward as it would have.
+    /// The unbind is asked on every host. On a VM-backed host the host's
+    /// gate applies the box's withdrawal of a port its row declares, so the
+    /// old address is free at once. A publish the VM host keeps behind
+    /// another box's row is not asked for, since its listener is still that
+    /// box's forward. An unbind that fails is logged, and the spawn's end
+    /// unbinds the forward as it would have.
     #[cfg(target_os = "linux")]
     pub(super) async fn release_moved_declared(
         &mut self,
@@ -1437,10 +1438,10 @@ impl BoxActor {
             return;
         }
         let control = self.switch_control().await;
-        if control.host_unbinds_declared_forwards() {
-            return;
-        }
-        for forwarder in stale {
+        for forwarder in stale
+            .into_iter()
+            .filter(|forwarder| !forwarder.is_kept_by_host())
+        {
             match forwarder.unbind_moved(&control).await {
                 Ok(()) => tracing::info!(
                     port,
