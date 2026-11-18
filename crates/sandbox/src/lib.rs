@@ -3100,25 +3100,42 @@ fn log_rootfs_collisions(c: &common::LinkCollisions, layers: &[PathBuf], rootfs:
 /// the assembled one (the link pass hardlinks, so the winner's file and
 /// the rootfs path are one). A symlink is made anew in the rootfs, not
 /// linked, so it shares no inode with its layer: its winner is the first
-/// layer whose link points where the placed one does. `None` when no
-/// layer matches, as for a file the assembly copied across filesystems.
+/// layer whose link points where the placed one does.
+///
+/// A file the assembly copied (the cache and the rootfs on different
+/// filesystems) has an inode of its own, so no layer matches it that way.
+/// The first-linked file stays, so its winner is the first layer, in link
+/// order, that ships the path, and that layer is named only when the link
+/// pass's own comparison calls its file the same as the placed one. `None`
+/// otherwise: the placed file came from somewhere other than `layers`, or
+/// the two have equal sizes above the compare limit
+/// ([`common::LinkCollision::Unchecked`]), which proves nothing about who
+/// placed it, so no layer is named rather than a possibly wrong one.
 fn collision_winner<'a>(rootfs: &Path, layers: &'a [PathBuf], rel: &Path) -> Option<&'a Path> {
     use std::os::unix::fs::MetadataExt as _;
-    let placed = fs::symlink_metadata(rootfs.join(rel)).ok()?;
+    let at = rootfs.join(rel);
+    let placed = fs::symlink_metadata(&at).ok()?;
     if placed.is_symlink() {
-        let target = fs::read_link(rootfs.join(rel)).ok()?;
+        let target = fs::read_link(&at).ok()?;
         return layers
             .iter()
             .find(|layer| fs::read_link(layer.join(rel)).is_ok_and(|t| t == target))
             .map(PathBuf::as_path);
     }
-    layers
+    let linked = layers.iter().find(|layer| {
+        fs::symlink_metadata(layer.join(rel))
+            .is_ok_and(|m| m.dev() == placed.dev() && m.ino() == placed.ino())
+    });
+    if let Some(layer) = linked {
+        return Some(layer.as_path());
+    }
+    let first = layers
         .iter()
-        .find(|layer| {
-            fs::symlink_metadata(layer.join(rel))
-                .is_ok_and(|m| m.dev() == placed.dev() && m.ino() == placed.ino())
-        })
-        .map(PathBuf::as_path)
+        .find(|layer| fs::symlink_metadata(layer.join(rel)).is_ok())?;
+    let shipped = first.join(rel);
+    let is_the_copy = fs::symlink_metadata(&shipped).is_ok_and(|m| m.is_file())
+        && common::link_collision(&shipped, &at) == common::LinkCollision::Same;
+    is_the_copy.then_some(first.as_path())
 }
 
 /// Logs a working input that was not placed at `dest` because something is
@@ -4436,6 +4453,81 @@ mod tests {
             super::collision_winner(&rootfs, &layers, std::path::Path::new("usr/lib/none")),
             None
         );
+    }
+
+    /// With the cache and the rootfs on different filesystems the link pass
+    /// copies, and a copy has an inode of its own: the winner is then the
+    /// first layer, in link order, that ships the path, named when its file
+    /// is the placed one's bytes. A placed file that is not that layer's has
+    /// no winner among the layers.
+    #[test]
+    fn collision_winner_of_a_copied_file_is_the_first_layer_that_ships_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("usr/share/man/man1/node.1");
+        let [a, b, c] = ["a", "b", "c"].map(|name| tmp.path().join(name));
+        let rootfs = tmp.path().join("rootfs");
+        for dir in [&b, &c, &rootfs] {
+            std::fs::create_dir_all(dir.join(rel.parent().unwrap())).unwrap();
+        }
+        // `a` does not ship the path; `b` ships it first, `c` after it
+        std::fs::create_dir_all(a.join("usr")).unwrap();
+        std::fs::write(b.join(rel), b".TH NODE 1 22").unwrap();
+        std::fs::write(c.join(rel), b".TH NODE 1 20, another").unwrap();
+        // the cross-filesystem branch of the link pass: a copy, not a link
+        std::fs::copy(b.join(rel), rootfs.join(rel)).unwrap();
+        let layers = [a.clone(), b.clone(), c.clone()];
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, rel),
+            Some(b.as_path()),
+            "the first layer to ship the path is the one whose copy stays"
+        );
+
+        // the same bytes in a later layer do not make it the winner
+        std::fs::write(c.join(rel), b".TH NODE 1 22").unwrap();
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, rel),
+            Some(b.as_path())
+        );
+
+        // what stands in the rootfs is not the first shipper's file
+        std::fs::write(rootfs.join(rel), b"placed by something else").unwrap();
+        assert_eq!(super::collision_winner(&rootfs, &layers, rel), None);
+    }
+
+    /// A copied file above the compare limit, of the same size as the first
+    /// shipper's, is only `Unchecked` by the link pass's comparison: equal
+    /// sizes prove nothing about who placed it, so no layer is named.
+    #[test]
+    fn collision_winner_of_an_unchecked_copy_names_no_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("usr/lib/libbig.so");
+        let [a, b] = ["a", "b"].map(|name| tmp.path().join(name));
+        let rootfs = tmp.path().join("rootfs");
+        for dir in [&a, &b, &rootfs] {
+            std::fs::create_dir_all(dir.join(rel.parent().unwrap())).unwrap();
+        }
+        // sparse files well above the compare limit, so the test writes no
+        // more than a few bytes: `a` ships zeros, `b` ships the path too, and
+        // the placed file is another source's, of equal size, other bytes
+        let size = 64 << 20;
+        std::fs::write(rootfs.join(rel), b"another source").unwrap();
+        for dir in [&a, &b, &rootfs] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join(rel))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        assert_eq!(
+            common::link_collision(&a.join(rel), &rootfs.join(rel)),
+            common::LinkCollision::Unchecked,
+            "the comparison must reach the unchecked branch"
+        );
+        let layers = [a.clone(), b.clone()];
+        assert_eq!(super::collision_winner(&rootfs, &layers, rel), None);
     }
 
     /// Two layers ship one path as symlinks to different targets. The link

@@ -1491,6 +1491,67 @@ mod tests {
         );
     }
 
+    /// A resume that the VM host refuses, here because the VM cannot reach
+    /// the DNS service for box names, fails the attach with the VM host's
+    /// reason, which names `min finalize-install --show`.
+    #[tokio::test]
+    async fn resume_refused_by_vm_host_names_its_reason() {
+        // minvmd's `NO_ANSWERER`, word for word.
+        const REASON: &str = "the running VM cannot reach Minimal's DNS service for box names, \
+                              so this box cannot be given an address; run `min \
+                              finalize-install --show` to check the service's setup, or see \
+                              minvmd.log for the cause (`min dirs` shows where logs are kept)";
+        let dir = tempfile::TempDir::new().unwrap();
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error {
+                // minvmd's refusal as it crosses the wire.
+                error: format!("could not give the box an address: {REASON}"),
+            })
+            .unwrap(),
+        )
+        .await;
+        let record = boxes::Record {
+            id: boxes::SessionId::nil(),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy::default(),
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: Some(boxes::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            }),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
+            attrs: Default::default(),
+        };
+        let error = resume_box_row(&dir.path().join("ssh.sock"), Some(&record))
+            .await
+            .expect_err("a refused resume fails the attach");
+        assert_eq!(requests.lock().unwrap().len(), 1, "one resume was asked");
+        let refusal = error
+            .downcast_ref::<minimal_client::box_registration::HostRefusal>()
+            .expect("the error carries the VM host's refusal");
+        assert_eq!(refusal.reason(), REASON);
+        // The reason prints once, after the box it is about.
+        assert_eq!(format!("{error:#}"), format!("box web: {REASON}"));
+    }
+
     /// NET-045/NET-138: the host-side registration carries the box's
     /// dynamic-ingress grant — the stance and the range — from the same
     /// create inputs the session record holds, so the host-side row holds
