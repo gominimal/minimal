@@ -1857,6 +1857,18 @@ impl File {
         Error::IO("resolving", rel.to_path_buf(), e)
     }
 
+    /// The error for a directory on the way to `minimal.toml` (`.minimal`)
+    /// that is a link to nothing.
+    #[cfg(target_os = "linux")]
+    fn dangling_dir_within(link: &Path) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "symlink to a directory that does not exist; create it or replace the link with a \
+             directory",
+        );
+        Error::IO("resolving", link.to_path_buf(), e)
+    }
+
     /// The best-effort confinement: no component of `rel` under `root` may
     /// be a symlink. A link swapped in between this check and the edit or
     /// read is not caught, which is why Linux resolves the names with
@@ -1947,6 +1959,35 @@ impl File {
         }
     }
 
+    /// After an open of the directory `parent_rel` beneath `root_fd` found
+    /// nothing, the first name on `parent_rel` that is a link to nothing
+    /// (a `.minimal` that points at a directory that does not exist), as a
+    /// name under the workspace. `None` when the missing name is simply not
+    /// there, or when the names have changed since.
+    #[cfg(target_os = "linux")]
+    fn dangling_dir_link(
+        root_fd: std::os::fd::BorrowedFd<'_>,
+        parent_rel: &Path,
+    ) -> Option<PathBuf> {
+        use std::os::fd::AsFd as _;
+
+        const LOOKUP: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
+        let mut at = PathBuf::new();
+        for component in parent_rel.components() {
+            let dir = beneath::open_beneath(root_fd, &at, LOOKUP).ok()?;
+            let name = component.as_os_str();
+            let link = at.join(name);
+            if beneath::is_symlink_at(dir.as_fd(), name).ok()?
+                && let Err(e) = beneath::open_beneath(root_fd, &link, LOOKUP)
+                && e.raw_os_error() == Some(libc::ENOENT)
+            {
+                return Some(link);
+            }
+            at = link;
+        }
+        None
+    }
+
     /// Resolves `rel` beneath `root` (open as `root_fd`) with `openat2(2)`
     /// to the directory that holds the file and the file's name in it, for
     /// [`File::edit_confined`] and [`File::read_confined`]. A `..` or a link
@@ -1978,7 +2019,15 @@ impl File {
                 return Ok(Beneath::NoOpenat2);
             }
             Err(e) if beneath::escaped(&e) => return Err(Self::leads_outside(rel, access)),
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(Beneath::NoDir(e)),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                // A `.minimal` that is a link to nothing is refused, as a
+                // `minimal.toml` that is one is: only an absent directory
+                // means there is no file.
+                if let Some(link) = Self::dangling_dir_link(root_fd, parent_rel) {
+                    return Err(Self::dangling_dir_within(&link));
+                }
+                return Ok(Beneath::NoDir(e));
+            }
             Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e)),
         };
 
@@ -5520,6 +5569,50 @@ bash = \"true\"
             assert!(err.to_string().contains("does not exist"), "error: {err}");
         }
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    }
+
+    #[test]
+    fn from_dir_within_refuses_a_dangling_dot_minimal_link() {
+        let (_dir, root, _) = workspace_and_outside();
+        let link = root.join(".minimal");
+        let target = Path::new("missing-dir");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        if refuses_every_link(&root) {
+            eprintln!("no openat2 here: checking the fallback's refusal of every link instead");
+            assert_link_refusal(&err, &root);
+        } else {
+            assert!(
+                err.to_string()
+                    .contains("symlink to a directory that does not exist"),
+                "error: {err}"
+            );
+            let Error::IO(_, shown, _) = &err else {
+                panic!("not an I/O refusal: {err:?}");
+            };
+            assert_eq!(shown, Path::new(".minimal"));
+        }
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(!root.join(target).exists(), "the read created the target");
+    }
+
+    #[test]
+    fn from_dir_within_finds_no_file_beside_a_dot_minimal_link_to_an_empty_directory() {
+        let (_dir, root, _) = workspace_and_outside();
+        std::fs::create_dir(root.join("conf")).unwrap();
+        let link = root.join(".minimal");
+        std::os::unix::fs::symlink("conf", &link).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        if refuses_every_link(&root) {
+            eprintln!("no openat2 here: checking the fallback's refusal of every link instead");
+            assert_link_refusal(&err, &root);
+            return;
+        }
+        assert!(matches!(err, Error::NotFound), "error: {err}");
     }
 
     #[test]
