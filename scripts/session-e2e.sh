@@ -305,10 +305,10 @@
 #                                    address, at its name and through the
 #                                    hostname proxy; a second box on the
 #                                    same port is refused at activate
-#   github_only_allowlist            NET-066/067/072/073/136 + NET-068's e2e
-#                                    half: a hostname-only allowlist runs a
-#                                    real toolchain against github.com and
-#                                    friends, reaches nothing at all beyond
+#   github_only_allowlist            NET-066/067/072/073/136/141 + NET-068's
+#                                    e2e half: a hostname-only allowlist runs
+#                                    a real toolchain against github.com and
+#                                    friends, cannot resolve any name beyond
 #                                    them, refuses and logs an answer into
 #                                    a denied range, answers AAAA/HTTPS/SVCB
 #                                    empty, and lets boxes reach each other by
@@ -19670,8 +19670,8 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   # ---- the title's other half: a name the declaration does not name ---------
   # The fetches above are the allowed half; the other half is that a name
   # with no --allow-dns-hosts entry reaches NOTHING. One GET from the same
-  # box, and the assertions are on the outcome — no HTTP response arrived,
-  # whichever way the stack refused it — and on the gate's own record: no
+  # box, and the assertions are on the outcome — the lookup refused, so no
+  # HTTP response arrived — and on the gate's own record: no
   # admission for the name, which is the one grant the box's dead subnet
   # rule could ever have carried a connect on. A reply whose name the gate
   # does not recognize pins nothing and warns nothing, so the absence has
@@ -19680,19 +19680,12 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   # never skipped for network conditions: a host that cannot reach the
   # internet fails them first.
   #
-  # This leg pins the CURRENT behaviour against a known gap — and the
-  # connect timeout (curl exit 28) is that current behaviour, not the shape
-  # the box is supposed to have: under the shipped interim the query for a
-  # name egress.allow_dns_hosts does not match is forwarded and only the
-  # resulting pin is withheld (crates/minimald/src/net/dns_gate.rs), so the
-  # resolution is honest, the address comes back, and the connect to it is
-  # then dropped unanswered under the box's egress rules until --max-time
-  # runs out. Design §5.3 instead refuses such a name at resolution, but
-  # spec 18 has no requirement for that yet. When
-  # https://github.com/gominimal/minimal/issues/1869 lands, this leg flips
-  # with it, deliberately: the refusal moves to the lookup itself and the
-  # assertion narrows to curl exit 6 (could not resolve host), fast —
-  # which is the shape the gate owes a hostname-only box.
+  # The refusal is at the lookup itself (NET-141): the box's relay answers
+  # a name egress.allow_dns_hosts does not match NXDOMAIN and forwards it
+  # nowhere, and on a VM host the host-side gate drops the query before the
+  # switch too. So curl must exit 6 (could not resolve host), inside
+  # 5000 ms, before any connection is tried — never a connect timeout
+  # (exit 28), which would mean the name resolved.
   goa_x_before="$(goa_log_lines)"
   goa_x_start="$(now_ms)"
   mnl session exec "$goa_t_sid" \
@@ -19702,39 +19695,19 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   goa_x_elapsed=$(( $(now_ms) - goa_x_start ))
   goa_x_status="$(cat "$WORK/goa-example.out" 2>/dev/null)"
   goa_x_err="$(tr '\n' ' ' < "$WORK/goa-example.err" 2>/dev/null)"
-  # How it was refused decides what the window is worth waiting for: a
-  # dropped connect owes the log its egress drop (and the asynchronous
-  # writer a moment to land it), a refused lookup owes nothing. The
-  # violation line is printed, never asserted on — this box has been
-  # dropping frames under this rule since the fetches, so R2.7's
-  # per-box-per-rule minute may lawfully have suppressed it here.
-  if grep -qiE 'could not resolve host|name or service not known|resolv.*timed out' <<<"$goa_x_err"; then
-    goa_print_net_since "$goa_x_before" ""
-    goa_x_way="the lookup reached no address the gate had admitted"
-  elif grep -qiE 'timed out|timeout' <<<"$goa_x_err"; then
-    goa_print_net_since "$goa_x_before" "network policy violation"
-    goa_x_way="the connect was silently dropped"
-  elif grep -qi 'reset by peer' <<<"$goa_x_err"; then
-    goa_print_net_since "$goa_x_before" ""
-    echo "::error::the undeclared-name connect was reset, not dropped — something answered a SYN the box's rules refuse"
-    cat "$WORK/goa-example.err" 2>/dev/null || true
-    fail
-  else
-    goa_print_net_since "$goa_x_before" ""
-    echo "::error::the undeclared-name GET failed a way this gate cannot account for: a hostname-only box refuses a name it did not declare by a refused lookup or a silently dropped connect, and curl's report names neither (exit $goa_x_rc: ${goa_x_err:-<none>})"
-    fail
-  fi
+  goa_print_net_since "$goa_x_before" ""
   echo "undeclared-name GET https://example.org -> rc=$goa_x_rc status=${goa_x_status:-<none>} elapsed=${goa_x_elapsed}ms curl: ${goa_x_err:-<none>}"
   if goa_curl_answered "$goa_x_rc" "${goa_x_status:-}"; then
     echo "::error::the hostname-only box answered a GET of example.org — a name the declaration does not name, so any reach it travelled is a grant the gate never made"
     cat "$WORK/goa-example.err" 2>/dev/null || true
     fail
   fi
-  if [ "$goa_x_way" = "the connect was silently dropped" ] && [ "$goa_x_elapsed" -lt 6000 ]; then
-    echo "::error::the undeclared-name connect failed in ${goa_x_elapsed}ms — a fast refusal. The fetches in this same run resolved and reached github.com, so a fast failure here is the box's own doing, not weather"
+  if [ "$goa_x_rc" != 6 ] || [ "$goa_x_elapsed" -ge 5000 ]; then
+    echo "::error::NET-141: the hostname-only box's GET of example.org did not fail fast at resolution (want curl exit 6 inside 5000 ms, got exit $goa_x_rc in ${goa_x_elapsed}ms) — its resolver refuses every name its allow list does not match. The fetches in this same run resolved and reached github.com, so this is the box's own doing, not weather"
     cat "$WORK/goa-example.err" 2>/dev/null || true
     fail
   fi
+  goa_x_way="the lookup was refused"
   goa_x_admits="$(goa_records_named "$GOA_RECORDS" 'admitted a resolved name' | grep -F -- 'example.org' || true)"
   if [ -n "$goa_x_admits" ]; then
     echo "::error::the DNS gate admitted example.org — a name the declaration does not name, so the hostname-only posture is open"

@@ -802,7 +802,7 @@ impl BoxRecord {
     /// egress declaration (the node namespace's among them, which carries
     /// every host-address box's frames) is never deny-all. The host-side
     /// gate reads this to drop a deny-all box's DNS queries for names
-    /// outside the box zone ([`crate::net::dns_pins::deny_all_refusal`]).
+    /// outside the box zone ([`crate::net::dns_pins::dns_query_refusal`]).
     #[must_use]
     pub fn is_deny_all(&self) -> bool {
         self.deny_all

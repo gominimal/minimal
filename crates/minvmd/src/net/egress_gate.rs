@@ -476,10 +476,18 @@ const INBOUND_FLOW_CAP_RULE: &str = "egress-inbound-flow-cap";
 /// than write on to the switch (NET-141's deny-all case, decided host-side
 /// for own-address rows): anything but a standard query whose every
 /// question is an A lookup of a box-zone name
-/// ([`dns_pins::deny_all_refusal`]). Its own rule, not the row verdict's:
+/// ([`dns_pins::dns_query_refusal`]). Its own rule, not the row verdict's:
 /// the verdict admitted the frame under the resolver carve-out, and what
 /// this names is the name the carve-out may not carry out.
 const DENY_ALL_DNS_RULE: &str = "egress-deny-all-dns-query";
+
+/// The rule name for an allow-list box's DNS datagram the host drops rather
+/// than write on to the switch (NET-141, decided host-side for own-address
+/// rows): a query naming anything its `allow_dns_hosts` does not match
+/// outside the box zone ([`dns_pins::dns_query_refusal`]). Its own rule, not
+/// the row verdict's: the verdict admitted the frame to the box's resolver,
+/// and what this names is a name no resolver beyond it may be asked.
+const UNMATCHED_NAME_DNS_RULE: &str = "egress-unmatched-dns-name";
 
 /// The port the resolver carve-out is keyed to at the gateway (NET-079):
 /// DNS, over UDP or TCP (a query falls back to TCP on truncation, so the
@@ -5464,17 +5472,18 @@ async fn relay_frames_to_switch(
         } else {
             None
         };
-        // NET-141's deny-all case, decided here for own-address rows: a
-        // deny-all box's query that names anything outside the box zone (or
-        // asks a zone name for anything but A, or does not parse as a
-        // standard query) is dropped by not being written on — silently
-        // toward the guest, like every drop here — and said once per box per
-        // name per interval. Before the write, so no resolver beyond the box
-        // ever sees the name.
+        // NET-141, decided here for own-address rows: a deny-all box's query
+        // that names anything outside the box zone (or asks a zone name for
+        // anything but A), an allow-list box's query that names anything its
+        // list does not match outside the box zone, and either one's
+        // datagram that does not parse as a standard query, is dropped by not
+        // being written on — silently toward the guest, like every drop
+        // here — and said once per box per name per interval. Before the
+        // write, so no resolver beyond the box ever sees the name.
         if let Some((query, datagram)) = &dns
-            && let Some(refusal) = dns_pins::deny_all_refusal(table, query, datagram)
+            && let Some(refusal) = dns_pins::dns_query_refusal(table, query, datagram)
         {
-            limiter.warn_deny_all_query(&refusal);
+            limiter.warn_refused_dns_query(&refusal);
             continue;
         }
         // One combined write keeps the length prefix and the frame together
@@ -7606,38 +7615,57 @@ impl DropLimiter {
         }
     }
 
-    /// Emits the warning for one deny-all box's DNS datagram the gate
-    /// dropped ([`dns_pins::deny_all_refusal`]): the same rate limit a DNS
+    /// Emits the warning for one box's DNS datagram the gate dropped
+    /// ([`dns_pins::dns_query_refusal`]): the same rate limit a DNS
     /// refusal's line answers to, keyed by the box, the rule and the name,
     /// so one name's burst says so once per interval while two names each
     /// get their line — and a flood of distinct names folds into the rule's
-    /// one shared line, at no memory past the limiter's bound. The line
-    /// names the box (its address and namespace) and the name it asked.
-    /// Returns whether a line was written.
-    pub(crate) fn warn_deny_all_query(&self, refusal: &dns_pins::DenyAllRefusal) -> bool {
+    /// one shared line, at no memory past the limiter's bound. The rule is
+    /// the deny-all one for a deny-all row and the unmatched-name one for an
+    /// allow-list row. The line names the box (its address and namespace)
+    /// and the name it asked. Returns whether a line was written.
+    pub(crate) fn warn_refused_dns_query(&self, refusal: &dns_pins::DnsQueryRefusal) -> bool {
         let src = refusal.record.switch_addr().octets();
-        match self.should_warn_refusal_at(src, &refusal.name, DENY_ALL_DNS_RULE, Instant::now()) {
+        let deny_all = refusal.record.is_deny_all();
+        let rule = if deny_all {
+            DENY_ALL_DNS_RULE
+        } else {
+            UNMATCHED_NAME_DNS_RULE
+        };
+        match self.should_warn_refusal_at(src, &refusal.name, rule, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
                 let query_type = refusal
                     .query_type
                     .map_or_else(|| "none".to_string(), |rtype| rtype.to_string());
-                tracing::warn!(
-                    source = %Ipv4Addr::from(src),
-                    namespace = ?refusal.record.name(),
-                    name = refusal.name.as_str(),
-                    query_type,
-                    rule_matched = DENY_ALL_DNS_RULE,
-                    "dropped a deny-all box's DNS query naming something outside the box \
-                     zone at the host-side egress gate",
-                );
+                if deny_all {
+                    tracing::warn!(
+                        source = %Ipv4Addr::from(src),
+                        namespace = ?refusal.record.name(),
+                        name = refusal.name.as_str(),
+                        query_type,
+                        rule_matched = rule,
+                        "dropped a deny-all box's DNS query naming something outside the box \
+                         zone at the host-side egress gate",
+                    );
+                } else {
+                    tracing::warn!(
+                        source = %Ipv4Addr::from(src),
+                        namespace = ?refusal.record.name(),
+                        name = refusal.name.as_str(),
+                        query_type,
+                        rule_matched = rule,
+                        "dropped a box's DNS query naming something its allow_dns_hosts does \
+                         not match, outside the box zone, at the host-side egress gate",
+                    );
+                }
                 true
             }
             WarnDecision::Overflow => {
                 tracing::warn!(
-                    rule_matched = DENY_ALL_DNS_RULE,
-                    "dropped deny-all boxes' DNS queries for more distinct boxes and names \
-                     than the gate keeps a window for; one line per rule covers the rest",
+                    rule_matched = rule,
+                    "dropped boxes' DNS queries for more distinct boxes and names than the \
+                     gate keeps a window for; one line per rule covers the rest",
                 );
                 true
             }
@@ -20719,8 +20747,8 @@ mod tests {
     /// name; zone A lookups (`host.min.internal` among them) pass byte for
     /// byte; a zone name asked for any other type, a multi-question query
     /// with a zone A in front, an unparseable datagram, and TCP to the
-    /// resolver are all dropped; and an allow-list row's queries are left
-    /// as they were.
+    /// resolver are all dropped; and an allow-list row is decided by its
+    /// own list, not the deny-all rule.
     #[tokio::test]
     async fn deny_all_row_query_outside_zone_dropped_host_side() {
         use hickory_proto::rr::RecordType;
@@ -20844,16 +20872,128 @@ mod tests {
             "each dropped name says so: {logged}"
         );
 
-        // A row that is not deny-all is untouched: the allow-list box's
-        // lookup of its declared name, and of a name it did not declare,
-        // both reach the switch as they always have.
-        for (port, name) in [(40006, "example.com."), (40007, "other.example.")] {
-            let query = query_from(lister, port, &dns_query_of(&[(qname(name), RecordType::A)]));
+        // A row that is not deny-all is decided by its own list: the
+        // allow-list box's lookup of its declared name, and a zone name of a
+        // type the deny-all rule drops, both reach the switch.
+        for (port, name, rtype) in [
+            (40006, "example.com.", RecordType::A),
+            (40007, "host.min.internal.", RecordType::TXT),
+        ] {
+            let query = query_from(lister, port, &dns_query_of(&[(qname(name), rtype)]));
             send_frame(&mut h.guest, &query).await;
             assert_eq!(
                 expect_frame(&mut h.switch).await,
                 query,
-                "an allow-list row's lookup of {name} is forwarded"
+                "an allow-list row's {rtype:?} lookup of {name} is forwarded"
+            );
+        }
+    }
+
+    /// NET-141, decided host-side for an own-address allow-list row: a
+    /// query for a name the box's `allow_dns_hosts` does not match, outside
+    /// the box zone, is dropped at the relay — never written on to the
+    /// switch, so no resolver beyond the box's own is asked it, and nothing
+    /// written back toward the guest — with one rate-limited warn line
+    /// naming the box and the name. The declared name and the zone pass
+    /// byte for byte, and a box with unrestricted egress resolves any name.
+    #[tokio::test]
+    async fn allow_list_row_unmatched_name_never_reaches_the_switch() {
+        use hickory_proto::rr::RecordType;
+
+        use super::UNMATCHED_NAME_DNS_RULE;
+        use crate::net::dns_pins::tests::{dns_query_of, qname, udp_payload_frame};
+
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                    allow_subnets: Some(Vec::new()),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let unrestricted = [100, 64, 0, 10];
+        registry.register(
+            BoxRegistration::new(
+                "unrestricted",
+                Ipv4Addr::from(unrestricted),
+                Ipv4Addr::LOCALHOST,
+            )
+            .with_egress_policy(EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+        );
+        let mut h = gate_over(registry).await;
+        let query_from = |lease: [u8; 4], port: u16, name: &str| {
+            udp_payload_frame(
+                Ipv4Addr::from(lease),
+                port,
+                SUBNET.dns_server(),
+                53,
+                &dns_query_of(&[(qname(name), RecordType::A)]),
+            )
+        };
+        // The marker every drop below is proved against: the declared name.
+        let marker = query_from(LEASE, 40100, "example.com.");
+
+        // The same unmatched name twice, and one behind the declared name:
+        // all dropped, one line per name.
+        let unmatched = query_from(LEASE, 40000, "example.org.");
+        send_frame(&mut h.guest, &unmatched).await;
+        send_frame(&mut h.guest, &unmatched).await;
+        let behind = udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40001,
+            SUBNET.dns_server(),
+            53,
+            &dns_query_of(&[
+                (qname("example.com."), RecordType::A),
+                (qname("leak.example.net."), RecordType::A),
+            ]),
+        );
+        send_frame(&mut h.guest, &behind).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "no unmatched lookup reached the switch; the declared name did"
+        );
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, "name=\"leak.example.net\"").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("source=100.64.0.9")
+                && logged.contains("namespace=\"weather\"")
+                && logged.contains("name=\"example.org\""),
+            "the drop line names the box and the name: {logged}"
+        );
+        assert_eq!(
+            logged
+                .matches(&format!("rule_matched=\"{UNMATCHED_NAME_DNS_RULE}\""))
+                .count(),
+            2,
+            "one line per name, not one per drop: {logged}"
+        );
+        // Nothing was written back toward the guest: the drop is silent.
+        expect_silence(&mut h.guest).await;
+
+        // Zone lookups pass byte for byte, and the unrestricted box's lookup
+        // of any name is forwarded.
+        for (lease, port, name) in [
+            (LEASE, 40002, "host.min.internal."),
+            (LEASE, 40003, "web.min.internal."),
+            (unrestricted, 40004, "example.org."),
+        ] {
+            let query = query_from(lease, port, name);
+            send_frame(&mut h.guest, &query).await;
+            assert_eq!(
+                expect_frame(&mut h.switch).await,
+                query,
+                "the lookup of {name} reaches the switch"
             );
         }
     }
