@@ -421,6 +421,36 @@ paths, and the archive layout.
   config is reported as malformed without quoting the offending line, which
   would be a line of the user's configuration. `SCHEMA_VERSION` stays at 1:
   the field is additive and a v1 reader is unaffected.
+- **R2.12**: When `min bug` collects the host bundle, the bundle shall
+  describe the DNS answerer service (`minzoned`). `host/answerer.json` shall
+  record the output of `minzoned --version` and the SHA-256 of two copies:
+  the root-owned copy the service runs, and the copy beside `min` or on
+  `PATH` that `min` installs. `host/answerer-service.txt` shall hold the
+  service manager's view: `launchctl print system/dev.gominimal.zone` on
+  macOS, and `systemctl status` of `minzoned.socket` and `minzoned.service`
+  on Linux. On Linux, `host/answerer-journal.txt` shall hold the journal of
+  those two units for the 24 hours before the bundle's creation time,
+  with journalctl's own notes, so a user who cannot read the system journal
+  sees why the transcript is empty. On macOS, the launchd unit shall send
+  the service's stdout and stderr to the fixed root-owned file
+  `/private/var/log/minimal/minzoned.log`, and the bundle shall hold its
+  tail as `host/answerer.log`. The log's path does not depend on the
+  environment of the process that installs the unit. If a copy, a command
+  or the log is not available, then the entry shall say why: the copy's
+  `errors` list in `host/answerer.json`, or a manifest skip. When the
+  installed unit names no log, the skip shall say that the installed
+  service predates its log and name `min finalize-install`. A service that
+  exits at start leaves no other record, so a copy mismatch or a start
+  failure is otherwise not visible in a bundle.
+- **R2.13**: Where the host is macOS, `min finalize-install` shall create
+  the log's directory `/private/var/log/minimal` owned by root with no group
+  or other write before it loads the answerer's unit, and shall install a
+  job that cuts the log to its last 256 KiB once it passes 1 MiB, checked
+  hourly. The answerer step's custody checks shall cover the log's
+  directory. When the installed unit names no log, or another log, the
+  step shall re-surface, so `min finalize-install --show` offers it.
+  `min finalize-install --undo` shall remove the job and the log's
+  directory.
 
 **Proof Artifacts:**
 
@@ -446,6 +476,19 @@ paths, and the archive layout.
    `a_malformed_config_is_reported_without_quoting_it` — a secret planted on
    the line the TOML parser rejects reaches no file in the bundle, the
    manifest's own reason included. Covers R2.11.
+6. **Test:** `the_answerer_service_is_described_from_fixtures` — with a
+   fixture installed copy, a fixture shipped copy, fixture service and
+   journal transcripts and a fixture log, the bundle holds each copy's
+   version and SHA-256, both transcripts and the log;
+   `the_answerer_service_is_described_when_its_log_is_absent` — an absent
+   log is a skip that says why, and a unit from before the log names
+   `min finalize-install`; `the_answerer_service_is_described` — on the
+   test host, each entry is present or a skip that says why. Covers R2.12.
+7. **Test:** `answerer_plist_sets_a_log_path` — the launchd unit names
+   `/private/var/log/minimal/minzoned.log`, the step makes its directory
+   root's before the unit loads and installs the size cap, a unit with no
+   log fails the step's check, and `--undo` removes the cap and the log's
+   directory. Covers R2.13.
 
 ---
 
