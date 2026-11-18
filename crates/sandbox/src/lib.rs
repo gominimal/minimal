@@ -261,7 +261,7 @@ impl<C: Channel> Sandbox<C> {
             let layer = match i {
                 config::SandboxMapped::Dir(p) => p.as_path(),
                 config::SandboxMapped::TempDir(td) => td.path(),
-                config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
+                config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy { src: p, .. } => {
                     return Err(Error::MappedFile(p.clone()));
                 }
             };
@@ -334,12 +334,15 @@ impl<C: Channel> Sandbox<C> {
                             }
                             .map_err(|e| Error::IO("hardlinking input file", dest.clone(), e))?;
                         }
-                        config::SandboxMapped::FileCopy(p) => {
-                            let dest = b.join(p.file_name().unwrap());
-                            if !copy_input_file(p, &dest)
+                        config::SandboxMapped::FileCopy { src, name } => {
+                            // The declared name, not the name of `src`: a package file
+                            // reached through a link is read from its target but keeps
+                            // the name its build refers to it by.
+                            let dest = b.join(name);
+                            if !copy_input_file(src, &dest)
                                 .map_err(|e| Error::IO("copying input file", dest.clone(), e))?
                             {
-                                log_input_collision("copying", p, &dest);
+                                log_input_collision("copying", src, &dest);
                             }
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
