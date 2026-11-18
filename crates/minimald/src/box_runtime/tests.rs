@@ -779,6 +779,35 @@ struct Seen {
 /// An attach the daemon ended exits non-zero, so a script can tell it from
 /// one the user ended. A detach and a session process that exited are the
 /// user's own ends and stay 0; a shed keeps ssh's 255.
+/// A takeover and a daemon shutdown leave the unwind codes on the terminal
+/// and nothing else. The client prints the one line that names the cause,
+/// so a line from the binding is a second line (#3035).
+#[tokio::test]
+async fn takeover_and_shutdown_write_no_disconnecting_line() {
+    let codes = b"\x1b[?1000l".to_vec();
+    for (farewell, reason) in [
+        (
+            Farewell::Superceded(codes.clone()),
+            MainloopExitReason::Superceded,
+        ),
+        (
+            Farewell::DaemonShutdown(codes.clone()),
+            MainloopExitReason::Shutdown,
+        ),
+    ] {
+        let mut written = Vec::new();
+        let ended = Binding::render_farewell(farewell, &mut written).await;
+        assert_eq!(ended, reason);
+        assert_eq!(ended.exit_status(), DAEMON_ENDED_EXIT_STATUS);
+        assert_eq!(
+            written,
+            codes,
+            "{reason:?} writes only the unwind codes, not {:?}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+}
+
 #[test]
 fn daemon_ended_attaches_report_a_non_zero_exit_status() {
     for reason in [
@@ -5070,18 +5099,18 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
         "an ask nobody answered asks the switch nothing"
     );
 
-    // The first channel saw the supersede itself — its farewell and a close
-    // — so the refusal above is the one a teardown mid-dialog answers with.
+    // The first channel saw the supersede itself — the daemon-ended status
+    // and a close — so the refusal above is the one a teardown mid-dialog
+    // answers with. The binding writes no line of its own for a takeover:
+    // the client names the cause.
     let (mut superseded, mut closed) = (false, false);
     let mut seen = Vec::new();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match channel.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => {
-                    seen.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&seen)
-                        .contains("session attached to from a different connection")
-                    {
+                Some(russh::ChannelMsg::Data { data }) => seen.extend_from_slice(&data),
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                    if exit_status == DAEMON_ENDED_EXIT_STATUS {
                         superseded = true;
                     }
                 }
@@ -5097,7 +5126,12 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
     .expect("the superseded binding's channel should close within the bound");
     assert!(
         superseded,
-        "the first client saw its supersede farewell: {}",
+        "the first client saw the daemon-ended status: {}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !String::from_utf8_lossy(&seen).contains("Disconnecting"),
+        "a takeover writes no Disconnecting line into the PTY: {}",
         String::from_utf8_lossy(&seen)
     );
     assert!(closed, "the channel should close after the supersede");
@@ -9106,4 +9140,113 @@ async fn task_box_exits_with_code_and_output_after_client_drop() {
         log.contains("reading a box's log") && log.contains(&id.to_string()),
         "the daemon log names the read of the box's output: {log}"
     );
+}
+
+/// What the client end of an attach saw until its channel closed: the
+/// terminal bytes, and the exit status the binding reported.
+async fn drain_attach(channel: &mut russh::Channel<russh::client::Msg>) -> (String, Option<u32>) {
+    let mut seen = Vec::new();
+    let mut exit_status = None;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => seen.extend_from_slice(&data),
+                russh::ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the attach must end, not wait on a prompt");
+    (String::from_utf8_lossy(&seen).into_owned(), exit_status)
+}
+
+/// BCLI-068: a stop or a removal while a client is attached ends the
+/// attach from the daemon's side. The box's entrypoint does not end the box
+/// here, so a shell that exits on its own raises the shell-exit prompt. A
+/// stop signals that same shell, and a removal kills it, but the host knows
+/// of the stop or removal first: the binding raises no prompt, writes no
+/// "Disconnecting - …" line, and ends with the daemon-ended status, 254.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
+    for end in [BoxEnd::Stop, BoxEnd::Removal] {
+        let (host, handle) = Host::build(
+            MockLauncher::default(),
+            HostParams {
+                name: "test-session".to_string(),
+                username: "user".to_string(),
+                paths: test_paths(),
+                sz: DEFAULT_SIZE,
+                channel: None,
+                control: None,
+                delta: None,
+                archives_dir: std::env::temp_dir(),
+                holds_host_row: false,
+                ends_with_entrypoint: false,
+                session_id: boxes::SessionId::nil(),
+                composition: None,
+                connection_env: ConnectionEnv::new(),
+                #[cfg(target_os = "linux")]
+                name_marker: None,
+            },
+        )
+        .await
+        .expect("failed to build host");
+        let task = crate::traced::spawn(host.mainloop());
+        let (mut channel, _client) = ssh_attach(&handle).await;
+
+        // The binding relays: the shell answers a line.
+        channel.make_writer().write_all(b"hello\n").await.unwrap();
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !String::from_utf8_lossy(&seen).contains("got:hello") {
+                match channel.wait().await {
+                    Some(russh::ChannelMsg::Data { data }) => seen.extend_from_slice(&data),
+                    Some(_) => {}
+                    None => panic!("the channel closed before the shell answered"),
+                }
+            }
+        })
+        .await
+        .expect("the attached client reads the shell's answer");
+
+        // The stop or removal tells the host first, as `BoxActor` does,
+        // then ends the shell as each one does.
+        handle.announce_end(end).await;
+        match end {
+            BoxEnd::Stop => {
+                let pid = handle
+                    .get_attrs()
+                    .await
+                    .expect("the host answers")
+                    .container_pid
+                    .expect("the mock names its process");
+                let pid = i32::try_from(pid).expect("a pid fits an i32");
+                // SAFETY: a plain kill(2) on the mock shell this test started.
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+            }
+            BoxEnd::Removal => handle
+                .kill(false)
+                .await
+                .expect("kill should reach the host"),
+        }
+
+        let (text, exit_status) = drain_attach(&mut channel).await;
+        assert!(
+            !text.contains(SHELL_EXIT_PROMPT),
+            "{end:?}: no shell-exit prompt: {text:?}"
+        );
+        assert!(
+            !text.contains("Disconnecting"),
+            "{end:?}: the binding writes no line of its own: {text:?}"
+        );
+        assert_eq!(
+            exit_status,
+            Some(DAEMON_ENDED_EXIT_STATUS),
+            "{end:?}: the attach ends with 254: {text:?}"
+        );
+        assert_eq!(DAEMON_ENDED_EXIT_STATUS, 254);
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    }
 }

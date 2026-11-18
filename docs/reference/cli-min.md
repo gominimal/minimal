@@ -8,7 +8,7 @@ description: "Reference for the min session CLI: create, attach to, and manage s
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-isn't running, with `bug`, `stop`, and `version` being the exceptions. The 
+isn't running, with `bug`, `host stop`, and `version` being the exceptions. The 
 daemon starts natively on Linux (and under `--provider local-minvmd`) or 
 inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
 Running bare `min` with no subcommand routes you into a session when stdin
@@ -21,7 +21,7 @@ help.
 
 Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
 and plural form (`session`/`sessions`, `loadout`/`loadouts`). A handful of
-bare verbs (`ls`, `stop`,
+bare verbs (`ls`,
 `init`, `add`, `update`) survive at the top level as deliberate ergonomic
 exceptions, called out as such below; see
 [the CLI convention](./cli.md#command-naming-convention) for the rule and the
@@ -60,20 +60,18 @@ its own shows that address. A box at the shared fallback shows `127.0.0.1`.
 The column shows `-` when the daemon does not report an address. An older
 daemon does not report it.
 
-`EGRESS` is the box's egress posture, in the words `min session policy`
-prints for it:
+`EGRESS` is the box's egress posture:
 
 | `EGRESS` | `egress_posture` in `--json` | Meaning |
 |---|---|---|
 | `deny-all (default)` | `deny_all_default` | The box does not declare egress, and the default denies every external address |
 | `allow-all (default)` | `allow_all_default` | The box does not declare egress, and the default allows every address: the operator opt-out, or a box without an address of its own |
 | `deny-all` | `deny_all` | The box declares egress that admits nothing |
-| `declared rules` | `declared_rules` | The box declares egress rules of its own. `min session policy` lists them |
+| `declared rules` | `declared_rules` | The box declares egress rules of its own. `min box show <box> --network` prints them |
 | `no network` | `no_network` | A `--network none` box. It has no network, so no egress posture applies |
 
 A host-address box on a host that cannot decide egress per box adds
-`; per-box enforcement none` to the posture. `min session policy` prints the
-same fact as its `per-box enforcement` row. The column shows `-` when the
+`; per-box enforcement none` to the posture. The column shows `-` when the
 daemon does not report a posture.
 
 With `--json`, each session entry has the address under `loopback_address`
@@ -126,97 +124,6 @@ upload, loadout compose, finalize), `q` quits. The cursor's last position
 is restored on the next launch from `<state>/dash-state.json`; TUI
 diagnostics go to `<state>/dash.log`.
 
-### `session activate`
-
-```
-min session activate [OPTIONS] [PATH]
-```
-
-Activates (creates) a new session for the project at `PATH` (defaults to
-the current directory).
-
-| Flag | Short | Description |
-|------|-------|-------------|
-| `--name <NAME>` | `-n` | Optional session name |
-| `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree. The session starts from a default project configuration and does not apply the project's `minimal.toml`) |
-| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace, and `own_ip` gives it its own IP address so `--ingress` can publish ports. With no flag, the session takes the `network.mode` that `minimal.toml` declares for it, else `host_ip`. An `own_ip` box with no egress flags reaches no external address by default (see below). The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before the daemon creates the box. An activation that cannot reach the VM host daemon exits 7. One that daemon refuses because it has no free addresses exits 8 |
-| `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
-| `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them. `ask` asks the attached person about a `min net expose`. With nobody attached, `ask` refuses the request at once. `ask` never publishes a listen. `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. On a VM-backed host the create registers the stance and range with the VM host daemon. That daemon admits each publish the box requests against that grant. It admits an `ask` publish only on a yes the host records. Every macOS host is VM-backed |
-| `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
-| `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
-| `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
-| `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
-| `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
-| `--attach` | | Automatically attach after creation |
-| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. Adds to the `allow_subnets` that `minimal.toml` declares. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. Boxes have no IPv6 path yet, so `::/0` is the forward-compatible spelling and grants nothing today. The opt-out below keeps the old allow-all meaning of an unset flag. An own-address (`--network own_ip`) or host-address (`--network host_ip`) box accepts the rule flags, and only an own-address box enforces them. A host that decides egress per box refuses to create a host-address box that carries them. Any other host runs that box with the rules unenforced. A `--network none` box rejects the whole egress declaration |
-| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Adds to the `allow_dns_hosts` that `minimal.toml` declares. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
-| `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant. Replaces the `allow_protocols` that `minimal.toml` declares |
-| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. Adds to the `deny_subnets` that `minimal.toml` declares, so it never drops a range the file denies. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
-| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Drops every `allow_subnets` and `allow_dns_hosts` value that `minimal.toml` declares. The file's `allow_protocols` and `deny_subnets` stay. With no `allow_protocols` from the file or `--allow-protocols`, it writes the deny-all `egress` section, every allow list present and empty. Combines with `--deny-subnets` and `--allow-protocols`, which only narrow, and conflicts with `--allow-subnets` and `--allow-dns-hosts`. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box gets deny-all by default when it does not declare egress by flag or in its `minimal.toml` (see below) |
-
-Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
-declaration. Naming one of them stores it on the session, and `min session
-policy` shows what the session ended up with. The flags apply to the
-`network.egress` keys that `minimal.toml` declares for the box: a list flag
-adds its values to the file's list, and `--allow-protocols` replaces it.
-`--deny-all-egress` can only narrow, so it cannot combine with
-`--allow-subnets` or `--allow-dns-hosts`.
-
-An unset `--allow-subnets` or `--allow-dns-hosts` inside a declaration
-grants nothing, whatever the box's network mode. This changes
-what a declaration with no allow list does. `--allow-dns-hosts github.com`
-alone reaches `github.com` and no address directly. `--deny-subnets` alone
-reaches nothing. Both used to reach every address the deny left, and the
-operator opt-out named below restores that earlier meaning. An
-own-address box (`--network own_ip`) gets the deny-all default when it does
-not declare egress by these flags or in the project's `minimal.toml`. It
-then reaches no external address. It can still resolve names in the box zone,
-`host.min.internal` included. Activate prints one line saying so:
-
-```
-This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default. To allow outbound traffic, activate a new session with --allow-subnets or --allow-dns-hosts, for example --allow-dns-hosts github.com.
-```
-
-To give such a box reach, declare it with the allow flags, such as
-`--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`. To keep the earlier allow-all default for
-every undeclared box on a host, the operator opts out. A native Linux host
-opts out with `minimald run --egress-deny-all-opt-out`, or with
-`MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts
-`minimald`. `min` starts the daemon without the flag when it is not running,
-so export the variable to keep the opt-out after such a restart (see
-[minimald](./cli-minimald.md)). A VM-backed host opts out with
-`MINVMD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts `minvmd`
-(see [minvmd](./cli-minvmd.md)). A host-address box with no section
-keeps allow-all either way.
-
-The opt-out also keeps the earlier meaning of an unset allow flag inside a
-declaration. On an opted-out host, `--allow-dns-hosts github.com` alone keeps
-allow-all addresses: the box reaches every address directly, and the names
-bound nothing. Activation does not warn about it. Add `--allow-subnets` to
-bound the addresses there.
-
-Known issue: own-address boxes take their addresses from 100.64.0.0/16,
-a block inside 100.64.0.0/10. Some VPNs, such as Tailscale, use addresses in
-100.64.0.0/10. While such a VPN is up, a box's connections to addresses the
-VPN routes in 100.64.0.0/16 can fail. No setting changes the range a box uses.
-
-Activating a path that already has a session is allowed, but warns: `min` names
-the existing session and creates a second one anyway. With two sessions on one
-path, resolving that directory to a session is ambiguous, so a bare `min` there
-can no longer pick one and `session attach` falls back to its picker (erroring
-when `--no-input` is set or stdin/stdout is not a terminal). Attach to the
-existing session instead when you mean to
-rejoin it.
-
-When `PATH` has no `minimal.toml`, activation still succeeds and the session
-comes up with a default environment. On an interactive terminal `min` first
-offers to scaffold a `minimal.toml`; accepting writes one into `PATH`, while
-declining leaves your directory untouched. When prompts are skipped
-(`--no-input`, or a non-terminal stdin) `min` prints a notice and continues
-without writing anything to `PATH` — the daemon fabricates a default config
-inside the session's own workspace instead. `--loadout` is resolved before any
-of this, so an unknown loadout name errors even in a directory with no config.
-
 ### `session start`
 
 ```
@@ -233,14 +140,18 @@ attaches this terminal to it. `ENTRY` names a `[sessions.<name>]` entry, or a
 | `--name <NAME>` | Name the box. With `--new`, the box is named `<NAME>-<n>` |
 | `--new` | Create another box from the entry, named `<name>-<n>`, even when a running box holds the entry's name |
 | `--detach` | Create the box, print its id and return. This terminal is not attached to the box |
-| `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box takes the entry's `network.mode`, else `host_ip` |
+| `--network <none\|host_ip\|own_ip>` | Override of the entry's `network.mode`: the box gets this network mode. Without the flag, the box takes the entry's `network.mode`, else `host_ip`. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling |
 | `--ingress <EXT:INT[/PROTO]>` | Override of the entry's `network.ingress`: each use adds one port mapping, `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Requires `--network own_ip` |
-| `--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`, `--deny-all-egress` | Overrides of the entry's `network.egress` keys, as on [`session activate`](#session-activate): a list flag adds to the entry's list, `--allow-protocols` replaces it, and `--deny-all-egress` empties the allow lists |
-| `--dynamic-ingress <allow\|ask\|deny>` | Override of the entry's `network.dynamic_ingress`: the stance that decides the box's own requests to publish a port, as on [`session activate`](#session-activate). Requires `--network own_ip` |
-| `--dynamic-range <LO-HI>` | Override of the port range in the entry's `network.ingress` inside which `--dynamic-ingress allow` publishes, as on [`session activate`](#session-activate). Requires `--dynamic-ingress` |
-| `--credentialed-upstream` | Declare a credentialed upstream for the box, so the box can reach the Box Egress Proxy, as on [`session activate`](#session-activate). Without the flag, the box has one only when `minimal.toml` grants it a secret through the proxy |
-| `--quic443 <auto\|block\|allow>` | Override of the entry's `network.quic443`: whether the box can send UDP to port 443, the traffic of HTTP/3. `block` always blocks it, `allow` always allows it, and `auto` blocks it only when the box has a credentialed upstream. `min session activate` does not take this flag |
-| `--vpn-network-names <NAME>` | Adds a name to the box's `network.vpn_network_names`. Repeatable. The box keeps the names, but `minimald` does not connect the box to a VPN yet. `min session activate` does not take this flag |
+| `--allow-subnets <CIDR>` | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. Adds to the `allow_subnets` that `minimal.toml` declares. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. Boxes have no IPv6 path yet, so `::/0` is the forward-compatible spelling and grants nothing today. The opt-out below keeps the old allow-all meaning of an unset flag. An own-address (`--network own_ip`) or host-address (`--network host_ip`) box accepts the rule flags, and only an own-address box enforces them. A host that decides egress per box refuses to create a host-address box that carries them. Any other host runs that box with the rules unenforced. A `--network none` box rejects the whole egress declaration |
+| `--allow-dns-hosts <HOST>` | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Adds to the `allow_dns_hosts` that `minimal.toml` declares. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
+| `--allow-protocols <PROTO>` | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant. Replaces the `allow_protocols` that `minimal.toml` declares |
+| `--deny-subnets <CIDR>` | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. Adds to the `deny_subnets` that `minimal.toml` declares, so it never drops a range the file denies. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
+| `--deny-all-egress` | Declare deny-all egress: the box reaches no external address. Drops every `allow_subnets` and `allow_dns_hosts` value that `minimal.toml` declares. The file's `allow_protocols` and `deny_subnets` stay. With no `allow_protocols` from the file or `--allow-protocols`, it writes the deny-all `egress` section, every allow list present and empty. Combines with `--deny-subnets` and `--allow-protocols`, which only narrow, and conflicts with `--allow-subnets` and `--allow-dns-hosts`. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box gets deny-all by default when it does not declare egress by flag or in its `minimal.toml` (see below) |
+| `--dynamic-ingress <allow\|ask\|deny>` | Override of the entry's `network.dynamic_ingress`. It sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them. `ask` asks the attached person about a `min net expose`. With nobody attached, `ask` refuses the request at once. `ask` never publishes a listen. `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. On a VM-backed host the create registers the stance and range with the VM host daemon. That daemon admits each publish the box requests against that grant. It admits an `ask` publish only on a yes the host records. Every macOS host is VM-backed |
+| `--dynamic-range <LO-HI>` | Override of the port range in the entry's `network.ingress`: the inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
+| `--credentialed-upstream` | Declare a credentialed upstream for the box, so the box can reach the Box Egress Proxy. Without the flag, the box has one only when `minimal.toml` grants it a secret through the proxy |
+| `--quic443 <auto\|block\|allow>` | Override of the entry's `network.quic443`: whether the box can send UDP to port 443, the traffic of HTTP/3. `block` always blocks it, `allow` always allows it, and `auto` blocks it only when the box has a credentialed upstream |
+| `--vpn-network-names <NAME>` | Adds a name to the box's `network.vpn_network_names`. Repeatable. The box keeps the names, but `minimald` does not connect the box to a VPN yet |
 | `--loadout <NAME>` | Apply the named loadout. Repeatable. With any `--loadout`, the config file's `default_loadouts` are not applied |
 | `--no-loadouts` | Apply no loadouts, and not the config file's `default_loadouts` either. Cannot be combined with `--loadout` |
 | `--no-hooks` | Run none of the box's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from the loadouts or from `minimal.toml`. The box keeps hooks off, so the choice also holds when the box is attached or detached, and when it ends |
@@ -287,6 +198,54 @@ The command refuses these starts before it creates a box:
 
 An invalid `minimal.toml` ends the command with exit code 3.
 
+#### Egress flags
+
+Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
+declaration. Naming one of them stores it on the box, and
+`min box show <box> --network` shows what the box ended up with. The flags apply to the
+`network.egress` keys that `minimal.toml` declares for the box: a list flag
+adds its values to the file's list, and `--allow-protocols` replaces it.
+`--deny-all-egress` can only narrow, so it cannot combine with
+`--allow-subnets` or `--allow-dns-hosts`.
+
+An unset `--allow-subnets` or `--allow-dns-hosts` inside a declaration
+grants nothing, whatever the box's network mode. This changes
+what a declaration with no allow list does. `--allow-dns-hosts github.com`
+alone reaches `github.com` and no address directly. `--deny-subnets` alone
+reaches nothing. Both used to reach every address the deny left, and the
+operator opt-out named below restores that earlier meaning. An
+own-address box (`--network own_ip`) gets the deny-all default when it does
+not declare egress by these flags or in the project's `minimal.toml`. It
+then reaches no external address. It can still resolve names in the box zone,
+`host.min.internal` included. `min session start` prints one line saying so:
+
+```
+This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default. To allow outbound traffic, activate a new session with --allow-subnets or --allow-dns-hosts, for example --allow-dns-hosts github.com.
+```
+
+To give such a box reach, declare it with the allow flags, such as
+`--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`. To keep the earlier allow-all default for
+every undeclared box on a host, the operator opts out. A native Linux host
+opts out with `minimald run --egress-deny-all-opt-out`, or with
+`MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts
+`minimald`. `min` starts the daemon without the flag when it is not running,
+so export the variable to keep the opt-out after such a restart (see
+[minimald](./cli-minimald.md)). A VM-backed host opts out with
+`MINVMD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts `minvmd`
+(see [minvmd](./cli-minvmd.md)). A host-address box with no section
+keeps allow-all either way.
+
+The opt-out also keeps the earlier meaning of an unset allow flag inside a
+declaration. On an opted-out host, `--allow-dns-hosts github.com` alone keeps
+allow-all addresses: the box reaches every address directly, and the names
+bound nothing. The start does not warn about it. Add `--allow-subnets` to
+bound the addresses there.
+
+Known issue: own-address boxes take their addresses from 100.64.0.0/16,
+a block inside 100.64.0.0/10. Some VPNs, such as Tailscale, use addresses in
+100.64.0.0/10. While such a VPN is up, a box's connections to addresses the
+VPN routes in 100.64.0.0/16 can fail. No setting changes the range a box uses.
+
 ### `session attach`
 
 ```
@@ -312,310 +271,68 @@ that still receives its workspace upload. Another is an `own_ip` box that
 cannot get its address back. The reason then names the command that checks
 the setup, such as `min finalize-install --show`.
 
-### `session exec`
+### `box exec`
 
 ```
-min session exec <SESSION> <COMMAND>...
+min box exec [-t|--tty|--detach] [--timeout <DURATION>] <BOX> -- <COMMAND>...
 ```
 
-Runs a command in an existing session, non-interactively, relaying its
-stdout, stderr and exit code.
-When a daemon shutdown stops the command, `min` prints
-`minimald is shutting down; the command was stopped` on stderr and exits with
-the command's own status.
-
-How `COMMAND` is read depends on how many arguments you give it:
-
-- **One argument is a shell command**, run by the session's shell with its
-  pipes, globs and `$VAR` intact — the `ssh host '<cmd>'` form.
-
-  ```
-  min session exec web 'echo $PWD'
-  ```
-
-- **Several arguments are an argv**, carried as data. No shell reassembles
-  them, so a word keeps its spaces and its metacharacters stay literal.
-
-  ```
-  min session exec web sh -c 'echo A B C'
-  ```
-
-The argv form matters because ssh has no argv on the wire — it joins its
-trailing arguments with single spaces and the far side reshells the result.
-Passing words through one by one would let the session's shell re-split them,
-which is how `sh -c 'echo A B C'` once lost its first word to `sh`'s `$0`.
-
-Nothing about a command's *text* routes it: a command is the session's however
-it happens to start, so the session's own `min` binary is reachable here. The
-daemon's own operations are named explicitly instead — see `session run`.
-
-#### Backgrounding a command
-
-`session exec` returns when `COMMAND` itself exits, and relays output up to
-that point. A process the command backgrounds keeps running in the session,
-but what it writes *after* the command has exited is not yours to rely on: a
-short drain catches whatever was already in flight, and past that its output
-is read and discarded. Nothing it writes is ever lost to a broken pipe — the
-process is not killed — but you will not see it.
+Runs a command in a running box, and exits with the command's exit code.
+`BOX` is the box's id, the start of its id, or its name, as `min box list`
+prints them. The command goes after `--`. It runs as these words, with no
+shell, so a word keeps its spaces and its metacharacters stay literal. To use
+a shell's pipes, globs and `$VAR`, run the shell as the command:
 
 ```
-min session exec web 'sleep 20 & echo STARTED'   # returns immediately
+min box exec web -- sh -c 'echo $PWD'
 ```
 
-So background a long-running process with its output redirected somewhere you
-can retrieve it, rather than expecting it on the wire:
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--tty` | `-t` | Give the command a terminal and connect this terminal to it. The command's exec id is printed on stderr, so stdout has only the command's output. Refused when stdin is not a terminal |
+| `--detach` | | Start the command and return at once. Only the command's exec id is printed, on stdout. Cannot be combined with `--tty` |
+| `--timeout <DURATION>` | | Stop the command when it runs for longer than this: a number of seconds, or a number followed by `s`, `m` or `h`, such as `30s`, `5m` or `1h`. The command then ends with exit code 124 |
+
+`min box show <BOX>` lists the box's running commands with their exec ids.
+`min box logs <BOX> --exec <ID>` shows what one of them printed.
+
+### `box rm`
 
 ```
-min session exec web 'nohup ./server >server.log 2>&1 &'
-min session exec web 'tail -n 50 server.log'
+min box rm [--force] <BOX>
 ```
 
-`nohup ... >/dev/null 2>&1 &` is the fully detached form: it hands the process
-its own stdout and stderr and drops the ones it inherited, so nothing about it
-depends on the exec channel at all. The same applies to `session run` and
-`task run`, which relay over the same channel.
+Removes a stopped or exited box: its record, its events and its files. The
+command refuses a running box. `--force` stops a running box at once and then
+removes it.
 
-If the client goes away while the command is still running, the exec ends its
-whole process group: SIGTERM, a grace period, then SIGKILL. A `nohup`'d job
-stays in that group, so it ends too. Start a job that must outlive the client
-with `setsid`, which puts it in a session and group of its own:
+### `box rename`
 
 ```
-min session exec web 'setsid nohup ./server >/dev/null 2>&1 &'
+min box rename <BOX> <NEW_NAME>
 ```
 
-A command that exits by itself ends nothing: its background jobs keep running.
+Gives a box a new name. The box keeps its id, its state and its files. The
+command refuses a name that a running box on the same host holds.
 
-### `session run`
-
-```
-min session run <SESSION> <TASK>
-```
-
-Runs a task declared in the session project's `minimal.toml`, in that session,
-relaying its output and exit code.
-
-This is the session-scoped counterpart to
-[`min task run <task>`](../guide/tasks.md), which composes a task session of
-its own. Use `session run` when you want the task to run against a session you
-already have.
-
-Because the task is named as a task rather than inferred from a command string,
-a task may share a name with a daemon subcommand or with a program on the
-session's `PATH`.
-
-The task's `env_vars` are resolved against your shell and checked against
-your `[vars]` policy before the task runs, as for `min task run`; see
-[Tasks](./tasks.md#env_vars).
-
-### `session destroy`
+### `box show`
 
 ```
-min session destroy [--all] [-f|--force] [SESSION]
+min box show [--network | -o <json|yaml>] <BOX>
 ```
 
-Destroys a session and ends its processes. `--all` destroys all sessions.
-`-f/--force` skips the confirmation. Under `-f`, if another destroy removed
-the session first, the command reports the session as already destroyed and
-succeeds. Without `-f`, the command fails and names the session.
+Shows one box: its id, name, type, parent, project and state, how it ended,
+the identity it runs under, and its provider and host. It also lists the
+box's running commands, each with its exec id, its argv, and whether it has
+a terminal (`tty`), is connected without one (`attached`) or runs on its own
+(`detached`).
 
-Before it destroys one session, the command asks for confirmation if the
-session holds uncommitted changes or commits that no remote has. It also asks
-if the daemon cannot report that state. The command destroys a clean session without
-a prompt. Without a terminal, or under `--no-input`, nobody can answer, so the
-command refuses unless you pass `-f`. `--all` without a terminal also refuses
-unless you pass `-f`.
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--network` | | Show only the box's `[network]` section, as the box was created with it: its network mode, ingress and egress, with the flags of the command that created it applied |
+| `--output <json\|yaml>` | `-o` | Write the box and its running commands in this format instead of text. Cannot be combined with `--network` |
 
-### `session rename`
-
-```
-min session rename <SESSION> <NEW_NAME>
-```
-
-Renames an existing session.
-
-### `session policy`
-
-```
-min session policy <SESSION> [-o json]
-```
-
-Prints the effective networking rules for `SESSION` (a UUID, unique id
-prefix, or session name). Resolved from the daemon, which answers from the policy stored at
-activation; each rule line shows what the session ended up with, not just
-what was typed.
-
-The egress block resolves every dimension of the box's `egress` declaration
-to its rule or its default:
-
-```
-egress
-  subnets  10.0.0.0/8
-  dns hosts  allow-all
-  protocols  tcp, udp
-  deny subnets  169.254.169.254/32
-```
-
-`subnets`, `dns hosts`, and `protocols` each read `allow-all` when the
-matching flag was not given. `deny subnets` reads `(none)` when the
-declaration denies nothing. A deny-all declaration, the `egress` section
-with every allow list present and empty, prints as the one row `deny-all`.
-A box without an `egress` section prints the default the daemon resolved
-the absence to, by name and marked as what it is. `deny-all (default)`
-marks an own-address box, which gets the deny-all default.
-`allow-all (default)` marks a box on a host that opted out of that default,
-or one that shares its host's network namespace. The `(default)` mark distinguishes a verdict
-the box declared from the same verdict the default gave it.
-
-A box activated with `--credentialed-upstream` prints one more row in
-the egress block:
-
-```
-egress
-  deny-all (default)
-  credentialed upstream  allowed to reach the Box Egress Proxy
-```
-
-The row names the lane the declaration opened. The gate admits the box's
-frames to the Box Egress Proxy's listener, and the proxy checks their
-credential. The rows above never decide that destination. The listener is
-the lane's whole reach. The gate still refuses everything else the box
-sends to the proxy's address. A box without the lane omits the row, so
-the missing row means the box runs without a lane.
-
-The lane takes effect with `--network own_ip`, and with `--network
-host_ip` on a host that runs boxes in a VM. Every other box still prints
-the row it declared, with the `(not in effect: <mode> box)` mark. This
-example is a `host_ip` box on a host that runs boxes natively:
-
-```
-egress
-  allow-all (default)
-  credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)
-```
-
-The ingress block lists the published port mappings the session's
-`--ingress` flags declared (or `deny-all` when the box leaves ingress
-undeclared). The `dynamic ports` row joins them when the box declared a
-`--dynamic-range`.
-The `dynamic ingress` row always prints, with the stance that decides the
-box's own publish requests. A box that set no `--dynamic-ingress`
-reads `deny (default)`, the deny the absence evaluates to, marked the way
-the egress block marks a default. A box that declared `deny` reads plain
-`deny`:
-
-```
-ingress
-  tcp  :8080 → :80
-  dynamic ports  8000–8443
-  dynamic ingress  allow
-```
-
-A host-address (`--network host_ip`) session prints no ingress block at all:
-it shares its host's network namespace, so minimald applies no per-session
-ingress to it and there is no rule to state.
-
-The `live ingress` block lists the ports the box published at runtime with
-`min net expose`. Each row shows the address the forward binds on and the
-in-box port it delivers to:
-
-```
-live ingress (published at runtime)
-  tcp  127.0.64.21:3000 → :3000
-```
-
-A listed runtime publish is reachable. The daemon admits the port at the
-box's relay gate when it binds the forward. If nothing in the box listens on
-the port yet, the box itself refuses a connection to it.
-A row from an older daemon whose gate did not admit runtime publishes reads
-`(pending; not yet reachable)`. A row from a daemon older than the `pending`
-field reads `(reachability unknown: the running daemon is older than this min)`.
-The CLI never shows
-either row as reachable.
-
-The daemon publishes a port the box listens on only after it writes the
-decision to its audit log. When the daemon cannot write the log, the port
-stays unpublished, and the command prints one line per port after the live
-rows:
-
-```
-warning: port 3000 is allowed but not reachable yet: Minimal could not write the audit log /path/to/audit/decisions.log. The port is published once that log can be written.
-```
-
-The line clears once the log takes records again and the port publishes.
-In `-o json` output the same ports appear as `unaudited_listen_ports`, a
-list the document leaves out when it is empty.
-
-`-o json` (`--output json`) prints one `min/v1/session-policy` document on
-stdout instead of text. Each block the text output prints becomes a key:
-`network`, `egress`, `ingress`, and `live_ingress`. The `egress` object
-carries the verdict the gate enforces as `effective` and its origin as
-`source`. `effective` reads `deny-all`, `allow-all`, or `rules` when the
-declaration's own lists say the verdict. `source` reads `default` for the
-rollout's resolution of an absent section, `declared` for the box's own.
-A declared section appears under `rules`, its lists as the record holds
-them. The fields match the text output's `(default)` mark, so a client
-never recomputes the default rule to tell a declaration from a default.
-Each `live_ingress` row is the daemon's mapping object, with its `pending`
-state (`true`, `false`, or `null` for a daemon older than the field). The
-document leaves out the blocks the text output leaves out. A host-address
-session has no `ingress` key, and a `--network none` box has only `schema`
-and `network`, plus `credentialed_upstream` when it declared a lane. The `ingress` block has a `kind` tag, `deny_all` or
-`declared`, so a client reads one field to branch. Both kinds carry
-`dynamic_ingress`, the resolved stance: `allow`, `ask`, or `deny`, never
-`null`. Both also carry `dynamic_ingress_source`. It reads `declared` when
-the box set `--dynamic-ingress`, and `default` when the stance is the deny
-an absent setting gives. Both keys are new in the `min/v1/session-policy`
-shape. A client written against the earlier document ignores them. A
-client that reads them finds a value in every `ingress` object. The
-document also carries `credentialed_upstream`, an object, when the box
-declared a lane, in any network mode. Its `effective` field is `true`
-for an `own_ip` box, and for a `host_ip` box on a host that runs boxes in
-a VM. It is `false` for any other box, the text row's
-`(not in effect: …)` mark. The document leaves the key out when the box
-did not declare a lane, so a missing key means the box runs without one.
-
-Boxes handed one shared loopback address can declare the same port. The
-box that published it first holds it, and a later box does not forward it.
-Activation prints a `warning:` line on stderr for each such port, naming
-the box that holds it. The text output marks the declared row
-`(held by <box>)`, and the document lists the rows under
-`shared_port_collisions`, each with `port` and the holding box as `held_by`.
-The key is absent when another box holds none of the box's ports.
-
-With `-o json`, a failed run writes one `min/v1/error` object on stderr and
-exits non-zero, with no plain-text error line. The `code` field names the
-failure: `not_found` for a missing session, `daemon_unreachable`, or
-`policy_unavailable`. The code is `output_failed` when the CLI cannot write
-its own document to stdout, such as on a full disk. Any other failure has
-the code `unspecified`. The `message` field holds the text mode's error
-chain, and `hint` says what to do next. An `unspecified` object has no
-`hint`. When the
-reader closes stdout early, the run writes nothing and exits 141,
-the shell's SIGPIPE convention.
-
-### `session hooks`
-
-```
-min session hooks <SESSION> [--json]
-```
-
-Lists the [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points)
-composed into `SESSION` (a UUID, unique id prefix, or session name), one row per script, with
-the transition it runs on, whether it is inline or external, its timeout, and
-the loadout or project that declared it.
-
-This shows what will actually run, not what was asked for: the daemon answers
-from the session's composition, which holds only the hooks that survived your
-[user policy](./user-policy.md). A session activated with `--no-hooks`, or one
-whose project you never allow-listed, lists nothing.
-
-Rows are in setup order — the project first, then loadouts in the order they
-were applied; teardown runs the reverse. Inline bodies are collapsed to their
-first line; `--json` emits the full records.
-
-Answered from the persisted composition, so it works after a daemon restart
-and for a session nobody is attached to.
+`--network` prints the section as TOML.
 
 ### `box spec`
 
@@ -650,6 +367,12 @@ A task entry refuses `--ingress` and `--loadout` with exit code 2, as
 host stores it. It takes `-o` and no override flag. An override flag with a
 box gives exit code 2.
 
+The spec of a box lists its
+[lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points),
+each with the loadout or project that declared it. A box started with
+`--no-hooks` lists none. To read a box and not an entry of the same name,
+give the box's id.
+
 `min box spec` with no argument shows how the box of the project reaches
 GitHub through the local Box Egress Proxy. The rows are the proxy's root
 certificate fingerprint, each secret with its hosts, the steering mode, and
@@ -658,13 +381,13 @@ Another override flag gives exit code 2.
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--network <none\|host_ip\|own_ip>` | | The network mode of the box to show, with the same values and the same default (`host_ip`) as `min session activate --network` |
+| `--network <none\|host_ip\|own_ip>` | | The network mode of the box to show, with the same values and the same default (`host_ip`) as `min session start --network` |
 
-The command refuses a box spec, with exit 3, where `min session activate` with
+The command refuses a box spec, with exit 3, where `min session start` with
 the same `--network` value refuses it for the same reason. For example, on a
 VM-backed host, `min box spec --network own_ip` accepts `steering = "both"`.
 With no `--network` flag, it refuses that spec because a `host_ip` box has no
-box DNS resolver, and `min session activate` with no flag refuses it too.
+box DNS resolver, and `min session start` with no flag refuses it too.
 
 ### `type list` (alias: `ls`) and `type show`
 
@@ -718,20 +441,19 @@ host_ip`). Either way the port reached is the one the box's service binds,
 so the command works for every network mode a session can have.
 
 The forward follows the session, not the box's process: a session record
-that outlives its box is the normal state after [`stop`](#stop), which keeps
+that outlives its box is the normal state after [`host stop`](#host-stop), which keeps
 records, and a forward that refused such a session would be stranded against
 every session that survived a daemon restart. Where the dial has to run
 inside the box — an isolated session's own network namespace — the daemon
-brings a box that isn't running up for the dial, exactly as
-[`session exec`](#session-exec) brings one up for a command. A
+brings a box that isn't running up for the dial. A
 `--network host_ip` box shares the daemon's namespace, so its dial needs no
 box up: a session nothing has started answers with a refused connection
 until something starts the box.
 
-The forward stays in the foreground and ends on `Ctrl-C`, when the session
-is destroyed, or when the daemon goes away; the listener and every open relay
-close with it. `stop` is not a destroy: it ends a forward only because the
-daemon's exit does, and it keeps every session record, so a later
+The forward stays in the foreground and ends on `Ctrl-C`, when the box
+is removed, or when the daemon goes away; the listener and every open relay
+close with it. `min host stop` does not remove a box: it ends a forward only because the
+daemon's exit does, and it keeps every box record, so a later
 `min net forward` reaches those sessions again.
 
 What the tree proves today is the host-address mode (`--network host_ip`)
@@ -751,7 +473,7 @@ min finalize-install [--show [--script | --json]] [--undo]
 The installer runs without privilege. Anything on this host that needs root
 is left for this command, which runs it in one `sudo` call. Until it runs,
 the hostname proxy serves box names. The host line that
-`min session activate` prints says how the box name opens. While the proxy
+`min session start` prints says how the box name opens. While the proxy
 serves the names, the line is
 `names: <box>.min.internal opens through the HTTP proxy at 127.0.0.1:<port>`.
 Once this host resolves the zone natively, the line has one of two forms. The
@@ -882,7 +604,7 @@ On macOS the local range addresses come off the loopback too, and `--undo`
 removes the resolver file's directory when it holds nothing else. While a VM
 is running, the addresses stay and a note says so: stop every VM, then run
 `--undo` again. The check counts any `minvmd` process on the host, so end one
-that `min stop` leaves behind too.
+that `min host stop` leaves behind too.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
 
@@ -892,24 +614,19 @@ The default is yes. It does not ask on a host that needs nothing. If you
 decline, or there is no terminal, it prints
 ``run `min finalize-install` when you're ready``.
 
-### `stop`
+### `host stop`
 
 ```
-min stop [-f|--force]
+min host stop [-f|--force] <HOST>
 ```
 
-Shuts down the `minimald` daemon. `--force` shuts down even if active
-sessions exist. On a VM backend, `--force` also stops the VM from the host
-when the in-guest daemon does not answer. A guest that does not acknowledge the
-shutdown is killed: its running sessions get no clean stop, and data not yet
-flushed inside the VM can be lost. Without `--force`, an unanswering VM fails
-with exit code 7. This stops the daemon backend that hosts sessions, and the
-sessions themselves survive it (contrast
-[`session destroy`](#session-destroy), which removes one session and leaves the
-daemon running).
-
-`stop` stays bare at the top level — a deliberate exception to the
-`min <noun> <verb>` convention: it acts on the daemon, not on any session.
+Stops each running box on a local host, then the host's daemon, and its VM
+on a VM host. `HOST` is the host's name as `min host list` prints it, such as
+`local0` or `local-minvmd0`. The boxes stay: their records, events and files
+remain until `min box rm` removes them. `--force` force-stops each box, and
+stops the daemon without waiting for it to shut down cleanly. On a VM host,
+`--force` stops the VM from this machine, and data not yet written to disk
+inside the VM can be lost.
 
 ### `auth login` (alias: `min login`)
 
@@ -1088,9 +805,9 @@ details.
 branch — rewriting `locked_commit` and leaving the file modified in your
 working tree — then refreshes the local checkouts to match. The standard
 library is embedded in the `min` binary and is only refreshed or verified
-locally — its commit is not re-pinned. The next `min session activate`
+locally — its commit is not re-pinned. The next `min session start`
 materializes the new closure, which can take several minutes on the first
-activate. When no pin has moved it reports that and leaves `minimal.toml`
+start. When no pin has moved it reports that and leaves `minimal.toml`
 unchanged. To update the `min` binary itself, reinstall it with the
 installer.
 
@@ -1147,10 +864,10 @@ What it emits is a short *registration* shim, not a completion table: it teaches
 the shell to ask `min` itself what to offer. That indirection is what makes
 session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
-exists at the time a static script would be written. Every argument documented
-as "UUID, unique id prefix, or session name" completes this way: `session attach`,
-`session exec`, `session run`, `session destroy`, `session rename`, and
-`session policy`.
+exists at the time a static script would be written. The `SESSION` argument of
+`session attach` completes this way, and so does the box argument of every
+`min box` verb that takes one, such as `box exec`, `box show`, `box rm` and
+`box rename`.
 
 Session completion is best-effort by design. It never starts a daemon — with
 none running there is nothing to list, and booting a VM on a keystroke would be
