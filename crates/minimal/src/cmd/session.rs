@@ -305,7 +305,14 @@ pub async fn cmd_session_policy(
     // on `use_minvmd()`, which is true only under an explicit `--provider
     // local-minvmd`.
     let mut out = std::io::stdout();
-    write_box_network(&mut out, &mut client, &record, daemon_host_kind(global), false).await
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        daemon_host_kind(global),
+        false,
+    )
+    .await
 }
 
 /// Register a session as an SSH remote in Zed's `settings.json`.

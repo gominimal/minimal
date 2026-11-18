@@ -16551,9 +16551,8 @@ async fn box_show_network_renders_effective_policy() {
         "the declaration comes first\n{with_live}"
     );
     assert!(
-        with_live.ends_with(
-            "live ingress (published at runtime)\n  tcp  127.0.64.96:3000 → :3000\n"
-        ),
+        with_live
+            .ends_with("live ingress (published at runtime)\n  tcp  127.0.64.96:3000 → :3000\n"),
         "{with_live}"
     );
 
@@ -16596,7 +16595,10 @@ async fn box_show_network_renders_effective_policy() {
     let error = cmd_box_show(&global, args)
         .await
         .expect_err("-o yaml is refused with --network");
-    assert!(error.downcast_ref::<NetworkFlagRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.downcast_ref::<NetworkFlagRefusal>().is_some(),
+        "{error:#}"
+    );
     assert_eq!(
         error.to_string(),
         "`min box show --network` does not write YAML. \

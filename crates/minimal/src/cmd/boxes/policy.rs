@@ -1046,12 +1046,9 @@ async fn box_policy_json_inputs(
     };
 
     match resp {
-        minimald_rpc::Errorable::Ok(policy) => Ok((
-            policy,
-            live,
-            unaudited_listen_ports,
-            shared_port_collisions,
-        )),
+        minimald_rpc::Errorable::Ok(policy) => {
+            Ok((policy, live, unaudited_listen_ports, shared_port_collisions))
+        }
         minimald_rpc::Errorable::Err { error } => {
             Err(PolicyJsonFailure::PolicyUnavailable(error.to_string()))
         }

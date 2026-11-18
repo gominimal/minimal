@@ -350,7 +350,14 @@ pub(crate) async fn write_box_network(
         minimald_rpc::Errorable::Ok(policy) => policy,
         minimald_rpc::Errorable::Err { error } => bail!("{error}"),
     };
-    render_box_network(out, &policy, record.network, facts.as_ref(), &live, host_kind)
+    render_box_network(
+        out,
+        &policy,
+        record.network,
+        facts.as_ref(),
+        &live,
+        host_kind,
+    )
 }
 
 /// Writes the text form of a box's effective network policy: `policy` for a
@@ -392,7 +399,11 @@ pub(crate) fn render_box_network(
     )?;
     write_live_ingress(out, live)?;
     if let Some(facts) = facts {
-        write_unaudited_listen_ports(out, &facts.unaudited_listen_ports, facts.audit_log.as_deref())?;
+        write_unaudited_listen_ports(
+            out,
+            &facts.unaudited_listen_ports,
+            facts.audit_log.as_deref(),
+        )?;
     }
     out.flush().context("Failed to write policy")?;
     Ok(())
