@@ -11215,7 +11215,7 @@ async fn attach_ended_from_other_side_notice_exit254() {
 /// line names the host that ended the attach.
 #[test]
 fn attach_ended_by_restart_names_restart_exit254() {
-    use cmd::{BoxRestart, EndsBefore, box_attach_ending, ends_show_restart};
+    use cmd::{BoxRestart, EndsBefore, attach_restart, box_attach_ending, ends_show_restart};
 
     assert_eq!(
         ends_show_restart(EndsBefore::Running(Some(1)), Some(2)),
@@ -11245,8 +11245,13 @@ fn attach_ended_by_restart_names_restart_exit254() {
     let target = ending_target("local0");
     let running = BoxAfterAttach::Listed(ending_entry("running"));
     let ending = |before: EndsBefore, after: Option<u64>| {
-        box_attach_ending(&target, 254, &running, ends_show_restart(before, after))
-            .expect("an ending")
+        box_attach_ending(
+            &target,
+            254,
+            &running,
+            attach_restart(254, &running, before, after),
+        )
+        .expect("an ending")
     };
     assert_eq!(
         ending(EndsBefore::Running(Some(0)), Some(1)),
@@ -11290,6 +11295,33 @@ fn attach_ended_by_restart_names_restart_exit254() {
     // that runs.
     let mut stopped = ending_entry("stopped");
     stopped.reason = Some("stopped".to_owned());
+    let rose = (EndsBefore::Running(Some(0)), Some(1));
+    for (code, after) in [
+        (0, running.clone()),
+        (255, running.clone()),
+        (254, BoxAfterAttach::Listed(stopped.clone())),
+        (254, BoxAfterAttach::Listed(ending_entry("exited"))),
+        (254, BoxAfterAttach::Gone),
+        (254, BoxAfterAttach::Unread),
+    ] {
+        assert_eq!(
+            attach_restart(code, &after, rose.0, rose.1),
+            BoxRestart::NotRestarted,
+            "{code} {after:?}"
+        );
+    }
+    assert_eq!(
+        attach_restart(254, &running, rose.0, rose.1),
+        BoxRestart::Restarted
+    );
+    assert_eq!(
+        attach_restart(254, &running, EndsBefore::Running(Some(1)), Some(1)),
+        BoxRestart::NotRestarted
+    );
+    assert_eq!(
+        attach_restart(254, &running, EndsBefore::Running(Some(1)), None),
+        BoxRestart::Unread
+    );
     assert_eq!(
         box_attach_ending(
             &target,
@@ -11309,6 +11341,78 @@ fn attach_ended_by_restart_names_restart_exit254() {
                 code: 0,
                 notice: None
             })
+        );
+    }
+}
+
+/// BCLI-068: `min box restart` of a box that an attach holds ends the
+/// attach with 254 and the line that names the restart, through a host.
+/// The host's restart stops the box, which raises its count of ends, and
+/// then starts it. This crate's harness daemon has no package store, so
+/// the start half fails and leaves the box stopped. The test does the
+/// start half itself: it writes back the record of the running box.
+///
+/// A restart stops the box and then starts it. When the command reads the
+/// box between the two, it reads `stopped` and prints the line for a stop.
+/// The second case pins that, with the box left stopped.
+#[tokio::test]
+async fn attach_ended_by_restart_names_restart_exit254_through_the_host() {
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let mut daemon = alpha.server.connect().await;
+    let id = create_box_with_spec(
+        &mut daemon,
+        "web",
+        alpha.project.path(),
+        Some(restart_spec(mfile::spec::Lifetime::UntilStopped)),
+    )
+    .await;
+    let hosts = vec![alpha.host.clone()];
+    let record = box_state_dir(&state, id).join("record.json");
+    let running = std::fs::read(&record).expect("the running box's record");
+
+    for (start_again, line) in [
+        (
+            true,
+            "Detached: web was restarted. Run min box attach web to attach again.",
+        ),
+        (false, "Detached: web was stopped."),
+    ] {
+        let (attached_tx, attached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (restarted_tx, restarted_rx) = tokio::sync::oneshot::channel::<()>();
+        let attach = box_attach_on_hosts(
+            hosts.clone(),
+            Some("web"),
+            None,
+            true,
+            async move |_: &BoxAttachTarget| {
+                let _ = attached_tx.send(());
+                // The restart's stop closes the attach's channel.
+                restarted_rx.await.expect("the restart ran");
+                Ok(254)
+            },
+        );
+        let restart = async {
+            attached_rx.await.expect("the attach ran");
+            let err = cmd::restart_box_on_hosts(hosts.clone(), &mut Vec::new(), "web")
+                .await
+                .expect_err("the harness cannot start the box again");
+            assert!(
+                format!("{err:#}").contains("did not start again"),
+                "the restart stopped the box: {err:#}"
+            );
+            if start_again {
+                std::fs::write(&record, &running).expect("the box runs again");
+            }
+            let _ = restarted_tx.send(());
+        };
+        let (ending, ()) = tokio::join!(attach, restart);
+        assert_eq!(
+            ending.expect("the attach ends"),
+            AttachEnding {
+                code: 254,
+                notice: Some(line.to_owned()),
+            },
+            "the box runs again: {start_again}"
         );
     }
 }

@@ -1552,14 +1552,13 @@ where
     }
     // BCLI-068: a box that runs again after the host ended the attach, and
     // whose count of ends rose, was restarted, not taken by another terminal.
-    // A count that was not read names no cause.
-    let restarted = if code == DAEMON_ENDED_ATTACH
-        && matches!(&after, BoxAfterAttach::Listed(entry) if entry.state == "running")
-    {
-        ends_show_restart(ends_before, box_end_count(&target).await)
+    // Only a 254 reads the count, since only a 254 can name a restart.
+    let ends_after = if code == DAEMON_ENDED_ATTACH {
+        box_end_count(&target).await
     } else {
-        BoxRestart::NotRestarted
+        None
     };
+    let restarted = attach_restart(code, &after, ends_before, ends_after);
     match box_attach_ending(&target, code, &after, restarted) {
         Ok(mut ending) => {
             if let Some((exited_clean, outcomes)) = &copied {
@@ -1651,6 +1650,25 @@ pub(crate) fn ends_show_restart(before: EndsBefore, after: Option<u64>) -> BoxRe
             BoxRestart::NotRestarted
         }
         (EndsBefore::Running(_), _) | (EndsBefore::Unread, _) => BoxRestart::Unread,
+    }
+}
+
+/// Whether the attach that ended with ssh's `code` was ended by a restart
+/// of its box. Only a 254 against a box that the settled read `after`
+/// lists as running can be a restart. Then the count of ends decides, from
+/// `before` the attach to `ends_after` it, as [`ends_show_restart`] says
+/// (BCLI-068).
+pub(crate) fn attach_restart(
+    code: i32,
+    after: &BoxAfterAttach,
+    before: EndsBefore,
+    ends_after: Option<u64>,
+) -> BoxRestart {
+    let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
+    if code == DAEMON_ENDED_ATTACH && running {
+        ends_show_restart(before, ends_after)
+    } else {
+        BoxRestart::NotRestarted
     }
 }
 
