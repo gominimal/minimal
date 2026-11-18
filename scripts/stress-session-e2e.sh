@@ -17,6 +17,9 @@
 # Usage: scripts/stress-session-e2e.sh [N]   (N defaults to 5)
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
+command -v jq >/dev/null 2>&1 \
+  || { echo "::error::jq is not on PATH; the teardown check reads 'min box list -o json' with it" >&2; exit 2; }
+
 N="${1:-5}"
 case "$N" in
   '' | *[!0-9]*) echo "N must be a positive integer, got: '$N'" >&2; exit 2 ;;
@@ -180,13 +183,19 @@ fi
 
 # And the daemon comes back cleanly: the next command autospawns a fresh one
 # in which no minted box still runs (the concurrent set was stopped, not
-# orphaned). `min host stop` keeps the box records, so the boxes stay listed.
-if ! after="$(mnl box list --all)"; then
+# orphaned). `min host stop` keeps the box records, so every minted box must
+# still be listed, and none of them in the running state.
+if ! after="$(mnl box list --all -o json)"; then
   echo "::error::failed to list boxes after teardown (daemon did not restart cleanly)"
   fail
 fi
 for sid in $sids; do
-  if printf '%s\n' "$after" | awk -v id="$sid" '$1 == id' | grep -qw running; then
+  if ! state="$(printf '%s\n' "$after" | jq -er --arg id "$sid" '.[] | select(.id == $id) | .state')"; then
+    echo "::error::box $sid is missing from 'min box list --all' after 'min host stop $host --force'"
+    printf '%s\n' "$after"
+    fail
+  fi
+  if [ "$state" = running ]; then
     echo "::error::box $sid still running after 'min host stop $host --force'"
     printf '%s\n' "$after"
     fail
