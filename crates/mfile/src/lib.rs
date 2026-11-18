@@ -869,14 +869,17 @@ pub struct ChainLink {
 /// /state. The prefix is joined onto the state directory, so it must first
 /// pass [`File::validate_state_component`], the rule for every state key and
 /// state dir name (not empty, `.` or `..`, and no `/` or NUL). It is also sent
-/// to the shell helpers on a `set_env:` line, so it is further refused when it
-/// holds `\`, `:` or a control character (Unicode category Cc, as
-/// [`char::is_control`] has it).
+/// to the shell helpers on a `set_env:` line, and they print it unquoted in an
+/// `export` command for the person to run. So it may hold only ASCII letters,
+/// digits, `.`, `_` and `-`: no character a shell reads as syntax, no space,
+/// no `:` or `\`, and no control character. The Nickel contract on the
+/// attribute (`attr_classes.ncl`) applies the same set.
 #[must_use]
 pub fn is_state_prefix(prefix: &str) -> bool {
     File::validate_state_component(prefix).is_ok()
-        && !prefix.contains(['\\', ':'])
-        && !prefix.chars().any(char::is_control)
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// The refusal for a package's `env_state_wiring` prefix that fails
@@ -886,9 +889,9 @@ pub fn is_state_prefix(prefix: &str) -> bool {
 #[must_use]
 pub fn state_prefix_refusal(package: &str, prefix: &str) -> String {
     format!(
-        "package `{}` declares `env_state_wiring` with prefix \"{}\". The prefix must be one \
-         directory name under /state, with no `/`, `\\`, `:` or control character, and not \
-         `.` or `..`.",
+        "package `{}` declares `env_state_wiring` with prefix \"{}\". A prefix is one directory \
+         name under /state. It may use only ASCII letters, digits, `.`, `_` and `-`, and it \
+         cannot be `.` or `..`. Change the prefix in the package's spec.",
         package.escape_debug(),
         prefix.escape_debug(),
     )

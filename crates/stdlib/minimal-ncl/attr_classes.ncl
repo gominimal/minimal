@@ -3,9 +3,9 @@
 # (env_min_helper.sh / min_helper.sh), and the variable name also travels
 # on the daemon-to-helper `set_env:` line protocol. A name containing shell
 # array subscripts is evaluated by bash `declare` — `X[$(cmd)]` runs the
-# command — and a prefix containing framing characters breaks the line
-# protocol, so each field is pinned here to the exact shape the helpers
-# accept. std.contract.custom keeps both default-free, matching every other
+# command — and the prefix is printed unquoted in an `export` command for the
+# person to run, so each field is pinned here to a shape no shell reads as
+# syntax. std.contract.custom keeps both default-free, matching every other
 # contract in this file (a default would let a bad value be silently
 # replaced rather than rejected).
 let env_var_name = std.contract.custom (fun _ value =>
@@ -18,18 +18,18 @@ let env_var_name = std.contract.custom (fun _ value =>
 )
 in
 # A prefix is one directory name under /state: it names a directory, never a
-# path (`/`, `\`, `.`, `..`), and must carry none of the characters that would
-# let it forge daemon-to-helper framing (`:`, any control character).
-# A control character is any of Unicode category Cc (C0, DEL and C1), as
-# Rust's char::is_control has it: the daemon applies the same rule again
-# (mfile::is_state_prefix), and `[:cntrl:]` here would be ASCII only.
+# path (`/`, `.`, `..`). The helpers also print it unquoted in an `export`
+# command for the person to run, so it is limited to ASCII letters, digits,
+# `.`, `_` and `-`: no shell syntax, no space, no `:` that would forge
+# daemon-to-helper framing, and no control character. The daemon applies the
+# same set again (mfile::is_state_prefix).
 let state_prefix = std.contract.custom (fun _ value =>
     if !(std.typeof value == 'String) then
         'Error { message = "env_state_wiring's prefix must be a string" }
     else if value == "." || value == ".." then
         'Error { message = "env_state_wiring's prefix must be one directory name under /state, not `.` or `..`" }
-    else if !(std.string.is_match m%"^[^/\\:\p{Cc}]+$"% value) then
-        'Error { message = "env_state_wiring's prefix must be one directory name under /state, with no `/`, `\\`, `:` or control character" }
+    else if !(std.string.is_match m%"^[A-Za-z0-9._-]+$"% value) then
+        'Error { message = "env_state_wiring's prefix must be one directory name under /state, using only ASCII letters, digits, `.`, `_` and `-`" }
     else
         'Ok value
 )
