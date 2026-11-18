@@ -126,6 +126,15 @@ pub(crate) struct InjectedCommands {
     /// filter itself or it could open sockets — `AF_VSOCK` to the host
     /// included — from inside a sealed box.
     pub(crate) seal_none_box: bool,
+    /// The box's id, which the `host_ip` cohort records an injected
+    /// process under (BEP-018).
+    pub(crate) box_id: String,
+    /// The box's classifier leaf, which the hook joins before it joins the
+    /// namespaces, so it never runs in the daemon's own leaf (NET-079).
+    /// `None` for a box this host placed in no leaf.
+    pub(crate) leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// Whether the box runs with host-address enforcement.
+    pub(crate) host_ip_enforced: bool,
 }
 
 impl BoxCommands for InjectedCommands {
@@ -145,7 +154,13 @@ impl BoxCommands for InjectedCommands {
         } else {
             injection
         };
-        injection.command().map_err(std::io::Error::other)
+        crate::box_runtime::placed_injection_command(
+            injection,
+            &self.box_id,
+            self.leaf.as_ref(),
+            self.host_ip_enforced,
+        )
+        .map_err(std::io::Error::other)
     }
 }
 
@@ -1779,7 +1794,10 @@ mod tests {
 
     /// The injected argv of a hook, as strings, so a test can ask what the
     /// shim was told to do.
-    async fn injected_argv(seal_none_box: bool) -> Vec<String> {
+    async fn injected_argv(
+        seal_none_box: bool,
+        leaf: Option<sandbox::config::ClassifierLeaf>,
+    ) -> Vec<String> {
         // A plain host process shares every namespace with us, so the join set
         // is empty and nothing privileged is asked of the runner.
         let mut hold = std::process::Command::new("/bin/sleep")
@@ -1791,6 +1809,9 @@ mod tests {
             cwd: String::new(),
             vars: BTreeMap::new(),
             seal_none_box,
+            box_id: "b".to_string(),
+            leaf,
+            host_ip_enforced: false,
         };
         let built = commands
             .command("/bin/true", &[], BTreeMap::new())
@@ -1812,7 +1833,7 @@ mod tests {
     #[tokio::test]
     async fn a_none_box_hook_injection_carries_the_socket_seal() {
         assert!(
-            injected_argv(true)
+            injected_argv(true, None)
                 .await
                 .contains(&"--seal-none-box".to_string()),
             "a sealing session must pass --seal-none-box to the hook's shim",
@@ -1825,10 +1846,25 @@ mod tests {
     #[tokio::test]
     async fn a_networked_session_hook_injection_is_not_sealed() {
         assert!(
-            !injected_argv(false)
+            !injected_argv(false, None)
                 .await
                 .contains(&"--seal-none-box".to_string()),
             "only a none box may pass --seal-none-box to the hook's shim",
         );
+    }
+
+    /// NET-079: a hook joins the box's classifier leaf before it joins the
+    /// namespaces, as an exec does, so the hook's process never runs in the
+    /// daemon's own leaf. The leaf travels on the shim's argv.
+    #[tokio::test]
+    async fn a_hook_injection_joins_the_box_leaf() {
+        let leaf =
+            sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/deny/b");
+        let argv = injected_argv(false, Some(leaf.clone())).await;
+        let at = argv
+            .iter()
+            .position(|arg| arg == "--classifier-leaf")
+            .unwrap_or_else(|| panic!("a placed box's hook names its leaf to the shim: {argv:?}"));
+        assert_eq!(argv[at + 1], leaf.dir().to_string_lossy());
     }
 }
