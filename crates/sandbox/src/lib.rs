@@ -2723,8 +2723,14 @@ impl<C: Channel> Sandbox<C> {
                 None => None,
                 Some(Ok(held)) => Some(held),
                 Some(Err(e)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // The process may have exited already: the reap below
+                    // runs whatever the kill answers.
+                    if let Err(error) = child.kill() {
+                        tracing::debug!(%error, "killing a refused process");
+                    }
+                    if let Err(error) = child.wait() {
+                        tracing::debug!(%error, "reaping a refused process");
+                    }
                     return Err(Error::Execution(ExecutionError::SpawnRefused(e)));
                 }
             };
