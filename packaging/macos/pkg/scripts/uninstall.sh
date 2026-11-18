@@ -1,10 +1,11 @@
 #!/bin/sh
 # uninstall.sh: remove the macOS system install. macOS keeps a receipt for a
 # package but has no command to remove one, so the package ships this.
-# Undoes the postinstall (the DNS service, its role account, the resolver,
-# the boot-time range job), then removes every file the receipt lists, then
-# the receipt. Never /usr or /usr/local themselves. A user's own state under
-# their home (~/.local/state/minimal, ~/.cache/minimal) is theirs and stays.
+# Undoes the postinstall (the DNS service, its log and the log's size cap,
+# its role account, the resolver, the boot-time range job), then removes
+# every file the receipt lists, then the receipt. Never /usr or /usr/local
+# themselves. A user's own state under their home (~/.local/state/minimal,
+# ~/.cache/minimal) is theirs and stays.
 #
 # The postinstall puts this script where only root writes, with the list of
 # files the payload placed beside it. A first install that failed has no
@@ -40,7 +41,12 @@ payload() {
 # The privileged setup the postinstall did.
 launchctl bootout system/dev.gominimal.zone 2>/dev/null || true
 launchctl bootout system/dev.minimal.local-range 2>/dev/null || true
-rm -f /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/LaunchDaemons/dev.minimal.local-range.plist
+launchctl bootout system/dev.gominimal.zone.logcap 2>/dev/null || true
+rm -f /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/LaunchDaemons/dev.minimal.local-range.plist \
+    /Library/LaunchDaemons/dev.gominimal.zone.logcap.plist
+# The service's log, and its directory when nothing else is in it.
+rm -f /private/var/log/minimal/minzoned.log
+rmdir /private/var/log/minimal 2>/dev/null || true
 rm -f /etc/resolver/min.internal
 rmdir /etc/resolver 2>/dev/null || true
 rm -rf /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old
