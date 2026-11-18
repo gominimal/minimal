@@ -1576,47 +1576,72 @@ where
     }
 }
 
-/// How many times the box `target` ended, when it is stopped or exited
-/// before the attach. `None` for a running box, and for a host that does
-/// not answer.
-async fn ended_box_end_count(target: &BoxAttachTarget) -> Option<u64> {
-    let BoxAfterAttach::Listed(entry) = box_after_attach(&target.host, target.box_id).await else {
-        return None;
-    };
-    if !matches!(entry.state.as_str(), "stopped" | "exited") {
-        return None;
-    }
-    let mut client = box_host_client(&target.host)
-        .await
-        .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
-        .ok()?;
-    box_ends(&mut client, target.box_id)
-        .await
-        .map(|ends| ends.count)
+/// What the attach knew of the box's ends before it started (BOX-204).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndsBefore {
+    /// The box ran, so any end it reaches is a new end.
+    Running,
+    /// The box was stopped or exited, and had ended this many times.
+    Ended(u64),
+    /// The host did not give the box's state or its count of ends.
+    Unread,
 }
 
-/// Whether the box `target`, which ended `before` times when the attach
-/// started, ended again since. A box that ran when the attach started
-/// (`before` is `None`) counts as ended again. A count that the host does
-/// not give counts as no new end, so the attach copies nothing, and a later
-/// `min box wait` can copy that end (BOX-204).
-async fn ended_again(target: &BoxAttachTarget, before: Option<u64>) -> bool {
-    let Some(before) = before else {
-        return true;
+/// What the attach knew of the box `target` before it started: running,
+/// ended a number of times, or not read.
+async fn ended_box_end_count(target: &BoxAttachTarget) -> EndsBefore {
+    let BoxAfterAttach::Listed(entry) = box_after_attach(&target.host, target.box_id).await else {
+        tracing::warn!(box_id = %target.box_id, "box ends: the host did not give the box's state");
+        return EndsBefore::Unread;
     };
+    if !matches!(entry.state.as_str(), "stopped" | "exited") {
+        return EndsBefore::Running;
+    }
+    let Ok(mut client) = box_host_client(&target.host)
+        .await
+        .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
+    else {
+        return EndsBefore::Unread;
+    };
+    box_ends(&mut client, target.box_id)
+        .await
+        .map_or(EndsBefore::Unread, |ends| EndsBefore::Ended(ends.count))
+}
+
+/// Whether a box that the attach knew as `before` ended again, when the
+/// host now gives `after` ends. A box that ran counts as ended again. A
+/// count that is not read, before or after, counts as no new end. Then the
+/// attach copies nothing, and a later `min box wait` can copy that end
+/// (BOX-204).
+pub(crate) fn ends_show_new_end(before: EndsBefore, after: Option<u64>) -> bool {
+    match before {
+        EndsBefore::Running => true,
+        EndsBefore::Ended(before) => after.is_some_and(|after| after > before),
+        EndsBefore::Unread => false,
+    }
+}
+
+/// Whether the box `target`, which the attach knew as `before`, ended
+/// again since. See [`ends_show_new_end`].
+async fn ended_again(target: &BoxAttachTarget, before: EndsBefore) -> bool {
+    if before == EndsBefore::Running {
+        return true;
+    }
     let mut after = None;
-    if let Ok(mut client) = box_host_client(&target.host).await {
+    if let EndsBefore::Ended(_) = before
+        && let Ok(mut client) = box_host_client(&target.host).await
+    {
         after = box_ends(&mut client, target.box_id)
             .await
             .map(|ends| ends.count);
     }
-    let again = after.is_some_and(|after| after > before);
+    let again = ends_show_new_end(before, after);
     if !again {
         tracing::info!(
             box_id = %target.box_id,
-            ends_before = before,
+            ends_before = ?before,
             ends_after = ?after,
-            "file exports: the resumed box did not end again, so the attach copies nothing"
+            "file exports: the attach did not see a new end of the box, so it copies nothing"
         );
     }
     again

@@ -22212,6 +22212,16 @@ async fn multi_box_wait_copies_in_order_of_ends() {
 // minimald's own tests drive a resume that launches (BOX-025).
 #[tokio::test]
 async fn resumed_box_copies_at_next_end_only() {
+    // A count of ends that the host did not give is no new end, so the
+    // attach leaves the end it resumed from unclaimed.
+    use cmd::{EndsBefore, ends_show_new_end};
+    assert!(ends_show_new_end(EndsBefore::Running, None));
+    assert!(ends_show_new_end(EndsBefore::Ended(1), Some(2)));
+    assert!(!ends_show_new_end(EndsBefore::Ended(1), Some(1)));
+    assert!(!ends_show_new_end(EndsBefore::Ended(1), None));
+    assert!(!ends_show_new_end(EndsBefore::Unread, Some(2)));
+    assert!(!ends_show_new_end(EndsBefore::Unread, None));
+
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
     let state = tempfile::tempdir().expect("a temp daemon state dir");
     let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
