@@ -22209,7 +22209,9 @@ async fn multi_box_wait_copies_in_order_of_ends() {
 // no package store, so the launch fails after the spec is read, and the
 // host writes back the record the box resumed from. The attach copies
 // nothing and claims nothing, so a later wait still copies that end once.
-// minimald's own tests drive a resume that launches (BOX-025).
+// minimald's own tests drive a resume that launches (BOX-025). A last
+// attach resumes the box again, and the box ends again while it runs, with
+// new contents in its export. That attach copies the new contents, once.
 #[tokio::test]
 async fn resumed_box_copies_at_next_end_only() {
     // A count of ends that the host did not give is no new end, so the
@@ -22224,6 +22226,7 @@ async fn resumed_box_copies_at_next_end_only() {
 
     let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
     let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_dir = state.path().to_path_buf();
     let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
     let project = tempfile::tempdir().expect("a temp project dir");
     let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
@@ -22306,6 +22309,95 @@ async fn resumed_box_copies_at_next_end_only() {
         b"first end"
     );
     assert_eq!(file_exported_lines(&global, "dev").await.len(), 1);
+
+    // The next end after a resume copies what the box holds then, once.
+    // The attach resumes the box. While the attach runs, the box gets new
+    // contents in its export and ends again: a second `exited` event, as
+    // the daemon writes it.
+    let mut refusal = Vec::new();
+    let code = attach_on_hosts(
+        AttachVerb::BoxResume,
+        local_hosts(&global).unwrap(),
+        Some("dev"),
+        None,
+        Some(&here),
+        true,
+        async |_target: &BoxAttachTarget| {
+            let mut channel = daemon.open_shell(dev).await;
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), channel.wait()).await
+            {
+                if let russh::ChannelMsg::Data { data } = msg {
+                    refusal.extend_from_slice(&data);
+                }
+            }
+            // A stopped box takes no SFTP write, so the new contents go
+            // straight into the files the host keeps for the box.
+            rewrite_kept_box_file(&state_dir, "notes.md", b"first end", b"next end");
+            write_box_exited_event(&state_dir, dev);
+            Ok(0)
+        },
+    )
+    .await;
+    assert!(code.is_ok(), "the attach ends: {code:?}");
+    assert_eq!(
+        std::fs::read(project.path().join("notes.md")).unwrap(),
+        b"next end",
+        "the next end copies what the box holds then"
+    );
+    let exported = file_exported_lines(&global, "dev").await;
+    let next_end: Vec<_> = exported
+        .iter()
+        .filter(|line| line["data"]["end"] == 2)
+        .collect();
+    assert_eq!(
+        next_end.len(),
+        1,
+        "one export event for the next end: {exported:?}"
+    );
+    assert_eq!(next_end[0]["data"]["copied"], true, "{exported:?}");
+    assert_eq!(exported.len(), 2, "{exported:?}");
+}
+
+/// Writes `new` over the one file named `name` with the contents `old`
+/// that the daemon under the state dir `state` keeps for a box.
+fn rewrite_kept_box_file(state: &std::path::Path, name: &str, old: &[u8], new: &[u8]) {
+    fn walk(dir: &std::path::Path, name: &str, old: &[u8], found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(&path, name, old, found);
+            } else if kind.is_file()
+                && entry.file_name() == name
+                && std::fs::read(&path).is_ok_and(|contents| contents == old)
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(state, name, old, &mut found);
+    assert_eq!(found.len(), 1, "one kept copy of {name}: {found:?}");
+    std::fs::write(&found[0], new).expect("the kept file is written");
+}
+
+/// Appends an `exited` event to the events of box `id` under the daemon
+/// state dir `state`, as the daemon writes one when the box ends.
+fn write_box_exited_event(state: &std::path::Path, id: boxes::SessionId) {
+    let box_dir = box_state_dir(state, id);
+    let record: boxes::Record =
+        serde_json_lenient::from_slice(&std::fs::read(box_dir.join("record.json")).unwrap())
+            .expect("the box's record");
+    let event = boxes::events::BoxEvent::for_record(&record, boxes::events::BoxEventType::Exited);
+    let events = camino::Utf8PathBuf::from_path_buf(box_dir.join(boxes::events::EVENTS_FILE))
+        .expect("a UTF-8 path");
+    boxes::store::append_event_at(&events, &event).expect("the event is written");
 }
 
 /// The harness host that `global` selects.
