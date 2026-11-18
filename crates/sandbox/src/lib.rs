@@ -2033,7 +2033,8 @@ pub type StdinSlot = Box<dyn FnOnce(fs::File) -> std::io::Result<()> + Send>;
 
 /// Called with the pid of each invocation's container once it is spawned,
 /// before the run waits on it. The value it returns is held while the
-/// container runs and dropped once the run is done with it. An error kills
+/// container runs, and dropped as soon as the container is reaped, before
+/// its network is torn down: a reaped pid can name another process. An error kills
 /// and reaps the container and fails the run, so no later invocation starts.
 pub type SpawnHook = Box<dyn FnMut(u32) -> std::io::Result<Box<dyn std::any::Any + Send>> + Send>;
 
@@ -2717,9 +2718,10 @@ impl<C: Channel> Sandbox<C> {
             let mut child = forker::on_fork_thread(move || cmd.spawn())
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-            // Held until this iteration ends, after the child is reaped on
-            // every path that reaps it.
-            let _spawned = match on_spawn.as_mut().map(|hook| hook(child.id())) {
+            // Held while the process can be signalled, and dropped the moment
+            // it is reaped, before anything awaits: once reaped, its PID can
+            // belong to another process.
+            let mut spawned = match on_spawn.as_mut().map(|hook| hook(child.id())) {
                 None => None,
                 Some(Ok(held)) => Some(held),
                 Some(Err(e)) => {
@@ -2760,6 +2762,7 @@ impl<C: Channel> Sandbox<C> {
                 if let Err(e) = started {
                     let _ = child.kill();
                     let _ = child.wait();
+                    drop(spawned.take());
                     if let Some(net_guard) = net_guard {
                         net_guard.teardown().await;
                     }
@@ -2899,6 +2902,7 @@ impl<C: Channel> Sandbox<C> {
 
                     // Reap the child process, then tear down its network.
                     let _ = child.wait();
+                    drop(spawned.take());
                     if let Some(net_guard) = net_guard {
                         net_guard.teardown().await;
                     }
@@ -2943,6 +2947,7 @@ impl<C: Channel> Sandbox<C> {
                         }
                         Ok(())
                     })();
+                    drop(spawned.take());
 
                     // The invocation's process has exited; tear down its network
                     // before propagating any error.
@@ -5554,6 +5559,139 @@ int main(int argc, char **argv) {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "no invocation starts after the refused one"
+        );
+    }
+
+    /// A network whose teardown notes whether the spawn hook's value for that
+    /// invocation was already dropped: `live` counts the values held.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct TeardownProbe {
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    /// What the probe's spawn hook returns: counted in `live` while held.
+    #[cfg(target_os = "linux")]
+    struct LiveRecord(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LiveRecord {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl network::Network for TeardownProbe {
+        fn plan(&self) -> network::PlanFuture<'_> {
+            Box::pin(std::future::ready(Ok(network::NetPlan::isolated())))
+        }
+        fn attach(&self, spawned: network::Spawned) -> network::AttachFuture<'_> {
+            drop(spawned);
+            struct Guard {
+                live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                seen: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+            }
+            impl network::NetGuard for Guard {
+                fn teardown(
+                    self: Box<Self>,
+                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                {
+                    let released = self.live.load(std::sync::atomic::Ordering::SeqCst) == 0;
+                    self.seen.lock().unwrap().push(released);
+                    Box::pin(std::future::ready(()))
+                }
+            }
+            Box::pin(std::future::ready(Ok(Box::new(Guard {
+                live: self.live.clone(),
+                seen: self.seen.clone(),
+            })
+                as Box<dyn network::NetGuard>)))
+        }
+    }
+
+    /// Once an invocation's container is reaped its pid is free for another
+    /// process, so the run drops what the spawn hook returned before the
+    /// network teardown awaits. A stop that reads the record then never
+    /// signals a reaped pid.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reaped_invocation_leaves_no_record_before_its_teardown() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping a_reaped_invocation_leaves_no_record_before_its_teardown: this host \
+                 denies the unprivileged user namespace every sandbox starts by unsharing: \
+                 {reason}"
+            );
+            return;
+        }
+        let Some(base_dir) = sandbox_base_dir() else {
+            eprintln!("no directory on this host can hold a sandbox — skipping");
+            return;
+        };
+        let base = tempfile::tempdir_in(&base_dir).unwrap();
+        let src = base.path().join("probe.c");
+        fs::write(&src, CWD_PROBE_C).unwrap();
+        let rootfs = base.path().join("rootfs-src");
+        let usr_bin = rootfs.join("usr").join("bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::create_dir_all(rootfs.join("usr").join("lib")).unwrap();
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        match std::process::Command::new("gcc")
+            .args(["-static", "-o"])
+            .arg(usr_bin.join("probe"))
+            .arg(&src)
+            .status()
+        {
+            Ok(status) => assert!(status.success(), "gcc failed: {status:?}"),
+            Err(e) => {
+                eprintln!("no gcc to build the probe with — skipping: {e}");
+                return;
+            }
+        }
+
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe = TeardownProbe {
+            live: live.clone(),
+            seen: seen.clone(),
+        };
+        let mut sandbox = Config::new("reap-probe")
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(rootfs)))
+            .with_dns(false)
+            .with_network(std::sync::Arc::new(probe))
+            .build(base.path().join("sandbox"), ())
+            .await
+            .expect("building the sandbox");
+
+        let hook_live = live.clone();
+        let options = RunOptions {
+            on_spawn: Some(Box::new(move |_pid| {
+                hook_live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(LiveRecord(hook_live.clone())) as Box<dyn std::any::Any + Send>)
+            })),
+            ..RunOptions::default()
+        };
+        let invocation = Invocation {
+            executable: "/usr/bin/probe".to_string(),
+            args: vec!["none".to_string()],
+            envs: Default::default(),
+        };
+        sandbox
+            .run_with_cancel(
+                vec![invocation.clone(), invocation],
+                None::<Vec<u8>>,
+                None::<Vec<u8>>,
+                options,
+            )
+            .await
+            .expect("the run passes");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![true, true],
+            "each invocation's record is gone before its network teardown"
         );
     }
 
