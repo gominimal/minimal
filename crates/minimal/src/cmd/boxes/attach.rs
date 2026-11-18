@@ -1552,9 +1552,14 @@ where
     }
     // BCLI-068: a box that runs again after the host ended the attach, and
     // whose count of ends rose, was restarted, not taken by another terminal.
-    let restarted = code == DAEMON_ENDED_ATTACH
+    // A count that was not read names no cause.
+    let restarted = if code == DAEMON_ENDED_ATTACH
         && matches!(&after, BoxAfterAttach::Listed(entry) if entry.state == "running")
-        && ends_show_restart(ends_before, box_end_count(&target).await);
+    {
+        ends_show_restart(ends_before, box_end_count(&target).await)
+    } else {
+        BoxRestart::NotRestarted
+    };
     match box_attach_ending(&target, code, &after, restarted) {
         Ok(mut ending) => {
             if let Some((exited_clean, outcomes)) = &copied {
@@ -1621,39 +1626,63 @@ async fn box_end_count(target: &BoxAttachTarget) -> Option<u64> {
         .map(|ends| ends.count)
 }
 
-/// Whether a box that ran when the attach started was restarted while it
-/// ran: its count of ends rose from `before` to `after`. A count that is
-/// not read, before or after, counts as no restart (BCLI-068).
-pub(crate) fn ends_show_restart(before: EndsBefore, after: Option<u64>) -> bool {
-    match before {
-        EndsBefore::Running(Some(before)) => after.is_some_and(|after| after > before),
-        _ => false,
+/// Whether a box that runs after its attach ended was restarted while the
+/// attach ran (BCLI-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxRestart {
+    /// The box's count of ends rose while the attach ran.
+    Restarted,
+    /// The count did not rise, or the box did not run when the attach
+    /// started.
+    NotRestarted,
+    /// The count before or after the attach was not read, so nothing
+    /// says why the attach ended.
+    Unread,
+}
+
+/// Whether a box that the attach knew as `before` was restarted while the
+/// attach ran: its count of ends rose from `before` to `after`. A count
+/// that was not read, before or after, gives [`BoxRestart::Unread`]
+/// (BCLI-068).
+pub(crate) fn ends_show_restart(before: EndsBefore, after: Option<u64>) -> BoxRestart {
+    match (before, after) {
+        (EndsBefore::Running(Some(before)), Some(after)) if after > before => BoxRestart::Restarted,
+        (EndsBefore::Running(Some(_)), Some(_)) | (EndsBefore::Ended(_), _) => {
+            BoxRestart::NotRestarted
+        }
+        (EndsBefore::Running(_), _) | (EndsBefore::Unread, _) => BoxRestart::Unread,
     }
 }
 
 /// How an attach that ended with ssh's `code` ends the command, as
-/// [`attach_ending`] says, except for a 254 against a box that runs again
-/// and was `restarted`. That attach ends with 254 and a line that names the
-/// restart, not another terminal (BCLI-068).
+/// [`attach_ending`] says, except for a 254 against a box that runs again.
+/// A box that was `restarted` ends with 254 and a line that names the
+/// restart, not another terminal. A box whose count of ends was not read
+/// ends with 254 and the line for a host that ended the attach, since
+/// nothing says why (BCLI-068).
 pub(crate) fn box_attach_ending(
     target: &BoxAttachTarget,
     code: i32,
     after: &BoxAfterAttach,
-    restarted: bool,
+    restarted: BoxRestart,
 ) -> Result<AttachEnding, BoxAttachRefusal> {
-    if code == DAEMON_ENDED_ATTACH
-        && restarted
-        && matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running")
-    {
-        let label = &target.label;
-        return Ok(AttachEnding {
-            code: DAEMON_ENDED_ATTACH,
-            notice: Some(format!(
-                "Detached: {label} was restarted. Run min box attach {label} to attach again."
-            )),
-        });
+    let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
+    if code != DAEMON_ENDED_ATTACH || !running {
+        return attach_ending(target, code, after);
     }
-    attach_ending(target, code, after)
+    match restarted {
+        BoxRestart::Restarted => {
+            let label = &target.label;
+            Ok(AttachEnding {
+                code: DAEMON_ENDED_ATTACH,
+                notice: Some(format!(
+                    "Detached: {label} was restarted. Run min box attach {label} to attach again."
+                )),
+            })
+        }
+        BoxRestart::NotRestarted => attach_ending(target, code, after),
+        BoxRestart::Unread => attach_ending(target, code, &BoxAfterAttach::Unread),
+    }
 }
 
 /// Whether a box that the attach knew as `before` ended again, when the
