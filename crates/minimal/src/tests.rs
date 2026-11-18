@@ -23379,3 +23379,180 @@ fn box_verbs_complete_box_names() {
         }
     }
 }
+
+/// NET-138: an attach that the in-VM daemon refuses because the VM host
+/// withdrew the box's row ends with its own status, and the client
+/// registers the box again from its record and hands the new registration
+/// to the daemon. The next attach is not refused for the released
+/// addresses: the daemon took the new registration as a new attachment.
+///
+/// The box's shell exit is stood in for by its record: a launch bound the
+/// row, and the daemon restarted with no host in the box's slot. No VM
+/// host answers the daemon's own read of the row, so the row reads as
+/// withdrawn. A stand-in VM host answers the client's registration on the
+/// control socket beside the daemon's ssh socket.
+#[tokio::test]
+async fn attach_after_row_withdrawn_registers_again() {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    const OLD: boxes::BoxAddresses = boxes::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(100, 64, 128, 40),
+        loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 40),
+    };
+    const NEW: boxes::BoxAddresses = boxes::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(100, 64, 128, 41),
+        loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 41),
+    };
+    let new_box_id = minimald_rpc::BoxId::from_bytes([0x51; 16]);
+
+    // An own-address box with the addresses its first registration handed.
+    let state = tempfile::TempDir::new().unwrap();
+    let state_path = state.path().to_path_buf();
+    let server = minimald::test_harness::TestServer::new_in(state).await;
+    let mut daemon = server.connect().await;
+    let mut request = minimald::test_harness::create_session_req("web", "/uwu");
+    request.config.network = boxes::NetworkMode::OwnIp;
+    request.config.box_addresses = Some(OLD);
+    request.config.box_id = Some(minimald_rpc::BoxId::from_bytes([0x50; 16]));
+    let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
+    minimald::test_harness::unwrap_ready(
+        daemon
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match daemon
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    drop(daemon);
+
+    // A launch bound the row, and the daemon restarted.
+    let record_path = box_state_dir(&state_path, id).join("record.json");
+    let mut record: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["host_row_bound"] = serde_json_lenient::Value::Bool(true);
+    std::fs::write(&record_path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+    let server = minimald::test_harness::TestServer::new_in(server.into_state_dir()).await;
+
+    // The daemon serves the ssh socket of a VM host's provider dir.
+    let dir = tempfile::TempDir::new().unwrap();
+    let host_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let sock = host_dir.join(paths::SSH_SOCK_FILE);
+    server.listen_on_uds(&sock).await;
+    let mut daemon = server.connect().await;
+
+    /// The text an attach wrote before its channel closed, and its status.
+    async fn attach_once(
+        daemon: &mut minimald::test_harness::TestClient,
+        id: boxes::SessionId,
+    ) -> (String, Option<u32>) {
+        let mut channel = daemon.open_shell(id).await;
+        let (mut out, mut status) = (Vec::new(), None);
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), channel.wait()).await
+        {
+            match msg {
+                russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                _ => {}
+            }
+        }
+        (String::from_utf8_lossy(&out).into_owned(), status)
+    }
+
+    let (refusal, status) = attach_once(&mut daemon, id).await;
+    assert!(
+        refusal.contains("the VM host released this box's network addresses"),
+        "the attach is refused for the withdrawn row: {refusal:?}"
+    );
+    assert_eq!(status, Some(minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS));
+    let code = i32::try_from(status.unwrap()).unwrap();
+
+    // The stand-in VM host registers the box again, and reports what the
+    // client wrote on the registration's lease.
+    let listener =
+        tokio::net::UnixListener::bind(host_dir.join(client::attach::VM_HOST_CONTROL_SOCK_FILE))
+            .unwrap();
+    let host = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).unwrap();
+        let minimald_rpc::BoxControlRequest::Register(register) = request else {
+            panic!("the client registers the box again, got {request:?}");
+        };
+        assert_eq!(register.name, "web", "under the record's name");
+        let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Registered(
+            minimald_rpc::RegisteredBox {
+                switch_address: NEW.switch_address,
+                loopback_address: NEW.loopback_address,
+                box_id: new_box_id,
+                task_addresses: Vec::new(),
+            },
+        ))
+        .unwrap();
+        stream
+            .get_mut()
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut lease = String::new();
+        let _ = stream.read_to_string(&mut lease).await;
+        lease
+    });
+
+    let record = attached_box_record(&sock, id)
+        .await
+        .unwrap()
+        .expect("the box's record");
+    let retry = register_again_after_row_ended(&sock, code, Some(&record))
+        .await
+        .expect("the box is registered again");
+    assert!(retry, "the attach retries after the new registration");
+    let lease = host.await.unwrap();
+    assert!(
+        lease.contains(minimald_rpc::REGISTRATION_COMMIT_LINE),
+        "the new row is kept once the daemon stored it: {lease:?}"
+    );
+
+    let record = attached_box_record(&sock, id)
+        .await
+        .unwrap()
+        .expect("the box's record");
+    assert_eq!(record.box_addresses, Some(NEW));
+    assert_eq!(record.box_id, Some(new_box_id));
+    assert!(!record.host_row_bound, "the next launch binds the new row");
+
+    // The retried attach is not refused for the withdrawn row. The harness
+    // daemon starts no sandbox, so what follows is the launch's own end.
+    let (retried, status) = attach_once(&mut daemon, id).await;
+    assert!(
+        !retried.contains("network addresses"),
+        "the retried attach goes past the row check: {retried:?}"
+    );
+    assert_ne!(status, Some(minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS));
+
+    // Any other status registers nothing.
+    assert!(
+        !register_again_after_row_ended(&sock, 0, Some(&record))
+            .await
+            .unwrap()
+    );
+}
