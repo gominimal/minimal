@@ -941,15 +941,6 @@ const KNOWN_GAPS: &[KnownGap] = &[
         issue: "minimal#2033",
     },
     KnownGap {
-        id: "TEL-034",
-        covered_by: "the VM tests \
-                     `the_guest_daemons_records_reach_the_host_spool_and_endpoint_over_vsock` and \
-                     `a_boot_and_stop_share_one_trace_with_the_guest_daemon`, gated \
-                     `MINVMD_E2E=1`, so they run on the VM lane only; lab scenarios 715b, \
-                     715f and 715i to 715l",
-        issue: "minimal#2034",
-    },
-    KnownGap {
         id: "TEL-044",
         covered_by: "each collector's scrub by unit tests \
                      (`a_host_bundle_never_carries_a_header_value_or_a_secret_attribute`, \
@@ -977,11 +968,6 @@ const KNOWN_GAPS: &[KnownGap] = &[
 #[test]
 fn known_gap_tel_009_a_daemon_keeps_its_own_switches() {
     known_gap("TEL-009");
-}
-
-#[test]
-fn known_gap_tel_034_the_guest_path_runs_on_the_vm_lane_only() {
-    known_gap("TEL-034");
 }
 
 #[test]
