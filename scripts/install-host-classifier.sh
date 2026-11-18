@@ -651,7 +651,7 @@ cgroup_level() {
 # run left — never an add-to-it that could leave half a table deciding
 # things — and leaves the previous table standing when it dies.
 #
-# The dstnat chain (priority dstnat, before the filter output chain)
+# The dstnat chain (priority -100, before the filter output chain)
 # retargets the deny subtree's DNS-port lookups onto the answerer's own
 # port: a deny-all box resolves through the carve-out (NET-079)
 # by asking DNS's port like any resolver would, and the one destination
@@ -659,6 +659,14 @@ cgroup_level() {
 # destination address: on a guest the box asks the switch gateway, not the
 # answerer, and the retarget is what steers the lookup onto the listener
 # that answers it.
+#
+# Its priority is spelled as the number, never the name `dstnat` that
+# stands for the same -100: nft before 1.0.9 takes `dstnat` on a
+# prerouting hook only and refuses it on output ("invalid priority
+# expression value in this context"), and that refusal fails the whole
+# transaction, so Debian 12 (1.0.6) and Ubuntu 22.04 (1.0.2) would load no
+# table at all. A number is accepted on every hook by every nft. The
+# postrouting chain's `srcnat` is on the one hook every nft takes it on.
 #
 # The filter output chain runs before the postrouting chain (priority
 # srcnat), so a connection refused on the box's own cgroup is refused
@@ -741,7 +749,7 @@ render_ruleset() {
         ip daddr $answerer_address udp dport $answerer_port accept"
     dstnat_chain="
     chain dstnat {
-        type nat hook output priority dstnat; policy accept;
+        type nat hook output priority -100; policy accept;
         socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" udp dport 53 dnat ip to $answerer_address:$answerer_port
     }"
     cat <<RULES

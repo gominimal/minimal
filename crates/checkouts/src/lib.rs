@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs::{self, File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
@@ -468,6 +469,12 @@ impl Manager {
     pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
         trace!("checkout_of {} at {:?}", remote, at);
 
+        // An option-like remote or ref is refused before anything else: no
+        // lock, no bare directory, no clone or fetch. `Repo` checks again for
+        // its direct callers.
+        repo::refuse_option_like_url(remote)?;
+        repo::refuse_option_like_ref(&at)?;
+
         // A ref already checked out, and an offline miss on an unknown
         // remote, are answered from an unlocked read (`state.json` is
         // replaced atomically): neither touches the cache, so neither waits
@@ -575,6 +582,31 @@ impl Manager {
     }
 }
 
+/// `remote` as an error names it: without userinfo, query or fragment, so a
+/// credential in a remote URL (`https://user:token@host/…`,
+/// `?private_token=…`) never reaches the error's text. The host and path are
+/// kept; they are what makes the error useful. scp-like remotes
+/// (`git@host:org/repo.git`) lose their user the same way; a local path is
+/// returned as given. The same function as on `main`, where the checkout
+/// spans use it too.
+pub(crate) fn scrubbed_remote(remote: &str) -> Cow<'_, str> {
+    let base = remote
+        .find(['?', '#'])
+        .map_or(remote, |at| remote.split_at(at).0);
+    if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            return Cow::Owned(format!("{scheme}://{host}{path}"));
+        }
+    } else if let Some((authority, path)) = base.split_once(':')
+        && !authority.contains('/')
+        && let Some((_, host)) = authority.rsplit_once('@')
+    {
+        return Cow::Owned(format!("{host}:{path}"));
+    }
+    Cow::Borrowed(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +617,39 @@ mod tests {
         assert_eq!(GitRef::Branch("main".to_string()).as_str(), "main");
         assert_eq!(GitRef::Tag("v1.0.0".to_string()).as_str(), "v1.0.0");
         assert_eq!(GitRef::Commit("abc123".to_string()).as_str(), "abc123");
+    }
+
+    #[test]
+    fn an_error_names_a_remote_without_credentials() {
+        for (remote, recorded) in [
+            (
+                "https://github.com/octocat/Spoon-Knife",
+                "https://github.com/octocat/Spoon-Knife",
+            ),
+            (
+                "https://user:ghp_token@github.com/org/private.git",
+                "https://github.com/org/private.git",
+            ),
+            (
+                "https://oauth2:glpat-x@gitlab.internal:8443/team/repo",
+                "https://gitlab.internal:8443/team/repo",
+            ),
+            (
+                "https://git.example/repo.git?private_token=abc#frag",
+                "https://git.example/repo.git",
+            ),
+            ("https://tok@git.example", "https://git.example"),
+            (
+                "ssh://git@git.example:2222/org/repo",
+                "ssh://git.example:2222/org/repo",
+            ),
+            ("git@github.com:org/repo.git", "github.com:org/repo.git"),
+            ("github.com:org/repo.git", "github.com:org/repo.git"),
+            ("/srv/git/repo@v1", "/srv/git/repo@v1"),
+            ("./a@b:c/repo", "./a@b:c/repo"),
+        ] {
+            assert_eq!(scrubbed_remote(remote), recorded, "{remote}");
+        }
     }
 
     #[test]
@@ -705,6 +770,115 @@ mod tests {
             }
             other => panic!("expected OfflineCacheMiss, got: {:?}", other),
         }
+    }
+
+    /// A repository URL or a ref that starts with `-`, or is empty, is
+    /// refused before the lock, the bare directory and any git command; a
+    /// plain local repository still clones.
+    #[test]
+    fn an_option_like_repository_or_ref_is_refused_before_git_runs() {
+        let base = tempfile::tempdir().unwrap();
+        let bares = base.path().join("git").join("db");
+        let bare_count = || std::fs::read_dir(&bares).unwrap().count();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+        let err = handle
+            .checkout_of("--not-a-url", GitRef::Branch("main".into()))
+            .expect_err("an option-like URL is refused");
+        assert!(
+            matches!(
+                err,
+                Error::OptionLike {
+                    what: "repository URL",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let err = handle
+            .checkout_of("", GitRef::Branch("main".into()))
+            .expect_err("an empty URL is refused");
+        assert!(
+            matches!(
+                err,
+                Error::EmptyValue {
+                    what: "repository URL"
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(bare_count(), 0, "a refused URL leaves no bare directory");
+
+        // Nothing is at this remote, so a clone would fail with
+        // `GitCommandFailed`: `OptionLike` shows that none ran.
+        let missing = base.path().join("no-such-repo");
+        let err = handle
+            .checkout_of(
+                missing.to_str().unwrap(),
+                GitRef::Commit("--not-a-ref".into()),
+            )
+            .expect_err("a ref starting with `-` is refused");
+        assert!(
+            matches!(err, Error::OptionLike { what: "ref", .. }),
+            "{err}"
+        );
+        assert_eq!(bare_count(), 0, "a refused ref leaves no bare directory");
+
+        let (src, _) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        handle
+            .checkout_of(&remote, GitRef::Branch("main".into()))
+            .expect("a plain local repository still clones");
+        // The remote is known now. With its source gone a fetch would fail,
+        // so `OptionLike` again shows that none ran.
+        drop(src);
+        let err = handle
+            .checkout_of(&remote, GitRef::Tag("-x".into()))
+            .expect_err("a ref starting with `-` is refused on a known remote");
+        assert!(
+            matches!(err, Error::OptionLike { what: "ref", .. }),
+            "{err}"
+        );
+        assert_eq!(bare_count(), 1);
+    }
+
+    /// A refused option-like URL is named without its userinfo or query, as
+    /// every other error names a remote, in Display and Debug alike.
+    #[test]
+    fn an_option_like_url_is_refused_without_its_credentials() {
+        let remote = "-https://u:ghp_t0ken@git.example/org/repo.git?private_token=q";
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+        let err = handle
+            .checkout_of(remote, GitRef::Branch("main".into()))
+            .expect_err("a URL starting with `-` is refused");
+        assert!(
+            matches!(
+                err,
+                Error::OptionLike {
+                    what: "repository URL",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let Err(direct) = repo::Repo::new(remote, base.path().join("bare")) else {
+            panic!("a URL starting with `-` is refused");
+        };
+        for text in [
+            err.to_string(),
+            format!("{err:?}"),
+            direct.to_string(),
+            format!("{direct:?}"),
+        ] {
+            for secret in ["ghp_t0ken", "private_token", "//u:"] {
+                assert!(!text.contains(secret), "{secret} in an error: {text}");
+            }
+        }
+        assert!(
+            err.to_string()
+                .contains("\"-https://git.example/org/repo.git\""),
+            "the refusal names the scrubbed URL, leading `-` kept: {err}"
+        );
     }
 
     /// Helper: initialise a local git repo with one commit on `branch` and
