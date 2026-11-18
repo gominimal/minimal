@@ -15641,7 +15641,8 @@ echo = "ok"
     );
     let task = crate::task_box_entry(root, "check", true)
         .expect("the task entry expands")
-        .expect("the project declares the task");
+        .expect("the project declares the task")
+        .wire;
     assert_eq!(
         (task.name.as_str(), task.box_type.as_str()),
         ("check", "task")
@@ -15702,7 +15703,8 @@ echo = "ok"
     assert_eq!(legacy_vars, ["EDITOR=vi"]);
     let legacy_task = crate::task_box_entry(legacy_root, "check", true)
         .expect("the legacy project's task entry expands")
-        .expect("the legacy project declares the task");
+        .expect("the legacy project declares the task")
+        .wire;
     let (legacy_task_vars, _) =
         start_from_entry(&mut daemon, "legacy-check", legacy.path(), legacy_task).await;
     assert_eq!(
@@ -22583,6 +22585,190 @@ async fn file_exported_lines(global: &GlobalArgs, target: &str) -> Vec<serde_jso
         .into_iter()
         .filter(|line| line["type"] == "file_exported")
         .collect()
+}
+
+/// The `minimal.toml` of the declared-export tests: task `build` with one
+/// `[[file_exports]]` item, `out/report.txt`, and session entry `dev` with
+/// one, `notes.md`.
+const DECLARED_EXPORTS_FILE: &str = "[tasks.build]\nexec = [\"make\"]\n\n\
+    [[tasks.build.file_exports]]\npath = \"out/report.txt\"\n\n\
+    [sessions.dev]\n\n\
+    [[sessions.dev.file_exports]]\npath = \"notes.md\"\n";
+
+/// The stored spec of a run of `argv`, `min task run build` or `min box run
+/// build`, built as `task::run_entry` builds it: the declared task's spec,
+/// then the expansion's exports from the task entry.
+fn run_spec(project: &std::path::Path, argv: &[&str]) -> serde_json_lenient::Value {
+    let root = camino::Utf8Path::from_path(project).unwrap();
+    let run = parsed_run(argv);
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    let declared = task::declared_task(root, &run.entry).expect("the task is declared");
+    let mut spec = task::task_box_spec(
+        &run.entry,
+        &declared,
+        crate::spec_flags(&request),
+        &run.args,
+    )
+    .expect("a non-interactive task has a spec");
+    let expanded = crate::task_box_entry(root, &run.entry, true)
+        .expect("the task entry expands")
+        .expect("the project declares the task");
+    task::take_expanded_exports(&mut spec, &expanded.spec);
+    crate::put_spec(&mut request, &spec).expect("the spec encodes");
+    request.spec.expect("the run stores a spec")
+}
+
+/// Creates the box of `argv` from [`DECLARED_EXPORTS_FILE`] on a harness
+/// daemon, writes its export in the box, stops the box and waits for it.
+/// Asserts that the wait copies the export into the project and that the
+/// record holds one `file_exported` event.
+async fn assert_run_copies_declared_export(argv: &[&str]) {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        DECLARED_EXPORTS_FILE,
+    )
+    .unwrap();
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+
+    let spec = run_spec(project.path(), argv);
+    assert_eq!(
+        cmd::stored_export_paths(&spec),
+        ["out/report.txt"],
+        "{argv:?}: the stored spec declares the export: {spec}"
+    );
+    let build = create_spec_box(
+        &mut daemon,
+        "build",
+        project.path(),
+        Some(spec),
+        minimald_rpc::CreatingVerb::Task,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        build,
+        &["/workbench/out"],
+        &[("/workbench/out/report.txt", b"all green")],
+    )
+    .await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).unwrap(),
+        &mut Vec::new(),
+        "build",
+        false,
+    )
+    .await
+    .expect("the box stops");
+    cmd::box_wait_on_hosts(
+        local_hosts(&global).unwrap(),
+        "build",
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees the box end");
+    assert_eq!(
+        std::fs::read(project.path().join("out/report.txt")).unwrap(),
+        b"all green",
+        "{argv:?}"
+    );
+    assert_eq!(
+        file_exported_lines(&global, "build").await.len(),
+        1,
+        "{argv:?}"
+    );
+}
+
+// BOX-203, BOX-185: `min task run` stores the task's declared export in the
+// box's spec, so the copy runs when the box ends.
+#[tokio::test]
+async fn task_run_copies_declared_file_exports() {
+    assert_run_copies_declared_export(&["min", "task", "run", "build"]).await;
+}
+
+// BOX-203, BOX-185: `min box run` of a task stores its declared export in
+// the box's spec, so the copy runs when the box ends.
+#[tokio::test]
+async fn box_run_copies_declared_file_exports() {
+    assert_run_copies_declared_export(&["min", "box", "run", "build"]).await;
+}
+
+// BOX-203, BOX-185: `min box start --detach dev` stores the session
+// entry's declared export in the box's spec, and a later `min box wait`
+// copies it when the box ends.
+#[tokio::test]
+async fn box_start_detach_then_wait_copies_declared_file_exports() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        DECLARED_EXPORTS_FILE,
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+
+    // The spec as the start stores it.
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    crate::stamp_session_spec_as(&mut request, root, Some("dev"), None)
+        .expect("the start stores a spec");
+    let spec = request.spec.expect("the start stores a spec");
+    assert_eq!(
+        cmd::stored_export_paths(&spec),
+        ["notes.md"],
+        "the stored spec declares the export: {spec}"
+    );
+    let dev = create_spec_box(
+        &mut daemon,
+        "dev",
+        project.path(),
+        Some(spec),
+        minimald_rpc::CreatingVerb::Session,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        dev,
+        &[],
+        &[("/workbench/notes.md", b"# today")],
+    )
+    .await;
+    cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "dev", false)
+        .await
+        .expect("the box stops");
+    cmd::box_wait_on_hosts(
+        local_hosts(&global).unwrap(),
+        "dev",
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees the box end");
+    assert_eq!(
+        std::fs::read(project.path().join("notes.md")).unwrap(),
+        b"# today"
+    );
+    assert_eq!(file_exported_lines(&global, "dev").await.len(), 1);
 }
 
 /// The sha256 of `bytes`, in lowercase hex.

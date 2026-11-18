@@ -1611,16 +1611,14 @@ mod tests {
             "#,
         )
         .unwrap();
-        let build =
-            BoxSpec::for_task("build", &file.tasks["build"], SpecFlags::default()).unwrap();
+        let build = BoxSpec::for_task("build", &file.tasks["build"], SpecFlags::default()).unwrap();
         let exports = build.file_exports.as_ref().expect("the spec stores them");
         assert_eq!(exports.len(), 1, "{exports:?}");
         assert_eq!(
             crate::expand::file_export_path(&exports[0].0),
             Some("dist/out.txt")
         );
-        let plain =
-            BoxSpec::for_task("plain", &file.tasks["plain"], SpecFlags::default()).unwrap();
+        let plain = BoxSpec::for_task("plain", &file.tasks["plain"], SpecFlags::default()).unwrap();
         assert_eq!(plain.file_exports, None);
     }
 

@@ -108,6 +108,19 @@ pub(crate) fn task_box_spec(
     Some(spec)
 }
 
+/// Puts the `[[file_exports]]` items of the task entry's expansion,
+/// `expanded`, on the task box's `spec` (BOX-203). The expansion holds the
+/// items of `[defaults]` and the task's type too, so the command that waits
+/// for the box copies each of them when the box ends.
+pub(crate) fn take_expanded_exports(spec: &mut mfile::spec::BoxSpec, expanded: &toml::Table) {
+    spec.file_exports = mfile::expand::stored_file_exports(expanded);
+    tracing::debug!(
+        entry = %spec.entry,
+        exports = spec.file_exports.as_ref().map_or(0, Vec::len),
+        "put the expanded task entry's file exports on the box spec"
+    );
+}
+
 /// The network a run gives task `task`'s box (NET-060), from
 /// [`task_box_network`].
 #[derive(Debug)]
@@ -1557,7 +1570,7 @@ pub(crate) async fn run_entry(
     // channel. The box is marked at create, so a daemon restart before its
     // task starts destroys it rather than resuming it (NET-131). The daemon
     // clears the mark when the task box's entrypoint starts.
-    let spec = task_box_spec(
+    let mut spec = task_box_spec(
         &args.entry,
         &declared,
         crate::spec_flags(&request),
@@ -1616,11 +1629,16 @@ pub(crate) async fn run_entry(
     // daemon composes the project's part of the box from it. One span
     // covers the expansion and the compose call that sends it.
     let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
-    contribution.entry = entry_span
-        .in_scope(|| {
-            crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
-        })?
-        .map(Box::new);
+    let expanded = entry_span.in_scope(|| {
+        crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
+    })?;
+    // BOX-203: the stored spec takes the expansion's exports, so the
+    // command that waits for the box copies them when it ends.
+    if let (Some(spec), Some(expanded)) = (spec.as_mut(), expanded.as_ref()) {
+        take_expanded_exports(spec, &expanded.spec);
+        crate::put_spec(&mut request, spec)?;
+    }
+    contribution.entry = expanded.map(|expanded| Box::new(expanded.wire));
     // Sent only for a task that declares `inherit_cwd`; any other task
     // starts at the root of the uploaded tree.
     let task_cwd = if declared.inherit_cwd {
