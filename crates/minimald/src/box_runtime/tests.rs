@@ -1211,6 +1211,60 @@ fn only_a_kill_through_the_handle_marks_the_exit_as_requested() {
     );
 }
 
+/// A process an outside SIGKILL already ended, but that nobody has reaped,
+/// still accepts a kill(2). A kill through the handle then finds the exit
+/// first, records it as unrequested and sends nothing, so the exit stays a
+/// warning rather than reading as one the daemon asked for.
+#[test]
+fn a_kill_after_an_unreaped_outside_kill_leaves_the_exit_unrequested() {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("failed to spawn sleep");
+    let mut process = MockProcess::new(MockBackend { child });
+    let pid = libc::pid_t::try_from(process.container_pid()).expect("pid fits in pid_t");
+    // SAFETY: `kill` takes plain integers; `pid` is the child this test
+    // spawned, which has not been reaped yet.
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(rc, 0, "failed to SIGKILL the child");
+
+    // Wait for the death without reaping it (`WNOWAIT`), so the child is a
+    // zombie when the handle's kill runs: the state the kill must not mistake
+    // for a live process.
+    // SAFETY: `siginfo_t` is a plain C struct, valid when all zeros.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live `siginfo_t` the call writes through, and `pid`
+    // is this test's own unreaped child.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            libc::id_t::try_from(pid).expect("pid fits in id_t"),
+            &raw mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "failed to wait for the child's death");
+    assert!(
+        process.exit_reason().is_none(),
+        "the death is not reaped yet"
+    );
+
+    process.kill().expect("a kill through the handle");
+    assert!(!process.killed, "a process already ended was not killed");
+    let reason = process
+        .exit_reason()
+        .expect("the kill reaps an exit it finds");
+    assert!(
+        reason.is_abnormal(),
+        "a SIGKILL is an abnormal end: {reason:?}"
+    );
+    process.wait().expect("the reap returns the cached status");
+    assert_eq!(
+        exit_log_level(&reason, process.killed),
+        tracing::Level::WARN
+    );
+}
+
 /// Precedence: the launcher `baseline` sits below the client-forwarded
 /// `inherited`, which sits below the composition, which sits below the
 /// per-connection `connection` facts. Later layers win on a shared key;

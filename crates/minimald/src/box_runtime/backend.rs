@@ -104,7 +104,7 @@ pub(crate) trait ProcessBackend: Send + 'static {
 /// process, which then reaps as `container received signal SIGKILL` with
 /// code 125, the same account an out-of-memory kill or any other outside
 /// SIGKILL gives. So the reason cannot tell them apart, and the decision rests
-/// on `killed`, which is set only when [`BoxProcess::kill`] succeeded. An
+/// on `killed`, which is set only when [`BoxProcess::kill`] sent the kill. An
 /// exit the process made on its own (`exit_code` is `Some`) stays a warning
 /// even then: it ended before the kill could reach it.
 pub(super) fn exit_log_level(reason: &ExitReason, killed: bool) -> tracing::Level {
@@ -126,7 +126,8 @@ pub(crate) struct HostProcess<B: ProcessBackend> {
     /// The reason captured at the reap; `None` until then.
     exit: Option<ExitReason>,
     /// Whether the daemon killed the process: set when [`BoxProcess::kill`]
-    /// succeeds, and read when the exit is logged (see [`exit_log_level`]).
+    /// sends the kill to a process not yet seen to exit, and read when the
+    /// exit is logged (see [`exit_log_level`]).
     pub(super) killed: bool,
 }
 
@@ -170,6 +171,22 @@ impl<B: ProcessBackend> BoxProcess for HostProcess<B> {
     }
 
     fn kill(&mut self) -> io::Result<()> {
+        // A process that has already ended, on its own or by an outside
+        // SIGKILL such as an out-of-memory kill, stays a zombie until it is
+        // reaped, and kill(2) on a zombie succeeds. Marking `killed` then
+        // would log that exit as one the daemon asked for. So reap without
+        // blocking first: an exit seen here is recorded as unrequested, and
+        // no kill is sent, since a signal to an ended process does nothing.
+        // A failed check falls through to the kill, as before it existed.
+        //
+        // The check and the kill are not atomic. A process that ends between
+        // them is still marked `killed`, and its exit logs at debug. Closing
+        // that window would need the kernel to say who sent the SIGKILL, which
+        // the reap does not report.
+        if let Ok(Some(report)) = self.backend.try_wait() {
+            self.record_exit(report);
+            return Ok(());
+        }
         self.backend.kill()?;
         self.killed = true;
         Ok(())
