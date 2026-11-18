@@ -1293,11 +1293,12 @@ impl File {
 
     /// Loads the minimal file from `dir` as the package graph reads a
     /// layer: [`Self::from_dir`] without the interactive-task refusal
-    /// (BOX-054). The graph reads only a layer's `[upstream]`, `[params]`
-    /// and `[stdlib]`, and never runs its tasks. An upstream package
-    /// repository can still declare `interactive = true` tasks, and the
-    /// user cannot fix that file. The project's own file gets the refusal
-    /// when it loads through [`Self::from_dir`].
+    /// (BOX-054) and without the refusal of a `state_key` that is not one
+    /// directory name. The graph reads only a layer's `[upstream]`,
+    /// `[params]` and `[stdlib]`, and never runs its tasks. An upstream
+    /// package repository can still declare `interactive = true` tasks or
+    /// such a key, and the user cannot fix that file. The project's own file
+    /// gets both refusals when it loads through [`Self::from_dir`].
     pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
         Self::load_dir(dir.as_ref(), TaskCheck::Skip)
     }
@@ -2352,8 +2353,10 @@ impl File {
             Err("it contains '/'".to_string())
         } else if component.contains('\0') {
             Err("it contains a NUL byte".to_string())
-        } else if component == "." || component == ".." {
-            Err(format!("it is {component:?}"))
+        } else if component == "." {
+            Err("it names the current directory".to_string())
+        } else if component == ".." {
+            Err("it names the parent directory".to_string())
         } else {
             Ok(())
         }
@@ -3710,7 +3713,7 @@ mod tests {
             Path::new("/home/user/project"),
         )
         .unwrap_err();
-        assert_eq!(err, "it is \"..\"");
+        assert_eq!(err, "it names the parent directory");
     }
 
     /// A state directory replaced by a symlink pointing outside the state
@@ -4275,6 +4278,30 @@ mod tests {
         assert!(msg.contains("\"../up\""), "{msg}");
         let file = load("dev").expect("a plain default key loads");
         assert_eq!(file.defaults.state_key.as_deref(), Some("dev"));
+    }
+
+    /// For `.` and `..` the refusal says what the key names, so the value is
+    /// not printed a second time as its own reason.
+    #[test]
+    fn a_dot_state_key_is_refused_with_what_it_names() {
+        let dir = tempdir().unwrap();
+        for (key, names) in [(".", "the current"), ("..", "the parent")] {
+            std::fs::write(
+                dir.path().join(MFILE_NAME),
+                format!("[tasks.build]\nexec = \"true\"\nstate_key = {key:?}\n"),
+            )
+            .unwrap();
+            let err = File::from_dir(dir.path()).expect_err(key);
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`[tasks.build]` in minimal.toml sets `state_key` to {key:?}, and it names \
+                     {names} directory. A state key is one directory name, such as \"dev\": not \
+                     `.` or `..`, and with no `/` or NUL byte."
+                )
+            );
+        }
     }
 
     /// The package graph reads an upstream layer without the state-key check:
