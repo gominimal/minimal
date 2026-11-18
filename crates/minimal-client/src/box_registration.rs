@@ -648,6 +648,101 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
     }
 }
 
+/// Registers the session's box with the VM host daemon again, after an
+/// attach ended because that daemon withdrew the box's row (NET-138,
+/// [`minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS`]), and hands the new
+/// registration to the in-VM daemon behind `ssh_sock`
+/// ([`minimald_rpc::RegisterBoxAgain`]). Returns whether the in-VM daemon
+/// stored it, so the caller retries the attach.
+///
+/// The registration is the one an activation makes, with the record's
+/// name, network and policy ([`register_box_beside`], the same exchange
+/// [`register_box_for_activation`] makes), and it is a new creation with a
+/// new box id. Its lease is committed only once the in-VM daemon stored
+/// the new facts. Otherwise the lease drops, and the VM host daemon
+/// withdraws the new row on the close.
+///
+/// `Ok(false)`, with nothing registered, for a record with no name or no
+/// box row, for a host that is not VM-backed, and when the old row did not
+/// end: a live row holds the name, or the in-VM daemon answers
+/// [`minimald_rpc::RegisterBoxAgainResponse::RowStands`]. That is the
+/// case of a shell that exited with the row-ended status by itself.
+///
+/// # Errors
+///
+/// The registration's own failure, as an activation reports it, and an
+/// in-VM daemon that cannot be asked or refuses the new facts.
+pub async fn register_box_again(ssh_sock: &Path, record: &boxes::Record) -> anyhow::Result<bool> {
+    let (Some(name), Some(_)) = (record.name.as_deref(), record.box_addresses) else {
+        return Ok(false);
+    };
+    let registered = match register_box_beside(ssh_sock, record.network, name, &record.policy).await
+    {
+        Ok(Some(registered)) => registered,
+        Ok(None) => return Ok(false),
+        Err(error) if error.downcast_ref::<NameAlreadyHeld>().is_some() => {
+            tracing::info!(
+                box = %name,
+                error = %format!("{error:#}"),
+                "a live row holds the box's name, so its row did not end; \
+                 the box is not registered again"
+            );
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(box_addresses) = registered.row_addresses() else {
+        return Ok(false);
+    };
+    let request = minimald_rpc::RegisterBoxAgainRequest {
+        id: record.id,
+        box_addresses,
+        task_addresses: registered.task_addresses.clone(),
+        box_id: registered.box_id,
+    };
+    let answer = tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
+        let mut client = crate::Client::connect(ssh_sock)
+            .await
+            .context("connecting to the box's daemon to hand it the box's new registration")?;
+        client
+            .oneshot_rpc::<minimald_rpc::RegisterBoxAgain>(request)
+            .await
+            .context("RegisterBoxAgain RPC failed")
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "the box's daemon did not take the box's new registration within \
+             {BOX_CONTROL_TIMEOUT:?}"
+        )
+    })??;
+    match answer {
+        minimald_rpc::Errorable::Ok(minimald_rpc::RegisterBoxAgainResponse::Registered) => {
+            if let Some(lease) = registered.lease {
+                lease.commit().await;
+            }
+            tracing::info!(
+                box = %name,
+                switch_address = %box_addresses.switch_address,
+                box_id = %registered.box_id.map(|id| id.to_string()).unwrap_or_default(),
+                "registered the box again after its host row ended"
+            );
+            Ok(true)
+        }
+        minimald_rpc::Errorable::Ok(minimald_rpc::RegisterBoxAgainResponse::RowStands) => {
+            tracing::info!(
+                box = %name,
+                "the box's daemon says its host row did not end; the new registration \
+                 is dropped"
+            );
+            Ok(false)
+        }
+        minimald_rpc::Errorable::Err { error } => Err(anyhow::anyhow!(
+            "the box's daemon refused the box's new registration: {error}"
+        )),
+    }
+}
+
 /// Registers this activation's box with the VM host daemon, when the daemon
 /// this invocation talks to is minvmd-backed (T66), returning what it handed
 /// back — `Ok(None)` when there is nothing to register.
@@ -1418,5 +1513,111 @@ mod tests {
                 "{reply:?}"
             );
         }
+    }
+
+    /// A stand-in VM host daemon at `local-minvmd0/control.sock` under
+    /// `dir`. It answers one registration with `reply`, then reads the
+    /// lease connection to its close and returns what the client wrote on
+    /// it. The ssh socket beside it is returned too, and nothing serves it.
+    fn stand_in_vm_host(
+        dir: &tempfile::TempDir,
+        reply: minimald_rpc::BoxControlReply,
+    ) -> (PathBuf, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(host_dir.join(crate::attach::VM_HOST_CONTROL_SOCK_FILE))
+                .unwrap();
+        let line = serde_json_lenient::to_string(&reply).unwrap();
+        let host = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            stream.read_line(&mut request).await.unwrap();
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(request.trim()).unwrap();
+            assert!(
+                matches!(&request, minimald_rpc::BoxControlRequest::Register(r) if r.name == "web"),
+                "the client registers the box under its record's name: {request:?}"
+            );
+            stream
+                .get_mut()
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut rest = String::new();
+            let _ = stream.read_to_string(&mut rest).await;
+            rest
+        });
+        (host_dir.join(paths::SSH_SOCK_FILE), host)
+    }
+
+    /// A record with no box row, and a host that is not VM-backed, register
+    /// nothing again: there is no row that could have ended.
+    #[tokio::test]
+    async fn register_box_again_registers_nothing_without_a_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let native = dir.path().join("providers").join("local-minimald0");
+        std::fs::create_dir_all(&native).unwrap();
+        let ssh_sock = native.join(paths::SSH_SOCK_FILE);
+        let mut rowless = own_ip_record(PAIR);
+        rowless.box_addresses = None;
+        assert!(!register_box_again(&ssh_sock, &rowless).await.unwrap());
+        assert!(
+            !register_box_again(&ssh_sock, &own_ip_record(PAIR))
+                .await
+                .unwrap(),
+            "a native host has no VM host daemon to register with"
+        );
+    }
+
+    /// A live row that holds the box's name is a row that did not end: the
+    /// box is not registered again, and the attach's status stands. This is
+    /// a shell that exited with the row-ended status by itself.
+    #[tokio::test]
+    async fn register_box_again_keeps_a_row_that_did_not_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (ssh_sock, host) = stand_in_vm_host(
+            &dir,
+            minimald_rpc::BoxControlReply::Error {
+                error: "a box named web already exists".to_string(),
+            },
+        );
+        let again = register_box_again(&ssh_sock, &own_ip_record(PAIR))
+            .await
+            .expect("a held name is not an error here");
+        assert!(!again, "nothing is registered again");
+        host.await.unwrap();
+    }
+
+    /// The new registration's lease is committed only once the box's daemon
+    /// stored the new facts. A daemon that cannot be reached fails the
+    /// re-registration, and the lease closes uncommitted, so the VM host
+    /// daemon withdraws the new row.
+    #[tokio::test]
+    async fn register_box_again_drops_the_new_row_the_daemon_did_not_take() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (ssh_sock, host) = stand_in_vm_host(
+            &dir,
+            minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 3),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 1),
+                box_id: minimald_rpc::BoxId::from_bytes([9; 16]),
+                task_addresses: Vec::new(),
+            }),
+        );
+        let error = register_box_again(&ssh_sock, &own_ip_record(PAIR))
+            .await
+            .expect_err("no daemon serves the ssh socket");
+        assert!(
+            format!("{error:#}").contains("the box's daemon"),
+            "{error:#}"
+        );
+        let written = host.await.unwrap();
+        assert!(
+            !written.contains(minimald_rpc::REGISTRATION_COMMIT_LINE),
+            "the lease closes uncommitted: {written:?}"
+        );
     }
 }
