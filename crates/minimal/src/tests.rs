@@ -11207,6 +11207,78 @@ async fn attach_ended_from_other_side_notice_exit254() {
     );
 }
 
+/// BCLI-068: `min box restart` of a box that runs ends its attach with 254
+/// and a line that names the restart. The box runs again afterwards, as it
+/// does after another terminal takes it, so its count of ends decides. A
+/// count that rose is a restart. A count that did not rise, or that the
+/// host did not give, keeps the line for another terminal.
+#[test]
+fn attach_ended_by_restart_names_restart_exit254() {
+    use cmd::{EndsBefore, box_attach_ending, ends_show_restart};
+
+    assert!(ends_show_restart(EndsBefore::Running(Some(1)), Some(2)));
+    assert!(!ends_show_restart(EndsBefore::Running(Some(1)), Some(1)));
+    assert!(!ends_show_restart(EndsBefore::Running(Some(1)), None));
+    assert!(!ends_show_restart(EndsBefore::Running(None), Some(2)));
+    assert!(!ends_show_restart(EndsBefore::Unread, Some(2)));
+    assert!(!ends_show_restart(EndsBefore::Ended(1), Some(2)));
+
+    let target = ending_target("local0");
+    let running = BoxAfterAttach::Listed(ending_entry("running"));
+    let ending = |before: EndsBefore, after: Option<u64>| {
+        box_attach_ending(&target, 254, &running, ends_show_restart(before, after))
+            .expect("an ending")
+    };
+    assert_eq!(
+        ending(EndsBefore::Running(Some(0)), Some(1)),
+        AttachEnding {
+            code: 254,
+            notice: Some(
+                "Detached: web was restarted. Run min box attach web to attach again.".to_owned()
+            ),
+        },
+        "a count of ends that rose is a restart"
+    );
+    let takeover = AttachEnding {
+        code: 254,
+        notice: Some("Detached: another terminal attached to web.".to_owned()),
+    };
+    assert_eq!(
+        ending(EndsBefore::Running(Some(1)), Some(1)),
+        takeover,
+        "a count of ends that did not rise is another terminal"
+    );
+    assert_eq!(
+        ending(EndsBefore::Running(None), Some(1)),
+        takeover,
+        "an unread count proves no restart"
+    );
+    assert_eq!(
+        ending(EndsBefore::Running(Some(0)), None),
+        takeover,
+        "an unread count proves no restart"
+    );
+
+    // A restart flag never changes an ending that is not a 254 against a
+    // box that runs.
+    let mut stopped = ending_entry("stopped");
+    stopped.reason = Some("stopped".to_owned());
+    assert_eq!(
+        box_attach_ending(&target, 254, &BoxAfterAttach::Listed(stopped), true),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was stopped.".to_owned())
+        })
+    );
+    assert_eq!(
+        box_attach_ending(&target, 0, &running, true),
+        Ok(AttachEnding {
+            code: 0,
+            notice: None
+        })
+    );
+}
+
 /// BCLI-068: the daemon closes the attach's channel before it writes the
 /// stopped record, so the first read after the attach still sees the box
 /// running. The command reads again until the record says why, and a stop
@@ -22375,7 +22447,7 @@ async fn resumed_box_copies_at_next_end_only() {
     // A count of ends that the host did not give is no new end, so the
     // attach leaves the end it resumed from unclaimed.
     use cmd::{EndsBefore, ends_show_new_end};
-    assert!(ends_show_new_end(EndsBefore::Running, None));
+    assert!(ends_show_new_end(EndsBefore::Running(None), None));
     assert!(ends_show_new_end(EndsBefore::Ended(1), Some(2)));
     assert!(!ends_show_new_end(EndsBefore::Ended(1), Some(1)));
     assert!(!ends_show_new_end(EndsBefore::Ended(1), None));
