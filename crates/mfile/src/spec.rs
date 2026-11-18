@@ -692,19 +692,34 @@ kept_fields!(DocInstall, "install", [raw_packages]);
 /// [`boxes::IngressPolicy`] shape, and `credentialed_upstream` is declared
 /// here. #2410 ends the interim.
 ///
-/// The other keys of [`NETWORK_KEYS`] are kept as they were written.
+/// The other keys of [`NETWORK_KEYS`] are kept as they were written,
+/// except the flat egress keys. Canonicalisation moves each one to its
+/// nested `egress.*` key before a spec is stored, and a resume reads only
+/// the policy. So a stored flat key is refused, never kept: a kept deny
+/// that no resume applies is a deny the box runs without.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DocNetwork {
     #[serde(with = "mode_word")]
     mode: boxes::NetworkMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dynamic_ingress: Option<StoredExport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    egress_allow_dns: Option<StoredExport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    egress_allow_subnets: Option<StoredExport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    egress_deny_subnets: Option<StoredExport>,
+    #[serde(default, skip_serializing, deserialize_with = "refuse_flat_allow_dns")]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_allow_dns: Option<()>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "refuse_flat_allow_subnets"
+    )]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_allow_subnets: Option<()>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "refuse_flat_deny_subnets"
+    )]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_deny_subnets: Option<()>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vpn_network_names: Option<StoredExport>,
     #[serde(flatten)]
@@ -716,15 +731,37 @@ struct DocNetwork {
 kept_fields!(
     DocNetwork,
     "network",
-    [
-        dynamic_ingress,
-        egress_allow_dns,
-        egress_allow_subnets,
-        egress_deny_subnets,
-        vpn_network_names,
-        bep,
-    ]
+    [dynamic_ingress, vpn_network_names, bep,]
 );
+
+/// Refuses the flat `[network]` egress key `flat` in a stored spec, and
+/// names the nested `egress.*` key that a stored spec carries in its place.
+fn refuse_flat_egress<E: serde::de::Error>(flat: &str) -> E {
+    let nested = crate::network::FLAT_EGRESS_KEYS
+        .iter()
+        .find(|(key, _)| *key == flat)
+        .map_or(flat, |(_, nested)| nested);
+    E::custom(format!(
+        "a stored spec does not carry `network.{flat}`. \
+         Write it as `network.egress.{nested}`."
+    ))
+}
+
+fn refuse_flat_allow_dns<'de, D: serde::Deserializer<'de>>(_: D) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_allow_dns"))
+}
+
+fn refuse_flat_allow_subnets<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_allow_subnets"))
+}
+
+fn refuse_flat_deny_subnets<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_deny_subnets"))
+}
 
 /// The `mode` key in its spec word, [`boxes::NetworkMode::word`], not the
 /// mode's serde form. `NetworkMode` is `#[non_exhaustive]`, so a match on it
@@ -1401,6 +1438,15 @@ mod tests {
                 .as_table_mut()
                 .unwrap();
             for (key, shape) in *keys {
+                // A stored spec never carries a flat egress key. The test
+                // below checks that a read refuses one.
+                if *section == "network"
+                    && crate::network::FLAT_EGRESS_KEYS
+                        .iter()
+                        .any(|(flat, _)| flat == key)
+                {
+                    continue;
+                }
                 // A sample does not replace a key that the typed spec
                 // wrote, such as `mode`.
                 table
@@ -1447,6 +1493,20 @@ mod tests {
         duration["execution"]["timeout"] = "2m".into();
         let read: BoxSpec = duration.try_into().unwrap();
         assert_eq!(read.timeout, Some(120));
+
+        // A flat egress key is refused, and the error names its nested key.
+        for (flat, nested) in crate::network::FLAT_EGRESS_KEYS {
+            let mut legacy = stored.clone();
+            legacy["network"].as_table_mut().unwrap().insert(
+                flat.to_owned(),
+                vec![toml::Value::from("10.0.0.0/8")].into(),
+            );
+            let refused = legacy.try_into::<BoxSpec>().unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("network.egress.{nested}")),
+                "{flat}: {refused}"
+            );
+        }
 
         // A key that no schema of a spec names is still refused. The
         // `[network]` table flattens the policy in, so it does not refuse
