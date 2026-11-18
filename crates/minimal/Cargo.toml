@@ -89,6 +89,7 @@ tracing-subscriber.workspace = true
 # Parsing the diag portal's endpoint to check its scheme before an
 # upload or delete puts a bundle or delete token on the wire.
 url.workspace = true
+uuid.workspace = true
 version.workspace = true
 
 # default-features = false drops minvmd's `libkrun` feature: the CLI only uses
