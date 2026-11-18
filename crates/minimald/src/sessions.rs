@@ -3211,6 +3211,66 @@ pub(crate) mod tests {
         );
     }
 
+    /// inbox#1245: the scaffold writes the default `minimal.toml` beneath
+    /// the box's workspace. A dangling link at `minimal.toml` reads as a
+    /// missing file, so the scaffold runs, and it refuses the link rather
+    /// than following it: nothing is created at the link's target outside
+    /// the workspace and the link is left as it was. `build_context` runs
+    /// the same scaffold on an attach or a relaunch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scaffold_refuses_a_dangling_minimal_toml_link() {
+        let (_state, _cache, mngr) = manager().await;
+        let config = |name: &str| minimald_rpc::SessionConfig {
+            name: Some(name.to_string()),
+            ..sample_config()
+        };
+
+        // Control: an empty workspace gets the scaffold, a regular file.
+        let plain = mngr
+            .create_session(config("scaffold-plain"), None)
+            .await
+            .unwrap();
+        session(&mngr, plain)
+            .await
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect("an empty workspace is scaffolded");
+        let plain_paths = session(&mngr, plain).await.paths().await.unwrap();
+        let scaffolded = plain_paths.working.as_utf8_path().join(mfile::MFILE_NAME);
+        assert!(
+            std::fs::symlink_metadata(&scaffolded).unwrap().is_file(),
+            "the scaffold is a regular file"
+        );
+
+        let id = mngr
+            .create_session(config("scaffold-link"), None)
+            .await
+            .unwrap();
+        let paths = session(&mngr, id).await.paths().await.unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("planted.toml");
+        let link = paths.working.as_utf8_path().join(mfile::MFILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = session(&mngr, id)
+            .await
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect_err("a scaffold through a dangling link is refused");
+
+        // An absolute link leads out (`openat2`), or, where every link is
+        // refused, is a link; a dangling one inside would not exist.
+        let text = err.to_string();
+        assert!(
+            text.contains("leads outside its workspace")
+                || text.contains("cannot follow a link here")
+                || text.contains("does not exist"),
+            "error: {text}"
+        );
+        assert!(!target.exists(), "the scaffold created the link's target");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    }
+
     /// A `[session]` block that contributes a package is picked up
     /// by [`ProjectComposable`] and lands in the composition. With
     /// the non-empty-composition guard gone, the record now
@@ -3258,7 +3318,7 @@ pub(crate) mod tests {
 
     /// Writes `pkg` as a package of the session's own workspace layer, so its
     /// graph resolves the name with no upstream layer (and no network) in play.
-    async fn seed_workspace_package(mngr: &ManagerHandle, id: SessionId, pkg: &str) {
+    pub(crate) async fn seed_workspace_package(mngr: &ManagerHandle, id: SessionId, pkg: &str) {
         let paths = session(mngr, id).await.paths().await.unwrap();
         let dir = paths.working.as_utf8_path().join("packages").join(pkg);
         tokio::fs::create_dir_all(&dir).await.unwrap();
