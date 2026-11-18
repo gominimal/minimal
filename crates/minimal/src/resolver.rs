@@ -1781,8 +1781,15 @@ pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> Answerer
             // ship a new program that speaks the same protocol, so the copy
             // is compared with the shipped bytes, and a job that keeps
             // exiting is reinstalled too.
+            //
+            // A shared service's program is its package's, and the copy
+            // this `min` would ship is one user's: another release beside
+            // the package (a curl install on the same Mac) differs by
+            // design, and no step replaces the shared service with it.
             Some(_) => match (&facts.installed_sha256, &facts.shipped_sha256) {
-                (Some(installed), Some(shipped)) if installed != shipped => {
+                (Some(installed), Some(shipped))
+                    if installed != shipped && facts.shared.is_none() =>
+                {
                     AnswererStep::CopyDiffers
                 }
                 _ if facts.job == AnswererJob::NotRunning => AnswererStep::NotRunning,
@@ -2083,8 +2090,8 @@ fn refuse_outside_the_group(
 }
 
 /// `step`, unless it would carry the copy over a shared service: a
-/// custody check failed or the protocol differs, and the step's install
-/// would replace the service of everyone the group admits with one
+/// custody check failed, the protocol differs or its job does not run, and
+/// the step's install would replace the service of everyone the group admits with one
 /// user's own. Then the step is unavailable, and the reason names what
 /// repairs the shared service instead: the package that installed it.
 /// An installed, absent or already-unavailable step stays as it is.
@@ -2106,6 +2113,10 @@ fn refuse_replacing_the_shared(step: AnswererStep, shared: &SharedService) -> An
             ),
         },
         AnswererStep::CustodyFailed { failed_check } => failed_check.clone(),
+        AnswererStep::NotRunning => "its job is loaded and its program is not running".to_string(),
+        AnswererStep::CopyDiffers => {
+            "its program is not the copy this min would install".to_string()
+        }
         other => format!("it is {other:?}"),
     };
     AnswererStep::SourceUnavailable {
@@ -11418,6 +11429,23 @@ resolvectl domain minzone0 '~min.internal'
             AnswererStep::Installed,
             "the group's 0660 socket, owned by the service account, holds"
         );
+        // The copy this `min` would ship is one user's (a curl install
+        // beside the package): that it differs from the shared service's
+        // program says nothing against the service. A job that keeps
+        // exiting is still read, and refused with words below.
+        let mut beside = shared(Some(310));
+        beside.installed_sha256 = Some("a".repeat(64));
+        beside.shipped_sha256 = Some("b".repeat(64));
+        assert_eq!(
+            answerer_step_over(&beside, daemon),
+            AnswererStep::Installed,
+            "another release's copy beside a shared service is no stale service"
+        );
+        beside.job = AnswererJob::NotRunning;
+        assert_eq!(
+            answerer_step_over(&beside, daemon),
+            AnswererStep::NotRunning
+        );
         let failed = |facts: &AnswererFacts| match answerer_step_over(facts, daemon) {
             AnswererStep::CustodyFailed { failed_check } => failed_check,
             other => panic!("expected a failed check, got {other:?}"),
@@ -11456,6 +11484,7 @@ resolvectl domain minzone0 '~min.internal'
             AnswererStep::CustodyFailed {
                 failed_check: "its channel socket is mode 600".to_string(),
             },
+            AnswererStep::NotRunning,
         ] {
             let refused = refuse_replacing_the_shared(step.clone(), &service);
             match &refused {
@@ -11479,6 +11508,9 @@ resolvectl domain minzone0 '~min.internal'
                             }),
                             "{reason}"
                         );
+                    }
+                    if step == AnswererStep::NotRunning {
+                        assert!(reason.contains("its program is not running"), "{reason}");
                     }
                 }
                 other => panic!("a shared service's step is never carried: {other:?}"),
