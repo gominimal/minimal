@@ -2725,6 +2725,10 @@ impl<C: Channel> Sandbox<C> {
                 None => None,
                 Some(Ok(held)) => Some(held),
                 Some(Err(e)) => {
+                    // No attach adopts the tap descriptor now, and a
+                    // `hakoniwa::Child` never closes it: adopt it here so
+                    // it closes with this.
+                    drop(network::Spawned::from_child(&mut child));
                     // The process may have exited already: the reap below
                     // runs whatever the kill answers.
                     if let Err(error) = child.kill() {

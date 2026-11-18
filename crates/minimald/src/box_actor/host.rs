@@ -2218,14 +2218,10 @@ pub(crate) async fn stop_task_containers(
     forced: &std::sync::atomic::AtomicBool,
 ) -> box_runtime::TaskStop {
     let stop = box_runtime::begin_task_stop(box_id);
-    let supervisors = box_runtime::take_task_containers(box_id);
-    if supervisors.is_empty() {
+    let containers = box_runtime::take_task_containers(box_id);
+    if containers.is_empty() {
         return stop;
     }
-    let containers: Vec<box_runtime::BoxProcesses> = supervisors
-        .into_iter()
-        .map(box_runtime::BoxProcesses::of_container)
-        .collect();
     let signal = |signal: i32| {
         let reached: usize = containers.iter().map(|c| c.signal(signal)).sum();
         tracing::info!(

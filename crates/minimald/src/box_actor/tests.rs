@@ -15815,6 +15815,51 @@ async fn stop_ends_the_task_containers_without_waiting_out_a_lasting_entrypoint(
     entrypoint.await.unwrap().unwrap();
 }
 
+/// BOX-013: a task container reaped before the stop signals it gets no
+/// signal, even when the kernel gave its pid to another child of the daemon.
+/// The record's pidfd pins the reaped process, so neither the stop's SIGTERM
+/// nor its SIGKILL escalation reaches the process that holds the pid now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reaped_task_container_gets_no_signal_through_a_reused_pid() {
+    let box_id = SessionId::mint();
+    // The container that ran the task: pinned, then reaped.
+    let mut reaped = spawn_stand_in_box("trap '' TERM");
+    let pidfd = crate::box_runtime::pidfd_open(reaped.id()).expect("pin the task container");
+    reaped.kill().unwrap();
+    reaped.wait().unwrap();
+    // Another child of the daemon, standing in for the process the kernel
+    // gave the reaped pid to: the record names its pid. A SIGTERM would end
+    // it with 0, a SIGKILL by signal.
+    let mut holder = spawn_stand_in_box("trap 'exit 0' TERM");
+    let _reaped_record =
+        crate::box_runtime::record_task_container_pinned_to(box_id, holder.id(), pidfd).unwrap();
+    // A live task container that ignores TERM, so the stop sends both its
+    // SIGTERM and its SIGKILL escalation.
+    let live = spawn_stand_in_box("trap '' TERM");
+    let _live_record = crate::box_runtime::record_task_container(box_id, live.id()).unwrap();
+    let entrypoint = stand_in_entrypoint(live);
+
+    let _stop = super::stop_task_containers(
+        box_id,
+        &entrypoint,
+        false,
+        Duration::from_millis(300),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert_eq!(
+        entrypoint.await.unwrap().unwrap().code,
+        125,
+        "the live task container got the SIGKILL escalation"
+    );
+    assert!(
+        holder.try_wait().unwrap().is_none(),
+        "the process holding the reaped container's pid got no signal"
+    );
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
 /// BOX-013: once a stop of a box has started, the box records no new task
 /// container until that stop ends. A later invocation of a multi-invocation
 /// task, spawned after the stop took the box's containers, is refused, so
@@ -15856,7 +15901,10 @@ async fn a_stopping_box_records_no_new_task_container() {
     let other = SessionId::mint();
     let other_record = crate::box_runtime::record_task_container(other, 4_000_002).unwrap();
     assert_eq!(
-        crate::box_runtime::take_task_containers(other),
+        crate::box_runtime::take_task_containers(other)
+            .iter()
+            .map(crate::box_runtime::TaskContainer::supervisor)
+            .collect::<Vec<_>>(),
         vec![4_000_002],
         "only the stopping box refuses"
     );
