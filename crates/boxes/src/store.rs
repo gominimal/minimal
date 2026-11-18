@@ -1096,8 +1096,9 @@ const INDEX_FORMAT_VERSION: u32 = 1;
 /// alias that many retained records can share (BOX-004).
 ///
 /// On disk the index also carries `format_version` and a `name_to_id`
-/// map. Builds before 0.8 require `name_to_id` and ignore unknown keys,
-/// so a store this build writes stays readable by them. This build
+/// map that is always empty. Builds before 0.8 require `name_to_id` and
+/// ignore unknown keys, so a store this build writes stays readable by
+/// them: their first open heals the map from the records. This build
 /// ignores `name_to_id` on read: the first open rebuilds `names` from the
 /// records.
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1117,17 +1118,14 @@ impl Serialize for Index {
             names: &'a BTreeMap<SessionId, String>,
             name_to_id: BTreeMap<&'a str, SessionId>,
         }
-        // A name can alias many boxes, and the legacy map holds one id per
-        // name. The highest id wins, so the map is deterministic.
-        let mut name_to_id = BTreeMap::new();
-        for (id, name) in &self.names {
-            name_to_id.insert(name.as_str(), *id);
-        }
+        // Builds before 0.8 require the field. Their open-time reconcile
+        // inserts each record's name, so the map stays empty here and no
+        // map on disk keys on a name (BOX-143).
         OnDisk {
             format_version: INDEX_FORMAT_VERSION,
             short_to_id: &self.short_to_id,
             names: &self.names,
-            name_to_id,
+            name_to_id: BTreeMap::new(),
         }
         .serialize(serializer)
     }
@@ -5265,10 +5263,7 @@ mod tests {
             legacy.short_to_id.get(&short_of(&unnamed_key)),
             Some(unnamed_key.id())
         );
-        assert_eq!(
-            legacy.name_to_id,
-            BTreeMap::from([("dev".to_string(), *named_key.id())])
-        );
+        assert!(legacy.name_to_id.is_empty(), "{text}");
         let value: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
         assert_eq!(value["format_version"], INDEX_FORMAT_VERSION, "{text}");
 
@@ -5524,9 +5519,7 @@ mod tests {
             let index: serde_json_lenient::Value = serde_json_lenient::from_slice(&bytes).unwrap();
             let maps = index.as_object().unwrap();
             for (field, map) in maps {
-                // `name_to_id` is written only for builds before 0.8 to read.
-                // This build never reads it, so no lookup keys on a name.
-                if field == "format_version" || field == "name_to_id" {
+                if field == "format_version" {
                     continue;
                 }
                 for map_key in map.as_object().unwrap().keys() {
