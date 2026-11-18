@@ -9192,7 +9192,10 @@ async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
                 // SAFETY: a plain kill(2) on the mock shell this test started.
                 assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
             }
-            BoxEnd::Removal => handle.kill(false).await.expect("kill should reach the host"),
+            BoxEnd::Removal => handle
+                .kill(false)
+                .await
+                .expect("kill should reach the host"),
         }
 
         let (text, exit_status) = drain_attach(&mut channel).await;
