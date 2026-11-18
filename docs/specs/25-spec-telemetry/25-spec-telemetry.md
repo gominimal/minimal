@@ -123,7 +123,7 @@ workflow is a maintainer-owned change (gominimal/minimal#2075). A test marked
 "known gap" runs no product code. It names one gap, what covers it today
 and its issue, and fails on request (`TEST_KNOWN_GAPS=1`) so a lane can
 list the gaps. It is removed when the requirement gets a real test. These
-are the known gaps on 2026-10-07, each with an issue to follow. TEL-009
+are the known gaps today, each with an issue to follow. TEL-009
 has lab scenario 785 only. TEL-044 has unit tests for its
 scrub and lab scenario 782 for the whole path. TEL-047 has
 no check, because nothing reports a box's injected environment yet
