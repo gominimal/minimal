@@ -8,7 +8,7 @@ description: "Reference for the min session CLI: create, attach to, and manage s
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-isn't running, with `bug`, `stop`, and `version` being the exceptions. The 
+isn't running, with `bug`, `host stop`, and `version` being the exceptions. The 
 daemon starts natively on Linux (and under `--provider local-minvmd`) or 
 inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
 Running bare `min` with no subcommand routes you into a session when stdin
@@ -21,7 +21,7 @@ help.
 
 Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
 and plural form (`session`/`sessions`, `loadout`/`loadouts`). A handful of
-bare verbs (`ls`, `stop`,
+bare verbs (`ls`,
 `init`, `add`, `update`) survive at the top level as deliberate ergonomic
 exceptions, called out as such below; see
 [the CLI convention](./cli.md#command-naming-convention) for the rule and the
