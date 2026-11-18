@@ -761,9 +761,11 @@ pub struct BoxActor {
 
     /// Whether the last [`Self::host_row_lost`] read found the binding
     /// launch's host gone and the VM host daemon's row still standing, so
-    /// the launch that follows rejoins that row. The next attach or exec
-    /// launch takes it and marks its host as holding the row; a hook launch,
-    /// which reads nothing first, drops it.
+    /// the launch that follows rejoins that row. A task run that replaces a
+    /// hook shell sets it too, when the VM host daemon confirms the row
+    /// stands before the shell ends (#3077). The next attach or exec launch
+    /// takes it and marks its host as holding the row; a hook launch, which
+    /// reads nothing first, drops it.
     relaunch_row_confirmed: bool,
 
     /// The spec stored beside this box's record (BOX-068), as the first

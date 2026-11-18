@@ -17368,10 +17368,13 @@ async fn until_complete_ends_on_entrypoint_return_without_client_then_a_run_read
     }
 }
 
-// BOX-015, T43: a task box with its own network address runs its project's
-// activate hooks in a shell that holds the box's host-side row. The shell
-// never exits, so a run that relayed it would wait for a task that never
-// starts. The run is refused at once, and the refusal says why.
+// BOX-015, T43, #3077: a task box with its own network address runs its
+// project's activate hooks in a shell that holds the box's host-side row.
+// The shell never exits, so a run that relayed it would wait for a task
+// that never starts. No VM host daemon answers here that the row stands,
+// so replacing the shell would leave the box rowless. The run is refused at
+// once, and the refusal says why. The standing-row run is
+// `until_complete_ends_on_entrypoint_return_without_client_runs_a_task_behind_a_hook_shell`.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn until_complete_ends_on_entrypoint_return_without_client_refuses_a_run_behind_a_hook_shell()
@@ -17435,6 +17438,121 @@ async fn until_complete_ends_on_entrypoint_return_without_client_refuses_a_run_b
         stderr.starts_with("Task check did not start in box "),
         "the refusal names the task and the box, with no spawn-failure prefix: {stderr:?}"
     );
+}
+
+// #3077, NET-138, BOX-038: a task box with its own network address runs
+// its project's activate hooks in a shell that binds the box's host-side
+// row. A task run asks the VM host daemon whether that row stands, replaces
+// the hook shell with the box's entrypoint, and rejoins the row. The run
+// relays the task's output and returns the task's exit code.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_runs_a_task_behind_a_hook_shell() {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 25);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let sock = daemon_switch_control(&server).await;
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    replies
+        .send(minimald_rpc::BoxControlReply::BoxIdMinted {
+            minted_box_id: HANDED_BOX_ID,
+        })
+        .expect("the report door stand-in lives");
+
+    let mut spec = mfile::spec::BoxSpec::for_task(
+        "check",
+        &mfile::Task::default(),
+        mfile::spec::SpecFlags::default(),
+    )
+    .expect("a task that is not interactive has a spec");
+    spec.entrypoint = mfile::spec::Entrypoint::Exec(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "echo task-ran; exit 7".to_string(),
+    ]);
+    let mut req = own_ip_handed_session_req(
+        "check",
+        switch_address,
+        std::net::Ipv4Addr::new(127, 0, 64, 25),
+    );
+    req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    assert_eq!(id, HANDED_BOX_ID, "the box takes the VM host daemon's id");
+    match reads.recv().await.expect("the report door stand-in lives") {
+        minimald_rpc::BoxControlRequest::MintBoxId(_) => {}
+        other => panic!("expected a mint ask, got {other:?}"),
+    }
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: contribution_with_hook(boxes::wire::primitives::WireLifecycleHook {
+                    on_activate: Some(inline(marker_body(&marker))),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(&mut client, id).await;
+    assert!(marker.exists(), "the activate hook launched the box");
+
+    // Once before the hook shell ends, and again once the task's host is up.
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    for _ in 0..2 {
+        replies
+            .send(minimald_rpc::BoxControlReply::RowStanding {
+                switch_address,
+                row_standing: true,
+            })
+            .expect("the report door stand-in lives");
+    }
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run ends when the task returns")
+    .expect("the daemon takes the run");
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    assert_eq!(outcome.exit_status, Some(7), "{outcome:?}: {stderr}");
+    assert!(
+        !stderr.contains(super::ENTRYPOINT_BEHIND_HOOK_SHELL),
+        "the run was not refused: {stderr:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&outcome.stdout).contains("task-ran"),
+        "the run relays the task's output: {outcome:?}"
+    );
+    for _ in 0..2 {
+        let read = tokio::time::timeout(Duration::from_secs(5), reads.recv())
+            .await
+            .expect("the run asked the VM host daemon whether the row stands")
+            .expect("the report door stand-in lives");
+        assert_eq!(
+            read,
+            minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
+                switch_address,
+                box_id: Some(HANDED_BOX_ID),
+            }),
+            "the run reads the box's own row, nothing else"
+        );
+    }
+    door.abort();
 }
 
 // BOX-038, T43: a task box holds a shell for its activate hooks, and the
