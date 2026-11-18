@@ -790,6 +790,46 @@ pub struct ChainLink {
     pub snapshot: String,
 }
 
+/// Whether `component` is exactly one directory component under the state
+/// base: not empty, not `.` or `..`, and no `/` or NUL.
+fn is_state_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.contains(['/', '\0'])
+}
+
+/// Whether a package's `env_state_wiring` prefix names one directory under
+/// /state. The prefix is joined onto the state directory, so it must first be
+/// one directory component (not empty, `.` or `..`, and no `/` or NUL). It is
+/// also sent to the shell helpers on a `set_env:` line, and they print it
+/// unquoted in an `export` command for the person to run. So it may hold only
+/// ASCII letters, digits, `.`, `_` and `-`: no character a shell reads as
+/// syntax, no space, no `:` or `\`, and no control character. The Nickel
+/// contract on the attribute (`attr_classes.ncl`) applies the same set.
+#[must_use]
+pub fn is_state_prefix(prefix: &str) -> bool {
+    is_state_component(prefix)
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The refusal for a package's `env_state_wiring` prefix that fails
+/// [`is_state_prefix`]. The package graph and the session composition both
+/// refuse such a prefix with this text. The values are escaped, so a newline
+/// or an escape sequence in one prints as text and the refusal stays one line.
+#[must_use]
+pub fn state_prefix_refusal(package: &str, prefix: &str) -> String {
+    format!(
+        "package `{}` declares `env_state_wiring` with prefix \"{}\". A prefix is one directory \
+         name under /state. It may use only ASCII letters, digits, `.`, `_` and `-`, and it \
+         cannot be `.` or `..`. Change the prefix in the package's spec.",
+        package.escape_debug(),
+        prefix.escape_debug(),
+    )
+}
+
 /// Object key of the per-commit index snapshot for a repo + commit:
 /// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
 pub fn commit_index_object(repo_url: &str, commit_sha: &str) -> String {
