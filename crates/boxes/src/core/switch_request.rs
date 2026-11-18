@@ -875,9 +875,9 @@ mod kani_proofs {
     /// declared ports and its runtime-published set — so a decision that
     /// refuses a box's withdrawal of its own declared forward at its stop
     /// (NET-121), one that refuses a listen-published port's teardown, or
-    /// one that retracts a name, fails here. The interim's arm carries the nothing-holds bound: a
-    /// request at a held address whose row refuses a record must not be
-    /// read as the interim's to apply.
+    /// one that retracts a name, fails here. The interim's arm carries the
+    /// nothing-holds bound: a request at a held address whose row refuses a
+    /// record must not be read as the interim's to apply.
     ///
     /// The table is one fully symbolic row beside symbolic plan bounds. One
     /// row is what the per-address decision needs — a retraction keyed by
@@ -928,12 +928,15 @@ mod kani_proofs {
         // address they carry, and by no other — a publish by what the row
         // declares, a retraction by the ports it declares or its runtime
         // published.
+        // The retract arm reads the row through `withdraws`, as the publish
+        // arm reads it through `holds`: the restatement shares the row's
+        // own scans with the decision, so CBMC proves the routing and the
+        // order of checks, not two encodings of one scan equal. A field
+        // restatement here ran the CI lane past its limit. What
+        // `withdraws` admits is the unit test's to pin.
         let admits = |row: &SwitchRow, record: Record| match verb {
             SwitchVerb::Publish | SwitchVerb::PublishName => row.holds(record),
-            SwitchVerb::Retract => match record {
-                Record::Port(port) => row.ports.contains(&port) || row.published.contains(&port),
-                Record::Name(_) => false,
-            },
+            SwitchVerb::Retract => row.withdraws(record),
         };
         let declared = table
             .row_at(addr)
