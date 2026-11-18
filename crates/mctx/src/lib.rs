@@ -1074,35 +1074,20 @@ impl Context {
             self.repo_dir()?.to_path_buf()
         };
         let state_base_dir = match state_key {
-<<<<<<< HEAD
             Some(name) if !name.is_empty() => mfile
                 .state_dir(name, self.daemon.config.state_base_dir())
+                .map_err(|reason| {
+                    Error::Other(anyhow!(
+                        "refusing to use state key {name:?}: {reason}. Choose a state key \
+                     that is a single directory name"
+                    ))
+                })?
                 .ok_or_else(|| {
                     Error::Other(anyhow!(
                         "cannot determine state directory for state key {name:?}: \
-                         the location of the minimal file on disk is unknown"
+                     the location of the minimal file on disk is unknown"
                     ))
                 })?,
-=======
-            Some(name) if !name.is_empty() => durable_state_dir(
-                mfile,
-                name,
-                self.daemon.config.state_base_dir(),
-                self.state_root(),
-            )
-            .map_err(|reason| {
-                Error::Other(anyhow!(
-                    "refusing to use state key {name:?}: {reason}. Choose a state key \
-                     that is a single directory name"
-                ))
-            })?
-            .ok_or_else(|| {
-                Error::Other(anyhow!(
-                    "cannot determine state directory for state key {name:?}: \
-                     the location of the minimal file on disk is unknown"
-                ))
-            })?,
->>>>>>> ae8fcb5 (fix: refuse unsafe state key and state dir path components (#3342))
             _ => {
                 let tmp = self.daemon.cache.temp_dir().map_err(|e| {
                     Error::Other(
@@ -1473,25 +1458,6 @@ fn detach_array_close(arr: &mut Array) -> String {
     tail[..i].trim_end().to_owned()
 }
 
-<<<<<<< HEAD
-=======
-/// The durable state directory for `state_key`: keyed on `state_root` when
-/// one is set, else on the directory `mfile` was read from. `None` when
-/// neither is known. An error when the state key is not a single directory
-/// name, or when the directory resolves outside `base`.
-fn durable_state_dir(
-    mfile: &mfile::File,
-    state_key: &str,
-    base: PathBuf,
-    state_root: Option<&Path>,
-) -> Result<Option<PathBuf>, String> {
-    match state_root {
-        Some(root) => mfile.state_dir_under(state_key, base, root).map(Some),
-        None => mfile.state_dir(state_key, base),
-    }
-}
-
->>>>>>> ae8fcb5 (fix: refuse unsafe state key and state dir path components (#3342))
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,35 +1531,6 @@ mod tests {
         ));
     }
 
-<<<<<<< HEAD
-=======
-    /// gominimal/minimal#1373: a state root keys a task's durable state on
-    /// the project, not on where this daemon's copy of the mfile sits.
-    /// Without one, the key stays the mfile's own directory.
-    #[test]
-    fn state_root_keys_durable_state_on_the_project() {
-        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-            .join("testdata")
-            .join("fakerepo");
-        let mfile = MFileSearchStrategy::Override(repo)
-            .find_mfile()
-            .expect("fakerepo has a minimal.toml");
-        let base = PathBuf::from("/state");
-
-        assert_eq!(
-            durable_state_dir(&mfile, "env", base.clone(), None),
-            mfile.state_dir("env", base.clone())
-        );
-        let root = Path::new("/home/user/src/my-project");
-        assert_eq!(
-            durable_state_dir(&mfile, "env", base.clone(), Some(root)),
-            Ok(Some(PathBuf::from(
-                "/state/-home-user-src-my%2Dproject/env"
-            )))
-        );
-    }
-
->>>>>>> ae8fcb5 (fix: refuse unsafe state key and state dir path components (#3342))
     /// NET-155: a context made for a box carries the box's classifier leaf,
     /// across a clone and a reload of its mfile, into the orchestrator it
     /// builds with. A context made for no box carries no leaf.
