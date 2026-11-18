@@ -112,13 +112,39 @@ pub struct BoxSpec {
 
 /// One `[[file_exports]]` item of a stored spec, kept as it was written:
 /// a path string, or a table with a `path` key.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// Equality is total: two floats are equal when their bits are equal. A
+/// hand-edited stored spec can hold a TOML `nan`, and such an item is
+/// still equal to itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct StoredExport(pub toml::Value);
 
-// A stored spec is JSON or TOML that the expansion wrote, and neither
-// carries a NaN float, so equality on an item is total.
+impl PartialEq for StoredExport {
+    fn eq(&self, other: &Self) -> bool {
+        toml_value_eq(&self.0, &other.0)
+    }
+}
+
 impl Eq for StoredExport {}
+
+/// Equality on two TOML values that compares floats by their bits, so it
+/// is reflexive for NaN.
+fn toml_value_eq(a: &toml::Value, b: &toml::Value) -> bool {
+    use toml::Value;
+    match (a, b) {
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| toml_value_eq(a, b))
+        }
+        (Value::Table(a), Value::Table(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, a)| b.get(key).is_some_and(|b| toml_value_eq(a, b)))
+        }
+        _ => a == b,
+    }
+}
 
 /// What a box runs as its first process: the program its launch starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1174,6 +1200,10 @@ mod tests {
         assert_eq!(written, stored, "a read and a write keep the stored spec");
         let again: BoxSpec = written.try_into().unwrap();
         assert_eq!(again, read);
+
+        let nan = StoredExport(toml::Value::Float(f64::NAN));
+        assert_eq!(nan, nan.clone(), "an item with a NaN float equals itself");
+        assert_ne!(nan, StoredExport(toml::Value::Float(0.0)));
 
         let mut unknown = stored;
         unknown.insert("file_imports".to_owned(), toml::Value::Array(Vec::new()));
