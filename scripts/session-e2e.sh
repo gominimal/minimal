@@ -7057,6 +7057,21 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     kill "$ts_pid" 2>/dev/null || true
     fail
   fi
+  # The client ends with the task's relayed exit. A client still connected
+  # after the stop is the regression this proof catches, so the wait is
+  # bounded and a miss fails with the client's output.
+  ts_deadline=$((SECONDS + 60))
+  while kill -0 "$ts_pid" 2>/dev/null && [ "$SECONDS" -lt "$ts_deadline" ]; do
+    sleep 0.5
+  done
+  if kill -0 "$ts_pid" 2>/dev/null; then
+    echo "::error::'min task run e2e-stoptask' was still running 60s after 'min box stop $ts_name'"
+    echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
+    echo "--- task stderr ---"; cat "$WORK/task-stop.err" 2>/dev/null || true
+    kill "$ts_pid" 2>/dev/null || true
+    wait "$ts_pid" 2>/dev/null || true
+    fail
+  fi
   wait "$ts_pid"
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -7076,10 +7091,14 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     echo "--- task stdout ---"; cat "$WORK/task-stop.out" 2>/dev/null || true
     fail
   fi
-  ts_row="$(mnl ls 2>/dev/null | grep -F "$ts_name" || true)"
-  if [[ "$ts_row" != *"stopped (exit 0)"* ]]; then
-    echo "::error::stopped task box $ts_name is not recorded as 'stopped (exit 0)': '$ts_row'"
-    mnl ls 2>&1 || true
+  # `min ls` prints only the state; `min box show` prints the exit code the
+  # record keeps.
+  ts_shown="$(mnl box show "$ts_name" </dev/null 2>&1)" || ts_shown=""
+  ts_state="$(printf '%s\n' "$ts_shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+  ts_code="$(printf '%s\n' "$ts_shown" | sed -n 's/^Exit code: *//p' | tr -d '\r')"
+  if [ "$ts_state" != stopped ] || [ "$ts_code" != 0 ]; then
+    echo "::error::stopped task box $ts_name is recorded as state '${ts_state:-<none>}', exit code '${ts_code:-<none>}' (expected stopped, 0)"
+    echo "--- min box show $ts_name ---"; printf '%s\n' "$ts_shown"
     fail
   fi
   task_kept_check e2e-stoptask "$WORK/task-stop.err"

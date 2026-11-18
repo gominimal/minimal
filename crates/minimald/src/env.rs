@@ -2496,6 +2496,7 @@ impl BoxChannel {
                 start_dir.clone(),
                 forward_stdin,
                 &mut forwarded,
+                self.session_id,
             )
             .await
         }
@@ -3618,7 +3619,9 @@ impl InvocationRunner for mctx::Env<'_> {
 /// relayed to `stream` as `msg:` and `<note_tag>:` lines. `start_dir` and
 /// `forward_stdin` set the run options. A forwarded stdin that started is
 /// left in `forwarded`. `Ok(true)` is a run that passed. The caller sends
-/// the exit line with [`BoxChannel::end_task_run`].
+/// the exit line with [`BoxChannel::end_task_run`]. With `box_id`, each
+/// invocation's container is recorded against that box while it runs
+/// ([`task_container_hook`]), so `min box stop` ends it with the box.
 #[expect(
     clippy::too_many_arguments,
     reason = "one call site in run_task, which hands over each fact of the run"
@@ -3632,6 +3635,7 @@ async fn run_invocations_relayed<R: InvocationRunner>(
     start_dir: Option<String>,
     forward_stdin: bool,
     forwarded: &mut Option<crate::exec::ForwardedStdin>,
+    box_id: Option<boxes::SessionId>,
 ) -> Result<bool, Error> {
     // One run path for every task: an `inherit_cwd` task, a task
     // whose helper forwards its stdin, and a default task differ
@@ -3650,6 +3654,7 @@ async fn run_invocations_relayed<R: InvocationRunner>(
         } else {
             None
         },
+        on_spawn: box_id.map(task_container_hook),
         ..sandbox::RunOptions::default()
     };
     let (mut stdout_writer, mut stderr_writer) = StreamWriter::pair_tagged(stream, note_tag)
@@ -3677,6 +3682,18 @@ async fn run_invocations_relayed<R: InvocationRunner>(
     }
     ran?;
     Ok(true)
+}
+
+/// The spawn hook that records each task container of box `box_id`
+/// (BOX-013) for as long as the run holds it. While a stop of the box is
+/// under way the record is refused, so the sandbox kills that container and
+/// the run starts no later invocation.
+fn task_container_hook(box_id: boxes::SessionId) -> sandbox::SpawnHook {
+    Box::new(move |supervisor| {
+        crate::box_runtime::record_task_container(box_id, supervisor)
+            .map(|record| Box::new(record) as Box<dyn std::any::Any + Send>)
+            .map_err(std::io::Error::other)
+    })
 }
 
 /// Where the stdin slot of a run leaves the forwarded stdin it started, or
@@ -6781,6 +6798,7 @@ exit $rc
             start_dir,
             helper_stdin.is_some(),
             &mut forwarded,
+            None,
         )
         .await;
         BoxChannel::end_task_run(&mut ours, true, "err", "fake", result, forwarded.as_mut());

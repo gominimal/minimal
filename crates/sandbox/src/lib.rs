@@ -2031,6 +2031,12 @@ struct BindOpts {
 /// the run.
 pub type StdinSlot = Box<dyn FnOnce(fs::File) -> std::io::Result<()> + Send>;
 
+/// Called with the pid of each invocation's container once it is spawned,
+/// before the run waits on it. The value it returns is held while the
+/// container runs and dropped once the run is done with it. An error kills
+/// and reaps the container and fails the run, so no later invocation starts.
+pub type SpawnHook = Box<dyn FnMut(u32) -> std::io::Result<Box<dyn std::any::Any + Send>> + Send>;
+
 /// How [`Sandbox::run_with_cancel`] runs its invocations.
 #[derive(Default)]
 pub struct RunOptions {
@@ -2041,6 +2047,8 @@ pub struct RunOptions {
     pub current_dir: Option<String>,
     /// Gives the first invocation a stdin pipe, and receives it.
     pub stdin: Option<StdinSlot>,
+    /// Told the pid of each invocation's container ([`SpawnHook`]).
+    pub on_spawn: Option<SpawnHook>,
 }
 
 impl From<tokio_util::sync::CancellationToken> for RunOptions {
@@ -2058,6 +2066,7 @@ impl std::fmt::Debug for RunOptions {
             .field("cancel", &self.cancel)
             .field("current_dir", &self.current_dir)
             .field("stdin", &self.stdin.is_some())
+            .field("on_spawn", &self.on_spawn.is_some())
             .finish()
     }
 }
@@ -2687,6 +2696,7 @@ impl<C: Channel> Sandbox<C> {
             cancel,
             current_dir,
             mut stdin,
+            mut on_spawn,
         } = options.into();
         for (i, exec) in invocations.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -2706,6 +2716,18 @@ impl<C: Channel> Sandbox<C> {
 
             let mut child = forker::on_fork_thread(move || cmd.spawn())
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+
+            // Held until this iteration ends, after the child is reaped on
+            // every path that reaps it.
+            let _spawned = match on_spawn.as_mut().map(|hook| hook(child.id())) {
+                None => None,
+                Some(Ok(held)) => Some(held),
+                Some(Err(e)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::Execution(ExecutionError::SpawnRefused(e)));
+                }
+            };
 
             // Step 3: wire this invocation's netns. Torn down explicitly once
             // the invocation completes (both arms).
@@ -5463,6 +5485,69 @@ int main(int argc, char **argv) {
             !String::from_utf8_lossy(&out).contains("/start/here"),
             "a run without a dir keeps the sandbox's own: {}",
             String::from_utf8_lossy(&out),
+        );
+
+        // The spawn hook is told each invocation's container, and what it
+        // returns is dropped once that invocation is done.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u32, bool)>::new()));
+        let (hook_seen, dropped) = (seen.clone(), std::sync::Arc::new(()));
+        let held = dropped.clone();
+        let options = RunOptions {
+            on_spawn: Some(Box::new(move |pid| {
+                // A second strong count while the previous one is held.
+                let overlapping = std::sync::Arc::strong_count(&held) > 2;
+                hook_seen.lock().unwrap().push((pid, overlapping));
+                Ok(Box::new(held.clone()) as Box<dyn std::any::Any + Send>)
+            })),
+            ..RunOptions::default()
+        };
+        sandbox
+            .run_with_cancel(
+                vec![invocation("none"), invocation("none")],
+                None::<Vec<u8>>,
+                None::<Vec<u8>>,
+                options,
+            )
+            .await
+            .expect("the run passes");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the hook sees both invocations: {seen:?}");
+        assert!(seen.iter().all(|(pid, _)| *pid > 0));
+        assert!(
+            seen.iter().all(|(_, overlapping)| !overlapping),
+            "each invocation's held value is dropped before the next starts: {seen:?}"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&dropped),
+            1,
+            "nothing the hook returned outlives the run"
+        );
+
+        // A hook that refuses ends the run: the refused container is killed
+        // and no later invocation starts.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let options = RunOptions {
+            on_spawn: Some(Box::new(move |_pid| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::Error::other("refused"))
+            })),
+            ..RunOptions::default()
+        };
+        let mut out = Vec::new();
+        let refused = sandbox
+            .run_with_cancel(
+                vec![invocation("none"), invocation("none")],
+                Some(&mut out),
+                None::<Vec<u8>>,
+                options,
+            )
+            .await;
+        assert!(refused.is_err(), "a refused spawn fails the run");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no invocation starts after the refused one"
         );
     }
 

@@ -1302,19 +1302,28 @@ pub(crate) fn host_address_box_in_namespace(namespace: (u64, u64)) -> Option<box
 /// A box's own PID namespace ends with the box, but a task invocation runs
 /// in a container of its own, and a stop that signals only the box leaves
 /// the task running. The stop takes these records so it can end the task
-/// containers first, and the task's own wait drops its record. Only a
-/// supervisor that is still this daemon's child is signalled
-/// ([`BoxProcesses::of_container`]), so a reaped container's pid names
-/// nothing even before its record is dropped.
+/// containers first. Only a supervisor that is still this daemon's child is
+/// signalled ([`BoxProcesses::of_container`]).
+///
+/// A box in `stopping` records no new container: from the moment its stop
+/// starts until that stop ends, a record is refused, and the run kills the
+/// container it just spawned. So the stop's one take sees every container
+/// that can run, and a multi-invocation task starts no invocation after it.
 #[derive(Debug, Default)]
 pub(crate) struct TaskContainers {
     by_box: BTreeMap<(boxes::SessionId, u32), ()>,
+    stopping: BTreeMap<boxes::SessionId, usize>,
 }
 
 impl TaskContainers {
-    /// Records the task container `supervisor` of box `id`.
-    fn record(&mut self, id: boxes::SessionId, supervisor: u32) {
+    /// Records the task container `supervisor` of box `id`. `false` when a
+    /// stop of the box is under way, and nothing is recorded.
+    fn record(&mut self, id: boxes::SessionId, supervisor: u32) -> bool {
+        if self.stopping.contains_key(&id) {
+            return false;
+        }
         self.by_box.insert((id, supervisor), ());
+        true
     }
 
     /// Drops the record of box `id`'s task container `supervisor`.
@@ -1336,11 +1345,27 @@ impl TaskContainers {
         });
         supervisors
     }
+
+    /// Marks a stop of box `id` as under way.
+    fn begin_stop(&mut self, id: boxes::SessionId) {
+        *self.stopping.entry(id).or_default() += 1;
+    }
+
+    /// Marks a stop of box `id` as over.
+    fn end_stop(&mut self, id: boxes::SessionId) {
+        if let std::collections::btree_map::Entry::Occupied(mut stops) = self.stopping.entry(id) {
+            *stops.get_mut() -= 1;
+            if *stops.get() == 0 {
+                stops.remove();
+            }
+        }
+    }
 }
 
 /// The running boxes' task containers ([`TaskContainers`]).
 static TASK_CONTAINERS: std::sync::Mutex<TaskContainers> = std::sync::Mutex::new(TaskContainers {
     by_box: BTreeMap::new(),
+    stopping: BTreeMap::new(),
 });
 
 fn task_containers() -> std::sync::MutexGuard<'static, TaskContainers> {
@@ -1349,16 +1374,61 @@ fn task_containers() -> std::sync::MutexGuard<'static, TaskContainers> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Records the task container `supervisor` that box `id`'s invocation just
-/// spawned (BOX-013), so `min box stop` can end it with the box.
-pub(crate) fn record_task_container(id: boxes::SessionId, supervisor: u32) {
-    task_containers().record(id, supervisor);
+/// The record of one task container ([`record_task_container`]). Dropping it
+/// drops the record, so a run that ends on any path, its future dropped
+/// included, leaves no pid behind for a later stop to signal.
+#[derive(Debug)]
+#[must_use = "dropping the record forgets the task container at once"]
+pub(crate) struct TaskContainerRecord {
+    id: boxes::SessionId,
+    supervisor: u32,
 }
 
-/// Drops the record of box `id`'s task container `supervisor`: the
-/// invocation's wait returned, so the container no longer needs a stop.
-pub(crate) fn forget_task_container(id: boxes::SessionId, supervisor: u32) {
-    task_containers().forget(id, supervisor);
+impl Drop for TaskContainerRecord {
+    fn drop(&mut self) {
+        task_containers().forget(self.id, self.supervisor);
+    }
+}
+
+/// A stop of a box under way ([`begin_task_stop`]). While it is held, the
+/// box records no new task container. Dropping it ends that.
+#[derive(Debug)]
+#[must_use = "dropping the stop lets the box record task containers again at once"]
+pub(crate) struct TaskStop {
+    id: boxes::SessionId,
+}
+
+impl Drop for TaskStop {
+    fn drop(&mut self) {
+        task_containers().end_stop(self.id);
+    }
+}
+
+/// The box `id` is stopping, so its task container `supervisor` was not
+/// recorded and must not run.
+#[derive(Debug, thiserror::Error)]
+#[error("the box is stopping")]
+pub(crate) struct BoxStopping;
+
+/// Records the task container `supervisor` that box `id`'s invocation just
+/// spawned (BOX-013), so `min box stop` can end it with the box. Refused
+/// while a stop of the box is under way ([`begin_task_stop`]).
+pub(crate) fn record_task_container(
+    id: boxes::SessionId,
+    supervisor: u32,
+) -> Result<TaskContainerRecord, BoxStopping> {
+    if task_containers().record(id, supervisor) {
+        Ok(TaskContainerRecord { id, supervisor })
+    } else {
+        Err(BoxStopping)
+    }
+}
+
+/// Starts a stop of box `id` (BOX-013): until the returned [`TaskStop`] is
+/// dropped, [`record_task_container`] refuses the box.
+pub(crate) fn begin_task_stop(id: boxes::SessionId) -> TaskStop {
+    task_containers().begin_stop(id);
+    TaskStop { id }
 }
 
 /// Takes every task container of box `id` (BOX-013): the supervisor pids
