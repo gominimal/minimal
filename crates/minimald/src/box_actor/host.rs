@@ -1485,6 +1485,47 @@ impl BoxActor {
             == Some(true)
     }
 
+    /// Stores the facts of the creator's new registration of this box
+    /// (NET-138), once its host-side row ended: the new addresses, task
+    /// addresses and box id go on the record, and the row binding is
+    /// cleared. The next attach or exec launch is then a new attachment
+    /// under the new row, as a box's first launch is, and binds it.
+    ///
+    /// The facts are refused, and nothing changes, while the old row has
+    /// not ended ([`Self::host_row_lost`]): a live host holds it, the VM
+    /// host daemon says it stands, or no launch bound one yet. Then the
+    /// client drops its new registration, and the old row stays the box's.
+    pub(super) async fn register_box_again(
+        &mut self,
+        request: minimald_rpc::RegisterBoxAgainRequest,
+    ) -> Result<minimald_rpc::RegisterBoxAgainResponse, std::io::Error> {
+        let record = self.record.record().await?;
+        if record.box_addresses.is_none() || !self.host_row_lost(&record).await {
+            tracing::info!(
+                session_id = %record.id,
+                "the box's host row did not end; the new registration is not stored"
+            );
+            return Ok(minimald_rpc::RegisterBoxAgainResponse::RowStands);
+        }
+        let mut registered = record.clone();
+        registered.box_addresses = Some(request.box_addresses);
+        registered.task_addresses = request.task_addresses;
+        registered.box_id = request.box_id;
+        registered.host_row_bound = false;
+        self.record.write(registered).await?;
+        // No host in the slot holds the new row, and no read of the old
+        // row carries over to the launch that follows.
+        self.slot_holds_row = false;
+        self.relaunch_row_confirmed = false;
+        tracing::info!(
+            session_id = %record.id,
+            switch_address = %request.box_addresses.switch_address,
+            box_id = %request.box_id.map(|id| id.to_string()).unwrap_or_default(),
+            "stored the box's new registration; the next launch binds its new host row"
+        );
+        Ok(minimald_rpc::RegisterBoxAgainResponse::Registered)
+    }
+
     /// Records the launch's own placement outcome on this session's record
     /// (NET-079): `per_box` when the launch placed this session's
     /// host-address box in a classifier leaf of the host's tree, `none` when
@@ -2632,6 +2673,29 @@ impl BoxActor {
         let mut record = self.record.record().await?;
         record.set_state(boxes::core::record::RecordState::Stopped(ending));
         self.record.write(record).await
+    }
+}
+
+impl BoxHandle {
+    /// Hands the actor the facts of the creator's new registration of this
+    /// box (NET-138). See [`BoxActor::register_box_again`]. A dead actor
+    /// maps to `NotConnected`.
+    pub(crate) async fn register_box_again(
+        &self,
+        request: minimald_rpc::RegisterBoxAgainRequest,
+    ) -> Result<minimald_rpc::RegisterBoxAgainResponse, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(BoxMessage::RegisterBoxAgain(request, send))
+            .await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session actor is gone",
+            ))
+        })
     }
 }
 

@@ -18,6 +18,7 @@ impl BoxMessage {
             Self::RunDetachHooks { .. } => "RunDetachHooks",
             Self::Abort { .. } => "Abort",
             Self::Rename { .. } => "Rename",
+            Self::RegisterBoxAgain(..) => "RegisterBoxAgain",
             Self::IsBusy { .. } => "IsBusy",
             Self::Stop { .. } => "Stop",
             Self::StopBox { .. } => "StopBox",

@@ -4844,25 +4844,112 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("the VM host daemon released this session's network addresses"),
+        refusal.contains("the VM host released this box's network addresses"),
         "the refusal must name the host-row cause; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("min session activate"),
-        "the refusal must name the step that registers a box again; got: {refusal:?}"
+        refusal.contains("`min box attach <box>` to register the box again"),
+        "the refusal must name the attach that registers the box again; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("min session destroy <session>"),
-        "the refusal must name the session argument the destroy step takes; got: {refusal:?}"
-    );
-    assert!(
-        refusal.contains("run the same command again"),
-        "the refusal must name the re-run that resumes the row; got: {refusal:?}"
+        !refusal.contains("min session destroy") && !refusal.contains("min session activate"),
+        "the refusal no longer sends the person to destroy the box; got: {refusal:?}"
     );
     assert_eq!(
         super::launch_publish_seam::observed(id).len(),
         1,
         "no second host may be minted for a box whose host row was withdrawn"
+    );
+}
+
+/// The creator's new registration of a box whose host-side row ended is a
+/// new attachment (NET-138). While the box's first host holds its row, the
+/// daemon refuses the new facts and changes nothing. Once the shell exits
+/// and the row is gone, the daemon stores the new addresses and box id,
+/// clears the row binding, and the next attach launches a new host that
+/// binds the new row.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_registered_again_after_its_row_ended_attaches_under_the_new_row() {
+    use minimald_rpc::{RegisterBoxAgain, RegisterBoxAgainRequest, RegisterBoxAgainResponse};
+    async fn record_of(server: &TestServer, id: SessionId) -> boxes::Record {
+        server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves")
+            .record()
+            .await
+            .expect("the record reads back")
+    }
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_box_from(
+        &mut client,
+        until_stopped(own_ip_handed_session_req(
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 23),
+            std::net::Ipv4Addr::new(127, 0, 64, 23),
+        )),
+        Default::default(),
+        true,
+    )
+    .await;
+    let again = RegisterBoxAgainRequest {
+        id,
+        box_addresses: boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 24),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 24),
+        },
+        task_addresses: vec![std::net::Ipv4Addr::new(100, 64, 128, 25)],
+        box_id: Some(minimald_rpc::BoxId::from_bytes([7; 16])),
+    };
+
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    assert_eq!(
+        client.call::<RegisterBoxAgain>(&again).await,
+        minimald_rpc::Errorable::Ok(RegisterBoxAgainResponse::RowStands),
+        "a live host holds the row, so the new registration is refused"
+    );
+    let record = record_of(&server, id).await;
+    assert_eq!(
+        record.box_addresses.map(|a| a.switch_address),
+        Some(std::net::Ipv4Addr::new(100, 64, 128, 23)),
+        "a refused registration changes nothing"
+    );
+    assert!(record.host_row_bound);
+
+    keep_exit(&mut channel).await;
+    assert_attach_refused_rowless(&mut client, id).await;
+
+    assert_eq!(
+        client.call::<RegisterBoxAgain>(&again).await,
+        minimald_rpc::Errorable::Ok(RegisterBoxAgainResponse::Registered),
+        "the row ended, so the new registration is stored"
+    );
+    let record = record_of(&server, id).await;
+    assert_eq!(record.box_addresses, Some(again.box_addresses));
+    assert_eq!(record.task_addresses, again.task_addresses);
+    assert_eq!(record.box_id, again.box_id);
+    assert!(
+        !record.host_row_bound,
+        "no launch has bound the new row yet"
+    );
+
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        2,
+        "the attach after the new registration launches a new host"
+    );
+    assert!(
+        record_of(&server, id).await.host_row_bound,
+        "the new launch binds the new row"
     );
 }
 
@@ -4873,7 +4960,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let refusal = collect_to_close(&mut channel).await;
     assert!(
         refusal.contains("Cannot attach to the box:")
-            && refusal.contains("the VM host daemon released this session's network addresses"),
+            && refusal.contains("the VM host released this box's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
 }

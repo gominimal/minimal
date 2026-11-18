@@ -2820,6 +2820,64 @@ impl OneshotSshRpc for RenameSession {
     type Response = Errorable<RenameSessionResponse>;
 }
 
+/// The exit status an attach ends with when the in-VM daemon refused it
+/// because the VM host daemon withdrew the box's host-side row (NET-138).
+/// The client reads it as its cue to register the box again
+/// ([`RegisterBoxAgain`]) and retry the attach one time. A shell that exits
+/// with this status by itself leaves its row standing, so the registration
+/// the client tries is refused, and the client ends with the status.
+pub const ATTACH_ROW_ENDED_EXIT_STATUS: u32 = 253;
+
+/// An RPC that hands the in-VM daemon the facts of a new registration of a
+/// box whose host-side row the VM host daemon withdrew (NET-138).
+///
+/// Only the box's creator registers a row, so the client registers the box
+/// again after an attach ends with [`ATTACH_ROW_ENDED_EXIT_STATUS`], and
+/// sends what the registration handed back. The daemon stores the new
+/// addresses and box id on the record and clears its row binding: the next
+/// launch is a new attachment under the new row, as the first launch of a
+/// box is. The daemon refuses the facts while the old row still stands or
+/// while a live host holds it ([`RegisterBoxAgainResponse::RowStands`]).
+pub struct RegisterBoxAgain;
+
+/// The request for a [`RegisterBoxAgain`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterBoxAgainRequest {
+    /// The session whose box was registered again.
+    pub id: SessionId,
+    /// The addresses the new registration handed back.
+    pub box_addresses: BoxAddresses,
+    /// The task addresses the new registration handed back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
+    /// The box id the new registration handed back, or `None` from a VM
+    /// host daemon that predates ids.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
+    pub box_id: Option<BoxId>,
+}
+
+/// The response for a [`RegisterBoxAgain`] RPC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RegisterBoxAgainResponse {
+    /// The record holds the new registration. The next attach launches
+    /// the box under the new row.
+    Registered,
+    /// The box's row did not end: it still stands, a live host holds it, or
+    /// no launch bound one yet. Nothing changed, and the client drops the
+    /// new registration.
+    RowStands,
+}
+
+impl OneshotSshRpc for RegisterBoxAgain {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RegisterBoxAgain");
+    type Request<'a> = RegisterBoxAgainRequest;
+    type Response = Errorable<RegisterBoxAgainResponse>;
+}
+
 /// An RPC to stop a running box and keep its record (BOX-013, BOX-018).
 ///
 /// The daemon sends SIGTERM to every process in the box, waits its grace

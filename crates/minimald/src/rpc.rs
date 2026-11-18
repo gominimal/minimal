@@ -1433,6 +1433,45 @@ async fn serve_rename_session(
         .await
 }
 
+/// `RegisterBoxAgain`: hands the session's actor the facts of its
+/// creator's new registration of the box, once the box's host-side row
+/// ended (NET-138). The actor stores them and clears the row binding, or
+/// answers that the row did not end and changes nothing.
+async fn serve_register_box_again(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::RegisterBoxAgain
+        .handle_channel(c, async |req| {
+            let res = async {
+                match s
+                    .sessions_manager()
+                    .await
+                    .get_session(BoxKeyPredicate::Id(req.id))
+                    .await?
+                {
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            req.id.as_ref()
+                        ),
+                    )),
+                    Some(h) => h.register_box_again(req).await,
+                }
+            }
+            .await;
+            Ok(match res {
+                Ok(answer) => Errorable::Ok(answer),
+                Err(e) => Errorable::Err {
+                    error: e.to_string(),
+                },
+            })
+        })
+        .await
+}
+
 /// `StopBox`: stops the running box and keeps its record (BOX-013,
 /// BOX-018). Answers how the box ended, as the record now stores it. A
 /// stop that the entrypoint's return beat answers that the box already
@@ -3646,6 +3685,7 @@ pub async fn handle_ssh_rpc(
         | SubmitVerdict::NAME
         | FinalizeSession::NAME
         | RenameSession::NAME
+        | minimald_rpc::RegisterBoxAgain::NAME
         | DestroySession::NAME
         | minimald_rpc::StopBox::NAME
         | minimald_rpc::RestartBox::NAME
@@ -3737,6 +3777,7 @@ pub async fn handle_ssh_rpc(
         SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
+        minimald_rpc::RegisterBoxAgain::NAME => serve!(serve_register_box_again(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
         minimald_rpc::RestartBox::NAME => serve!(serve_restart_box(s, channel)),

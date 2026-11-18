@@ -41,10 +41,11 @@ pub enum AttachError {
     /// holds no row for it (NET-138): the row was withdrawn after its detach
     /// grace and its creator did not resume it. The host gate drops frames
     /// from an unregistered source, so any host handed out now would be
-    /// "rowless". Only the box's creator registers or resumes a row, and the
-    /// client resumes it before every attach and exec, so the message names
-    /// a re-run as the way forward, and a new activation once the host no
-    /// longer holds the creator's record to resume from.
+    /// "rowless". Only the box's creator registers a row, so the refusal
+    /// ends with its own exit status
+    /// ([`minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS`]): the client reads it,
+    /// registers the box again, hands the new registration to this daemon
+    /// ([`minimald_rpc::RegisterBoxAgain`]) and retries the attach once.
     BoxHostRowEnded,
     /// The attach named a stopped or exited box, and its resume was refused
     /// (BOX-025, BOX-030). The box's state is unchanged. The error's kind
@@ -59,7 +60,8 @@ impl AttachError {
     /// it before it closes the channel, for every refusal: without one, ssh
     /// exits 255, and the client reads that as a dropped connection and
     /// writes its blind terminal unwind over the refusal's text. A refused
-    /// resume carries its own status. Every other refusal ends with 1.
+    /// resume carries its own status, and so does a box whose host-side row
+    /// ended. Every other refusal ends with 1.
     pub fn exit_code(&self) -> u32 {
         /// The status of a refusal that carries none of its own.
         const ATTACH_REFUSED: u32 = 1;
@@ -73,8 +75,8 @@ impl AttachError {
             | AttachError::LaunchRecordUnwritable(_)
             | AttachError::SessionPending
             | AttachError::WorkspaceUploadInFlight
-            | AttachError::SessionBusy
-            | AttachError::BoxHostRowEnded => ATTACH_REFUSED,
+            | AttachError::SessionBusy => ATTACH_REFUSED,
+            AttachError::BoxHostRowEnded => minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS,
         }
     }
 }
@@ -121,10 +123,8 @@ impl fmt::Display for AttachError {
             }
             AttachError::BoxHostRowEnded => write!(
                 f,
-                "the VM host daemon released this session's network addresses; run \
-                 the same command again to restore them. If it is refused again, \
-                 destroy the session with `min session destroy <session>` and start \
-                 it again with `min session activate`"
+                "the VM host released this box's network addresses. Run \
+                 `min box attach <box>` to register the box again and attach to it."
             ),
             AttachError::ResumeRefused(e, _) => write!(f, "{e}"),
         }

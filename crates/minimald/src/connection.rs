@@ -1047,17 +1047,20 @@ fn attach_refusal_line(cause: &impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     /// An attach refusal sends an exit status, so the client's ssh never
-    /// ends with its transport status 255. A row that minvmd released keeps
-    /// its text, and a refused resume keeps its own status.
+    /// ends with its transport status 255. A row that minvmd released ends
+    /// with the status the client registers the box again on, and its text
+    /// names the attach that does it. A refused resume keeps its own status.
     #[test]
     fn attach_refusal_sends_an_exit_status_for_every_refusal() {
         use crate::box_actor::AttachError;
         let (line, code) = super::attach_refusal(&AttachError::BoxHostRowEnded);
-        assert_eq!(code, 1);
-        assert!(
-            line.contains("the VM host daemon released this session's network addresses"),
-            "{line}"
+        assert_eq!(code, minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS);
+        assert_eq!(
+            line,
+            "Cannot attach to the box: the VM host released this box's network addresses. \
+             Run `min box attach <box>` to register the box again and attach to it.\r\n"
         );
+        assert!(!line.contains("min session destroy"), "{line}");
         assert!(line.ends_with("\r\n"), "{line:?}");
         let refusals = [
             AttachError::NoPty,
