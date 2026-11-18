@@ -1117,7 +1117,7 @@ impl Reader<'_> {
             Self::Host => {
                 std::fs::exists(path).map_err(|e| Error::IO("stat", path.to_path_buf(), e))
             }
-            Self::Within(root) => File::read_within(root, path).map(|data| data.is_some()),
+            Self::Within(root) => File::exists_within(root, path),
         }
     }
 }
@@ -1499,6 +1499,52 @@ impl File {
                 Err(Self::became_a_link(rel, Access::Read))
             }
             Err(e) => Err(Error::IO("minimal file", shown, e)),
+        }
+    }
+
+    /// Whether `path`, a file under `root`, exists, resolving every name
+    /// beneath `root` as [`File::read_within`] does, so a link that leads
+    /// out of `root` or dangles is refused as the read refuses it. The file
+    /// itself is not opened or read: whatever is there (a FIFO, a large
+    /// file) is only looked up.
+    fn exists_within(root: &Path, path: &Path) -> Result<bool, Error> {
+        let rel = Self::rel_within(root, path, Access::Read)?;
+        Self::exists_confined(root, rel, path)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn exists_confined(root: &Path, rel: &Path, path: &Path) -> Result<bool, Error> {
+        Self::exists_checking_components(root, rel, path)
+    }
+
+    /// [`File::check_components`], then a look-up of `path` that does not
+    /// follow a link at the final name.
+    fn exists_checking_components(root: &Path, rel: &Path, path: &Path) -> Result<bool, Error> {
+        Self::check_components(root, rel, Access::Read)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::IO("statting", path.to_path_buf(), e)),
+        }
+    }
+
+    /// Resolves `rel` beneath `root` with `openat2(2)`, then looks the name
+    /// up in the directory that holds it.
+    #[cfg(target_os = "linux")]
+    fn exists_confined(root: &Path, rel: &Path, path: &Path) -> Result<bool, Error> {
+        use std::os::fd::AsFd as _;
+
+        let root_fd = match beneath::open_root(root) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+            Err(e) => return Err(Error::IO("opening workspace", root.to_path_buf(), e)),
+        };
+        match Self::resolve_beneath(root, root_fd.as_fd(), rel, path, Access::Read)? {
+            Beneath::Found { dir, name, shown } => beneath::mode_at(dir.as_fd(), &name)
+                .map(|mode| mode.is_some())
+                .map_err(|e| Error::IO("statting", shown, e)),
+            Beneath::NoDir(_) => Ok(false),
+            Beneath::NoOpenat2 => Self::exists_checking_components(root, rel, path),
         }
     }
 
@@ -2992,6 +3038,15 @@ mod beneath {
     /// Whether `name` in `dir` is a symlink, without following it.
     /// A name that does not exist is not one.
     pub(super) fn is_symlink_at(dir: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<bool> {
+        Ok(mode_at(dir, name)?.is_some_and(|mode| (mode & libc::S_IFMT) == libc::S_IFLNK))
+    }
+
+    /// The `st_mode` of `name` in `dir`, without following a link there and
+    /// without opening it: `None` if there is no such name.
+    pub(super) fn mode_at(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+    ) -> std::io::Result<Option<libc::mode_t>> {
         let c = c_path(name)?;
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `c` outlives the call and `st` is a writable `stat`.
@@ -3006,14 +3061,14 @@ mod beneath {
         if r != 0 {
             let e = std::io::Error::last_os_error();
             return if e.raw_os_error() == Some(libc::ENOENT) {
-                Ok(false)
+                Ok(None)
             } else {
                 Err(e)
             };
         }
         // SAFETY: `fstatat` returned 0, so it filled `st`.
         let st = unsafe { st.assume_init() };
-        Ok((st.st_mode & libc::S_IFMT) == libc::S_IFLNK)
+        Ok(Some(st.st_mode))
     }
 
     /// Opens `name` in `dir` without following a link there (`ELOOP`), and
@@ -5549,6 +5604,90 @@ bash = \"true\"
         let err = File::from_dir_within(&root).unwrap_err();
 
         assert_not_regular(&err.to_string());
+    }
+
+    /// A workspace with both layouts: a readable `minimal.toml` at the
+    /// root, and `.minimal/` made, for the caller to put something in.
+    fn workspace_with_both_layouts() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (dir, root, _) = workspace_and_outside();
+        std::fs::write(root.join(MFILE_NAME), READABLE).unwrap();
+        std::fs::create_dir(root.join(".minimal")).unwrap();
+        let other = root.join(".minimal").join(MFILE_NAME);
+        (dir, root, other)
+    }
+
+    /// The load reported both layouts, naming the two files.
+    fn assert_conflicting_layouts(err: &Error, root: &Path, other: &Path) {
+        let Error::ConflictingLayouts(paths) = err else {
+            panic!("not a conflict of layouts: {err:?}");
+        };
+        assert_eq!(paths, &vec![root.join(MFILE_NAME), other.to_path_buf()]);
+    }
+
+    #[test]
+    fn from_dir_within_reports_conflicting_layouts() {
+        let (_dir, root, other) = workspace_with_both_layouts();
+        std::fs::write(&other, READABLE).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        assert_conflicting_layouts(&err, &root, &other);
+    }
+
+    #[test]
+    fn from_dir_within_reports_conflicting_layouts_without_opening_a_fifo() {
+        let (_dir, root, other) = workspace_with_both_layouts();
+        mkfifo(&other);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let read_root = root.clone();
+        std::thread::spawn(move || {
+            let answer = match File::from_dir_within(&read_root) {
+                Err(Error::ConflictingLayouts(paths)) => Ok(paths),
+                Err(e) => Err(e.to_string()),
+                Ok(_) => Err("the load succeeded".to_string()),
+            };
+            tx.send(answer).unwrap();
+        });
+        let paths = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(answer) => answer.expect("not a conflict of layouts"),
+            Err(_) => panic!("the load blocked"),
+        };
+
+        // Only a look-up of the FIFO reports the conflict: an open of it is
+        // refused as not a regular file instead.
+        assert_eq!(paths, vec![root.join(MFILE_NAME), other]);
+    }
+
+    #[test]
+    fn from_dir_within_reports_conflicting_layouts_without_reading_the_other_file() {
+        // Root may open a file whatever its mode, so the open would not fail.
+        // SAFETY: geteuid reads the caller's effective uid. It has no side
+        // effects and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_dir, root, other) = workspace_with_both_layouts();
+        std::fs::write(&other, READABLE).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        // A read of the file fails with permission denied: only a look-up
+        // that leaves its content alone reports the conflict.
+        assert_conflicting_layouts(&err, &root, &other);
+    }
+
+    #[test]
+    fn from_dir_within_refuses_a_conflicting_link_out_of_the_workspace() {
+        let (_dir, root, other) = workspace_with_both_layouts();
+        let outside = root.parent().unwrap().join("outside.toml");
+        std::fs::write(&outside, OUTSIDE_SECRET).unwrap();
+        std::os::unix::fs::symlink(&outside, &other).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        assert_read_refused(&err, &other, &outside);
     }
 
     #[test]
