@@ -4705,7 +4705,7 @@ fn dynamic_ingress_flags_parse() {
     );
 }
 
-/// The CLI reference documents the network flags on `session activate`
+/// The CLI reference documents the network flags on `session start`
 /// (NET-036), read from the real file so a docs edit cannot silently drop
 /// either row.
 #[test]
@@ -4715,8 +4715,8 @@ fn cli_reference_documents_network_flags() {
     let doc = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let section = doc
-        .split_once("### `session activate`")
-        .expect("a `session activate` section in the CLI reference")
+        .split_once("### `session start`")
+        .expect("a `session start` section in the CLI reference")
         .1;
     let section = section.split("### ").next().unwrap();
     // Table cells escape their pipes as `\|`; compare against the rendered
@@ -4730,7 +4730,7 @@ fn cli_reference_documents_network_flags() {
     ] {
         assert!(
             section.contains(row),
-            "the CLI reference's `session activate` rows must document `{row}`"
+            "the CLI reference's `session start` rows must document `{row}`"
         );
     }
 }

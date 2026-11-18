@@ -1059,6 +1059,13 @@ impl BoxActor {
                 s.shutdown().await;
             }
             if let Some((host, mut task)) = host {
+                // BCLI-068: a removal tells the host before the kill, so an
+                // attached client is told the box was removed. Only
+                // `destroy_now` cancels `destroying`, right before it calls
+                // this.
+                if !for_shutdown && self.destroying.is_cancelled() {
+                    host.announce_end(box_runtime::BoxEnd::Removal).await;
+                }
                 // Signal the process to die, then stop its runtime loop so the
                 // sandbox files backing its rootfs are released before the
                 // caller removes the session's directory tree. The wait is
@@ -2487,6 +2494,10 @@ impl BoxActor {
             // unrecorded ending, its processes run now. This stop signals
             // them, and the record keeps how they ended.
             (_, Some((host, task))) => {
+                // BCLI-068: the host knows of the stop before any signal, so
+                // an attached client is told the box was stopped, and sees
+                // no shell-exit prompt.
+                host.announce_end(box_runtime::BoxEnd::Stop).await;
                 // The task containers first (BOX-013), relay still up: the
                 // task's exit reaches the box, and what the entrypoint then
                 // records is the task's own ending.
