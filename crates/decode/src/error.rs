@@ -135,9 +135,12 @@ const LINK_OUTSIDE_HINT: &str =
 /// Why a package-relative `file` was refused (see [Error::LocalInput]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalInputWhy {
-    /// The path is absolute, climbs out with `..`, or resolves (through a
-    /// symlink) outside the package directory.
+    /// The path is absolute or climbs out with `..`.
     Outside,
+    /// The path is plain, but resolves outside the package directory through
+    /// a symlink: the file itself or one of its directories is a link that
+    /// leads out.
+    LinkOutside,
     /// The string has no source position, so the decoder cannot tell which
     /// `.ncl` file names it, nor the package directory it is relative to.
     NoPackage,
@@ -153,12 +156,37 @@ impl fmt::Display for LocalInputWhy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LocalInputWhy::Outside => write!(f, "it is outside the package directory"),
+            LocalInputWhy::LinkOutside => write!(
+                f,
+                "it is outside the package directory, reached through a symlink"
+            ),
             LocalInputWhy::NoPackage => {
                 write!(f, "the decoder cannot tell which package names it")
             }
             LocalInputWhy::NotFound => write!(f, "it does not exist"),
             LocalInputWhy::NotAFile => write!(f, "it is not a regular file"),
             LocalInputWhy::Unreadable(kind) => write!(f, "it could not be read ({})", kind),
+        }
+    }
+}
+
+impl LocalInputWhy {
+    /// The next step printed under the refusal, one per reason.
+    pub fn note(&self) -> &'static str {
+        match self {
+            LocalInputWhy::Outside => {
+                "move the file into the package directory, and name it from there \
+                 without `..` or a leading `/`"
+            }
+            LocalInputWhy::LinkOutside => "replace the symlink in the path with the file itself",
+            LocalInputWhy::NoPackage => {
+                "name the file with a string written in the package's own `.ncl` file"
+            }
+            LocalInputWhy::NotFound => "create the file, or correct its name",
+            LocalInputWhy::NotAFile => "name a regular file, not a directory",
+            LocalInputWhy::Unreadable(_) => {
+                "make the file readable by the user that runs the build"
+            }
         }
     }
 }
@@ -524,15 +552,7 @@ impl Error {
                 } else {
                     diagnostic
                 };
-                let diagnostic = diagnostic.with_note(match why {
-                    LocalInputWhy::NoPackage => {
-                        "name the file with a string written in the package's own `.ncl` file"
-                    }
-                    _ => {
-                        "the file must be inside the package directory, \
-                         without `..` or a leading `/`"
-                    }
-                });
+                let diagnostic = diagnostic.with_note(why.note());
 
                 report_with(
                     writer,
@@ -749,6 +769,37 @@ mod tests {
         let why = LocalInputWhy::NoPackage.to_string();
         assert_eq!(why, "the decoder cannot tell which package names it");
         assert!(!why.contains("outside"), "{why}");
+    }
+
+    /// Each reason prints its own next step, and no other reason's.
+    #[test]
+    fn local_input_note_follows_the_reason() {
+        let all = [
+            LocalInputWhy::Outside,
+            LocalInputWhy::LinkOutside,
+            LocalInputWhy::NoPackage,
+            LocalInputWhy::NotFound,
+            LocalInputWhy::NotAFile,
+            LocalInputWhy::Unreadable(std::io::ErrorKind::PermissionDenied),
+        ];
+        for why in all {
+            let e = Error::LocalInput {
+                files: Files::default(),
+                pos: TermPos::None,
+                what: "local input",
+                path: PathBuf::from("files/a.patch"),
+                why,
+            };
+            let out = capture(&e);
+            assert!(out.contains("local input files/a.patch refused"), "{out:?}");
+            assert!(out.contains(why.note()), "{why:?}: {out:?}");
+            for other in all.iter().filter(|o| o.note() != why.note()) {
+                assert!(
+                    !out.contains(other.note()),
+                    "{why:?} printed {other:?}'s note: {out:?}"
+                );
+            }
+        }
     }
 
     #[test]
