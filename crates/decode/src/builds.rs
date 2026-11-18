@@ -496,7 +496,8 @@ impl BuildDep {
 /// regular file that can be read. Every failure is an [Error::LocalInput]
 /// naming the path and the reason, never the content.
 ///
-/// Returns the joined (not canonicalized) path and the hash of the content.
+/// Returns the resolved (canonical) path of the file that was checked and
+/// read, and the hash of its content.
 fn read_package_file(
     program: &Program<CacheImpl>,
     what: &'static str,
@@ -553,7 +554,9 @@ fn read_package_file(
     }
     let content = std::fs::read(&canon).map_err(|e| refuse(full_path.clone(), why_io(&e)))?;
 
-    Ok((full_path, blake3::hash(&content)))
+    // The resolved path, so a later read opens the file that was checked even
+    // if a link on the way is pointed elsewhere afterwards.
+    Ok((canon, blake3::hash(&content)))
 }
 
 /// An output from a build.
@@ -1426,6 +1429,30 @@ mod tests {
         assert!(!text.contains(SECRET), "{text}");
         assert!(text.contains("through a symlink"), "{text}");
         assert!(text.contains(LocalInputWhy::LinkOutside.note()), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_input_through_a_link_inside_the_package_stores_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("pkg").join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("a.patch"), "patch").unwrap();
+        std::os::unix::fs::symlink("files/a.patch", dir.path().join("pkg").join("link.patch"))
+            .unwrap();
+
+        let dep = decode_file_input(dir.path(), "Local", "link.patch").unwrap();
+        let BuildDep::Local {
+            full_path,
+            filename,
+            ..
+        } = dep
+        else {
+            panic!("not a local input: {dep:?}");
+        };
+        assert_eq!(filename, "link.patch");
+        assert_eq!(full_path, files.join("a.patch").canonicalize().unwrap());
+        assert!(!full_path.symlink_metadata().unwrap().is_symlink());
     }
 
     #[test]

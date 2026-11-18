@@ -178,10 +178,7 @@ impl LocalInputWhy {
                 "move the file into the package directory, and name it from there \
                  without `..` or a leading `/`"
             }
-            LocalInputWhy::LinkOutside => {
-                "the path or one of its directories is a symlink that leads out of the package; \
-                 replace the link with the file itself"
-            }
+            LocalInputWhy::LinkOutside => "replace the symlink in the path with the file itself",
             LocalInputWhy::NoPackage => {
                 "name the file with a string written in the package's own `.ncl` file"
             }
