@@ -22934,3 +22934,104 @@ async fn skipped_export_keeps_failed_task_exit_code() {
     assert_ne!(code, 125, "a stop keeps its own code");
     assert!(!project.path().join("never-made.txt").exists());
 }
+
+// BCLI-028: one command model drives completion, so every `min box` verb
+// that takes a box completes box names exactly as `min session attach` does.
+#[test]
+fn box_verbs_complete_box_names() {
+    use clap::CommandFactory as _;
+    use clap_complete::engine::ArgValueCompleter;
+
+    fn completer<'a>(cli: &'a clap::Command, path: &[&str], arg: &str) -> &'a ArgValueCompleter {
+        let mut cmd = cli;
+        for name in path {
+            cmd = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("`min {}` exists", path.join(" ")));
+        }
+        let found = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == arg)
+            .unwrap_or_else(|| panic!("`min {}` takes `{arg}`", path.join(" ")));
+        found
+            .get::<ArgValueCompleter>()
+            .unwrap_or_else(|| panic!("`min {}` completes `{arg}`", path.join(" ")))
+    }
+
+    fn values(completer: &ArgValueCompleter, prefix: &str) -> Vec<String> {
+        completer
+            .complete(std::ffi::OsStr::new(prefix))
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // A fixed box list in place of the daemon: a running box named `web`,
+    // one named `api`, and one with no name.
+    let web_id = "019f5d80-ff86-7322-8846-18b49b6aae89";
+    let _boxes = crate::completion::test_boxes::set(vec![
+        twin_entry(web_id, Some("web"), None, boxes::BoxState::Active),
+        twin_entry(
+            "019f5d80-ff86-7322-8846-000000000002",
+            Some("api"),
+            None,
+            boxes::BoxState::Active,
+        ),
+        twin_entry(
+            "abcdef01-0000-7000-8000-000000000000",
+            None,
+            None,
+            boxes::BoxState::Active,
+        ),
+    ]);
+
+    let cli = Cli::command();
+    let reference = completer(&cli, &["session", "attach"], "session");
+
+    // The reference itself offers `web` for `w`, so the comparison below
+    // compares real candidates and not two empty lists.
+    assert_eq!(values(reference, "w"), vec!["web".to_string()]);
+    assert_eq!(
+        values(reference, ""),
+        vec![
+            "web".to_string(),
+            "api".to_string(),
+            "abcdef01-0000-7000-8000-000000000000".to_string(),
+        ],
+    );
+    assert_eq!(
+        values(reference, "019f5d80-ff86-7322-8846-18"),
+        vec![web_id.to_string()]
+    );
+
+    let box_args: &[(&[&str], &str)] = &[
+        (&["box", "attach"], "target"),
+        (&["box", "exec"], "target"),
+        (&["box", "logs"], "target"),
+        (&["box", "show"], "target"),
+        (&["box", "spec"], "target"),
+        (&["box", "audit"], "target"),
+        (&["box", "audit"], "parent"),
+        (&["box", "stop"], "target"),
+        (&["box", "rm"], "target"),
+        (&["box", "restart"], "target"),
+        (&["box", "resume"], "target"),
+        (&["box", "wait"], "target"),
+        (&["box", "events"], "target"),
+        (&["box", "events"], "parent"),
+        (&["box", "rename"], "target"),
+        (&["box", "prune"], "parent"),
+    ];
+
+    for prefix in ["", "w", "019f5d80-ff86-7322-8846-18"] {
+        let expected = values(reference, prefix);
+        for (path, arg) in box_args {
+            assert_eq!(
+                values(completer(&cli, path, arg), prefix),
+                expected,
+                "`min {} <{arg}>` offers what `min session attach` offers for {prefix:?}",
+                path.join(" "),
+            );
+        }
+    }
+}
