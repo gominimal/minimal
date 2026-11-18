@@ -1409,8 +1409,50 @@ impl File {
 
     #[cfg(not(target_os = "linux"))]
     fn read_confined(root: &Path, rel: &Path, path: &Path) -> Result<Option<Vec<u8>>, Error> {
+        Self::read_checking_components(root, rel, path)
+    }
+
+    /// [`File::check_components`], then a read of `path` that does not
+    /// follow a link at the final name and refuses anything but a regular
+    /// file, as the `openat2` read does. The open does not block, so a FIFO
+    /// at `path` is refused rather than waited on.
+    fn read_checking_components(
+        root: &Path,
+        rel: &Path,
+        path: &Path,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         Self::check_components(root, rel, Access::Read)?;
-        Self::read_by_path(path)
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // A link put at `path` after the components were checked.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(Self::link_not_followed(rel, Access::Read));
+            }
+            Err(e) => return Err(Error::IO("minimal file", path.to_path_buf(), e)),
+        };
+        let meta = file
+            .metadata()
+            .map_err(|e| Error::IO("statting", path.to_path_buf(), e))?;
+        if !meta.is_file() {
+            let e = std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file, so the read is refused. \
+                 Replace it with a regular file",
+            );
+            return Err(Error::IO("reading", rel.to_path_buf(), e));
+        }
+        let mut file_data = Vec::new();
+        file.read_to_end(&mut file_data)
+            .map_err(|e| Error::IO("minimal file", path.to_path_buf(), e))?;
+        Ok(Some(file_data))
     }
 
     /// Resolves `rel` beneath `root` with `openat2(2)`, then reads the file
@@ -1430,10 +1472,7 @@ impl File {
             match Self::resolve_beneath(root, root_fd.as_fd(), rel, path, Access::Read)? {
                 Beneath::Found { dir, name, shown } => (dir, name, shown),
                 Beneath::NoDir(_) => return Ok(None),
-                Beneath::NoOpenat2 => {
-                    Self::check_components(root, rel, Access::Read)?;
-                    return Self::read_by_path(path);
-                }
+                Beneath::NoOpenat2 => return Self::read_checking_components(root, rel, path),
             };
         match beneath::open_at(dir.as_fd(), &name, libc::O_RDONLY) {
             Ok(fd) => {
@@ -5449,6 +5488,126 @@ bash = \"true\"
 
         assert_eq!(file.file_path(), Some(&link));
         assert!(matches!(file.layout(), Some(Layout::Root)));
+    }
+
+    /// Makes a FIFO at `path`.
+    fn mkfifo(path: &Path) {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a NUL-terminated string that outlives the call.
+        let r = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        assert_eq!(r, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    }
+
+    /// Runs `read` on a thread and gives its answer, failing the test if
+    /// the read is still blocked after a while rather than hanging it.
+    fn without_blocking(read: impl FnOnce() -> Result<(), String> + Send + 'static) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(read()).unwrap());
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => panic!("the read was not refused"),
+            Ok(Err(text)) => text,
+            Err(_) => panic!("the read blocked"),
+        }
+    }
+
+    /// The read was refused as not a regular file, naming the file by its
+    /// path under the workspace.
+    fn assert_not_regular(text: &str) {
+        assert!(
+            text.contains("minimal.toml")
+                && text.contains("not a regular file, so the read is refused")
+                && text.contains("Replace it with a regular file"),
+            "error: {text}"
+        );
+    }
+
+    /// The fallback read, taken off Linux and on a kernel without
+    /// `openat2`, called directly: on Linux the tests cannot force it.
+    fn read_by_fallback(root: &Path) -> Result<Option<Vec<u8>>, Error> {
+        File::read_checking_components(root, Path::new(MFILE_NAME), &root.join(MFILE_NAME))
+    }
+
+    #[test]
+    fn from_dir_within_refuses_a_fifo_without_blocking() {
+        let (_dir, root, _) = workspace_and_outside();
+        mkfifo(&root.join(MFILE_NAME));
+
+        let text = without_blocking(move || {
+            File::from_dir_within(&root)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+
+        assert_not_regular(&text);
+    }
+
+    #[test]
+    fn from_dir_within_refuses_a_directory() {
+        let (_dir, root, _) = workspace_and_outside();
+        std::fs::create_dir(root.join(MFILE_NAME)).unwrap();
+
+        let err = File::from_dir_within(&root).unwrap_err();
+
+        assert_not_regular(&err.to_string());
+    }
+
+    #[test]
+    fn fallback_read_refuses_a_fifo_without_blocking() {
+        let (_dir, root, _) = workspace_and_outside();
+        mkfifo(&root.join(MFILE_NAME));
+
+        let text = without_blocking(move || {
+            read_by_fallback(&root)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+
+        assert_not_regular(&text);
+    }
+
+    #[test]
+    fn fallback_read_refuses_a_directory() {
+        let (_dir, root, _) = workspace_and_outside();
+        std::fs::create_dir(root.join(MFILE_NAME)).unwrap();
+
+        let err = read_by_fallback(&root).unwrap_err();
+
+        assert_not_regular(&err.to_string());
+        let Error::IO(_, shown, _) = &err else {
+            panic!("not an I/O refusal: {err:?}");
+        };
+        assert_eq!(shown, Path::new(MFILE_NAME));
+    }
+
+    #[test]
+    fn fallback_read_reads_a_plain_file() {
+        let (_dir, root, _) = workspace_and_outside();
+        std::fs::write(root.join(MFILE_NAME), READABLE).unwrap();
+
+        let data = read_by_fallback(&root).unwrap();
+
+        assert_eq!(data.as_deref(), Some(READABLE.as_bytes()));
+    }
+
+    #[test]
+    fn fallback_read_finds_no_missing_file() {
+        let (_dir, root, _) = workspace_and_outside();
+
+        assert_eq!(read_by_fallback(&root).unwrap(), None);
+    }
+
+    #[test]
+    fn fallback_read_refuses_a_link() {
+        let (_dir, root, outside) = workspace_and_outside();
+        std::fs::write(&outside, OUTSIDE_SECRET).unwrap();
+        let link = root.join(MFILE_NAME);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let err = read_by_fallback(&root).unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("cannot follow a link here"), "error: {text}");
+        assert!(!text.contains("outside-secret"), "error: {text}");
     }
 
     #[test]
