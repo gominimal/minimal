@@ -7172,6 +7172,51 @@ async fn admission_refuses_spec_breaching_builtin_root_constraint_exit3() {
     }
 }
 
+/// BOX-025, BOX-160, BOX-176: a start from a stored spec words a type with
+/// no built-in root as the create's refusal does. A project type that
+/// omits `type.root` does not name the built-in type it extends. A
+/// `type.root` that is not a built-in type is not one. The control: a
+/// stored spec of a built-in type that its root admits passes.
+#[test]
+fn stored_spec_root_refusal_words_each_unknown_root() {
+    let spec = |extra: serde_json_lenient::Value| {
+        let mut spec = serde_json_lenient::json!({
+            "v": 0,
+            "box": { "type": "ci" },
+            "io": { "pty_enabled": false },
+        });
+        if let (Some(spec), Some(extra)) = (spec.as_object_mut(), extra.as_object()) {
+            spec.extend(extra.clone());
+        }
+        spec
+    };
+    for (spec, wanted, unwanted) in [
+        (
+            spec(serde_json_lenient::json!({})),
+            "set `box.type` to `ci`, but they do not name the built-in type that `ci` extends.",
+            "is not a built-in type",
+        ),
+        (
+            spec(serde_json_lenient::json!({ "type": { "root": "nope" } })),
+            "set `type.root` to `nope`, which is not a built-in type.",
+            "extends",
+        ),
+    ] {
+        let err = stored_spec_root_refusal(&spec, boxes::TASK_BOX_TYPE)
+            .expect_err("a type with no built-in root is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let text = err.to_string();
+        assert!(text.contains(wanted), "{wanted:?} not in {text}");
+        assert!(!text.contains(unwanted), "{unwanted:?} in {text}");
+        assert!(!text.contains("names no built-in type"), "{text}");
+    }
+
+    let mut task = spec(serde_json_lenient::json!({}));
+    task["box"]["type"] = boxes::TASK_BOX_TYPE.into();
+    stored_spec_root_refusal(&task, boxes::TASK_BOX_TYPE)
+        .expect("a `task` spec with no terminal passes its root");
+}
+
 /// BOX-059, BOX-061, BOX-156, BOX-160 end to end: a project Box Type that
 /// extends `task` only narrows it. A type that tries to loosen the root's
 /// constraint does not resolve. An entry of the narrowing type that breaks
