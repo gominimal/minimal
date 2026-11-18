@@ -487,9 +487,9 @@ pub(crate) fn attached_lease(
 /// its frames to the session's row. `decision` carries the verdict decision this launch itself
 /// read for the box before it reserved anything (NET-079) — the launch's own
 /// fresh fact, never another launch's, which a process-wide memo left a
-/// concurrent launch free to read in its place. A task launch passes `None`
-/// deliberately too: it places no classifier leaf, so there is no per-box
-/// verdict for its plan to follow.
+/// concurrent launch free to read in its place. A task launch goes through
+/// [`task_network_for`], which builds its plan around the verdict of the
+/// box leaf the task joins.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
@@ -538,18 +538,33 @@ pub(crate) fn network_for(
 /// (`task_addresses`, off the session record) — each a host-side row
 /// carrying the box's id and egress — never at the box's own address and
 /// never at one it draws. No task addresses is the plain draw, which only a
-/// native switch makes ([`SwitchClient::attach_task_slot`]). Every other
-/// mode is [`network_for`]'s, with no reporter, no handed box addresses and
-/// no classifier decision: a task owns no proxy route and places no leaf.
+/// native switch makes ([`SwitchClient::attach_task_slot`]).
+///
+/// A `HostNet` task runs in the existing leaf of its box (NET-079), so its
+/// plan follows `box_verdict`, the verdict of that leaf, and `decision`, the
+/// box's decision when the caller holds one. A task with no box leaf gets
+/// the plan [`network_for`] builds from the policy. Every other mode is
+/// [`network_for`]'s, with no reporter and no handed box addresses: a task
+/// owns no proxy route.
 pub(crate) fn task_network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
     policy: Option<boxes::BoxPolicy>,
     task_addresses: Vec<std::net::Ipv4Addr>,
+    box_verdict: Option<sandbox::config::Verdict>,
+    decision: Option<crate::net::classifier::Decision>,
 ) -> Arc<dyn Network> {
-    match mode {
-        NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
+    match (mode, box_verdict) {
+        (NetworkMode::HostNet, Some(verdict)) => Arc::new(HostIpAddressNetwork {
+            switch: Arc::clone(switch),
+            verdict,
+            decision,
+            steering: steering_seed(identity, policy.as_ref()),
+            seams: SteeringSeams::default(),
+            answerer: std::sync::Mutex::new(None),
+        }),
+        (NetworkMode::OwnIp, _) => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
             identity: identity.to_string(),
             policy,
@@ -587,8 +602,8 @@ struct HostIpAddressNetwork {
     /// (NET-079) — carried in by the launch that builds the plan, so the
     /// plan follows its own launch's reading and never a concurrent
     /// launch's, which a process-wide memo let a later launch overwrite in
-    /// its place. `None` for a task launch: it places no classifier leaf,
-    /// so there is no per-box verdict for its plan to follow.
+    /// its place. A task runs in the leaf of its box and carries the box's
+    /// decision when its caller holds one, else `None`.
     decision: Option<crate::net::classifier::Decision>,
     /// The box's steered names (BEP-086), or `None` when the box's own
     /// spec declares no credentialed upstream or its steering is not

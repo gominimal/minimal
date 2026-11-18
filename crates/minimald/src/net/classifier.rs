@@ -81,6 +81,28 @@ use sandbox::config::Verdict;
 /// deny-all box to them would admit it to everything upstream.
 pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
+/// The leaf a task of a box runs in (NET-079), and the verdict its plan
+/// follows. A task of a host-address box shares the namespace of its box, so
+/// the task joins the box's own existing leaf: the packet filter then decides
+/// the task's connections on the box's verdict, the same as for a process the
+/// box itself starts. A task places no leaf of its own. `None` for every
+/// other mode, and for a box the host placed in no leaf.
+pub(crate) fn task_box_leaf(
+    mode: boxes::NetworkMode,
+    box_leaf: Option<&sandbox::config::ClassifierLeaf>,
+) -> Option<(sandbox::config::ClassifierLeaf, Verdict)> {
+    if mode != boxes::NetworkMode::HostNet {
+        return None;
+    }
+    let leaf = box_leaf?.clone();
+    let verdict = if leaf.is_deny() {
+        Verdict::Deny
+    } else {
+        Verdict::Allow
+    };
+    Some((leaf, verdict))
+}
+
 /// Which cohort subtree `declaration` places a box's leaf in (NET-079): the
 /// deny subtree is for the declaration that admits no destination — the one
 /// shape `boxes::EgressPolicy::deny_all` materializes, every `allow_*`
