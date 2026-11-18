@@ -19,6 +19,9 @@
 //! host loopback, as root. It is a verb of this program, not a script of its
 //! own, because macOS lists a launchd job under an app's name only when the
 //! job's program is signed code inside that app's bundle.
+//!
+//! And one that only prints, `log-cap-unit`: the launchd unit that keeps the
+//! service's log bounded, for the macOS package's postinstall to write.
 
 use std::path::PathBuf;
 
@@ -74,6 +77,33 @@ enum Command {
     /// carries.
     #[cfg(target_os = "macos")]
     ReserveLocalRange,
+    /// Print the launchd unit that keeps the service's log under its size
+    /// cap, for the account that runs the service.
+    #[cfg(target_os = "macos")]
+    LogCapUnit {
+        /// The account the service runs as, which owns the log.
+        #[arg(long, value_name = "ACCOUNT")]
+        user: String,
+    },
+}
+
+/// The `log-cap-unit` verb: the cap's launchd unit for `user`, as text.
+/// `min finalize-install` installs this unit for a user's own service and
+/// checks it afterwards; the macOS package's postinstall, which is root's
+/// and runs nothing from `/usr/local`, writes what this prints, so the two
+/// never differ. The verb reads no file and no environment variable, and
+/// prints nothing for a name that is not an account name's characters.
+#[cfg(any(test, target_os = "macos"))]
+fn log_cap_unit(user: &str) -> Result<String> {
+    anyhow::ensure!(
+        !user.is_empty()
+            && user.len() <= 64
+            && user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')),
+        "--user takes an account name (letters, digits, `_`, `-`, `.`)"
+    );
+    Ok(minvmd::net::answerer_log::cap_plist(user))
 }
 
 /// The mask `ifconfig` prints for a `/32` alias.
@@ -156,6 +186,11 @@ fn main() -> Result<()> {
     if matches!(cli.command, Some(Command::ReserveLocalRange)) {
         return reserve_local_range();
     }
+    #[cfg(target_os = "macos")]
+    if let Some(Command::LogCapUnit { user }) = &cli.command {
+        print!("{}", log_cap_unit(user)?);
+        return Ok(());
+    }
     // The service's lines go to stderr, which the service manager's journal
     // reads; the verbs print their own sentences there too.
     tracing_subscriber::registry()
@@ -172,6 +207,11 @@ fn main() -> Result<()> {
         }
         #[cfg(target_os = "macos")]
         Some(Command::ReserveLocalRange) => reserve_local_range(),
+        #[cfg(target_os = "macos")]
+        Some(Command::LogCapUnit { user }) => {
+            print!("{}", log_cap_unit(&user)?);
+            Ok(())
+        }
         None => {
             exit_on_panic();
             minvmd::cmd::answerer::run(cli.protocol_version, cli.admit_group.as_deref())
@@ -197,6 +237,17 @@ fn exit_on_panic() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verb prints the unit for an account name and nothing for text
+    /// that could carry markup into the plist.
+    #[test]
+    fn log_cap_unit_prints_the_unit_for_an_account_name_only() {
+        let unit = log_cap_unit("_minimal").expect("an account name");
+        assert_eq!(unit, minvmd::net::answerer_log::cap_plist("_minimal"));
+        for bad in ["", "a b", "x</string>", "$(id)", &"a".repeat(65)] {
+            assert!(log_cap_unit(bad).is_err(), "{bad:?}");
+        }
+    }
 
     /// The verb adds exactly the reserved range's addresses that lo0 does
     /// not carry with the /32 mask: all 254 on a bare loopback, none on a

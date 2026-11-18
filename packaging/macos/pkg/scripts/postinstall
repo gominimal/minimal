@@ -351,38 +351,19 @@ chmod 0644 /etc/resolver/min.internal
 
 # 5b. The log's size cap: launchd has no limit for a job's log, so an hourly
 #     job, run as the role account and never as root, cuts the log to its
-#     last 256 KiB once it passes 1 MiB. The job is the one `min
-#     finalize-install` installs for a user's own service, and `min
-#     finalize-install --show` checks these arguments word for word (a test
-#     in crates/minimal/src/resolver.rs reads this file). A cap that does
-#     not load leaves a working install, and is said.
+#     last 256 KiB once it passes 1 MiB. It is the job `min finalize-install`
+#     installs for a user's own service, and `min finalize-install --show`
+#     checks it word for word. This script keeps no copy of it: the
+#     service's program, checked in step 1 and root's, prints the unit. A
+#     cap that does not load leaves a working install, and is said.
 cap=/Library/LaunchDaemons/dev.gominimal.zone.logcap.plist
 launchctl bootout system/dev.gominimal.zone.logcap 2>/dev/null || true
-sed "s/__ROLE__/$role/" > "$cap" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>dev.gominimal.zone.logcap</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>f=/private/var/log/minimal/minzoned.log; [ &quot;$(stat -f %z &quot;$f&quot; 2&gt;/dev/null || echo 0)&quot; -gt 1048576 ] || exit 0; t=$(mktemp) || exit 1; tail -c 262144 &quot;$f&quot; &gt; &quot;$t&quot; &amp;&amp; cat &quot;$t&quot; &gt; &quot;$f&quot;; rm -f &quot;$t&quot;</string>
-    </array>
-    <key>UserName</key>
-    <string>__ROLE__</string>
-    <key>StartInterval</key>
-    <integer>3600</integer>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-PLIST
-chown root:wheel "$cap"
-chmod 0644 "$cap"
-if ! launchctl bootstrap system "$cap"; then
+if ! "$bundle/Contents/MacOS/minzoned" log-cap-unit --user "$role" > "$cap"; then
+    rm -f "$cap"
+    echo "minimal: the DNS service program did not print the unit for the size cap on $log, so the log can grow without a limit. Install again to set it up" >&2
+elif chown root:wheel "$cap" && chmod 0644 "$cap" && launchctl bootstrap system "$cap"; then
+    :
+else
     rm -f "$cap"
     echo "minimal: the hourly size cap on $log did not load, so the log can grow without a limit (if the job is switched off, switch it on with: sudo launchctl enable system/dev.gominimal.zone.logcap). Install again to set it up" >&2
 fi
