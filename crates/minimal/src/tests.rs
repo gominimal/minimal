@@ -18501,7 +18501,7 @@ on_detach = { type = "external", value = "./cleanup.sh" }
          #   on_attach \"x\\n# on_attach: y (from minimal.toml)\": inline \"echo x\" (from minimal.toml)\n\
          #   on_detach \"Carriage\": inline \"echo a\\rforged\" (from minimal.toml)\n\
          #   on_attach \"Attach rust\\nthen say \\\"hi\\\"\": inline \"echo rust\" (from loadout rust)\n\
-         #   on_detach \"Attach rust\\nthen say \\\"hi\\\"\": script \"./cleanup.sh\" (from loadout rust)\n"
+         #   on_detach \"Attach rust\\nthen say \\\"hi\\\"\": external \"./cleanup.sh\" (from loadout rust)\n"
     );
     assert!(text.starts_with(&header), "{text}");
     // The list is comments, so the render stays TOML with the hooks in it.

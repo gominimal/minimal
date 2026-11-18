@@ -1129,7 +1129,7 @@ fn write_hook_list(hooks: &[toml::Value], out: &mut Vec<u8>) -> anyhow::Result<(
                     }
                 }
                 HookScriptBody::External(path) => {
-                    format!("script {}", one_line_string(path.as_str()))
+                    format!("external {}", one_line_string(path.as_str()))
                 }
             };
             let description = hook
