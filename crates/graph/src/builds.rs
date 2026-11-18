@@ -27,8 +27,8 @@ pub enum SourceFetch {
     },
     Local {
         /// The resolved path of the file that was checked and hashed, never a
-        /// link; after the wire, the receiver's copy of it. The spec hash does
-        /// not read it.
+        /// link. The wire carries no copy of a local source, so on a receiver
+        /// this is still the sender's path. The spec hash does not read it.
         full_path: PathBuf,
         /// The path as the package declared it, relative to the package. Its
         /// last component names the file in the build, and it is hashed.
