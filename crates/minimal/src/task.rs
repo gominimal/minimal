@@ -2109,9 +2109,8 @@ pub(crate) fn exit_after_exports(
 /// run, so the copy happens only when the record shows that the box ended.
 ///
 /// The run sets its exit status from the outcomes with
-/// [`exit_after_exports`]. Interim: no `file_exported` event records them
-/// (BOX-195, gominimal/minimal#3446). This changes when that requirement
-/// lands: the outcomes become the report.
+/// [`exit_after_exports`]. The copy claims and reports each export
+/// through `copy_box_exports` (BOX-195, BOX-198).
 pub(crate) async fn copy_ended_task_box_exports<E: std::io::Write>(
     client: &mut crate::client::Client,
     id: boxes::SessionId,
