@@ -148,7 +148,11 @@ pub enum SourceFetch {
         sha256_pos: Option<StrPos>,
     },
     Local {
+        /// The resolved path of the file that was checked and hashed, never a
+        /// link. The spec hash does not read it.
         full_path: PathBuf,
+        /// The path as the package declared it, relative to the package. Its
+        /// last component names the file in the build, and it is hashed.
         filename: String,
         file_hash: blake3::Hash,
     },
@@ -388,7 +392,11 @@ pub enum BuildDep {
     Build(BuildRef),
     Source(SourceInput),
     Local {
+        /// The resolved path of the file that was checked and hashed, never a
+        /// link. The spec hash does not read it.
         full_path: PathBuf,
+        /// The path as the package declared it, relative to the package. Its
+        /// last component names the file in the build, and it is hashed.
         filename: String,
         file_hash: blake3::Hash,
     },
@@ -497,7 +505,10 @@ impl BuildDep {
 /// naming the path and the reason, never the content.
 ///
 /// Returns the resolved (canonical) path of the file that was checked and
-/// read, and the hash of its content.
+/// read, and the hash of its content. The resolved path is only where the
+/// bytes are read from: the file keeps the name `file` declares, which the
+/// caller stores alongside it (`link.patch -> files/a.patch` is staged as
+/// `link.patch`).
 fn read_package_file(
     program: &Program<CacheImpl>,
     what: &'static str,
