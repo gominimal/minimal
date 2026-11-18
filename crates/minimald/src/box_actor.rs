@@ -792,6 +792,11 @@ pub struct BoxActor {
     /// (BOX-040).
     resume_in_flight: bool,
 
+    /// Set when an attach mints a host while [`Self::resume_in_flight`] is
+    /// set, whether or not the attach to that host then succeeds. The
+    /// [`Self::finish_resume`] that reads it writes `started` (BOX-040).
+    resume_attach_minted: bool,
+
     /// When the box runs past its `timeout` (BOX-037): armed by each launch
     /// that starts the entrypoint of an `until_complete` box with a timeout,
     /// and disarmed when the box stops, is destroyed or ends on its own.
@@ -906,6 +911,7 @@ impl BoxActor {
             entrypoint_watch: None,
             exit_unsettled: false,
             resume_in_flight: false,
+            resume_attach_minted: false,
             // Armed by the launch that starts the entrypoint.
             timeout_deadline: None,
             // Forwards are registered as their channels open; a session
@@ -1374,6 +1380,7 @@ impl BoxActor {
         match resumed {
             Ok(restarted_from_stored_spec) => {
                 self.resume_in_flight = true;
+                self.resume_attach_minted = false;
                 Ok(Some(PendingResume {
                     from,
                     before,
@@ -1414,6 +1421,7 @@ impl BoxActor {
             minted_host,
         } = pending;
         self.resume_in_flight = false;
+        let attach_minted = std::mem::take(&mut self.resume_attach_minted);
         let outcome_span = span.clone();
         let finish = async {
             let has_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
@@ -1465,9 +1473,11 @@ impl BoxActor {
                 }
             }
             // BOX-040: the resume started the entrypoint again, so `started`
-            // follows `resumed`. A launch that failed beside a host that was
-            // already there started nothing.
-            if launched.is_ok() {
+            // follows `resumed`. An attach that minted a host and then timed
+            // out stored that host, so its entrypoint started too. A launch
+            // that failed beside a host that was already there started
+            // nothing.
+            if launched.is_ok() || attach_minted {
                 self.record_started("resume").await;
             }
             // BOX-027: the resume runs no hook itself. The attach's launch

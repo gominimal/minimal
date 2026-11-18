@@ -18839,6 +18839,43 @@ async fn resumed_session_box_records_started() {
     );
 }
 
+/// BOX-040: a resume whose attach mints a host that then wedges stores that
+/// host, so the entrypoint started. The attach refuses busy, and the box
+/// still records `resumed` and then `started`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_session_box_records_started_when_attach_wedges() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resumed-wedged"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the attach starts the shell");
+    stop_through_daemon(&server, id).await;
+    let before = event_kinds(&server, id).await.len();
+
+    super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostWedged);
+    let mut channel = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("the session is busy; run the attach again in a moment"),
+        "the wedged host reads as busy, got: {refusal:?}"
+    );
+    let kinds = event_kinds_once(&server, id, before + 2).await;
+    assert_eq!(
+        kinds[before..],
+        [BoxEventType::Resumed, BoxEventType::Started],
+        "{kinds:?}"
+    );
+}
+
 /// BOX-176, BOX-178: an argv until_stopped box that holds a host-side row
 /// and sets `hooks_on_resume` cannot start its entrypoint behind the shell
 /// its `on_activate` hooks run in. Its restart fails after the stop: the

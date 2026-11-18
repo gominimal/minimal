@@ -1983,7 +1983,9 @@ impl BoxActor {
         self.publish_host();
         // BOX-040: a new host started the box's entrypoint. On a resume,
         // `finish_resume` writes `started` after `resumed`.
-        if !self.resume_in_flight {
+        if self.resume_in_flight {
+            self.resume_attach_minted = true;
+        } else {
             self.record_started("attach").await;
         }
         outcome
