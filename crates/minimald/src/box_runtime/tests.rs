@@ -779,6 +779,35 @@ struct Seen {
 /// An attach the daemon ended exits non-zero, so a script can tell it from
 /// one the user ended. A detach and a session process that exited are the
 /// user's own ends and stay 0; a shed keeps ssh's 255.
+/// A takeover and a daemon shutdown leave the unwind codes on the terminal
+/// and nothing else. The client prints the one line that names the cause,
+/// so a line from the binding is a second line (#3035).
+#[tokio::test]
+async fn takeover_and_shutdown_write_no_disconnecting_line() {
+    let codes = b"\x1b[?1000l".to_vec();
+    for (farewell, reason) in [
+        (
+            Farewell::Superceded(codes.clone()),
+            MainloopExitReason::Superceded,
+        ),
+        (
+            Farewell::DaemonShutdown(codes.clone()),
+            MainloopExitReason::Shutdown,
+        ),
+    ] {
+        let mut written = Vec::new();
+        let ended = Binding::render_farewell(farewell, &mut written).await;
+        assert_eq!(ended, reason);
+        assert_eq!(ended.exit_status(), DAEMON_ENDED_EXIT_STATUS);
+        assert_eq!(
+            written,
+            codes,
+            "{reason:?} writes only the unwind codes, not {:?}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+}
+
 #[test]
 fn daemon_ended_attaches_report_a_non_zero_exit_status() {
     for reason in [
@@ -5070,18 +5099,18 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
         "an ask nobody answered asks the switch nothing"
     );
 
-    // The first channel saw the supersede itself — its farewell and a close
-    // — so the refusal above is the one a teardown mid-dialog answers with.
+    // The first channel saw the supersede itself — the daemon-ended status
+    // and a close — so the refusal above is the one a teardown mid-dialog
+    // answers with. The binding writes no line of its own for a takeover:
+    // the client names the cause.
     let (mut superseded, mut closed) = (false, false);
     let mut seen = Vec::new();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match channel.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => {
-                    seen.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&seen)
-                        .contains("session attached to from a different connection")
-                    {
+                Some(russh::ChannelMsg::Data { data }) => seen.extend_from_slice(&data),
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                    if exit_status == DAEMON_ENDED_EXIT_STATUS {
                         superseded = true;
                     }
                 }
@@ -5097,7 +5126,12 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
     .expect("the superseded binding's channel should close within the bound");
     assert!(
         superseded,
-        "the first client saw its supersede farewell: {}",
+        "the first client saw the daemon-ended status: {}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !String::from_utf8_lossy(&seen).contains("Disconnecting"),
+        "a takeover writes no Disconnecting line into the PTY: {}",
         String::from_utf8_lossy(&seen)
     );
     assert!(closed, "the channel should close after the supersede");

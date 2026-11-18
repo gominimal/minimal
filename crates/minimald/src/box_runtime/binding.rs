@@ -1165,7 +1165,7 @@ impl Binding {
     /// whichever side of a dialog the message lands on. An associated fn
     /// taking the writer piecewise, exactly like [`Self::ask_prompt`], because
     /// [`Self::run`] holds the channel halves as locals.
-    async fn render_farewell<W>(farewell: Farewell, w: &mut W) -> MainloopExitReason
+    pub(super) async fn render_farewell<W>(farewell: Farewell, w: &mut W) -> MainloopExitReason
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
@@ -1206,20 +1206,15 @@ impl Binding {
                 }
                 MainloopExitReason::ProcessExited
             }
+            // No line here for a takeover or a daemon shutdown either: the
+            // client prints the one line that names each cause on stderr
+            // (#3035).
             Farewell::Superceded(unwind_codes) => {
                 let _ = w.write_all(&unwind_codes).await;
-                let _ = w
-                    .write_all(
-                        b"\r\nDisconnecting - session attached to from a different connection\r\n",
-                    )
-                    .await;
                 MainloopExitReason::Superceded
             }
             Farewell::DaemonShutdown(unwind_codes) => {
                 let _ = w.write_all(&unwind_codes).await;
-                let _ = w
-                    .write_all(b"\r\nDisconnecting - minimald is shutting down\r\n")
-                    .await;
                 MainloopExitReason::Shutdown
             }
             Farewell::Detach(unwind_codes) => {
