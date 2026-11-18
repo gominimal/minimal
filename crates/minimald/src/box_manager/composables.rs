@@ -982,48 +982,42 @@ mod tests {
     }
 
     /// A package declaring `env_state_wiring` with a multi-component
-    /// `prefix` (e.g. `"cache/artifacts"`) is rejected at extraction
-    /// with a descriptive `InvalidData` error. Guards the
-    /// task-vs-session divergence — the legacy `SetupForPackages`
-    /// path would silently `mkdir -p` such a prefix, but the
-    /// composition path's state-dir derivation would drop it. Rather
-    /// than pick a behavior arbitrarily, fail loudly so a package
-    /// author sees the "novel schema shape not yet supported"
-    /// message.
+    /// `prefix` (e.g. `"cache/artifacts"`) never reaches the session: the
+    /// legacy `SetupForPackages` path would `mkdir -p` such a prefix, but
+    /// the composition path's state-dir derivation would drop it. The
+    /// `attrs` contract `BuildSpec` applies refuses it when the spec
+    /// loads, so the same spec with a one-name prefix is loaded first: a
+    /// load error for another reason cannot pass for the refusal. The
+    /// refusal's text is checked by `graph::env_setup`'s
+    /// `the_prefix_rule_and_the_contract_agree`; the extraction-time
+    /// check, for a spec no contract saw, by the test after this one.
     #[test]
     fn multi_component_state_wiring_prefix_errors() {
-        let layer = Layer::new_for_test(
-            indoc! {
-                "
-                let {BuildSpec, ..} = import \"minimal.ncl\" in
-                {
-                    name = \"bad\",
-                    build_deps = [],
-                    cmd = \"\",
-                    attrs.env_state_wiring = [
-                      { env_var = \"WEIRD\", prefix = \"cache/artifacts\" },
-                    ],
-                } | BuildSpec
-                "
-            }
-            .to_string(),
-        )
-        .unwrap_or_else(|e| {
+        let spec = |prefix: &str| {
+            format!(
+                "let {{BuildSpec, ..}} = import \"minimal.ncl\" in\n\
+                 {{ name = \"bad\", build_deps = [], cmd = \"\", \
+                 attrs.env_state_wiring = [{{ env_var = \"WEIRD\", prefix = \"{prefix}\" }}] }} \
+                 | BuildSpec\n"
+            )
+        };
+
+        let layer = Layer::new_for_test(spec("artifacts")).unwrap_or_else(|e| {
             e.report_to_stderr();
-            panic!("spec parsing failed");
+            panic!("the one-name prefix did not load, so the test proves nothing");
         });
         let g = graph::Graph::new().ingest(layer).unwrap();
         let bs = g.get(g.by_name("bad").unwrap()).unwrap();
+        assert_eq!(extract_package_attrs(bs).unwrap().state_wiring.len(), 1);
 
-        let err = extract_package_attrs(bs)
-            .expect_err("multi-component prefix should error at extraction");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        let msg = err.to_string();
-        assert!(msg.contains("bad"), "error should name the package: {msg}");
-        assert!(
-            msg.contains("cache/artifacts"),
-            "error should name the offending prefix: {msg}"
-        );
+        match Layer::new_for_test(spec("cache/artifacts")) {
+            Ok(_) => panic!("a multi-component prefix loaded"),
+            Err(decode::Error::Nickel(_)) => {}
+            Err(e) => {
+                e.report_to_stderr();
+                panic!("the prefix was refused by the reader, not the contract");
+            }
+        }
     }
 
     /// The composition path re-checks both fields of a wiring entry for a
@@ -1061,6 +1055,7 @@ mod tests {
             ("1A", "gocache", "\"1A\""),
             ("A\nB", "gocache", "\"A\\nB\""),
             ("GOCACHE", "..", "\"..\""),
+            ("GOCACHE", "cache/artifacts", "\"cache/artifacts\""),
             ("GOCACHE", "cache:artifacts", "\"cache:artifacts\""),
             ("GOCACHE", "a\u{1b}[2Jb", "\"a\\u{1b}[2Jb\""),
         ] {

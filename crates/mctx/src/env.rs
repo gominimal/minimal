@@ -2701,7 +2701,7 @@ mod tests {
         std::fs::write(&helper, MIN_SCRIPT).unwrap();
 
         // The payload's marker: the crafted name would `touch` it if bash
-        // evaluated the subscript. Under the fix it must stay absent.
+        // evaluated the subscript. It must not exist after the helper runs.
         let marker = tmp.path().join("pwned");
 
         // A socat stand-in that answers a request with three `set_env:`
