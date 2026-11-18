@@ -4151,7 +4151,7 @@ struct DnsRecordBody {
 /// daemon's own client writes it (`dns_add_body`,
 /// `crates/minimald/src/net/policy.rs`).
 fn box_zone_name() -> String {
-    format!("{}.", boxes::core::zone_answer::ZONE_APEX)
+    format!("{}.", sessions::core::zone_answer::ZONE_APEX)
 }
 
 /// How many records a zone-add the decision summarizes may carry: the
