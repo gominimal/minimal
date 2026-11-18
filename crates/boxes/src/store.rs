@@ -1799,8 +1799,17 @@ fn held_name_error(name: &str, holder: &NamedBox) -> std::io::Error {
 /// row in the zone. Refused under ASCII case folding because box names are
 /// lower-cased. The two node-row labels are read from
 /// [`crate::core::zone_answer`] so this list cannot drift from the
-/// registries that key those rows.
-const RESERVED_SESSION_NAMES: [&str; 4] = [HOST_ROW_LABEL, "local", "localhost", NODE_ROW_LABEL];
+/// registries that key those rows. The last entry is `self`, the name that
+/// addresses the calling box (BOX-007): a rename to it is refused by
+/// [`crate::box_name::check_rename`] before this list is read, and a
+/// creation is refused here.
+const RESERVED_SESSION_NAMES: [&str; 5] = [
+    HOST_ROW_LABEL,
+    "local",
+    "localhost",
+    NODE_ROW_LABEL,
+    crate::box_name::RESERVED_NAME,
+];
 
 /// Reject a session name that would break a downstream output contract.
 ///
@@ -3272,6 +3281,57 @@ mod tests {
         );
         // No session directory was created for the rejected name.
         assert!(loader.keys().next().is_none());
+    }
+
+    /// BOX-007: `self` addresses the calling box, so no box is created with
+    /// that name, in any case. Each case runs in its own store, so the
+    /// refusal cannot come from a name collision, and the same store then
+    /// files a box with an ordinary name: the refusal is of the name.
+    #[test]
+    fn create_refuses_the_name_self_and_files_nothing() {
+        for name in ["self", "SELF", "Self"] {
+            let tmp = TempDir::new().unwrap();
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+            let mut record = sample_record();
+            record.name = Some(name.to_string());
+            let err = loader.create(record).expect_err(name);
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "`{name}`: {err}");
+            assert!(err.to_string().contains("`self` is reserved"), "{err}");
+            assert!(loader.keys().next().is_none(), "`{name}` filed a box");
+            assert_eq!(loader.find_by_name(name).unwrap(), None);
+
+            let mut record = sample_record();
+            record.name = Some("selfish".to_string());
+            let key = loader.create(record).unwrap();
+            assert_eq!(loader.find_by_name("selfish").unwrap(), Some(key));
+        }
+    }
+
+    /// A box that already carries the name `self` (filed before creation
+    /// refused it) keeps working: a save that does not change the name is
+    /// not a rename, so the reserved list is not read.
+    #[test]
+    fn save_of_a_record_already_named_self_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let dir = root.as_utf8_path().join("sessions").join("zzzzy");
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        let mut planted = sample_record();
+        planted.id = SessionId::from(uuid::Uuid::from_u128(0x5E1F));
+        planted.name = Some("self".to_string());
+        std::fs::write(
+            dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&planted).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.find_by_name("self").unwrap().expect("re-indexed");
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = BoxState::Active;
+        loader.save(&key, &promoted).unwrap();
+        assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active);
     }
 
     #[test]
