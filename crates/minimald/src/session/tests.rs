@@ -14095,3 +14095,36 @@ fn box_package_build_under_box_egress_verdict_builds_unenforced_box_without_rule
         None
     );
 }
+
+/// The default `minimal.toml` is written inside the box's workspace only:
+/// over a link that leads out of it, the scaffold is refused, the file
+/// outside is left as it was and the link is kept.
+#[test]
+fn a_scaffold_over_a_link_out_of_the_workspace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    let content = "[session]\npackages = [\"base\", \"vim\"]\n";
+    let link = workspace.join(mfile::MFILE_NAME);
+
+    // Control: in an empty workspace the same write lands, as a regular file.
+    super::write_default_mfile(&workspace, &link, content.to_string())
+        .expect("an empty workspace gets the default");
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_file());
+    std::fs::rename(&link, workspace.join("was-minimal.toml")).unwrap();
+
+    let outside = dir.path().join("outside.toml");
+    std::fs::write(&outside, "# outside\n").unwrap();
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let err = super::write_default_mfile(&workspace, &link, content.to_string()).unwrap_err();
+
+    // Where every link is refused (off Linux, or a kernel without
+    // `openat2`) the refusal says only that it is a link.
+    assert!(
+        err.contains("leads outside its workspace") || err.contains("cannot follow a link here"),
+        "error: {err}"
+    );
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# outside\n");
+    assert_eq!(std::fs::read_link(&link).unwrap(), outside);
+}
