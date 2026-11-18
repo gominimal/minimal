@@ -987,18 +987,29 @@ pub(super) fn leaf_lists_pid(members: &str, pid: u32) -> std::io::Result<()> {
         return Ok(());
     }
     Err(std::io::Error::other(format!(
-        "the leaf's cgroup.procs does not list pid {pid} after the write"
+        "the cgroup does not list process {pid} after the move"
     )))
 }
 
 /// The error a launch fails with when the box's supervisor could not be
 /// placed in its classifier leaf (NET-079: every process of a host-address
-/// box stays in the cgroup its verdict is decided on).
-pub(super) fn supervisor_placement_refusal() -> std::io::Error {
-    std::io::Error::other(
+/// box stays in the cgroup its verdict is decided on). `cause` is
+/// [`place_box_processes`]'s error: a leaf that is gone reads `NotFound`, a
+/// move the kernel refused reads `PermissionDenied`, and anything else,
+/// such as a leaf that does not list the supervisor after the move, says
+/// itself. The daemon logs the full error with the leaf and the pid, which
+/// a `min bug` bundle carries.
+pub(super) fn supervisor_placement_refusal(cause: &std::io::Error) -> std::io::Error {
+    let cause = match cause.kind() {
+        std::io::ErrorKind::NotFound => "The cgroup no longer exists.".to_string(),
+        std::io::ErrorKind::PermissionDenied => "The kernel refused the move.".to_string(),
+        _ => format!("The move failed: {cause}."),
+    };
+    std::io::Error::other(format!(
         "the box did not start: Minimal could not move the box's supervisor \
-         process into the cgroup that decides the box's network access",
-    )
+         process into the cgroup that decides the box's network access. {cause} \
+         If it keeps failing, run `min bug` to collect a diagnostic bundle."
+    ))
 }
 
 /// Every process of one box, as a stop signals them (BOX-013): the
