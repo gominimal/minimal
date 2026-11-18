@@ -444,8 +444,8 @@ impl BoxDir {
         id: &SessionId,
     ) -> Result<Option<Self>, std::io::Error> {
         let sessions = sub_path!(minimal_dir, "sessions");
-        let index: Index = match std::fs::File::open(sessions.as_utf8_path().join("index.json")) {
-            Ok(file) => serde_json_lenient::from_reader(file)?,
+        let index = match read_index(&sessions.as_utf8_path().join("index.json")) {
+            Ok(index) => index,
             Err(e) if e.kind() == NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
@@ -1086,17 +1086,74 @@ impl BoxObject for DiskBox {
     }
 }
 
+/// The format version this build writes into `index.json`. An index with
+/// no `format_version` is version 0. A build refuses an index with a
+/// version above this one, because a newer build wrote it.
+const INDEX_FORMAT_VERSION: u32 = 1;
+
 /// The store's index. Every map in it is keyed on the box's short
 /// directory name or on its id, never on its name (BOX-143): a name is an
 /// alias that many retained records can share (BOX-004).
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// On disk the index also carries `format_version` and a `name_to_id`
+/// map. Builds before 0.8 require `name_to_id` and ignore unknown keys,
+/// so a store this build writes stays readable by them. This build
+/// ignores `name_to_id` on read: the first open rebuilds `names` from the
+/// records.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 struct Index {
     short_to_id: BTreeMap<String, SessionId>,
-    /// Each named box's current alias, keyed on its id. An index written
-    /// before names were shared carries a `name_to_id` map instead, which
-    /// is ignored: the first open rebuilds this map from the records.
+    /// Each named box's current alias, keyed on its id.
     #[serde(default)]
     names: BTreeMap<SessionId, String>,
+}
+
+impl Serialize for Index {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct OnDisk<'a> {
+            format_version: u32,
+            short_to_id: &'a BTreeMap<String, SessionId>,
+            names: &'a BTreeMap<SessionId, String>,
+            name_to_id: BTreeMap<&'a str, SessionId>,
+        }
+        // A name can alias many boxes, and the legacy map holds one id per
+        // name. The highest id wins, so the map is deterministic.
+        let mut name_to_id = BTreeMap::new();
+        for (id, name) in &self.names {
+            name_to_id.insert(name.as_str(), *id);
+        }
+        OnDisk {
+            format_version: INDEX_FORMAT_VERSION,
+            short_to_id: &self.short_to_id,
+            names: &self.names,
+            name_to_id,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Reads `index.json` from `path`. Refuses an index whose
+/// `format_version` is newer than [`INDEX_FORMAT_VERSION`] with an
+/// `InvalidData` error that names both versions and the path.
+fn read_index(path: &camino::Utf8Path) -> Result<Index, std::io::Error> {
+    #[derive(Deserialize)]
+    struct Version {
+        #[serde(default)]
+        format_version: u32,
+    }
+    let bytes = std::fs::read(path)?;
+    let Version { format_version } = serde_json_lenient::from_slice(&bytes)?;
+    if format_version > INDEX_FORMAT_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{path} has format version {format_version}. This minimald reads format \
+                 version {INDEX_FORMAT_VERSION} or older. A newer minimald wrote this file."
+            ),
+        ));
+    }
+    Ok(serde_json_lenient::from_slice(&bytes)?)
 }
 
 impl Index {
@@ -1296,7 +1353,7 @@ impl DiskLoader {
         std::fs::create_dir_all(minimal_dir.as_utf8_path().join("sessions"))?;
         let index_file = minimal_dir.as_utf8_path().join("sessions/index.json");
         let index = if std::fs::exists(&index_file)? {
-            serde_json_lenient::from_reader(std::fs::File::open(index_file)?)?
+            read_index(&index_file)?
         } else {
             Index::default()
         };
@@ -5165,9 +5222,96 @@ mod tests {
         std::fs::write(&index_file, legacy).unwrap();
 
         let loader = DiskLoader::new(root).unwrap();
-        assert_eq!(loader.find_by_name("dev").unwrap(), Some(key));
-        let rewritten = std::fs::read_to_string(&index_file).unwrap();
-        assert!(!rewritten.contains("name_to_id"), "{rewritten}");
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(key.clone()));
+        let rewritten: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&std::fs::read_to_string(&index_file).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["names"][key.id().to_string()],
+            "dev",
+            "{rewritten}"
+        );
+    }
+
+    /// The index shape a 0.7.x minimald reads: `name_to_id` is required,
+    /// and unknown keys are ignored.
+    #[derive(Deserialize)]
+    struct LegacyIndex {
+        short_to_id: BTreeMap<String, SessionId>,
+        name_to_id: BTreeMap<String, SessionId>,
+    }
+
+    /// An index this build writes parses as the legacy shape, so a data
+    /// volume this build used still boots under a 0.7.x guest minimald.
+    #[test]
+    fn index_written_now_parses_with_the_legacy_index_shape() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let named_key = loader.create(named("dev")).unwrap();
+        let mut unnamed = named("unused");
+        unnamed.name = None;
+        let unnamed_key = loader.create(unnamed).unwrap();
+        drop(loader);
+
+        let text =
+            std::fs::read_to_string(root.as_utf8_path().join("sessions/index.json")).unwrap();
+        let legacy: LegacyIndex = serde_json_lenient::from_str(&text).unwrap();
+        assert_eq!(legacy.short_to_id.len(), 2, "{text}");
+        assert_eq!(
+            legacy.short_to_id.get(&short_of(&named_key)),
+            Some(named_key.id())
+        );
+        assert_eq!(
+            legacy.short_to_id.get(&short_of(&unnamed_key)),
+            Some(unnamed_key.id())
+        );
+        assert_eq!(
+            legacy.name_to_id,
+            BTreeMap::from([("dev".to_string(), *named_key.id())])
+        );
+        let value: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
+        assert_eq!(value["format_version"], INDEX_FORMAT_VERSION, "{text}");
+
+        // This build still opens what it wrote.
+        let loader = DiskLoader::new(root).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(named_key));
+    }
+
+    /// A store whose index a newer build wrote is refused on both open
+    /// paths, and the error names the version it found.
+    #[test]
+    fn index_with_newer_format_version_is_refused_with_a_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(named("dev")).unwrap();
+        drop(loader);
+        let index_file = root.as_utf8_path().join("sessions/index.json");
+        let mut value: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&std::fs::read_to_string(&index_file).unwrap()).unwrap();
+        let newer = INDEX_FORMAT_VERSION + 1;
+        value["format_version"] = newer.into();
+        std::fs::write(&index_file, value.to_string()).unwrap();
+
+        let Err(err) = DiskLoader::new(root.clone()) else {
+            panic!("an index with format version {newer} opened");
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("format version {newer}")), "{msg}");
+        assert!(
+            msg.contains(&format!("format version {INDEX_FORMAT_VERSION} or older")),
+            "{msg}"
+        );
+        assert!(msg.contains(index_file.as_str()), "{msg}");
+
+        let err = BoxDir::find(&root, key.id()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains(&format!("format version {newer}")));
+        // The refusal changes nothing on disk.
+        let after: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&std::fs::read_to_string(&index_file).unwrap()).unwrap();
+        assert_eq!(after["format_version"], newer);
     }
 
     proptest! {
@@ -5380,6 +5524,11 @@ mod tests {
             let index: serde_json_lenient::Value = serde_json_lenient::from_slice(&bytes).unwrap();
             let maps = index.as_object().unwrap();
             for (field, map) in maps {
+                // `name_to_id` is written only for builds before 0.8 to read.
+                // This build never reads it, so no lookup keys on a name.
+                if field == "format_version" || field == "name_to_id" {
+                    continue;
+                }
                 for map_key in map.as_object().unwrap().keys() {
                     prop_assert!(
                         is_valid_short(map_key) || SessionId::parse_str(map_key).is_ok(),
