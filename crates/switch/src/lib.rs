@@ -145,6 +145,12 @@ pub const GVPROXY_FILE: &str = "gvproxy-min";
 /// install.
 pub const PACKAGE_GVPROXY_BIN: &str = "/usr/bin/gvproxy-min";
 
+/// Where the macOS system package places the switch binary. macOS seals
+/// `/usr/bin`, so a machine-wide package there installs under `/usr/local/bin`
+/// (`packaging/macos`); without this path a package-only Mac finds no switch
+/// and its VM boots without guest egress.
+pub const LOCAL_PACKAGE_GVPROXY_BIN: &str = "/usr/local/bin/gvproxy-min";
+
 /// Operator-provisioned system-wide install path for the switch binary: the
 /// final fallback when neither a user-local nor a system package install
 /// exists.
@@ -175,8 +181,9 @@ fn installer_bin_dir() -> Option<PathBuf> {
 
 /// Resolve the switch binary an install placed on this host: an existing
 /// user-local install (`<bin-dir>/gvproxy-min`, where the curl|sh installer
-/// stamps it), else the system package install ([`PACKAGE_GVPROXY_BIN`]), else
-/// the operator-provisioned [`DEFAULT_GVPROXY_BIN`].
+/// stamps it), else the system package install ([`PACKAGE_GVPROXY_BIN`], or
+/// [`LOCAL_PACKAGE_GVPROXY_BIN`] where the macOS package puts it), else the
+/// operator-provisioned [`DEFAULT_GVPROXY_BIN`].
 ///
 /// One definition shared by `minimald` (which spawns the switch for native
 /// own-IP sessions) and `minvmd` (the host switch supervisor), so the two
@@ -189,10 +196,55 @@ fn installer_bin_dir() -> Option<PathBuf> {
 pub fn installed_gvproxy_bin() -> PathBuf {
     resolve_installed(
         installer_bin_dir(),
-        Path::new(PACKAGE_GVPROXY_BIN),
+        &package_install(&system_package_candidates()),
         Path::new(DEFAULT_GVPROXY_BIN),
         Path::new(LEGACY_SYSTEM_GVPROXY_BIN),
     )
+}
+
+/// Where a system package may have put the switch binary on this platform.
+/// `/usr/bin` is the system's own on every platform. `/usr/local/bin` is
+/// offered on macOS only, where the package installs there, and only when
+/// [`root_keeps`] it: on a Mac whose `/usr/local/bin` belongs to a user
+/// (Homebrew's Intel layout) any file there is that user's to replace, and a
+/// daemon of another user must not run it.
+fn system_package_candidates() -> Vec<&'static Path> {
+    let mut candidates = vec![Path::new(PACKAGE_GVPROXY_BIN)];
+    if cfg!(target_os = "macos") && root_keeps(Path::new(LOCAL_PACKAGE_GVPROXY_BIN)) {
+        candidates.push(Path::new(LOCAL_PACKAGE_GVPROXY_BIN));
+    }
+    candidates
+}
+
+/// Whether only root can change what `path` names: the file and the
+/// directory holding it are root's, neither is writable by group or others,
+/// and the file is no link. A file that is absent or cannot be read is not
+/// kept.
+fn root_keeps(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let closed = |p: &Path, file: bool| {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            m.uid() == 0
+                && m.mode() & 0o022 == 0
+                && if file {
+                    m.file_type().is_file()
+                } else {
+                    m.is_dir()
+                }
+        })
+    };
+    closed(path, true) && path.parent().is_some_and(|dir| closed(dir, false))
+}
+
+/// The system package's copy: the first of `candidates` that exists, else the
+/// first, which then fails the caller's own existence check.
+fn package_install(candidates: &[&Path]) -> PathBuf {
+    candidates
+        .iter()
+        .find(|path| path.exists())
+        .or(candidates.first())
+        .map(|path| path.to_path_buf())
+        .unwrap_or_default()
 }
 
 /// The resolution itself, with every probed location passed in.
@@ -1053,6 +1105,47 @@ mod tests {
             resolve_installed(Some(bin), &package, &system, &legacy),
             want
         );
+    }
+
+    /// A binary in a directory a user owns is that user's to replace, so it
+    /// is not offered to another user's daemon (differential review, F1).
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_binary_only_root_can_change_is_kept_and_a_users_is_not() {
+        // The system's own tools: root's file in root's directory.
+        assert!(root_keeps(Path::new("/bin/ls")));
+        // A file this test wrote, in a directory it owns.
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = tmp.path().join(GVPROXY_FILE);
+        std::fs::write(&mine, b"anyone's").unwrap();
+        // Root running the tests owns the file, but the temp dir's parent
+        // chain is still not the point: only the uid-0 case could pass, and
+        // then the file really is root's.
+        if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&mine).unwrap()) != 0 {
+            assert!(!root_keeps(&mine));
+        }
+        assert!(!root_keeps(&tmp.path().join("absent")));
+        // A link to a root-owned program is not the program.
+        let link = tmp.path().join("ls");
+        std::os::unix::fs::symlink("/bin/ls", &link).unwrap();
+        assert!(!root_keeps(&link));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_macos_package_path_is_found_when_the_linux_one_is_absent() {
+        // The macOS package cannot write /usr/bin; its copy under
+        // /usr/local/bin must resolve, and a Linux package's copy still wins
+        // where both exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let usr_bin = tmp.path().join("usr-bin-gvproxy-min");
+        let usr_local_bin = tmp.path().join("usr-local-bin-gvproxy-min");
+        assert_eq!(package_install(&[&usr_bin, &usr_local_bin]), usr_bin);
+        std::fs::write(&usr_local_bin, b"macOS package").unwrap();
+        assert_eq!(package_install(&[&usr_bin, &usr_local_bin]), usr_local_bin);
+        std::fs::write(&usr_bin, b"Linux package").unwrap();
+        assert_eq!(package_install(&[&usr_bin, &usr_local_bin]), usr_bin);
+        assert!(LOCAL_PACKAGE_GVPROXY_BIN.ends_with(GVPROXY_FILE));
     }
 
     #[cfg_attr(miri, ignore)]

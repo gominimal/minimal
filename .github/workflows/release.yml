@@ -1440,6 +1440,83 @@ jobs:
                   [ "$RESTAGE" != "true" ] || args+=(--restage)
                   scripts/stage-release.sh "${args[@]}"
 
+    build-macos-pkg:
+        # The macOS system package (packaging/macos/pkg/README.md): the staged
+        # row's darwin/arm64 artifacts wrapped in a product archive, signed
+        # with the Developer ID Installer identity, notarized and stapled,
+        # with a disk image around it for a download page. build-pkg.sh
+        # reads the row stage-installer just wrote, so the package carries
+        # the bytes the curl installer serves, already signed and notarized
+        # above; nothing is rebuilt here.
+        #
+        # OPT-IN: skipped until the repository variable
+        # MACOS_PKG_INSTALLER_IDENTITY names the Installer identity, which
+        # the signing keychain must hold beside the Application one (a
+        # separate certificate, same team). Nothing needs this job, so it
+        # gates no smoke, no channel and no promote: the package is an
+        # artifact of the run until a download page or an MDM takes it. A
+        # dry run stages nothing, so there is no row to package.
+        needs: [assert-version, stage-installer]
+        if: ${{ !inputs.dry_run && vars.RUN_MACOS_CI != 'false' && vars.MACOS_PKG_INSTALLER_IDENTITY != '' }}
+        runs-on: [self-hosted, macOS, ARM64, minimal-signing]
+        environment: release
+        timeout-minutes: 60
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  # Don't leave git credentials on the persistent self-hosted runner.
+                  persist-credentials: false
+            - name: Build, sign and notarize the package
+              # productbuild resolves the Installer identity by name from the
+              # search list; notarytool reads its profile from the signing
+              # keychain, as the notarization step above does. The identity
+              # is looked up first so a keychain without the certificate
+              # fails with that sentence and not productbuild's.
+              env:
+                  KC_PW: ${{ secrets.KC_PW }}
+                  NOTARY_PROFILE: ${{ vars.MACOS_NOTARY_PROFILE }}
+                  PKG_IDENTITY: ${{ vars.MACOS_PKG_INSTALLER_IDENTITY }}
+                  VERSION: ${{ needs.assert-version.outputs.version }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "$NOTARY_PROFILE" ]; then
+                    echo "::error::repository variable MACOS_NOTARY_PROFILE is not set" >&2
+                    exit 1
+                  fi
+                  KC=minimal-signing.keychain-db
+                  APP_IDENTITY="Developer ID Application: Minimal Software Research Ltd. (3G47C5HY64)"
+                  printf '%s\n' "$KC_PW" | security unlock-keychain "$KC"
+                  security list-keychains -d user -s "$KC" login.keychain-db
+
+                  if ! security find-certificate -c "$PKG_IDENTITY" "$KC" >/dev/null 2>&1; then
+                    echo "::error::the signing keychain holds no certificate named '$PKG_IDENTITY' (MACOS_PKG_INSTALLER_IDENTITY). A package needs a Developer ID Installer certificate; the Application one does not sign it." >&2
+                    exit 1
+                  fi
+
+                  packaging/macos/pkg/build-pkg.sh --version "$VERSION" \
+                    --sign "$PKG_IDENTITY" \
+                    --notarize "$NOTARY_PROFILE" \
+                    --notary-keychain "$HOME/Library/Keychains/$KC" \
+                    --dmg --sign-dmg "$APP_IDENTITY" \
+                    --out "$RUNNER_TEMP/pkg"
+                  ls -l "$RUNNER_TEMP/pkg"
+            - name: Upload the package and its disk image
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+              with:
+                  name: minimal-macos-pkg
+                  path: |
+                      ${{ runner.temp }}/pkg/*.pkg
+                      ${{ runner.temp }}/pkg/*.dmg
+                  if-no-files-found: error
+                  retention-days: 30
+            - name: Lock the signing keychain
+              # Last step of a job that unlocks it, on any outcome, so the
+              # keychain is not left open for the next job on this runner.
+              if: always()
+              run: security lock-keychain minimal-signing.keychain-db
+
     # --- Smoke: prove the artifacts this run just built actually run, BEFORE
     # anything can point a channel at them. Each smoke job downloads the
     # uploaded artifacts by name, puts the SHIPPED binaries on PATH (never a

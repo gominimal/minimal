@@ -1,0 +1,59 @@
+#!/bin/sh
+# preinstall: make room for the payload. On an upgrade (an earlier package's
+# receipt or privileged services exist) the local-range job is stopped and
+# the services' program is moved aside (Minimal.app.old), so the payload
+# writes a whole new bundle, never into an older one; the postinstall
+# restarts the box-name service on it, and puts the earlier program back
+# should it fail. Users' own daemons (minvmd, minimald)
+# are theirs and keep running the binaries they loaded until they restart;
+# an installer cannot stop a user's sessions on their behalf.
+set -eu
+# Only the base system's tools, wherever this was started from: sudo keeps
+# the caller's PATH, and a directory a user owns may be first on it.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+# A label an administrator switched off (`launchctl disable`) stays off
+# across an uninstall, and launchd then refuses the postinstall's bootstrap
+# with "5: Input/output error", which names nothing. Stop here instead,
+# before anything on this Mac changes, and say which switch it is. Switching
+# it back on is the administrator's call, not an installer's.
+off="$(launchctl print-disabled system 2>/dev/null || true)"
+for job in dev.gominimal.zone dev.minimal.local-range; do
+    if printf '%s\n' "$off" | grep -Eq "\"$job\" => (disabled|true)"; then
+        echo "minimal: the service $job is switched off on this Mac (launchctl disable), so nothing was installed or changed. Switch it on with: sudo launchctl enable system/$job  then install again" >&2
+        exit 1
+    fi
+done
+# The box-name service stays loaded through an upgrade: launchd holds its
+# UDP port for as long as the job is loaded, and the port is unprivileged,
+# so a bootout here would hand it to whichever local program asks first
+# (one loop took it during an upgrade and failed the install for every
+# user: minfarm j-0a7aeb65f643ca23). The running program keeps the file it
+# was started from when the bundle is moved aside below; the postinstall
+# restarts it on the new one, or loads the job again when its definition
+# changed. The local-range job is a one-shot with no port, and goes.
+launchctl bootout system/dev.minimal.local-range 2>/dev/null || true
+# Packages before this layout kept the service's bundle and the uninstaller
+# under /usr/local. Installer does not remove what a newer package no longer
+# carries, so the two would stay for good, in no receipt. They go here, and
+# only when the earlier receipt lists them: never a path that is a link, and
+# nothing a user put there under the same name on a Mac the package never
+# wrote to.
+earlier="$(pkgutil --files dev.minimal.min 2>/dev/null || true)"
+if printf '%s\n' "$earlier" | grep -qx 'usr/local/bin/Minimal.app'; then
+    if [ -d /usr/local/bin/Minimal.app ] && [ ! -L /usr/local/bin/Minimal.app ]; then
+        rm -rf /usr/local/bin/Minimal.app
+    fi
+fi
+if printf '%s\n' "$earlier" | grep -qx 'usr/local/share/minimal/uninstall.sh'; then
+    if [ -f /usr/local/share/minimal/uninstall.sh ] && [ ! -L /usr/local/share/minimal/uninstall.sh ]; then
+        rm -f /usr/local/share/minimal/uninstall.sh
+    fi
+fi
+bundle=/Library/PrivilegedHelperTools/Minimal.app
+# An install that stopped between this script and its postinstall left the
+# earlier program aside: it is the current one again.
+if [ ! -e "$bundle" ] && [ -d "$bundle.old" ]; then mv "$bundle.old" "$bundle"; fi
+rm -rf "$bundle.old"
+if [ -d "$bundle" ] && [ ! -L "$bundle" ]; then mv "$bundle" "$bundle.old"; fi
+exit 0

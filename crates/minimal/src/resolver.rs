@@ -379,35 +379,31 @@ pub(crate) const ANSWERER_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.gominim
 /// walk. `/private/var/log` is root's with no group write on a stock
 /// macOS, which the walk requires and `/Library/Logs` does not give.
 #[cfg(any(test, target_os = "macos"))]
-pub(crate) const MACOS_ANSWERER_LOG_DIR: &str = "/private/var/log/minimal";
+pub(crate) const MACOS_ANSWERER_LOG_DIR: &str = minvmd::net::answerer_log::MACOS_LOG_DIR;
 
 /// The file the macOS answerer service's stdout and stderr go to
 /// (`StandardOutPath` and `StandardErrorPath`), and the file `min bug`
 /// collects. The step makes it the operator's, mode 0644, so the service
 /// and the size cap ([`ANSWERER_LOG_CAP_PLIST`]) both run as the operator.
 #[cfg(any(test, target_os = "macos"))]
-pub(crate) const MACOS_ANSWERER_LOG_PATH: &str = "/private/var/log/minimal/minzoned.log";
+pub(crate) const MACOS_ANSWERER_LOG_PATH: &str = minvmd::net::answerer_log::MACOS_LOG_PATH;
 
 /// The size past which the cap job cuts the log down
 /// ([`ANSWERER_LOG_KEEP_BYTES`]): 1 MiB.
 #[cfg(any(test, target_os = "macos"))]
-const ANSWERER_LOG_MAX_BYTES: u64 = 1024 * 1024;
+const ANSWERER_LOG_MAX_BYTES: u64 = minvmd::net::answerer_log::MAX_BYTES;
 
 /// What the cap job keeps of an oversized log: its last 256 KiB.
 #[cfg(any(test, target_os = "macos"))]
-const ANSWERER_LOG_KEEP_BYTES: u64 = 256 * 1024;
-
-/// How often the cap job runs, in seconds: hourly.
-#[cfg(any(test, target_os = "macos"))]
-const ANSWERER_LOG_CAP_INTERVAL_SECS: u32 = 3600;
+const ANSWERER_LOG_KEEP_BYTES: u64 = minvmd::net::answerer_log::KEEP_BYTES;
 
 /// launchd's job label for the log's size cap.
 #[cfg(any(test, target_os = "macos"))]
-const ANSWERER_LOG_CAP_LABEL: &str = "dev.gominimal.zone.logcap";
+const ANSWERER_LOG_CAP_LABEL: &str = minvmd::net::answerer_log::CAP_LABEL;
 
-/// The plist of the log's size cap ([`ANSWERER_LOG_CAP_TEMPLATE`]).
+/// The plist of the log's size cap ([`minvmd::net::answerer_log::cap_plist`]).
 #[cfg(any(test, target_os = "macos"))]
-const ANSWERER_LOG_CAP_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.gominimal.zone.logcap.plist";
+const ANSWERER_LOG_CAP_PLIST_PATH: &str = minvmd::net::answerer_log::CAP_PLIST_PATH;
 
 /// The root-owned path the answerer program is copied to on Linux — never
 /// a user-writable binary, the same rule as [`MACOS_ANSWERER_PROGRAM_PATH`]'s
@@ -533,41 +529,6 @@ const ANSWERER_PLIST_TEMPLATE: &str = "\
 \t<key>RunAtLoad</key>
 \t<true/>
 \t<key>KeepAlive</key>
-\t<true/>
-</dict>
-</plist>
-";
-
-/// The launchd unit that keeps the answerer's log ([`MACOS_ANSWERER_LOG_PATH`])
-/// bounded. launchd has no size limit for `StandardOutPath`, and the
-/// service holds the file open for as long as it runs, so a rename-based
-/// rotation would leave it writing to the renamed file. launchd opens the
-/// log for append, so a cut in place is safe: every
-/// [`ANSWERER_LOG_CAP_INTERVAL_SECS`], a log over [`ANSWERER_LOG_MAX_BYTES`]
-/// is cut to its last [`ANSWERER_LOG_KEEP_BYTES`]. The job runs as the
-/// operator, who owns the log, never as root.
-///
-/// The script writes the body under a quoted heredoc, so nothing in it
-/// expands. `__SCRIPT__` is XML-escaped text.
-#[cfg(any(test, target_os = "macos"))]
-const ANSWERER_LOG_CAP_TEMPLATE: &str = "\
-<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
-<dict>
-\t<key>Label</key>
-\t<string>dev.gominimal.zone.logcap</string>
-\t<key>ProgramArguments</key>
-\t<array>
-\t\t<string>/bin/sh</string>
-\t\t<string>-c</string>
-\t\t<string>__SCRIPT__</string>
-\t</array>
-\t<key>UserName</key>
-\t<string>__OPERATOR__</string>
-\t<key>StartInterval</key>
-\t<integer>__INTERVAL__</integer>
-\t<key>RunAtLoad</key>
 \t<true/>
 </dict>
 </plist>
@@ -1871,7 +1832,8 @@ fn plist_string_array(text: &str, key: &str) -> Option<Vec<String>> {
     Some(values)
 }
 
-/// `text` with the five XML escapes [`xml_escape`] writes undone.
+/// `text` with the five XML escapes
+/// [`minvmd::net::answerer_log::xml_escape`] writes undone.
 #[cfg(any(test, target_os = "macos"))]
 fn xml_unescape(text: &str) -> String {
     text.replace("&lt;", "<")
@@ -2134,7 +2096,7 @@ fn refuse_replacing_the_shared(step: AnswererStep, shared: &SharedService) -> An
 /// it, never `min finalize-install`.
 pub(crate) const SHARED_SERVICE_REMEDY: &str = "A newer minimal package upgrades it \
     (sudo installer -pkg minimal-VERSION.pkg -target /), and its uninstaller removes it \
-    (sudo /usr/local/share/minimal/uninstall.sh)";
+    (sudo \"/Library/Application Support/minimal/uninstall.sh\")";
 
 /// Whether the account of `uid` is in the group `gid`, by the service's
 /// own definition ([`minvmd::net::answerer::uid_in_group`]), so `--show`
@@ -4125,40 +4087,20 @@ fn answerer_unit_plist(install: &AnswererInstall) -> String {
         .replace("__CHANNEL__", &install.channel)
 }
 
-/// The shell line the cap job runs ([`ANSWERER_LOG_CAP_TEMPLATE`]): when
-/// the log is over [`ANSWERER_LOG_MAX_BYTES`], copy its tail to a temp
-/// file and write it back over the log. The operator cannot create a file
-/// in the root-owned log directory, so the temp file is `mktemp`'s.
+#[cfg(test)]
+use minvmd::net::answerer_log::xml_escape;
+
+/// The shell line the cap job runs, from the one definition `minzoned
+/// log-cap-unit` prints too ([`minvmd::net::answerer_log`]).
 #[cfg(any(test, target_os = "macos"))]
 fn answerer_log_cap_script() -> String {
-    format!(
-        "f={MACOS_ANSWERER_LOG_PATH}; \
-         [ \"$(stat -f %z \"$f\" 2>/dev/null || echo 0)\" -gt {ANSWERER_LOG_MAX_BYTES} ] || exit 0; \
-         t=$(mktemp) || exit 1; \
-         tail -c {ANSWERER_LOG_KEEP_BYTES} \"$f\" > \"$t\" && cat \"$t\" > \"$f\"; \
-         rm -f \"$t\""
-    )
+    minvmd::net::answerer_log::cap_script()
 }
 
-/// The cap's launchd unit, rendered from [`ANSWERER_LOG_CAP_TEMPLATE`]
-/// for the operator the answerer runs as.
+/// The cap's launchd unit for the operator the answerer runs as.
 #[cfg(any(test, target_os = "macos"))]
 fn answerer_log_cap_plist(install: &AnswererInstall) -> String {
-    ANSWERER_LOG_CAP_TEMPLATE
-        .replace("__SCRIPT__", &xml_escape(&answerer_log_cap_script()))
-        .replace("__OPERATOR__", &install.operator)
-        .replace("__INTERVAL__", &ANSWERER_LOG_CAP_INTERVAL_SECS.to_string())
-}
-
-/// `text` with the five XML special characters escaped, for a value the
-/// plist carries inside a `<string>`.
-#[cfg(any(test, target_os = "macos"))]
-fn xml_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    minvmd::net::answerer_log::cap_plist(&install.operator)
 }
 
 /// The answerer's systemd socket unit, rendered from
@@ -4873,6 +4815,152 @@ pub(crate) fn shared_service_undo_refusal(unit_text: &str) -> Option<String> {
          them and leave the rest of the package, so nothing was run. \
          {SHARED_SERVICE_REMEDY}"
     ))
+}
+
+/// What `min finalize-install --show` says of the names item when no daemon
+/// reports a port and nothing answers on the one the host's hook names,
+/// on a host whose installed answerer unit is a shared service's (the
+/// minimal package's): that service is the one not running, and an
+/// administrator is who looks. "No daemon is reachable" sends a user to
+/// their own daemons, which a package install does not use for names; the
+/// commonest cause is a service an administrator switched off. `None`
+/// when no unit is installed, it cannot be read, or it is one operator's:
+/// the caller keeps its own wording.
+pub(crate) fn shared_service_not_running_on_this_host() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let path = ANSWERER_PLIST_PATH;
+    #[cfg(not(target_os = "macos"))]
+    let path = ANSWERER_UNIT_SERVICE_PATH;
+    match read_installed_unit(path) {
+        UnitRead::Text(text) => shared_service_not_running(&text),
+        UnitRead::Absent | UnitRead::Unreadable(_) => None,
+    }
+}
+
+/// [`shared_service_not_running_on_this_host`] over a unit's text. Pure.
+pub(crate) fn shared_service_not_running(unit_text: &str) -> Option<String> {
+    let group = unit_admit_group(unit_text)?;
+    #[cfg(target_os = "macos")]
+    let look = format!(
+        "an administrator sees why with `sudo launchctl print system/{ANSWERER_LAUNCHD_LABEL}`; \
+         when it was switched off (System Settings > General > Login Items, or `launchctl \
+         disable`), they switch it on and install the package again"
+    );
+    #[cfg(not(target_os = "macos"))]
+    let look = "an administrator sees why with `systemctl status` on the service".to_string();
+    Some(format!(
+        "the DNS service the minimal package installed for the group {group} is not \
+         answering on this machine, so box names do not resolve: {look}"
+    ))
+}
+
+/// What the service manager says of the job the installed shared service
+/// runs under. launchd makes that job's UDP listener and holds it for as
+/// long as the job is loaded, whether or not the program is running
+/// (measured on a package install: a user's bind of the port is refused
+/// with every reuse option, the program stopped or not). So on a host
+/// with a shared service, a reply on the port is the service's only
+/// while the job is loaded; with it booted out, the port is any local
+/// program's to take, and a DNS reply from there proves nothing.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedServiceJob {
+    /// No shared service is installed here (no unit, one operator's, or
+    /// one that could not be read): there is no job to tie the port to.
+    NotShared,
+    /// The job is loaded: the port is the service manager's.
+    Loaded,
+    /// The service manager has no such job.
+    NotLoaded,
+    /// The service manager did not say.
+    Unread,
+}
+
+/// `launchctl print`'s status for a job that is not loaded ("Could not
+/// find service"), measured as root and as a standard user.
+#[cfg(any(test, target_os = "macos"))]
+const LAUNCHCTL_NO_SUCH_JOB: i32 = 113;
+
+/// [`SharedServiceJob`] from a `launchctl print system/<label>` of the
+/// shared service's job: `None` when the call did not run or outlived
+/// its bound, else its exit status (`None` again when a signal ended
+/// it). Only launchd's own "no such job" reads as not loaded: a call
+/// that could not look is not a job that is gone. Pure.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn shared_service_job_from(print: Option<Option<i32>>) -> SharedServiceJob {
+    match print {
+        Some(Some(0)) => SharedServiceJob::Loaded,
+        Some(Some(LAUNCHCTL_NO_SUCH_JOB)) => SharedServiceJob::NotLoaded,
+        Some(_) | None => SharedServiceJob::Unread,
+    }
+}
+
+/// [`SharedServiceJob`] on this host: the root-owned unit says whether a
+/// shared service is installed, and one read-only `launchctl print` of
+/// the system's own tool, with an empty environment and bounded by
+/// [`LAUNCHCTL_BOUND`], says whether its job is loaded. A standard user
+/// may ask. macOS only: a systemd socket unit holds the port the same
+/// way, but that has not been measured, so Linux judges nothing here.
+#[cfg(target_os = "macos")]
+async fn shared_service_job_on_this_host() -> SharedServiceJob {
+    let shared = match read_installed_unit(ANSWERER_PLIST_PATH) {
+        UnitRead::Text(text) => unit_admit_group(&text).is_some(),
+        UnitRead::Absent | UnitRead::Unreadable(_) => false,
+    };
+    if !shared {
+        return SharedServiceJob::NotShared;
+    }
+    let print = tokio::time::timeout(
+        LAUNCHCTL_BOUND,
+        tokio::process::Command::new("/bin/launchctl")
+            .arg("print")
+            .arg(format!("system/{ANSWERER_LAUNCHD_LABEL}"))
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(|status| status.code());
+    shared_service_job_from(print)
+}
+
+/// [`port_not_the_shared_services`] over this host's own job read: what
+/// the names item says instead of "done" when a reply on `port` is not
+/// the installed shared service's to give.
+#[cfg(target_os = "macos")]
+pub(crate) async fn answer_not_the_shared_services(port: u16) -> Option<String> {
+    port_not_the_shared_services(port, shared_service_job_on_this_host().await)
+}
+
+/// What the names item says when something answers DNS on `port` and the
+/// shared service's job is not what holds it (`job` is
+/// [`SharedServiceJob::NotLoaded`] or [`SharedServiceJob::Unread`]):
+/// whose answer it is not, and what an administrator runs. `None` for a
+/// job that is loaded or a host with no shared service, where the reply
+/// stands. Pure.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn port_not_the_shared_services(port: u16, job: SharedServiceJob) -> Option<String> {
+    match job {
+        SharedServiceJob::NotShared | SharedServiceJob::Loaded => None,
+        SharedServiceJob::NotLoaded => Some(format!(
+            "a program is answering DNS on 127.0.0.1:{port}, and it is not the service the \
+             minimal package installed (launchd has no job {ANSWERER_LAUNCHD_LABEL} loaded), \
+             so what box names resolve to on this machine is that program's say: an \
+             administrator finds it with `sudo lsof -nP -iUDP:{port}`, stops it, and \
+             installs the package again"
+        )),
+        SharedServiceJob::Unread => Some(format!(
+            "launchd did not say whether the DNS service the minimal package installed is \
+             loaded, so what answers on 127.0.0.1:{port} is unconfirmed: `launchctl print \
+             system/{ANSWERER_LAUNCHD_LABEL}` shows the job, and `min finalize-install \
+             --show` reads it again"
+        )),
+    }
 }
 
 /// [`other_operator_refusal`] over this host's installed answerer unit and
@@ -6805,6 +6893,52 @@ pub(crate) mod tests {
         );
     }
 
+    /// Only launchd's own "no such job" says the shared service's job is
+    /// gone; a print that did not run, timed out, was killed or failed
+    /// some other way is unread, and neither lets a reply on the port
+    /// stand as the service's.
+    #[test]
+    fn a_reply_on_the_port_is_the_shared_services_only_while_its_job_is_loaded() {
+        assert_eq!(
+            shared_service_job_from(Some(Some(0))),
+            SharedServiceJob::Loaded
+        );
+        assert_eq!(
+            shared_service_job_from(Some(Some(113))),
+            SharedServiceJob::NotLoaded
+        );
+        for unread in [None, Some(None), Some(Some(1)), Some(Some(64))] {
+            assert_eq!(
+                shared_service_job_from(unread),
+                SharedServiceJob::Unread,
+                "{unread:?}"
+            );
+        }
+        assert_eq!(
+            port_not_the_shared_services(7656, SharedServiceJob::Loaded),
+            None
+        );
+        assert_eq!(
+            port_not_the_shared_services(7656, SharedServiceJob::NotShared),
+            None
+        );
+        let foreign = port_not_the_shared_services(7656, SharedServiceJob::NotLoaded)
+            .expect("a reply with no job loaded is named");
+        assert!(
+            foreign.contains("it is not the service the minimal package installed"),
+            "{foreign}"
+        );
+        assert!(foreign.contains("sudo lsof -nP -iUDP:7656"), "{foreign}");
+        assert!(foreign.contains("dev.gominimal.zone"), "{foreign}");
+        let unread = port_not_the_shared_services(7656, SharedServiceJob::Unread)
+            .expect("an unread job is named");
+        assert!(unread.contains("is unconfirmed"), "{unread}");
+        assert!(
+            unread.contains("launchctl print system/dev.gominimal.zone"),
+            "{unread}"
+        );
+    }
+
     /// The liveness query's negative arms, the ones a unit test can pin
     /// without the answerer: a port nothing answers — held by a silent
     /// process, or free — is not a bound answerer, whatever the status
@@ -8280,6 +8414,17 @@ exit 0
                 None
             );
             assert_eq!(unit_admit_group(&shared), Some("_minimal"));
+            // The status line for a shared service that does not answer
+            // names the service and who looks, and says nothing for one
+            // operator's unit.
+            let stopped = shared_service_not_running(&shared)
+                .expect("a shared service's unit has its own status wording");
+            assert!(
+                stopped.contains("the minimal package installed for the group _minimal"),
+                "{stopped}"
+            );
+            assert!(stopped.contains("an administrator sees why"), "{stopped}");
+            assert_eq!(shared_service_not_running(text), None);
             assert_eq!(
                 unit_admit_group("ExecStart=/x/minzoned --admit-group minimal --bindings /f"),
                 Some("minimal")
@@ -8375,6 +8520,39 @@ exit 0
                 None
             );
         }
+    }
+
+    /// The macOS package installs the log and its size cap for the shared
+    /// service from its own postinstall. It carries no copy of the cap's
+    /// unit: it asks the service's program for it (`minzoned log-cap-unit`),
+    /// which prints the text these checks read. The log's place is still
+    /// written in the script, so it is checked here.
+    #[test]
+    fn the_macos_package_installs_the_log_and_cap_these_checks_expect() {
+        let postinstall = include_str!("../../../packaging/macos/pkg/scripts/postinstall");
+        assert!(
+            postinstall.contains("minzoned\" log-cap-unit --user \"$role\" > \"$cap\""),
+            "the postinstall writes the unit minzoned prints"
+        );
+        assert!(
+            !postinstall.contains("stat -f %z"),
+            "and keeps no copy of the cap's shell line"
+        );
+        let unit = minvmd::net::answerer_log::cap_plist("_minimal");
+        let arguments =
+            plist_string_array(&unit, "ProgramArguments").expect("the cap names its arguments");
+        let root = Some(FileCustody {
+            owner: 0,
+            mode: 0o644,
+        });
+        assert_eq!(answerer_log_cap_check(root, Some(&arguments)), None);
+        assert!(
+            postinstall.contains(&format!("logdir={MACOS_ANSWERER_LOG_DIR}\n"))
+                && postinstall.contains("log=\"$logdir/minzoned.log\"\n")
+                && MACOS_ANSWERER_LOG_PATH == format!("{MACOS_ANSWERER_LOG_DIR}/minzoned.log")
+                && postinstall.contains("<key>StandardErrorPath</key>\n    <string>$log</string>"),
+            "the service's unit logs where answerer_log_check expects"
+        );
     }
 
     /// The log's size-cap unit is one of the step's custody checks: the
