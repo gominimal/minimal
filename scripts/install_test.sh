@@ -498,13 +498,22 @@ cat >"$remedybin/sudo" <<'STUB'
 exec "$@"
 STUB
 chmod +x "$remedybin/sudo"
-for _rb_cmd in systemctl nft gpasswd apparmor_parser ip resolvectl launchctl; do
+for _rb_cmd in systemctl nft gpasswd apparmor_parser ip resolvectl launchctl ifconfig; do
     cat >"$remedybin/$_rb_cmd" <<STUB
 #!/bin/sh
 printf '%s %s\\n' "$_rb_cmd" "\$*" >>"$remedy_calls"
 STUB
     chmod +x "$remedybin/$_rb_cmd"
 done
+# pgrep logs its call and finds no process unless $remedy_vm exists, so a
+# scenario can say a VM is running.
+remedy_vm="$root/remedy.vm"
+cat >"$remedybin/pgrep" <<STUB
+#!/bin/sh
+printf 'pgrep %s\\n' "\$*" >>"$remedy_calls"
+[ -e "$remedy_vm" ]
+STUB
+chmod +x "$remedybin/pgrep"
 for _rb_cmd in rm rmdir find; do
     _rb_real="$(command -v "$_rb_cmd")"
     # A builtin or an alias comes back as a bare name, and the link would
@@ -916,13 +925,43 @@ EOF
         "Library/Application Support/minimal"; do
         want_err "darwin: the printed remedy removes $f" test -e "$fake_nsd/$f"
     done
-    for f in Library/LaunchDaemons Library/PrivilegedHelperTools "Library/Application Support"; do
+    for f in Library/LaunchDaemons "Library/Application Support"; do
         want_ok "darwin: the system directory $f stays" test -d "$fake_nsd/$f"
+    done
+    for f in etc/resolver Library/PrivilegedHelperTools; do
+        want_err "darwin: the printed remedy removes the empty directory $f" test -e "$fake_nsd/$f"
     done
     for job in dev.gominimal.zone dev.minimal.local-range; do
         want_ok "darwin: the remedy boots out $job" \
             grep -qx "launchctl bootout system/$job" "$remedy_calls"
     done
+    want_ok "darwin: the remedy asks whether a VM is running" \
+        grep -qx "pgrep -qx minvmd" "$remedy_calls"
+    for addr in 127.0.64.1 127.0.64.128 127.0.64.254; do
+        want_ok "darwin: the remedy removes the lo0 alias $addr" \
+            grep -qx "ifconfig lo0 -alias $addr" "$remedy_calls"
+    done
+    check 254 "$(grep -c '^ifconfig lo0 -alias 127\.0\.64\.' "$remedy_calls")" \
+        "darwin: the remedy removes all 254 lo0 aliases"
+    want_err "darwin: the remedy removes no alias outside 127.0.64.1-254" \
+        grep -qE "^ifconfig lo0 -alias 127\.0\.64\.(0|255)\$" "$remedy_calls"
+    want_ok "darwin: the note says the DNS service runs until the commands run" \
+        grep -q "The DNS service (launchd job dev.gominimal.zone) keeps running until these commands run." "$OUT"
+
+    # A VM is running: the aliases stay and the line says why.
+    : >"$remedy_vm"
+    _vm_line="$(awk '/^      /{sub(/^      /, ""); print; exit}' "$OUT")"
+    : >"$remedy_calls"
+    _vm_err="$( (cd "$root" && HOME="$root" PATH="$remedybin" "$remedy_sh" -c "$_vm_line") 2>&1)"
+    check 0 "$?" "darwin: the remedy runs while a VM is running"
+    rm -f "$remedy_vm"
+    want_err "darwin: the remedy keeps the lo0 aliases while a VM is running" \
+        grep -q "^ifconfig " "$remedy_calls"
+    case "$_vm_err" in
+        *"the loopback IPs boxes use stay on lo0 while a VM is running"*) _vm_said=1 ;;
+        *) _vm_said=0 ;;
+    esac
+    check 1 "$_vm_said" "darwin: the remedy says the aliases stay while a VM is running"
 
     HNS2="$root/hns2"; mkdir -p "$HNS2"
     run ns2_seed "$HNS2"
