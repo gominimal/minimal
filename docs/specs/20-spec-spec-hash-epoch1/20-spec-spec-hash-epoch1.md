@@ -44,17 +44,22 @@ names it selects. A spec's edges enter its encoding as a set ordered by
 those bytes, so neither the order a recipe lists them in nor a repeated
 listing is part of the canonical form. A **container's canonical form** is
 the container field list below. Its members enter it as the set of their
-keys. Specs or containers with
+keys. A **subset's canonical form** is the subset field list below: its
+components as a set ordered by their bytes, each with its output names as
+a set. Specs, subsets or containers with
 different canonical forms are **canonically distinct**. A **bounded spec**
 has at most 3 elements in any list, set or map, its edges included. It has
 at most 8 bytes in any string, and each edge key is an arbitrary 32-byte
 value. A **bounded container** has at most 3
 elements in any list, set or map, at most 8 bytes in any string, and up to 3
-arbitrary 32-byte member keys. Edges and members enter an encoding as keys.
+arbitrary 32-byte member keys. A **bounded subset** has up to 3
+components, each an arbitrary 32-byte spec key with up to 3 output names
+of at most 8 bytes. Edges, members and components enter an encoding as
+keys.
 So a harness ranges over the key bytes, never runs the hash symbolically,
 and has no dependency depth to bound. Harnesses that are exhaustive over
-bounded specs or containers state nothing beyond that domain. The **epoch-1
-context** is the Blake3 `derive_key` context string
+bounded specs, subsets or containers state nothing beyond that domain.
+The **epoch-1 context** is the Blake3 `derive_key` context string
 `minimal.dev spec-hash epoch 1`.
 
 D3.1 leaves three things to each epoch's spec: the field enumeration, the
@@ -81,11 +86,10 @@ encoding**.
     It can also be a list or a map of attribute values.
   - The edges, as a set. An edge's kind is build input, runtime dependency
     or replace-on-cycle.
-- **Outside a spec's canonical form:** `tests` (EPOCH-010, decision 1 of
-  minimal#1246), the attributes defined on the spec (`attrs`) and its
-  origin (`from`). The diagnostic fields are also outside: `url_pos`,
-  `sha256_pos`, `full_path` and the positions of strings. Epoch 0 leaves
-  all of these out too.
+- **Outside a spec's canonical form:** `tests` (EPOCH-010), the attributes
+  defined on the spec (`attrs`) and its origin (`from`). The diagnostic
+  fields are also outside: `url_pos`, `sha256_pos`, `full_path` and the
+  positions of strings. Epoch 0 leaves all of these out too.
 - **Subset fields.** A subset is a set of components. Each component
   holds the epoch-1 key of a spec and the set of output names the subset
   takes from that spec.
@@ -379,25 +383,18 @@ build-infra operator. Release manager.
     property: encode({Av: B}) != encode({A: vB})
 
 - **EPOCH-014** WHEN the system computes a container key THE SYSTEM SHALL
-  enter each member package by its key under the container's epoch. A
-  container's epoch is the one the producing side is configured to seal
-  at: the same value that selects the spec and subset encoders, epoch 1
-  once the flip has moved it (EPOCH-015 derives the key under the epoch-1
-  context).
+  enter each member package by the key that the same graph computes for
+  that member under the container's epoch. A container's epoch is the one
+  the producing side is configured to seal at: the same value that selects
+  the spec and subset encoders, epoch 1 once the flip has moved it
+  (EPOCH-015 derives the key under the epoch-1 context). A key carries no
+  epoch in its bytes, so the hasher never reads a member key from an index
+  record; every member key it enters is of the container's epoch by
+  construction.
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_container_members_by_key
   property: for all containers c, members m of c: the member bytes of
-    encode(c) are hash_e(m) for the epoch e of c's key
-  - IF a member's key is not of the container's epoch THEN THE SYSTEM SHALL
-    refuse to seal the container. The message names the container, the
-    member, the member's epoch and the container's epoch. It tells the
-    person to reseal the member's index under the container's epoch and
-    then seal the container again. A key carries no
-    epoch in its bytes. The member's epoch is the one the index record its
-    key was read from declares (EPOCH-009), and the sealer hands the hasher
-    each member key with that epoch.
-    tier:   T0
-    verify: cargo nextest run -p rcache container_with_a_member_of_another_epoch_is_refused
+    encode(c) are hash_e(m) for the container's epoch e
 
 - **EPOCH-015** WHEN the system computes a container key for a container
   whose epoch is 1 (EPOCH-014) THE SYSTEM SHALL derive it under the epoch-1
@@ -458,12 +455,32 @@ build-infra operator. Release manager.
   a key of another under the one epoch-1 context. Epoch 0 leads with
   `build spec`, `subset` and `container`; epoch 1 keeps one leading tag per
   kind, and the three injectivity requirements (EPOCH-001, EPOCH-013,
-  EPOCH-017) then compose across kinds.
+  EPOCH-023) then compose across kinds.
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_kinds_lead_with_distinct_tags
   property: for all specs s, subsets u, containers c: lead(encode(s)),
     lead(encode(u)) and lead(encode(c)) are pairwise distinct, so no two
     of encode(s), encode(u), encode(c) are equal
+
+- **EPOCH-023** THE SYSTEM SHALL encode canonically distinct subsets to
+  distinct byte strings.
+  tier:     T2
+  verify:   cargo nextest run -p graph epoch1_subset_injectivity_bounded
+  property: for all canonical subsets a, b: a != b implies
+    encode(a) != encode(b), whether they differ in a component's spec key,
+    in a component's output names or in their sets of components
+  harness:  kani_epoch1_subset_injectivity_bounded, exhaustive over
+    bounded subsets (up to 3 components, each an arbitrary 32-byte spec
+    key with up to 3 output names of at most 8 bytes), unwind 33 (the
+    32-byte spec-key loop; output names need less)
+
+- **EPOCH-024** THE SYSTEM SHALL decode every epoch-1 subset encoding back
+  to the canonical form of the subset it encodes.
+  tier:     T2
+  verify:   cargo nextest run -p graph epoch1_subset_roundtrip_bounded
+  property: for all bounded subsets u: decode(encode(u)) == canon(u)
+  harness:  kani_epoch1_subset_roundtrip_bounded, exhaustive over bounded
+    subsets, unwind 33
 
 ## Non-goals
 
@@ -521,7 +538,7 @@ in the formal-verification path.
 D3.1 has four commitments, and each maps to requirements:
 
 - injective over the closure's meaning: EPOCH-001, EPOCH-002, EPOCH-004,
-  EPOCH-013 and, across kinds, EPOCH-022
+  EPOCH-013, EPOCH-023 and, across kinds, EPOCH-022
 - epochs by domain-separated context at a fixed 32 bytes, declared by the
   index and followed by consumers: EPOCH-005, EPOCH-009, EPOCH-012,
   EPOCH-014, EPOCH-015 and EPOCH-019
@@ -583,8 +600,11 @@ test never rotates a key, and a person can re-run tests without a rebuild.
 The write-guard makes that assumption real instead of hashing around it.
 The subset key (EPOCH-011) follows the spec key's epoch because witness
 class 9 is its collision family. Its output names are length-framed
-(EPOCH-017) because witness class 4 is. A subset computed under another
-epoch cannot find the index of its spec.
+(EPOCH-017) because witness class 4 is. EPOCH-023 and EPOCH-024 hold the
+subset's injectivity and round-trip over bounded subsets, as EPOCH-013 and
+EPOCH-016 do for containers, so class 9 is refuted over the whole bounded
+domain and not only on its witness pair (EPOCH-004). A subset computed
+under another epoch cannot find the index of its spec.
 
 The container key (EPOCH-013, EPOCH-014, EPOCH-015, EPOCH-020) is the same
 codec with container tags. EPOCH-016 and EPOCH-007's container harness
@@ -592,12 +612,13 @@ cover the container round-trip and the unknown-tag rejection in container
 position. The container encoder chooses its encoder at its own call site.
 The flip must move that site together with the spec and subset sites, or
 containers stay on epoch 0 with the container witness pinned. A container
-is a declaration over packages. Its members enter by key. A key's epoch is
-the one its index record declares, because nothing in the key's bytes says
-it. So a container key is well-defined only when every member key is of
-the container's epoch. EPOCH-014's refusal makes that a requirement rather
-than an inference from EPOCH-009. A member may well sit in another index
-of another epoch. Before the flip a container key is an epoch-0 key.
+is a declaration over packages. Its members enter by key. A container key
+is well-defined only when every member key is of the container's epoch.
+The hasher computes each member key from the graph, under the same encoder
+choice that keys the container (EPOCH-014), so that holds by construction
+and needs no check. A member with no record under the container's epoch
+in an index is a cache miss, and the member rebuilds, as any miss does.
+Before the flip a container key is an epoch-0 key.
 Today no index holds a container record, so the container keyspace has
 nothing to rotate. The epoch-0 container witness (EPOCH-013) is a property
 of the epoch-0 encoding and not of a stored key.
@@ -630,7 +651,8 @@ reuses them.
   specs the same cache key except through a Blake3 collision.
   enforced by: prefix-free TLV encoding, with machine-checked bounded
   injectivity and witness refutations
-  covered by: EPOCH-001, EPOCH-004, EPOCH-011, EPOCH-013, EPOCH-017
+  covered by: EPOCH-001, EPOCH-004, EPOCH-011, EPOCH-013, EPOCH-017,
+    EPOCH-022, EPOCH-023
 - **Invariant:** THE SYSTEM SHALL never silently absorb unknown structure
   into a hash preimage.
   enforced by: the encoder, which emits only the tags of its epoch for the
@@ -659,13 +681,14 @@ reuses them.
   that seals the first epoch-1 snapshot. Until it does, the snapshot's
   root-index fallback is withheld (EPOCH-012). No lookup unions the two
   epochs, and for a client at or after the reading release the flip shows
-  misses and never refusals, with two exceptions the flip itself can force
+  misses and never refusals, with one exception the flip itself can force
   while producers are mid-flip: a lookup over an upstream index and
-  sideloads on different epochs is refused (EPOCH-012), and sealing a
-  container with a member of another epoch is refused (EPOCH-014). Both
-  end when the sideloads and the container's members reseal under epoch 1,
-  which the producing side does in the same cycle as the root index: one
-  config value, one flip. A client before the reading release refuses the
+  sideloads on different epochs is refused (EPOCH-012). It ends when the
+  sideloads reseal under epoch 1, which the producing side does in the
+  same cycle as the root index: one config value, one flip. A container's
+  member keys are computed under the container's epoch (EPOCH-014), so a
+  member not yet sealed under epoch 1 is a miss that rebuilds. A client
+  before the reading release refuses the
   first epoch-1 index as any unknown epoch (EPOCH-009), which is why the
   reading release ships first and the flip waits until the fleet is on
   it. The catalog
@@ -686,13 +709,6 @@ reuses them.
   see cache misses, and never wrong data. Record layouts do not change.
 
 ## Open questions
-
-Settled in this spec, not open: decision 1 of minimal#1246 (`tests` stay
-outside the canonical form, with the write-guard: EPOCH-010) and decision 5
-(additive evolution by reserved tag, with an unknown tag a hard error:
-EPOCH-007, EPOCH-021). A flip of either reopens the canonical form, EPOCH-010
-and the Success claim together, and is a new revision of this spec, not an
-amendment.
 
 - [NEEDS CLARIFICATION (HIGH): the mechanism of EPOCH-010's write guard for a
   `build_test` test. A standalone test already runs in a test sandbox whose
