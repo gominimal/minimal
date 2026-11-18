@@ -10,6 +10,7 @@ publish.workspace = true
 [dev-dependencies]
 mockall = "0.15"
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
 
 [dependencies]
 tracing.workspace = true

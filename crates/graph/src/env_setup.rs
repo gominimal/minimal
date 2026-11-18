@@ -297,8 +297,8 @@ mod tests {
                     name = \"b1\",
                     build_deps = [],
                     cmd = \"\",
-                    needs.internet = true,
-                    needs.dns = true,
+                    needs.internet = {},
+                    needs.dns = {},
                 } | BuildSpec,
                 b2 = {
                     name = \"b2\",
