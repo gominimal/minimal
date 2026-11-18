@@ -580,11 +580,21 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-068** WHILE a box's egress is a hostname-only allowlist naming every host that `git clone`, `npm install`, `pip install`, and a container pull contact THE SYSTEM SHALL complete those operations.
   tier:     T0
   verify:   cargo nextest run -p minvmd hostname_allowlist_toolchain_completes
+  verify:   cargo test -p minimald hostname_allowlist_box_loopback_connect_is_admitted
+  <!-- The guest table does not refuse a box's own loopback traffic, such as
+       git's connect to 127.0.0.1. An own-IP box has a network namespace of
+       its own and no classifier leaf, and a hostname allowlist is not
+       deny-all. Every refusing rule of the guest table needs a socket of the
+       boxes subtree. The one refusal on lo that a guest boot log carries is
+       the effect probe's, from its deny leaf at boot, so the verify reads the
+       log only from the first tool on and fails on a refusal on lo there. -->
   <!-- S8b/AC3; prose 44; state-driven; the story's list also names apt, which the composed base (the gominimal/pkgs base, no Debian userland) does not ship, so no box can run it; the container pull keeps the rotating-CDN shape apt stood for, and git, npm and pip cover the pinned-name shape; the five-tool list came from the egress-gateway spike as an illustration, not as a requirement in itself. The
-       allowlist the verify uses names both CDNs Docker Hub's blob redirect lands
-       on (cloudflare and cloudfront): every host the pull may contact is a host
-       it contacts, and two exact names are preferred to a CIDR fallback, so
-       the list is the union and must not be trimmed to one CDN. The proof is a
+       allowlist the verify uses names all three hosts Docker Hub's blob redirect
+       lands on (the cloudflare and cloudfront CDNs, and the S3 bucket
+       docker-images-prod.s3.dualstack.us-east-1.amazonaws.com): every host the
+       pull may contact is a host it contacts, and exact names are preferred to
+       a CIDR fallback, so the list is the union and must not be trimmed to one
+       of them. The proof is a
        local VM run until the VM lanes export the switch binary to the harness
        step; then it is verified in CI. -->
 
@@ -934,7 +944,7 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-132** WHERE the host is VM-backed and runs a node-local Box Egress Proxy THE SYSTEM SHALL deliver a box's connection to the proxy at the proxy's own infrastructure address on the switch, beside the gateway, with the box's own switch address as its source.
   tier:     T0
   verify:   ./scripts/session-e2e.sh proxy_sees_each_vm_box_by_its_switch_address
-  <!-- design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the machine-internal path MUST preserve each box's own source address, a v1 conformance requirement of the un-enrolled profile; a node-local BEP's steered destination is the BEP's own address on the host side of the switch (design §7.1 line 240), a second infrastructure address beside the gateway rather than the gateway itself, because the gateway address terminates in the switch's own stack, which cannot hand a connection off; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the proxy's address follows the switch's subnet, the second infrastructure address above the lease run; proposed working values, tuned by the integration run: the proxy's listener answers on port 8118, a box may hold at most 16 connections to it at once, and the delivery's listener pool is partitioned per registered box so each box's share is that per-source cap, added at its registration and withdrawn with its row -->
+  <!-- design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the machine-internal path MUST preserve each box's own source address, a v1 conformance requirement of the un-enrolled profile; a node-local BEP's steered destination is the BEP's own address on the host side of the switch (design §7.1 line 240), a second infrastructure address beside the gateway rather than the gateway itself, because the gateway address terminates in the switch's own stack, which cannot hand a connection off; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the proxy's address follows the switch's subnet, the second infrastructure address above the lease run; the proxy's listener answers on port 8118, a working value; the per-source cap is tuned to 128: a box may hold at most 128 connections to the proxy at once, because one Pulumi preview opens dozens of parallel connections and the earlier working value of 16 reset them; an operator sets the cap per Box Host with `minvmd config set --bep-per-box-cap`, saved to `config.toml` and read at the next boot, and the `MINVMD_BEP_PER_BOX_CAP` environment variable overrides it for one boot; `minvmd config show` prints the effective cap and its source; the delivery's listener pool is partitioned per registered box so each box's share is that per-source cap, added at its registration and withdrawn with its row -->
   - IF a process outside every box connects to the proxy's listener THEN THE SYSTEM SHALL present it from no box's address.
     tier:   T0
     verify: cargo nextest run -p minvmd host_process_never_arrives_from_a_box_address

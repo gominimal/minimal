@@ -190,9 +190,12 @@ pub(crate) async fn vm_host_answerer_status_at(
 /// machine the session is about to rely on: which VM host daemon answers
 /// the zone decides where the names resolve from, and a start that said
 /// nothing left the holder discoverable only from `min ls`. The same line
-/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line`]),
-/// so the two surfaces name one holder the same way. Pure, so the test
-/// asserts the wording without capturing stderr.
+/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line_beside`]),
+/// so the two surfaces name one holder the same way. That includes a
+/// failing DNS service: when its job holds the port and is not running,
+/// both name it, and both name `min finalize-install` only when that
+/// command offers the reinstall. The service state is read only for the
+/// service's port held with no channel, so the other states stay pure.
 ///
 /// `None` for the pre-acquisition state — a daemon still bringing its
 /// answerer up has nothing to name yet, and the start prints nothing for
@@ -201,7 +204,47 @@ pub(crate) async fn vm_host_answerer_status_at(
 pub(crate) fn vm_host_answerer_start_line(
     status: minimald_rpc::ZoneAnswererStatus,
 ) -> Option<String> {
-    crate::resolver::vm_host_answerer_line(status).map(|line| format!("DNS service: {line}"))
+    let service = if crate::resolver::port_held_by_service_job(&status) {
+        dns_service_state_blocking(&status)
+    } else {
+        crate::resolver::DnsServiceState::default()
+    };
+    vm_host_answerer_start_line_beside(status, service)
+}
+
+/// [`vm_host_answerer_start_line`] over a DNS service state already read.
+/// Pure, so the test asserts the wording without capturing stderr.
+#[must_use]
+pub(crate) fn vm_host_answerer_start_line_beside(
+    status: minimald_rpc::ZoneAnswererStatus,
+    service: crate::resolver::DnsServiceState,
+) -> Option<String> {
+    crate::resolver::vm_host_answerer_line_beside(status, service)
+        .map(|line| format!("DNS service: {line}"))
+}
+
+/// [`crate::resolver::dns_service_state_on_this_host`] for the one status
+/// the session start prints, from a synchronous caller. The read runs on a
+/// thread of its own with its own runtime, so it works whether or not the
+/// caller runs inside one. A read that does not run claims nothing.
+fn dns_service_state_blocking(
+    status: &minimald_rpc::ZoneAnswererStatus,
+) -> crate::resolver::DnsServiceState {
+    let status = status.clone();
+    std::thread::Builder::new()
+        .name("dns-service-state".to_string())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| {
+                    runtime.block_on(crate::resolver::dns_service_state_on_this_host([&status]))
+                })
+                .unwrap_or_default()
+        })
+        .ok()
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default()
 }
 
 /// Releases the zone hold a destroyed session's activation made, when the
@@ -1448,6 +1491,67 @@ mod tests {
         );
     }
 
+    /// A resume that the VM host refuses, here because the VM cannot reach
+    /// the DNS service for box names, fails the attach with the VM host's
+    /// reason, which names `min finalize-install --show`.
+    #[tokio::test]
+    async fn resume_refused_by_vm_host_names_its_reason() {
+        // minvmd's `NO_ANSWERER`, word for word.
+        const REASON: &str = "the running VM cannot reach Minimal's DNS service for box names, \
+                              so this box cannot be given an address; run `min \
+                              finalize-install --show` to check the service's setup, or see \
+                              minvmd.log for the cause (`min dirs` shows where logs are kept)";
+        let dir = tempfile::TempDir::new().unwrap();
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error {
+                // minvmd's refusal as it crosses the wire.
+                error: format!("could not give the box an address: {REASON}"),
+            })
+            .unwrap(),
+        )
+        .await;
+        let record = boxes::Record {
+            id: boxes::SessionId::nil(),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy::default(),
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: Some(boxes::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            }),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
+            attrs: Default::default(),
+        };
+        let error = resume_box_row(&dir.path().join("ssh.sock"), Some(&record))
+            .await
+            .expect_err("a refused resume fails the attach");
+        assert_eq!(requests.lock().unwrap().len(), 1, "one resume was asked");
+        let refusal = error
+            .downcast_ref::<minimal_client::box_registration::HostRefusal>()
+            .expect("the error carries the VM host's refusal");
+        assert_eq!(refusal.reason(), REASON);
+        // The reason prints once, after the box it is about.
+        assert_eq!(format!("{error:#}"), format!("box web: {REASON}"));
+    }
+
     /// NET-045/NET-138: the host-side registration carries the box's
     /// dynamic-ingress grant — the stance and the range — from the same
     /// create inputs the session record holds, so the host-side row holds
@@ -1999,6 +2103,21 @@ mod tests {
             None,
             "the pre-acquisition state prints nothing at session start"
         );
+        // D3472: a failing DNS service prints the line `min ls` prints.
+        let held = minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 };
+        for reinstall_offered in [true, false] {
+            let service = crate::resolver::DnsServiceState {
+                job: crate::resolver::AnswererJob::NotRunning,
+                reinstall_offered,
+            };
+            assert_eq!(
+                vm_host_answerer_start_line_beside(held.clone(), service),
+                Some(format!(
+                    "DNS service: {}",
+                    crate::resolver::failing_dns_service_line(7_656, reinstall_offered)
+                )),
+            );
+        }
     }
 
     /// T66's destroy side: the client holding a destroyed session's record

@@ -2026,6 +2026,62 @@ struct BindOpts {
     recursive: bool,
 }
 
+/// Called with the stdin pipe of a run's first invocation, once that process
+/// runs and before its output is read. An error kills the process and fails
+/// the run.
+pub type StdinSlot = Box<dyn FnOnce(fs::File) -> std::io::Result<()> + Send>;
+
+/// How [`Sandbox::run_with_cancel`] runs its invocations.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Kills the running invocation and ends the run when it fires.
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// The directory, inside the sandbox, that every invocation starts in.
+    /// `None` keeps the sandbox's own working directory.
+    pub current_dir: Option<String>,
+    /// Gives the first invocation a stdin pipe, and receives it.
+    pub stdin: Option<StdinSlot>,
+}
+
+impl From<tokio_util::sync::CancellationToken> for RunOptions {
+    fn from(cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            cancel,
+            ..Self::default()
+        }
+    }
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("cancel", &self.cancel)
+            .field("current_dir", &self.current_dir)
+            .field("stdin", &self.stdin.is_some())
+            .finish()
+    }
+}
+
+/// Sets the [`RunOptions`] on the command of one invocation. The command
+/// starts in `current_dir` when it is set. The command gets a stdin pipe when
+/// `stdin` still holds a slot, and the slot moves out to the caller. So only
+/// the first invocation of a run gets the slot, and the later ones get none.
+#[cfg(target_os = "linux")]
+fn apply_run_options(
+    cmd: &mut hakoniwa::Command,
+    current_dir: Option<&str>,
+    stdin: &mut Option<StdinSlot>,
+) -> Option<StdinSlot> {
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    let slot = stdin.take();
+    if slot.is_some() {
+        cmd.stdin(hakoniwa::Stdio::piped());
+    }
+    slot
+}
+
 // Sandbox usage
 #[cfg(target_os = "linux")]
 impl<C: Channel> Sandbox<C> {
@@ -2609,18 +2665,29 @@ impl<C: Channel> Sandbox<C> {
     /// on the caller's. That thread is never retired, so this future may be
     /// driven from any runtime thread, worker or blocking-pool; see the
     /// [`forker`] module docs for the failure the fork thread rules out.
+    ///
+    /// `options` is a [`RunOptions`], or only its cancellation token. Every
+    /// invocation starts in [`RunOptions::current_dir`] when it is set. The
+    /// first invocation gets a stdin pipe when [`RunOptions::stdin`] is set,
+    /// and the slot gets that pipe once the process runs. The later
+    /// invocations get no stdin.
     #[cfg(target_os = "linux")]
     pub async fn run_with_cancel<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
         mut stdout_writer: Option<W1>,
         mut stderr_writer: Option<W2>,
-        cancel: tokio_util::sync::CancellationToken,
+        options: impl Into<RunOptions>,
     ) -> Result<(), Error>
     where
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
+        let RunOptions {
+            cancel,
+            current_dir,
+            mut stdin,
+        } = options.into();
         for (i, exec) in invocations.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Execution(ExecutionError::Cancelled));
@@ -2632,6 +2699,7 @@ impl<C: Channel> Sandbox<C> {
             let container = self.new_container(planned.plan())?;
 
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
+            let stdin_slot = apply_run_options(&mut cmd, current_dir.as_deref(), &mut stdin);
             cmd.stderr(hakoniwa::Stdio::MakePipe);
             cmd.stdout(hakoniwa::Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
@@ -2653,6 +2721,23 @@ impl<C: Channel> Sandbox<C> {
                     return Err(e);
                 }
             };
+
+            // Hand the stdin pipe to its slot before the output is read, so
+            // what the slot sends its caller comes before any output line.
+            if let Some(slot) = stdin_slot {
+                let started = match child.stdin.take() {
+                    Some(pipe) => slot(fs::File::from(std::os::fd::OwnedFd::from(pipe))),
+                    None => Err(std::io::Error::other("the process has no stdin pipe")),
+                };
+                if let Err(e) = started {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(net_guard) = net_guard {
+                        net_guard.teardown().await;
+                    }
+                    return Err(Error::IO("passing stdin to the process", PathBuf::new(), e));
+                }
+            }
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
             // files, as well as to the caller-provided writers if applicable.
@@ -3015,25 +3100,42 @@ fn log_rootfs_collisions(c: &common::LinkCollisions, layers: &[PathBuf], rootfs:
 /// the assembled one (the link pass hardlinks, so the winner's file and
 /// the rootfs path are one). A symlink is made anew in the rootfs, not
 /// linked, so it shares no inode with its layer: its winner is the first
-/// layer whose link points where the placed one does. `None` when no
-/// layer matches, as for a file the assembly copied across filesystems.
+/// layer whose link points where the placed one does.
+///
+/// A file the assembly copied (the cache and the rootfs on different
+/// filesystems) has an inode of its own, so no layer matches it that way.
+/// The first-linked file stays, so its winner is the first layer, in link
+/// order, that ships the path, and that layer is named only when the link
+/// pass's own comparison calls its file the same as the placed one. `None`
+/// otherwise: the placed file came from somewhere other than `layers`, or
+/// the two have equal sizes above the compare limit
+/// ([`common::LinkCollision::Unchecked`]), which proves nothing about who
+/// placed it, so no layer is named rather than a possibly wrong one.
 fn collision_winner<'a>(rootfs: &Path, layers: &'a [PathBuf], rel: &Path) -> Option<&'a Path> {
     use std::os::unix::fs::MetadataExt as _;
-    let placed = fs::symlink_metadata(rootfs.join(rel)).ok()?;
+    let at = rootfs.join(rel);
+    let placed = fs::symlink_metadata(&at).ok()?;
     if placed.is_symlink() {
-        let target = fs::read_link(rootfs.join(rel)).ok()?;
+        let target = fs::read_link(&at).ok()?;
         return layers
             .iter()
             .find(|layer| fs::read_link(layer.join(rel)).is_ok_and(|t| t == target))
             .map(PathBuf::as_path);
     }
-    layers
+    let linked = layers.iter().find(|layer| {
+        fs::symlink_metadata(layer.join(rel))
+            .is_ok_and(|m| m.dev() == placed.dev() && m.ino() == placed.ino())
+    });
+    if let Some(layer) = linked {
+        return Some(layer.as_path());
+    }
+    let first = layers
         .iter()
-        .find(|layer| {
-            fs::symlink_metadata(layer.join(rel))
-                .is_ok_and(|m| m.dev() == placed.dev() && m.ino() == placed.ino())
-        })
-        .map(PathBuf::as_path)
+        .find(|layer| fs::symlink_metadata(layer.join(rel)).is_ok())?;
+    let shipped = first.join(rel);
+    let is_the_copy = fs::symlink_metadata(&shipped).is_ok_and(|m| m.is_file())
+        && common::link_collision(&shipped, &at) == common::LinkCollision::Same;
+    is_the_copy.then_some(first.as_path())
 }
 
 /// Logs a working input that was not placed at `dest` because something is
@@ -4353,6 +4455,81 @@ mod tests {
         );
     }
 
+    /// With the cache and the rootfs on different filesystems the link pass
+    /// copies, and a copy has an inode of its own: the winner is then the
+    /// first layer, in link order, that ships the path, named when its file
+    /// is the placed one's bytes. A placed file that is not that layer's has
+    /// no winner among the layers.
+    #[test]
+    fn collision_winner_of_a_copied_file_is_the_first_layer_that_ships_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("usr/share/man/man1/node.1");
+        let [a, b, c] = ["a", "b", "c"].map(|name| tmp.path().join(name));
+        let rootfs = tmp.path().join("rootfs");
+        for dir in [&b, &c, &rootfs] {
+            std::fs::create_dir_all(dir.join(rel.parent().unwrap())).unwrap();
+        }
+        // `a` does not ship the path; `b` ships it first, `c` after it
+        std::fs::create_dir_all(a.join("usr")).unwrap();
+        std::fs::write(b.join(rel), b".TH NODE 1 22").unwrap();
+        std::fs::write(c.join(rel), b".TH NODE 1 20, another").unwrap();
+        // the cross-filesystem branch of the link pass: a copy, not a link
+        std::fs::copy(b.join(rel), rootfs.join(rel)).unwrap();
+        let layers = [a.clone(), b.clone(), c.clone()];
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, rel),
+            Some(b.as_path()),
+            "the first layer to ship the path is the one whose copy stays"
+        );
+
+        // the same bytes in a later layer do not make it the winner
+        std::fs::write(c.join(rel), b".TH NODE 1 22").unwrap();
+        assert_eq!(
+            super::collision_winner(&rootfs, &layers, rel),
+            Some(b.as_path())
+        );
+
+        // what stands in the rootfs is not the first shipper's file
+        std::fs::write(rootfs.join(rel), b"placed by something else").unwrap();
+        assert_eq!(super::collision_winner(&rootfs, &layers, rel), None);
+    }
+
+    /// A copied file above the compare limit, of the same size as the first
+    /// shipper's, is only `Unchecked` by the link pass's comparison: equal
+    /// sizes prove nothing about who placed it, so no layer is named.
+    #[test]
+    fn collision_winner_of_an_unchecked_copy_names_no_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("usr/lib/libbig.so");
+        let [a, b] = ["a", "b"].map(|name| tmp.path().join(name));
+        let rootfs = tmp.path().join("rootfs");
+        for dir in [&a, &b, &rootfs] {
+            std::fs::create_dir_all(dir.join(rel.parent().unwrap())).unwrap();
+        }
+        // sparse files well above the compare limit, so the test writes no
+        // more than a few bytes: `a` ships zeros, `b` ships the path too, and
+        // the placed file is another source's, of equal size, other bytes
+        let size = 64 << 20;
+        std::fs::write(rootfs.join(rel), b"another source").unwrap();
+        for dir in [&a, &b, &rootfs] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join(rel))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        assert_eq!(
+            common::link_collision(&a.join(rel), &rootfs.join(rel)),
+            common::LinkCollision::Unchecked,
+            "the comparison must reach the unchecked branch"
+        );
+        let layers = [a.clone(), b.clone()];
+        assert_eq!(super::collision_winner(&rootfs, &layers, rel), None);
+    }
+
     /// Two layers ship one path as symlinks to different targets. The link
     /// pass makes the rootfs symlink anew rather than linking it, so no
     /// layer shares its inode: the winner is the layer whose link points
@@ -5086,6 +5263,207 @@ ff02::2\tip6-allrouters
     fn userns_restricted_with_unreadable_label_is_diagnosed() {
         let got = userns_restriction_from(Some("15000\n".into()), Some("1\n".into()), false, None);
         assert_eq!(got, Some(UsernsRestriction::ApparmorUnconfined));
+    }
+
+    /// A program that prints its working directory on one line, then copies
+    /// its stdin to its stdout when its one argument is `stdin`.
+    #[cfg(target_os = "linux")]
+    const CWD_PROBE_C: &str = r#"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    char dir[4096];
+    if (!getcwd(dir, sizeof dir)) return 2;
+    printf("cwd:%s\n", dir);
+    fflush(stdout);
+    if (argc > 1 && strcmp(argv[1], "stdin") == 0) {
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(0, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)n, stdout);
+    }
+    return 0;
+}
+"#;
+
+    /// A directory that can hold a sandbox: one that is not `nodev` or
+    /// `noexec`, since the sandbox remounts its rootfs and runs from it.
+    #[cfg(target_os = "linux")]
+    fn sandbox_base_dir() -> Option<PathBuf> {
+        use nix::sys::statvfs::{FsFlags, statvfs};
+        let target_tmp = std::env::var_os("CARGO_TARGET_DIR")
+            .map(|dir| PathBuf::from(dir).join("tmp"))
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
+        let _ = fs::create_dir_all(&target_tmp);
+        [
+            std::env::temp_dir(),
+            PathBuf::from("/var/tmp"),
+            PathBuf::from("/run"),
+            PathBuf::from("/state"),
+            target_tmp,
+        ]
+        .into_iter()
+        .find(|dir| {
+            tempfile::tempdir_in(dir).is_ok()
+                && statvfs(dir).is_ok_and(|st| {
+                    !st.flags()
+                        .intersects(FsFlags::ST_NODEV | FsFlags::ST_NOEXEC)
+                })
+        })
+    }
+
+    /// The options of `run_with_cancel` reach the command that each
+    /// invocation builds. Every command starts in the run's working
+    /// directory. Only the first command takes the stdin slot, and it is the
+    /// slot the caller gave. This test builds commands and spawns nothing, so
+    /// it needs no user namespace and runs on every Linux host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_with_cancel_starts_in_the_given_dir_on_each_built_command() {
+        let container = hakoniwa::Container::new();
+        let given = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let slot_saw = given.clone();
+        let mut stdin: Option<StdinSlot> = Some(Box::new(move |mut pipe: fs::File| {
+            pipe.write_all(b"from the slot\n")?;
+            slot_saw.lock().unwrap().extend_from_slice(b"called");
+            Ok(())
+        }));
+
+        let mut first = container.command("/usr/bin/probe");
+        let first_slot = apply_run_options(&mut first, Some("/start/here"), &mut stdin);
+        let mut second = container.command("/usr/bin/probe");
+        let second_slot = apply_run_options(&mut second, Some("/start/here"), &mut stdin);
+
+        assert_eq!(first.get_current_dir(), Some(Path::new("/start/here")));
+        assert_eq!(second.get_current_dir(), Some(Path::new("/start/here")));
+        assert!(
+            second_slot.is_none(),
+            "a later invocation gets no stdin slot"
+        );
+        assert!(
+            stdin.is_none(),
+            "the run keeps no slot after the first command"
+        );
+
+        let pipe = tempfile::tempfile().unwrap();
+        first_slot.expect("the first invocation gets the slot")(pipe)
+            .expect("the slot takes the pipe");
+        assert_eq!(
+            &*given.lock().unwrap(),
+            b"called",
+            "it is the caller's slot"
+        );
+
+        let mut plain = container.command("/usr/bin/probe");
+        let mut none: Option<StdinSlot> = None;
+        assert!(apply_run_options(&mut plain, None, &mut none).is_none());
+        assert_eq!(
+            plain.get_current_dir(),
+            None,
+            "no dir keeps the sandbox's own"
+        );
+    }
+
+    /// `run_with_cancel` starts every invocation in the run's working
+    /// directory, and gives the first one a stdin pipe through its slot. The
+    /// later invocation reads no stdin. An inherit_cwd task and a task that
+    /// forwards its stdin run through this one path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_with_cancel_starts_in_the_given_dir() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping run_with_cancel_starts_in_the_given_dir: this host denies the \
+                 unprivileged user namespace every sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+        let Some(base_dir) = sandbox_base_dir() else {
+            eprintln!("no directory on this host can hold a sandbox — skipping");
+            return;
+        };
+        let base = tempfile::tempdir_in(&base_dir).unwrap();
+        let src = base.path().join("probe.c");
+        fs::write(&src, CWD_PROBE_C).unwrap();
+        let rootfs = base.path().join("rootfs-src");
+        let usr_bin = rootfs.join("usr").join("bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::create_dir_all(rootfs.join("usr").join("lib")).unwrap();
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::create_dir_all(rootfs.join("start").join("here")).unwrap();
+        match std::process::Command::new("gcc")
+            .args(["-static", "-o"])
+            .arg(usr_bin.join("probe"))
+            .arg(&src)
+            .status()
+        {
+            Ok(status) => assert!(status.success(), "gcc failed: {status:?}"),
+            Err(e) => {
+                eprintln!("no gcc to build the probe with — skipping: {e}");
+                return;
+            }
+        }
+
+        let mut sandbox = Config::new("cwd-probe")
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(rootfs)))
+            .with_dns(false)
+            .with_plan(network::NetPlan::isolated())
+            .build(base.path().join("sandbox"), ())
+            .await
+            .expect("building the sandbox");
+
+        let given = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let slot_saw = given.clone();
+        let options = RunOptions {
+            current_dir: Some("/start/here".to_string()),
+            stdin: Some(Box::new(move |mut pipe: fs::File| {
+                *slot_saw.lock().unwrap() = true;
+                pipe.write_all(b"from the slot\n")
+            })),
+            ..RunOptions::default()
+        };
+        let invocation = |arg: &str| Invocation {
+            executable: "/usr/bin/probe".to_string(),
+            args: vec![arg.to_string()],
+            envs: Default::default(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        sandbox
+            .run_with_cancel(
+                vec![invocation("stdin"), invocation("stdin")],
+                Some(&mut out),
+                Some(&mut err),
+                options,
+            )
+            .await
+            .expect("the run passes");
+
+        assert!(*given.lock().unwrap(), "the slot gets the stdin pipe");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "cwd:/start/here\nfrom the slot\ncwd:/start/here\n",
+            "both invocations start in the given dir, and only the first reads the slot's \
+             stdin; stderr: {}",
+            String::from_utf8_lossy(&err),
+        );
+
+        // Only a cancellation token: the sandbox's own working directory.
+        let mut out = Vec::new();
+        sandbox
+            .run_with_cancel(
+                vec![invocation("none")],
+                Some(&mut out),
+                None::<Vec<u8>>,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the run passes");
+        assert!(
+            !String::from_utf8_lossy(&out).contains("/start/here"),
+            "a run without a dir keeps the sandbox's own: {}",
+            String::from_utf8_lossy(&out),
+        );
     }
 
     /// Creates a tempdir with the `synth/usr/` structure required by

@@ -1828,6 +1828,7 @@ mod tests {
         PublishedKey {
             public: URL_SAFE_NO_PAD.encode(key.to_sec1_bytes()),
             kid: key.kid(),
+            store: None,
         }
     }
 

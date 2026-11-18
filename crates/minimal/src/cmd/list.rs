@@ -702,10 +702,18 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // the same host facts the session start's host line does, so the two
     // verbs print the same pointer. Machine modes print no row, so they pay
     // no probe.
+    // D3472: the `DNS SERVICE` row names Minimal's failing DNS service
+    // from one read of its state for the whole listing, not one per row.
     let host_install = if args.json || args.raw {
         crate::resolver::HostInstall::default()
     } else {
-        crate::cmd::finalize_install::host_install_for_this_host(global)
+        crate::resolver::HostInstall {
+            dns_service: crate::resolver::dns_service_state_on_this_host(
+                vm_answerers.iter().flatten().map(|reply| &reply.answerer),
+            )
+            .await,
+            ..crate::cmd::finalize_install::host_install_for_this_host(global)
+        }
     };
     // T126 (NET-138): each VM host daemon's collided mirror ports, read
     // over that VM's own control socket, all VMs at once so a VM that does
@@ -1083,9 +1091,9 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         // the pre-acquisition state prints no answerer line and forces no
         // blank one, and a proxy cause rides beside whatever the answerer's
         // own state decided — displacing nothing, displaced by nothing.
-        let vm_answerer_line = vm_answerer
-            .as_ref()
-            .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()));
+        let vm_answerer_line = vm_answerer.as_ref().and_then(|reply| {
+            crate::resolver::vm_host_answerer_line_beside(reply.answerer.clone(), host.dns_service)
+        });
         // NET-020: the cause prints on the HOSTNAME PROXY row, once. The
         // surface folds the cause out, so the BOX NAMES row beside it does
         // not repeat it (#3046).
@@ -1623,10 +1631,12 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
                     width = VM_COLUMN_WIDTH,
                 )?;
                 facts += 1;
-            } else if let Some(line) = answerer_at(index)
-                .as_ref()
-                .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()))
-            {
+            } else if let Some(line) = answerer_at(index).as_ref().and_then(|reply| {
+                crate::resolver::vm_host_answerer_line_beside(
+                    reply.answerer.clone(),
+                    host.dns_service,
+                )
+            }) {
                 writeln!(
                     out,
                     "DNS SERVICE:     {vm:<width$} {line}",

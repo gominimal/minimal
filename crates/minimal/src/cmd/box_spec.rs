@@ -1065,6 +1065,10 @@ async fn box_spec(
                 Some(toml::Value::Table(table)) => table,
                 _ => anyhow::bail!("The stored spec of box {id} is not a table."),
             };
+            // BCLI-022, BOX-179: each stored hook, with who declared it.
+            if let Some(toml::Value::Array(hooks)) = spec.get("lifecycle_hooks") {
+                write_hook_list(hooks, &mut text)?;
+            }
             write_toml(&spec, &std::collections::BTreeMap::new(), &mut text)?;
         }
         format => {
@@ -1078,6 +1082,84 @@ async fn box_spec(
     tracing::info!(verb = "box spec", box_id = %id, outcome = "ok", host = %host.host);
     out.extend_from_slice(&text);
     Ok(())
+}
+
+/// Writes the stored lifecycle `hooks` as comment lines: one line for each
+/// event of each hook, with its command, its description and its declarer.
+fn write_hook_list(hooks: &[toml::Value], out: &mut Vec<u8>) -> anyhow::Result<()> {
+    use boxes::core::lifecyclehook::{HookScript, HookScriptBody, LifecycleHook};
+    use mfile::spec::HookDeclarer;
+    if hooks.is_empty() {
+        writeln!(out, "# Lifecycle hooks: none.")?;
+        return Ok(());
+    }
+    writeln!(out, "# Lifecycle hooks:")?;
+    for value in hooks {
+        let declarer = match HookDeclarer::of(value) {
+            Some(HookDeclarer::Project) => "from minimal.toml".to_owned(),
+            Some(HookDeclarer::Loadout { name }) => format!("from loadout {name}"),
+            None => "declarer not recorded".to_owned(),
+        };
+        let hook: LifecycleHook = match mfile::spec::hook_without_declarer(value).try_into() {
+            Ok(hook) => hook,
+            Err(e) => {
+                tracing::debug!("a stored lifecycle hook does not read: {e}");
+                writeln!(out, "#   a hook that cannot be read ({declarer})")?;
+                continue;
+            }
+        };
+        let events: [(&str, Option<&HookScript>); 4] = [
+            ("on_activate", hook.on_activate()),
+            ("on_destroy", hook.on_destroy()),
+            ("on_attach", hook.on_attach()),
+            ("on_detach", hook.on_detach()),
+        ];
+        for (event, script) in events {
+            let Some(script) = script else { continue };
+            let command = match script.body() {
+                HookScriptBody::Inline(body) => {
+                    let mut lines = body.trim().lines();
+                    // `lines` splits only on `\n`, so a lone `\r` or another
+                    // control character stays. Escape it, as for the path.
+                    let first = one_line_string(lines.next().unwrap_or_default());
+                    if lines.next().is_some() {
+                        format!("inline {first} ...")
+                    } else {
+                        format!("inline {first}")
+                    }
+                }
+                HookScriptBody::External(path) => {
+                    format!("external {}", one_line_string(path.as_str()))
+                }
+            };
+            let description = hook
+                .description()
+                .map(|d| format!(" {}", one_line_string(d)))
+                .unwrap_or_default();
+            writeln!(out, "#   {event}{description}: {command} ({declarer})")?;
+        }
+    }
+    Ok(())
+}
+
+/// `s` as a TOML basic string on one line: a line break or another control
+/// character is escaped, so the text cannot end the comment that holds it.
+fn one_line_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `value` as TOML, with each `null` left out. `None` for a `null`.
