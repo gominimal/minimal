@@ -16475,10 +16475,12 @@ fn run_verbs_take_dynamic_ingress_and_credentialed_upstream() {
     }
 }
 
-// BCLI-025: `min box show <box> --network` renders the `[network]` section
-// the box's record stores, with the creating command's overrides in it.
+// BCLI-025: `min box show <box> --network` renders the box's effective
+// network policy: the deny-all default for a bare own-address box, the
+// ports it published while running, and, under `-o json`, the policy
+// document. `-o yaml` is refused with it.
 #[tokio::test]
-async fn box_show_network_renders_effective() {
+async fn box_show_network_renders_effective_policy() {
     let (_state, global, server) = show_network_daemon().await;
     let mut daemon = server.connect().await;
     let project = tempfile::tempdir().unwrap();
@@ -16487,86 +16489,118 @@ async fn box_show_network_renders_effective() {
         project.path().to_str().expect("a UTF-8 project path"),
     );
     request.config.network = boxes::NetworkMode::OwnIp;
-    request.config.policy = boxes::BoxPolicy {
-        egress: Some(boxes::EgressPolicy {
-            allow_dns_hosts: Some(vec!["a.example".to_owned(), "b.example".to_owned()]),
-            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
-            ..boxes::EgressPolicy::default()
-        }),
-        ingress: Some(boxes::IngressPolicy {
-            port_mappings: vec![parse_ingress_mapping("8080:80").unwrap()],
-            dynamic_allowed_range: None,
-            dynamic_ingress: None,
-        }),
-        ..boxes::BoxPolicy::default()
-    };
     let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
         minimald_rpc::Errorable::Ok(created) => created.id,
         minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
     };
 
     let mut client = connect_daemon(&global).await.expect("the daemon answers");
-    // `min box show --network` reads the record from the daemon and
-    // writes its network section.
-    let mut out = Vec::new();
-    show_stored_network(&mut out, &mut client, id, "web")
+    let record = stored_box_record(&mut client, id)
         .await
-        .expect("the section is shown");
-    let text = String::from_utf8(out).unwrap();
-    assert_eq!(
-        text,
-        "[network]\n\
-         mode = \"own_ip\"\n\
-         \n\
-         [network.egress]\n\
-         allow_dns_hosts = [\"a.example\", \"b.example\"]\n\
-         allow_protocols = [\"tcp\"]\n\
-         \n\
-         [[network.ingress.port_mappings]]\n\
-         external_port = 8080\n\
-         internal_port = 80\n\
-         proto = \"tcp\"\n"
-    );
-    let parsed: toml::Table = toml::from_str(&text).expect("the section is TOML");
-    let network = parsed["network"].as_table().expect("a [network] table");
-    assert_eq!(network["mode"].as_str(), Some("own_ip"), "{text}");
-    let egress = network["egress"].as_table().expect("an egress table");
-    assert_eq!(
-        egress["allow_dns_hosts"],
-        toml::Value::from(vec!["a.example", "b.example"]),
-        "{text}"
-    );
-    assert!(text.contains("8080"), "{text}");
-    assert_eq!(parsed.len(), 1, "only the network section\n{text}");
+        .expect("the record is read")
+        .expect("the host has the box");
 
-    // A box with no network prints its mode and nothing it cannot have.
+    // The text form: a bare own-address box gets the deny-all default.
     let mut out = Vec::new();
-    write_stored_network(
-        &mut out,
-        boxes::NetworkMode::NoNet,
-        &boxes::BoxPolicy::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        String::from_utf8(out).unwrap(),
-        "[network]\nmode = \"none\"\n"
-    );
-
-    // A box the host does not have prints nothing and fails.
-    let mut out = Vec::new();
-    show_stored_network(
+    write_box_network(
         &mut out,
         &mut client,
-        boxes::SessionId::from_bytes([7; 16]),
-        "gone",
+        &record,
+        paths::HostKind::Minimald,
+        false,
     )
     .await
-    .expect_err("the host has no such box");
-    assert!(out.is_empty());
-
+    .expect("the policy is shown");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("deny-all (default)"), "{text}");
     assert!(
-        Cli::try_parse_from(["min", "box", "show", "web", "--network"]).is_ok(),
-        "min box show takes --network"
+        !text.contains("[network]"),
+        "the effective policy, not the stored TOML section\n{text}"
+    );
+
+    // A port the box published while running is listed under the policy.
+    let policy = match client
+        .oneshot_rpc::<minimald_rpc::GetEffectiveSessionPolicy>(
+            minimald_rpc::GetEffectiveSessionPolicyRequest::Id(id),
+        )
+        .await
+        .expect("the policy RPC")
+    {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("no effective policy: {error}"),
+    };
+    let live = [minimald_rpc::LiveMapping {
+        local: "127.0.64.96:3000".to_owned(),
+        internal_port: 3000,
+        proto: boxes::IpProto::Tcp,
+        pending: Some(false),
+    }];
+    let mut out = Vec::new();
+    render_box_network(
+        &mut out,
+        &policy,
+        record.network,
+        None,
+        &live,
+        paths::HostKind::Minimald,
+    )
+    .expect("the render");
+    let with_live = String::from_utf8(out).unwrap();
+    assert!(
+        with_live.starts_with(&text),
+        "the declaration comes first\n{with_live}"
+    );
+    assert!(
+        with_live.ends_with(
+            "live ingress (published at runtime)\n  tcp  127.0.64.96:3000 → :3000\n"
+        ),
+        "{with_live}"
+    );
+
+    // `-o json`: the one policy document.
+    let mut out = Vec::new();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        paths::HostKind::Minimald,
+        true,
+    )
+    .await
+    .expect("the document is written");
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&out).expect("one JSON document");
+    assert_eq!(document["schema"], POLICY_JSON_SCHEMA, "{document}");
+    assert_eq!(document["network"], "own_ip", "{document}");
+    assert_eq!(document["ingress"]["kind"], "deny_all", "{document}");
+
+    // The flags: `--network` takes `-o json`, and `-o yaml` with it is a
+    // usage error, refused before any box is looked up.
+    let Some(Command::Box(BoxArgs {
+        command: BoxCommand::Show(args),
+    })) = Cli::try_parse_from(["min", "box", "show", "web", "--network", "-o", "json"])
+        .expect("min box show --network takes -o json")
+        .command
+    else {
+        panic!("a box show command");
+    };
+    assert_eq!(args.output, Some(BoxShowOutputFormat::Json));
+    let Some(Command::Box(BoxArgs {
+        command: BoxCommand::Show(args),
+    })) = Cli::try_parse_from(["min", "box", "show", "gone", "--network", "-o", "yaml"])
+        .expect("the parser takes the flags")
+        .command
+    else {
+        panic!("a box show command");
+    };
+    let error = cmd_box_show(&global, args)
+        .await
+        .expect_err("-o yaml is refused with --network");
+    assert!(error.downcast_ref::<NetworkFlagRefusal>().is_some(), "{error:#}");
+    assert_eq!(
+        error.to_string(),
+        "`min box show --network` does not write YAML. \
+         Run it with `-o json`, or with no `-o` for text."
     );
 }
 
@@ -16707,9 +16741,10 @@ async fn box_show_output_json_writes_box_with_execs() {
         }
         _ => panic!("not `min box show`"),
     }
+    // BCLI-025: `--network` takes `-o json`, for the policy document.
     assert!(
-        Cli::try_parse_from(["min", "box", "show", "web", "-o", "json", "--network"]).is_err(),
-        "-o and --network do not go together"
+        Cli::try_parse_from(["min", "box", "show", "web", "-o", "json", "--network"]).is_ok(),
+        "-o json and --network go together"
     );
 
     box_with_two_execs!(alpha, _state, _shell, _job);
