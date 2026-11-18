@@ -1069,6 +1069,728 @@ impl File {
         }
     }
 
+<<<<<<< HEAD
+=======
+    /// Read-modify-write `minimal.toml` under an exclusive lock, so
+    /// concurrent `min` commands cannot lose each other's edits.
+    ///
+    /// The lock is an advisory `flock` on the directory that holds the
+    /// file's canonical path. Every process that edits the file shares it,
+    /// whatever its `HOME`, and every spelling of the path (relative,
+    /// absolute, through a symlink) resolves to one directory. Nothing is
+    /// written into the project tree. It is held for the whole
+    /// read-edit-write sequence; the content is re-read **inside** the
+    /// lock, so every serialized writer sees the previous writer's result.
+    /// The write itself is atomic (temp file + rename), so a concurrent
+    /// reader never sees a torn file and cannot write a partial view back.
+    ///
+    /// Where the filesystem refuses a `flock` on a directory (NFS), the
+    /// lock is a file in the per-user Minimal state directory
+    /// (`<state>/minimal/mfile-locks/`), named by a hash of the canonical
+    /// path. That lock only excludes processes that share the state
+    /// directory. The lock is best-effort. The edit runs unlocked after one
+    /// warning, still with the atomic write, when neither lock can be had.
+    /// Errors reading or writing `path` itself still fail the edit, and so
+    /// does an existing file the caller may not write, as with
+    /// `std::fs::write`, although the rename alone would replace it. A wait
+    /// for the lock that outlasts 60 s (or `MINIMAL_MFILE_LOCK_TIMEOUT_SECS`)
+    /// fails the edit, so a stuck holder cannot block it forever. An edit
+    /// made inside a session VM does not exclude one made on the host. The
+    /// rename keeps the file's mode, but not its owner, ACLs or extended
+    /// attributes: restoring the owner needs a `chown` the caller is usually
+    /// not privileged for, and ACLs and xattrs have no portable Rust API, so
+    /// the replacement is documented as dropping them rather than half-keeping
+    /// them per platform.
+    ///
+    /// The `edit` closure receives the current content (`None` if the
+    /// file does not exist yet) and returns `Ok(Some(new))` to write,
+    /// `Ok(None)` to leave the file untouched, or an error to abort
+    /// without writing.
+    pub fn edit_exclusively<E>(
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        let lock_dir = paths::try_minimal_state_dir()
+            .map(|state| AsRef::<Path>::as_ref(&state).join("mfile-locks"));
+        Self::edit_exclusively_in(lock_dir.as_deref(), mfile_lock_timeout(), path, edit)
+    }
+
+    /// [`File::edit_exclusively`] with the lock directory passed in, so
+    /// tests do not write to the real state directory. `None` means the
+    /// state directory could not be resolved, and the edit runs unlocked.
+    fn edit_exclusively_in<E>(
+        lock_dir: Option<&Path>,
+        timeout: Duration,
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        // Resolve symlinks so the lock key and the atomic replace both
+        // target the real file: `persist` would otherwise replace the
+        // symlink entry itself. A file that does not exist yet is keyed
+        // by its canonical parent, so `min init` shares the lock with the
+        // edits that follow it. A dangling symlink is refused: the replace
+        // would swap the link entry for a regular file, and following it
+        // would create a file wherever the link points.
+        let path = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) =>
+            {
+                let target = std::fs::read_link(path).unwrap_or_default();
+                let e = std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "symlink to {0}, which does not exist; create {0} or replace the link \
+                         with a file",
+                        target.display()
+                    ),
+                );
+                return Err(Error::IO("resolving", path.to_path_buf(), e).into());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                match (std::fs::canonicalize(parent), path.file_name()) {
+                    (Ok(p), Some(name)) => p.join(name),
+                    _ => path.to_path_buf(),
+                }
+            }
+            Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e).into()),
+        };
+        let path = path.as_path();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // Held until this function returns, so across the write below.
+        let _lock = Self::lock_for(lock_dir, path, timeout)?;
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(Error::IO("reading", path.to_path_buf(), e).into()),
+        };
+
+        match edit(content.as_deref())? {
+            None => Ok(()),
+            Some(new) => {
+                // The existing file's mode, which the replace keeps.
+                let existing = match std::fs::metadata(path) {
+                    Ok(meta) => Some(meta.permissions()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(Error::IO("statting", path.to_path_buf(), e).into()),
+                };
+                // Replacing by rename needs only write access to the parent
+                // directory, so open the existing file for writing first: a
+                // file the caller may not write (a read-only minimal.toml)
+                // fails here with the error std::fs::write gave, and root
+                // still passes. Nothing is truncated or written.
+                if existing.is_some()
+                    && let Err(e) = std::fs::OpenOptions::new().write(true).open(path)
+                {
+                    return Err(Error::IO("writing", path.to_path_buf(), e).into());
+                }
+                // Over an existing file, the temp starts owner-only and takes
+                // that file's mode just before the rename, so a private file
+                // is never exposed through the temp. A new file gets 0o666
+                // less the umask (open(2) applies it), as std::fs::write gave.
+                let mut builder = tempfile::Builder::new();
+                builder.permissions(std::fs::Permissions::from_mode(if existing.is_some() {
+                    0o600
+                } else {
+                    0o666
+                }));
+                let mut tmp = match builder.tempfile_in(&parent) {
+                    Ok(t) => t,
+                    Err(e) => return Err(Error::IO("creating temp", path.to_path_buf(), e).into()),
+                };
+                if let Err(e) = tmp.write_all(new.as_bytes()) {
+                    return Err(Error::IO("writing temp", path.to_path_buf(), e).into());
+                }
+                if let Err(e) = tmp.as_file().sync_all() {
+                    return Err(Error::IO("syncing temp", path.to_path_buf(), e).into());
+                }
+                if let Some(perms) = existing
+                    && let Err(e) = std::fs::set_permissions(tmp.path(), perms)
+                {
+                    return Err(Error::IO("setting permissions", path.to_path_buf(), e).into());
+                }
+                match tmp.persist(path) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(Error::IO("replacing", path.to_path_buf(), e.error).into()),
+                }
+            }
+        }
+    }
+
+    /// [`File::edit_exclusively`] for a `minimal.toml` that someone other
+    /// than the caller controls: the workspace of a box, edited by the
+    /// daemon on the box's behalf. Every name the edit resolves stays inside
+    /// `root`, so a link at `minimal.toml` (or at `.minimal`) cannot carry
+    /// the write to a file outside the workspace. A link that stays inside
+    /// `root` is followed, as the host editor follows one; a link that leads
+    /// out of it, or that dangles, is refused and left as it was. A link
+    /// inside `root` must be relative: an absolute target names a path in
+    /// the box's view, not the daemon's, and is refused.
+    ///
+    /// `path` is the file's path as [`File::from_dir`] made it from `root`
+    /// (`root/minimal.toml` or `root/.minimal/minimal.toml`). A `path` that
+    /// is not under `root` is refused. `root` itself is trusted.
+    ///
+    /// On Linux the kernel enforces the confinement: every name is resolved
+    /// with `openat2(2)` and `RESOLVE_BENEATH` from a descriptor of `root`,
+    /// and the lock, read, temp file and rename all happen relative to the
+    /// descriptor of the directory that holds the file, so a link swapped in
+    /// after the check is not followed either. Elsewhere, and on a kernel
+    /// without `openat2` (before 5.6), the check is best-effort: no component
+    /// under `root` may be a symlink, checked before the path-based edit.
+    /// Boxes run on the native Linux provider, where the check is exact.
+    pub fn edit_exclusively_within<E>(
+        root: &Path,
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        let lock_dir = paths::try_minimal_state_dir()
+            .map(|state| AsRef::<Path>::as_ref(&state).join("mfile-locks"));
+        Self::edit_exclusively_within_in(
+            lock_dir.as_deref(),
+            mfile_lock_timeout(),
+            root,
+            path,
+            edit,
+        )
+    }
+
+    /// [`File::edit_exclusively_within`] with the lock directory passed in,
+    /// as [`File::edit_exclusively_in`] takes it.
+    fn edit_exclusively_within_in<E>(
+        lock_dir: Option<&Path>,
+        timeout: Duration,
+        root: &Path,
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        let rel = path.strip_prefix(root).ok().filter(|rel| {
+            rel.file_name().is_some() && rel.components().all(|c| matches!(c, Component::Normal(_)))
+        });
+        let Some(rel) = rel else {
+            // The caller built `path` from something other than `root`: a
+            // daemon bug, not something the box did, so the daemon's paths
+            // are the useful ones here.
+            let e = std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "not a file under the workspace {}, so the edit is refused. \
+                     This is a bug in Minimal. Run `min bug` to report it.",
+                    root.display()
+                ),
+            );
+            return Err(Error::IO("editing", path.to_path_buf(), e).into());
+        };
+        Self::edit_confined(lock_dir, timeout, root, rel, path, edit)
+    }
+
+    // The refusals below name the file by `rel`, its path under the
+    // workspace (`minimal.toml` or `.minimal/minimal.toml`). They reach the
+    // person who ran `min add` in the box, who knows the file by that name
+    // and not by the daemon's path to the workspace, and each ends with what
+    // that person can do about it.
+
+    /// The error for a `minimal.toml` whose name resolves, through a link,
+    /// to a file outside the workspace.
+    #[cfg(target_os = "linux")]
+    fn leads_outside(rel: &Path) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "it leads outside its workspace through a link, so the edit is refused. \
+             Replace the link (`minimal.toml` or `.minimal`) with a regular file or directory, \
+             or with a relative link that stays in the workspace",
+        );
+        Error::IO("editing", rel.to_path_buf(), e)
+    }
+
+    /// The error for a link at `link` (a name under the workspace) where
+    /// links are not followed: the fallback for a kernel without `openat2`,
+    /// or a system other than Linux, refuses every link, since it cannot
+    /// keep a followed link inside the workspace. It does not say the link
+    /// leads outside: it did not look where the link leads.
+    fn link_not_followed(link: &Path) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "a link, and this system cannot follow a link here and keep the edit inside \
+             the workspace, so the edit is refused. Replace the link with a regular file \
+             or directory",
+        );
+        Error::IO("editing", link.to_path_buf(), e)
+    }
+
+    /// The error for a `minimal.toml` that became a link after it was
+    /// resolved, while the edit held it.
+    #[cfg(target_os = "linux")]
+    fn became_a_link(rel: &Path) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "it was replaced by a link during the edit, so the edit is refused. \
+             Run the command again",
+        );
+        Error::IO("editing", rel.to_path_buf(), e)
+    }
+
+    /// The error for a `minimal.toml` that is a link to nothing.
+    #[cfg(target_os = "linux")]
+    fn dangling_within(rel: &Path) -> Error {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "symlink to a file that does not exist; create it or replace the link with a file",
+        );
+        Error::IO("resolving", rel.to_path_buf(), e)
+    }
+
+    /// The best-effort confinement: no component of `rel` under `root` may
+    /// be a symlink. A link swapped in between this check and the edit is
+    /// not caught, which is why Linux uses [`File::edit_confined`]'s
+    /// `openat2` path instead.
+    fn edit_checking_components<E>(
+        lock_dir: Option<&Path>,
+        timeout: Duration,
+        root: &Path,
+        rel: &Path,
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        let mut at = root.to_path_buf();
+        let mut link = PathBuf::new();
+        for component in rel.components() {
+            at.push(component);
+            link.push(component);
+            match std::fs::symlink_metadata(&at) {
+                Ok(meta) if meta.is_symlink() => return Err(Self::link_not_followed(&link).into()),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(Error::IO("statting", at, e).into()),
+            }
+        }
+        // No component under `root` is a link, so the path-based editor's
+        // canonical path stays under the (trusted) canonical `root`.
+        Self::edit_exclusively_in(lock_dir, timeout, path, edit)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn edit_confined<E>(
+        lock_dir: Option<&Path>,
+        timeout: Duration,
+        root: &Path,
+        rel: &Path,
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        Self::edit_checking_components(lock_dir, timeout, root, rel, path, edit)
+    }
+
+    /// Resolves `rel` beneath `root` with `openat2(2)`, then edits the file
+    /// through the descriptor of the directory that holds it.
+    #[cfg(target_os = "linux")]
+    fn edit_confined<E>(
+        lock_dir: Option<&Path>,
+        timeout: Duration,
+        root: &Path,
+        rel: &Path,
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        use std::os::fd::AsFd as _;
+
+        let root_fd = beneath::open_root(root)
+            .map_err(|e| Error::IO("opening workspace", root.to_path_buf(), e))?;
+        let parent_rel = rel.parent().unwrap_or(Path::new(""));
+        let Some(name) = rel.file_name() else {
+            return Err(Self::leads_outside(rel).into());
+        };
+
+        let dir_fd = match beneath::open_beneath(root_fd.as_fd(), parent_rel, beneath::DIR_FLAGS) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                tracing::warn!(
+                    "this kernel has no openat2; checking {} for links before editing it",
+                    path.display()
+                );
+                return Self::edit_checking_components(lock_dir, timeout, root, rel, path, edit);
+            }
+            Err(e) if beneath::escaped(&e) => return Err(Self::leads_outside(rel).into()),
+            Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e).into()),
+        };
+
+        // A link at the final name: resolve it beneath `root` too, and edit
+        // the file it reaches in the directory that holds that file. The
+        // link entry itself is left in place, as the host editor leaves it.
+        let is_link = beneath::is_symlink_at(dir_fd.as_fd(), name);
+        let (dir_fd, name) = match is_link {
+            Ok(false) => (dir_fd, name.to_os_string()),
+            Ok(true) => {
+                let target = match beneath::open_beneath(root_fd.as_fd(), rel, libc::O_PATH) {
+                    Ok(fd) => fd,
+                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                        return Err(Self::dangling_within(rel).into());
+                    }
+                    Err(e) if beneath::escaped(&e) => {
+                        return Err(Self::leads_outside(rel).into());
+                    }
+                    Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e).into()),
+                };
+                let resolved = beneath::fd_path(target.as_fd())
+                    .map_err(|e| Error::IO("resolving", path.to_path_buf(), e))?;
+                let root_real = beneath::fd_path(root_fd.as_fd())
+                    .map_err(|e| Error::IO("resolving", root.to_path_buf(), e))?;
+                let Some(real_rel) = resolved.strip_prefix(&root_real).ok() else {
+                    return Err(Self::leads_outside(rel).into());
+                };
+                let Some(real_name) = real_rel.file_name() else {
+                    return Err(Self::leads_outside(rel).into());
+                };
+                // Opened beneath `root` again rather than by the absolute
+                // path, so a directory swapped for a link meanwhile is
+                // refused instead of followed.
+                let real_parent = real_rel.parent().unwrap_or(Path::new(""));
+                let dir =
+                    match beneath::open_beneath(root_fd.as_fd(), real_parent, beneath::DIR_FLAGS) {
+                        Ok(fd) => fd,
+                        Err(e) if beneath::escaped(&e) => {
+                            return Err(Self::leads_outside(rel).into());
+                        }
+                        Err(e) => return Err(Error::IO("opening", path.to_path_buf(), e).into()),
+                    };
+                (dir, real_name.to_os_string())
+            }
+            Err(e) => return Err(Error::IO("statting", path.to_path_buf(), e).into()),
+        };
+        // The real location, for the lock key and the messages.
+        let shown = beneath::fd_path(dir_fd.as_fd())
+            .map(|dir| dir.join(&name))
+            .unwrap_or_else(|_| path.to_path_buf());
+        Self::edit_in_dir(
+            lock_dir,
+            timeout,
+            std::fs::File::from(dir_fd),
+            &name,
+            &shown,
+            rel,
+            edit,
+        )
+    }
+
+    /// The read-edit-write of [`File::edit_exclusively_in`], done relative
+    /// to the open directory `dir` instead of by path, so no name is looked
+    /// up again after [`File::edit_confined`] resolved it: the lock is a
+    /// `flock` on `dir`, the read refuses a link at `name`
+    /// (`O_NOFOLLOW`), the temp file is made in `dir`, and the replace is a
+    /// `renameat` within `dir`. A rename never follows a link at its target
+    /// name. It duplicates that body rather than sharing it, because the
+    /// path-based one must keep following links for the host CLI.
+    ///
+    /// `shown` is the file's real path, for the lock key and the I/O
+    /// errors; `rel` is the name under the workspace the caller asked for,
+    /// for the refusals.
+    #[cfg(target_os = "linux")]
+    fn edit_in_dir<E>(
+        lock_dir: Option<&Path>,
+        timeout: Duration,
+        dir: std::fs::File,
+        name: &OsStr,
+        shown: &Path,
+        rel: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        use std::io::Read as _;
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        // Held until this function returns, so across the write below.
+        // `dir` stays open as long, which keeps its own `flock`.
+        let _fallback_lock = match Self::wait_for_directory_lock(&dir, shown, timeout) {
+            Ok(()) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(Error::IO("locking", shown.to_path_buf(), e).into());
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "cannot lock the directory of {} ({e}); using the state-directory lock",
+                    shown.display()
+                );
+                Self::state_dir_lock(lock_dir, shown, timeout)?
+            }
+        };
+
+        let existing = match beneath::open_at(dir.as_fd(), name, libc::O_RDONLY) {
+            Ok(fd) => {
+                let mut file = std::fs::File::from(fd);
+                let meta = file
+                    .metadata()
+                    .map_err(|e| Error::IO("statting", shown.to_path_buf(), e))?;
+                if !meta.is_file() {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "not a regular file, so the edit is refused. \
+                         Replace it with a regular file",
+                    );
+                    return Err(Error::IO("reading", rel.to_path_buf(), e).into());
+                }
+                let mut content = String::new();
+                file.read_to_string(&mut content)
+                    .map_err(|e| Error::IO("reading", shown.to_path_buf(), e))?;
+                Some((content, meta.permissions()))
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
+            // A link put at `name` after it was resolved.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(Self::became_a_link(rel).into());
+            }
+            Err(e) => return Err(Error::IO("reading", shown.to_path_buf(), e).into()),
+        };
+        let (content, perms) = match existing {
+            Some((content, perms)) => (Some(content), Some(perms)),
+            None => (None, None),
+        };
+
+        let Some(new) = edit(content.as_deref())? else {
+            return Ok(());
+        };
+        // As in `edit_exclusively_in`: a file the caller may not write fails
+        // here, before the rename (which needs only the directory) would
+        // replace it. Nothing is truncated or written.
+        if perms.is_some()
+            && let Err(e) = beneath::open_at(dir.as_fd(), name, libc::O_WRONLY)
+        {
+            return Err(Error::IO("writing", shown.to_path_buf(), e).into());
+        }
+        // The temp is made through the directory's descriptor, so it lands
+        // in `dir` whatever happens to the names above it.
+        let dir_by_fd = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        let mut builder = tempfile::Builder::new();
+        builder.permissions(std::fs::Permissions::from_mode(if perms.is_some() {
+            0o600
+        } else {
+            0o666
+        }));
+        let mut tmp = match builder.tempfile_in(&dir_by_fd) {
+            Ok(t) => t,
+            Err(e) => return Err(Error::IO("creating temp", shown.to_path_buf(), e).into()),
+        };
+        if let Err(e) = tmp.write_all(new.as_bytes()) {
+            return Err(Error::IO("writing temp", shown.to_path_buf(), e).into());
+        }
+        if let Err(e) = tmp.as_file().sync_all() {
+            return Err(Error::IO("syncing temp", shown.to_path_buf(), e).into());
+        }
+        if let Some(perms) = perms
+            && let Err(e) = tmp.as_file().set_permissions(perms)
+        {
+            return Err(Error::IO("setting permissions", shown.to_path_buf(), e).into());
+        }
+        let (_file, tmp_path) = tmp.into_parts();
+        let Some(tmp_name) = tmp_path.file_name().map(OsStr::to_os_string) else {
+            let e = std::io::Error::other("the temp file has no name");
+            return Err(Error::IO("creating temp", shown.to_path_buf(), e).into());
+        };
+        match beneath::rename_at(dir.as_fd(), &tmp_name, name) {
+            // The temp's name is now the file's: nothing is left to remove.
+            Ok(()) => {
+                let _ = tmp_path.keep();
+                Ok(())
+            }
+            // Dropping `tmp_path` removes the temp.
+            Err(e) => Err(Error::IO("replacing", shown.to_path_buf(), e).into()),
+        }
+    }
+
+    /// Takes the exclusive lock for the canonical `path`, saying so on
+    /// stderr before it waits for another process to release it.
+    ///
+    /// The lock is a `flock` on the directory that holds `path`, so every
+    /// process that edits the file shares it, whatever its `HOME`. Where
+    /// the filesystem refuses a `flock` on a directory (NFS answers
+    /// `EBADF`), the lock falls back to a file in `lock_dir`, named by a
+    /// hash of `path`. `None` means neither lock can be had: it warns once
+    /// and the caller edits unlocked. A wait longer than `timeout` fails,
+    /// so a stuck holder cannot block an edit forever.
+    fn lock_for(
+        lock_dir: Option<&Path>,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Option<std::fs::File>, Error> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match std::fs::File::open(parent) {
+            Ok(dir) => match Self::wait_for_directory_lock(&dir, path, timeout) {
+                Ok(()) => return Ok(Some(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(Error::IO("locking", path.to_path_buf(), e));
+                }
+                Err(e) => tracing::debug!(
+                    "cannot lock directory {} ({e}); using the state-directory lock",
+                    parent.display()
+                ),
+            },
+            Err(e) => tracing::debug!(
+                "cannot open directory {} ({e}); using the state-directory lock",
+                parent.display()
+            ),
+        }
+        Self::state_dir_lock(lock_dir, path, timeout)
+    }
+
+    /// The fallback lock of [`File::lock_for`]: a file in `lock_dir`, named
+    /// by a hash of `path`, for a filesystem that refuses a `flock` on a
+    /// directory. `None` means it cannot be had either: it warns once and
+    /// the caller edits unlocked.
+    fn state_dir_lock(
+        lock_dir: Option<&Path>,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Option<std::fs::File>, Error> {
+        let Some(lock_dir) = lock_dir else {
+            tracing::warn!(
+                "cannot find the Minimal state directory (is HOME set?); editing {} without \
+                 the lock",
+                path.display()
+            );
+            return Ok(None);
+        };
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(path.as_os_str().as_bytes());
+        let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        let lock_path = lock_dir.join(format!("{name}.lock"));
+
+        if let Err(e) = std::fs::create_dir_all(lock_dir) {
+            tracing::warn!(
+                "cannot create lock directory {} ({e}); editing {} without the lock",
+                lock_dir.display(),
+                path.display()
+            );
+            return Ok(None);
+        }
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    "cannot open lock {} ({e}); editing {} without the lock",
+                    lock_path.display(),
+                    path.display()
+                );
+                return Ok(None);
+            }
+        };
+
+        match Self::wait_for_lock(&file, path, timeout) {
+            Ok(()) => Ok(Some(file)),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                Err(Error::IO("locking", path.to_path_buf(), e))
+            }
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EBADF | libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS)
+                ) || e.raw_os_error() == Some(libc::ENOTSUP) =>
+            {
+                tracing::warn!(
+                    "cannot lock {} ({e}); editing {} without the lock",
+                    lock_path.display(),
+                    path.display()
+                );
+                Ok(None)
+            }
+            Err(e) => Err(Error::IO("locking", lock_path, e)),
+        }
+    }
+
+    /// [`File::wait_for_lock`] on the directory that holds `path`. Tests can
+    /// make it fail with `EBADF`, as NFS does, through
+    /// `tests::REFUSE_DIRECTORY_FLOCK`, to reach the state-directory lock.
+    fn wait_for_directory_lock(
+        dir: &std::fs::File,
+        path: &Path,
+        timeout: Duration,
+    ) -> std::io::Result<()> {
+        #[cfg(test)]
+        if tests::REFUSE_DIRECTORY_FLOCK.get() {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        }
+        Self::wait_for_lock(dir, path, timeout)
+    }
+
+    /// Takes `file`'s exclusive `flock`, polling with backoff. It says once
+    /// on stderr that it waits for `path`, and gives up with
+    /// [`std::io::ErrorKind::TimedOut`] after `timeout`.
+    fn wait_for_lock(file: &std::fs::File, path: &Path, timeout: Duration) -> std::io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut backoff = Duration::from_millis(10);
+        let mut said = false;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(()),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+            if !said {
+                eprintln!(
+                    "waiting for another command to finish editing {}",
+                    path.display()
+                );
+                said = true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "another command kept this file locked for {}s. It may be run by \
+                         another user. Stop that command and run this one again, or set \
+                         {MFILE_LOCK_TIMEOUT_ENV} to wait longer",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(backoff.min(deadline - now));
+            backoff = (backoff * 2).min(Duration::from_secs(1));
+        }
+    }
+
+>>>>>>> 287e4f4 (fix(mfile,mctx,minimald): keep a box's minimal.toml edits inside its workspace (#3404))
     // Creates a synthetic minimal file not backed on the filesystem.
     //
     // DO NOT USE unless you know what you are doing.
@@ -1460,6 +2182,164 @@ impl File {
                 })
             }
         }
+    }
+}
+
+/// The descriptor-relative calls behind [`File::edit_exclusively_within`].
+#[cfg(target_os = "linux")]
+mod beneath {
+    use std::ffi::{CString, OsStr};
+    use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::{Path, PathBuf};
+
+    // From <linux/openat2.h>.
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_BENEATH: u64 = 0x08;
+
+    /// `struct open_how` of `openat2(2)`. libc's `open_how` is
+    /// `non_exhaustive`, so it cannot be built outside libc.
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    /// The flags a directory is opened with: readable, so it can be
+    /// `flock`ed (an `O_PATH` descriptor cannot be).
+    pub(super) const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
+
+    fn c_path(path: &OsStr) -> std::io::Result<CString> {
+        CString::new(path.as_bytes()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn owned(fd: libc::c_int) -> std::io::Result<OwnedFd> {
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a descriptor the kernel just returned to us, and
+        // nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Opens the trusted directory `root` as an `O_PATH` anchor.
+    pub(super) fn open_root(root: &Path) -> std::io::Result<OwnedFd> {
+        let c = c_path(root.as_os_str())?;
+        // SAFETY: `c` is a NUL-terminated string that outlives the call.
+        owned(unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        })
+    }
+
+    /// Opens `rel` (empty means `dir` itself) beneath `dir` with
+    /// `openat2(2)`: the kernel refuses with `EXDEV` a `..` or a symlink
+    /// that leaves `dir`, and with `ELOOP` a magic link (`/proc/.../fd/N`).
+    pub(super) fn open_beneath(
+        dir: BorrowedFd<'_>,
+        rel: &Path,
+        flags: libc::c_int,
+    ) -> std::io::Result<OwnedFd> {
+        let rel = if rel.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            rel
+        };
+        let c = c_path(rel.as_os_str())?;
+        let how = OpenHow {
+            flags: u64::from((flags | libc::O_CLOEXEC).cast_unsigned()),
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+        };
+        // The kernel answers EAGAIN when a rename elsewhere raced the
+        // lookup; it asks for a retry.
+        let mut tries = 0;
+        loop {
+            // SAFETY: `c` and `how` outlive the call, and the size passed is
+            // the size of `how`, the layout of `struct open_how`.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    dir.as_raw_fd(),
+                    c.as_ptr(),
+                    &raw const how,
+                    std::mem::size_of::<OpenHow>(),
+                )
+            };
+            let fd = libc::c_int::try_from(fd).unwrap_or(-1);
+            match owned(fd) {
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && tries < 16 => tries += 1,
+                other => return other,
+            }
+        }
+    }
+
+    /// Whether an [`open_beneath`] error means the name leads out of the
+    /// directory, or through a magic link.
+    pub(super) fn escaped(e: &std::io::Error) -> bool {
+        matches!(e.raw_os_error(), Some(libc::EXDEV | libc::ELOOP))
+    }
+
+    /// Whether `name` in `dir` is a symlink, without following it.
+    /// A name that does not exist is not one.
+    pub(super) fn is_symlink_at(dir: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<bool> {
+        let c = c_path(name)?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `c` outlives the call and `st` is a writable `stat`.
+        let r = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::ENOENT) {
+                Ok(false)
+            } else {
+                Err(e)
+            };
+        }
+        // SAFETY: `fstatat` returned 0, so it filled `st`.
+        let st = unsafe { st.assume_init() };
+        Ok((st.st_mode & libc::S_IFMT) == libc::S_IFLNK)
+    }
+
+    /// Opens `name` in `dir` without following a link there (`ELOOP`), and
+    /// without blocking on a FIFO.
+    pub(super) fn open_at(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        flags: libc::c_int,
+    ) -> std::io::Result<OwnedFd> {
+        let c = c_path(name)?;
+        let flags = flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        // SAFETY: `c` is a NUL-terminated string that outlives the call.
+        owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
+    }
+
+    /// Renames `from` to `to`, both in `dir`. A link at `to` is replaced,
+    /// never followed.
+    pub(super) fn rename_at(dir: BorrowedFd<'_>, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+        let from = c_path(from)?;
+        let to = c_path(to)?;
+        // SAFETY: both strings are NUL-terminated and outlive the call.
+        let r =
+            unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The path the kernel resolved `fd` to.
+    pub(super) fn fd_path(fd: BorrowedFd<'_>) -> std::io::Result<PathBuf> {
+        std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
     }
 }
 
@@ -2701,4 +3581,793 @@ mod tests {
             CaptureWriter(self.0.clone())
         }
     }
+<<<<<<< HEAD
+=======
+
+    /// One lock directory for the whole test process, so tests never write
+    /// to the real state directory; lock files are keyed by each test's
+    /// own temp path, so tests do not contend.
+    static TEST_LOCK_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| tempdir().unwrap());
+
+    thread_local! {
+        /// Makes this thread's directory `flock` fail with `EBADF`, as NFS
+        /// answers, so a test reaches the state-directory lock.
+        pub(super) static REFUSE_DIRECTORY_FLOCK: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Runs `f` with this thread's directory `flock` refused.
+    fn with_directory_flock_refused<T>(f: impl FnOnce() -> T) -> T {
+        REFUSE_DIRECTORY_FLOCK.set(true);
+        let out = f();
+        REFUSE_DIRECTORY_FLOCK.set(false);
+        out
+    }
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+    fn edit_in_test(
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, Error>,
+    ) -> Result<(), Error> {
+        File::edit_exclusively_in(Some(TEST_LOCK_DIR.path()), TEST_TIMEOUT, path, edit)
+    }
+
+    #[test]
+    fn edit_exclusively_serializes_writers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
+
+        let writers: Vec<String> = (0..8).map(|i| format!("k{i} = {i}\n")).collect();
+        std::thread::scope(|s| {
+            for line in &writers {
+                let path = &path;
+                s.spawn(move || {
+                    edit_in_test(path, |content| {
+                        let Some(mut content) = content.map(str::to_string) else {
+                            panic!("minimal.toml vanished under the lock");
+                        };
+                        content.push_str(line);
+                        Ok(Some(content))
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let final_content = std::fs::read_to_string(&path).unwrap();
+        for line in &writers {
+            assert!(
+                final_content.contains(line),
+                "lost edit `{line:?}`; file:\n{final_content}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_exclusively_never_exposes_a_torn_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..64 {
+                    edit_in_test(&path, |content| {
+                        let mut content = content
+                            .expect("minimal.toml vanished under the lock")
+                            .to_string();
+                        content.push_str(&format!("k{i} = {i}\n"));
+                        Ok(Some(content))
+                    })
+                    .unwrap();
+                }
+            });
+            s.spawn(|| {
+                for _ in 0..512 {
+                    // The atomic-replace write means every read observes
+                    // either the old or the new file — never a truncated
+                    // prefix of one, which `std::fs::write` in place can
+                    // produce. A torn write leaves a partial table that
+                    // fails to parse as a whole document.
+                    let content = std::fs::read_to_string(&path).unwrap();
+                    toml::from_str::<toml::Value>(&content).unwrap_or_else(|e| {
+                        panic!("torn read: {e}; content: {content:?}");
+                    });
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn link_missing_repo_and_dir_names_the_fields() {
+        let err = File::from_toml_bytes(indoc! {b"
+            [upstream]
+            branch = \"main\"
+        "})
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`repo`"), "message: {msg}");
+        assert!(msg.contains("`dir`"), "message: {msg}");
+        assert!(msg.contains("[upstream]"), "message: {msg}");
+    }
+
+    /// A sideload missing `repo`/`dir` is mapped too, and the message
+    /// points at the sideload's table rather than at `[upstream]`. Also
+    /// pins the serde wording the mapping matches on.
+    #[test]
+    fn sideload_missing_repo_and_dir_names_the_table_and_line() {
+        let err = File::from_toml_bytes(indoc! {b"
+            [upstream]
+            repo = \"https://example.com/pkgs.git\"
+
+            [[upstream.sideload]]
+            dir = \"../local\"
+
+            [[upstream.sideload]]
+            branch = \"main\"
+        "})
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::LinkConfig { .. }),
+            "not mapped to LinkConfig: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("`repo`"), "message: {msg}");
+        assert!(msg.contains("[[upstream.sideload]]"), "message: {msg}");
+        assert!(msg.contains("line 7"), "message: {msg}");
+        assert!(!msg.contains("untagged"), "message: {msg}");
+    }
+
+    /// A second editor waits while the lock is held, including one that
+    /// names the file through a symlink: both spellings share one lock.
+    #[test]
+    #[cfg(unix)]
+    fn edit_exclusively_waits_for_the_holder_across_spellings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+
+        let held = File::lock_for(
+            Some(TEST_LOCK_DIR.path()),
+            &std::fs::canonicalize(&path).unwrap(),
+            TEST_TIMEOUT,
+        )
+        .unwrap()
+        .expect("flock is supported on the test filesystem");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                edit_in_test(&link, |content| Ok(content.map(|c| format!("{c}k = 1\n")))).unwrap();
+                tx.send(()).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the edit ran while another holder had the lock"
+            );
+            drop(held);
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the edit runs once the lock is released");
+        });
+        assert!(std::fs::read_to_string(&path).unwrap().contains("k = 1"));
+    }
+
+    #[test]
+    fn edit_exclusively_creates_a_missing_file_at_the_requested_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+
+        edit_in_test(&path, |content| {
+            assert!(content.is_none(), "a missing file reads as None");
+            Ok(Some("[stack]\nname = \"base\"\n".to_string()))
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[stack]\nname = \"base\"\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_exclusively_follows_a_symlink_instead_of_replacing_it() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "[stack]\nname = \"base\"\n").unwrap();
+        let link = dir.path().join(MFILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        edit_in_test(&link, |content| {
+            let mut content = content.expect("target vanished").to_string();
+            content.push_str("k = \"v\"\n");
+            Ok(Some(content))
+        })
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("symlink entry vanished")
+                .file_type()
+                .is_symlink(),
+            "the edit replaced the symlink entry itself"
+        );
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("k = \"v\""), "content: {content}");
+    }
+
+    #[test]
+    fn edit_exclusively_refuses_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("missing.toml");
+        let link = dir.path().join(MFILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = edit_in_test(&link, |_| Ok(Some("k = \"v\"\n".to_string()))).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "resolving I/O error at path {0}: symlink to {1}, which does not exist; \
+                 create {1} or replace the link with a file",
+                link.display(),
+                target.display()
+            )
+        );
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the edit replaced the dangling symlink"
+        );
+        assert!(!target.exists(), "the edit created the link's target");
+    }
+
+    fn edit_within_test(
+        root: &Path,
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, Error>,
+    ) -> Result<(), Error> {
+        File::edit_exclusively_within_in(Some(TEST_LOCK_DIR.path()), TEST_TIMEOUT, root, path, edit)
+    }
+
+    fn append_k(content: Option<&str>) -> Result<Option<String>, Error> {
+        let mut content = content.unwrap_or_default().to_string();
+        content.push_str("k = \"v\"\n");
+        Ok(Some(content))
+    }
+
+    const BASE: &str = "[stack]\nname = \"base\"\n";
+
+    /// A workspace `ws` beside a file `outside.toml` that is not in it.
+    fn workspace_and_outside() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside.toml");
+        std::fs::write(&outside, BASE).unwrap();
+        (dir, root, outside)
+    }
+
+    /// Whether the edit of a file under `root` refuses every link rather
+    /// than following it: the fallback, taken off Linux and on a Linux
+    /// kernel without `openat2`.
+    fn refuses_every_link(root: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            takes_the_no_openat2_fallback(root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = root;
+            true
+        }
+    }
+
+    /// The edit was refused with a refusal that names the file by its path
+    /// under the workspace and says what to do: as leading outside the
+    /// workspace, or, where every link is refused, as a link. The fallback
+    /// does not look where a link leads, so it must not say.
+    fn assert_link_refusal(err: &Error, root: &Path) {
+        let text = err.to_string();
+        if refuses_every_link(root) {
+            assert!(
+                text.contains("cannot follow a link here") && !text.contains("leads outside"),
+                "error: {text}"
+            );
+            assert!(
+                text.contains("Replace the link with a regular file"),
+                "error: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("leads outside its workspace"),
+                "error: {text}"
+            );
+            assert!(
+                text.contains("or with a relative link that stays in the workspace"),
+                "error: {text}"
+            );
+        }
+        let Error::IO(_, shown, _) = err else {
+            panic!("not an I/O refusal: {err:?}");
+        };
+        assert!(
+            shown.is_relative() && !text.contains(&*root.to_string_lossy()),
+            "the refusal shows the daemon's path: {text}"
+        );
+    }
+
+    /// The edit was refused as leading out of the workspace, `outside` is
+    /// unchanged, and `link` is still the link it was.
+    fn assert_refused_outside(err: &Error, outside: &Path, link: &Path, target: &Path) {
+        assert_link_refusal(err, link.parent().unwrap());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), BASE);
+        assert_eq!(
+            std::fs::read_link(link).expect("the link entry was replaced"),
+            target
+        );
+    }
+
+    #[test]
+    fn edit_within_edits_a_plain_file_in_place() {
+        let (_dir, root, _) = workspace_and_outside();
+        let path = root.join(MFILE_NAME);
+        std::fs::write(&path, BASE).unwrap();
+
+        edit_within_test(&root, &path, append_k).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{BASE}k = \"v\"\n")
+        );
+        let names: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![OsString::from(MFILE_NAME)],
+            "no temp left behind"
+        );
+    }
+
+    #[test]
+    fn edit_within_creates_a_missing_file() {
+        let (_dir, root, _) = workspace_and_outside();
+        let path = root.join(MFILE_NAME);
+
+        edit_within_test(&root, &path, append_k).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = \"v\"\n");
+    }
+
+    #[test]
+    fn edit_within_refuses_an_absolute_link_out_of_the_workspace() {
+        let (_dir, root, outside) = workspace_and_outside();
+        let link = root.join(MFILE_NAME);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let err = edit_within_test(&root, &link, append_k).unwrap_err();
+
+        assert_refused_outside(&err, &outside, &link, &outside);
+    }
+
+    #[test]
+    fn edit_within_refuses_a_relative_link_out_of_the_workspace() {
+        let (_dir, root, outside) = workspace_and_outside();
+        let link = root.join(MFILE_NAME);
+        let target = Path::new("../outside.toml");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        let err = edit_within_test(&root, &link, append_k).unwrap_err();
+
+        assert_refused_outside(&err, &outside, &link, target);
+    }
+
+    #[test]
+    fn edit_within_refuses_a_dot_minimal_link_out_of_the_workspace() {
+        let (dir, root, _) = workspace_and_outside();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let outside = elsewhere.join(MFILE_NAME);
+        std::fs::write(&outside, BASE).unwrap();
+        let link = root.join(".minimal");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        let path = root.join(".minimal").join(MFILE_NAME);
+        let err = edit_within_test(&root, &path, append_k).unwrap_err();
+
+        assert_refused_outside(&err, &outside, &link, &elsewhere);
+    }
+
+    #[test]
+    fn edit_within_edits_the_dot_minimal_layout() {
+        let (_dir, root, _) = workspace_and_outside();
+        std::fs::create_dir(root.join(".minimal")).unwrap();
+        let path = root.join(".minimal").join(MFILE_NAME);
+        std::fs::write(&path, BASE).unwrap();
+
+        edit_within_test(&root, &path, append_k).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{BASE}k = \"v\"\n")
+        );
+    }
+
+    #[test]
+    fn edit_within_refuses_a_path_outside_the_root() {
+        let (_dir, root, outside) = workspace_and_outside();
+
+        let err = edit_within_test(&root, &outside, append_k).unwrap_err();
+
+        assert!(
+            err.to_string().contains("not a file under the workspace"),
+            "error: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), BASE);
+    }
+
+    /// Whether the edit of a file at `root` takes the fallback for a kernel
+    /// without `openat2`. It makes the first call [`File::edit_confined`]
+    /// makes and checks the one answer that sends it to the fallback,
+    /// `ENOSYS`. An `EPERM` (a seccomp filter) fails the edit there instead.
+    #[cfg(target_os = "linux")]
+    fn takes_the_no_openat2_fallback(root: &Path) -> bool {
+        use std::os::fd::AsFd as _;
+
+        let root_fd = beneath::open_root(root).unwrap();
+        match beneath::open_beneath(root_fd.as_fd(), Path::new(""), beneath::DIR_FLAGS) {
+            Ok(_) => false,
+            Err(e) => e.raw_os_error() == Some(libc::ENOSYS),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn edit_within_refuses_a_dangling_link() {
+        let (_dir, root, _) = workspace_and_outside();
+        let link = root.join(MFILE_NAME);
+        let target = Path::new("missing.toml");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        let err = edit_within_test(&root, &link, append_k).unwrap_err();
+
+        if takes_the_no_openat2_fallback(&root) {
+            eprintln!(
+                "this kernel has no openat2: checking the fallback's refusal of every link instead"
+            );
+            assert_link_refusal(&err, &root);
+        } else {
+            assert!(err.to_string().contains("does not exist"), "error: {err}");
+        }
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(
+            !root.join(target).exists(),
+            "the edit created the link's target"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn edit_within_follows_a_relative_link_that_stays_inside() {
+        let (_dir, root, _) = workspace_and_outside();
+        std::fs::create_dir(root.join("conf")).unwrap();
+        let real = root.join("conf").join("real.toml");
+        std::fs::write(&real, BASE).unwrap();
+        let link = root.join(MFILE_NAME);
+        let target = Path::new("conf/real.toml");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        if takes_the_no_openat2_fallback(&root) {
+            eprintln!(
+                "this kernel has no openat2: checking the fallback's refusal of every link instead"
+            );
+            let err = edit_within_test(&root, &link, append_k).unwrap_err();
+            assert_link_refusal(&err, &root);
+            assert_eq!(std::fs::read_to_string(&real).unwrap(), BASE);
+            assert_eq!(std::fs::read_link(&link).unwrap(), target);
+            return;
+        }
+
+        edit_within_test(&root, &link, append_k).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            format!("{BASE}k = \"v\"\n")
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("the link entry was replaced"),
+            target
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn edit_within_keeps_a_private_file_private() {
+        let (_dir, root, _) = workspace_and_outside();
+        let path = root.join(MFILE_NAME);
+        std::fs::write(&path, BASE).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        edit_within_test(&root, &path, append_k).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn edit_exclusively_gives_a_new_file_the_mode_fs_write_would() {
+        // Compare with a file std::fs::write creates under the same umask;
+        // setting the umask here would race the other test threads.
+        let dir = tempdir().unwrap();
+        let reference = dir.path().join("reference");
+        std::fs::write(&reference, "").unwrap();
+        let expected = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+        let path = dir.path().join(MFILE_NAME);
+
+        edit_in_test(&path, |_| Ok(Some("k = \"v\"\n".to_string()))).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, expected,
+            "mode {mode:o}, std::fs::write gives {expected:o}"
+        );
+        if expected & 0o022 == 0 {
+            assert_eq!(
+                mode & 0o022,
+                0,
+                "a new file is group/world-writable: {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_exclusively_keeps_a_private_file_private() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "k = \"v\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        edit_in_test(&path, |_| Ok(Some("k = \"w\"\n".to_string()))).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode {mode:o}");
+    }
+
+    #[test]
+    fn edit_exclusively_leaves_no_files_beside_minimal_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
+
+        edit_in_test(&path, |content| {
+            let mut content = content.expect("minimal.toml vanished").to_string();
+            content.push_str("k = \"v\"\n");
+            Ok(Some(content))
+        })
+        .unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![OsString::from(MFILE_NAME)]);
+    }
+
+    /// Edits `minimal.toml` in a fresh directory with `lock_dir` as the
+    /// lock directory and asserts the write landed.
+    fn assert_edit_lands_with_lock_dir(lock_dir: Option<&Path>) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+
+        File::edit_exclusively_in::<Error>(lock_dir, TEST_TIMEOUT, &path, |content| {
+            assert!(content.is_none());
+            Ok(Some("k = \"v\"\n".to_string()))
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = \"v\"\n");
+    }
+
+    #[test]
+    fn edit_exclusively_lands_when_the_lock_dir_cannot_be_created() {
+        // A lock directory beneath a regular file cannot be created, even
+        // by root (ENOTDIR), like a state dir on a read-only filesystem.
+        let state = tempdir().unwrap();
+        let blocker = state.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        assert_edit_lands_with_lock_dir(Some(&blocker.join("mfile-locks")));
+    }
+
+    #[test]
+    fn edit_exclusively_lands_when_the_lock_dir_is_read_only() {
+        // An existing read-only lock directory: the lock file cannot be
+        // opened (EACCES), unless the test runs as root, which locks.
+        let state = tempdir().unwrap();
+        let lock_dir = state.path().join("mfile-locks");
+        std::fs::create_dir(&lock_dir).unwrap();
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert_edit_lands_with_lock_dir(Some(&lock_dir));
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn edit_exclusively_lands_without_a_state_dir() {
+        assert_edit_lands_with_lock_dir(None);
+    }
+
+    #[test]
+    fn edit_exclusively_excludes_editors_with_different_state_dirs() {
+        // minimald and a CLI with another HOME resolve different state
+        // directories. The directory lock still makes them exclude.
+        let dir = tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap().join(MFILE_NAME);
+        let other_state = tempdir().unwrap();
+        let _held = File::lock_for(Some(other_state.path()), &path, TEST_TIMEOUT)
+            .unwrap()
+            .expect("flock is supported on the test filesystem");
+
+        let err = File::edit_exclusively_in::<Error>(
+            Some(TEST_LOCK_DIR.path()),
+            Duration::from_millis(200),
+            &path,
+            |_| Ok(Some("k = \"v\"\n".to_string())),
+        )
+        .unwrap_err();
+        assert!(
+            !path.exists(),
+            "the edit ran while another holder had the lock"
+        );
+        assert!(
+            err.to_string().contains(MFILE_LOCK_TIMEOUT_ENV),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn edit_exclusively_gives_up_when_the_holder_never_releases() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "k = 1\n").unwrap();
+        let _held = File::lock_for(
+            Some(TEST_LOCK_DIR.path()),
+            &std::fs::canonicalize(&path).unwrap(),
+            TEST_TIMEOUT,
+        )
+        .unwrap()
+        .expect("flock is supported on the test filesystem");
+
+        let start = Instant::now();
+        let err = File::edit_exclusively_in::<Error>(
+            Some(TEST_LOCK_DIR.path()),
+            Duration::from_millis(200),
+            &path,
+            |_| Ok(Some("k = 2\n".to_string())),
+        )
+        .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(matches!(err, Error::IO("locking", ..)), "error: {err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = 1\n");
+    }
+
+    #[test]
+    fn edit_exclusively_falls_back_to_the_state_dir_lock_when_the_directory_flock_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "k = 1\n").unwrap();
+        let state = tempdir().unwrap();
+        let lock_dir = state.path().join("mfile-locks");
+
+        // The fallback lock is taken: the edit lands and leaves its lock
+        // file, named by the path's hash, in the state directory.
+        with_directory_flock_refused(|| {
+            File::edit_exclusively_in::<Error>(Some(&lock_dir), TEST_TIMEOUT, &path, |c| {
+                assert_eq!(c, Some("k = 1\n"));
+                Ok(Some("k = 2\n".to_string()))
+            })
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = 2\n");
+        let locks: Vec<_> = std::fs::read_dir(&lock_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(locks.len(), 1, "lock files: {locks:?}");
+        assert_eq!(locks[0].extension(), Some(OsStr::new("lock")));
+
+        // And it excludes: while another holder has that lock file, the
+        // edit waits for it and times out without writing.
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&locks[0])
+            .unwrap();
+        held.lock().unwrap();
+        let err = with_directory_flock_refused(|| {
+            File::edit_exclusively_in::<Error>(
+                Some(&lock_dir),
+                Duration::from_millis(200),
+                &path,
+                |_| Ok(Some("k = 3\n".to_string())),
+            )
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::IO("locking", ..)), "error: {err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = 2\n");
+    }
+
+    #[test]
+    fn lock_timeout_takes_whole_seconds_and_warns_on_anything_else() {
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        assert_eq!(lock_timeout_from(None), Duration::from_secs(60));
+        assert_eq!(lock_timeout_from(Some("5")), Duration::from_secs(5));
+        assert!(capture.contents().is_empty(), "{}", capture.contents());
+        for bad in ["1.5", "60s", "0", ""] {
+            assert_eq!(lock_timeout_from(Some(bad)), Duration::from_secs(60));
+            assert!(
+                capture
+                    .contents()
+                    .contains(&format!("{MFILE_LOCK_TIMEOUT_ENV}={bad:?}")),
+                "no warning for {bad:?}: {}",
+                capture.contents()
+            );
+        }
+        assert!(capture.contents().contains("waiting 60s"));
+
+        drop(guard);
+    }
+
+    #[test]
+    fn edit_exclusively_refuses_a_read_only_minimal_toml() {
+        // Root may write a 0o444 file, as std::fs::write let it.
+        // SAFETY: geteuid reads the caller's effective uid. It has no side
+        // effects and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "k = \"old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let err = File::edit_exclusively_in::<Error>(None, TEST_TIMEOUT, &path, |_| {
+            Ok(Some("k = \"new\"\n".to_string()))
+        })
+        .unwrap_err();
+
+        match err {
+            Error::IO("writing", p, e) => {
+                assert_eq!(p, std::fs::canonicalize(&path).unwrap());
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = \"old\"\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444);
+    }
+
+    #[test]
+    fn edit_exclusively_still_fails_when_the_target_cannot_be_written() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join(MFILE_NAME);
+
+        let err = File::edit_exclusively_in::<Error>(None, TEST_TIMEOUT, &path, |_| {
+            Ok(Some("k = \"v\"\n".to_string()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::IO(..)), "error: {err:?}");
+    }
+>>>>>>> 287e4f4 (fix(mfile,mctx,minimald): keep a box's minimal.toml edits inside its workspace (#3404))
 }
