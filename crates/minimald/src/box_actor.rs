@@ -786,6 +786,12 @@ pub struct BoxActor {
     /// time (BOX-038).
     exit_unsettled: bool,
 
+    /// Set from a [`Self::resume`] that set the record to `running` until
+    /// its [`Self::finish_resume`]. The attach's launch then writes no
+    /// `started` event, because `finish_resume` writes it after `resumed`
+    /// (BOX-040).
+    resume_in_flight: bool,
+
     /// When the box runs past its `timeout` (BOX-037): armed by each launch
     /// that starts the entrypoint of an `until_complete` box with a timeout,
     /// and disarmed when the box stops, is destroyed or ends on its own.
@@ -899,6 +905,7 @@ impl BoxActor {
             // No launch yet, so no loop to watch.
             entrypoint_watch: None,
             exit_unsettled: false,
+            resume_in_flight: false,
             // Armed by the launch that starts the entrypoint.
             timeout_deadline: None,
             // Forwards are registered as their channels open; a session
@@ -1365,14 +1372,17 @@ impl BoxActor {
         let resumed =
             tracing::Instrument::instrument(self.resume_ended(record, from), span.clone()).await;
         match resumed {
-            Ok(restarted_from_stored_spec) => Ok(Some(PendingResume {
+            Ok(restarted_from_stored_spec) => {
+                self.resume_in_flight = true;
+                Ok(Some(PendingResume {
                 from,
                 before,
                 span,
                 restarted_from_stored_spec,
-                minted_host: !had_host
-                    && matches!(self.inner, BoxInner::Active { host: Some(_), .. }),
-            })),
+                    minted_host: !had_host
+                        && matches!(self.inner, BoxInner::Active { host: Some(_), .. }),
+                }))
+            }
             Err(error) => {
                 span.record("outcome", "refused");
                 span.in_scope(
@@ -1403,6 +1413,7 @@ impl BoxActor {
             restarted_from_stored_spec,
             minted_host,
         } = pending;
+        self.resume_in_flight = false;
         let outcome_span = span.clone();
         let finish = async {
             let has_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
@@ -1452,6 +1463,12 @@ impl BoxActor {
                 Err(error) => {
                     tracing::warn!(%error, "resume: could not open the box to write the resumed event");
                 }
+            }
+            // BOX-040: the resume started the entrypoint again, so `started`
+            // follows `resumed`. A launch that failed beside a host that was
+            // already there started nothing.
+            if launched.is_ok() {
+                self.record_started("resume").await;
             }
             // BOX-027: the resume runs no hook itself. The attach's launch
             // ran `on_attach`, and logs what its hooks did there.
@@ -2010,6 +2027,14 @@ impl BoxActor {
 
         // BOX-040, BOX-178: the entrypoint started again. The restart records
         // no event type of its own.
+        self.record_started("restart").await;
+        Ok(())
+    }
+
+    /// Writes the box's `started` event (BOX-040): its entrypoint started
+    /// on a new host. `op` names the operation that started it in the log.
+    /// A failed write is logged and does not stop the box, which runs.
+    pub(super) async fn record_started(&self, op: &'static str) {
         match self.record.object().await {
             Ok(object) => {
                 if let Err(error) = crate::box_manager::write_box_event(
@@ -2017,15 +2042,13 @@ impl BoxActor {
                     boxes::events::BoxEventType::Started,
                     boxes::events::EventData::new(),
                 ) {
-                    // The box runs: a missing event must not stop it.
-                    tracing::warn!(%error, "restart: could not write the started event");
+                    tracing::warn!(%error, op, "could not write the started event");
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, "restart: could not open the box to write the started event");
+                tracing::warn!(%error, op, "could not open the box to write the started event");
             }
         }
-        Ok(())
     }
 
     /// Runs the box's `on_activate` hooks again for a resume or a restart

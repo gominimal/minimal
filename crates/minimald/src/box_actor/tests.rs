@@ -18720,6 +18720,125 @@ async fn restart_records_exited_then_started_only() {
     assert_eq!(added, [BoxEventType::Started], "{added:?}");
 }
 
+/// The kinds of the events `id` recorded, once `want` of them are written.
+/// The end of a box writes its `exited` event after its record, so a test
+/// that saw the record waits here for the event.
+async fn event_kinds_once(
+    server: &TestServer,
+    id: SessionId,
+    want: usize,
+) -> Vec<boxes::events::BoxEventType> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let kinds: Vec<_> = event_kinds(server, id)
+            .await
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        if kinds.len() >= want || tokio::time::Instant::now() >= deadline {
+            return kinds;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// BOX-040: a task box records `started` when its run starts the
+/// entrypoint, between its `created` and its `exited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn created_task_box_records_started() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box(&mut client, &["/bin/sh", "-c", "exit 0"]).await;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run ends when the entrypoint returns")
+    .expect("the daemon takes the run");
+    assert_eq!(outcome.exit_status, Some(0), "{outcome:?}");
+    let manager = server.state.sessions_manager().await;
+    record_once_exited(&manager, id).await;
+
+    let kinds = event_kinds_once(&server, id, 3).await;
+    assert_eq!(
+        kinds,
+        [
+            BoxEventType::Created,
+            BoxEventType::Started,
+            BoxEventType::Exited
+        ],
+        "{kinds:?}"
+    );
+}
+
+/// BOX-040: a session box records `started` when its first attach starts
+/// its shell, after its `created`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn created_session_box_records_started() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("started-session"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the attach starts the shell");
+
+    let kinds = event_kinds_once(&server, id, 2).await;
+    assert_eq!(
+        kinds,
+        [BoxEventType::Created, BoxEventType::Started],
+        "{kinds:?}"
+    );
+}
+
+/// BOX-040: an attach that resumes a stopped session box records
+/// `resumed` and then `started`, and no second `started`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_session_box_records_started() {
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resumed-session"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the attach starts the shell");
+    stop_through_daemon(&server, id).await;
+    let before = event_kinds(&server, id).await.len();
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach to a stopped PTY box resumes it");
+    let kinds = event_kinds_once(&server, id, before + 2).await;
+    assert_eq!(
+        kinds[before..],
+        [BoxEventType::Resumed, BoxEventType::Started],
+        "{kinds:?}"
+    );
+}
+
 /// BOX-176, BOX-178: an argv until_stopped box that holds a host-side row
 /// and sets `hooks_on_resume` cannot start its entrypoint behind the shell
 /// its `on_activate` hooks run in. Its restart fails after the stop: the
