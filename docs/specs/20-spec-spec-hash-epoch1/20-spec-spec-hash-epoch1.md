@@ -165,10 +165,12 @@ the key over bounded specs (EPOCH-001). A dependency reorder no longer
 rotates keys.
 
 **First slice:** the pure encode/decode codec with its machine-checked
-round-trip and the nine witness refutations, plus the pinned epoch-1
-digests. No call site flips yet. A person runs `epoch1_golden_pins` and
-sees the digests reproduce. The Kani lane then reports the round-trip and
-the nine refutations as proved.
+round-trip and the witness refutations, plus the pinned epoch-1 digests.
+No call site flips yet. A person runs `epoch1_golden_pins` and sees the
+digests reproduce. The Kani lane then reports the round-trip and eight
+refutations as proved, one for each class that has a witness to run
+(classes 1 to 6, 8 and 9). Class 7 has no harness: it is refuted by the
+layout, which holds no index and no reference (EPOCH-004).
 
 ## Users and stories
 
@@ -519,9 +521,14 @@ unsafe code, no trait objects and no unbounded recursion, because the spec
 walk stays outside it.
 
 Domain separation carries the epoch, so versioning costs zero preimage
-bytes and no downstream format changes. The codec has no conditional
-emission because adjacent content must never express an absence. That
-ambiguity is the root cause of five of the nine witness classes.
+bytes and no downstream format changes. The sealed fields have no
+conditional emission because adjacent content must never express an
+absence. That ambiguity is the root cause of five of the nine witness
+classes. The one kind of field emitted only when set is an optional field
+added after the seal (EPOCH-021). It comes after every sealed field, as a
+reserved tag and its framed payload, so a closure that sets it and one
+that does not differ by a tagged field and never by what adjacent bytes
+mean.
 
 An edge is the dependency's key and kind, and a spec's edges enter as a
 set ordered by those bytes (EPOCH-002). That is what lets a bottom-up fold
