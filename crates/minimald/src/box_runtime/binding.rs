@@ -135,6 +135,10 @@ pub(super) enum MainloopExitReason {
     HostGone,
     /// The client detached.
     Detach,
+    /// The box was stopped or removed while this binding was attached
+    /// (BCLI-068). The attach ends from the daemon's side: no shell-exit
+    /// prompt, and no line of the binding's own.
+    BoxEnded(BoxEnd),
     /// The client went away without a detach: it closed its channel, or
     /// its connection dropped.
     ClientLost,
@@ -159,7 +163,9 @@ impl MainloopExitReason {
         match self {
             // Nobody reads the status of a lost client; 0 as for a detach.
             Self::Detach | Self::ClientLost | Self::ProcessExited => 0,
-            Self::HostGone | Self::Superceded | Self::Shutdown => DAEMON_ENDED_EXIT_STATUS,
+            Self::HostGone | Self::Superceded | Self::Shutdown | Self::BoxEnded(_) => {
+                DAEMON_ENDED_EXIT_STATUS
+            }
             Self::Shed => SHED_EXIT_STATUS,
         }
     }
@@ -182,6 +188,21 @@ pub(super) enum Farewell {
     DaemonShutdown(Vec<u8>),
     /// The client detached.
     Detach(Vec<u8>),
+    /// The box was stopped or removed.
+    BoxEnded(BoxEnd, Vec<u8>),
+}
+
+/// Why the daemon ends a box that a client can be attached to, as the box's
+/// host records it before the stop or removal signals the box's processes.
+/// With it the host tells its binding that the end is the daemon's, not the
+/// entrypoint's own return, so the binding raises no shell-exit prompt
+/// (BCLI-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxEnd {
+    /// `min box stop`, or the stop half of a restart.
+    Stop,
+    /// `min box rm`.
+    Removal,
 }
 
 pub(super) enum BindingMsg {
@@ -212,6 +233,10 @@ pub(super) enum BindingMsg {
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
     TeardownDueToDaemonShutdown(Vec<u8>),
+    /// The box was stopped or removed while attached (BCLI-068). The
+    /// binding writes the unwind codes and nothing else, and ends with
+    /// [`DAEMON_ENDED_EXIT_STATUS`]. The client names the cause itself.
+    TeardownDueToBoxEnd(BoxEnd, Vec<u8>),
 }
 
 /// The `errno` every exiting shell produces: the last slave fd closes and the
@@ -737,6 +762,10 @@ impl Binding {
                                         farewell = Some(Farewell::Detach(unwind_codes));
                                         break;
                                     }
+                                    Some(BindingMsg::TeardownDueToBoxEnd(end, unwind_codes)) => {
+                                        farewell = Some(Farewell::BoxEnded(end, unwind_codes));
+                                        break;
+                                    }
                                     // The host is gone: no session left to
                                     // publish for, and nobody to answer for.
                                     None => break,
@@ -931,6 +960,9 @@ impl Binding {
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
                             break Self::render_farewell(Farewell::Detach(unwind_codes), &mut w).await;
                         }
+                        BindingMsg::TeardownDueToBoxEnd(end, unwind_codes) => {
+                            break Self::render_farewell(Farewell::BoxEnded(end, unwind_codes), &mut w).await;
+                        }
                     };
 
                 }
@@ -1010,6 +1042,16 @@ impl Binding {
             // Not on a shed either. Nobody chose to leave, and the terminal
             // a hook would write to is the one that stopped reading.
             MainloopExitReason::Shed => false,
+            // BCLI-068: a stop or a removal ends the box. Nothing is left to
+            // keep or delete, so no prompt asks, and no detach hook runs.
+            MainloopExitReason::BoxEnded(end) => {
+                tracing::info!(
+                    session = %self.name,
+                    ?end,
+                    "the box was stopped or removed; the attach ends with no shell-exit prompt"
+                );
+                false
+            }
         };
 
         // Asked of the session actor rather than run here: a detach hook is
@@ -1184,6 +1226,12 @@ impl Binding {
                 let _ = w.write_all(&unwind_codes).await;
                 let _ = w.write_all(b"\r\nDetaching from session.\r\n").await;
                 MainloopExitReason::Detach
+            }
+            // No line here: the client prints the one line that names the
+            // stop or the removal on stderr, after it restores the terminal.
+            Farewell::BoxEnded(end, unwind_codes) => {
+                let _ = w.write_all(&unwind_codes).await;
+                MainloopExitReason::BoxEnded(end)
             }
         }
     }
