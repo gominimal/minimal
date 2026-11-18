@@ -243,7 +243,7 @@ impl<C: Channel> Sandbox<C> {
             match i {
                 config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &rootfs)?,
                 config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &rootfs)?,
-                config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
+                config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy { src: p, .. } => {
                     return Err(Error::MappedFile(p.clone()));
                 }
             }
@@ -314,17 +314,8 @@ impl<C: Channel> Sandbox<C> {
                             }
                             .map_err(|e| Error::IO("hardlinking input file", dest.clone(), e))?;
                         }
-                        config::SandboxMapped::FileCopy(p) => {
-                            let dest = b.join(p.file_name().unwrap());
-                            if !copy_input_file(p, &dest)
-                                .map_err(|e| Error::IO("copying input file", dest.clone(), e))?
-                            {
-                                tracing::warn!(
-                                    "Not copying {} => {}, already exists",
-                                    p.display(),
-                                    dest.display()
-                                );
-                            }
+                        config::SandboxMapped::FileCopy { src, name } => {
+                            stage_file_copy(&b, src, name)?;
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
                         config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &b)?,
@@ -2745,6 +2736,41 @@ fn booted_with_systemd() -> bool {
         .unwrap_or_default()
 }
 
+/// Stages one copied input in the working directory `build_dir`: the bytes
+/// and mode of `src`, under `name`.
+///
+/// The copy takes the declared name, not the name of `src`: a package file
+/// reached through a link is read from its target but keeps the name its
+/// build refers to it by. `name` must be one file name. A name with a
+/// separator, `.`, `..` or nothing in it is refused, so a copy cannot be put
+/// outside `build_dir`. An entry already at the name is left as it is.
+fn stage_file_copy(build_dir: &Path, src: &Path, name: &std::ffi::OsStr) -> Result<(), Error> {
+    let dest = build_dir.join(name);
+    let mut parts = Path::new(name).components();
+    let one_name = matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !one_name {
+        return Err(Error::IO(
+            "copying input file",
+            dest,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the name to copy it under is not one file name",
+            ),
+        ));
+    }
+    if !copy_input_file(src, &dest).map_err(|e| Error::IO("copying input file", dest.clone(), e))? {
+        tracing::warn!(
+            "Not copying {} => {}, already exists",
+            src.display(),
+            dest.display()
+        );
+    }
+    Ok(())
+}
+
 /// Copy `src` to `dest` as a new file with `src`'s permission bits. Returns
 /// `false`, touching nothing, when `dest` already exists: two inputs with one
 /// basename keep the first, as a hardlinked `File` input does. `fs::copy`
@@ -3993,6 +4019,52 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copied input is staged under the name it is given, not under the name
+    /// of the file its bytes come from. Without that, a package file declared
+    /// as `link.patch` and read from `files/a.patch` would be staged as
+    /// `a.patch`, and the build that names `link.patch` would not find it.
+    #[test]
+    fn stage_file_copy_uses_the_given_name_not_the_source_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.patch");
+        fs::write(&src, b"payload").unwrap();
+        let build = tmp.path().join("build");
+        fs::create_dir(&build).unwrap();
+        stage_file_copy(&build, &src, std::ffi::OsStr::new("link.patch")).unwrap();
+        assert_eq!(fs::read(build.join("link.patch")).unwrap(), b"payload");
+        assert!(
+            !build.join("a.patch").exists(),
+            "staged under the source's name"
+        );
+        // The control: a copy given the source's own name is staged under it.
+        stage_file_copy(&build, &src, std::ffi::OsStr::new("a.patch")).unwrap();
+        assert_eq!(fs::read(build.join("a.patch")).unwrap(), b"payload");
+    }
+
+    /// A name that is not one file name is refused, and nothing is written: a
+    /// copy cannot be put outside the working directory.
+    #[test]
+    fn stage_file_copy_refuses_a_name_that_is_not_one_file_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.patch");
+        fs::write(&src, b"payload").unwrap();
+        let build = tmp.path().join("build");
+        fs::create_dir(&build).unwrap();
+        for name in ["../out.patch", "sub/out.patch", "/out.patch", "..", ".", ""] {
+            let refused = stage_file_copy(&build, &src, std::ffi::OsStr::new(name));
+            assert!(
+                matches!(refused, Err(Error::IO("copying input file", _, _))),
+                "{name:?} was not refused: {refused:?}"
+            );
+        }
+        assert!(!tmp.path().join("out.patch").exists());
+        assert_eq!(
+            fs::read_dir(&build).unwrap().count(),
+            0,
+            "something was staged"
+        );
+    }
 
     /// A copied input is a new file with the source's bytes and mode.
     #[test]
