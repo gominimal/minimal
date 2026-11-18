@@ -4209,6 +4209,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "serde",
+ "serde_json",
  "serde_json_lenient",
  "serial_test",
  "sessions",
