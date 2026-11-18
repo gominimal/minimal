@@ -73,6 +73,11 @@ pub fn complete_box_arg(current: &OsStr) -> Vec<CompletionCandidate> {
         return Vec::new();
     };
 
+    #[cfg(test)]
+    if let Some(sessions) = test_boxes::get() {
+        return to_completion(candidates_from(&sessions, prefix));
+    }
+
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -84,12 +89,49 @@ pub fn complete_box_arg(current: &OsStr) -> Vec<CompletionCandidate> {
     // a value completer the current word and nothing else, so a `--provider`
     // or `--minimal-dir` earlier in the line cannot be honoured here.
     let global = GlobalArgs::default();
-    let candidates = runtime.block_on(session_candidates(&global, prefix));
+    to_completion(runtime.block_on(session_candidates(&global, prefix)))
+}
 
+/// Convert the candidates into the form clap hands to the shell.
+fn to_completion(candidates: Vec<SessionCandidate>) -> Vec<CompletionCandidate> {
     candidates
         .into_iter()
         .map(|c| CompletionCandidate::new(c.value).help(c.description.map(Into::into)))
         .collect()
+}
+
+/// A fixed box list that [`complete_box_arg`] reads in place of the daemon,
+/// so a test can drive the real completer without a daemon and without
+/// reaching one that runs on the developer's host. Thread-local, so tests
+/// that run in parallel threads do not see each other's list.
+#[cfg(test)]
+pub(crate) mod test_boxes {
+    use std::cell::RefCell;
+
+    use minimald_rpc::ListSessionsEntry;
+
+    thread_local! {
+        static BOXES: RefCell<Option<Vec<ListSessionsEntry>>> = const { RefCell::new(None) };
+    }
+
+    /// Clears the fixed list when dropped.
+    pub(crate) struct Guard(());
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BOXES.with(|b| *b.borrow_mut() = None);
+        }
+    }
+
+    /// Serve `boxes` to every completion on this thread until the guard drops.
+    pub(crate) fn set(boxes: Vec<ListSessionsEntry>) -> Guard {
+        BOXES.with(|b| *b.borrow_mut() = Some(boxes));
+        Guard(())
+    }
+
+    pub(super) fn get() -> Option<Vec<ListSessionsEntry>> {
+        BOXES.with(|b| b.borrow().clone())
+    }
 }
 
 /// The candidates for `prefix`, or an empty list when the daemon cannot be
