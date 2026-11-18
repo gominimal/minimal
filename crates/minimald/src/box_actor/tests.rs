@@ -15092,6 +15092,62 @@ async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_pl
         .expect("a box that was never placed starts a check");
 }
 
+/// inbox#1245: the context the box actor builds for a box confines its
+/// `minimal.toml` edits to the box's workspace. Once the box replaces its
+/// `minimal.toml` with a link to a file outside the workspace, `min add` in
+/// the box (`add_deps` on that context) is refused, and neither the file
+/// outside nor the link changes. Without `build_context`'s
+/// `confine_mfile_edits_to` the edit follows the link out of the workspace
+/// and the add succeeds, so this test fails.
+///
+/// The context is built while `minimal.toml` is still a regular file, so
+/// the test reaches the edit whether or not the context's read of the file
+/// is confined too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_context_refuses_an_add_through_a_minimal_toml_that_links_out() {
+    let server = TestServer::new().await;
+    let mngr = server.state.sessions_manager().await;
+    let id =
+        crate::box_manager::tests::active_session_needing(&mngr, "confined-add", "pkg-a").await;
+    let handle = box_handle(&server, id).await;
+    let workspace = handle.paths().await.unwrap().working;
+    let mut ctx = handle
+        .context()
+        .await
+        .expect("an active box builds its context");
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().join(mfile::MFILE_NAME);
+    let content = "[stack]\nname = \"base\"\n";
+    std::fs::write(&outside_path, content).unwrap();
+    let mfile_path = workspace.as_utf8_path().join(mfile::MFILE_NAME);
+    let staged = workspace.as_utf8_path().join("minimal.toml.link");
+    std::os::unix::fs::symlink(&outside_path, &staged).unwrap();
+    std::fs::rename(&staged, &mfile_path).unwrap();
+
+    let err = ctx
+        .add_deps(
+            &graph::Graph::new(),
+            Vec::<graph::BuildSpecRef>::new(),
+            mctx::AddDepMode::BuildPackages,
+        )
+        .expect_err("an add through a link out of the workspace is refused");
+
+    // Where every link is refused (off Linux, or a kernel without
+    // `openat2`) the refusal says only that it is a link.
+    let text = err.to_string();
+    assert!(
+        text.contains("leads outside its workspace") || text.contains("cannot follow a link here"),
+        "error: {text}"
+    );
+    assert!(
+        !text.contains(workspace.as_utf8_path().as_str()),
+        "the refusal shows the daemon's path to the workspace: {text}"
+    );
+    assert_eq!(std::fs::read_to_string(&outside_path).unwrap(), content);
+    assert_eq!(std::fs::read_link(&mfile_path).unwrap(), outside_path);
+}
+
 /// gominimal/minimal#1373: the context a box builds keys its task state on
 /// the record's host project, so a run's state survives the next session's
 /// freshly laid-out tree. A context made from the fixture repo carries no
