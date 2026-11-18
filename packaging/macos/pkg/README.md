@@ -84,7 +84,7 @@ What an MDM administrator should know:
   can delete the role account. It also forgets the receipt. With no Full
   Disk Access it removes everything but the account and exits 1; an MDM
   reports that as a failed policy, so push it through the agent.
-- **Background items.** The package installs two LaunchDaemons the old
+- **Background items.** The package installs three LaunchDaemons the old
   way, as files under `/Library/LaunchDaemons` (Apple's `SMAppService`
   needs an app that registers them and a user who approves, which a push
   with nobody logged in has neither of). macOS shows each user a
@@ -109,10 +109,20 @@ What an MDM administrator should know:
           <key>RuleValue</key><string>3G47C5HY64</string>
           <key>Comment</key><string>Minimal: the box-name service and its loopback range</string>
       </dict>
+      <dict>
+          <key>RuleType</key><string>LabelPrefix</string>
+          <key>RuleValue</key><string>dev.gominimal.zone</string>
+          <key>Comment</key><string>Minimal: the box-name service and the size cap on its log</string>
+      </dict>
   </array>
   ```
 
-  A rule by label needs both: `dev.gominimal.zone` and
+  The third job, `dev.gominimal.zone.logcap`, keeps the service's log
+  (`/private/var/log/minimal/minzoned.log`) under 1 MiB. It runs
+  `/bin/sh` as the role account once an hour, and `/bin/sh` is Apple's,
+  so the team rule is not expected to match it: the label rule is there
+  for it. A rule by label alone needs `dev.gominimal.zone` (as a prefix,
+  or that label and `dev.gominimal.zone.logcap`) and
   `dev.minimal.local-range`. The team rule matches a released package
   only; a test build's program carries no team. Apple lists this
   payload for delivery by MDM alone (device channel, user-approved MDM,

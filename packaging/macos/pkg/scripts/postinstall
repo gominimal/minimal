@@ -71,7 +71,7 @@ restore() {
             chmod 0644 /etc/resolver/min.internal
         fi
     else
-        for job in dev.gominimal.zone dev.minimal.local-range; do
+        for job in dev.gominimal.zone dev.minimal.local-range dev.gominimal.zone.logcap; do
             launchctl bootout "system/$job" 2>/dev/null || true
             rm -f "/Library/LaunchDaemons/$job.plist"
         done
@@ -221,6 +221,20 @@ launchctl bootstrap system /Library/LaunchDaemons/dev.minimal.local-range.plist
 #    no state: a restart holds nothing until the users' daemons reconnect.
 zone=/Library/LaunchDaemons/dev.gominimal.zone.plist
 install -d -m 0755 -o root -g wheel "$run"
+# The service's log, where `min finalize-install` keeps it for a user's own
+# service and `min bug` reads it: a directory that is root's (launchd makes
+# none) and a file that is the role account's. /private/var/log is root's,
+# so nobody else can have put anything here; a log an earlier per-user
+# service left belongs to that user, and is started again as the account's.
+logdir=/private/var/log/minimal
+log="$logdir/minzoned.log"
+install -d -m 0755 -o root -g wheel "$logdir"
+if [ -L "$log" ] || [ "$(stat -f %u "$log" 2>/dev/null || echo none)" != "$uid" ]; then
+    rm -rf "$log"
+fi
+touch "$log"
+chown "$uid:$gid" "$log"
+chmod 0644 "$log"
 # The job's definition, written beside its place first: whether it changed
 # decides how the service is brought onto the new program.
 cat > "$zone.new" <<PLIST
@@ -242,6 +256,10 @@ cat > "$zone.new" <<PLIST
     <array>
         <string>dev.minimal.minzoned</string>
     </array>
+    <key>StandardOutPath</key>
+    <string>$log</string>
+    <key>StandardErrorPath</key>
+    <string>$log</string>
     <key>Sockets</key>
     <dict>
         <key>Listener</key>
@@ -330,6 +348,44 @@ fi
 # Only now: the service holds the port the file names.
 printf 'nameserver 127.0.0.1\nport 7656\n' > /etc/resolver/min.internal
 chmod 0644 /etc/resolver/min.internal
+
+# 5b. The log's size cap: launchd has no limit for a job's log, so an hourly
+#     job, run as the role account and never as root, cuts the log to its
+#     last 256 KiB once it passes 1 MiB. The job is the one `min
+#     finalize-install` installs for a user's own service, and `min
+#     finalize-install --show` checks these arguments word for word (a test
+#     in crates/minimal/src/resolver.rs reads this file). A cap that does
+#     not load leaves a working install, and is said.
+cap=/Library/LaunchDaemons/dev.gominimal.zone.logcap.plist
+launchctl bootout system/dev.gominimal.zone.logcap 2>/dev/null || true
+sed "s/__ROLE__/$role/" > "$cap" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.gominimal.zone.logcap</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>f=/private/var/log/minimal/minzoned.log; [ &quot;$(stat -f %z &quot;$f&quot; 2&gt;/dev/null || echo 0)&quot; -gt 1048576 ] || exit 0; t=$(mktemp) || exit 1; tail -c 262144 &quot;$f&quot; &gt; &quot;$t&quot; &amp;&amp; cat &quot;$t&quot; &gt; &quot;$f&quot;; rm -f &quot;$t&quot;</string>
+    </array>
+    <key>UserName</key>
+    <string>__ROLE__</string>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+chown root:wheel "$cap"
+chmod 0644 "$cap"
+if ! launchctl bootstrap system "$cap"; then
+    rm -f "$cap"
+    echo "minimal: the hourly size cap on $log did not load, so the log can grow without a limit (if the job is switched off, switch it on with: sudo launchctl enable system/dev.gominimal.zone.logcap). Install again to set it up" >&2
+fi
 
 # 6. Users who installed with curl keep an older min at ~/.local/bin/min,
 #    which their shell finds before /usr/local/bin. Nothing here touches a

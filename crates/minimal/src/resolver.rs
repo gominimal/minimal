@@ -8580,6 +8580,38 @@ exit 0
         }
     }
 
+    /// The macOS package installs the log and its size cap for the shared
+    /// service from its own postinstall, in shell. The checks that read a
+    /// user's own service must pass the package's too, so a change to the
+    /// cap or the log's place here fails until the package follows.
+    #[test]
+    fn the_macos_package_installs_the_log_and_cap_these_checks_expect() {
+        let postinstall = include_str!("../../../packaging/macos/pkg/scripts/postinstall");
+        let (_, cap) = postinstall
+            .split_once("<string>dev.gominimal.zone.logcap</string>")
+            .expect("the postinstall writes the cap's unit");
+        let arguments =
+            plist_string_array(cap, "ProgramArguments").expect("the cap names its arguments");
+        let root = Some(FileCustody {
+            owner: 0,
+            mode: 0o644,
+        });
+        assert_eq!(answerer_log_cap_check(root, Some(&arguments)), None);
+        assert!(
+            cap.contains(&format!(
+                "<integer>{ANSWERER_LOG_CAP_INTERVAL_SECS}</integer>"
+            )),
+            "the cap runs at the step's interval"
+        );
+        assert!(
+            postinstall.contains(&format!("logdir={MACOS_ANSWERER_LOG_DIR}\n"))
+                && postinstall.contains("log=\"$logdir/minzoned.log\"\n")
+                && MACOS_ANSWERER_LOG_PATH == format!("{MACOS_ANSWERER_LOG_DIR}/minzoned.log")
+                && postinstall.contains("<key>StandardErrorPath</key>\n    <string>$log</string>"),
+            "the service's unit logs where answerer_log_check expects"
+        );
+    }
+
     /// The log's size-cap unit is one of the step's custody checks: the
     /// unit the step writes passes, and a missing unit, one root does not
     /// own, or one that runs other arguments re-surfaces the step. A cap
