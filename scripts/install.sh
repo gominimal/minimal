@@ -1792,9 +1792,10 @@ say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
 # so it lists every field the request sends, as the CLI's own disclosure
 # does, and names the switch. A channel install is told when its channel
 # moves on; a pinned (--version) one is counted but never told, since no
-# channel pointer applies to it.
+# channel pointer applies to it. A pinned release older than 0.7.4 has no
+# check and sends nothing, so the pinned line says which releases report.
 if [ "$version_set" -eq 1 ]; then
-    say "  ${dim}min reports this install once a day (no release notices for --version), sending its channel$rst"
+    say "  ${dim}min 0.7.4 and later report this install once a day (no release notices for --version), sending the channel$rst"
     say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
 else
     say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
