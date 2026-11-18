@@ -22214,6 +22214,287 @@ async fn exports_not_copied_from_another_project() {
     );
 }
 
+// BOX-203: one wait on several boxes copies their exports box by box in
+// the order the boxes ended, so where two boxes export one path, the file
+// of the later end stays. The wait names the boxes in the other order. A
+// wait from another project copies nothing of either box (BOX-199).
+#[tokio::test]
+async fn multi_box_wait_copies_in_order_of_ends() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let other = tempfile::tempdir().expect("a temp folder of another project");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let other_root = paths::HostAbsPath::try_new(other.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let mut ids = Vec::new();
+    for name in ["early", "late"] {
+        let id = create_spec_box(
+            &mut daemon,
+            name,
+            project.path(),
+            Some(export_spec(false, &["report.txt"])),
+            minimald_rpc::CreatingVerb::Task,
+        )
+        .await;
+        let contents = format!("from {name}");
+        put_box_files(
+            &mut daemon,
+            id,
+            &[],
+            &[("/workbench/report.txt", contents.as_bytes())],
+        )
+        .await;
+        ids.push(id);
+    }
+    let (early, late) = (ids[0], ids[1]);
+    for name in ["early", "late"] {
+        cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), name, false)
+            .await
+            .expect("the box stops");
+        // The ends are written in whole milliseconds, so they must differ.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    let targets = ["late".to_owned(), "early".to_owned()];
+
+    // From another project, the wait copies nothing and claims no end.
+    let elsewhere = cmd::box_wait_all_on_hosts(
+        local_hosts(&global).unwrap(),
+        &targets,
+        Some(&other_root),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees both boxes end");
+    assert_eq!(elsewhere.len(), 2);
+    assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+    assert!(file_exported_lines(&global, "early").await.is_empty());
+    assert!(file_exported_lines(&global, "late").await.is_empty());
+
+    let waited = cmd::box_wait_all_on_hosts(
+        local_hosts(&global).unwrap(),
+        &targets,
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees both boxes end");
+    let order: Vec<_> = waited.iter().map(|one| one.box_id).collect();
+    assert_eq!(order, vec![early, late], "copied in the order of the ends");
+    assert_eq!(
+        std::fs::read(project.path().join("report.txt")).unwrap(),
+        b"from late",
+        "the file of the later end stays"
+    );
+    for name in ["early", "late"] {
+        let events = file_exported_lines(&global, name).await;
+        assert_eq!(events.len(), 1, "{name}: {events:?}");
+        assert_eq!(events[0]["data"]["copied"], true, "{name}");
+    }
+}
+
+// BOX-204: an attach that resumes a box with a terminal copies only an end
+// that comes after the resume, never the end the box resumed from. The box
+// stores a whole spec that declares the export, so a resume reads it. The
+// attach resumes the box through its shell. This crate's harness daemon has
+// no package store, so the launch fails after the spec is read, and the
+// host writes back the record the box resumed from. The attach copies
+// nothing and claims nothing, so a later wait still copies that end once.
+// minimald's own tests drive a resume that launches (BOX-025). A last
+// attach resumes the box again, and the box ends again while it runs, with
+// new contents in its export. That attach copies the new contents, once.
+#[tokio::test]
+async fn resumed_box_copies_at_next_end_only() {
+    // A count of ends that the host did not give is no new end, so the
+    // attach leaves the end it resumed from unclaimed.
+    use cmd::{EndsBefore, ends_show_new_end};
+    assert!(ends_show_new_end(EndsBefore::Running, None));
+    assert!(ends_show_new_end(EndsBefore::Ended(1), Some(2)));
+    assert!(!ends_show_new_end(EndsBefore::Ended(1), Some(1)));
+    assert!(!ends_show_new_end(EndsBefore::Ended(1), None));
+    assert!(!ends_show_new_end(EndsBefore::Unread, Some(2)));
+    assert!(!ends_show_new_end(EndsBefore::Unread, None));
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_dir = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = true;
+    let mut spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    spec["file_exports"] = serde_json_lenient::json!([{ "path": "notes.md" }]);
+    let dev = create_spec_box(
+        &mut daemon,
+        "dev",
+        project.path(),
+        Some(spec),
+        minimald_rpc::CreatingVerb::Session,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        dev,
+        &[],
+        &[("/workbench/notes.md", b"first end")],
+    )
+    .await;
+    cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "dev", false)
+        .await
+        .expect("the box stops");
+
+    for code in [0, 1] {
+        let mut refusal = Vec::new();
+        let _ = attach_on_hosts(
+            AttachVerb::BoxResume,
+            local_hosts(&global).unwrap(),
+            Some("dev"),
+            None,
+            Some(&here),
+            true,
+            async |_target: &BoxAttachTarget| {
+                let mut channel = daemon.open_shell(dev).await;
+                while let Ok(Some(msg)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), channel.wait()).await
+                {
+                    if let russh::ChannelMsg::Data { data } = msg {
+                        refusal.extend_from_slice(&data);
+                    }
+                }
+                Ok(code)
+            },
+        )
+        .await;
+        let refusal = String::from_utf8_lossy(&refusal);
+        assert!(
+            refusal.contains("no such package"),
+            "code {code}: the resume read the stored spec and reached the launch: {refusal:?}"
+        );
+        assert!(
+            !refusal.contains("settings it was created with"),
+            "code {code}: the stored spec with exports is read: {refusal:?}"
+        );
+        assert!(
+            !project.path().join("notes.md").exists(),
+            "code {code}: the end the box resumes from gets no copy"
+        );
+        assert!(file_exported_lines(&global, "dev").await.is_empty());
+    }
+
+    // The end is not claimed, so a wait copies it, once.
+    for _ in 0..2 {
+        cmd::box_wait_on_hosts(
+            local_hosts(&global).unwrap(),
+            "dev",
+            Some(&here),
+            None,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("the wait sees the box end");
+    }
+    assert_eq!(
+        std::fs::read(project.path().join("notes.md")).unwrap(),
+        b"first end"
+    );
+    assert_eq!(file_exported_lines(&global, "dev").await.len(), 1);
+
+    // The next end after a resume copies what the box holds then, once.
+    // The attach resumes the box. While the attach runs, the box gets new
+    // contents in its export and ends again: a second `exited` event, as
+    // the daemon writes it.
+    let mut refusal = Vec::new();
+    let code = attach_on_hosts(
+        AttachVerb::BoxResume,
+        local_hosts(&global).unwrap(),
+        Some("dev"),
+        None,
+        Some(&here),
+        true,
+        async |_target: &BoxAttachTarget| {
+            let mut channel = daemon.open_shell(dev).await;
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), channel.wait()).await
+            {
+                if let russh::ChannelMsg::Data { data } = msg {
+                    refusal.extend_from_slice(&data);
+                }
+            }
+            // A stopped box takes no SFTP write, so the new contents go
+            // straight into the files the host keeps for the box.
+            rewrite_kept_box_file(&state_dir, "notes.md", b"first end", b"next end");
+            write_box_exited_event(&state_dir, dev);
+            Ok(0)
+        },
+    )
+    .await;
+    assert!(code.is_ok(), "the attach ends: {code:?}");
+    assert_eq!(
+        std::fs::read(project.path().join("notes.md")).unwrap(),
+        b"next end",
+        "the next end copies what the box holds then"
+    );
+    let exported = file_exported_lines(&global, "dev").await;
+    let next_end: Vec<_> = exported
+        .iter()
+        .filter(|line| line["data"]["end"] == 2)
+        .collect();
+    assert_eq!(
+        next_end.len(),
+        1,
+        "one export event for the next end: {exported:?}"
+    );
+    assert_eq!(next_end[0]["data"]["copied"], true, "{exported:?}");
+    assert_eq!(exported.len(), 2, "{exported:?}");
+}
+
+/// Writes `new` over the one file named `name` with the contents `old`
+/// that the daemon under the state dir `state` keeps for a box.
+fn rewrite_kept_box_file(state: &std::path::Path, name: &str, old: &[u8], new: &[u8]) {
+    fn walk(dir: &std::path::Path, name: &str, old: &[u8], found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(&path, name, old, found);
+            } else if kind.is_file()
+                && entry.file_name() == name
+                && std::fs::read(&path).is_ok_and(|contents| contents == old)
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(state, name, old, &mut found);
+    assert_eq!(found.len(), 1, "one kept copy of {name}: {found:?}");
+    std::fs::write(&found[0], new).expect("the kept file is written");
+}
+
+/// Appends an `exited` event to the events of box `id` under the daemon
+/// state dir `state`, as the daemon writes one when the box ends.
+fn write_box_exited_event(state: &std::path::Path, id: boxes::SessionId) {
+    let box_dir = box_state_dir(state, id);
+    let record: boxes::Record =
+        serde_json_lenient::from_slice(&std::fs::read(box_dir.join("record.json")).unwrap())
+            .expect("the box's record");
+    let event = boxes::events::BoxEvent::for_record(&record, boxes::events::BoxEventType::Exited);
+    let events = camino::Utf8PathBuf::from_path_buf(box_dir.join(boxes::events::EVENTS_FILE))
+        .expect("a UTF-8 path");
+    boxes::store::append_event_at(&events, &event).expect("the event is written");
+}
+
 /// The harness host that `global` selects.
 fn selected_host(global: &GlobalArgs) -> LocalHost {
     local_hosts(global)

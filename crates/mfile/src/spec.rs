@@ -100,6 +100,50 @@ pub struct BoxSpec {
     /// with no `minimal.toml`, or a spec stored before the key existed. The
     /// daemon then composes the project's hooks as before.
     pub lifecycle_hooks: Option<Vec<SpecHook>>,
+    /// The expanded spec's `[[file_exports]]` items, as the client stored
+    /// them (BOX-203, BOX-204). Serialized as the top-level `file_exports`
+    /// list, and left out when `None`.
+    ///
+    /// The client reads these items and copies the exports when the box
+    /// ends. The daemon only keeps them, so a box that declares exports
+    /// can resume from its stored spec.
+    pub file_exports: Option<Vec<StoredExport>>,
+}
+
+/// One `[[file_exports]]` item of a stored spec, kept as it was written:
+/// a path string, or a table with a `path` key.
+///
+/// Equality is total: two floats are equal when their bits are equal. A
+/// hand-edited stored spec can hold a TOML `nan`, and such an item is
+/// still equal to itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct StoredExport(pub toml::Value);
+
+impl PartialEq for StoredExport {
+    fn eq(&self, other: &Self) -> bool {
+        toml_value_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StoredExport {}
+
+/// Equality on two TOML values that compares floats by their bits, so it
+/// is reflexive for NaN.
+fn toml_value_eq(a: &toml::Value, b: &toml::Value) -> bool {
+    use toml::Value;
+    match (a, b) {
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| toml_value_eq(a, b))
+        }
+        (Value::Table(a), Value::Table(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, a)| b.get(key).is_some_and(|b| toml_value_eq(a, b)))
+        }
+        _ => a == b,
+    }
 }
 
 /// What a box runs as its first process: the program its launch starts.
@@ -321,6 +365,7 @@ impl BoxSpec {
                 policy: flags.policy,
             },
             lifecycle_hooks: None,
+            file_exports: None,
         }
     }
 
@@ -504,6 +549,9 @@ struct SpecDoc {
     /// Absent from a spec that carries no hook list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lifecycle_hooks: Option<Vec<SpecHook>>,
+    /// Absent from a spec that declares no exports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_exports: Option<Vec<StoredExport>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -617,6 +665,7 @@ impl From<BoxSpec> for SpecDoc {
                 policy: spec.network.policy,
             },
             lifecycle_hooks: spec.lifecycle_hooks,
+            file_exports: spec.file_exports,
         }
     }
 }
@@ -647,6 +696,7 @@ impl From<SpecDoc> for BoxSpec {
                 policy: doc.network.policy,
             },
             lifecycle_hooks: doc.lifecycle_hooks,
+            file_exports: doc.file_exports,
         }
     }
 }
@@ -1117,6 +1167,50 @@ mod tests {
         assert!(SpecHook::from_value(&bare).is_err());
     }
 
+    // BOX-203, BOX-204: a stored spec that declares exports reads back,
+    // so a box with exports can resume. Its items stay as they were
+    // written, and every other unknown key is still refused.
+    #[test]
+    fn stored_spec_with_file_exports_round_trips() {
+        let spec = BoxSpec::for_session(None, SpecFlags::default());
+        let table = toml::Table::try_from(&spec).unwrap();
+        assert!(!table.contains_key("file_exports"));
+
+        let mut stored = table.clone();
+        let items: toml::Value = toml::from_str::<toml::Table>(
+            r#"
+            items = ["dist/a.txt", { path = "out/b.txt" }, { path = "./reports", note = "kept" }]
+            "#,
+        )
+        .unwrap()["items"]
+            .clone();
+        stored.insert("file_exports".to_owned(), items.clone());
+
+        let read: BoxSpec = stored.clone().try_into().unwrap();
+        let kept: Vec<toml::Value> = read
+            .file_exports
+            .clone()
+            .expect("the stored items read back")
+            .into_iter()
+            .map(|item| item.0)
+            .collect();
+        assert_eq!(toml::Value::Array(kept), items);
+
+        let written = toml::Table::try_from(&read).unwrap();
+        assert_eq!(written, stored, "a read and a write keep the stored spec");
+        let again: BoxSpec = written.try_into().unwrap();
+        assert_eq!(again, read);
+
+        let nan = StoredExport(toml::Value::Float(f64::NAN));
+        assert_eq!(nan, nan.clone(), "an item with a NaN float equals itself");
+        assert_ne!(nan, StoredExport(toml::Value::Float(0.0)));
+
+        let mut unknown = stored;
+        unknown.insert("file_imports".to_owned(), toml::Value::Array(Vec::new()));
+        let refused = unknown.try_into::<BoxSpec>().unwrap_err();
+        assert!(refused.to_string().contains("file_imports"), "{refused}");
+    }
+
     // BOX-068: the first spec comes from the `[session]` table or a task,
     // with the flags as the last layer.
     #[test]
@@ -1166,6 +1260,7 @@ mod tests {
                     policy: policy.clone(),
                 },
                 lifecycle_hooks: None,
+                file_exports: None,
             }
         );
 

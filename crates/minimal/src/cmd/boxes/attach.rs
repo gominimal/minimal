@@ -1496,6 +1496,9 @@ where
         host = %target.host.host,
         outcome = "attaching"
     );
+    // BOX-204: a box that ended before the attach resumes in it. The
+    // attach then copies only a later end, never the end it resumed from.
+    let ends_before = ended_box_end_count(&target).await;
     let code = attach(&target).await.inspect_err(|err| {
         tracing::info!(verb = name, box_id = %target.box_id, outcome = "error", "{err:#}");
     })?;
@@ -1532,6 +1535,7 @@ where
     let mut copied = None;
     if let BoxAfterAttach::Listed(entry) = &ended
         && matches!(entry.state.as_str(), "stopped" | "exited")
+        && ended_again(&target, ends_before).await
     {
         let root = entry.project_root.as_ref();
         let outcomes = copy_box_exports_on_host(
@@ -1570,6 +1574,77 @@ where
             Err(refusal.into())
         }
     }
+}
+
+/// What the attach knew of the box's ends before it started (BOX-204).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndsBefore {
+    /// The box ran, so any end it reaches is a new end.
+    Running,
+    /// The box was stopped or exited, and had ended this many times.
+    Ended(u64),
+    /// The host did not give the box's state or its count of ends.
+    Unread,
+}
+
+/// What the attach knew of the box `target` before it started: running,
+/// ended a number of times, or not read.
+async fn ended_box_end_count(target: &BoxAttachTarget) -> EndsBefore {
+    let BoxAfterAttach::Listed(entry) = box_after_attach(&target.host, target.box_id).await else {
+        tracing::warn!(box_id = %target.box_id, "box ends: the host did not give the box's state");
+        return EndsBefore::Unread;
+    };
+    if !matches!(entry.state.as_str(), "stopped" | "exited") {
+        return EndsBefore::Running;
+    }
+    let Ok(mut client) = box_host_client(&target.host)
+        .await
+        .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
+    else {
+        return EndsBefore::Unread;
+    };
+    box_ends(&mut client, target.box_id)
+        .await
+        .map_or(EndsBefore::Unread, |ends| EndsBefore::Ended(ends.count))
+}
+
+/// Whether a box that the attach knew as `before` ended again, when the
+/// host now gives `after` ends. A box that ran counts as ended again. A
+/// count that is not read, before or after, counts as no new end. Then the
+/// attach copies nothing, and a later `min box wait` can copy that end
+/// (BOX-204).
+pub(crate) fn ends_show_new_end(before: EndsBefore, after: Option<u64>) -> bool {
+    match before {
+        EndsBefore::Running => true,
+        EndsBefore::Ended(before) => after.is_some_and(|after| after > before),
+        EndsBefore::Unread => false,
+    }
+}
+
+/// Whether the box `target`, which the attach knew as `before`, ended
+/// again since. See [`ends_show_new_end`].
+async fn ended_again(target: &BoxAttachTarget, before: EndsBefore) -> bool {
+    if before == EndsBefore::Running {
+        return true;
+    }
+    let mut after = None;
+    if let EndsBefore::Ended(_) = before
+        && let Ok(mut client) = box_host_client(&target.host).await
+    {
+        after = box_ends(&mut client, target.box_id)
+            .await
+            .map(|ends| ends.count);
+    }
+    let again = ends_show_new_end(before, after);
+    if !again {
+        tracing::info!(
+            box_id = %target.box_id,
+            ends_before = ?before,
+            ends_after = ?after,
+            "file exports: the attach did not see a new end of the box, so it copies nothing"
+        );
+    }
+    again
 }
 
 /// The box an attach of `verb` goes to, among the boxes the verb sees. A
