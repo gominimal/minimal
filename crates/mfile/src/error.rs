@@ -54,6 +54,14 @@ pub enum Error {
     /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
     /// the task name. Exits 3.
     InteractiveTask(String),
+    /// A task or `[defaults.task]` sets a non-empty `state_key` that is not
+    /// one directory name. Carries the table header, the value, and why
+    /// [`crate::File::validate_state_component`] refused it. Exits 3.
+    InvalidStateKey {
+        entry: String,
+        value: String,
+        reason: String,
+    },
     /// A selected loadout sets `loadout_mode`, which only the layers up to
     /// and including the entry can set (BOX-172). Carries the loadout's
     /// name, when the caller knows it. Exits 3.
@@ -197,6 +205,7 @@ impl Error {
             | Error::InvalidSpecKey { .. }
             | Error::LegacyTable { .. }
             | Error::InteractiveTask(_)
+            | Error::InvalidStateKey { .. }
             | Error::LoadoutSetsLoadoutMode { .. }
             | Error::NamedLoadoutOnSealedBox { .. }
             | Error::ConstraintViolated { .. }
@@ -360,6 +369,16 @@ impl fmt::Display for Error {
                 EntryHeader("tasks", name),
                 EntryHeader("sessions", name)
             ),
+            Error::InvalidStateKey {
+                entry,
+                value,
+                reason,
+            } => write!(
+                f,
+                "`{entry}` in minimal.toml sets `state_key` to {value:?}, and {reason}. A \
+                 state key is one directory name, such as \"dev\": not `.` or `..`, and with \
+                 no `/` or NUL byte."
+            ),
             Error::LoadoutSetsLoadoutMode { loadout } => {
                 let (which, that) = match loadout {
                     Some(name) => (format!("loadout `{name}`"), format!("loadout `{name}`")),
@@ -473,6 +492,7 @@ impl std::error::Error for Error {
             Error::InvalidSpecKey { .. } => None,
             Error::LegacyTable { .. } => None,
             Error::InteractiveTask(_) => None,
+            Error::InvalidStateKey { .. } => None,
             Error::LoadoutSetsLoadoutMode { .. } => None,
             Error::NamedLoadoutOnSealedBox { .. } => None,
             Error::ConstraintViolated { .. } => None,
