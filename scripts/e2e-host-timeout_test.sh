@@ -91,5 +91,30 @@ else
   bad "stop after the kill: got exit $rc after ${elapsed}s, want 124 well before 30s"
 fi
 
+# With E2E_TIMEOUT_KILL_AFTER set, a command that ignores SIGTERM is killed
+# after the grace period, and the answer is still 124.
+rc=0
+t0=$SECONDS
+(PATH="$root/bin"; E2E_TIMEOUT_KILL_AFTER=1 e2e_timeout 1 sh -c 'trap "" TERM; sleep 30') || rc=$?
+elapsed=$((SECONDS - t0))
+if [ "$rc" -eq 124 ] && [ "$elapsed" -lt 10 ]; then
+  ok "a command that ignores TERM is killed after the grace, with 124 after ${elapsed}s"
+else
+  bad "TERM ignored: got exit $rc after ${elapsed}s, want 124 well before 30s"
+fi
+
+# The same through GNU timeout, when this host has it.
+if command -v timeout >/dev/null 2>&1; then
+  rc=0
+  t0=$SECONDS
+  E2E_TIMEOUT_KILL_AFTER=1 e2e_timeout 1 sh -c 'trap "" TERM; sleep 30' || rc=$?
+  elapsed=$((SECONDS - t0))
+  if [ "$rc" -eq 124 ] && [ "$elapsed" -lt 10 ]; then
+    ok "GNU timeout: a command that ignores TERM is killed, with 124 after ${elapsed}s"
+  else
+    bad "GNU timeout, TERM ignored: got exit $rc after ${elapsed}s, want 124 well before 30s"
+  fi
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

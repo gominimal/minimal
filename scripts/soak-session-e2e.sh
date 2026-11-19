@@ -72,18 +72,48 @@ case "$CASES" in
 esac
 # Check every name once, up front: session-e2e.sh refuses an unknown case
 # only when it runs, so a misspelt name would fail the same case in every
-# iteration. Each case is the suffix of a proof_<case> function there.
+# iteration. The accepted names are read from the arm of session-e2e.sh's
+# final dispatch that calls "proof_$1", so the two lists cannot drift. Some
+# proof_ functions are helpers that this arm does not name, and they are
+# refused here too.
+dispatch_cases() {
+  awk '
+    /^case "\$\{1:-\}" in$/ { in_case = 1; arm = 0; names = ""; next }
+    /^esac$/                { in_case = 0; next }
+    in_case && /^    ;;$/   { arm = 1; next }
+    in_case && arm && /^    "proof_\$1"$/ { print names; exit }
+    in_case && arm          { names = names " " $0 }
+  ' "$ROOT/scripts/session-e2e.sh" | tr '|\\)' '   '
+}
+KNOWN_CASES=" $(dispatch_cases | tr -s ' \t' '  ') "
+if [ -z "${KNOWN_CASES// /}" ]; then
+  echo "could not read the case names from scripts/session-e2e.sh" >&2
+  exit 2
+fi
 for c in $CASES; do
-  if ! grep -q "^proof_${c}() {" "$ROOT/scripts/session-e2e.sh"; then
-    echo "SOAK_CASES names '$c', which is not a case of scripts/session-e2e.sh" >&2
-    exit 2
-  fi
+  case "$KNOWN_CASES" in
+    *" $c "*) ;;
+    *) echo "SOAK_CASES names '$c', which is not a case of scripts/session-e2e.sh" >&2; exit 2 ;;
+  esac
 done
 
 CASE_TIMEOUT="${SOAK_CASE_TIMEOUT_SECS:-600}"
 case "$CASE_TIMEOUT" in
-  '' | *[!0-9]* | 0) echo "SOAK_CASE_TIMEOUT_SECS must be a positive integer, got: '$CASE_TIMEOUT'" >&2; exit 2 ;;
+  '' | *[!0-9]*) echo "SOAK_CASE_TIMEOUT_SECS must be a positive integer, got: '$CASE_TIMEOUT'" >&2; exit 2 ;;
 esac
+# Compare as a number, so 0 and 00 are both refused: GNU timeout reads a
+# zero limit as no limit at all.
+if [ "$((10#$CASE_TIMEOUT))" -eq 0 ]; then
+  echo "SOAK_CASE_TIMEOUT_SECS must be a positive integer, got: '$CASE_TIMEOUT'" >&2
+  exit 2
+fi
+# A case that outlives its limit gets SIGTERM, which runs session-e2e.sh's
+# teardown. That teardown stops the daemon and the VM, and against a wedged
+# daemon it can hang too, so SIGKILL follows if the case is still running
+# this long after the SIGTERM. Not exported: e2e_timeout reads it in this
+# shell, and session-e2e.sh's own calls of the helper keep their behaviour.
+# shellcheck disable=SC2034 # read by e2e_timeout, which is sourced above
+E2E_TIMEOUT_KILL_AFTER=120
 # e2e_timeout: a host-side timeout that also works with no GNU timeout on
 # PATH, as on a stock Mac.
 # shellcheck disable=SC1091
