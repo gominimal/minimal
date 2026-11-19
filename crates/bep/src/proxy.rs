@@ -981,16 +981,44 @@ async fn read_head<S: AsyncRead + Unpin>(
     }
 }
 
-/// Writes one refusal and closes the write half.
+/// Writes one refusal as plain text and closes the write half.
 pub(crate) async fn respond<S: AsyncWrite + Unpin>(
     stream: &mut S,
     status: u16,
     reason: &str,
     body: &str,
 ) {
+    respond_as(stream, status, reason, "text/plain; charset=utf-8", body).await;
+}
+
+/// Writes one refusal whose body is the JSON document `body`, and closes
+/// the write half.
+pub(crate) async fn respond_json<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    body: &str,
+) {
+    respond_as(
+        stream,
+        status,
+        reason,
+        "application/json; charset=utf-8",
+        body,
+    )
+    .await;
+}
+
+async fn respond_as<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+) {
     let body = format!("{body}\n");
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes()).await;
