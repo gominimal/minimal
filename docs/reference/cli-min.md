@@ -59,7 +59,7 @@ else goes to stderr for that failure. The command still exits non-zero.
 | `code` | Exit code | When the command gives it |
 |--------|-----------|---------------------------|
 | `ambiguous` | 2 | A box name or id prefix matches more than one box |
-| `not_found` | 4 | No box matches the box name or id, the box is on a VM that is stopped, or `min type show` names no box type. When `min session policy -o json` or `min box show --network -o json` finds no box, the exit code is 1 |
+| `not_found` | 4 | No box matches the box name or id, the box is on a VM that is stopped, or `min type show` names no box type. When `min box show --network -o json` finds no box, the exit code is 1 |
 | `host_unreachable` | 7 | A host that the command must ask does not answer |
 | `insufficient_resources` | 8 | The VM host has no network address left for another box |
 | `github_sign_in_required` | 3 | The box spec needs a GitHub sign-in, and you are not signed in. Run `min auth login` |
