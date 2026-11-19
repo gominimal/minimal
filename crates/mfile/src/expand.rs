@@ -1248,9 +1248,8 @@ const NETWORK_KEY: &str = "network";
 /// Merges one key of a layer into the spec: a list onto a list unions,
 /// each item once, and any other value replaces the spec's. An argument
 /// vector (`ARGV_KEYS`) always replaces, item for item. A `network` table
-/// merges onto a `network` table by key, and a sub-table such as `egress`
-/// or `bep` merges onto a sub-table by key, so a later layer replaces only
-/// the keys it sets.
+/// merges onto a `network` table by its keys (`mode`, `egress`, `bep`), so
+/// a later layer replaces only the sub-tables and keys it sets.
 fn merge_value(
     spec: &mut toml::Table,
     report: &mut ExpansionReport,
@@ -1302,10 +1301,12 @@ fn merge_value(
 }
 
 /// Merges a layer's `network` value into the spec. A table onto a table
-/// merges by key, and a sub-table onto a sub-table merges by key: each key
-/// the layer sets replaces the spec's. Any other value replaces the whole
-/// `network` value. The report keeps the layer of each key below
-/// `network`.
+/// merges by key: each key the layer sets below `network`, such as `mode`,
+/// `egress` or `bep`, replaces the spec's key whole, and the keys the layer
+/// does not set stay. Any other value replaces the whole `network` value.
+/// The flat `egress_*` keys and `egress` spell one setting, so a layer that
+/// sets any of them replaces all of them. The report keeps the layer of
+/// each key below `network`.
 fn merge_network(
     spec: &mut toml::Table,
     report: &mut ExpansionReport,
@@ -1327,32 +1328,17 @@ fn merge_network(
         }
         return;
     };
+    let egress_keys = || {
+        std::iter::once("egress").chain(crate::network::FLAT_EGRESS_KEYS.iter().map(|(f, _)| *f))
+    };
+    if egress_keys().any(|key| add.contains_key(key)) {
+        for key in egress_keys() {
+            have.remove(key);
+            report.network.remove(key);
+        }
+    }
     for (sub, item) in add {
-        // A flat egress key and its nested `egress.*` key set one value, so
-        // the later layer's spelling replaces the earlier one.
-        for (flat, nested) in crate::network::FLAT_EGRESS_KEYS {
-            if sub == flat
-                && let Some(toml::Value::Table(egress)) = have.get_mut("egress")
-            {
-                egress.remove(nested);
-            }
-            if sub == "egress"
-                && item.as_table().is_some_and(|t| t.contains_key(nested))
-                && have.remove(flat).is_some()
-            {
-                report.network.remove(flat);
-            }
-        }
-        match (have.get_mut(sub), item) {
-            (Some(toml::Value::Table(old)), toml::Value::Table(new)) => {
-                for (k, v) in new {
-                    old.insert(k.clone(), v.clone());
-                }
-            }
-            _ => {
-                have.insert(sub.clone(), item.clone());
-            }
-        }
+        have.insert(sub.clone(), item.clone());
         report.network.insert(sub.clone(), origin.clone());
     }
 }
@@ -2015,8 +2001,9 @@ mod tests {
     }
 
     // BOX-048, #3597: a later layer that sets one `network` sub-table keeps
-    // the other sub-tables of an earlier layer, and a sub-table merges by
-    // key. The report names the layer of each key below `network`.
+    // the other sub-tables of an earlier layer. A sub-table that two layers
+    // set comes whole from the later one. The report names the layer of
+    // each key below `network`.
     #[test]
     fn network_merges_by_sub_table() {
         let file = r#"
@@ -2037,7 +2024,7 @@ mod tests {
             toml::Value::Table(table(indoc::indoc! {r#"
                 mode = "own_ip"
                 bep = { proxy_env = true }
-                egress = { allow_dns_hosts = ["a.example"], deny_subnets = ["192.168.0.0/16"] }
+                egress = { deny_subnets = ["192.168.0.0/16"] }
             "#}))
         );
         let layer_of = |key: &str| e.report.network.get(key).map(|o| o.layer);
@@ -2079,8 +2066,8 @@ mod tests {
         assert_eq!(replaced.spec["network"].as_str(), Some("x"));
         assert!(replaced.report.network.is_empty());
 
-        // A flat egress key in a later layer replaces the nested key it
-        // spells, and the other way round.
+        // A flat egress key in a later layer replaces an earlier `egress`
+        // table, and the other way round.
         let flat = fold(&[
             (
                 Origin::of(Layer::Defaults),
@@ -2093,9 +2080,7 @@ mod tests {
         ]);
         assert_eq!(
             flat.spec["network"],
-            toml::Value::Table(table(
-                "egress = { deny_subnets = [] }\negress_allow_dns = [\"b\"]"
-            ))
+            toml::Value::Table(table("egress_allow_dns = [\"b\"]"))
         );
         let nested = fold(&[
             (
