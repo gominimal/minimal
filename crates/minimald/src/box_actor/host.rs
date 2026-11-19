@@ -1485,105 +1485,6 @@ impl BoxActor {
             == Some(true)
     }
 
-    /// Stores the facts of the creator's new registration of this box
-    /// (NET-138), once its host-side row ended: the new addresses, task
-    /// addresses and box id go on the record, and the row binding is
-    /// cleared. The next attach or exec launch is then a new attachment
-    /// under the new row, as a box's first launch is, and binds it. When the
-    /// new registration moved the box's loopback address, the box's
-    /// published address and name move with it, so the next launch does not
-    /// use the old publication.
-    ///
-    /// The facts are refused, and nothing changes, while the old row has
-    /// not ended ([`Self::host_row_lost`]): a live host holds it, the VM
-    /// host daemon says it stands, or no launch bound one yet. They are
-    /// refused too while a host launched before the row ended still runs
-    /// in the slot, such as a detach hook's: it still uses the old
-    /// addresses, and a launch would reuse it. Then the client drops its new
-    /// registration, and the old row stays the box's.
-    ///
-    /// `abandoned` says whether the client stopped waiting for the answer.
-    /// It is read once more before the record is written: a client that
-    /// stopped waiting drops its registration's lease, and the VM host
-    /// daemon withdraws the new row, so its facts are not stored.
-    pub(super) async fn register_box_again(
-        &mut self,
-        request: minimald_rpc::RegisterBoxAgainRequest,
-        abandoned: impl Fn() -> bool,
-    ) -> Result<minimald_rpc::RegisterBoxAgainResponse, std::io::Error> {
-        let record = self.record.record().await?;
-        if record.box_addresses.is_none() || !self.host_row_lost(&record).await {
-            tracing::info!(
-                session_id = %record.id,
-                "the box's host row did not end; the new registration is not stored"
-            );
-            return Ok(minimald_rpc::RegisterBoxAgainResponse::RowStands);
-        }
-        let slot_alive = matches!(
-            &self.inner,
-            BoxInner::Active { host: Some((h, _)), .. } if h.is_alive()
-        );
-        if slot_alive {
-            tracing::info!(
-                session_id = %record.id,
-                "a host launched before the box's row ended still runs; the new \
-                 registration is not stored"
-            );
-            return Ok(minimald_rpc::RegisterBoxAgainResponse::HostRunning);
-        }
-        if abandoned() {
-            tracing::info!(
-                session_id = %record.id,
-                "the client stopped waiting for the box's new registration; it is not stored"
-            );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the client stopped waiting, so the box's new registration was not stored",
-            ));
-        }
-        let mut registered = record.clone();
-        registered.box_addresses = Some(request.box_addresses);
-        registered.task_addresses = request.task_addresses;
-        registered.box_id = request.box_id;
-        registered.host_row_bound = false;
-        self.record.write(registered.clone()).await?;
-        // No host in the slot holds the new row, and no read of the old
-        // row carries over to the launch that follows.
-        self.slot_holds_row = false;
-        self.relaunch_row_confirmed = false;
-        #[cfg(target_os = "linux")]
-        if record.box_addresses.map(|old| old.loopback_address)
-            != Some(request.box_addresses.loopback_address)
-        {
-            self.republish_own_address(&registered).await;
-        }
-        tracing::info!(
-            session_id = %record.id,
-            switch_address = %request.box_addresses.switch_address,
-            box_id = %request.box_id.map(|id| id.to_string()).unwrap_or_default(),
-            "stored the box's new registration; the next launch binds its new host row"
-        );
-        Ok(minimald_rpc::RegisterBoxAgainResponse::Registered)
-    }
-
-    /// Moves this box's published own address and its name to the loopback
-    /// address `registered` now carries (NET-138): the publication the box
-    /// kept by its id is dropped, so the registration publishes the new
-    /// address rather than answering from the old one.
-    #[cfg(target_os = "linux")]
-    async fn republish_own_address(&self, registered: &Record) {
-        self.deregister_hostname(false).await;
-        {
-            let mut reg = self
-                .hostnames
-                .write()
-                .expect("hostname registry lock poisoned");
-            let _ = reg.unpublish_own_address(registered.id);
-            reg.forget_own_address(registered.id);
-        }
-        self.register_hostname(registered, false).await;
-    }
-
     /// Records the launch's own placement outcome on this session's record
     /// (NET-079): `per_box` when the launch placed this session's
     /// host-address box in a classifier leaf of the host's tree, `none` when
@@ -2731,29 +2632,6 @@ impl BoxActor {
         let mut record = self.record.record().await?;
         record.set_state(boxes::core::record::RecordState::Stopped(ending));
         self.record.write(record).await
-    }
-}
-
-impl BoxHandle {
-    /// Hands the actor the facts of the creator's new registration of this
-    /// box (NET-138). See [`BoxActor::register_box_again`]. A dead actor
-    /// maps to `NotConnected`.
-    pub(crate) async fn register_box_again(
-        &self,
-        request: minimald_rpc::RegisterBoxAgainRequest,
-    ) -> Result<minimald_rpc::RegisterBoxAgainResponse, std::io::Error> {
-        let (send, recv) = oneshot::channel();
-        // Ignore send errors - the recv will also fail.
-        let _ = self
-            .0
-            .send(BoxMessage::RegisterBoxAgain(request, send))
-            .await;
-        recv.await.unwrap_or_else(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "session actor is gone",
-            ))
-        })
     }
 }
 

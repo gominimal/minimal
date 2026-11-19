@@ -23380,18 +23380,18 @@ fn box_verbs_complete_box_names() {
     }
 }
 
-/// NET-138: an attach that the in-VM daemon refuses because the VM host
-/// withdrew the box's row ends with its own status, and the client asks
-/// the VM host to register the box again, presenting only the record's
-/// name, pair and box id, and hands the new registration to the daemon.
-/// The next attach is not refused for the released addresses: the daemon
-/// took the new registration as a new attachment. `min` never exits with
-/// the row-ended status.
+/// NET-138: an interactive attach that the in-VM daemon refuses because the
+/// VM host withdrew the box's row ends with its own status. The client then
+/// asks the VM host for the row back with a resume, presenting the record's
+/// name, pair and box id, and attaches one more time. The box keeps its id
+/// and its addresses: the record the attach read stays right, and nothing
+/// new is registered. When the second attach is refused too, `min` exits 1
+/// and asks for the row no third time.
 ///
 /// The box's shell exit is stood in for by its record: a launch bound the
-/// row, and the daemon restarted with no host in the box's slot. No VM
-/// host answers the daemon's own read of the row, so the row reads as
-/// withdrawn. A stand-in VM host answers the client's registration on the
+/// row, and the daemon restarted with no host in the box's slot. No VM host
+/// answers the daemon's own read of the row, so the row reads as withdrawn
+/// on both attaches. A stand-in VM host answers the client's resume on the
 /// control socket beside the daemon's ssh socket.
 #[tokio::test]
 async fn attach_after_row_withdrawn_registers_again() {
@@ -23399,27 +23399,24 @@ async fn attach_after_row_withdrawn_registers_again() {
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
         FinalizeSessionRequest,
     };
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-    const OLD: boxes::BoxAddresses = boxes::BoxAddresses {
+    const PAIR: boxes::BoxAddresses = boxes::BoxAddresses {
         switch_address: std::net::Ipv4Addr::new(100, 64, 128, 40),
         loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 40),
     };
-    const NEW: boxes::BoxAddresses = boxes::BoxAddresses {
-        switch_address: std::net::Ipv4Addr::new(100, 64, 128, 41),
-        loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 41),
-    };
-    let new_box_id = minimald_rpc::BoxId::from_bytes([0x51; 16]);
+    let box_id = minimald_rpc::BoxId::from_bytes([0x50; 16]);
 
-    // An own-address box with the addresses its first registration handed.
+    // An own-address box with the addresses its registration handed.
     let state = tempfile::TempDir::new().unwrap();
     let state_path = state.path().to_path_buf();
     let server = minimald::test_harness::TestServer::new_in(state).await;
     let mut daemon = server.connect().await;
     let mut request = minimald::test_harness::create_session_req("web", "/uwu");
     request.config.network = boxes::NetworkMode::OwnIp;
-    request.config.box_addresses = Some(OLD);
-    request.config.box_id = Some(minimald_rpc::BoxId::from_bytes([0x50; 16]));
+    request.config.box_addresses = Some(PAIR);
+    request.config.box_id = Some(box_id);
     let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
     minimald::test_harness::unwrap_ready(
         daemon
@@ -23456,14 +23453,82 @@ async fn attach_after_row_withdrawn_registers_again() {
     std::fs::create_dir_all(&host_dir).unwrap();
     let sock = host_dir.join(paths::SSH_SOCK_FILE);
     server.listen_on_uds(&sock).await;
-    let mut daemon = server.connect().await;
+
+    // The record the attach reads first, and the box id it holds.
+    let record = attached_box_record(&sock, id)
+        .await
+        .unwrap()
+        .expect("the box's record");
+    let held_id = record.box_id;
+
+    // The stand-in VM host reads no row for the box, as the in-VM daemon
+    // read it, and answers every resume with the box's own row. It counts
+    // the reads and the resumes.
+    let listener =
+        tokio::net::UnixListener::bind(host_dir.join(client::attach::VM_HOST_CONTROL_SOCK_FILE))
+            .unwrap();
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let resumes = std::sync::Arc::new(AtomicUsize::new(0));
+    let host = tokio::spawn({
+        let (reads, resumes) = (
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&resumes),
+        );
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let request: minimald_rpc::BoxControlRequest =
+                    serde_json_lenient::from_str(line.trim()).unwrap();
+                let reply = match request {
+                    minimald_rpc::BoxControlRequest::ReadRow(read) => {
+                        assert_eq!(read.name, "web");
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        minimald_rpc::BoxControlReply::NoRow {
+                            name: read.name,
+                            no_row: true,
+                        }
+                    }
+                    minimald_rpc::BoxControlRequest::ResumeBox(resume) => {
+                        assert_eq!(
+                            resume,
+                            minimald_rpc::ResumeBoxRequest {
+                                name: "web".to_string(),
+                                switch_address: PAIR.switch_address,
+                                loopback_address: PAIR.loopback_address,
+                                box_id: held_id,
+                            },
+                            "the client resumes the box's own creation, under its own id"
+                        );
+                        resumes.fetch_add(1, Ordering::SeqCst);
+                        minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                            switch_address: PAIR.switch_address,
+                            loopback_address: PAIR.loopback_address,
+                            box_id: held_id.unwrap_or(box_id),
+                            task_addresses: Vec::new(),
+                        })
+                    }
+                    other => panic!("the client reads the row or resumes it, got {other:?}"),
+                };
+                let reply = serde_json_lenient::to_string(&reply).unwrap();
+                stream
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    });
 
     /// The text an attach wrote before its channel closed, and its status.
     /// An attach that does not close within the bound fails the test.
     async fn attach_once(
-        daemon: &mut minimald::test_harness::TestClient,
+        server: &minimald::test_harness::TestServer,
         id: boxes::SessionId,
     ) -> (String, Option<u32>) {
+        let mut daemon = server.connect().await;
         let mut channel = daemon.open_shell(id).await;
         let (mut out, mut status) = (Vec::new(), None);
         loop {
@@ -23480,107 +23545,164 @@ async fn attach_after_row_withdrawn_registers_again() {
         (String::from_utf8_lossy(&out).into_owned(), status)
     }
 
-    let (refusal, status) = attach_once(&mut daemon, id).await;
-    assert!(
-        refusal.contains("the VM host released this box's network addresses"),
-        "the attach is refused for the withdrawn row: {refusal:?}"
-    );
-    assert_eq!(status, Some(minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS));
-    let code = i32::try_from(status.unwrap()).unwrap();
-
-    // The stand-in VM host registers the box again, and reports what the
-    // client wrote on the registration's lease.
-    let listener =
-        tokio::net::UnixListener::bind(host_dir.join(client::attach::VM_HOST_CONTROL_SOCK_FILE))
-            .unwrap();
-    let host = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut stream = tokio::io::BufReader::new(stream);
-        let mut line = String::new();
-        stream.read_line(&mut line).await.unwrap();
-        let request: minimald_rpc::BoxControlRequest =
-            serde_json_lenient::from_str(line.trim()).unwrap();
-        // The request type carries the proof alone, so no rule can ride it.
-        let minimald_rpc::BoxControlRequest::RegisterBoxAgain(again) = request else {
-            panic!("the client asks the VM host to register the box again, got {request:?}");
-        };
-        assert_eq!(
-            (
-                again.name.as_str(),
-                again.switch_address,
-                again.loopback_address
-            ),
-            ("web", OLD.switch_address, OLD.loopback_address),
-            "the client presents the record's name and pair"
-        );
-        let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Registered(
-            minimald_rpc::RegisteredBox {
-                switch_address: NEW.switch_address,
-                loopback_address: NEW.loopback_address,
-                box_id: new_box_id,
-                task_addresses: Vec::new(),
-            },
-        ))
-        .unwrap();
-        stream
-            .get_mut()
-            .write_all(format!("{reply}\n").as_bytes())
-            .await
-            .unwrap();
-        let mut lease = String::new();
-        let _ = stream.read_to_string(&mut lease).await;
-        lease
-    });
-
-    let record = attached_box_record(&sock, id)
-        .await
-        .unwrap()
-        .expect("the box's record");
-    let retry = register_again_after_row_ended(&sock, code, Some(&record))
-        .await
-        .expect("the box is registered again")
-        .expect("the attach retries after the new registration");
+    let attaches = AtomicUsize::new(0);
+    let server = &server;
+    let attaches_ref = &attaches;
+    let exit = attach_retrying_row_ended(
+        || async move {
+            attaches_ref.fetch_add(1, Ordering::SeqCst);
+            let (refusal, status) = attach_once(server, id).await;
+            assert!(
+                refusal.contains("the VM host released this box's network addresses"),
+                "the attach is refused for the withdrawn row: {refusal:?}"
+            );
+            assert_eq!(status, Some(minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS));
+            Ok(i32::try_from(status.unwrap()).unwrap())
+        },
+        || client::box_registration::box_row_withdrawn(&sock, Some(&record)),
+        || resume_after_row_ended(&sock, Some(&record)),
+    )
+    .await
+    .expect("the row came back, so the resume is no error");
     assert_eq!(
-        (retry.box_addresses, retry.box_id),
-        (Some(NEW), Some(new_box_id)),
-        "the retry carries the new registration's addresses and id"
+        attaches.load(Ordering::SeqCst),
+        2,
+        "the attach runs once more after the row came back, and no third time"
     );
-    let lease = host.await.unwrap();
-    assert!(
-        lease.contains(minimald_rpc::REGISTRATION_COMMIT_LINE),
-        "the new row is kept once the daemon stored it: {lease:?}"
+    assert_eq!(
+        resumes.load(Ordering::SeqCst),
+        1,
+        "the row is asked back once"
     );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "each refusal is told from a shell's own status by the host's row"
+    );
+    assert_eq!(
+        exit, ROW_ENDED_REFUSED,
+        "`min` never exits with the row-ended status for a refusal: it exits 1"
+    );
+    host.abort();
 
-    let record = attached_box_record(&sock, id)
+    let after = attached_box_record(&sock, id)
         .await
         .unwrap()
         .expect("the box's record");
-    assert_eq!(record.box_addresses, Some(NEW));
-    assert_eq!(record.box_id, Some(new_box_id));
-    assert!(!record.host_row_bound, "the next launch binds the new row");
-
-    // The retried attach is not refused for the withdrawn row. The harness
-    // daemon starts no sandbox, so what follows is the launch's own end.
-    let (retried, status) = attach_once(&mut daemon, id).await;
-    assert!(
-        !retried.contains("network addresses"),
-        "the retried attach goes past the row check: {retried:?}"
+    assert_eq!(
+        (after.box_addresses, after.box_id),
+        (Some(PAIR), held_id),
+        "the box keeps its addresses and its id"
     );
-    let status = status.expect("the retried attach ends with an exit status");
-    assert_ne!(status, minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS);
+}
 
-    // Any other status registers nothing.
-    assert!(
-        register_again_after_row_ended(&sock, 0, Some(&record))
-            .await
-            .unwrap()
-            .is_none()
+/// The retry around an interactive attach (NET-138): the row-ended status
+/// asks for the row back only when the VM host holds no row of the box's
+/// own, so a shell that exits with the same status by itself keeps it. The
+/// attach runs once more only when the row came back, never a third time,
+/// and a refusal not followed by an attach ends with 1.
+#[tokio::test]
+async fn an_attach_retries_once_when_its_row_comes_back() {
+    use std::cell::RefCell;
+
+    /// Runs the retry over `codes`, one per attach, with `ended` as the
+    /// row reads' answers and `resumed` as the resume's. Returns the exit
+    /// status or the error text, the attaches run, the rows read and the
+    /// resumes asked.
+    async fn retry(
+        codes: &[i32],
+        ended: &[bool],
+        resumed: anyhow::Result<bool>,
+    ) -> (Result<i32, String>, usize, usize, usize) {
+        let codes = RefCell::new(codes.iter().copied());
+        let ended = RefCell::new(ended.iter().copied());
+        let (attaches, reads, resumes) = (RefCell::new(0), RefCell::new(0), RefCell::new(0));
+        let exit = attach_retrying_row_ended(
+            || {
+                *attaches.borrow_mut() += 1;
+                let code = codes.borrow_mut().next().expect("an attach too many");
+                async move { Ok(code) }
+            },
+            || {
+                *reads.borrow_mut() += 1;
+                let ended = ended.borrow_mut().next().expect("a row read too many");
+                async move { Ok(ended) }
+            },
+            || {
+                *resumes.borrow_mut() += 1;
+                async move { resumed }
+            },
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        (
+            exit,
+            attaches.into_inner(),
+            reads.into_inner(),
+            resumes.into_inner(),
+        )
+    }
+
+    let row_ended = ROW_ENDED_ATTACH;
+    assert_eq!(retry(&[0], &[], Ok(true)).await, (Ok(0), 1, 0, 0));
+    assert_eq!(retry(&[130], &[], Ok(true)).await, (Ok(130), 1, 0, 0));
+    assert_eq!(
+        retry(&[row_ended], &[false], Ok(true)).await,
+        (Ok(row_ended), 1, 1, 0),
+        "the box's row stands: the status is the shell's own, and nothing is asked back"
     );
+    assert_eq!(
+        retry(&[row_ended, 0], &[true], Ok(true)).await,
+        (Ok(0), 2, 1, 1),
+        "the row came back, so the attach runs once more"
+    );
+    assert_eq!(
+        retry(&[row_ended, row_ended], &[true, true], Ok(true)).await,
+        (Ok(ROW_ENDED_REFUSED), 2, 2, 1),
+        "a second refusal ends the attach with 1, with no third attempt"
+    );
+    assert_eq!(
+        retry(&[row_ended, row_ended], &[true, false], Ok(true)).await,
+        (Ok(row_ended), 2, 2, 1),
+        "after the retry, a shell that exits with the status by itself keeps it"
+    );
+    assert_eq!(
+        retry(&[row_ended], &[true], Ok(false)).await,
+        (Ok(ROW_ENDED_REFUSED), 1, 1, 1),
+        "no row to ask back: the refusal on screen ends the attach with 1"
+    );
+    let not_back = RowNotBack::NotBack {
+        name: "web".to_string(),
+    };
+    assert_eq!(
+        retry(&[row_ended], &[true], Err(not_back.into())).await,
+        (
+            Err(
+                "box web cannot get its network addresses back from the VM host. Run \
+                 `min box attach web` again. If it is refused again, remove the box with \
+                 `min box rm --force web` and start a new one with `min session start`."
+                    .to_string()
+            ),
+            1,
+            1,
+            1
+        )
+    );
+}
 
-    // `min` never exits with the row-ended status: an attach that ends
-    // with it and was not attached again exits 1. Every other status is
-    // ssh's own.
-    assert_eq!(attach_exit_status(code), 1);
-    assert_eq!(attach_exit_status(0), 0);
-    assert_eq!(attach_exit_status(130), 130);
+/// The text an interactive attach ends with when another box holds its
+/// box's name now (NET-138): it names both boxes and the commands that free
+/// the name, so a second attach does not fail the same way.
+#[test]
+fn row_not_back_names_the_box_that_holds_the_name() {
+    let held = RowNotBack::NameHeld {
+        name: "web".to_string(),
+        held: "Web".to_string(),
+    };
+    assert_eq!(
+        held.to_string(),
+        "box web cannot get its network addresses back. Another box, Web, holds its name \
+         now. Rename that box with `min box rename Web <new-name>` or remove it with \
+         `min box rm --force Web`, then run `min box attach web` again."
+    );
 }

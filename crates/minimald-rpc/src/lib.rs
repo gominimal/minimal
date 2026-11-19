@@ -1008,40 +1008,6 @@ pub struct ResumeBoxRequest {
     pub box_id: Option<BoxId>,
 }
 
-/// A creator's request to register its box again
-/// ([`BoxControlRequest::RegisterBoxAgain`], NET-138), after an attach
-/// ended because the host withdrew the box's row and could not give it
-/// back: the session that registered the box presenting the pair and the
-/// id the registration handed back, as for a resume ([`ResumeBoxRequest`]).
-///
-/// The pair and the id are the proof and the lookup key. The host
-/// registers a new row, with a new box id, from its own record of the
-/// box's creation: the declaration that creation was registered from,
-/// never a rule from this request, and never one from the guest. The
-/// registration is held as a lease, as an activation's is
-/// ([`RegisterBoxRequest::hold`]): its reply is a
-/// [`BoxControlReply::Registered`] on a connection the client commits once
-/// the in-VM daemon stored the new facts, and the host retires the old
-/// creation at that commit. A close before the commit withdraws the new
-/// row and keeps the old creation. A row that still stands is answered
-/// with [`BoxControlReply::RowStanding`], and nothing is registered.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RegisterBoxAgainHostRequest {
-    /// The name the box was registered under.
-    pub name: String,
-    /// The switch address the registration handed back.
-    pub switch_address: std::net::Ipv4Addr,
-    /// The loopback address the registration handed back.
-    pub loopback_address: std::net::Ipv4Addr,
-    /// The box id the registration handed back, when the client holds it.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "boxes::box_id_hex::option"
-    )]
-    pub box_id: Option<BoxId>,
-}
-
 /// The in-VM daemon's read of whether the host still holds a row at its
 /// box's switch address ([`BoxControlRequest::RowStanding`], NET-138):
 /// asked before the daemon relaunches a box's host after the host it ran
@@ -1795,12 +1761,6 @@ pub enum BoxControlRequest {
     /// NET-138): served on the host's control socket only, answered with
     /// [`BoxControlReply::Registered`].
     ResumeBox(ResumeBoxRequest),
-    /// A creator's request to register its box again from the host's own
-    /// record of its creation ([`RegisterBoxAgainHostRequest`], NET-138):
-    /// served on the host's control socket only, answered with
-    /// [`BoxControlReply::Registered`] on a held lease, or with
-    /// [`BoxControlReply::RowStanding`] when the box's row stands.
-    RegisterBoxAgain(RegisterBoxAgainHostRequest),
     /// The in-VM daemon's read of whether its box's row stands
     /// ([`RowStandingRequest`]): carried on the daemon's own control
     /// channel, answered with [`BoxControlReply::RowStanding`].
@@ -2860,78 +2820,14 @@ impl OneshotSshRpc for RenameSession {
     type Response = Errorable<RenameSessionResponse>;
 }
 
-/// The exit status an attach ends with when the in-VM daemon refused it
-/// because the VM host daemon withdrew the box's host-side row (NET-138).
-/// The client reads it as its cue to register the box again
-/// ([`RegisterBoxAgain`]) and retry the attach one time. A shell that exits
-/// with this status by itself leaves its row standing, so the host
-/// registers nothing again. The status is a signal from the daemon to the
-/// client only: `min` never ends with it.
+/// The exit status an interactive attach ends with when the in-VM daemon
+/// refused it because the VM host daemon withdrew the box's host-side row
+/// (NET-138). The client reads it as its cue to ask the VM host daemon for
+/// the row back ([`BoxControlRequest::ResumeBox`]), which reinstates it
+/// from the host's own record of the box's creation under the same box id,
+/// and to retry the attach one time. The status is a signal from the
+/// daemon to the client only: `min` never ends with it.
 pub const ATTACH_ROW_ENDED_EXIT_STATUS: u32 = 253;
-
-/// How long the in-VM daemon waits on a [`RegisterBoxAgain`] request before
-/// it gives up on it and stores nothing. Shorter than the client's own
-/// wait, so a request the client stopped waiting for, whose registration's
-/// lease it then drops, is not stored on the record afterwards.
-pub const REGISTER_BOX_AGAIN_SERVE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// An RPC that hands the in-VM daemon the facts of a new registration of a
-/// box whose host-side row the VM host daemon withdrew (NET-138).
-///
-/// Only the box's creator registers a row, so the client asks the VM host
-/// daemon to register the box again from its own record of the box's
-/// creation ([`BoxControlRequest::RegisterBoxAgain`]) after an attach ends
-/// with [`ATTACH_ROW_ENDED_EXIT_STATUS`], and sends what that registration
-/// handed back. The daemon stores the new addresses and box id on the
-/// record and clears its row binding: the next launch is a new attachment
-/// under the new row, as the first launch of a box is. The daemon refuses
-/// the facts while the old row still stands
-/// ([`RegisterBoxAgainResponse::RowStands`]) or while a host from before
-/// the row ended still runs ([`RegisterBoxAgainResponse::HostRunning`]),
-/// and stores nothing once [`REGISTER_BOX_AGAIN_SERVE_BOUND`] has passed.
-pub struct RegisterBoxAgain;
-
-/// The request for a [`RegisterBoxAgain`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RegisterBoxAgainRequest {
-    /// The session whose box was registered again.
-    pub id: SessionId,
-    /// The addresses the new registration handed back.
-    pub box_addresses: BoxAddresses,
-    /// The task addresses the new registration handed back.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub task_addresses: Vec<std::net::Ipv4Addr>,
-    /// The box id the new registration handed back, or `None` from a VM
-    /// host daemon that predates ids.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "boxes::box_id_hex::option"
-    )]
-    pub box_id: Option<BoxId>,
-}
-
-/// The response for a [`RegisterBoxAgain`] RPC.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum RegisterBoxAgainResponse {
-    /// The record holds the new registration. The next attach launches
-    /// the box under the new row.
-    Registered,
-    /// The box's row did not end: it still stands, a live host holds it, or
-    /// no launch bound one yet. Nothing changed, and the client drops the
-    /// new registration.
-    RowStands,
-    /// A host launched before the row ended still runs in the box's slot,
-    /// such as a detach hook's, and it still uses the old addresses.
-    /// Nothing changed, and the client drops the new registration.
-    HostRunning,
-}
-
-impl OneshotSshRpc for RegisterBoxAgain {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RegisterBoxAgain");
-    type Request<'a> = RegisterBoxAgainRequest;
-    type Response = Errorable<RegisterBoxAgainResponse>;
-}
 
 /// An RPC to stop a running box and keep its record (BOX-013, BOX-018).
 ///

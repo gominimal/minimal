@@ -2065,26 +2065,6 @@ pub enum ResumeError {
     Allocation(#[from] AllocationError),
 }
 
-/// What a creator's box is registered again from
-/// ([`BoxRegistry::registration_again`], NET-138): the declaration its
-/// creation was registered from, and the creation's own name, pair and id,
-/// which retire it once the new registration is committed.
-#[derive(Debug, Clone)]
-pub struct RegistrationAgain {
-    /// The declaration the creation was registered from.
-    pub spec: ClientBoxSpec,
-    /// How many task addresses the creation was filed with.
-    pub task_slots: u8,
-    /// The name the creation was registered under.
-    pub name: String,
-    /// The creation's switch address.
-    pub switch_address: Ipv4Addr,
-    /// The creation's loopback address.
-    pub loopback_address: Ipv4Addr,
-    /// The creation's box id.
-    pub box_id: BoxId,
-}
-
 /// What a resume finds before anything is allocated for it
 /// ([`BoxRegistry::resumable`]).
 #[derive(Debug)]
@@ -5943,50 +5923,6 @@ impl BoxRegistry {
                 name: creation.name,
             },
         })
-    }
-
-    /// What a creator's box is registered again from (NET-138): the box
-    /// its creator registered as `name`, handed the pair `(switch_addr,
-    /// loopback_addr)` and, when the creator knows it, created as `box_id`,
-    /// found and proved as a resume finds and proves it
-    /// ([`Self::resumable`]). The declaration is the one the creation was
-    /// registered from ([`Creation::spec`]), never one from the request and
-    /// never one from the guest, with as many task slots as the creation
-    /// was filed with.
-    ///
-    /// `Ok(None)` when the creation's row stands: nothing is registered
-    /// again. A row past its bound is withdrawn first, as for a resume.
-    ///
-    /// # Errors
-    ///
-    /// [`ResumeError`]: the registry keeps no creation under the name, the
-    /// pair or the id is not the creation's, or a running box holds the
-    /// name of a superseded creation.
-    pub fn registration_again(
-        &self,
-        name: &str,
-        switch_addr: Ipv4Addr,
-        loopback_addr: Ipv4Addr,
-        box_id: Option<BoxId>,
-    ) -> Result<Option<RegistrationAgain>, ResumeError> {
-        let creation = self.resumable_creation(name, switch_addr, loopback_addr, box_id)?;
-        self.withdraw_if_past_its_bound(&creation);
-        let rows = self
-            .rows
-            .read()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        if standing_row_of(&rows, &creation).is_some() {
-            return Ok(None);
-        }
-        drop(rows);
-        Ok(Some(RegistrationAgain {
-            spec: creation.spec(),
-            task_slots: u8::try_from(creation.task_addresses.len()).unwrap_or(u8::MAX),
-            name: creation.name.clone(),
-            switch_address: creation.switch_address,
-            loopback_address: creation.loopback_address,
-            box_id: creation.id(),
-        }))
     }
 
     /// Withdraws `creation`'s row when it stands past its bound — its grace
@@ -11255,6 +11191,59 @@ mod tests {
         wait_until(
             || registry.row_by_name("web").is_none(),
             "the row is withdrawn at its grace's end, not held to the resume bound",
+        );
+    }
+
+    /// NET-138: the resume an attach makes after the in-VM daemon found the
+    /// row withdrawn. The resume before the attach found the detached row
+    /// standing, near its grace's end, and the grace ended before the
+    /// in-VM daemon read the row. The second resume reinstates the same
+    /// creation: the same box id and addresses. The registry keeps that one
+    /// creation, none superseded, so no older creation keeps addresses
+    /// reserved.
+    #[test]
+    fn a_resume_after_the_row_ended_brings_back_the_same_creation() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box_with_task_slots(client_spec("web"), 1)
+            .expect("the plan has addresses for the box and its task");
+        let resume = || {
+            let claim = registry.begin_registration("web");
+            registry.resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+        };
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches at its relay's end");
+        registry.advance_clock(DETACH_GRACE.saturating_sub(Duration::from_secs(1)));
+        let standing = resume().expect("the resume before the attach");
+        assert!(Arc::ptr_eq(&standing, &web), "answered as it stands");
+        registry.advance_clock(Duration::from_secs(1));
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the grace ends before the in-VM daemon reads the row",
+        );
+
+        let back = resume().expect("the resume after the attach found the row withdrawn");
+        assert_eq!(back.box_id(), web.box_id(), "the same box id");
+        assert_eq!(back.switch_addr(), web.switch_addr());
+        assert_eq!(back.loopback_addr(), web.loopback_addr());
+        assert_eq!(back.task_addrs(), web.task_addrs());
+        let creations = registry.creations();
+        assert_eq!(
+            creations.all().map(Creation::id).collect::<Vec<_>>(),
+            [web.box_id()],
+            "one creation, the box's own"
+        );
+        assert!(
+            creations.superseded.is_empty(),
+            "no older creation keeps addresses reserved"
         );
     }
 

@@ -41,11 +41,11 @@ pub enum AttachError {
     /// holds no row for it (NET-138): the row was withdrawn after its detach
     /// grace and its creator did not resume it. The host gate drops frames
     /// from an unregistered source, so any host handed out now would be
-    /// "rowless". Only the box's creator registers a row, so the refusal
-    /// ends with its own exit status
-    /// ([`minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS`]): the client reads it,
-    /// registers the box again, hands the new registration to this daemon
-    /// ([`minimald_rpc::RegisterBoxAgain`]) and retries the attach once.
+    /// "rowless". Only the box's creator registers or resumes a row, so
+    /// the refusal ends with its own exit status
+    /// ([`minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS`]): the client reads
+    /// it, asks the VM host daemon for the row back under the same box id,
+    /// and retries the attach once.
     BoxHostRowEnded,
     /// The attach named a stopped or exited box, and its resume was refused
     /// (BOX-025, BOX-030). The box's state is unchanged. The error's kind
@@ -122,7 +122,11 @@ impl fmt::Display for AttachError {
                 write!(f, "the session is busy; run the attach again in a moment")
             }
             AttachError::BoxHostRowEnded => {
-                write!(f, "the VM host released this box's network addresses")
+                write!(
+                    f,
+                    "the VM host released this box's network addresses. Run the same command \
+                     again to ask for them back"
+                )
             }
             AttachError::ResumeRefused(e, _) => write!(f, "{e}"),
         }

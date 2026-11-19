@@ -259,95 +259,86 @@ async fn box_via_ssh_with(
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
-        let mut record = record;
-        let mut registered_again = false;
-        loop {
-            // The pair the box's row was registered with, and the box id
-            // beside it, read before the attach: an attach that ends in a
-            // daemon-side destroy leaves no record to read them from, and
-            // the row is still this client's to withdraw. The id proves a
-            // box renamed since its registration (#1116); it goes only with
-            // a pair.
-            let box_row = match host_asks_for {
-                Some(_) => record
-                    .as_ref()
-                    .and_then(|record| record.box_addresses.map(|pair| (pair, record.box_id))),
-                None => None,
-            };
-            let box_addresses = box_row.map(|(pair, _)| pair);
-            let host_asks = host_asks_target(
-                control_sock_beside(sock),
-                host_asks_for,
-                box_addresses,
-                record_unreadable,
-            );
-            // The relay blocks its thread until ssh exits, so it runs off
-            // the runtime's workers.
-            let code = tokio::task::spawn_blocking(move || {
-                interactive_attach(
-                    ssh,
-                    stdin_is_tty,
-                    crate::attach::TerminalUnwind::arm,
-                    |ssh| {
-                        // A terminal the relay could not take was never
-                        // changed, so a failure here owes it nothing; the
-                        // marker tells `interactive_attach` so.
-                        let real = minimal_client::tty_relay::RealTty::acquire()
-                            .context(crate::attach::TerminalNotTaken)?;
-                        mark_relay_not_started(
-                            subscribe_host_asks(host_asks)
-                                .map(minimal_client::attach::HostAsks::into_hook),
-                            |hook| {
-                                minimal_client::attach::run_interactive_attach_on(
-                                    ssh,
-                                    real,
-                                    Some(hook),
+        // The pair the box's row was registered with, and the box id beside
+        // it, read before the attach: an attach that ends in a daemon-side
+        // destroy leaves no record to read them from, and the row is still
+        // this client's to withdraw. The id proves a box renamed since its
+        // registration (#1116); it goes only with a pair. A retried attach
+        // keeps them: the row comes back under the same id and pair.
+        let box_row = match host_asks_for {
+            Some(_) => record
+                .as_ref()
+                .and_then(|record| record.box_addresses.map(|pair| (pair, record.box_id))),
+            None => None,
+        };
+        let box_addresses = box_row.map(|(pair, _)| pair);
+        let mut first = Some(ssh);
+        let code = attach_retrying_row_ended(
+            || {
+                let ssh = match first.take() {
+                    Some(ssh) => Ok(ssh),
+                    None => minimal_client::attach::attach_command(
+                        sock,
+                        id,
+                        None,
+                        session_keys.as_ref(),
+                    ),
+                };
+                let host_asks = host_asks_target(
+                    control_sock_beside(sock),
+                    host_asks_for,
+                    box_addresses,
+                    record_unreadable,
+                );
+                async move {
+                    let ssh = ssh?;
+                    // The relay blocks its thread until ssh exits, so it
+                    // runs off the runtime's workers.
+                    tokio::task::spawn_blocking(move || {
+                        interactive_attach(
+                            ssh,
+                            stdin_is_tty,
+                            crate::attach::TerminalUnwind::arm,
+                            |ssh| {
+                                // A terminal the relay could not take was
+                                // never changed, so a failure here owes it
+                                // nothing; the marker tells
+                                // `interactive_attach` so.
+                                let real = minimal_client::tty_relay::RealTty::acquire()
+                                    .context(crate::attach::TerminalNotTaken)?;
+                                mark_relay_not_started(
+                                    subscribe_host_asks(host_asks)
+                                        .map(minimal_client::attach::HostAsks::into_hook),
+                                    |hook| {
+                                        minimal_client::attach::run_interactive_attach_on(
+                                            ssh,
+                                            real,
+                                            Some(hook),
+                                        )
+                                    },
                                 )
                             },
                         )
-                    },
-                )
-            })
-            .await
-            .context("the interactive attach's thread failed")??;
-            // The VM host withdrew the box's row: register the box again
-            // and retry the attach, one time (NET-138).
-            if !registered_again
-                && let Some(again) =
-                    register_again_after_row_ended(sock, code, record.as_ref()).await?
-            {
-                registered_again = true;
-                // The record read back, or else the old one with the new
-                // registration's addresses and box id, so the retried
-                // attach and its cleanup name the new row.
-                record = match attached_box_record(sock, id).await {
-                    Ok(Some(read)) => Some(read),
-                    Ok(None) => Some(again),
-                    Err(error) => {
-                        tracing::warn!(
-                            "could not read the session's record after its new \
-                             registration ({error:#}); the attach goes on with the \
-                             new registration's addresses"
-                        );
-                        Some(again)
-                    }
-                };
-                ssh =
-                    minimal_client::attach::attach_command(sock, id, None, session_keys.as_ref())?;
-                continue;
-            }
-            // The attach may have ended in the shell-exit prompt's Delete, a
-            // destroy made daemon-side: withdraw the row an own-address box
-            // registered, or release the name a `host_ip` box held.
-            if let Some(name) = host_asks_for {
-                release_held_name_after_attach(sock, id, name, box_row).await;
-            }
-            // Terminate with ssh's own status, exactly as the `exec()` this
-            // replaced did: `min` has nothing of its own left to say after
-            // an attach, and the unwind guard has already run. `run` exits
-            // once the command's `cmd` span has ended and been flushed.
-            return Err(Handoff::Exit(attach_exit_status(code)).into());
+                    })
+                    .await
+                    .context("the interactive attach's thread failed")?
+                }
+            },
+            || minimal_client::box_registration::box_row_withdrawn(sock, record.as_ref()),
+            || resume_after_row_ended(sock, record.as_ref()),
+        )
+        .await?;
+        // The attach may have ended in the shell-exit prompt's Delete, a
+        // destroy made daemon-side: withdraw the row an own-address box
+        // registered, or release the name a `host_ip` box held.
+        if let Some(name) = host_asks_for {
+            release_held_name_after_attach(sock, id, name, box_row).await;
         }
+        // Terminate with ssh's own status, exactly as the `exec()` this
+        // replaced did: `min` has nothing of its own left to say after an
+        // attach, and the unwind guard has already run. `run` exits once the
+        // command's `cmd` span has ended and been flushed.
+        return Err(Handoff::Exit(code).into());
     }
 
     // The exec path spawns ssh with stdout piped so this process can relay
@@ -405,46 +396,129 @@ async fn box_via_ssh_with(
 
 /// The exit status an attach ends with when the in-VM daemon refused it
 /// because the VM host withdrew the box's row (NET-138). It is the daemon's
-/// signal to this client only: `min` never exits with it
-/// ([`attach_exit_status`]).
+/// signal to this client only: `min` never exits with it for a refusal
+/// ([`attach_retrying_row_ended`]). A box's shell can exit with the same
+/// status by itself, and then `min` exits with it.
 pub(crate) const ROW_ENDED_ATTACH: i32 = 253;
 const _: () = assert!(ROW_ENDED_ATTACH as u32 == minimald_rpc::ATTACH_ROW_ENDED_EXIT_STATUS);
 
-/// The status `min` exits with after an interactive attach that ended with
-/// `code`. The daemon's row-ended status ([`ROW_ENDED_ATTACH`]) is not in
-/// `min`'s exit table: an attach that ends with it was refused and no retry
-/// attached the box, so `min` exits 1, the status of any other refused
-/// attach. Every other status is ssh's own.
-pub(crate) fn attach_exit_status(code: i32) -> i32 {
-    if code == ROW_ENDED_ATTACH { 1 } else { code }
-}
+/// The status `min` exits with when an interactive attach was refused
+/// because the box's row ended and no retry attached the box: 1, the
+/// status of any other refused attach. The daemon's row-ended status
+/// ([`ROW_ENDED_ATTACH`]) is not in `min`'s exit table.
+pub(crate) const ROW_ENDED_REFUSED: i32 = 1;
 
-/// Whether an interactive attach that ended with `code` retries: the code
-/// says the VM host withdrew the box's row, and the VM host registered the
-/// box again ([`minimal_client::box_registration::register_box_again`])
-/// for the session's `record`, which the in-VM daemon then stored. Returns
-/// the record with the new registration's addresses and box id. A record
-/// that could not be read registers nothing.
+/// Runs an interactive attach with `attach` (NET-138). An attach that ends
+/// with [`ROW_ENDED_ATTACH`] is read as the in-VM daemon's refusal only
+/// when `row_ended` says the VM host holds no row of the box's own:
+/// otherwise it is the status the box's shell exited with, and `min` exits
+/// with it. On the refusal, `resume` asks for the row back, and once it
+/// says the row is back, `attach` runs one more time. A refusal that is not
+/// followed by an attach ends with [`ROW_ENDED_REFUSED`]. Returns the
+/// status `min` exits with.
 ///
 /// # Errors
 ///
-/// The new registration failed. The daemon's refusal is already on the
-/// terminal, and the error says why the retry did not happen.
-pub(crate) async fn register_again_after_row_ended(
-    sock: &std::path::Path,
-    code: i32,
-    record: Option<&boxes::Record>,
-) -> anyhow::Result<Option<boxes::Record>> {
-    if code != ROW_ENDED_ATTACH {
-        return Ok(None);
+/// An attach that could not run, a row read that could not reach the VM
+/// host, and `resume`'s error: the row did not come back, and the error
+/// says why and what to do.
+pub(crate) async fn attach_retrying_row_ended<A, AF, E, EF, R, RF>(
+    mut attach: A,
+    mut row_ended: E,
+    resume: R,
+) -> anyhow::Result<i32>
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = anyhow::Result<i32>>,
+    E: FnMut() -> EF,
+    EF: std::future::Future<Output = anyhow::Result<bool>>,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let code = attach().await?;
+    if code != ROW_ENDED_ATTACH || !row_ended().await? {
+        return Ok(code);
     }
-    let Some(record) = record else {
-        return Ok(None);
-    };
-    minimal_client::box_registration::register_box_again(sock, record)
-        .await
-        .context("registering the box again with the VM host failed")
+    if !resume().await? {
+        return Ok(ROW_ENDED_REFUSED);
+    }
+    let code = attach().await?;
+    if code == ROW_ENDED_ATTACH && row_ended().await? {
+        return Ok(ROW_ENDED_REFUSED);
+    }
+    Ok(code)
 }
+
+/// Asks the VM host for the row of the session's box back after an attach
+/// found it withdrawn ([`minimal_client::box_registration::resume_box_row_after_row_ended`]).
+/// `Ok(true)` when the row is back under the same box id, so the attach
+/// runs again. `Ok(false)` when there is no row to ask back: the daemon's
+/// refusal is on the terminal already, and the attach ends with it.
+///
+/// # Errors
+///
+/// [`RowNotBack`] when the row did not come back, and the VM host's own
+/// errors: it cannot be reached, or it refuses to give the box an address.
+pub(crate) async fn resume_after_row_ended(
+    sock: &std::path::Path,
+    record: Option<&boxes::Record>,
+) -> anyhow::Result<bool> {
+    use minimal_client::box_registration::RowEndedResume;
+    let answer =
+        minimal_client::box_registration::resume_box_row_after_row_ended(sock, record).await?;
+    let name = record
+        .and_then(|record| record.name.clone())
+        .unwrap_or_default();
+    match answer {
+        RowEndedResume::NothingToResume => Ok(false),
+        RowEndedResume::Back => Ok(true),
+        RowEndedResume::NameHeld { held } => Err(RowNotBack::NameHeld { name, held }.into()),
+        RowEndedResume::NotBack(why) => {
+            tracing::info!(box = %name, "the box's row did not come back: {why}");
+            Err(RowNotBack::NotBack { name }.into())
+        }
+    }
+}
+
+/// Why an interactive attach that found its box's row withdrawn could not
+/// get the row back (NET-138). Exits 1, as any refused attach does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowNotBack {
+    /// Another box holds the box's name now, in the spelling `held`.
+    NameHeld {
+        /// The box's own name.
+        name: String,
+        /// The name in the spelling the other box holds it.
+        held: String,
+    },
+    /// The VM host did not give the row back for another reason.
+    NotBack {
+        /// The box's own name.
+        name: String,
+    },
+}
+
+impl std::fmt::Display for RowNotBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RowNotBack::NameHeld { name, held } => write!(
+                f,
+                "box {name} cannot get its network addresses back. Another box, {held}, \
+                 holds its name now. Rename that box with `min box rename {held} <new-name>` \
+                 or remove it with `min box rm --force {held}`, then run \
+                 `min box attach {name}` again."
+            ),
+            RowNotBack::NotBack { name } => write!(
+                f,
+                "box {name} cannot get its network addresses back from the VM host. Run \
+                 `min box attach {name}` again. If it is refused again, remove the box with \
+                 `min box rm --force {name}` and start a new one with `min session start`."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RowNotBack {}
 
 /// Where an interactive attach subscribes to its box's pending asks
 /// (NET-045): the VM host daemon's control socket and the box's name, for a

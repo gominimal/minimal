@@ -409,12 +409,6 @@ enum BoxMessage {
     /// Rename the session: persist the new name through the record handle,
     /// refresh the in-memory snapshot, and relink the PTask hostname.
     Rename(String, oneshot::Sender<Result<(), std::io::Error>>),
-    /// Store the facts of the creator's new registration of a box whose
-    /// host-side row ended (NET-138). See [`BoxActor::register_box_again`].
-    RegisterBoxAgain(
-        minimald_rpc::RegisterBoxAgainRequest,
-        oneshot::Sender<Result<minimald_rpc::RegisterBoxAgainResponse, std::io::Error>>,
-    ),
     /// Whether this session blocks an unforced daemon shutdown: a `Draft`
     /// holding compose state (a client is mid create flow, and stopping
     /// would strand it) or an `Active` with a minted host. A `Draft` that
@@ -2614,14 +2608,6 @@ impl BoxActor {
             },
             BoxMessage::Rename(new_name, r) => {
                 let _ = r.send(self.rename(new_name).await);
-            }
-            BoxMessage::RegisterBoxAgain(request, r) => {
-                // A request whose caller gave up before the actor reached it
-                // is not served: its client dropped the registration.
-                if !r.is_closed() {
-                    let answer = self.register_box_again(request, || r.is_closed()).await;
-                    let _ = r.send(answer);
-                }
             }
             #[cfg(test)]
             BoxMessage::Park(d, entered) => {
