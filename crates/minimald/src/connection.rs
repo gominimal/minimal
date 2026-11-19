@@ -1074,17 +1074,22 @@ fn watch_in_box_dial(
 }
 
 /// The log line for how the in-box dial to `host`:`port` ended, with what
-/// it wrote to its `stderr`. The two exit codes the injection shim leaves
-/// with when it cannot join the box's classifier leaf are warnings: the
-/// dial never ran, and `stderr` is the shim's line that says why. Any other
-/// failure is the relay's own.
+/// it wrote to its `stderr`. The two exits the injection shim leaves with
+/// when it cannot join the box's classifier leaf are warnings: the dial
+/// never ran, and `stderr` is the shim's line that says why. `socat` can
+/// exit with the same codes, so a code counts as the shim's only when
+/// `stderr` carries the shim's line too, as `min box exec` checks. Any
+/// other failure is the relay's own.
 fn log_in_box_dial_end(
     host: &str,
     port: u16,
     status: std::io::Result<std::process::ExitStatus>,
     stderr: &str,
 ) {
-    use minimald_rpc::exec::{INJECTION_BOX_STOPPED_EXIT, INJECTION_UNPLACED_EXIT};
+    use minimald_rpc::exec::{
+        INJECTION_BOX_STOPPED_EXIT, INJECTION_BOX_STOPPED_TEXT, INJECTION_UNPLACED_EXIT,
+        INJECTION_UNPLACED_TEXT,
+    };
     let status = match status {
         Ok(status) => status,
         Err(error) => {
@@ -1093,22 +1098,32 @@ fn log_in_box_dial_end(
         }
     };
     match status.code() {
-        Some(code) if code == i32::from(INJECTION_BOX_STOPPED_EXIT) => tracing::warn!(
-            host,
-            port,
-            exit_code = code,
-            stderr,
-            "direct-tcpip: the in-box dial did not run: the box's classifier leaf is gone, \
+        Some(code)
+            if code == i32::from(INJECTION_BOX_STOPPED_EXIT)
+                && stderr == INJECTION_BOX_STOPPED_TEXT.trim_end() =>
+        {
+            tracing::warn!(
+                host,
+                port,
+                exit_code = code,
+                stderr,
+                "direct-tcpip: the in-box dial did not run: the box's classifier leaf is gone, \
              so the box stopped"
-        ),
-        Some(code) if code == i32::from(INJECTION_UNPLACED_EXIT) => tracing::warn!(
-            host,
-            port,
-            exit_code = code,
-            stderr,
-            "direct-tcpip: the in-box dial did not run: it could not join the box's \
+            )
+        }
+        Some(code)
+            if code == i32::from(INJECTION_UNPLACED_EXIT)
+                && stderr.starts_with(INJECTION_UNPLACED_TEXT) =>
+        {
+            tracing::warn!(
+                host,
+                port,
+                exit_code = code,
+                stderr,
+                "direct-tcpip: the in-box dial did not run: it could not join the box's \
              classifier leaf"
-        ),
+            )
+        }
         Some(0) | None => {
             tracing::debug!(host, port, %status, stderr, "direct-tcpip: the in-box dial ended")
         }
@@ -1180,8 +1195,24 @@ mod tests {
     /// from the log.
     fn stand_in_dial(line: &str, code: u8) -> tokio::process::Child {
         let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", &format!("echo '{line}' >&2; exit {code}")]);
+        command
+            .args(["-c", &format!("printf '%s\\n' \"$LINE\" >&2; exit {code}")])
+            .env("LINE", line);
         super::spawn_in_box_dial(command).expect("spawning a stand-in dial")
+    }
+
+    /// The line the injection shim writes for `code` on a dial to `port`.
+    fn shim_line(code: u8, port: u16) -> String {
+        if code == minimald_rpc::exec::INJECTION_BOX_STOPPED_EXIT {
+            minimald_rpc::exec::INJECTION_BOX_STOPPED_TEXT
+                .trim_end()
+                .to_string()
+        } else {
+            format!(
+                "{}: stand-in cause for port {port}.",
+                minimald_rpc::exec::INJECTION_UNPLACED_TEXT
+            )
+        }
     }
 
     /// Whether `logged` has one warning for the dial to `port` that names
@@ -1215,7 +1246,7 @@ mod tests {
                 "so the box stopped",
             ),
         ] {
-            let line = format!("stand-in dial stderr for port {port}");
+            let line = shim_line(code, port);
             let child = stand_in_dial(&line, code);
             let (_stop, watcher) = super::watch_in_box_dial(child, "127.0.0.1".to_string(), port);
             watcher.await.expect("the watcher reaps the dial");
@@ -1227,6 +1258,39 @@ mod tests {
         }
     }
 
+    /// `socat` itself can exit with the shim's codes. Without the shim's
+    /// line on its stderr, the exit is the relay's own failure, not a
+    /// warning that names a cause.
+    #[tokio::test]
+    async fn a_shim_exit_code_without_the_shim_s_line_is_the_relay_s_own_failure() {
+        let log = crate::test_harness::captured_log();
+        for (code, port) in [
+            (minimald_rpc::exec::INJECTION_UNPLACED_EXIT, 40_505),
+            (minimald_rpc::exec::INJECTION_BOX_STOPPED_EXIT, 40_506),
+        ] {
+            let line = format!("stand-in socat stderr for port {port}");
+            let child = stand_in_dial(&line, code);
+            let (_stop, watcher) = super::watch_in_box_dial(child, "127.0.0.1".to_string(), port);
+            watcher.await.expect("the watcher reaps the dial");
+            let logged = log.contents();
+            let ours: Vec<&str> = logged
+                .lines()
+                .filter(|l| l.contains(&format!("port={port}")))
+                .collect();
+            assert!(
+                ours.iter().any(|l| l.contains("INFO")
+                    && l.contains("the in-box dial exited with a failure")
+                    && l.contains(&format!("exit_code={code}"))
+                    && l.contains(&line)),
+                "the exit is logged as the relay's own failure: {logged}"
+            );
+            assert!(
+                !ours.iter().any(|l| l.contains("WARN")),
+                "no warning names a shim cause: {logged}"
+            );
+        }
+    }
+
     /// A dial that leaves a process behind holding its stderr open is
     /// still logged with what it wrote, once the wait for the pipe ends.
     #[tokio::test]
@@ -1234,9 +1298,14 @@ mod tests {
         let log = crate::test_harness::captured_log();
         let code = minimald_rpc::exec::INJECTION_UNPLACED_EXIT;
         let port = 40_504;
-        let line = format!("stand-in dial stderr for port {port}");
+        let line = shim_line(code, port);
         let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", &format!("echo '{line}' >&2; sleep 5 & exit {code}")]);
+        command
+            .args([
+                "-c",
+                &format!("printf '%s\\n' \"$LINE\" >&2; sleep 5 & exit {code}"),
+            ])
+            .env("LINE", &line);
         let child = super::spawn_in_box_dial(command).expect("spawning a stand-in dial");
         let (_stop, watcher) = super::watch_in_box_dial(child, "127.0.0.1".to_string(), port);
         tokio::time::timeout(std::time::Duration::from_secs(3), watcher)
@@ -1263,7 +1332,7 @@ mod tests {
         let log = crate::test_harness::captured_log();
         let code = minimald_rpc::exec::INJECTION_UNPLACED_EXIT;
         let port = 40_503;
-        let line = format!("stand-in dial stderr for port {port}");
+        let line = shim_line(code, port);
         let _held = super::ChildStdio::new(stand_in_dial(&line, code), "127.0.0.1", port);
         let cause = "could not join the box's classifier leaf";
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
