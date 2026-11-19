@@ -14750,6 +14750,114 @@ fn box_wait_orphaned_stopped_record_returns_137() {
     assert_eq!(wait_exit(&no_reason, "web"), Some(Ok(137)));
 }
 
+// BCLI-013, BCLI-033: `min box wait -o json` writes one `min/v1/wait`
+// object on stdout that says how the box ended: what its record keeps and
+// the code the wait exits with. A text run writes nothing on stdout.
+#[test]
+fn box_wait_json_lists_how_the_box_ended() {
+    let id = "0199f000-0000-7000-8000-000000000001";
+    for (record, ended, state, reason, exit_code, signal, code) in [
+        (
+            waited_entry("exited", Some("exit"), Some(0), None),
+            Ok(0),
+            "exited",
+            "exit",
+            serde_json_lenient::json!(0),
+            serde_json_lenient::Value::Null,
+            0,
+        ),
+        (
+            waited_entry("exited", Some("exit"), Some(3), None),
+            Ok(3),
+            "exited",
+            "exit",
+            serde_json_lenient::json!(3),
+            serde_json_lenient::Value::Null,
+            3,
+        ),
+        (
+            waited_entry("exited", Some("timeout"), None, Some(9)),
+            Err(BoxTimedOut::ended("web")),
+            "exited",
+            "timeout",
+            serde_json_lenient::Value::Null,
+            serde_json_lenient::json!(9),
+            124,
+        ),
+        (
+            waited_entry("stopped", Some("stopped"), None, Some(15)),
+            Ok(143),
+            "stopped",
+            "stopped",
+            serde_json_lenient::Value::Null,
+            serde_json_lenient::json!(15),
+            143,
+        ),
+        (
+            waited_entry("stopped", Some("stopped"), None, None),
+            Ok(ORPHANED_STOP_EXIT_CODE),
+            "stopped",
+            "stopped",
+            serde_json_lenient::Value::Null,
+            serde_json_lenient::Value::Null,
+            137,
+        ),
+        // A clean exit whose declared export was skipped (BOX-193).
+        (
+            waited_entry("exited", Some("exit"), Some(0), None),
+            Ok(125),
+            "exited",
+            "exit",
+            serde_json_lenient::json!(0),
+            serde_json_lenient::Value::Null,
+            125,
+        ),
+    ] {
+        if let Ok(stored) = ended
+            && stored != 125
+        {
+            assert_eq!(wait_exit(&record, "web"), Some(Ok(stored)), "{record:?}");
+        }
+        let waited = [BoxWaited {
+            box_id: record.box_id,
+            ended,
+            record,
+        }];
+
+        let mut text = Vec::new();
+        write_wait_output(&mut text, None, &waited).expect("the text write");
+        assert!(text.is_empty(), "a text run writes nothing on stdout");
+
+        let mut out = Vec::new();
+        write_wait_output(&mut out, Some(BoxWaitOutputFormat::Json), &waited)
+            .expect("the json write");
+        let line = String::from_utf8(out).expect("utf-8");
+        assert_eq!(line.lines().count(), 1, "one object on one line: {line}");
+        assert!(
+            line.starts_with(r#"{"schema":"min/v1/wait","boxes":["#),
+            "{line}"
+        );
+        let object: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&line).expect("one JSON object");
+        assert_eq!(
+            object,
+            serde_json_lenient::json!({
+                "schema": "min/v1/wait",
+                "boxes": [{
+                    "box_id": id,
+                    "name": "web",
+                    "state": state,
+                    "reason": reason,
+                    "exit_code": exit_code,
+                    "signal": signal,
+                    "code": code,
+                }],
+            }),
+            "{line}"
+        );
+    }
+}
+
 // BCLI-013: `min box wait --timeout` stops waiting on a box that still
 // runs, with exit 124 and the `wait_timeout` error that names the box id,
 // and leaves the box running.
