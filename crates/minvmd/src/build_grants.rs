@@ -7,7 +7,7 @@
 //! box's own under a host-side deadline. A guest signal can end a grant
 //! early, and nothing extends one.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,6 +34,11 @@ const BUILD_GRANT_DEADLINE: Duration = Duration::from_secs(6 * 60 * 60);
 /// box's own rules, so a guest that asks in a loop cannot use up the addresses
 /// other boxes draw from.
 const MAX_OPEN_GRANTS: usize = 32;
+
+/// The most ended boxes [`BuildGrants::drop_table`] remembers, so a part of
+/// a table filed after its box's end files nothing. The ids come from the
+/// guest, so the set is bounded.
+const MAX_ENDED_BOXES: usize = 4096;
 
 /// How often the deadlines are read.
 pub(crate) const GRANT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
@@ -73,9 +78,29 @@ struct State {
     /// Counts grants, so each row has a name of its own.
     opened: u64,
     /// The boxes whose table [`BuildGrants::drop_table`] ended in this
-    /// process. A box id is never used again, so a part of a table filed
-    /// after its box's end is dropped, never a table.
+    /// process, the most recent [`MAX_ENDED_BOXES`] of them. A box id is
+    /// never used again, so a part of a table filed after its box's end is
+    /// dropped, never a table.
     ended: BTreeSet<boxes::SessionId>,
+    /// The ids in `ended`, oldest first, so the oldest leaves at the bound.
+    ended_order: VecDeque<boxes::SessionId>,
+}
+
+impl State {
+    /// Remembers that the table of `session_id` ended. Past
+    /// [`MAX_ENDED_BOXES`], the oldest id leaves: a late part of a table
+    /// arrives within moments of its box's end, not after that many ends.
+    fn note_ended(&mut self, session_id: boxes::SessionId) {
+        if !self.ended.insert(session_id) {
+            return;
+        }
+        self.ended_order.push_back(session_id);
+        while self.ended_order.len() > MAX_ENDED_BOXES {
+            if let Some(oldest) = self.ended_order.pop_front() {
+                self.ended.remove(&oldest);
+            }
+        }
+    }
 }
 
 /// The box tables and the open grants, shared by every clone.
@@ -162,7 +187,7 @@ impl BuildGrants {
     pub fn drop_table(&self, session_id: boxes::SessionId) -> Vec<WithdrawBoxRequest> {
         let mut withdrawals = Vec::new();
         self.change_tables(|state| {
-            state.ended.insert(session_id);
+            state.note_ended(session_id);
             state
                 .reserved
                 .retain(|_, reserved_for| *reserved_for != session_id);
@@ -473,6 +498,23 @@ mod tests {
             grants.lookup(early, "aa").is_none(),
             "a box that ended before its first part has no table either"
         );
+    }
+
+    /// The ended boxes are remembered up to a bound, whatever ids the
+    /// guest names: past it, the oldest is forgotten first.
+    #[test]
+    fn the_ended_boxes_stay_within_their_bound() {
+        let grants = BuildGrants::default();
+        let first = boxes::SessionId::mint();
+        grants.drop_table(first);
+        grants.drop_table(first);
+        for _ in 0..MAX_ENDED_BOXES {
+            grants.drop_table(boxes::SessionId::mint());
+        }
+        let state = grants.lock();
+        assert_eq!(state.ended.len(), MAX_ENDED_BOXES);
+        assert_eq!(state.ended_order.len(), MAX_ENDED_BOXES);
+        assert!(!state.ended.contains(&first), "the oldest left first");
     }
 
     /// NET-165: a box's table survives the VM host daemon.
