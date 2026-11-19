@@ -270,7 +270,8 @@ fn answer_failure(
 /// refusal carries (`minimal::StartEntryRefusal`: 4 when the start does not
 /// find the entry, 2 when it cannot pick or start it), 2 when a start needs a terminal
 /// it does not have (`minimal::StartNeedsTerminal`) or asks for a held name
-/// (`minimal::StartNameHeld`), 124 when an exec ran past its own timeout
+/// (`minimal::StartNameHeld`), 2 when an attach cannot get its row back
+/// because another box holds the name (`minimal::RowNotBack`), 124 when an exec ran past its own timeout
 /// (`minimal::BoxExecTimedOut`) or a box ran past its own timeout or a
 /// `min box wait --timeout` ran out (`minimal::BoxTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
@@ -349,6 +350,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-069: a start whose name a running box holds.
     if e.downcast_ref::<minimal::StartNameHeld>().is_some() {
         return minimal::StartNameHeld::EXIT_CODE;
+    }
+    // NET-138: an attach whose row did not come back; 2 when another box
+    // holds the name, 1 otherwise.
+    if let Some(refusal) = e.downcast_ref::<minimal::RowNotBack>() {
+        return refusal.exit_code();
     }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
@@ -1448,6 +1454,21 @@ mod tests {
             "--deny-all-egress",
         ));
         assert_eq!(failure_exit_code(&err), 2, "{err:#}");
+    }
+
+    /// An attach whose row did not come back ends with 2 when another box
+    /// holds its name, and with 1 otherwise (NET-138).
+    #[test]
+    fn row_not_back_exit_codes() {
+        let held = anyhow::Error::new(minimal::RowNotBack::NameHeld {
+            name: "web".to_string(),
+            held: "Web".to_string(),
+        });
+        assert_eq!(failure_exit_code(&held), 2, "{held:#}");
+        let not_back = anyhow::Error::new(minimal::RowNotBack::NotBack {
+            name: "web".to_string(),
+        });
+        assert_eq!(failure_exit_code(&not_back), 1, "{not_back:#}");
     }
 
     /// BCLI-053: an exec that its own timeout ended ends the run with 124

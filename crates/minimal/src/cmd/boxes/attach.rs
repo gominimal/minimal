@@ -481,9 +481,11 @@ pub(crate) async fn resume_after_row_ended(
 }
 
 /// Why an interactive attach that found its box's row withdrawn could not
-/// get the row back (NET-138). Exits 1, as any refused attach does.
+/// get the row back (NET-138). [`RowNotBack::NameHeld`] exits 2, as an
+/// operation a held name does not admit does when the message names the
+/// holder. [`RowNotBack::NotBack`] exits 1, as any other refused attach does.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RowNotBack {
+pub enum RowNotBack {
     /// Another box holds the box's name now, in the spelling `held`.
     NameHeld {
         /// The box's own name.
@@ -514,6 +516,17 @@ impl std::fmt::Display for RowNotBack {
                  `min box attach {name}` again. If it is refused again, remove the box with \
                  `min box rm --force {name}` and start a new one with `min session start`."
             ),
+        }
+    }
+}
+
+impl RowNotBack {
+    /// The status the attach ends with: 2 when another box holds the name,
+    /// 1 otherwise.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            RowNotBack::NameHeld { .. } => 2,
+            RowNotBack::NotBack { .. } => 1,
         }
     }
 }
