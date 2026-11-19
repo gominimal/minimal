@@ -18150,7 +18150,7 @@ async fn box_spec_renders_formats_secrets_as_refs() {
             "spec",
             "default",
             "--network",
-            "own_ip",
+            "host_ip",
             "-o",
             "json",
         ],
@@ -18168,7 +18168,7 @@ async fn box_spec_renders_formats_secrets_as_refs() {
     assert!(rows.contains(&"steering  proxy_env".to_owned()), "{rows:?}");
     let toml = box_spec_text(
         &global,
-        &["min", "box", "spec", "default", "--network", "own_ip"],
+        &["min", "box", "spec", "default", "--network", "host_ip"],
     )
     .await
     .expect("the entry renders");
@@ -18194,7 +18194,9 @@ async fn box_spec_path_form_renders_bep_rows() {
         "[session.network.bep]\nsteering = \"proxy_env\"\n\n\
          [session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n",
     );
-    let text = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+    // A `host_ip` box with no egress reaches every host. An `own_ip` box
+    // with no egress is refused, as the start refuses it (BEP-008).
+    let text = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
         .await
         .expect("the rows render");
     assert!(text.contains("\nsteering  proxy_env\n"), "{text}");

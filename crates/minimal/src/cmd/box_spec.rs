@@ -17,9 +17,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use boxes::core::bep::{
-    ActivationSpec, BepSettings, BepTables, BepWarning, HostFacts,
-    Quic443, SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, check_activation,
-    store_references,
+    ActivationSpec, BepSettings, BepTables, BepWarning, HostFacts, Quic443, SecretGrant,
+    SecretGrants, Steering, StoreAction, StoreRules, check_activation, store_references,
 };
 
 use crate::output::ObjectType;
