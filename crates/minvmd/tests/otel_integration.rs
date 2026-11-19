@@ -422,6 +422,8 @@ impl Drop for StopOnDrop {
 /// are the guest daemon's spans, which reach the host spool over vsock:
 /// `guest.ready` is `vm.boot`'s child, and every guest span in the trace
 /// descends from `vm.boot` or, for the guest's shutdown, from `vm.stop`.
+/// The supervisor's start phase (`supervisor.start` and its root `minvmd`)
+/// is in the host spool at READY, before the stop.
 /// The boot line, as minvmd logs it, carries only allowlisted telemetry
 /// keys, no endpoint and no header (the values are logged as `…`; that the
 /// caller's trace crossed is `guest.ready` under `vm.boot`). With telemetry
@@ -493,6 +495,36 @@ fn a_boot_and_stop_share_one_trace_with_the_guest_daemon() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "no guest.ready reached the host spool"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // TEL-032: the start phase is exported at READY, while the VM runs:
+        // `supervisor.start` and its parent, the supervisor's root `minvmd`,
+        // are in the host spool before the stop. `run --detach` returns once
+        // the state is Running, which is written just before the
+        // supervisor's bounded READY flush, so wait for them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let up = spans(&spool_lines_settled(&spool));
+            let start = up
+                .iter()
+                .find(|(svc, s)| svc == "minvmd" && s["name"] == "supervisor.start");
+            let root = start.and_then(|(_, st)| {
+                up.iter().find(|(svc, s)| {
+                    svc == "minvmd" && s["name"] == "minvmd" && s["spanId"] == st["parentSpanId"]
+                })
+            });
+            if root.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "at READY, before the stop: {} not in the host spool",
+                if start.is_none() {
+                    "supervisor.start"
+                } else {
+                    "the supervisor's root span minvmd (supervisor.start's parent)"
+                }
             );
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
