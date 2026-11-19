@@ -128,10 +128,7 @@ impl CleanCache {
         let stale: Vec<SpecHash> = cache
             .iter_entries()
             .filter(|hash| !self.keep.contains(hash))
-            .filter(|hash| match atimes.last_read(hash) {
-                Some(last) => last < cutoff,
-                None => written_before(cache, hash, cutoff),
-            })
+            .filter(|hash| atimes.last_read(hash).is_none_or(|last| last < cutoff))
             .collect();
 
         let mut report = CleanReport::default();
@@ -216,21 +213,6 @@ impl CleanCache {
 /// hours; a dead daemon's stamp never changes again, so a few days apart tells
 /// the two cases apart without any way to ask the other daemon.
 const FOREIGN_OWNER_IDLE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
-
-/// Whether the entry `hash` in `cache` was written before `cutoff`. An entry
-/// with no recorded read is stale only when it is this old: an entry written
-/// after the cutoff is new, and nothing had time to read it yet. An entry
-/// whose metadata cannot be read has no known write time and counts as old,
-/// as every unread entry did before.
-fn written_before(cache: &Cache<LocalDir>, hash: &SpecHash, cutoff: SystemTime) -> bool {
-    let Ok(meta) = cache.read_meta(hash) else {
-        return true;
-    };
-    let millis = u64::try_from(meta.epoch_millis).unwrap_or(u64::MAX);
-    SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_millis(millis))
-        .is_none_or(|written| written < cutoff)
-}
 
 /// The newest modification time of `root` or anything under it, or `None`
 /// when that can't be told: `root` itself or an entry under it can't be read
@@ -424,58 +406,18 @@ mod tests {
         .run(&cache)
         .unwrap();
 
-        // `never_read` was written just now, after the cutoff, so it stays.
         assert_eq!(
             report,
             CleanReport {
-                entries: 1,
+                entries: 2,
                 dirs: 0
             }
         );
         let mut left: Vec<SpecHash> = cache.iter_entries().collect();
         left.sort();
-        let mut want = vec![recent, never_read, kept];
+        let mut want = vec![recent, kept];
         want.sort();
         assert_eq!(left, want);
-    }
-
-    /// An entry with no recorded read is stale only when its write time is
-    /// before the cutoff. One written after the cutoff stays, and one
-    /// written before it goes.
-    #[test]
-    fn clean_keeps_an_unread_entry_written_after_the_cutoff() {
-        let tmp = TempDir::new().unwrap();
-        let cache = Cache::at_dir(tmp.path()).unwrap();
-        let (fresh, aged) = (hash(1), hash(2));
-        write_entry(&cache, &fresh, "fresh");
-        let w = cache.write_dir(&aged).unwrap();
-        w.open_write("f").unwrap().write_all(b"x").unwrap();
-        w.finalize(EntryMeta {
-            inner: MetaInner::Spec("aged".to_string()),
-            fetched: false,
-            epoch_millis: u128::from(secs_ago(Duration::from_secs(30 * 24 * 60 * 60))) * 1000,
-            ..Default::default()
-        })
-        .unwrap();
-
-        let report = CleanCache {
-            older_than: Duration::from_secs(14 * 24 * 60 * 60),
-            keep: HashSet::new(),
-            sweep: vec![],
-            daemon_id: None,
-            events: None,
-        }
-        .run(&cache)
-        .unwrap();
-
-        assert_eq!(
-            report,
-            CleanReport {
-                entries: 1,
-                dirs: 0
-            }
-        );
-        assert_eq!(cache.iter_entries().collect::<Vec<_>>(), vec![fresh]);
     }
 
     #[test]
@@ -484,11 +426,6 @@ mod tests {
         let cache = Cache::at_dir(tmp.path()).unwrap();
         let gone = hash(7);
         write_entry(&cache, &gone, "curl");
-        // A read older than `older_than` makes the new entry stale.
-        record_reads(
-            tmp.path(),
-            &[(gone.clone(), secs_ago(Duration::from_secs(60)))],
-        );
 
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         CleanCache {
