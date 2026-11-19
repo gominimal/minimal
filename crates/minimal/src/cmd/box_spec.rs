@@ -241,6 +241,61 @@ pub(crate) async fn box_spec_to(
     spawn: bool,
     out: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
+    // `min box spec` starts no box, so a project file that does not load
+    // says the spec cannot show, never that the box cannot start.
+    box_spec_render(global, args, spawn, out)
+        .await
+        .map_err(
+            |error| match error.downcast::<crate::ProjectFileInvalid>() {
+                Ok(invalid) => SpecFileInvalid {
+                    error: invalid.error,
+                }
+                .into(),
+                Err(error) => error,
+            },
+        )
+}
+
+/// The refusal of `min box spec` when the project's `minimal.toml` does
+/// not load. The command exits 3, the exit code of an invalid project file.
+#[derive(Debug)]
+pub struct SpecFileInvalid {
+    /// Why the file did not load.
+    pub error: mfile::Error,
+}
+
+impl SpecFileInvalid {
+    /// The exit code of the refusal.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for SpecFileInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cause is in this text and `source()` returns none, so the
+        // printer's `{:#}` shows it once. A loadout file is not the
+        // project's file, so its refusal does not say that the project's
+        // file does not load.
+        if let mfile::Error::LoadoutSetsLoadoutMode { .. } = self.error {
+            return write!(f, "Cannot show the spec: {}", self.error);
+        }
+        write!(
+            f,
+            "Cannot show the spec: the project's {name} does not load: {error}",
+            name = mfile::MFILE_NAME,
+            error = self.error,
+        )
+    }
+}
+
+impl std::error::Error for SpecFileInvalid {}
+
+/// [`box_spec_to`] before its project file error says the spec.
+async fn box_spec_render(
+    global: &GlobalArgs,
+    args: BoxSpecArgs,
+    spawn: bool,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
     let Some(target) = args.target.clone() else {
         // BCLI-021: the project form keeps only `--network`.
         if let Some(flag) = given_override_flags(&args, false).first() {
