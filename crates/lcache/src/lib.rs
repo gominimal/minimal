@@ -111,6 +111,15 @@ impl PendingDir {
             std::fs::rename(from_path, to).map_err(CacheErr::IO)?;
         }
 
+        // The rename keeps the temp dir's mtime, which is the last change to
+        // its direct children and can predate this finalize by the whole
+        // build (or come from an extract that preserves upstream times). The
+        // cache clean reads this mtime as the write time of an entry nobody
+        // has read yet, so stamp it now.
+        std::fs::File::open(to)
+            .and_then(|d| d.set_modified(std::time::SystemTime::now()))
+            .map_err(CacheErr::IO)?;
+
         drop(st);
 
         meta.write(&inner.fs, &self.hash)?;

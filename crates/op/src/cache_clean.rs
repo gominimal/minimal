@@ -231,7 +231,8 @@ impl CleanCache {
 const FOREIGN_OWNER_IDLE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// When the cache entry with `hash` was last written: its directory's
-/// modification time, absent when that cannot be read.
+/// modification time, which `PendingDir::finalize` stamps when it puts the
+/// entry in place. Absent when that cannot be read.
 fn written_at(cache: &Cache<LocalDir>, hash: &SpecHash) -> Option<SystemTime> {
     std::fs::metadata(cache.entry_path(hash))
         .and_then(|m| m.modified())
@@ -508,6 +509,45 @@ mod tests {
             }
         );
         assert_eq!(cache.iter_entries().collect::<Vec<_>>(), vec![fresh]);
+    }
+
+    /// Finalize stamps the entry's write time. A build whose tree carries an
+    /// old mtime (an extract that keeps upstream dates, or top-level files
+    /// that stopped changing long before the build ended) still yields a
+    /// fresh entry that the next clean keeps.
+    #[test]
+    fn clean_keeps_a_fresh_entry_whose_tree_carries_an_old_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let h = hash(1);
+        let w = cache.write_dir(&h).unwrap();
+        w.open_write("f").unwrap().write_all(b"x").unwrap();
+        let then = SystemTime::now()
+            .checked_sub(Duration::from_secs(30 * 24 * 60 * 60))
+            .unwrap();
+        std::fs::File::open(w.path())
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+        w.finalize(EntryMeta {
+            inner: MetaInner::Spec("old-tree".to_string()),
+            fetched: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let report = CleanCache {
+            older_than: Duration::from_secs(14 * 24 * 60 * 60),
+            keep: HashSet::new(),
+            sweep: vec![],
+            daemon_id: None,
+            events: None,
+        }
+        .run(&cache)
+        .unwrap();
+
+        assert_eq!(report, CleanReport::default());
+        assert_eq!(cache.iter_entries().collect::<Vec<_>>(), vec![h]);
     }
 
     #[test]
