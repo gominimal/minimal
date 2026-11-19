@@ -5506,6 +5506,24 @@ async fn relay_frames_to_switch(
             limiter.warn_refused_dns_query(&refusal);
             continue;
         }
+        // The first fragment of a TCP segment to that resolver is dropped
+        // whatever its TCP header holds: the gate reads only whole segments.
+        // It is read from the frame's summary, so a fragment that ends
+        // before the TCP flags byte is decided too.
+        if let (Some(src), Some(dst), Some(proto)) =
+            (summary.source(), summary.destination(), summary.protocol())
+            && let Some(refusal) = dns_pins::tcp_first_fragment_refusal(
+                table,
+                &frame[..n],
+                src,
+                dst,
+                proto,
+                summary.destination_port(),
+            )
+        {
+            limiter.warn_refused_dns_query(&refusal);
+            continue;
+        }
         // The same decision for DNS over TCP to the box's own resolver: the
         // connection's length-prefixed messages are read in order, and the
         // frame that completes a refused message is dropped, as is every
@@ -5624,7 +5642,14 @@ async fn relay_frames_to_switch(
             None => switch.try_send(framed),
         };
         match sent {
-            Ok(()) => {}
+            // The connection's read position moves only for a frame the
+            // queue took: a dropped one leaves its entry as it was, so the
+            // box's retransmission of it is decided again.
+            Ok(()) => {
+                if let Some(advance) = dns_tcp_advance {
+                    dns_tcp.commit(advance);
+                }
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 limiter.warn_backpressure(
                     QueueDirection::TowardSwitch,
@@ -5639,9 +5664,6 @@ async fn relay_frames_to_switch(
                     "the relay's switch writer is gone",
                 ));
             }
-        }
-        if let Some(advance) = dns_tcp_advance {
-            dns_tcp.commit(advance);
         }
         // A box's segment on a connection one of its forwards carries moves
         // the sequence number a reset at its end is built at. The table
@@ -21500,6 +21522,182 @@ mod tests {
         expect_silence(&mut h.switch).await;
         // Nothing was written back toward the guest: the drops are silent.
         expect_silence(&mut h.guest).await;
+    }
+
+    /// NET-141 over TCP: the first fragment of a segment to the box's own
+    /// resolver is dropped even when it ends before the TCP flags byte, so
+    /// the gate never writes on part of a segment it cannot read. A whole
+    /// segment on the same connection still passes.
+    #[tokio::test]
+    async fn allow_list_row_tcp_short_first_fragment_never_reaches_the_switch() {
+        use hickory_proto::rr::RecordType;
+
+        use crate::net::dns_pins::tests::{
+            dns_query_of, qname, tcp_dns_message, tcp_segment_frame,
+        };
+
+        const SYN: u8 = 0x02;
+        const PSH_ACK: u8 = 0x18;
+        // The Ethernet header's length: the IPv4 header follows it.
+        const IP: usize = 14;
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
+                    allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+        let resolver = SUBNET.dns_server();
+        let segment = |flags: u8, seq: u32, payload: &[u8]| {
+            tcp_segment_frame(
+                Ipv4Addr::from(LEASE),
+                41020,
+                resolver,
+                53,
+                flags,
+                seq,
+                payload,
+            )
+        };
+        let declared = tcp_dns_message(&dns_query_of(&[(qname("example.com."), RecordType::A)]));
+        passes(&mut h, &segment(SYN, 1000, &[]), "the opening").await;
+
+        // The first 8 bytes of the segment's TCP header, sent as the first
+        // fragment of its datagram: the ports are readable, the flags are
+        // not.
+        let whole = segment(PSH_ACK, 1001, &declared);
+        let mut fragment = whole[..IP + 20 + 8].to_vec();
+        fragment[IP + 2..IP + 4].copy_from_slice(&28u16.to_be_bytes());
+        fragment[IP + 6] |= 0x20;
+        assert!(
+            dns_pins::parse_ipv4_l4(&fragment).is_none(),
+            "the fragment ends before the TCP flags byte"
+        );
+        send_frame(&mut h.guest, &fragment).await;
+        passes(&mut h, &whole, "the whole segment").await;
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, "name=\"<fragment>\"").await;
+        // Nothing was written back toward the guest: the drop is silent.
+        expect_silence(&mut h.guest).await;
+    }
+
+    /// NET-141 over TCP at a full switch queue: a segment to the box's own
+    /// resolver that the queue has no room for is dropped and leaves the
+    /// connection's entry as it was. A later segment that continues past it
+    /// is a gap and is dropped, the box's retransmission of the dropped
+    /// segment is decided again and passes, and the continuation passes
+    /// after it.
+    #[tokio::test]
+    async fn tcp_dns_segment_dropped_at_a_full_queue_leaves_the_connection_as_it_was() {
+        use hickory_proto::rr::RecordType;
+
+        use crate::net::dns_pins::tests::{
+            dns_query_of, qname, tcp_dns_message, tcp_segment_frame,
+        };
+
+        const SYN: u8 = 0x02;
+        const PSH_ACK: u8 = 0x18;
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
+                    allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let table = registry.table();
+        let pins = dns_pins::DnsPins::new(registry.subnet());
+        let replies = ReplyTables::new();
+        let baseline = NodePlaneBaseline::built_in(registry.subnet());
+        let limiter = DropLimiter::new();
+        let forwards = PublishedForwards::new();
+        let mut attributed = Vec::new();
+        let mut carried = crate::box_registry::RelayCarry::default();
+        let (log, _guard) = capture_log();
+        let (ours, mut guest) = UnixStream::pair().expect("a socket pair");
+        let (read, _write) = ours.into_split();
+        let mut reader = super::Prefixed::new(Vec::new(), read);
+        // A queue of one frame, drained only by the script below, so which
+        // frame finds it full is known.
+        let (queue, mut drain) = mpsc::channel::<Vec<u8>>(1);
+
+        let resolver = SUBNET.dns_server();
+        let segment = |seq: u32, flags: u8, payload: &[u8]| {
+            tcp_segment_frame(
+                Ipv4Addr::from(LEASE),
+                41030,
+                resolver,
+                53,
+                flags,
+                seq,
+                payload,
+            )
+        };
+        let declared = tcp_dns_message(&dns_query_of(&[(qname("example.com."), RecordType::A)]));
+        let len = u32::try_from(declared.len()).expect("a query fits in u32");
+        let opening = segment(1000, SYN, &[]);
+        let dropped = segment(1001, PSH_ACK, &declared);
+        let continuation = segment(1001 + len, PSH_ACK, &declared);
+        let filler = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+
+        let relay = super::relay_frames_to_switch(
+            &mut reader,
+            &queue,
+            &table,
+            &pins,
+            &replies,
+            &baseline,
+            &limiter,
+            &forwards,
+            &mut attributed,
+            &mut carried,
+        );
+        // Each queued entry is the frame behind its 2-byte length.
+        async fn next(drain: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+            let framed = drain.recv().await.expect("the relay holds the queue");
+            framed[2..].to_vec()
+        }
+        let script = async {
+            send_frame(&mut guest, &opening).await;
+            assert_eq!(next(&mut drain).await, opening, "the opening is written on");
+            // The filler takes the queue's one slot, and the segment behind
+            // it finds the queue full.
+            send_frame(&mut guest, &filler).await;
+            while drain.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            send_frame(&mut guest, &dropped).await;
+            wait_for_log(&log, "egress-backpressure").await;
+            assert_eq!(next(&mut drain).await, filler, "the filler is written on");
+            // The continuation starts past the connection's next undecided
+            // byte, which the dropped segment did not move: it is dropped.
+            // The retransmission is decided again and written on.
+            send_frame(&mut guest, &continuation).await;
+            send_frame(&mut guest, &dropped).await;
+            assert_eq!(
+                next(&mut drain).await,
+                dropped,
+                "the retransmission of the dropped segment is written on, \
+                 and the continuation before it is not"
+            );
+            send_frame(&mut guest, &continuation).await;
+            assert_eq!(
+                next(&mut drain).await,
+                continuation,
+                "the continuation passes once the segment before it did"
+            );
+            guest.shutdown().await.expect("the guest closes its side");
+        };
+        let (result, ()) = tokio::time::timeout(DEADLINE, async { tokio::join!(relay, script) })
+            .await
+            .expect("the relay and the script finish within the deadline");
+        result.expect("the relay ends cleanly at the guest's close");
     }
 
     /// A relay whose guest side never reads must keep draining its switch

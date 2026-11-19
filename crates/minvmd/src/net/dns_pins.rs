@@ -1690,6 +1690,35 @@ pub(crate) fn unreadable_datagram_refusal(
     })
 }
 
+/// The host-side DNS gate's rule for the first fragment of a TCP segment to
+/// a decided row's resolver: the gate reads only whole segments, so `Some`
+/// is the drop, as [`DnsTcpStreams::decide`] drops one. It reads the frame's
+/// summary (source, destination, protocol and destination port) and the
+/// frame's IPv4 flags, so a first fragment that ends before the TCP flags
+/// byte, which [`parse_ipv4_l4`] does not parse, is decided too. `None` for
+/// every frame that is not such a fragment.
+pub(crate) fn tcp_first_fragment_refusal(
+    table: &BoxTable,
+    frame: &[u8],
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    dst_port: u16,
+) -> Option<DnsQueryRefusal> {
+    if proto != IPPROTO_TCP
+        || !frame
+            .get(ETH_HDR + 6)
+            .is_some_and(|flags| flags & IPV4_MORE_FRAGMENTS != 0)
+    {
+        return None;
+    }
+    Some(DnsQueryRefusal {
+        record: decided_row_at(table, src, dst, dst_port)?,
+        name: "<fragment>".to_string(),
+        query_type: None,
+    })
+}
+
 /// The row whose queries to `pkt`'s destination the host-side DNS gate
 /// decides ([`dns_query_refusal`]), whatever the transport: a deny-all row,
 /// or one that declared `allow_dns_hosts`, sending to its own resolver's
