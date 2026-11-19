@@ -1616,10 +1616,12 @@ pub struct GlobalArgs {
     pub config_dir: Option<PathBuf>,
     /// Select the daemon backend that hosts sessions.
     ///
-    /// On Linux, `local` (the default) runs minimald on the host;
-    /// `local-minvmd` runs it inside the minvmd microVM. No effect on macOS,
-    /// where minvmd is the only backend. `min provider list --all` lists the
-    /// providers on this machine.
+    /// On Linux, `local` runs minimald on the host and `local-minvmd` runs it
+    /// inside the minvmd microVM. Without this flag, `min` uses
+    /// `MINIMAL_PROVIDER`, then the `provider` key of config.toml, then
+    /// `local-minvmd` where /dev/kvm opens for you and `local` where it does
+    /// not. No effect on macOS, where minvmd is the only backend. `min
+    /// provider list --all` lists the providers on this machine.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
     /// Skip interactive prompts that need a terminal.
@@ -1643,8 +1645,9 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
-    /// Whether the minvmd microVM backend (DM1) is selected via
-    /// `--provider local-minvmd`.
+    /// Whether the minvmd microVM backend (DM1) is selected: by
+    /// `--provider local-minvmd`, or by the default a flagless command
+    /// resolves at dispatch ([`crate::hosts::resolve_default_provider`]).
     pub fn use_minvmd(&self) -> bool {
         matches!(self.provider, Some(Provider::LocalMinvmd))
     }
@@ -1845,14 +1848,19 @@ pub struct EgressArgs {
 
 /// Which daemon backend (box host) serves sessions, as `--provider` names it.
 ///
-/// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
-/// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
-/// only backend, so the choice has no effect there.
+/// On Linux `local` is the host-native daemon (DM2) and `local-minvmd` runs
+/// `minimald` inside the minvmd microVM (DM1). A command without
+/// `--provider` takes `MINIMAL_PROVIDER`, then the `provider` key of
+/// `config.toml`, then `local-minvmd` where `/dev/kvm` opens for reading and
+/// writing and `local` otherwise ([`crate::hosts::resolve_default_provider`]).
+/// On macOS minvmd is the only backend, so the choice has no effect there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Provider {
-    /// Linux: run minimald natively on the host (the default).
+    /// Linux: run minimald natively on the host (the default where
+    /// /dev/kvm does not open).
     Local,
-    /// Run minimald inside the minvmd microVM.
+    /// Run minimald inside the minvmd microVM (the Linux default where
+    /// /dev/kvm opens).
     LocalMinvmd,
     /// The old name of `local`.
     // BCLI-046: read as `local` for one release, with a hint on stderr

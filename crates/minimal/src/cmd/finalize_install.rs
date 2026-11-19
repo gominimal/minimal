@@ -535,7 +535,10 @@ async fn plan_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> P
 /// scoping both readers share: the user-namespace profile unless the
 /// configured provider is the Linux VM provider, then the `kvm` group
 /// membership for that provider or the classifier tree for the native one,
-/// in that order. [`plan_for_this_host`] slots the names item in among them
+/// in that order. The native provider also gets the `kvm` group item when
+/// `/dev/kvm` is there but does not open for this user: joining the group
+/// is what makes the VM provider the default
+/// ([`crate::hosts::resolve_default_provider`]). [`plan_for_this_host`] slots the names item in among them
 /// and the host line ([`host_install_for_this_host`]) reads them whole, so
 /// the two read the same items by construction. Every item is Linux-only,
 /// so a macOS host reads none.
@@ -546,14 +549,19 @@ fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> 
         if !global.use_minvmd() {
             items.extend(linux::userns_item_on_this_host());
         }
+        let kvm = crate::hosts::open_kvm_device();
+        let offer_kvm = linux::offers_kvm_item(global.use_minvmd(), &kvm);
         if global.use_minvmd() {
             // Formerly BEP-047 (gominimal/inbox#1184): the vm-users item is
             // not offered until minvmd starts the VM and gvproxy through
             // `sudo -n` (T66, #2566). Its drop-in names subcommands minvmd
             // does not have at this head.
-            items.push(linux::kvm_item_on_this_host());
+            items.push(linux::kvm_item_on_this_host(kvm));
         } else {
             items.extend(linux::classifier_items_on_this_host(global, ct_mark_mask));
+            if offer_kvm {
+                items.push(linux::kvm_item_on_this_host(kvm));
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -1881,7 +1889,8 @@ pub(crate) mod linux {
             socket,
         )
     }
-    /// The KVM item over the result of opening `/dev/kvm` for reading:
+    /// The KVM item over the result of opening `/dev/kvm` for reading and
+    /// writing:
     /// done when it opens; missing — the step adds `operator` to the `kvm`
     /// group — on `EACCES`, unless `already_member` says the group database
     /// lists the operator already, when only a new login is missing and
@@ -1972,12 +1981,20 @@ pub(crate) mod linux {
             })
     }
 
-    /// [`kvm_item_over`] this host's reads.
-    pub(crate) fn kvm_item_on_this_host() -> Item {
-        let open = std::fs::OpenOptions::new()
-            .read(true)
-            .open("/dev/kvm")
-            .map(|_| ());
+    /// Whether the plan offers the `kvm` group item: always for the VM
+    /// provider, and for the native one when `/dev/kvm` is there but did not
+    /// open (`open`), so the host that could boot VMs is told how.
+    pub(crate) fn offers_kvm_item(use_minvmd: bool, open: &std::io::Result<()>) -> bool {
+        use_minvmd
+            || open
+                .as_ref()
+                .is_err_and(|err| err.kind() != std::io::ErrorKind::NotFound)
+    }
+
+    /// [`kvm_item_over`] this host's reads, with `open` the result of
+    /// opening `/dev/kvm` for reading and writing
+    /// ([`crate::hosts::open_kvm_device`]).
+    pub(crate) fn kvm_item_on_this_host(open: std::io::Result<()>) -> Item {
         let operator = crate::resolver::operator_name();
         let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
         kvm_item_over(open, &operator, in_kvm_group(&group, &operator))
@@ -4429,6 +4446,31 @@ mod tests {
         assert!(!DAEMON_RUNNING_NOTE.contains("--force"));
         assert!(!DAEMON_RUNNING_NOTE.contains("sessions survive"));
         assert!(!DAEMON_RUNNING_NOTE.contains('\''));
+    }
+
+    /// The plan offers the `kvm` group item to the VM provider, and to the
+    /// native one when `/dev/kvm` is there but does not open.
+    #[test]
+    fn kvm_item_is_offered_where_kvm_is_there_but_closed() {
+        use linux::offers_kvm_item;
+        use std::io::{Error, ErrorKind};
+        assert!(offers_kvm_item(true, &Ok(())));
+        assert!(offers_kvm_item(
+            true,
+            &Err(Error::from(ErrorKind::NotFound))
+        ));
+        assert!(
+            !offers_kvm_item(false, &Ok(())),
+            "a usable /dev/kvm needs no step"
+        );
+        assert!(
+            !offers_kvm_item(false, &Err(Error::from(ErrorKind::NotFound))),
+            "a host with no /dev/kvm has nothing to join"
+        );
+        assert!(
+            offers_kvm_item(false, &Err(Error::from(ErrorKind::PermissionDenied))),
+            "a /dev/kvm this user cannot open gets the kvm group step"
+        );
     }
 
     /// The KVM item's table: done when the device opens, a group step on

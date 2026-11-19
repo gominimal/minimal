@@ -42,6 +42,90 @@ pub fn read_provider_alias(global: &mut GlobalArgs) -> Option<&'static str> {
     }
 }
 
+/// The environment variable that names the provider for a `min` command
+/// with no `--provider`. It wins over the `provider` key of `config.toml`.
+pub const PROVIDER_ENV: &str = "MINIMAL_PROVIDER";
+
+/// The device the Linux VM provider drives.
+const KVM_DEVICE: &str = "/dev/kvm";
+
+/// Open [`KVM_DEVICE`] for reading and writing, as a VM boot does. `Ok` is
+/// the test of whether KVM is usable by this user: a user outside the `kvm`
+/// group gets a permission error from a device that exists.
+pub(crate) fn open_kvm_device() -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(KVM_DEVICE)
+        .map(|_| ())
+}
+
+/// Choose the provider for a command that has no `--provider`, on Linux.
+/// `MINIMAL_PROVIDER` decides first, then the `provider` key of the user's
+/// `config.toml`. With neither, the VM provider is the default where
+/// `/dev/kvm` opens for reading and writing, and the native provider
+/// otherwise, which leaves `provider` unset as before. macOS has one
+/// provider, so nothing changes there.
+///
+/// # Errors
+///
+/// A `MINIMAL_PROVIDER` or `provider` value that names no provider, or a
+/// `config.toml` that is not read or does not parse.
+pub fn resolve_default_provider(global: &mut GlobalArgs) -> anyhow::Result<()> {
+    if global.provider.is_some() || !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let path = crate::config::user_config_path(global);
+    global.provider = default_provider_over(
+        std::env::var(PROVIDER_ENV).ok(),
+        || Ok(crate::config::read_config_parts(&path)?.0.provider),
+        &path,
+        open_kvm_device,
+    )?;
+    Ok(())
+}
+
+/// [`resolve_default_provider`] over its inputs: the environment
+/// variable's value, a reader of the `provider` key of the config file at
+/// `path`, and the result of opening `/dev/kvm`. Each later input is read
+/// only when the earlier ones name nothing.
+pub(crate) fn default_provider_over(
+    env: Option<String>,
+    config: impl FnOnce() -> anyhow::Result<Option<String>>,
+    path: &Path,
+    kvm: impl FnOnce() -> std::io::Result<()>,
+) -> anyhow::Result<Option<Provider>> {
+    if let Some(value) = env.filter(|v| !v.is_empty()) {
+        return parse_provider(&value).map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{PROVIDER_ENV}={value} names no provider. Set {PROVIDER_ENV} to local or \
+                 local-minvmd, or unset it."
+            )
+        });
+    }
+    if let Some(value) = config()? {
+        return parse_provider(&value).map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider = \"{value}\" in {} names no provider. Set it to local or \
+                 local-minvmd, or remove it.",
+                path.display()
+            )
+        });
+    }
+    match kvm() {
+        Ok(()) => Ok(Some(Provider::LocalMinvmd)),
+        Err(error) => {
+            tracing::debug!(%error, "{KVM_DEVICE} does not open: the native provider is the default");
+            Ok(None)
+        }
+    }
+}
+
+/// The provider `value` names, as `--provider` reads it.
+fn parse_provider(value: &str) -> Option<Provider> {
+    <Provider as clap::ValueEnum>::from_str(value, false).ok()
+}
+
 /// The alias hint of a run that failed. The error path prints it, so a
 /// machine output mode carries it in the error object's `hint` field and
 /// prints no separate line (BCLI-042).
@@ -759,4 +843,106 @@ pub fn provider_list(
     writeln!(out, "{:<14} HOSTS", "PROVIDER")?;
     output::write_objects(out, OutputMode::Text, &rows)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod default_provider_tests {
+    use super::*;
+
+    fn denied() -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    fn no_config() -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// With no override, a usable `/dev/kvm` makes the VM provider the
+    /// default, and a device that does not open keeps the native one.
+    #[test]
+    fn linux_default_is_the_vm_where_kvm_opens() {
+        let path = Path::new("/c/config.toml");
+        let vm = default_provider_over(None, no_config, path, || Ok(())).unwrap();
+        assert_eq!(vm, Some(Provider::LocalMinvmd));
+        let native = default_provider_over(None, no_config, path, denied).unwrap();
+        assert_eq!(native, None);
+        let absent = default_provider_over(None, no_config, path, || {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap();
+        assert_eq!(absent, None);
+    }
+
+    /// `MINIMAL_PROVIDER` wins over the config key, and the config key wins
+    /// over the KVM probe. Neither is read past the input that decides.
+    #[test]
+    fn env_beats_config_and_config_beats_kvm() {
+        let path = Path::new("/c/config.toml");
+        let from_env = default_provider_over(
+            Some("local".into()),
+            || panic!("the config is not read when the variable is set"),
+            path,
+            || panic!("/dev/kvm is not opened when the variable is set"),
+        )
+        .unwrap();
+        assert_eq!(from_env, Some(Provider::Local));
+        let from_config = default_provider_over(
+            None,
+            || Ok(Some("local".into())),
+            path,
+            || panic!("/dev/kvm is not opened when the config names a provider"),
+        )
+        .unwrap();
+        assert_eq!(from_config, Some(Provider::Local));
+        let vm = default_provider_over(
+            Some(String::new()),
+            || Ok(Some("local-minvmd".into())),
+            path,
+            denied,
+        )
+        .unwrap();
+        assert_eq!(
+            vm,
+            Some(Provider::LocalMinvmd),
+            "an empty variable names nothing"
+        );
+        let old =
+            default_provider_over(Some("local-minimald".into()), no_config, path, denied).unwrap();
+        assert_eq!(
+            old,
+            Some(Provider::LocalMinimald),
+            "the old name reads, and the alias hint follows"
+        );
+    }
+
+    /// A value that names no provider is refused with the step that fixes it.
+    #[test]
+    fn unknown_provider_values_are_refused() {
+        let path = Path::new("/c/config.toml");
+        let env = default_provider_over(Some("vm".into()), no_config, path, denied).unwrap_err();
+        assert_eq!(
+            env.to_string(),
+            "MINIMAL_PROVIDER=vm names no provider. Set MINIMAL_PROVIDER to local or local-minvmd, \
+             or unset it."
+        );
+        let config =
+            default_provider_over(None, || Ok(Some("vm".into())), path, denied).unwrap_err();
+        assert_eq!(
+            config.to_string(),
+            "provider = \"vm\" in /c/config.toml names no provider. Set it to local or \
+             local-minvmd, or remove it."
+        );
+    }
+
+    /// `--provider` beats the variable and the config: a flagged command is
+    /// left as it is.
+    #[test]
+    fn the_flag_beats_every_default() {
+        let mut global = GlobalArgs {
+            provider: Some(Provider::Local),
+            ..GlobalArgs::default()
+        };
+        resolve_default_provider(&mut global).unwrap();
+        assert_eq!(global.provider, Some(Provider::Local));
+    }
 }

@@ -88,6 +88,7 @@ async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
     let state = tempfile::TempDir::new().unwrap();
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MINIMAL_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .args(["--no-input", "finalize-install", "--show", "--json"])
@@ -189,6 +190,7 @@ async fn finalize_install_show_returns_within_its_deadline_on_a_wedged_daemon() 
     });
     let started = std::time::Instant::now();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MINIMAL_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .args(["--no-input", "finalize-install", "--show", "--json"])
@@ -1330,6 +1332,7 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     // out of the run.
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MINIMAL_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1385,6 +1388,7 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
         .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
         .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MINIMAL_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1531,6 +1535,7 @@ async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> Strin
         .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
         .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MINIMAL_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -1628,6 +1633,7 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
     // out of the run.
     let config_dir = tempfile::TempDir::new().unwrap();
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MINIMAL_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -3361,6 +3367,7 @@ async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
+    command.env("MINIMAL_PROVIDER", "local");
     command
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
@@ -4953,6 +4960,7 @@ async fn net_forward_announces_the_bound_local_port() {
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MINIMAL_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
@@ -5039,6 +5047,7 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
 
     let config_dir = tempfile::TempDir::new().unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .env("MINIMAL_PROVIDER", "local")
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")

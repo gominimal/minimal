@@ -845,11 +845,21 @@ fi
 # e2e-env adds the args on Linux only), so the script supplies the flag
 # for them itself. That default is what #1816 retires; until that fix
 # lands, this branch keeps supplying the flag exactly as it is.
-# An explicit E2E_MINIMAL_ARGS is kept verbatim, and
-# Linux is untouched: a Linux run without provider args is the native
-# lane and must stay exactly that.
-if [ "$(uname -s)" = Darwin ] && [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
-  E2E_MINIMAL_ARGS="--provider local-minvmd"
+# An explicit E2E_MINIMAL_ARGS is kept verbatim. A Linux run without
+# provider args is the native lane and must stay exactly that, so the
+# script names `--provider local` itself: without a flag the CLI would
+# take MINIMAL_PROVIDER, the config's provider key, or the VM provider
+# wherever /dev/kvm opens (resolve_default_provider in
+# crates/minimal/src/cmd/hosts.rs), and a runner with KVM would move the
+# native lane into a VM. MINIMAL_PROVIDER=local holds the same for a `min`
+# call that does not go through E2E_MINIMAL_ARGS; a flag still wins over it.
+if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
+  if [ "$(uname -s)" = Darwin ]; then
+    E2E_MINIMAL_ARGS="--provider local-minvmd"
+  else
+    E2E_MINIMAL_ARGS="--provider local"
+    export MINIMAL_PROVIDER=local
+  fi
 fi
 #
 # The daemon that name resolves to on THIS run is `minimald` on a native
@@ -14030,7 +14040,7 @@ bep_live_gate() {
   local lg_control="$HOME/.minimal/bep/control.sock" lg_status lg_try
   local lg_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
   if [ "$(uname -s)" != "Darwin" ]; then
-    not_run "$1" "the Box Egress Proxy runs on macOS only"
+    not_run "$1" "the live Box Egress Proxy cases run on macOS lanes only"
     return 1
   fi
   if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -14091,9 +14101,9 @@ bep_live_gate() {
 # Egress Proxy running, two boxes that declare a GitHub grant start one after
 # the other, headless, and neither asks for a sign-in. Each creation mints a
 # sealed sign-in reference and registers the box with the proxy, so the second
-# box reuses the sign-in the first one found. `bep serve` runs on macOS only,
-# and the case needs a sign-in a person made with `min auth login`, so a lane
-# without both records it as NOT RUN.
+# box reuses the sign-in the first one found. The live proxy cases run on
+# macOS lanes only, and the case needs a sign-in a person made with `min auth
+# login`, so a lane without both records it as NOT RUN.
 proof_bep_second_box_needs_no_sign_in() {
   echo "::group::GitHub grant boxes: the second box needs no sign-in"
   bep_live_gate bep_second_box_needs_no_sign_in || { echo "::endgroup::"; return 0; }
@@ -15866,8 +15876,9 @@ proof_bep_revoke_and_sign_out_end_to_end() {
 # the gvproxy switch. A box on a credentialed lane with the default `dns`
 # steering and `quic443 = "block"` starts. Where a Box Egress Proxy runs, an A
 # lookup of api.github.com must first get an address. Then the case stops the
-# proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
-# runs and it is down from the start) and, from inside the box:
+# proxy (`bep serve`, which minvmd starts when a bep binary is beside it, so
+# on a lane without one no proxy runs and it is down from the start) and,
+# from inside the box:
 #   1. an A lookup of api.github.com, a steered name, must be answered
 #      SERVFAIL (rcode 2) by the box's resolver, never by real DNS (BEP-062);
 #   2. AAAA, HTTPS and SVCB lookups of it must be NODATA: rcode 0, no

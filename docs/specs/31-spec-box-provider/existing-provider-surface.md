@@ -15,7 +15,7 @@ theirs.
 | | |
 |---|---|
 | `crates/minimal/src/cli.rs` | `enum Provider { LocalMinimald, LocalMinvmd }`, and `--provider` as a `global = true` arg |
-| Values | `local-minimald` (minimald on the host, the Linux default) and `local-minvmd` (minimald inside the microVM) |
+| Values | `local-minimald` (minimald on the host) and `local-minvmd` (minimald inside the microVM). Without the flag, Linux takes `MINIMAL_PROVIDER`, then the `provider` key of `config.toml`, then `local-minvmd` where `/dev/kvm` opens for the user and the host daemon where it does not |
 | Platform | No effect on macOS, where minvmd is the only backend |
 
 Two values, not three, and both local. BPA-013's targets are `local-minvmd`,
