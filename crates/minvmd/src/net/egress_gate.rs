@@ -17444,7 +17444,7 @@ mod tests {
         // hostname proxy at the port the node row holds (NET-162).
         for (port, holder) in [
             (7654, "the hostname proxy"),
-            (crate::net::answerer::DEFAULT_ANSWERER_PORT, "the answerer"),
+            (crate::net::answerer::hook_port(), "the answerer"),
             (switch::bep_host::PROXY_PORT, "the Box Egress Proxy"),
         ] {
             let at_listener = NodePlaneBaseline::built_in(SUBNET)
@@ -17989,7 +17989,7 @@ mod tests {
     fn host_exposure_on_minimal_listener_port_refused() {
         let (log, _guard) = capture_log();
         let drawn = 41234;
-        let answerer = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        let answerer = crate::net::answerer::hook_port();
         let proxy = switch::bep_host::PROXY_PORT;
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");

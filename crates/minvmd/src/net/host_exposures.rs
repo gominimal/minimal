@@ -130,7 +130,8 @@ pub(crate) const BASELINE_ENDPOINT: &str = "a node-plane baseline endpoint at ho
 ///
 /// - the hostname proxy at each port in `hostname_proxy`: the node row's
 ///   assigned port, an operator's pin or a drawn fallback;
-/// - the box-name answerer at the port each VM-backed node reserves for it;
+/// - the box-name answerer at the port this node reserves for it
+///   ([`crate::net::answerer::hook_port`]: the default or the operator's pin);
 /// - the node-local Box Egress Proxy at its listener's port;
 /// - the node-plane baseline endpoints at `baseline_alias_ports`, over the
 ///   protocol the baseline fetches with.
@@ -148,7 +149,7 @@ pub(crate) fn minimal_listeners(
             name: HOSTNAME_PROXY,
         })
         .collect();
-    let answerer = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+    let answerer = crate::net::answerer::hook_port();
     held.push(Holder {
         ports: (answerer, answerer),
         protocol: None,

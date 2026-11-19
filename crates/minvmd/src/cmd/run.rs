@@ -168,6 +168,11 @@ fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredS
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_gate_sock()?)?;
+    // The zone answerer's hook port: the operator's pin
+    // (`MINVMD_ZONE_ANSWERER_PORT`) or the default, resolved once here so a
+    // value that is not a port fails the start in the caller's terminal,
+    // even under --detach, and every reader in this process sees one port.
+    crate::net::answerer::configure_hook_port().map_err(anyhow::Error::msg)?;
 
     if detach {
         // The caller's root covers its whole wait: the hand-off ends when this
@@ -904,7 +909,6 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     use crate::cmd::MARKER_SOCK_ENV;
     use crate::image::resolve_boot_images;
     use crate::lifecycle::{Action, Lifecycle, next_state};
-    use crate::net::answerer::DEFAULT_ANSWERER_PORT;
     use crate::state::{StartingGuard, State, StateDir};
     // One span per supervisor phase, like minimald's per-connection `conn`
     // span: every record the supervisor emits carries `vm`, so a detached
@@ -1173,11 +1177,14 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // published answers from the moment the VM does — best-effort at
     // startup, unlike the control socket: a thread that could not spawn is
     // warned and the VM still boots, its names then answering from whatever
-    // answerer holds the port.
+    // answerer holds the port. The hook port is the one `run_supervisor`
+    // resolved: the default, or the operator's `MINVMD_ZONE_ANSWERER_PORT`.
     let mirror_answerer = answerer_status.clone();
-    if let Err(error) =
-        crate::net::answerer::spawn(boxes.clone(), DEFAULT_ANSWERER_PORT, answerer_status)
-    {
+    if let Err(error) = crate::net::answerer::spawn(
+        boxes.clone(),
+        crate::net::answerer::hook_port(),
+        answerer_status,
+    ) {
         tracing::warn!(
             %error,
             "failed to start the zone answerer; this VM's box names answer only from \
@@ -2510,13 +2517,16 @@ const SKIP_NODE_RESERVED: &str = "the node reserves it for its own daemons";
 /// The ports this node itself reserves, skipped by the draw whether or not
 /// anything is bound at them at the probe ([`SKIP_NODE_RESERVED`]). The
 /// zone answerer's hook port is the one port every VM-backed boot binds on
-/// the host: [`crate::net::answerer::DEFAULT_ANSWERER_PORT`]. The in-VM
+/// the host: [`crate::net::answerer::hook_port`], the default or the
+/// operator's [`crate::net::answerer::ANSWERER_PORT_ENV`] pin. The in-VM
 /// egress and mTLS defaults (:7654/:7655) are not here — a VM-backed host
 /// runs its hostname proxy *and* its zone answerer on the host, and those
 /// in-guest defaults are exactly the ports a VM's own guest daemons bind
 /// inside their VM, not ports the node reserves on the host.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-const NODE_RESERVED_PORTS: &[u16] = &[crate::net::answerer::DEFAULT_ANSWERER_PORT];
+fn node_reserved_ports() -> [u16; 1] {
+    [crate::net::answerer::hook_port()]
+}
 
 /// The mode every ports directory is created with, and the widest mode an
 /// existing one may carry: per user, so another user's VMs never hold a
@@ -2724,7 +2734,7 @@ enum CandidateCheck {
 
 /// Checks one node-port candidate and, when it passes, takes its
 /// reservation before returning it (T93): the node-reserved set first
-/// ([`NODE_RESERVED_PORTS`], whether or not anything is bound), then the
+/// ([`node_reserved_ports`], whether or not anything is bound), then the
 /// probes — the bind on the published address with the wildcard as the
 /// extra holder check, then, for TCP, the connect probe — and the
 /// reservation last, so a port another VM of this user holds is skipped
@@ -2758,7 +2768,7 @@ fn candidate_verdict(
     probe: &dyn Fn(u16) -> std::io::Result<u16>,
 ) -> CandidateCheck {
     use std::io::ErrorKind::AddrInUse;
-    if NODE_RESERVED_PORTS.contains(&port) {
+    if node_reserved_ports().contains(&port) {
         return CandidateCheck::Skip(SKIP_NODE_RESERVED);
     }
     let refused = match probe(port) {
@@ -4838,7 +4848,7 @@ mod tests {
              the window) nor any of {fresh_attempts} fresh freed ports after it"
         );
 
-        let reserved = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        let reserved = crate::net::answerer::hook_port();
         let err = super::configured_node_port(ports.path(), reserved)
             .unwrap_err()
             .to_string();
@@ -5143,13 +5153,13 @@ mod tests {
         // publish on the port the host's zone answerer serves from
         // (NET-138), so the skip is a fact about the port, not a fact
         // about what happens to be bound at it now.
-        let hook = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        let hook = crate::net::answerer::hook_port();
         assert!(
             !super::loopback_answers(hook),
             "nothing binds the answerer's hook port while this test runs"
         );
         assert!(
-            super::NODE_RESERVED_PORTS.contains(&hook),
+            super::node_reserved_ports().contains(&hook),
             "the node-reserved set names the answerer's hook port"
         );
         let assigned = super::assign_node_port(ports.path(), hook, false).unwrap();

@@ -14415,7 +14415,7 @@ mod tests {
 
         // A notice for the node's own listeners binds nothing: the hostname
         // proxy and the in-VM daemon's own sockets.
-        for port in [proxy, crate::net::answerer::DEFAULT_ANSWERER_PORT] {
+        for port in [proxy, crate::net::answerer::hook_port()] {
             assert_eq!(
                 registry.mirror_notice(listening(port)),
                 MirrorOutcome::RefusedInfrastructure,
@@ -14441,8 +14441,9 @@ mod tests {
             binder.calls()
         );
         assert!(
-            !binder.calls().iter().any(|(call, _, port)| *call == "bind"
-                && *port == crate::net::answerer::DEFAULT_ANSWERER_PORT),
+            !binder.calls().iter().any(
+                |(call, _, port)| *call == "bind" && *port == crate::net::answerer::hook_port()
+            ),
             "the in-VM daemon's socket is never bound"
         );
     }
