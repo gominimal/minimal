@@ -9700,8 +9700,8 @@ mod tests {
         );
         assert!(
             text.contains(
-                "No rule on this host uses the bits 0x60000000, and no well-known program \
-                 marks connections with them. To use them, run: min finalize-install \
+                "No rule this step read uses the bits 0x60000000, and no program this step \
+                 knows marks connections with them. To use them, run: min finalize-install \
                  --ct-mark-mask 0x60000000\n"
             ),
             "the refusal names a free mask: {text}"

@@ -1741,7 +1741,7 @@ scan_ct_mark_conflicts() {
         esac
         local free
         if free="$(free_ct_mark_mask)"; then
-            printf 'No rule on this host uses the bits %s, and no well-known program marks connections with them. To use them, run: min finalize-install --ct-mark-mask %s\n' "$free" "$free" >&2
+            printf 'No rule this step read uses the bits %s, and no program this step knows marks connections with them. To use them, run: min finalize-install --ct-mark-mask %s\n' "$free" "$free" >&2
         fi
         die "refusing to install over another ct-mark user. Choose two contiguous bits that no rule above uses and run: $(mask_rerun_hint)"
     fi
