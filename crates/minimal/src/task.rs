@@ -123,10 +123,13 @@ pub(crate) fn take_expanded_exports(spec: &mut mfile::spec::BoxSpec, expanded: &
 
 /// Puts the stored spec of a task run on `request` (BOX-068). `spec` is
 /// the declared task's spec, `None` for an interactive task. `expanded` is
-/// the task entry's expansion, whose `[[file_exports]]` items and
-/// `network.vpn_network_names` the spec takes (BOX-203, BCLI-024). Then each `--vpn-network-names` value, `vpn_network_names`,
-/// goes on the stored spec (BCLI-024). That edits the stored JSON, so it
-/// runs after `put_spec`, and once.
+/// the task entry's expansion, whose `[[file_exports]]` items,
+/// `network.vpn_network_names` and `[secrets]` the spec takes (BOX-203,
+/// BCLI-024, BOX-071). The client digest is the projection of that spec, so
+/// it binds the task's secret grants, and the daemon reads the same
+/// `[secrets]` (#3650). Then each `--vpn-network-names` value,
+/// `vpn_network_names`, goes on the stored spec (BCLI-024). That edits the
+/// stored JSON, so it runs after `put_expanded_spec`, and once.
 ///
 /// # Errors
 ///
@@ -145,8 +148,10 @@ pub(crate) fn put_task_spec(
             // The expansion holds the names `[defaults]` and the task's
             // type declare too. A flag value adds to them below.
             spec.network.vpn_network_names = mfile::spec::entry_vpn_network_names(expanded);
+            crate::put_expanded_spec(request, spec, expanded)?;
+        } else {
+            crate::put_spec(request, spec)?;
         }
-        crate::put_spec(request, spec)?;
     } else {
         // An interactive task sends no spec: the task type denies a
         // terminal. With no spec to name it, the request carries the
@@ -1633,7 +1638,12 @@ pub(crate) async fn run_entry(
     // covers the expansion and the compose call that sends it.
     let entry_span = tracing::info_span!("box_entry", box_type = boxes::TASK_BOX_TYPE);
     let expanded = entry_span.in_scope(|| {
-        crate::task_box_entry(&upload_root, &args.entry, request.config.hooks_enabled)
+        crate::task_box_entry(
+            &upload_root,
+            &args.entry,
+            request.config.hooks_enabled,
+            Some(global),
+        )
     })?;
     put_task_spec(
         &mut request,

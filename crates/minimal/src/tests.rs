@@ -430,6 +430,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/create.rs::activate_box = asserts",
             // A unit test's request, never sent: it checks the box spec.
             "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
+            // A unit test's request, never sent: it checks that the client
+            // digest of a spec with secrets equals the daemon's.
+            "cmd/boxes/create.rs::create_stores_a_client_digest_equal_to_the_daemon_digest = asserts nothing",
             // A unit test's request, never sent: it checks the project root.
             "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // A unit test's request, never sent: it checks the creation key
@@ -2916,6 +2919,7 @@ fn create_verbs_name_flag_overrides_box_name() {
             root,
             options.entry.as_deref(),
             options.box_name.as_deref(),
+            None,
         )
         .unwrap();
         assert_eq!(created_box_name(&request).as_deref(), Some("api"));
@@ -2978,7 +2982,7 @@ fn create_verbs_name_flag_overrides_box_name() {
         boxes::BoxPolicy::default(),
     );
     request.config.name = minimal_client::box_name::request_name(None);
-    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None, None).unwrap();
     assert_eq!(created_box_name(&request).as_deref(), Some("dev"));
 
     // A task entry's box takes a generated name, so `--name` is refused
@@ -16567,7 +16571,7 @@ echo = "ok"
         (session.name.as_str(), session.box_type.as_str()),
         ("default", "session")
     );
-    let task = crate::task_box_entry(root, "check", true)
+    let task = crate::task_box_entry(root, "check", true, None)
         .expect("the task entry expands")
         .expect("the project declares the task")
         .wire;
@@ -16629,7 +16633,7 @@ echo = "ok"
     assert_eq!(entry.name, "default");
     let (legacy_vars, _) = start_from_entry(&mut daemon, "legacy", legacy.path(), entry).await;
     assert_eq!(legacy_vars, ["EDITOR=vi"]);
-    let legacy_task = crate::task_box_entry(legacy_root, "check", true)
+    let legacy_task = crate::task_box_entry(legacy_root, "check", true, None)
         .expect("the legacy project's task entry expands")
         .expect("the legacy project declares the task")
         .wire;
@@ -16740,7 +16744,7 @@ fn planned_session_request_checked(
     );
     request.config.name = minimal_client::box_name::request_name(None);
     request.config.hooks_enabled = !args.no_hooks;
-    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None).unwrap();
+    stamp_session_spec_as(&mut request, root, options.entry.as_deref(), None, None).unwrap();
     add_vpn_network_names(&mut request, &options.vpn_network_names).unwrap();
     // Each create in a test is a fresh instance, so no name is held.
     request_fresh_instance(&mut request);
@@ -21004,6 +21008,7 @@ async fn start_attach_resume_end_to_end() {
             root,
             options.entry.as_deref(),
             options.box_name.as_deref(),
+            None,
         )
         .expect("the spec is stamped");
         let mut daemon = alpha.server.connect().await;
@@ -23608,7 +23613,7 @@ fn run_spec(project: &std::path::Path, argv: &[&str]) -> serde_json_lenient::Val
         &run.args,
     )
     .expect("a non-interactive task has a spec");
-    let expanded = crate::task_box_entry(root, &run.entry, true)
+    let expanded = crate::task_box_entry(root, &run.entry, true, None)
         .expect("the task entry expands")
         .expect("the project declares the task");
     task::put_task_spec(
@@ -23912,7 +23917,7 @@ async fn box_start_detach_then_wait_copies_declared_file_exports() {
         boxes::NetworkMode::HostNet,
         boxes::BoxPolicy::default(),
     );
-    crate::stamp_session_spec_as(&mut request, root, Some("dev"), None)
+    crate::stamp_session_spec_as(&mut request, root, Some("dev"), None, None)
         .expect("the start stores a spec");
     let spec = request.spec.expect("the start stores a spec");
     assert_eq!(

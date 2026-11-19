@@ -1861,6 +1861,25 @@ pub(crate) fn session_box_expansion(
     hooks_enabled: bool,
     selected: &SelectedLoadouts,
 ) -> anyhow::Result<Option<BoxEntryExpansion>> {
+    session_box_expansion_with_rules(project, entry, hooks_enabled, selected, None)
+}
+
+/// [`session_box_expansion`], with the client's `[secret-store-rules]`
+/// read through `global` for an entry with a store reference, so the
+/// expanded spec's `[secrets]` carry each rule's `upstream` and `inject`
+/// (BOX-071). With no `global`, no rule is read.
+///
+/// # Errors
+///
+/// As [`session_box_expansion`], and fails on a client configuration whose
+/// store rules do not read.
+pub(crate) fn session_box_expansion_with_rules(
+    project: &camino::Utf8Path,
+    entry: Option<&str>,
+    hooks_enabled: bool,
+    selected: &SelectedLoadouts,
+    global: Option<&GlobalArgs>,
+) -> anyhow::Result<Option<BoxEntryExpansion>> {
     let Some(bytes) = project_file_bytes(project)? else {
         return Ok(None);
     };
@@ -1873,21 +1892,25 @@ pub(crate) fn session_box_expansion(
         // project's `[session]` table.
         None => pick_session_entry(&entries)?,
     };
-    box_entry(project, &bytes, picked, hooks_enabled, selected).map(Some)
+    box_entry(project, &bytes, picked, hooks_enabled, selected, global).map(Some)
 }
 
 /// The expanded `[tasks.<task>]` entry of the project at `project`, for the
 /// daemon to compose the task box from (BOX-068), with the expanded spec
-/// that the stored spec reads its `[[file_exports]]` from (BOX-203). `None`
-/// when the project declares no such entry.
+/// that the stored spec reads its `[[file_exports]]` and `[secrets]` from
+/// (BOX-203, BOX-071). With `global`, the client's `[secret-store-rules]`
+/// are read for a task with a store reference. `None` when the project
+/// declares no such entry.
 ///
 /// # Errors
 ///
-/// Fails with exit 3 on a `minimal.toml` whose entry does not expand.
+/// Fails with exit 3 on a `minimal.toml` whose entry does not expand, and
+/// on a client configuration whose store rules do not read.
 pub(crate) fn task_box_entry(
     project: &camino::Utf8Path,
     task: &str,
     hooks_enabled: bool,
+    global: Option<&GlobalArgs>,
 ) -> anyhow::Result<Option<BoxEntryExpansion>> {
     let Some(bytes) = project_file_bytes(project)? else {
         return Ok(None);
@@ -1910,6 +1933,7 @@ pub(crate) fn task_box_entry(
         entry,
         hooks_enabled,
         &SelectedLoadouts::default(),
+        global,
     )
     .map(Some)
 }
@@ -1930,12 +1954,18 @@ pub(crate) fn task_box_entry(
 /// so a loadout that conflicts with the project fails here (BOX-183), and
 /// each hook of that spec names its declarer (BOX-179). The lists sent
 /// come from the expansion without the loadouts.
+///
+/// With `global`, that spec also expands with the client's
+/// `[secret-store-rules]`, read only for an entry with a store reference,
+/// so its `[secrets]` are the ones a create sends (BOX-071). `min box spec`
+/// expands with the same rules ([`expand_with_store_rules`]).
 fn box_entry(
     project: &camino::Utf8Path,
     bytes: &[u8],
     entry: mfile::entry::BoxEntry,
     hooks_enabled: bool,
     selected: &SelectedLoadouts,
+    global: Option<&GlobalArgs>,
 ) -> anyhow::Result<BoxEntryExpansion> {
     let format_error = |error| ProjectFileInvalid {
         error: mfile::Error::Format(error),
@@ -1979,8 +2009,7 @@ fn box_entry(
     whole.loadouts = selected.layers()?;
     (whole.type_defaults, whole.type_constraints) = entry_type_layers(&doc, &entry);
     whole.host_vars = host_vars(&whole);
-    let mut full =
-        mfile::expand::expand(&entry, &whole).map_err(|error| ProjectFileInvalid { error })?;
+    let (mut full, _) = crate::cmd::box_spec::expand_with_store_rules(global, &entry, &mut whole)?;
     // With hooks off (`--no-hooks`), the spec carries no hook.
     if !hooks_enabled {
         full.spec.remove("lifecycle_hooks");
@@ -3337,6 +3366,50 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// Puts `spec` on the create request with the `[secrets]` of `expanded`,
+/// the entry's expanded spec, and sets the client's projection digest of
+/// the spec it sends (BOX-068, BOX-071). Each store reference in
+/// `expanded` already carries the `upstream` and `inject` that the client's
+/// store rules wrote, so the digest binds the secret grants, and the daemon
+/// reads the same grants from the spec it receives.
+///
+/// # Errors
+///
+/// Fails if the spec cannot be encoded as JSON.
+pub(crate) fn put_expanded_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    spec: &mfile::spec::BoxSpec,
+    expanded: &toml::Table,
+) -> Result<(), anyhow::Error> {
+    let mut spec = spec.clone();
+    take_expanded_secrets(&mut spec, expanded);
+    put_spec(request, &spec)
+}
+
+/// Puts the `[secrets]` table of `expanded` on `spec`, whole, or takes it
+/// off when `expanded` has none (BOX-071).
+pub(crate) fn take_expanded_secrets(spec: &mut mfile::spec::BoxSpec, expanded: &toml::Table) {
+    match expanded.get("secrets") {
+        Some(secrets) => {
+            spec.kept_keys.insert(
+                "secrets".to_owned(),
+                mfile::spec::StoredExport(secrets.clone()),
+            );
+        }
+        None => {
+            spec.kept_keys.remove("secrets");
+        }
+    }
+    tracing::debug!(
+        entry = %spec.entry,
+        secrets = expanded
+            .get("secrets")
+            .and_then(toml::Value::as_table)
+            .map_or(0, toml::Table::len),
+        "put the expanded spec's secrets on the box spec"
+    );
+}
+
 /// Sets the client's projection digest of `spec` on `request` (BOX-071).
 /// `spec` is the typed spec that [`put_spec`] also sends as JSON. The
 /// client converts it to a TOML table with `toml::Table::try_from` and
@@ -3347,10 +3420,8 @@ pub(crate) fn put_spec(
 /// the daemon then refuses the create. A spec that names no type is of the
 /// creating verb's type, as the daemon reads it.
 ///
-/// Gap: the typed spec has no `[secrets]` table, so this digest binds no
-/// secret grants or store rules (BOX-071 says the projection holds the
-/// requested secret scopes). It binds them when the create sends the
-/// expanded spec in place of the typed one, which #2410 tracks.
+/// A spec that [`put_expanded_spec`] built carries the expanded
+/// `[secrets]`, so the digest binds its secret grants and store rules.
 ///
 /// A spec that does not project carries no client digest. The daemon then
 /// stores none.
@@ -3606,7 +3677,7 @@ pub(crate) fn stamp_session_spec(
     request: &mut minimald_rpc::CreateSessionRequest,
     dir: &camino::Utf8Path,
 ) -> Result<(), anyhow::Error> {
-    stamp_session_spec_as(request, dir, None, None)
+    stamp_session_spec_as(request, dir, None, None, None)
 }
 
 /// [`stamp_session_spec`] for the session entry `entry`, with `name` as the
@@ -3620,22 +3691,29 @@ pub(crate) fn stamp_session_spec(
 /// `entry`, the session entry pick applies. A project with no
 /// `minimal.toml` gets the spec of an empty `[session]` table.
 ///
+/// The spec carries the expanded `[secrets]`. With `global`, each store
+/// reference carries the `upstream` and `inject` of the client's store rule
+/// for it (BOX-071), and the client digest binds them.
+///
 /// # Errors
 ///
 /// Fails on a `minimal.toml` in `dir` or a parent of it that does not load
 /// or does not expand, and when no single session entry can be picked.
+/// Fails too on a client configuration whose store rules do not read.
 pub(crate) fn stamp_session_spec_as(
     request: &mut minimald_rpc::CreateSessionRequest,
     dir: &camino::Utf8Path,
     entry: Option<&str>,
     name: Option<&str>,
+    global: Option<&GlobalArgs>,
 ) -> Result<(), anyhow::Error> {
     let flags = spec_flags(request);
-    let expanded = session_box_expansion(
+    let expanded = session_box_expansion_with_rules(
         dir,
         entry,
         flags.hooks_enabled,
         &SelectedLoadouts::default(),
+        global,
     )?;
     let mut spec = match &expanded {
         Some(expanded) => mfile::spec::BoxSpec::for_session_entry(
@@ -3659,7 +3737,10 @@ pub(crate) fn stamp_session_spec_as(
         packages = spec.packages.len(),
         "built the session box's spec from its expanded entry"
     );
-    put_spec(request, &spec)
+    match &expanded {
+        Some(expanded) => put_expanded_spec(request, &spec, &expanded.spec),
+        None => put_spec(request, &spec),
+    }
 }
 
 /// The project root to record for an activation from `dir`. Tarball sync
@@ -4176,6 +4257,7 @@ pub(crate) async fn activate_box(
                 &utf8_path,
                 options.entry.as_deref(),
                 options.box_name.as_deref(),
+                Some(global),
             )?;
             if let Some(hooks) = spec_hooks {
                 put_spec_hooks(&mut request, hooks)?;
@@ -5459,6 +5541,101 @@ mod tests {
             Some(daemon.as_str())
         );
         assert_eq!(client, daemon);
+    }
+
+    /// BOX-071, BOX-072: a session entry with a store reference sends its
+    /// expanded `[secrets]`, with the client's store rule written in. The
+    /// client digest equals the daemon's digest of the sent JSON, and binds
+    /// the rule. The daemon reads the sent spec as a box spec, with the
+    /// secrets kept, and a later edit of the spec's hooks keeps them.
+    #[test]
+    fn create_stores_a_client_digest_equal_to_the_daemon_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[sessions.dev]\n\n[sessions.dev.secrets.NPM_TOKEN]\nsource = \"store\"\n\
+             store = \"keychain\"\nid = \"npm-token\"\n",
+        )
+        .unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config.path().join("minimal")).unwrap();
+        std::fs::write(
+            config.path().join("minimal/config.toml"),
+            "[secret-store-rules.npm-token]\nupstream = [\"registry.npmjs.org\"]\n\
+             header = \"Authorization\"\nprefix = \"Bearer \"\n",
+        )
+        .unwrap();
+        let global = GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            ..Default::default()
+        };
+        let new_request = || {
+            minimald_rpc::CreateSessionRequest::new(
+                "dev",
+                paths::HostAbsPath::try_new(root.to_path_buf()).unwrap(),
+                boxes::NetworkMode::OwnIp,
+                boxes::BoxPolicy::default(),
+            )
+        };
+
+        let mut request = new_request();
+        stamp_session_spec_as(&mut request, root, Some("dev"), None, Some(&global)).unwrap();
+        let wire = request.spec.clone().expect("the spec is on the request");
+        let grant = &wire["secrets"]["NPM_TOKEN"];
+        assert_eq!(grant["source"], "store", "{wire}");
+        assert_eq!(grant["id"], "npm-token", "{wire}");
+        assert_eq!(
+            grant["upstream"],
+            serde_json_lenient::json!(["registry.npmjs.org"]),
+            "the client's store rule reaches the sent spec: {wire}"
+        );
+        assert_eq!(grant["inject"]["header"], "Authorization", "{wire}");
+        assert_eq!(grant["inject"]["prefix"], "Bearer ", "{wire}");
+
+        let daemon = mfile::projection::spec_digest(&wire, boxes::SESSION_BOX_TYPE)
+            .expect("the sent spec projects");
+        assert_eq!(
+            request.config.client_projection_digest(),
+            Some(daemon.as_str())
+        );
+
+        // The digest binds the rule: with no rule read, the sent spec has
+        // no authorities, and its digest differs.
+        let mut unruled = new_request();
+        stamp_session_spec_as(&mut unruled, root, Some("dev"), None, None).unwrap();
+        let unruled_wire = unruled.spec.clone().expect("the spec is on the request");
+        assert!(
+            unruled_wire["secrets"]["NPM_TOKEN"]
+                .get("upstream")
+                .is_none(),
+            "{unruled_wire}"
+        );
+        assert_ne!(
+            unruled.config.client_projection_digest(),
+            Some(daemon.as_str())
+        );
+
+        // The daemon reads the sent spec as a box spec, secrets kept.
+        let read: mfile::spec::BoxSpec =
+            serde_json_lenient::from_value(wire.clone()).expect("the daemon reads the sent spec");
+        assert_eq!(
+            read.kept_keys.get("secrets").map(|kept| &kept.0),
+            Some(&toml::Value::try_from(&wire["secrets"]).unwrap())
+        );
+
+        // Putting the hooks on the spec keeps the secrets and the digest.
+        put_spec_hooks(&mut request, Vec::new()).unwrap();
+        let rehooked = request.spec.as_ref().expect("the spec is on the request");
+        assert_eq!(rehooked["secrets"], wire["secrets"]);
+        assert_eq!(
+            request.config.client_projection_digest(),
+            Some(
+                mfile::projection::spec_digest(rehooked, boxes::SESSION_BOX_TYPE)
+                    .expect("the sent spec projects")
+                    .as_str()
+            )
+        );
     }
 
     /// BOX-001: with no tarball upload root, a subdirectory resolves to the
