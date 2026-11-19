@@ -32144,12 +32144,12 @@ for row in lines:
   TWO_VM_FWD_PID=""
 
   # ---- a name no VM holds -------------------------------------------------
-  lt_run unknown mnl session policy "$lt_nobody"
-  lt_want_rc refused "min session policy $lt_nobody"
-  lt_want_line "the unknown-box refusal says no running VM has the box" \
-    "no running VM has a box named '$lt_nobody'." "$LT_ERR"
-  lt_want_line "the unknown-box refusal shows the --vm form of the command" \
-    "min --vm <vm> session policy $lt_nobody" "$LT_ERR"
+  lt_run unknown mnl box show "$lt_nobody" --network
+  lt_want_rc refused "min box show $lt_nobody --network"
+  lt_want_line "the unknown-box refusal says no box has the name" \
+    "No box named $lt_nobody." "$LT_ERR"
+  lt_want_line "the unknown-box refusal names the command that lists every box" \
+    "Run \`min box list --all\` to see the boxes of every project." "$LT_ERR"
 
   # ---- the expose refusals inside the box ---------------------------------
   lt_run expose-public lt_mn session exec "$lt_b_sid" "/usr/bin/min net expose --public $lt_port"
@@ -32242,8 +32242,8 @@ $LT_ERR"
     printf '%s\n' "$LT_OUT"
     lt_fail
   fi
-  lt_run policy-stopped mnl session policy "$lt_b"
-  lt_want_rc refused "min session policy $lt_b, with VM $lt_vm stopped"
+  lt_run policy-stopped mnl box show "$lt_b" --network
+  lt_want_rc refused "min box show $lt_b --network, with VM $lt_vm stopped"
   lt_want_line "the stopped-VM refusal names the box and its VM" \
     "box '$lt_b' is on VM '$lt_vm', which is stopped." "$LT_ERR"
   lt_want_line "the stopped-VM refusal gives the command that starts the VM" \
