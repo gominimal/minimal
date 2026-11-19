@@ -430,11 +430,11 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/create.rs::activate_box = asserts",
             // A unit test's request, never sent: it checks the box spec.
             "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
+            // A unit test's request, never sent: it checks the project root.
+            "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // A unit test's request, never sent: it checks that the client
             // digest of a spec with secrets equals the daemon's.
             "cmd/boxes/create.rs::create_stores_a_client_digest_equal_to_the_daemon_digest = asserts nothing",
-            // A unit test's request, never sent: it checks the project root.
-            "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // A unit test's request, never sent: it checks the creation key
             // a fresh-instance grant box registers under (BEP-082).
             "cmd/boxes/create.rs::fresh_instance_grant_box_registers_under_a_creation_key = asserts nothing",
@@ -498,6 +498,9 @@ fn every_create_session_asserts_the_daemon_build() {
             // A unit test's request, never sent: it checks the run path's
             // `--no-hooks` on the stored spec.
             "tests.rs::start_no_hooks_stores_no_hooks = asserts nothing",
+            // A unit test's request, never sent: it checks the task's
+            // secrets on the spec a run sends.
+            "tests.rs::task_spec_carries_expanded_secrets = asserts nothing",
             // A unit test's request, never sent: it checks that
             // `--vpn-network-names` is refused when the request has no spec.
             "tests.rs::vpn_network_names_without_a_spec_is_refused = asserts nothing",
