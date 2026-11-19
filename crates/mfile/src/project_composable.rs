@@ -104,22 +104,23 @@ mod tests {
     /// resolution failures.
     #[test]
     fn contribute_populates_every_domain_with_project_provenance() {
-        let mf: crate::File = toml::from_str(indoc! {
+        let mf = crate::File::from_toml_bytes(indoc! {
             r#"
-            [session]
+            [defaults.session]
             packages = ["rustc", "cargo"]
             patches = [
                 { dest = "~/.cargo/config.toml", source = "config/cargo.toml" },
             ]
 
-            [session.vars]
+            [defaults.session.env_vars]
             RUST_LOG         = "info"
             CARGO_TERM_COLOR = "always"
 
-            [[session.lifecycle_hooks]]
+            [[defaults.session.lifecycle_hooks]]
             on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&1 || true" }
             "#
-        })
+        }
+        .as_bytes())
         .unwrap();
         let session = mf.session.expect("populated block parses");
         let path = HostPath::try_new("/some/project").unwrap();
@@ -169,12 +170,13 @@ mod tests {
     /// [`Loadout::contribute`]: boxes::core::loadout::Loadout::contribute
     #[test]
     fn inherit_without_env_surfaces_as_error() {
-        let mf: crate::File = toml::from_str(indoc! {
+        let mf = crate::File::from_toml_bytes(indoc! {
             r#"
-            [session.vars]
+            [defaults.session.env_vars]
             DATABASE_URL = { inherit = true }
             "#
-        })
+        }
+        .as_bytes())
         .unwrap();
         let session = mf.session.expect("populated block parses");
         let comp = ProjectComposable::new(HostPath::try_new("/proj").unwrap(), session);
@@ -196,12 +198,13 @@ mod tests {
     /// [`ResolvedVar::resolve_with`]: boxes::core::primitives::ResolvedVar::resolve_with
     #[test]
     fn inherit_with_default_falls_back_when_absent() {
-        let mf: crate::File = toml::from_str(indoc! {
+        let mf = crate::File::from_toml_bytes(indoc! {
             r#"
-            [session.vars]
+            [defaults.session.env_vars]
             DATABASE_URL = { inherit = true, default = "postgres://localhost/dev" }
             "#
-        })
+        }
+        .as_bytes())
         .unwrap();
         let session = mf.session.expect("populated block parses");
         let comp = ProjectComposable::new(HostPath::try_new("/proj").unwrap(), session);

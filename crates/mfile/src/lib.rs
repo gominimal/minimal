@@ -491,7 +491,7 @@ impl Eq for Stack {}
 ///     { dest = "~/.psqlrc",            source = "config/psqlrc" },
 /// ]
 ///
-/// [session.vars]
+/// [session.env_vars]
 /// # Applies uniformly to every developer's session.
 /// RUST_LOG          = "info"
 /// CARGO_TERM_COLOR  = "always"
@@ -503,48 +503,124 @@ impl Eq for Stack {}
 /// [[session.lifecycle_hooks]]
 /// on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&1 || true" }
 /// ```
+///
+/// The variables are one `env_vars` table (BOX-205). A name in it that is
+/// strict POSIX (`[A-Z_][A-Z0-9_]*`) reads into [`Session::vars`], and any
+/// other name the kernel accepts into [`Session::vars_lenient`]. The
+/// expansion refuses a name that is not POSIX-shaped (BOX-207), so reading
+/// one here does not fail the file. A `vars` or `vars_lenient` key stays
+/// in [`Session::extra`], where the expansion refuses it (BOX-206).
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(from = "SessionTable", into = "SessionTable")]
 pub struct Session {
     /// Packages to bring into the session, alongside the client's
     /// loadout packages.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<String>,
-    /// Variables with POSIX-shaped names — the common case.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// The variables of `env_vars` with strict POSIX names.
     pub vars: BTreeMap<boxes::core::primitives::StrictVarName, boxes::core::primitives::VarValue>,
-    /// Variables with Linux-permissive names — explicit opt-in for
-    /// the rare case a non-POSIX name is necessary.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The variables of `env_vars` with any other name the kernel accepts.
     pub vars_lenient: Vec<boxes::core::primitives::LenientVarEntry>,
     /// Patches contributed by this project.
-    #[serde(
-        default,
-        skip_serializing_if = "boxes::core::primitives::Patches::is_empty"
-    )]
     pub patches: boxes::core::primitives::Patches,
     /// Scripts run at session-level transition points, in
     /// declaration order (concatenated with any hooks from the
     /// client's loadout).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_hooks: Vec<boxes::core::lifecyclehook::LifecycleHook>,
     /// `[session.network]`: the box's network settings this file owns.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<SessionNetwork>,
     /// `[session.secrets.<VAR>]`: the credential grants, by the environment
     /// variable each one lands in. A project cannot set
     /// `acknowledge_full_breadth_unenrolled` here: the reader ignores it with
     /// a warning, because only the client configuration accepts full
     /// breadth (BEP-057).
+    pub secrets: boxes::core::bep::SecretGrants,
+
+    /// Any fields which are not understood by this version of minimal.
+    pub extra: HashMap<String, toml::Value>,
+}
+
+/// [`Session`] as the file writes it: one `env_vars` table, by name.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionTable {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    env_vars: BTreeMap<String, boxes::core::primitives::VarValue>,
+    #[serde(
+        default,
+        skip_serializing_if = "boxes::core::primitives::Patches::is_empty"
+    )]
+    patches: boxes::core::primitives::Patches,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lifecycle_hooks: Vec<boxes::core::lifecyclehook::LifecycleHook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<SessionNetwork>,
     #[serde(
         default,
         skip_serializing_if = "BTreeMap::is_empty",
         deserialize_with = "boxes::core::bep::deserialize_project_secrets"
     )]
-    pub secrets: boxes::core::bep::SecretGrants,
-
-    /// Any fields which are not understood by this version of minimal.
+    secrets: boxes::core::bep::SecretGrants,
     #[serde(flatten)]
-    pub extra: HashMap<String, toml::Value>,
+    extra: HashMap<String, toml::Value>,
+}
+
+impl From<SessionTable> for Session {
+    fn from(table: SessionTable) -> Self {
+        use boxes::core::primitives::{LenientVarEntry, StrictVarName};
+        let mut vars = BTreeMap::new();
+        let mut vars_lenient = Vec::new();
+        for (name, value) in table.env_vars {
+            match StrictVarName::try_new(name.clone()) {
+                Ok(strict) => {
+                    vars.insert(strict, value);
+                }
+                Err(_) => match LenientVarEntry::try_new(name.as_str(), value) {
+                    Ok(entry) => vars_lenient.push(entry),
+                    // The expansion refuses the name (BOX-207). The session
+                    // has no place to keep it.
+                    Err(_) => tracing::debug!(
+                        rule = "BOX-207",
+                        variable = %name,
+                        "dropped a variable name the kernel does not accept"
+                    ),
+                },
+            }
+        }
+        Self {
+            packages: table.packages,
+            vars,
+            vars_lenient,
+            patches: table.patches,
+            lifecycle_hooks: table.lifecycle_hooks,
+            network: table.network,
+            secrets: table.secrets,
+            extra: table.extra,
+        }
+    }
+}
+
+impl From<Session> for SessionTable {
+    fn from(session: Session) -> Self {
+        let env_vars = session
+            .vars
+            .into_iter()
+            .map(|(name, value)| (name.into_inner(), value))
+            .chain(session.vars_lenient.into_iter().map(|entry| {
+                let (name, value) = entry.into_parts();
+                (name.into_inner(), value)
+            }))
+            .collect();
+        Self {
+            packages: session.packages,
+            env_vars,
+            patches: session.patches,
+            lifecycle_hooks: session.lifecycle_hooks,
+            network: session.network,
+            secrets: session.secrets,
+            extra: session.extra,
+        }
+    }
 }
 
 /// The `[session.network]` table: the UDP 443 stance and the Box Egress
@@ -1026,6 +1102,9 @@ fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
         .keys()
         .map(String::as_str)
         .filter(|key| !SPEC_READ_ENTRY_KEYS.contains(key))
+        // BOX-206: the expansion refuses a retired variable key, so it is
+        // not reported as unknown.
+        .filter(|key| !expand::RETIRED_VAR_KEYS.contains(key))
         .collect();
     keys.sort_unstable();
     keys
@@ -2538,7 +2617,9 @@ impl File {
                 let type_defaults = value.is_table()
                     && (expand::BUILTIN_BOX_TYPES.contains(&key.as_str())
                         || project_types.contains(key.as_str()));
-                !type_defaults && !expand::is_spec_key(key)
+                !type_defaults
+                    && !expand::is_spec_key(key)
+                    && !expand::RETIRED_VAR_KEYS.contains(&key.as_str())
             })
             .map(|(key, _)| key.as_str())
             .collect();
@@ -4265,7 +4346,7 @@ mod tests {
                 { dest = "~/.psqlrc",            source = "config/psqlrc" },
             ]
 
-            [session.vars]
+            [session.env_vars]
             RUST_LOG         = "info"
             CARGO_TERM_COLOR = "always"
             DATABASE_URL     = { inherit = true, default = "postgres://localhost/dev" }
