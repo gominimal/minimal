@@ -1945,7 +1945,7 @@ impl BoxLauncher for SandboxLauncher {
                      supervisor here, the program in its own pre-exec closure",
                 ),
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         session = %session_label,
                         leaf = %leaf.dir().display(),
                         supervisor,
