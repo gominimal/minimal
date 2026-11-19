@@ -3800,7 +3800,7 @@ case_linux_vm_stack() {
         grep -qE "^  switch-binary +(verified|current)" "$OUT"
 }
 
-# --- #2498: the Box Egress Proxy installs beside minvmd on macOS -------------
+# --- #2498: the Box Egress Proxy installs beside minvmd ----------------------
 # minvmd starts `bep` from beside its own binary, so an installed minvmd finds
 # the proxy only when both land in the same directory. The proof reads the
 # release's own component table (scripts/stage-release.sh), then installs a
@@ -3817,8 +3817,16 @@ case_bep_installs_beside_minvmd() {
     check 'file|bin/bep.app/Contents/MacOS/bep|bep-macos-arm64"' "$(_row bep-program)" \
         "the release stages the bep program inside bin/bep.app"
     check "bin/minvmd" "$(_row minvmd | cut -d'|' -f2)" "the release stages minvmd for darwin/arm64 at bin/minvmd"
-    want_err "the release stages no bep for Linux" \
-        grep -qE '^    "bep[-a-z]*\|linux\|' "$_table"
+    # Linux ships bep as a plain file beside minvmd: its keys live in the TPM
+    # or Secret Service, which need no bundle.
+    for _arch in amd64 arm64; do
+        check "file|bin/bep|bep-linux-$_arch\"" \
+            "$(awk -F'|' -v a="$_arch" '$1 ~ /"bep$/ && $2 == "linux" && $3 == a {print $4 "|" $5 "|" $6}' "$_table")" \
+            "the release stages bep for linux/$_arch at bin/bep"
+        check "bin/minvmd" \
+            "$(awk -F'|' -v a="$_arch" '$1 ~ /"minvmd$/ && $2 == "linux" && $3 == a {print $5}' "$_table")" \
+            "the release stages minvmd for linux/$_arch at bin/minvmd"
+    done
 
     printf 'darwin-arm64-minvmd-body\n' >"$mock/versions/v1/minvmd-macos-arm64"
     printf 'darwin-arm64-bep-body\n'    >"$mock/versions/v1/bep-macos-arm64"
