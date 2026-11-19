@@ -1612,7 +1612,11 @@ fn entry_egress(
     // A flat `egress_*` key, which `canonicalize` folded into `egress`,
     // sets egress too. The latest layer of them names the egress.
     let egress_key = std::iter::once("egress")
-        .chain(mfile::network::FLAT_EGRESS_KEYS.iter().map(|(flat, _)| *flat))
+        .chain(
+            mfile::network::FLAT_EGRESS_KEYS
+                .iter()
+                .map(|(flat, _)| *flat),
+        )
         .filter_map(|key| Some((expansion.report.network.get(key)?.layer, key)))
         .max()
         .map_or("egress", |(_, key)| key);
