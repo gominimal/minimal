@@ -18601,7 +18601,7 @@ async fn box_spec_bare_reads_defaults_network_bep() {
          [sessions.default]\npackages = [\"git\"]\n\n\
          [sessions.default.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n",
     );
-    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
         .await
         .expect("the rows render");
     assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
@@ -18625,7 +18625,7 @@ async fn box_spec_bare_reads_defaults_network_bep_undecided_entry() {
          [sessions.one]\npackages = [\"git\"]\n\n\
          [sessions.two]\npackages = [\"git\"]\n",
     );
-    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
         .await
         .expect("the rows render without a picked session entry");
     assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
@@ -18643,7 +18643,7 @@ async fn box_spec_bare_reads_defaults_network_bep_top_level_undecided_entry() {
          [sessions.one]\npackages = [\"git\"]\n\n\
          [sessions.two]\npackages = [\"git\"]\n",
     );
-    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
         .await
         .expect("the rows render without a picked session entry");
     assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");
@@ -18675,7 +18675,7 @@ async fn box_spec_bare_reads_defaults_network_bep_matches_start_projection() {
     assert!(start_secrets.contains_key("GH_TOKEN"), "{start_secrets:?}");
     assert_eq!(start_quic443, None);
 
-    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
+    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
         .await
         .expect("the rows render without a picked session entry");
     assert!(bare.contains("\nsteering  proxy_env\n"), "{bare}");

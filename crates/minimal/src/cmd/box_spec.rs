@@ -570,7 +570,24 @@ fn project_network(
     let mut activate = crate::ActivateArgs::unflagged();
     activate.network = args.overrides.network;
     let (port_mappings, flags) = super::box_verbs::flag_network_overrides(&activate)?;
-    let mut project_egress = super::box_verbs::project_egress(project, None)?;
+    let mut project_egress = match super::box_verbs::project_egress(project, None) {
+        Ok(project_egress) => project_egress,
+        // The bare form is read-only and never refuses for the session
+        // entry pick (D3598). With no single entry, it previews no project
+        // egress, and the flags still apply.
+        Err(error)
+            if error
+                .downcast_ref::<crate::SessionEntryUndecided>()
+                .is_some() =>
+        {
+            tracing::debug!(
+                error = %error,
+                "min box spec: no single session entry, previewing no project egress"
+            );
+            Default::default()
+        }
+        Err(error) => return Err(error),
+    };
     let (network, port_mappings) =
         super::box_verbs::session_box_network(&activate, &mut project_egress, port_mappings)?;
     let egress = super::box_verbs::session_effective_egress(
