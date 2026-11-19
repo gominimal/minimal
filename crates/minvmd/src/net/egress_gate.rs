@@ -5517,10 +5517,11 @@ async fn relay_frames_to_switch(
                     }
                     continue;
                 }
-                // A refused connection: the frame is dropped and the reset
-                // that ends the resolver's side goes on in its place. The
-                // entry is released only once the queue took the reset;
-                // otherwise the connection's next frame draws it again.
+                // A refused connection: the frame is dropped and a reset at
+                // the gate's next undecided byte goes on in its place. An
+                // entry past its idle bound is released only once the queue
+                // took the reset; otherwise the connection's next frame
+                // draws it again.
                 dns_pins::TcpDnsVerdict::Reset {
                     refusal,
                     reset,
@@ -5533,7 +5534,11 @@ async fn relay_frames_to_switch(
                     framed.extend_from_slice(&(reset.len() as u16).to_le_bytes());
                     framed.extend_from_slice(&reset);
                     match switch.try_send(framed) {
-                        Ok(()) => dns_tcp.commit(release),
+                        Ok(()) => {
+                            if let Some(release) = release {
+                                dns_tcp.commit(release);
+                            }
+                        }
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             limiter.warn_backpressure(
                                 QueueDirection::TowardSwitch,
@@ -5550,6 +5555,38 @@ async fn relay_frames_to_switch(
                     }
                     continue;
                 }
+            }
+        }
+        // An opening that reclaims entries of connections it must reset
+        // writes those resets on first. A reset the queue has no room for
+        // drops the opening too, so no entry is given up without its reset.
+        if let Some(advance) = dns_tcp_advance.as_ref() {
+            let mut queued = true;
+            for reset in advance.resets() {
+                let mut framed = Vec::with_capacity(2 + reset.len());
+                framed.extend_from_slice(&(reset.len() as u16).to_le_bytes());
+                framed.extend_from_slice(reset);
+                match switch.try_send(framed) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        limiter.warn_backpressure(
+                            QueueDirection::TowardSwitch,
+                            summary.source(),
+                            Who::of(table, summary.source()),
+                        );
+                        queued = false;
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "the relay's switch writer is gone",
+                        ));
+                    }
+                }
+            }
+            if !queued {
+                continue;
             }
         }
         // One combined write keeps the length prefix and the frame together
@@ -21108,7 +21145,7 @@ mod tests {
         );
         assert_eq!(
             reset.seq, seq,
-            "the reset sits at the byte the resolver expects next"
+            "the reset sits at the gate's next undecided byte"
         );
     }
 
@@ -21116,14 +21153,16 @@ mod tests {
     /// row whose rules admit TCP to its resolver's address: each
     /// length-prefixed message on a connection to the box's own resolver is
     /// decided by the datagram's rule. A declared name passes, whole or split
-    /// across two segments, and a retransmission of a decided segment
-    /// passes. The segment that completes an unmatched name's message is
-    /// dropped, and a reset from the box at the byte the resolver expects
-    /// next goes to the switch in its place. Every later segment of that
-    /// connection carrying data is dropped, while one without data passes.
-    /// A length prefix past the bound is dropped at once, the same way. A query to an address other than the resolver is
-    /// not this gate's and passes. Each drop says so in the unmatched-name
-    /// rule's line.
+    /// across two segments, and a byte-identical retransmission of a decided
+    /// segment passes. The segment that completes an unmatched name's
+    /// message is dropped, and a reset from the box at the gate's next
+    /// undecided byte goes to the switch in its place. Every later segment
+    /// of that connection, with or without data, is dropped and draws the
+    /// reset again. A retransmission whose bytes differ from the decided
+    /// ones is refused the same way. A length prefix past the bound is
+    /// dropped at once, the same way. A query to an address other than the
+    /// resolver is not this gate's and passes. Each drop says so in the
+    /// unmatched-name rule's line.
     #[tokio::test]
     async fn allow_list_row_tcp_query_decided_like_a_datagram() {
         use hickory_proto::rr::RecordType;
@@ -21176,8 +21215,8 @@ mod tests {
         };
 
         // A declared query passes; the unmatched one behind it on the same
-        // connection is dropped, and so is the declared one after that,
-        // while a segment without data passes.
+        // connection is dropped, and so are the declared one after that and
+        // a segment without data, each drawing the reset again.
         passes(
             &mut h,
             &segment(resolver, 41000, SYN, 1000, &[]),
@@ -21196,19 +21235,16 @@ mod tests {
             &segment(resolver, 41000, PSH_ACK, after, &unmatched),
         )
         .await;
+        expect_reset(&mut h, 41000, after).await;
         send_frame(
             &mut h.guest,
             &segment(resolver, 41000, PSH_ACK, after + len(&unmatched), &declared),
         )
         .await;
         expect_reset(&mut h, 41000, after).await;
+        send_frame(&mut h.guest, &segment(resolver, 41000, ACK, after, &[])).await;
+        expect_reset(&mut h, 41000, after).await;
         marker(&mut h).await;
-        passes(
-            &mut h,
-            &segment(resolver, 41000, ACK, after, &[]),
-            "a segment without data after the refusal",
-        )
-        .await;
 
         // Split across two segments: the declared query's halves both pass,
         // and a retransmission of the first half passes; the unmatched
@@ -21239,6 +21275,18 @@ mod tests {
             "a retransmission of the first half",
         )
         .await;
+        // A retransmission at the same sequence number that carries an
+        // unmatched query in place of the declared one is refused and draws
+        // the reset at the next undecided byte.
+        assert_eq!(unmatched.len(), declared.len(), "the two queries line up");
+        send_frame(
+            &mut h.guest,
+            &segment(resolver, 41001, PSH_ACK, 2001, &unmatched),
+        )
+        .await;
+        expect_reset(&mut h, 41001, 2001 + len(&declared)).await;
+        marker(&mut h).await;
+
         let (head, tail) = unmatched.split_at(5);
         passes(
             &mut h,
@@ -21278,6 +21326,7 @@ mod tests {
         marker(&mut h).await;
 
         wait_for_log(&h.log, "name=\"<over the size limit>\"").await;
+        wait_for_log(&h.log, "name=\"<retransmission differs>\"").await;
         let logged = h.log.contents();
         assert!(
             logged.contains("source=100.64.0.9")
@@ -21312,9 +21361,9 @@ mod tests {
     /// port that follows is dropped and the half that completes an
     /// unmatched query never reaches the switch: the half that completes it
     /// at the first opening's sequence number draws the reset instead. A
-    /// refused connection's entry ends only once the gate's reset is at the
-    /// switch: after it, data on the same port without an opening is
-    /// dropped, and a new opening starts a fresh reading.
+    /// refused connection's entry stays within its idle bound: every later
+    /// frame of it, a new opening on the same port included, is dropped and
+    /// draws the reset again.
     #[tokio::test]
     async fn allow_list_row_tcp_close_never_restarts_the_stream() {
         use hickory_proto::rr::RecordType;
@@ -21400,45 +21449,23 @@ mod tests {
         expect_reset(&mut h, 41010, 6001 + len(head)).await;
         marker(&mut h).await;
 
-        // A refused connection: the reset reaches the switch before any
-        // later frame of the port. The box's close after it passes, and
-        // data without an opening is dropped. A new opening on the same port
-        // starts a fresh reading, and its declared query passes.
+        // A refused connection within its idle bound: the reset reaches the
+        // switch before any later frame of the port, and every later frame
+        // of it (the box's close, data, a new opening on the same port) is
+        // dropped and draws the reset again. The release past the idle bound
+        // is proved on the table itself.
         passes(&mut h, &segment(41011, SYN, 8000, &[]), "the opening").await;
         send_frame(&mut h.guest, &segment(41011, PSH_ACK, 8001, &unmatched)).await;
         expect_reset(&mut h, 41011, 8001).await;
-        marker(&mut h).await;
-        passes(
-            &mut h,
-            &segment(41011, FIN_ACK, 8001, &[]),
-            "the box's close after the reset",
-        )
-        .await;
-        send_frame(&mut h.guest, &segment(41011, PSH_ACK, 8001, &declared)).await;
-        marker(&mut h).await;
-        passes(&mut h, &segment(41011, SYN, 9000, &[]), "a new opening").await;
-        passes(
-            &mut h,
-            &segment(41011, PSH_ACK, 9001, &declared),
-            "the new connection's declared query",
-        )
-        .await;
-
-        // More refused connections than one relay tracks, each reset and
-        // released, leave room for a declared lookup on a connection of its
-        // own.
-        for port in 42000..42000 + 70 {
-            passes(&mut h, &segment(port, SYN, 1000, &[]), "the opening").await;
-            send_frame(&mut h.guest, &segment(port, PSH_ACK, 1001, &unmatched)).await;
-            expect_reset(&mut h, port, 1001).await;
+        for frame in [
+            segment(41011, FIN_ACK, 8001, &[]),
+            segment(41011, PSH_ACK, 8001, &declared),
+            segment(41011, SYN, 9000, &[]),
+        ] {
+            send_frame(&mut h.guest, &frame).await;
+            expect_reset(&mut h, 41011, 8001).await;
         }
-        passes(&mut h, &segment(43000, SYN, 1000, &[]), "the opening").await;
-        passes(
-            &mut h,
-            &segment(43000, PSH_ACK, 1001, &declared),
-            "a declared query after the refused connections",
-        )
-        .await;
+        marker(&mut h).await;
         expect_silence(&mut h.switch).await;
         // Nothing was written back toward the guest: the drops are silent.
         expect_silence(&mut h.guest).await;
