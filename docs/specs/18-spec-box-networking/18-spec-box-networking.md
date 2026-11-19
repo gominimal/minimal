@@ -499,7 +499,7 @@ box that holds it returns to `running`. These terms follow the decision in
     <!-- S7b; unwanted; the box verbs take `--provider` and `--host`, not `--vm` (design addressing section), so their not-found answer points at the listing instead of a flag; a box on a stopped VM is answered by the sub-requirement below instead -->
   - IF a command names a box on a stopped VM THEN THE SYSTEM SHALL say which stopped VM holds the box and give the command that starts that VM.
     tier:   T0
-    verify: cargo nextest run -p minimal box_on_stopped_vm_names_start_command
+    verify: cargo nextest run -p minimal box_on_stopped_vm_names_start_command box_verb_on_stopped_vm_box_refuses_with_start_hint
     <!-- S7b; unwanted; the companion of NET-152's listing: a box the listing shows as stopped is never answered as not found -->
 
 - **NET-059** WHILE two VMs run THE SYSTEM SHALL route hostnames from both through the host's hostname surface at the same time.
