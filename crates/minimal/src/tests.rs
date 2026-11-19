@@ -23891,7 +23891,7 @@ fn box_verbs_complete_box_names() {
 /// on both attaches. A stand-in VM host answers the client's resume on the
 /// control socket beside the daemon's ssh socket.
 #[tokio::test]
-async fn attach_after_row_withdrawn_registers_again() {
+async fn attach_after_row_withdrawn_resumes_the_same_creation() {
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
         FinalizeSessionRequest,

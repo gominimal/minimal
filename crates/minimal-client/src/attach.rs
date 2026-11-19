@@ -883,7 +883,13 @@ pub fn resume_box_row_at(
     addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) -> anyhow::Result<bool> {
-    let failure = match resume_box_row_answer(control_sock, box_name, addresses, box_id)? {
+    let failure = match resume_box_row_answer(
+        control_sock,
+        box_name,
+        addresses,
+        box_id,
+        BOX_CONTROL_THREAD_BOUND,
+    )? {
         Ok(()) => return Ok(true),
         Err(RowNotResumed::Refused(error)) => format!("the daemon refused it: {error}"),
         Err(RowNotResumed::Failed(failure)) => failure,
@@ -953,7 +959,7 @@ pub enum RowNotResumed {
 /// come back rather than warning: `Ok(Ok(()))` when the daemon answered
 /// with the box's row at the presented pair, which stands or which the
 /// daemon reinstated from its own record of the box's creation, under the
-/// same box id.
+/// same box id. The exchange is bounded by `timeout`.
 ///
 /// # Errors
 ///
@@ -964,6 +970,7 @@ pub fn resume_box_row_answer(
     box_name: &str,
     addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
+    timeout: std::time::Duration,
 ) -> anyhow::Result<Result<(), RowNotResumed>> {
     let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
         name: box_name.to_string(),
@@ -971,7 +978,7 @@ pub fn resume_box_row_answer(
         loopback_address: addresses.loopback_address,
         box_id,
     });
-    let failure = match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
+    let failure = match host_control_within(control_sock, &request, timeout) {
         Ok((minimald_rpc::BoxControlReply::Registered(row), _))
             if row.switch_address == addresses.switch_address
                 && row.loopback_address == addresses.loopback_address =>

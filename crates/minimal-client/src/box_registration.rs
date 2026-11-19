@@ -683,6 +683,15 @@ pub enum RowEndedResume {
 /// two drift apart.
 pub const NAME_HELD_REFUSAL: (&str, &str) = ("a box named ", " already exists");
 
+/// How long the resume after a row-ended attach may take
+/// ([`resume_box_row_after_row_ended`]). A row that was just withdrawn
+/// can still have its revocation in flight, and the VM host daemon waits
+/// up to 5 s for it before it reinstates the row (`REVOCATION_WAIT` in
+/// `crates/minvmd/src/box_registry.rs`). This bound is twice that wait, so
+/// the client does not give up on a row the host is bringing back. A test
+/// reads minvmd's source and fails when the wait grows past half of it.
+pub const ROW_ENDED_RESUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Asks the VM host daemon beside `sock` for the session's box row back
 /// once more, after the in-VM daemon refused an interactive attach because
 /// the row was withdrawn (NET-138). The resume before the attach can find
@@ -692,7 +701,7 @@ pub const NAME_HELD_REFUSAL: (&str, &str) = ("a box named ", " already exists");
 /// of that creation, under the same box id and at the same addresses, so
 /// the record the client holds stays right, and no second creation is made
 /// that would hold addresses of its own. Bounded by
-/// [`BOX_CONTROL_TIMEOUT`].
+/// [`ROW_ENDED_RESUME_TIMEOUT`].
 ///
 /// # Errors
 ///
@@ -713,9 +722,17 @@ pub async fn resume_box_row_after_row_ended(
     };
     let box_name = name.clone();
     let answer = tokio::time::timeout(
-        BOX_CONTROL_TIMEOUT,
+        ROW_ENDED_RESUME_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            crate::attach::resume_box_row_answer(&control_sock, &box_name, addresses, box_id)
+            // One second past the caller's own deadline, so that deadline
+            // is the one that answers.
+            crate::attach::resume_box_row_answer(
+                &control_sock,
+                &box_name,
+                addresses,
+                box_id,
+                ROW_ENDED_RESUME_TIMEOUT + std::time::Duration::from_secs(1),
+            )
         }),
     )
     .await;
@@ -730,7 +747,7 @@ pub async fn resume_box_row_after_row_ended(
         }
         Err(_) => {
             return Ok(RowEndedResume::NotBack(format!(
-                "the VM host daemon did not answer the resume in {BOX_CONTROL_TIMEOUT:?}"
+                "the VM host daemon did not answer the resume in {ROW_ENDED_RESUME_TIMEOUT:?}"
             )));
         }
     };
@@ -1620,6 +1637,19 @@ mod tests {
         anyhow::Result<RowEndedResume>,
         minimald_rpc::BoxControlRequest,
     ) {
+        resume_after_row_ended_answered_after(box_id, reply, std::time::Duration::ZERO).await
+    }
+
+    /// [`resume_after_row_ended_answered_with`], with the VM host daemon
+    /// answering `delay` after it read the request.
+    async fn resume_after_row_ended_answered_after(
+        box_id: Option<minimald_rpc::BoxId>,
+        reply: minimald_rpc::BoxControlReply,
+        delay: std::time::Duration,
+    ) -> (
+        anyhow::Result<RowEndedResume>,
+        minimald_rpc::BoxControlRequest,
+    ) {
         use std::io::{BufRead as _, Read as _, Write as _};
         let dir = tempfile::TempDir::new().unwrap();
         let (_, listener) = silent_vm_host(&dir);
@@ -1630,6 +1660,7 @@ mod tests {
             reader.read_line(&mut line).unwrap();
             let request: minimald_rpc::BoxControlRequest =
                 serde_json_lenient::from_str(line.trim()).unwrap();
+            std::thread::sleep(delay);
             let mut reply = serde_json_lenient::to_string(&reply).unwrap();
             reply.push('\n');
             (&stream).write_all(reply.as_bytes()).unwrap();
@@ -1674,6 +1705,54 @@ mod tests {
                 box_id: Some(box_id),
             }),
             "the client resumes the box's own creation; it registers nothing new"
+        );
+    }
+
+    /// The VM host daemon can wait for a withdrawn row's revocation before
+    /// it reinstates the row, so the resume after a row-ended attach waits
+    /// past [`BOX_CONTROL_TIMEOUT`] for its answer: a row the host brings
+    /// back late is back, not a row that did not come back.
+    #[tokio::test]
+    async fn resume_after_row_ended_waits_for_a_late_answer() {
+        let box_id = minimald_rpc::BoxId::from_bytes([5; 16]);
+        let (resumed, _) = resume_after_row_ended_answered_after(
+            Some(box_id),
+            minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: PAIR.switch_address,
+                loopback_address: PAIR.loopback_address,
+                box_id,
+                task_addresses: Vec::new(),
+            }),
+            BOX_CONTROL_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(resumed.unwrap(), RowEndedResume::Back);
+    }
+
+    /// [`ROW_ENDED_RESUME_TIMEOUT`] outlasts the revocation wait minvmd
+    /// runs before it reinstates a withdrawn row, with room for the
+    /// exchange around it. minvmd's source must still bound that wait at
+    /// no more than half of it.
+    #[test]
+    fn row_ended_resume_outlasts_minvmds_revocation_wait() {
+        let registry =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../minvmd/src/box_registry.rs");
+        let source = std::fs::read_to_string(&registry)
+            .unwrap_or_else(|error| panic!("read {}: {error}", registry.display()));
+        let lead = "pub const REVOCATION_WAIT: Duration = Duration::from_secs(";
+        let wait: u64 = source
+            .split_once(lead)
+            .and_then(|(_, rest)| rest.split_once(");"))
+            .and_then(|(secs, _)| secs.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} no longer writes `{lead}<secs>);`: update this test",
+                    registry.display()
+                )
+            });
+        assert!(
+            std::time::Duration::from_secs(wait * 2) <= ROW_ENDED_RESUME_TIMEOUT,
+            "minvmd waits {wait} s for a revocation; raise ROW_ENDED_RESUME_TIMEOUT to twice that"
         );
     }
 
