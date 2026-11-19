@@ -18132,7 +18132,11 @@ async fn box_spec_renders_formats_secrets_as_refs() {
         .await
         .expect_err("a grant with a value key is refused");
     assert!(
-        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        error.downcast_ref::<crate::SpecFileInvalid>().is_some(),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains("Cannot start the box"),
         "{error:#}"
     );
     assert!(!format!("{error:#}").contains("hunter2"), "{error:#}");
@@ -18428,8 +18432,12 @@ async fn box_spec_entry_loadouts_resolve_as_start() {
 
 /// The project file error that `min box spec` ends with.
 fn spec_project_error(error: &anyhow::Error) -> &mfile::Error {
+    assert!(
+        !format!("{error:#}").contains("Cannot start the box"),
+        "{error:#}"
+    );
     &error
-        .downcast_ref::<crate::ProjectFileInvalid>()
+        .downcast_ref::<crate::SpecFileInvalid>()
         .unwrap_or_else(|| panic!("not a project file error: {error:#}"))
         .error
 }
@@ -18802,7 +18810,11 @@ async fn box_spec_argument_directory_then_entry_then_box() {
         .await
         .expect_err("a bare name is an entry name first");
     assert!(
-        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        error.downcast_ref::<crate::SpecFileInvalid>().is_some(),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains("Cannot start the box"),
         "{error:#}"
     );
     // A full box id cannot name an entry, so the box renders past the
@@ -18819,7 +18831,11 @@ async fn box_spec_argument_directory_then_entry_then_box() {
         .await
         .expect_err("no entry and no box");
     assert!(
-        error.downcast_ref::<crate::ProjectFileInvalid>().is_some(),
+        error.downcast_ref::<crate::SpecFileInvalid>().is_some(),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains("Cannot start the box"),
         "{error:#}"
     );
 }

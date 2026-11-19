@@ -46,6 +46,7 @@ pub(crate) use box_spec::box_spec_to;
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 pub use box_audit::AuditSelfUnsupportedUnenrolled;
+pub use box_spec::SpecFileInvalid;
 pub use box_verbs::*;
 pub use finalize_install::*;
 pub use list::*;
