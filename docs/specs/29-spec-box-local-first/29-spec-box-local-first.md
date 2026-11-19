@@ -287,7 +287,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p mfile defaults_merge_lists_union_scalars_replace
   property: For every pair of layers, merging unions list values in layer order, merges `env_vars` by name with the more specific layer's value for a name both set, and replaces other scalars and tables with the more specific layer's.
 
-- **BOX-049** THE SYSTEM SHALL accept per-entry keys written flat (`timeout`, `pty_enabled`, and the `[machine]` and `on_oom` keys as the resources spec (gominimal/inbox#698; BRES) defines them) and keep the meaning of `packages`, `patches`, `vars` and `lifecycle_hooks`.
+- **BOX-049** THE SYSTEM SHALL accept per-entry keys written flat (`timeout`, `pty_enabled`, and the `[machine]` and `on_oom` keys as the resources spec (gominimal/inbox#698; BRES) defines them) and keep the meaning of `packages`, `patches`, `env_vars` and `lifecycle_hooks`.
   tier:     T0
   verify:   cargo nextest run -p mfile flat_per_entry_keys_and_legacy_keys_keep_meaning
 
@@ -389,12 +389,12 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify: cargo nextest run -p mfile env_vars_read_from_every_layer
   <!-- owner ruling 2026-11-16 (gominimal/arch#177): one table under one name at every layer, the task entry's included, replacing `vars`, `vars_lenient` and the task-only `env_vars` -->
 
-- **BOX-206** IF a `minimal.toml` table or a loadout file sets `vars` or `vars_lenient` THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the file, the table that sets the key, and the key, and SHALL tell the person to move the variables to `env_vars`.
+- **BOX-206** IF a layer that a `minimal.toml` table or a loadout file supplies sets `vars` or `vars_lenient` as one of its own keys, not as a variable name inside its `env_vars`, THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the file, the table that sets the key, and the key, and SHALL tell the person to move the variables to `env_vars`.
   tier:   T0
   verify: cargo nextest run -p mfile retired_var_keys_refused_exit3
   <!-- owner ruling 2026-11-16: no compatibility shim, so a file that still uses a retired key learns the new key at once rather than losing its variables -->
 
-- **BOX-207** IF an `env_vars` table sets a variable whose name holds a character other than an ASCII letter, a digit or `_`, or starts with a digit, THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the variable and the file, and say which characters a name can hold.
+- **BOX-207** IF an `env_vars` table sets a variable whose name is empty, holds a character other than an ASCII letter, a digit or `_`, or starts with a digit, THEN THE SYSTEM SHALL fail the expansion with exit 3, so that the creation and `min box spec <entry>` both refuse it. The error SHALL name the variable and the file, and say which characters a name can hold.
   tier:   T0
   verify: cargo nextest run -p mfile non_posix_env_var_name_refused_exit3
   <!-- decided 2026-11-19: `[[vars_lenient]]` was the opt-in for other names and no shipped loadout or example uses it; a per-variable opt-in can be added later without breaking a project, while accepting every name now could not be narrowed later -->
