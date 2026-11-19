@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Soak harness: run the unified session e2e (scripts/session-e2e.sh) N times
 # back-to-back against a VM-backed target, reaping leftover VM processes
-# between iterations, to shake out the boot / first-connect raciness (the
+# between runs, to shake out the boot / first-connect raciness (the
 # vsock-bridge wedge class) that a single PR-lane run cannot surface. Reports
 # a pass/fail tally and exits non-zero if ANY iteration failed.
+#
+# An iteration runs the cold-boot core cases (SOAK_CASES below), each as its
+# own session-e2e.sh invocation. Every invocation gets a fresh state dir, so
+# each case is a cold VM boot followed by a first connect. An iteration does
+# not run the whole lane: the KVM lane already runs it on every push to main,
+# and one whole-lane run now takes over 20 minutes on a hosted runner, so ten
+# of them cannot fit the nightly job's time limit.
 #
 # Then, once, the bulk host→guest upload proof (scripts/bulk-upload-e2e.sh):
 # no session-e2e iteration pushes enough data through the guest vsock to catch
@@ -16,10 +23,14 @@
 # on PATH, MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS set,
 # libkrun on the loader path — and passes the VM knobs through the
 # environment (E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd" E2E_PROJECT_DIR=/tmp),
-# same as the lane invocation. Each iteration runs session-e2e.sh, which
-# creates its own fresh XDG state, so every pass is a clean cold start.
+# same as the lane invocation. Each session-e2e.sh invocation creates its own
+# fresh XDG state, so every pass is a clean cold start.
 #
 # Environment:
+#   SOAK_CASES          the session-e2e.sh case names each iteration runs, in
+#                       order, separated by spaces (default: lifecycle
+#                       session_exec sandbox restart). `all` runs the whole
+#                       lane once per iteration instead.
 #   SOAK_MIN_FREE_MIB   free-space floor, in MiB, for the filesystem holding the
 #                       per-iteration state dirs (default 4096). See the
 #                       headroom check below for why this harness needs one.
@@ -43,6 +54,17 @@ mkdir -p "$LOGDIR" || { echo "cannot create boot-log dir: '$LOGDIR'" >&2; exit 2
 # silently, exactly when a failing run needs it.
 LOGDIR="$(cd "$LOGDIR" && pwd)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# The cases each iteration runs. Each one autospawns the daemon in a fresh VM
+# and then makes the first connect its proof needs: list, warm call and
+# destroy; a non-interactive exec; an interactive attach over the vsock
+# bridge; a daemon stop and its autospawn.
+CASES="${SOAK_CASES-lifecycle session_exec sandbox restart}"
+case "$CASES" in
+  all) CASES="" ;;  # session-e2e.sh with no argument runs the whole lane
+  *[!\ ]*) ;;
+  *) echo "SOAK_CASES names no case; set it to case names or 'all'" >&2; exit 2 ;;
+esac
 
 # Reap leftovers a failed boot may strand (the detached __krun-vmm grandchild
 # and the gvproxy switch can linger and wedge the next iteration's bridge).
@@ -114,7 +136,19 @@ for i in $(seq 1 "$ITER"); do
     echo "::endgroup::"
     exit 1
   fi
-  if MINVMD_BOOT_LOG="$LOGDIR/boot-$i.log" "$ROOT/scripts/session-e2e.sh"; then
+  iter_ok=1
+  if [ -z "$CASES" ]; then
+    MINVMD_BOOT_LOG="$LOGDIR/boot-$i.log" "$ROOT/scripts/session-e2e.sh" || iter_ok=0
+  else
+    for c in $CASES; do
+      reap
+      if ! MINVMD_BOOT_LOG="$LOGDIR/boot-$i-$c.log" "$ROOT/scripts/session-e2e.sh" "$c"; then
+        iter_ok=0
+        echo "::warning::soak iteration $i: case $c FAILED"
+      fi
+    done
+  fi
+  if [ "$iter_ok" -eq 1 ]; then
     pass=$((pass + 1))
     echo "iteration $i: OK"
   else
