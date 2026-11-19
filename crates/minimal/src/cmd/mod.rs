@@ -78,7 +78,15 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
     }
     // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
     // prints after the command ends, never before an attached shell.
-    let alias_hint = hosts::read_provider_alias(&mut cli.global_args);
+    // Where the `/dev/kvm` default moved the command to the VM provider
+    // while the native provider still has boxes or a daemon, the notice
+    // that says so takes the same path. The two never meet: the old name
+    // is always a named provider.
+    let alias_hint = hosts::read_provider_alias(&mut cli.global_args).or_else(|| {
+        shows_native_boxes_notice(cli.command.as_ref())
+            .then(|| hosts::native_boxes_notice(cli.global_args.minimal_dir.as_deref()))
+            .flatten()
+    });
     // The verb and the outcome go on the root span (BCLI-033
     // observability), so one span tells what ran. `box_id` stays empty
     // until a command records the id it resolved, through
@@ -148,6 +156,9 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
 /// changes for a target the user did not name. `finalize-install --undo`
 /// does not: it removes what an earlier install left on this host,
 /// whichever provider that install was for.
+///
+/// `proxy --socket` does not: ssh starts it without the parent's flags,
+/// and it connects to the socket it is given, whatever the provider.
 fn needs_provider(command: Option<&Command>) -> bool {
     !matches!(
         command,
@@ -155,6 +166,10 @@ fn needs_provider(command: Option<&Command>) -> bool {
             Command::Loadout(_)
                 | Command::Type(_)
                 | Command::FinalizeInstall(FinalizeInstallArgs { undo: true, .. })
+                | Command::Proxy(ProxyArgs {
+                    socket: Some(_),
+                    ..
+                })
                 | Command::Dirs
                 | Command::Doctor
                 | Command::Bug(_)
@@ -166,6 +181,23 @@ fn needs_provider(command: Option<&Command>) -> bool {
                 | Command::Completions(_)
         )
     )
+}
+
+/// Whether `command` prints [`hosts::NATIVE_BOXES_NOTICE`] after it ends,
+/// when the notice applies: a command that reaches the provider, other
+/// than the helpers that ssh, the shell's completion and the spinner run.
+/// Their stderr is not a command the person typed.
+fn shows_native_boxes_notice(command: Option<&Command>) -> bool {
+    needs_provider(command)
+        && !matches!(
+            command,
+            Some(
+                Command::Proxy(_)
+                    | Command::CompleteSessionStr(_)
+                    | Command::Spin(_)
+                    | Command::DebugAnswererCommand
+            )
+        )
 }
 
 /// The verb a run dispatches, as the user typed it (`box show`,
@@ -1762,6 +1794,36 @@ impl SessionRpc {
 #[cfg(test)]
 mod tests {
     use crate::{SessionRpc, session_rpc_failed};
+
+    /// The native-boxes notice prints after a command that reaches a
+    /// provider, never after a helper that ssh or the shell runs, and
+    /// `proxy --socket` needs no provider at all.
+    #[test]
+    fn the_native_boxes_notice_skips_helpers() {
+        use clap::Parser as _;
+        let command = |args: &[&str]| {
+            crate::Cli::try_parse_from(std::iter::once("min").chain(args.iter().copied()))
+                .unwrap()
+                .command
+        };
+        assert!(super::shows_native_boxes_notice(command(&["ls"]).as_ref()));
+        assert!(super::shows_native_boxes_notice(
+            command(&["session", "attach", "web"]).as_ref()
+        ));
+        assert!(!super::shows_native_boxes_notice(
+            command(&["proxy"]).as_ref()
+        ));
+        assert!(!super::shows_native_boxes_notice(
+            command(&["complete-session-str"]).as_ref()
+        ));
+        assert!(!super::shows_native_boxes_notice(
+            command(&["dirs"]).as_ref()
+        ));
+        assert!(!super::needs_provider(
+            command(&["proxy", "--socket", "/s"]).as_ref()
+        ));
+        assert!(super::needs_provider(command(&["proxy"]).as_ref()));
+    }
 
     /// BEP-082: a Ctrl-C during a `host_ip` activation withdraws the box's
     /// name with the id its registration handed back, as the activation's

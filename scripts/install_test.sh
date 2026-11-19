@@ -109,6 +109,37 @@ write_min_stub() {
 # Every call records whether it ran with the installer's update-check guard
 # (MINIMAL_UNDER_INSTALLER) and its verb, in $HOME/min.calls.
 printf '%s %s\n' "${MINIMAL_UNDER_INSTALLER:-unset}" "${1:-}" >>"$HOME/min.calls"
+# The provider each call ran under (its MIN_PROVIDER, or unset) and its verb,
+# in $HOME/min.provider.
+printf '%s %s\n' "${MIN_PROVIDER:-unset}" "${1:-}" >>"$HOME/min.provider"
+# MIN_PROVIDER as `min` reads it: a value that names no provider is refused,
+# unless this stub stands for a `min` from before the variable (the
+# "pre-provider" label), which ignores it. With $HOME/kvm.opens, a call of a
+# current `min` with no MIN_PROVIDER reaches the VM provider, where no daemon
+# runs: `version` prints no server line, `stop` finds nothing, `ls` lists
+# nothing.
+_pre_provider=0
+grep -q '^# mock min (pre-provider)' "$0" && _pre_provider=1
+_on_vm=0
+if [ "$_pre_provider" -eq 0 ]; then
+    case "${MIN_PROVIDER:-}" in
+        ""|local|local-minvmd) ;;
+        *)
+            echo "error: MIN_PROVIDER=$MIN_PROVIDER names no provider. Set MIN_PROVIDER to local or local-minvmd, or unset it." >&2
+            exit 1
+            ;;
+    esac
+    if [ -f "$HOME/kvm.opens" ] && [ -z "${MIN_PROVIDER:-}" ]; then
+        _on_vm=1
+    fi
+fi
+if [ "$_on_vm" -eq 1 ]; then
+    case "${1:-}" in
+        version) printf 'Client: minimal v1\n'; exit 0 ;;
+        stop) printf 'vm %s\n' "$*" >>"$HOME/stop.calls"; echo "error: no daemon is running" >&2; exit 1 ;;
+        ls) exit 0 ;;
+    esac
+fi
 comp_target() {
     case "$1" in
         bash) printf '%s/bash-completion/completions/min\n' "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
@@ -2042,6 +2073,52 @@ stop" "$(cat "$HL9/stop.calls")" \
         "the failed run still takes the closing stop (R5.5)"
     check "$h_minimald" "$(hash_file "$HL9/daemon.running")" \
         "the daemon the failed run leaves serves the minimald it installed (R5.5)"
+
+    # An upgrade from a `min` that predates MIN_PROVIDER, on a Linux host where
+    # /dev/kvm opens. The old `min` ran the native daemon, and a client
+    # respawns it from the old binaries during the run. The new `min` with no
+    # flag would reach the VM provider and find no daemon there, so the
+    # closing stop runs with MIN_PROVIDER=local and stops the native one. The
+    # variable stays inside that stop: the later finalize-install probe runs
+    # without it.
+    HL12="$root/hl12"; mkdir -p "$HL12"
+    stage_live_upgrade "$HL12" nativebeforeprovider
+    rm -f "$HL12/sessions.live"
+    write_min_stub "$HL12/bin/min" pre-provider
+    printf 'stale\n' >"$HL12/daemon.running"
+    : >"$HL12/daemon.reconnect"
+    : >"$HL12/kvm.opens"
+    rm -f "$HL12/min.provider"
+    run nativebeforeprovider "$HL12"
+    check 0 "$rc" "an upgrade from a min before MIN_PROVIDER exits 0 (R5.5)"
+    want_ok "the closing stop finds the old native daemon (R5.5)" \
+        grep -q "stopping a daemon still running from build old" "$OUT"
+    check "stop
+stop" "$(cat "$HL12/stop.calls")" \
+        "graceful stop before the swap, then a graceful closing stop of the native daemon (R5.5)"
+    want_ok "the closing stop asks the native provider (R5.5)" \
+        grep -qx "local version" "$HL12/min.provider"
+    want_err "no call reached the VM provider (R5.5)" grep -q "^vm " "$HL12/stop.calls"
+    want_err "nothing after the closing stop runs with MIN_PROVIDER=local (R5.5)" \
+        grep -qx "local finalize-install" "$HL12/min.provider"
+    check "$h_minimald" "$(hash_file "$HL12/daemon.running")" \
+        "the daemon the run leaves is the one just installed (R5.5)"
+
+    # The same host with a session opened in the respawned native daemon and
+    # no terminal: the advice names the native provider, which a flagless
+    # `min` no longer reaches there.
+    HL13="$root/hl13"; mkdir -p "$HL13"
+    stage_live_upgrade "$HL13" nativeadvice
+    rm -f "$HL13/sessions.live"
+    write_min_stub "$HL13/bin/min" pre-provider
+    printf 'stale\n' >"$HL13/daemon.running"
+    : >"$HL13/daemon.reconnect"
+    : >"$HL13/respawn.sessions"
+    : >"$HL13/kvm.opens"
+    run nativeadvice "$HL13"
+    check 0 "$rc" "an upgrade that leaves the native daemon running exits 0 (R5.5)"
+    want_ok "the advice names the native provider (R5.5)" \
+        grep -qF "run 'min --provider local stop' after those sessions end, or 'min --provider local stop --force' to end them now." "$OUT"
 }
 
 case_shell_integration() {

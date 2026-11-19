@@ -5302,6 +5302,44 @@ async fn an_unknown_min_provider_refuses_flagless_commands_only() {
     assert!(flagged.status.success(), "{flagged:?}");
 }
 
+/// The `provider` key of the `config.toml` that `min` finds on its own
+/// config path decides a flagless command's provider, ahead of the
+/// `/dev/kvm` probe: `provider = "local"` keeps it native on a host where
+/// `/dev/kvm` opens, and `provider = "local-minvmd"` picks the VM where it
+/// does not. `min dirs` prints the socket of the provider it resolved.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_config_provider_key_decides_a_flagless_command() {
+    let home = tempfile::TempDir::new().unwrap();
+    let config = home.path().join("xdg-config/minimal/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let dirs = || async {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+            .env_remove("MIN_PROVIDER")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+            .env("XDG_STATE_HOME", home.path().join("xdg-state"))
+            .args(["--no-input", "dirs"])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    std::fs::write(&config, "provider = \"local\"\n").unwrap();
+    let native = dirs().await;
+    assert!(
+        native.contains("providers/local-minimald0/ssh.sock"),
+        "provider = \"local\" keeps the native provider: {native}"
+    );
+    std::fs::write(&config, "provider = \"local-minvmd\"\n").unwrap();
+    let vm = dirs().await;
+    assert!(
+        vm.contains("providers/local-minvmd0/ssh.sock"),
+        "provider = \"local-minvmd\" picks the VM provider: {vm}"
+    );
+}
+
 /// A `MIN_PROVIDER` that names no provider leaves a command that reads no
 /// provider running, while a command that talks to a host still refuses.
 /// `finalize-install` refuses too, because the provider picks what it

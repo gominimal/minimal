@@ -50,7 +50,7 @@ pub const PROVIDER_ENV: &str = "MIN_PROVIDER";
 const KVM_DEVICE: &str = "/dev/kvm";
 
 /// Open [`KVM_DEVICE`] for reading and writing, as a VM boot does. `Ok` is
-/// the test of whether KVM is usable by this user: a user outside the `kvm`
+/// the test of whether this user may open KVM: a user outside the `kvm`
 /// group gets a permission error from a device that exists.
 pub(crate) fn open_kvm_device() -> std::io::Result<()> {
     std::fs::OpenOptions::new()
@@ -60,12 +60,89 @@ pub(crate) fn open_kvm_device() -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// The KVM API version every Linux kernel since 2.6.22 reports.
+#[cfg(target_os = "linux")]
+const KVM_API_VERSION: i32 = 12;
+
+#[cfg(target_os = "linux")]
+nix::ioctl_none!(kvm_get_api_version, 0xAE, 0x00);
+
+/// Whether the KVM device at `path` runs VMs for this user: it opens for
+/// reading and writing, and answers `KVM_GET_API_VERSION` with
+/// [`KVM_API_VERSION`]. A device that opens but refuses the call, as in a
+/// container that was given the device node and denied its use, does not.
+#[cfg(target_os = "linux")]
+pub(crate) fn kvm_usable_at(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let device = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    // SAFETY: KVM_GET_API_VERSION takes no argument and writes no memory of
+    // ours, and `device` keeps the descriptor open for the whole call.
+    let version = unsafe { kvm_get_api_version(device.as_raw_fd()) }?;
+    if version == KVM_API_VERSION {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "{} reports KVM API version {version}, not {KVM_API_VERSION}",
+            path.display()
+        )))
+    }
+}
+
+/// Whether the VM provider's device runs VMs for this user
+/// ([`kvm_usable_at`] over [`KVM_DEVICE`]).
+#[cfg(target_os = "linux")]
+fn kvm_usable() -> std::io::Result<()> {
+    kvm_usable_at(Path::new(KVM_DEVICE))
+}
+
+/// No KVM outside Linux, where the default is never resolved.
+#[cfg(not(target_os = "linux"))]
+fn kvm_usable() -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+/// How a command with no `--provider` came to its provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultProvider {
+    /// `MIN_PROVIDER` or the `provider` key of `config.toml` named it.
+    Named(Provider),
+    /// Neither named one, and `/dev/kvm` runs VMs: the VM provider.
+    VmByKvm,
+    /// Neither named one, and `/dev/kvm` runs no VMs: the native provider,
+    /// with `provider` left unset as before.
+    Native,
+}
+
+impl DefaultProvider {
+    fn provider(self) -> Option<Provider> {
+        match self {
+            DefaultProvider::Named(provider) => Some(provider),
+            DefaultProvider::VmByKvm => Some(Provider::LocalMinvmd),
+            DefaultProvider::Native => None,
+        }
+    }
+}
+
+/// Set when this process's provider is the VM provider only because
+/// `/dev/kvm` runs VMs: no `--provider`, `MIN_PROVIDER` or `provider` key
+/// named it.
+static VM_CHOSEN_BY_KVM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process's provider is the VM provider only because
+/// `/dev/kvm` runs VMs ([`resolve_default_provider`]).
+pub fn vm_chosen_by_kvm() -> bool {
+    VM_CHOSEN_BY_KVM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Choose the provider for a command that has no `--provider`, on Linux.
 /// `MIN_PROVIDER` decides first, then the `provider` key of the user's
 /// `config.toml`. With neither, the VM provider is the default where
-/// `/dev/kvm` opens for reading and writing, and the native provider
-/// otherwise, which leaves `provider` unset as before. macOS has one
-/// provider, so nothing changes there.
+/// `/dev/kvm` runs VMs for this user, and the native provider otherwise,
+/// which leaves `provider` unset as before. macOS has one provider, so
+/// nothing changes there.
 ///
 /// # Errors
 ///
@@ -76,49 +153,103 @@ pub fn resolve_default_provider(global: &mut GlobalArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     let path = crate::config::user_config_path(global);
-    global.provider = default_provider_over(
+    let chosen = default_provider_over(
         std::env::var(PROVIDER_ENV).ok(),
         || Ok(crate::config::read_config_parts(&path)?.0.provider),
         &path,
-        open_kvm_device,
+        kvm_usable,
     )?;
+    VM_CHOSEN_BY_KVM.store(
+        chosen == DefaultProvider::VmByKvm,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    global.provider = chosen.provider();
     Ok(())
 }
 
 /// [`resolve_default_provider`] over its inputs: the environment
 /// variable's value, a reader of the `provider` key of the config file at
-/// `path`, and the result of opening `/dev/kvm`. Each later input is read
-/// only when the earlier ones name nothing.
+/// `path`, and whether `/dev/kvm` runs VMs. Each later input is read only
+/// when the earlier ones name nothing.
 pub(crate) fn default_provider_over(
     env: Option<String>,
     config: impl FnOnce() -> anyhow::Result<Option<String>>,
     path: &Path,
     kvm: impl FnOnce() -> std::io::Result<()>,
-) -> anyhow::Result<Option<Provider>> {
+) -> anyhow::Result<DefaultProvider> {
     if let Some(value) = env.filter(|v| !v.is_empty()) {
-        return parse_provider(&value).map(Some).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{PROVIDER_ENV}={value} names no provider. Set {PROVIDER_ENV} to local or \
-                 local-minvmd, or unset it."
-            )
-        });
+        return parse_provider(&value)
+            .map(DefaultProvider::Named)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{PROVIDER_ENV}={value} names no provider. Set {PROVIDER_ENV} to local or \
+                     local-minvmd, or unset it."
+                )
+            });
     }
     if let Some(value) = config()? {
-        return parse_provider(&value).map(Some).ok_or_else(|| {
-            anyhow::anyhow!(
-                "provider = \"{value}\" in {} names no provider. Set it to local or \
-                 local-minvmd, or remove it.",
-                path.display()
-            )
-        });
+        return parse_provider(&value)
+            .map(DefaultProvider::Named)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider = \"{value}\" in {} names no provider. Set it to local or \
+                     local-minvmd, or remove it.",
+                    path.display()
+                )
+            });
     }
     match kvm() {
-        Ok(()) => Ok(Some(Provider::LocalMinvmd)),
+        Ok(()) => Ok(DefaultProvider::VmByKvm),
         Err(error) => {
-            tracing::debug!(%error, "{KVM_DEVICE} does not open: the native provider is the default");
-            Ok(None)
+            tracing::debug!(%error, "{KVM_DEVICE} runs no VMs: the native provider is the default");
+            Ok(DefaultProvider::Native)
         }
     }
+}
+
+/// What a command prints on stderr after it ends, when the VM provider is
+/// its provider only because `/dev/kvm` runs VMs and the native provider
+/// still has boxes or a running daemon ([`native_boxes_notice`]).
+pub const NATIVE_BOXES_NOTICE: &str = "note: min uses the VM provider by default because \
+     /dev/kvm opens for you. The native provider still has boxes or a running daemon, which \
+     this command did not reach. To list them, run min --provider local ls. To keep using the \
+     native provider, set MIN_PROVIDER=local or put provider = \"local\" in config.toml.";
+
+/// [`NATIVE_BOXES_NOTICE`] when it applies to this process: the VM provider
+/// came from the `/dev/kvm` probe, and the native provider of `minimal_dir`
+/// has boxes or a running daemon.
+pub fn native_boxes_notice(minimal_dir: Option<&Path>) -> Option<&'static str> {
+    (vm_chosen_by_kvm() && native_provider_in_use(minimal_dir)).then_some(NATIVE_BOXES_NOTICE)
+}
+
+/// Whether the native provider of `minimal_dir` has boxes or a running
+/// daemon: its box index lists a box, or its daemon's socket answers. It
+/// reads one file and makes one connect, and starts nothing.
+fn native_provider_in_use(minimal_dir: Option<&Path>) -> bool {
+    let base = match minimal_dir {
+        Some(dir) => std::path::absolute(dir).ok(),
+        None => {
+            paths::try_minimal_state_dir().map(|dir| dir.as_utf8_path().as_std_path().to_path_buf())
+        }
+    };
+    let has_boxes = base
+        .and_then(|base| std::fs::read(base.join("sessions").join("index.json")).ok())
+        .is_some_and(|bytes| box_index_lists_a_box(&bytes));
+    has_boxes || crate::autospawn::is_daemon_running(false, minimal_dir).unwrap_or(false)
+}
+
+/// Whether the native daemon's box index (`sessions/index.json`) lists a
+/// box. An index that does not parse lists none.
+fn box_index_lists_a_box(bytes: &[u8]) -> bool {
+    serde_json_lenient::from_slice::<serde_json_lenient::Value>(bytes)
+        .ok()
+        .and_then(|index| {
+            index
+                .get("short_to_id")?
+                .as_object()
+                .map(|ids| !ids.is_empty())
+        })
+        .unwrap_or(false)
 }
 
 /// The provider `value` names, as `--provider` reads it.
@@ -863,14 +994,14 @@ mod default_provider_tests {
     fn linux_default_is_the_vm_where_kvm_opens() {
         let path = Path::new("/c/config.toml");
         let vm = default_provider_over(None, no_config, path, || Ok(())).unwrap();
-        assert_eq!(vm, Some(Provider::LocalMinvmd));
+        assert_eq!(vm, DefaultProvider::VmByKvm);
         let native = default_provider_over(None, no_config, path, denied).unwrap();
-        assert_eq!(native, None);
+        assert_eq!(native, DefaultProvider::Native);
         let absent = default_provider_over(None, no_config, path, || {
             Err(std::io::Error::from(std::io::ErrorKind::NotFound))
         })
         .unwrap();
-        assert_eq!(absent, None);
+        assert_eq!(absent, DefaultProvider::Native);
     }
 
     /// `MIN_PROVIDER` wins over the config key, and the config key wins
@@ -885,7 +1016,7 @@ mod default_provider_tests {
             || panic!("/dev/kvm is not opened when the variable is set"),
         )
         .unwrap();
-        assert_eq!(from_env, Some(Provider::Local));
+        assert_eq!(from_env, DefaultProvider::Named(Provider::Local));
         let from_config = default_provider_over(
             None,
             || Ok(Some("local".into())),
@@ -893,7 +1024,7 @@ mod default_provider_tests {
             || panic!("/dev/kvm is not opened when the config names a provider"),
         )
         .unwrap();
-        assert_eq!(from_config, Some(Provider::Local));
+        assert_eq!(from_config, DefaultProvider::Named(Provider::Local));
         let vm = default_provider_over(
             Some(String::new()),
             || Ok(Some("local-minvmd".into())),
@@ -903,14 +1034,14 @@ mod default_provider_tests {
         .unwrap();
         assert_eq!(
             vm,
-            Some(Provider::LocalMinvmd),
+            DefaultProvider::Named(Provider::LocalMinvmd),
             "an empty variable names nothing"
         );
         let old =
             default_provider_over(Some("local-minimald".into()), no_config, path, denied).unwrap();
         assert_eq!(
             old,
-            Some(Provider::LocalMinimald),
+            DefaultProvider::Named(Provider::LocalMinimald),
             "the old name reads, and the alias hint follows"
         );
     }
@@ -944,5 +1075,45 @@ mod default_provider_tests {
         };
         resolve_default_provider(&mut global).unwrap();
         assert_eq!(global.provider, Some(Provider::Local));
+    }
+
+    /// The native daemon's box index counts as boxes only when it maps a
+    /// short name to a box.
+    #[test]
+    fn box_index_lists_a_box_only_with_an_entry() {
+        assert!(box_index_lists_a_box(
+            br#"{"format_version":1,"short_to_id":{"a1b2":"0190c0de-0000-7000-8000-000000000001"},"names":{}}"#
+        ));
+        assert!(!box_index_lists_a_box(
+            br#"{"format_version":1,"short_to_id":{},"names":{}}"#
+        ));
+        assert!(!box_index_lists_a_box(b"not json"));
+        assert!(!box_index_lists_a_box(b"{}"));
+    }
+
+    /// The line a command prints after it ends when the `/dev/kvm` default
+    /// moved it to the VM provider and the native provider is still in use.
+    #[test]
+    fn native_boxes_notice_names_both_ways_back() {
+        assert_eq!(
+            NATIVE_BOXES_NOTICE,
+            "note: min uses the VM provider by default because /dev/kvm opens for you. The \
+             native provider still has boxes or a running daemon, which this command did not \
+             reach. To list them, run min --provider local ls. To keep using the native \
+             provider, set MIN_PROVIDER=local or put provider = \"local\" in config.toml."
+        );
+        assert!(!NATIVE_BOXES_NOTICE.contains('\n'), "one line");
+    }
+
+    /// A file that opens for reading and writing but is no KVM device fails
+    /// the probe: the `KVM_GET_API_VERSION` call is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_device_that_opens_but_runs_no_vms_is_not_usable() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = kvm_usable_at(file.path()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::ENOTTY), "{error}");
+        let absent = kvm_usable_at(Path::new("/nonexistent/kvm")).unwrap_err();
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
     }
 }

@@ -53,7 +53,8 @@ A command without `--provider` chooses the provider in this order:
    provider = "local"
    ```
 
-3. `local-minvmd`, when `/dev/kvm` opens for reading and writing for you.
+3. `local-minvmd`, when `/dev/kvm` opens for reading and writing for you
+   and answers the KVM API version request.
 4. `local`, otherwise.
 
 `--provider` wins over all of them. A host where `/dev/kvm` is there but does
@@ -64,6 +65,16 @@ Each provider keeps its own boxes. Boxes you started on the native provider
 before `local-minvmd` became your default stay there: `min --provider local
 ls` lists them. To keep the native provider as your default, set
 `MIN_PROVIDER=local` or put `provider = "local"` in `config.toml`.
+
+A command can reach `local-minvmd` only because `/dev/kvm` opens. If the
+native provider then still has boxes or a running daemon, the command prints
+a note on stderr after it ends. The note names both ways back above, and it
+stops once `--provider`, `MIN_PROVIDER` or the `provider` key names the
+provider.
+
+A VM that fails to start under this default gives an error with one more
+line. That line says `min` used the VM because `/dev/kvm` opens, and that
+`MIN_PROVIDER=local` keeps the native provider.
 
 ## Commands
 
@@ -591,7 +602,7 @@ the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
 When both apply, both lines print, the login line last. When the step that
 enforces deny-all egress installs while a daemon is running, on a host with
-systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress yet, restart the daemon. Run min host stop local0, which stops each running box and then the daemon. Then run min ls, which starts the daemon again.`
+systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress yet, restart the daemon. Run min host stop local0 --provider local, which stops each running box and then the daemon. Then run min ls --provider local, which starts the daemon again.`
 When `min finalize-install` runs with `--minimal-dir`, both commands in the
 note carry the same `--minimal-dir`, made absolute.
 A daemon of this release reads the machine again once the step places it, so

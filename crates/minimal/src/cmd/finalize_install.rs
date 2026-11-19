@@ -824,8 +824,8 @@ pub(crate) mod linux {
     /// the block echoes it in one.
     pub(crate) const DAEMON_RUNNING_NOTE: &str = "note: a Minimal daemon is running. If a box \
          you start next still says this machine cannot enforce its egress yet, restart the daemon. Run \
-         min host stop local0, which stops each running box and then the daemon. Then run min ls, \
-         which starts the daemon again.";
+         min host stop local0 --provider local, which stops each running box and then the daemon. \
+         Then run min ls --provider local, which starts the daemon again.";
 
     /// [`DAEMON_RUNNING_NOTE`] for the daemon of `minimal_dir`, the
     /// `--minimal-dir` this run was given: both commands carry the flag, so
@@ -845,10 +845,13 @@ pub(crate) mod linux {
                     .unwrap_or_else(|_| dir.to_string());
                 DAEMON_RUNNING_NOTE
                     .replace(
-                        "min host stop local0,",
-                        &format!("min host stop local0 --minimal-dir {dir},"),
+                        "min host stop local0 --provider local,",
+                        &format!("min host stop local0 --provider local --minimal-dir {dir},"),
                     )
-                    .replace("min ls,", &format!("min ls --minimal-dir {dir},"))
+                    .replace(
+                        "min ls --provider local,",
+                        &format!("min ls --provider local --minimal-dir {dir},"),
+                    )
             }
         }
     }
@@ -2002,6 +2005,7 @@ pub(crate) mod linux {
     pub(crate) fn native_kvm_item(mut item: Item) -> Item {
         if item.state == ItemState::Missing {
             item.today = Some(NATIVE_KVM_TODAY.to_string());
+            item.step = item.step.map(|step| format!("{step}. {NATIVE_KVM_STEP}"));
         }
         item
     }
@@ -2010,6 +2014,14 @@ pub(crate) mod linux {
     /// group, as the native provider's `kvm` item says it.
     pub(crate) const NATIVE_KVM_TODAY: &str = "min uses the native provider, not the VM \
         provider, because /dev/kvm does not open for you";
+
+    /// What joining the `kvm` group changes on a host the native provider
+    /// serves by default, after the step's own text: the VM provider becomes
+    /// the default ([`crate::hosts::resolve_default_provider`]), and the
+    /// native boxes stay where they are.
+    pub(crate) const NATIVE_KVM_STEP: &str = "From then on min uses the VM provider by \
+        default. Boxes you started on the native provider stay reachable with --provider \
+        local, as in min --provider local ls";
 
     /// [`kvm_item_over`] this host's reads, with `open` the result of
     /// opening `/dev/kvm` for reading and writing
@@ -4049,19 +4061,25 @@ mod tests {
         assert_eq!(daemon_running_note(None), DAEMON_RUNNING_NOTE);
         let dir = "/home/alice/m";
         let note = daemon_running_note(Some(dir));
-        assert!(note.contains("Run min host stop local0 --minimal-dir /home/alice/m, which"));
-        assert!(note.contains("Then run min ls --minimal-dir /home/alice/m, which starts"));
+        assert!(note.contains(
+            "Run min host stop local0 --provider local --minimal-dir /home/alice/m, which"
+        ));
+        assert!(note.contains(
+            "Then run min ls --provider local --minimal-dir /home/alice/m, which starts"
+        ));
         assert!(!note.contains('\''));
         // A relative directory prints absolute, as the daemon resolves it.
         let cwd = std::env::current_dir().expect("a working directory");
         let abs = cwd.join("m").display().to_string();
         let relative = daemon_running_note(Some("m"));
         assert!(
-            relative.contains(&format!("min host stop local0 --minimal-dir {abs},")),
+            relative.contains(&format!(
+                "min host stop local0 --provider local --minimal-dir {abs},"
+            )),
             "{relative}"
         );
         assert!(
-            relative.contains(&format!("min ls --minimal-dir {abs},")),
+            relative.contains(&format!("min ls --provider local --minimal-dir {abs},")),
             "{relative}"
         );
         let facts = ClassifierFacts {
@@ -4459,10 +4477,16 @@ mod tests {
         );
         // The note names the one command that stops the running boxes and then the daemon,
         // and the block can echo it whole.
-        assert!(DAEMON_RUNNING_NOTE.contains("restart the daemon. Run min host stop local0,"));
+        assert!(
+            DAEMON_RUNNING_NOTE
+                .contains("restart the daemon. Run min host stop local0 --provider local,")
+        );
         assert!(DAEMON_RUNNING_NOTE.contains("stops each running box and then the daemon."));
         // Not every command starts the daemon: `min host stop` on a stopped host does not.
-        assert!(DAEMON_RUNNING_NOTE.contains("Then run min ls, which starts the daemon again."));
+        assert!(
+            DAEMON_RUNNING_NOTE
+                .contains("Then run min ls --provider local, which starts the daemon again.")
+        );
         assert!(!DAEMON_RUNNING_NOTE.contains("--force"));
         assert!(!DAEMON_RUNNING_NOTE.contains("sessions survive"));
         assert!(!DAEMON_RUNNING_NOTE.contains('\''));
@@ -4500,8 +4524,17 @@ mod tests {
                  open for you"
             )
         );
+        assert_eq!(
+            item.step.as_deref(),
+            Some(
+                "adds alice to the kvm group (it takes effect at your next login). From then on \
+                 min uses the VM provider by default. Boxes you started on the native provider \
+                 stay reachable with --provider local, as in min --provider local ls"
+            )
+        );
         let done = native_kvm_item(kvm_item_over(Ok(()), "alice", false));
         assert_eq!(done.today, None);
+        assert_eq!(done.step, None);
     }
 
     /// The KVM item's table: done when the device opens, a group step on
