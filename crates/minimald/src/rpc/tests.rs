@@ -271,7 +271,7 @@ async fn stream_workspace_files_refuses_a_session_awaiting_its_verdict() {
     // A daemon-collected var must be gated by the client, so the
     // configure parks the session instead of finalizing it.
     server
-        .seed_workspace_mfile(session_id, "[session.vars]\nRUST_LOG = \"info\"\n")
+        .seed_workspace_mfile(session_id, "[defaults.session.env_vars]\nRUST_LOG = \"info\"\n")
         .await;
     let configured = client
         .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
