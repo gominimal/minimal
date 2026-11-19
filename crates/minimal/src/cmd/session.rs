@@ -892,6 +892,7 @@ pub(crate) async fn resolve_box_of_type(
                 BoxAddressRefusal::Ambiguous { .. }
                 | BoxAddressRefusal::AmbiguousIdStart { .. } => "ambiguous",
                 BoxAddressRefusal::NotFound { .. } => "not found",
+                BoxAddressRefusal::OnStoppedVm { .. } => "on a stopped VM",
                 BoxAddressRefusal::Unreachable { .. } => "host unreachable",
             };
             tracing::info!(verb, address, box_type, outcome, "{refusal}");

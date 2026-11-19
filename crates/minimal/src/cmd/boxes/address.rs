@@ -102,6 +102,14 @@ pub enum BoxAddressRefusal {
         /// The address as the caller wrote it.
         address: String,
     },
+    /// The address resolved to a box on a VM that is stopped, so no daemon
+    /// can act on it (NET-058). Exit 4.
+    OnStoppedVm {
+        /// The box's name, or its id when it has no name.
+        name: String,
+        /// The stopped VM that holds the box.
+        vm: String,
+    },
 }
 
 impl BoxAddressRefusal {
@@ -111,7 +119,7 @@ impl BoxAddressRefusal {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Ambiguous { .. } | Self::AmbiguousIdStart { .. } => 2,
-            Self::NotFound { .. } => 4,
+            Self::NotFound { .. } | Self::OnStoppedVm { .. } => 4,
             Self::Unreachable { .. } => 7,
         }
     }
@@ -122,17 +130,22 @@ impl BoxAddressRefusal {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Ambiguous { .. } | Self::AmbiguousIdStart { .. } => "ambiguous",
-            Self::NotFound { .. } => "not_found",
+            Self::NotFound { .. } | Self::OnStoppedVm { .. } => "not_found",
             Self::Unreachable { .. } => "host_unreachable",
         }
     }
 
     /// The next step the error object's `hint` names.
+    /// The message of [`Self::OnStoppedVm`] carries the command that starts
+    /// the VM, with the VM's and the box's names in it.
     pub fn hint(&self) -> &'static str {
         match self {
             Self::Ambiguous { .. } => "Name one box as provider/host/name.",
             Self::AmbiguousIdStart { .. } => "Give more of the id.",
             Self::NotFound { .. } => "Run `min box list --all` to see the boxes of every project.",
+            Self::OnStoppedVm { .. } => {
+                "Start the VM that holds the box, then run the command again."
+            }
             Self::Unreachable { .. } => "Run the command again when the host answers.",
         }
     }
@@ -142,6 +155,7 @@ impl BoxAddressRefusal {
         match self {
             Self::Ambiguous { .. } | Self::AmbiguousIdStart { .. } => "ambiguous",
             Self::NotFound { .. } => "not found",
+            Self::OnStoppedVm { .. } => "on a stopped VM",
             Self::Unreachable { .. } => "host unreachable",
         }
     }
@@ -208,6 +222,7 @@ impl std::fmt::Display for BoxAddressRefusal {
                 "No box named {address}. \
                  Run `min box list --all` to see the boxes of every project."
             ),
+            Self::OnStoppedVm { name, vm } => f.write_str(&crate::cmd::box_on_stopped_vm(name, vm)),
         }
     }
 }
@@ -460,18 +475,37 @@ pub(crate) fn newest_named<'a>(
 /// verb, the box id and the outcome. A qualified address asks only its own
 /// host. A version skew on the selected host ends the command, as it does
 /// for `min box list`. A host that does not answer is named in the refusal.
+///
+/// A VM that is not running answers from the box records it keeps on disk,
+/// each box listed as stopped. An address that resolves to one of those
+/// boxes is refused with the VM's name and the command that starts it
+/// (NET-058).
 pub(crate) async fn resolve_box_on_local_hosts(
     global: &GlobalArgs,
     address: &str,
     verb: &'static str,
 ) -> Result<ResolvedBox, anyhow::Error> {
     let hosts = crate::cmd::list::local_hosts(global)?;
-    resolve_box_on_hosts(hosts, address, verb).await
+    let vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
+    resolve_box_over(hosts, &vms, address, verb).await
 }
 
-/// [`resolve_box_on_local_hosts`] over the local `hosts` it read.
+/// [`resolve_box_on_local_hosts`] over the local `hosts` it read, with no
+/// read of a stopped VM's box records.
 pub(crate) async fn resolve_box_on_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    address: &str,
+    verb: &'static str,
+) -> Result<ResolvedBox, anyhow::Error> {
+    resolve_box_over(hosts, &[], address, verb).await
+}
+
+/// Resolves `address` over `hosts`. A host that is not running, and that
+/// serves one of `vms`, lists the boxes its VM keeps on disk (NET-152), and
+/// a box resolved there is refused as on a stopped VM (NET-058).
+async fn resolve_box_over(
     mut hosts: Vec<crate::cmd::list::LocalHost>,
+    vms: &[client::VmSocket],
     address: &str,
     verb: &'static str,
 ) -> Result<ResolvedBox, anyhow::Error> {
@@ -479,13 +513,43 @@ pub(crate) async fn resolve_box_on_hosts(
         hosts.retain(|h| h.provider == provider && h.host == host);
     }
     let mut listings = Vec::with_capacity(hosts.len());
+    // The stopped VMs' hosts, each with the VM's name.
+    let mut stopped: Vec<(String, String)> = Vec::new();
     for host in hosts {
-        let boxes = read_host_boxes(&host).await.inspect_err(|err| {
+        let read = read_host(&host).await.inspect_err(|err| {
             tracing::info!(verb, outcome = "error", host = %host.host, "{err:#}");
         })?;
+        let boxes = match read {
+            HostRead::Answered(boxes) => boxes,
+            HostRead::NotRunning => match vms.iter().find(|vm| vm.sock == host.sock) {
+                Some(vm) => {
+                    stopped.push((host.host.clone(), vm.vm.clone()));
+                    Ok(stopped_vm_entries(vm))
+                }
+                None => Ok(Vec::new()),
+            },
+        };
         listings.push(HostListing { host, boxes });
     }
-    match resolve_box_address(address, &listings) {
+    let resolution = resolve_box_address(address, &listings).and_then(|resolved| {
+        let Some((_, vm)) = stopped.iter().find(|(host, _)| *host == resolved.host.host) else {
+            return Ok(resolved);
+        };
+        let name = listings
+            .iter()
+            .filter(|l| l.host.host == resolved.host.host)
+            .filter_map(|l| l.boxes.as_ref().ok())
+            .flatten()
+            .find(|e| e.box_id == resolved.box_id)
+            .and_then(|e| e.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| resolved.box_id.to_string());
+        Err(BoxAddressRefusal::OnStoppedVm {
+            name,
+            vm: vm.clone(),
+        })
+    });
+    match resolution {
         Ok(resolved) => {
             tracing::info!(
                 verb,
@@ -515,34 +579,80 @@ pub(crate) async fn resolve_box_on_hosts(
 pub(crate) async fn read_host_boxes(
     host: &crate::cmd::list::LocalHost,
 ) -> Result<Result<Vec<minimald_rpc::BoxListingEntry>, String>, anyhow::Error> {
+    Ok(match read_host(host).await? {
+        HostRead::Answered(boxes) => boxes,
+        HostRead::NotRunning => Ok(Vec::new()),
+    })
+}
+
+/// What [`read_host`] read from one host.
+enum HostRead {
+    /// The host's box records, or why the host did not answer.
+    Answered(Result<Vec<minimald_rpc::BoxListingEntry>, String>),
+    /// No daemon serves a host this process did not select.
+    NotRunning,
+}
+
+/// [`read_host_boxes`], with a host that is not running kept apart from a
+/// host that answered with no records.
+async fn read_host(host: &crate::cmd::list::LocalHost) -> Result<HostRead, anyhow::Error> {
     if host.selected {
         let mut client = match connect_box_host(host).await {
             Ok(client) => client,
-            Err(BoxHostConnect::Unreachable(e)) => return Ok(Err(format!("{e:#}"))),
+            Err(BoxHostConnect::Unreachable(e)) => {
+                return Ok(HostRead::Answered(Err(format!("{e:#}"))));
+            }
             Err(BoxHostConnect::Skew(e)) => return Err(e),
         };
-        return Ok(list_box_records(&mut client, None)
-            .await
-            .map_err(|e| format!("{e:#}")));
+        return Ok(HostRead::Answered(
+            list_box_records(&mut client, None)
+                .await
+                .map_err(|e| format!("{e:#}")),
+        ));
     }
     let read = tokio::time::timeout(client::PROBE_TIMEOUT, async {
         let mut client = match client::Client::probe(&host.sock).await {
             Ok(client) => client,
-            Err(client::ProbeRefusal::NotRunning) => return Ok(Vec::new()),
-            Err(client::ProbeRefusal::Unreachable(e)) => return Err(format!("{e:#}")),
+            Err(client::ProbeRefusal::NotRunning) => return HostRead::NotRunning,
+            Err(client::ProbeRefusal::Unreachable(e)) => {
+                return HostRead::Answered(Err(format!("{e:#}")));
+            }
         };
-        list_box_records(&mut client, None)
-            .await
-            .map_err(|e| format!("{e:#}"))
+        HostRead::Answered(
+            list_box_records(&mut client, None)
+                .await
+                .map_err(|e| format!("{e:#}")),
+        )
     })
     .await;
     Ok(read.unwrap_or_else(|elapsed| {
-        Err(format!(
+        HostRead::Answered(Err(format!(
             "daemon at {} did not answer within {:?}: {elapsed}",
             host.sock.display(),
             client::PROBE_TIMEOUT
-        ))
+        )))
     }))
+}
+
+/// The boxes a stopped VM keeps in its persisted records (NET-152), each as
+/// a `stopped` entry with its name and id and nothing a daemon would add.
+fn stopped_vm_entries(vm: &client::VmSocket) -> Vec<minimald_rpc::BoxListingEntry> {
+    crate::attach::stopped_vm_boxes(vm)
+        .into_iter()
+        .map(|held| minimald_rpc::BoxListingEntry {
+            box_id: held.id,
+            name: Some(held.name),
+            box_type: None,
+            parent: None,
+            project_root: None,
+            state: "stopped".to_owned(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            pty_enabled: false,
+            lifetime: None,
+        })
+        .collect()
 }
 
 /// Why the selected host gave no client.
