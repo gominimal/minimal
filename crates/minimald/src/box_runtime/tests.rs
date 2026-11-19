@@ -9425,8 +9425,12 @@ async fn restart_records_restart_reason_before_start() {
             .state()
             .unwrap()
     };
+    // The client reads these exact strings (`ends_of` in `min`, pinned by
+    // `attach_ended_by_restart_names_restart_exit254`). Pin the wire text here
+    // too, so a change on either side fails a test.
+    assert_eq!((STOPPED_BY, STOPPED_BY_RESTART), ("stopped_by", "restart"));
     let by_restart = |event: &BoxEvent| {
-        event.data.get(STOPPED_BY).and_then(|v| v.as_str()) == Some(STOPPED_BY_RESTART)
+        event.data.get("stopped_by").and_then(|v| v.as_str()) == Some("restart")
     };
     manager
         .get_session(crate::box_manager::BoxKeyPredicate::Id(id))

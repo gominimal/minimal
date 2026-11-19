@@ -1639,7 +1639,10 @@ pub(crate) struct EndsAfter {
 
 /// The key of an `exited` event's `data` that names the stop half of a
 /// restart, and its value. The daemon writes them (`minimald`'s
-/// `STOPPED_BY` and `STOPPED_BY_RESTART`).
+/// `STOPPED_BY` and `STOPPED_BY_RESTART`). The two crates share no type for
+/// them, so the tests on both sides pin the same wire text:
+/// `restart_records_restart_reason_before_start` in `minimald` and
+/// `attach_ended_by_restart_names_restart_exit254` here.
 const STOPPED_BY: &str = "stopped_by";
 const STOPPED_BY_RESTART: &str = "restart";
 
