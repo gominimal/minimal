@@ -565,9 +565,8 @@ The script holds only what this host is missing from:
   the service it starts places the daemon in its leaf. An un-enrolled
   host does not need a source identity for it. The classifier translates
   nothing until an association adds the reserved addresses
-- membership of the `kvm` group, when the provider is the Linux VM provider,
-  or when no provider is named and `/dev/kvm` is there but does not open for
-  you
+- membership of the `kvm` group, for the Linux VM provider. A command that
+  does not name a provider also gets it where `/dev/kvm` does not open for you
 
 On macOS the step installs the box-name service's program in an app bundle,
 `/Library/PrivilegedHelperTools/Minimal.app`, that root owns. The service and
