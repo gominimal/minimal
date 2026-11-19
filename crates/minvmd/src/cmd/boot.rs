@@ -54,7 +54,7 @@ fn run_boot(foreground: bool) -> Result<()> {
     use crate::state::StateDir;
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
-    // unavailable (Linux: /dev/kvm). No-op on macOS.
+    // unavailable (Linux: /dev/kvm; macOS: kern.hv_support).
     crate::cmd::ensure_hypervisor_accessible()?;
 
     // Fail-fast: resolve paths before spawning anything. The UDS length
