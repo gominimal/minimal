@@ -310,12 +310,7 @@ pub(crate) async fn write_box_network(
     // entry and from `--vpn-network-names`.
     let vpn_network_names = stored_vpn_network_names(client, record.id).await;
     if json {
-        let mut document = Vec::new();
-        write_box_policy_json(&mut document, client, record, host_kind).await?;
-        let document = with_vpn_network_names(document, &vpn_network_names)?;
-        out.write_all(&document).context(OutputWriteError)?;
-        out.flush().context(OutputWriteError)?;
-        return Ok(());
+        return write_box_policy_json(out, client, record, host_kind, &vpn_network_names).await;
     }
     // The follow-up lookups go by the resolved id, so a box named by an id
     // prefix reaches the same box they do.
@@ -425,35 +420,6 @@ pub(crate) fn write_vpn_network_names(
     }
     out.flush().context(OutputWriteError)?;
     Ok(())
-}
-
-/// Adds `names` to the `min/v1/session-policy` document `document`, one
-/// JSON object on one line, as its last key, `vpn_network_names`
-/// (BCLI-024). The document is unchanged when `names` is empty. The key is
-/// added to the encoded text, so the other keys keep their order.
-///
-/// # Errors
-///
-/// Fails when `document` is not one JSON object on one line, or a name
-/// does not encode.
-pub(crate) fn with_vpn_network_names(
-    mut document: Vec<u8>,
-    names: &[String],
-) -> Result<Vec<u8>, anyhow::Error> {
-    if names.is_empty() {
-        return Ok(document);
-    }
-    anyhow::ensure!(
-        document.ends_with(b"}\n"),
-        "the session-policy document is not one JSON object on one line"
-    );
-    document.truncate(document.len() - 2);
-    let encoded =
-        serde_json_lenient::to_string(names).context("encoding the session-policy document")?;
-    let separator = if document.ends_with(b"{") { "" } else { "," };
-    document
-        .extend_from_slice(format!("{separator}\"vpn_network_names\":{encoded}}}\n").as_bytes());
-    Ok(document)
 }
 
 /// Writes the text form of a box's effective network policy: `policy` for a

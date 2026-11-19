@@ -674,6 +674,10 @@ struct PolicyJson<'a> {
     /// predates the fact, or a facts fetch that failed, also leaves.
     #[serde(skip_serializing_if = "no_shared_port_collisions")]
     shared_port_collisions: &'a [minimald_rpc::SharedPortCollision],
+    /// BCLI-024: the VPN networks the box's stored spec keeps, in its
+    /// order. Absent when the box keeps no names.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    vpn_network_names: &'a [String],
 }
 
 /// Serde helper: leave [`PolicyJson::shared_port_collisions`] out when empty.
@@ -749,6 +753,7 @@ pub fn write_policy_json(
         live,
         shared_port_collisions,
         &[],
+        &[],
     )
 }
 
@@ -768,6 +773,7 @@ pub fn write_policy_json_noting(
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     unaudited_listen_ports: &[u16],
+    vpn_network_names: &[String],
 ) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
     // note is prose for a person, so the document carries the schema, the
@@ -787,6 +793,7 @@ pub fn write_policy_json_noting(
             live_ingress: None,
             unaudited_listen_ports: &[],
             shared_port_collisions: &[],
+            vpn_network_names,
         }
     } else {
         // The baseline set is a switch-fabric surface, held to the same
@@ -848,6 +855,7 @@ pub fn write_policy_json_noting(
             } else {
                 shared_port_collisions
             },
+            vpn_network_names,
         }
     };
     let encoded =
@@ -1067,6 +1075,7 @@ pub(crate) async fn write_box_policy_json(
     client: &mut client::Client,
     record: &boxes::Record,
     host_kind: paths::HostKind,
+    vpn_network_names: &[String],
 ) -> Result<(), anyhow::Error> {
     let (policy, live, unaudited_listen_ports, shared_port_collisions) =
         box_policy_json_inputs(client, record)
@@ -1086,6 +1095,7 @@ pub(crate) async fn write_box_policy_json(
         live,
         &shared_port_collisions,
         &unaudited_listen_ports,
+        vpn_network_names,
     )
     .context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
@@ -1103,7 +1113,14 @@ pub(crate) async fn box_policy_as_json(
         Err(failure) => return Err(failure.machine_failure().into()),
     };
     let mut out = std::io::stdout();
-    write_box_policy_json(&mut out, &mut client, &record, daemon_host_kind(global)).await
+    write_box_policy_json(
+        &mut out,
+        &mut client,
+        &record,
+        daemon_host_kind(global),
+        &[],
+    )
+    .await
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy
@@ -1686,6 +1703,7 @@ mod tests {
                 Ok(Vec::new()),
                 &[],
                 &[],
+                &[],
             )
             .unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
@@ -2037,6 +2055,7 @@ mod tests {
                 Ok(Vec::new()),
                 &[],
                 ports,
+                &[],
             )
             .unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()

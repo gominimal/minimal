@@ -23015,7 +23015,56 @@ async fn vpn_network_names_kept_and_flag_adds() {
         serde_json_lenient::from_slice(&out).expect("one JSON document");
     assert_eq!(document["schema"], POLICY_JSON_SCHEMA, "{document}");
     assert_eq!(document["vpn_network_names"], both, "{document}");
-    assert!(out.ends_with(b"]}\n"), "one line: {document}");
+
+    // A box that keeps no names has no `vpn_network_names` key, and no
+    // text rows.
+    let bare = tempfile::tempdir().unwrap();
+    let bare_root = camino::Utf8Path::from_path(bare.path()).unwrap();
+    let start = parsed_start(&["min", "box", "start"]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &start_entries("[sessions.default]\n"), true)
+            .expect("the start is planned")
+    else {
+        panic!("the default entry is a session");
+    };
+    let request = planned_session_request(&args, &options, bare_root);
+    let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+        minimald_rpc::Errorable::Ok(created) => created.id,
+        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+    };
+    let record = stored_box_record(&mut client, id)
+        .await
+        .expect("the record is read")
+        .expect("the host has the box");
+    let mut out = Vec::new();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        paths::HostKind::Minimald,
+        false,
+    )
+    .await
+    .expect("the policy is shown");
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("vpn networks"), "{text}");
+    let mut out = Vec::new();
+    write_box_network(
+        &mut out,
+        &mut client,
+        &record,
+        paths::HostKind::Minimald,
+        true,
+    )
+    .await
+    .expect("the document is written");
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&out).expect("one JSON document");
+    assert_eq!(document["schema"], POLICY_JSON_SCHEMA, "{document}");
+    assert!(
+        document.get("vpn_network_names").is_none(),
+        "no names, no key: {document}"
+    );
 }
 
 /// Creates the box of `argv` from [`DECLARED_EXPORTS_FILE`] on a harness
