@@ -1513,7 +1513,10 @@ mod tests {
                 2,
             ),
             (
-                minimal::BoxExecRefusal::NetworkRulesNotApplied { target },
+                minimal::BoxExecRefusal::NetworkRulesNotApplied {
+                    target,
+                    cause: "Permission denied (os error 13)".to_string(),
+                },
                 5,
             ),
         ] {

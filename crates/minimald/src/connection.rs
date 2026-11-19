@@ -914,7 +914,7 @@ async fn dial_in_box(
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let child = match tokio::process::Command::from(command)
         .kill_on_drop(true)
         .spawn()
@@ -996,10 +996,19 @@ impl ChildStdio {
     }
 }
 
-/// Reaps the in-box dial's injected `child` and logs how it ended, so a
-/// forward whose channel closes at once has a cause in the daemon's log.
-/// The child is killed when the returned sender is dropped, if it has not
-/// ended by then. The handle ends once the child is reaped.
+/// How much of the in-box dial's stderr the daemon keeps for its log line.
+/// The rest is read and dropped, so the dial never blocks on a full pipe.
+const IN_BOX_DIAL_STDERR_KEPT: usize = 4096;
+
+/// How long the watcher waits for the in-box dial's stderr to close once
+/// the dial is reaped. A process the dial left behind can hold it open.
+const IN_BOX_DIAL_STDERR_WAIT: Duration = Duration::from_secs(1);
+
+/// Reaps the in-box dial's injected `child` and logs how it ended, with
+/// what it wrote to its stderr, so a forward whose channel closes at once
+/// has a cause in the daemon's log. The child is killed when the returned
+/// sender is dropped, if it has not ended by then. The handle ends once the
+/// child is reaped.
 fn watch_in_box_dial(
     mut child: tokio::process::Child,
     host: String,
@@ -1009,6 +1018,18 @@ fn watch_in_box_dial(
     tokio::task::JoinHandle<()>,
 ) {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let stderr = child.stderr.take().map(|mut stderr| {
+        crate::traced::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut kept = Vec::new();
+            let mut buf = [0u8; 1024];
+            while let Ok(read @ 1..) = stderr.read(&mut buf).await {
+                let room = IN_BOX_DIAL_STDERR_KEPT.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..read.min(room)]);
+            }
+            kept
+        })
+    });
     let watcher = crate::traced::spawn(async move {
         let status = tokio::select! {
             biased;
@@ -1020,16 +1041,37 @@ fn watch_in_box_dial(
                 child.wait().await
             }
         };
-        log_in_box_dial_end(&host, port, status);
+        let stderr = match stderr {
+            Some(reader) => {
+                let abort = reader.abort_handle();
+                match tokio::time::timeout(IN_BOX_DIAL_STDERR_WAIT, reader).await {
+                    Ok(Ok(kept)) => kept,
+                    Ok(Err(_)) => Vec::new(),
+                    Err(_) => {
+                        abort.abort();
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+        let stderr = String::from_utf8_lossy(&stderr);
+        log_in_box_dial_end(&host, port, status, stderr.trim_end());
     });
     (stop, watcher)
 }
 
-/// The log line for how the in-box dial to `host`:`port` ended. The two
-/// exit codes the injection shim leaves with when it cannot join the box's
-/// classifier leaf are warnings: the dial never ran. Any other failure is
-/// the relay's own.
-fn log_in_box_dial_end(host: &str, port: u16, status: std::io::Result<std::process::ExitStatus>) {
+/// The log line for how the in-box dial to `host`:`port` ended, with what
+/// it wrote to its `stderr`. The two exit codes the injection shim leaves
+/// with when it cannot join the box's classifier leaf are warnings: the
+/// dial never ran, and `stderr` is the shim's line that says why. Any other
+/// failure is the relay's own.
+fn log_in_box_dial_end(
+    host: &str,
+    port: u16,
+    status: std::io::Result<std::process::ExitStatus>,
+    stderr: &str,
+) {
     use minimald_rpc::exec::{INJECTION_BOX_STOPPED_EXIT, INJECTION_UNPLACED_EXIT};
     let status = match status {
         Ok(status) => status,
@@ -1043,6 +1085,7 @@ fn log_in_box_dial_end(host: &str, port: u16, status: std::io::Result<std::proce
             host,
             port,
             exit_code = code,
+            stderr,
             "direct-tcpip: the in-box dial did not run: the box's classifier leaf is gone, \
              so the box stopped"
         ),
@@ -1050,16 +1093,18 @@ fn log_in_box_dial_end(host: &str, port: u16, status: std::io::Result<std::proce
             host,
             port,
             exit_code = code,
+            stderr,
             "direct-tcpip: the in-box dial did not run: it could not join the box's \
              classifier leaf"
         ),
         Some(0) | None => {
-            tracing::debug!(host, port, %status, "direct-tcpip: the in-box dial ended")
+            tracing::debug!(host, port, %status, stderr, "direct-tcpip: the in-box dial ended")
         }
         Some(code) => tracing::info!(
             host,
             port,
             exit_code = code,
+            stderr,
             "direct-tcpip: the in-box dial exited with a failure"
         ),
     }
@@ -1117,9 +1162,35 @@ fn attach_refusal_line(cause: &impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A stand-in in-box dial that writes `line` to its stderr and exits
+    /// with `code`, with its stdio piped as `dial_in_box` pipes it.
+    fn stand_in_dial(line: &str, code: u8) -> tokio::process::Child {
+        use std::process::Stdio;
+        tokio::process::Command::new("/bin/sh")
+            .args(["-c", &format!("echo '{line}' >&2; exit {code}")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawning a stand-in dial")
+    }
+
+    /// Whether `logged` has one warning for the dial to `port` that names
+    /// `cause`, the exit code `code`, and the dial's stderr `line`.
+    fn warned(logged: &str, port: u16, cause: &str, code: u8, line: &str) -> bool {
+        logged.lines().any(|logged| {
+            logged.contains("WARN")
+                && logged.contains(cause)
+                && logged.contains(&format!("port={port}"))
+                && logged.contains(&format!("exit_code={code}"))
+                && logged.contains(line)
+        })
+    }
+
     /// An in-box dial whose injection could not join the box's classifier
-    /// leaf ends at once. The daemon logs why, with the exit code, so the
-    /// forward that closed has a cause in its log.
+    /// leaf ends at once. The daemon logs why, with the exit code and the
+    /// line the dial wrote to its stderr, so the forward that closed has a
+    /// cause in its log.
     #[tokio::test]
     async fn an_in_box_dial_that_did_not_run_is_logged_with_its_exit_code() {
         let log = crate::test_harness::captured_log();
@@ -1135,21 +1206,35 @@ mod tests {
                 "so the box stopped",
             ),
         ] {
-            let child = tokio::process::Command::new("/bin/sh")
-                .args(["-c", &format!("exit {code}")])
-                .spawn()
-                .expect("spawning a stand-in dial");
+            let line = format!("stand-in dial stderr for port {port}");
+            let child = stand_in_dial(&line, code);
             let (_stop, watcher) = super::watch_in_box_dial(child, "127.0.0.1".to_string(), port);
             watcher.await.expect("the watcher reaps the dial");
             let logged = log.contents();
             assert!(
-                logged.lines().any(|line| line.contains("WARN")
-                    && line.contains(cause)
-                    && line.contains(&format!("port={port}"))
-                    && line.contains(&format!("exit_code={code}"))),
-                "one warning names the cause and the exit code: {logged}"
+                warned(&logged, port, cause, code, &line),
+                "one warning names the cause, the exit code and the stderr: {logged}"
             );
         }
+    }
+
+    /// The forward's box-side half hands its dial to the watcher, so a dial
+    /// that ends at once is logged while the forward still holds it.
+    #[tokio::test]
+    async fn the_forward_s_box_side_half_watches_its_dial() {
+        let log = crate::test_harness::captured_log();
+        let code = minimald_rpc::exec::INJECTION_UNPLACED_EXIT;
+        let port = 40_503;
+        let line = format!("stand-in dial stderr for port {port}");
+        let _held = super::ChildStdio::new(stand_in_dial(&line, code), "127.0.0.1", port);
+        let cause = "could not join the box's classifier leaf";
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !warned(&log.contents(), port, cause, code, &line) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the dial's end is logged: {}", log.contents()));
     }
 
     /// An attach refusal sends an exit status, so the client's ssh never

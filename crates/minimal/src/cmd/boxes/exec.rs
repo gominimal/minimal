@@ -569,13 +569,19 @@ fn reads_as_refusal(chunk: &[u8]) -> bool {
         && (text.ends_with(NOT_RUNNING_TAIL)
             || text.contains(EXEC_DISABLED_MARK)
             || text.contains(SPEC_UNREADABLE_MARK));
-    refused_by_box || text == INJECTION_BOX_STOPPED_TEXT || reads_as_unplaced(&text)
+    refused_by_box || text == INJECTION_BOX_STOPPED_TEXT || unplaced_cause(&text).is_some()
 }
 
-/// Whether `text` is the one line the daemon's injection prints when the
-/// box's network rules could not be applied to the command.
-fn reads_as_unplaced(text: &str) -> bool {
-    text.starts_with(INJECTION_UNPLACED_TEXT) && text.lines().count() == 1
+/// The error the join met, from the one line the daemon's injection prints
+/// when the box's network rules could not be applied to the command
+/// (`<INJECTION_UNPLACED_TEXT> (<error>).`), or `None` when `text` is not
+/// that line.
+fn unplaced_cause(text: &str) -> Option<&str> {
+    let cause = text
+        .strip_prefix(INJECTION_UNPLACED_TEXT)?
+        .strip_prefix(" (")?
+        .strip_suffix(").\n")?;
+    (!cause.is_empty() && !cause.contains('\n')).then_some(cause)
 }
 
 /// The state word in the daemon's text `box <label> is <state>. Only a
@@ -604,8 +610,11 @@ fn exec_refusal(target: &str, status: u32, held: &[u8]) -> Option<BoxExecRefusal
         {
             Some(BoxExecRefusal::StoppedBeforeStart { target })
         }
-        code if code == u32::from(INJECTION_UNPLACED_EXIT) && reads_as_unplaced(&text) => {
-            Some(BoxExecRefusal::NetworkRulesNotApplied { target })
+        code if code == u32::from(INJECTION_UNPLACED_EXIT) => {
+            unplaced_cause(&text).map(|cause| BoxExecRefusal::NetworkRulesNotApplied {
+                target,
+                cause: cause.to_owned(),
+            })
         }
         _ => None,
     }

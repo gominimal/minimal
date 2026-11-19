@@ -12015,8 +12015,9 @@ async fn box_exec_runs_command_and_exits_with_its_code() {
 // NET-079: an exec whose injection could not join the box's classifier leaf
 // never ran its command. The daemon's one line and exit code become the
 // CLI's own refusal: exit 2 when the box stopped before the command
-// started, exit 5 when the box's network rules could not be applied to it.
-// The same line under another exit code is the command's own stderr.
+// started, exit 5 when the box's network rules could not be applied to it,
+// with the error the host met and `min bug` as the next step. The same line
+// under another exit code is the command's own stderr.
 #[tokio::test]
 async fn box_exec_reports_an_injection_that_never_started_as_a_refusal() {
     use minimald_rpc::exec::{INJECTION_BOX_STOPPED_TEXT, INJECTION_UNPLACED_TEXT};
@@ -12032,7 +12033,8 @@ async fn box_exec_reports_an_injection_that_never_started_as_a_refusal() {
             unplaced.clone(),
             5,
             "Did not run the command in web: the host could not apply the box's network \
-             rules to it.",
+             rules to it (Permission denied (os error 13)). If it keeps failing, run \
+             `min bug` to collect a diagnostic bundle.",
         ),
     ] {
         let (run, _) = run_scripted_exec(

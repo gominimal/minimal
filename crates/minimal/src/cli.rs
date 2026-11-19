@@ -937,6 +937,8 @@ pub enum BoxExecRefusal {
     NetworkRulesNotApplied {
         /// The box as the user named it.
         target: String,
+        /// The error the host met, as the daemon's injection reported it.
+        cause: String,
     },
 }
 
@@ -994,10 +996,11 @@ impl std::fmt::Display for BoxExecRefusal {
             Self::StoppedBeforeStart { target } => {
                 write!(f, "{target} stopped before the command started.")
             }
-            Self::NetworkRulesNotApplied { target } => write!(
+            Self::NetworkRulesNotApplied { target, cause } => write!(
                 f,
                 "Did not run the command in {target}: the host could not apply the \
-                 box's network rules to it."
+                 box's network rules to it ({cause}). If it keeps failing, run \
+                 `min bug` to collect a diagnostic bundle."
             ),
         }
     }

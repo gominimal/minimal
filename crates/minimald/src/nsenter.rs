@@ -686,7 +686,10 @@ fn join_classifier_leaf(leaf: &sandbox::config::ClassifierLeaf) -> std::io::Resu
 
 /// The line the shim prints and the exit code it leaves with when it cannot
 /// join the box's classifier leaf (NET-079). A leaf that is not there is a
-/// box that stopped: the leaf goes with the box. Any other error is a
+/// box that stopped: the leaf goes with the box. The open of its
+/// `cgroup.procs` then fails with `ENOENT`, and a write through a file the
+/// shim opened before the leaf was removed fails with `ENODEV` (the kernel
+/// refuses a write to a removed cgroup file that way). Any other error is a
 /// refusal: the box's network rules would not apply to the program, so it
 /// never runs. Both lines are ones `min box exec` reads as a refusal.
 fn join_refusal(source: &std::io::Error) -> (String, i32) {
@@ -694,7 +697,8 @@ fn join_refusal(source: &std::io::Error) -> (String, i32) {
         INJECTION_BOX_STOPPED_EXIT, INJECTION_BOX_STOPPED_TEXT, INJECTION_UNPLACED_EXIT,
         INJECTION_UNPLACED_TEXT,
     };
-    if source.kind() == std::io::ErrorKind::NotFound {
+    if source.kind() == std::io::ErrorKind::NotFound || source.raw_os_error() == Some(libc::ENODEV)
+    {
         return (
             INJECTION_BOX_STOPPED_TEXT.to_string(),
             i32::from(INJECTION_BOX_STOPPED_EXIT),
@@ -1825,20 +1829,24 @@ mod tests {
     }
 
     /// NET-079: a leaf that is gone reads as a box that stopped, with the
-    /// exit code of a box that is not running. Any other failed join is a
-    /// refusal with an exit code of its own, never the 1 a failed command
-    /// leaves with, and its line names the error. Each is one line.
-    /// `nsenter_integration` drives the shim itself.
+    /// exit code of a box that is not running: `ENOENT` when the leaf was
+    /// gone at the open, `ENODEV` when it went between the open and the
+    /// write. Any other failed join is a refusal with an exit code of its
+    /// own, never the 1 a failed command leaves with, and its line names the
+    /// error. Each is one line. `nsenter_integration` drives the shim itself.
     #[test]
     fn a_failed_leaf_join_is_one_line_and_an_exit_code_of_its_own() {
-        let gone = std::io::Error::from_raw_os_error(libc::ENOENT);
-        assert_eq!(
-            join_refusal(&gone),
-            (
-                "The box stopped before the command started.\n".to_string(),
-                2
-            )
-        );
+        for errno in [libc::ENOENT, libc::ENODEV] {
+            let gone = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                join_refusal(&gone),
+                (
+                    "The box stopped before the command started.\n".to_string(),
+                    2
+                ),
+                "errno {errno}"
+            );
+        }
         for errno in [libc::EACCES, libc::EPERM, libc::EBUSY] {
             let source = std::io::Error::from_raw_os_error(errno);
             let (line, code) = join_refusal(&source);
