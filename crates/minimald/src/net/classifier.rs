@@ -9723,8 +9723,11 @@ mod tests {
             "the firewalld rule uses bit 0x10000000: {both}"
         );
         let mount_unknown = standin_mount();
-        let refused_unknown =
-            run_install_with(&mount_unknown, &["--ct-mark-mask", "0xc0000000"], tools.path());
+        let refused_unknown = run_install_with(
+            &mount_unknown,
+            &["--ct-mark-mask", "0xc0000000"],
+            tools.path(),
+        );
         let unknown = said(&refused_unknown);
         assert!(!refused_unknown.status.success(), "{unknown}");
         assert!(
