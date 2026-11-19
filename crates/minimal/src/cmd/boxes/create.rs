@@ -2613,7 +2613,9 @@ pub(crate) fn proxy_absence(
         // The text names the log only when the host daemon wrote it.
         Ok(path) if path.exists() => {
             let log = log.filter(|log| log.exists());
-            let last_error = log.as_deref().and_then(crate::mint::last_error_line);
+            let last_error = log
+                .as_deref()
+                .and_then(|log| crate::mint::last_error_line(log, control));
             ProxyAbsence::NotAnswering {
                 path,
                 log,

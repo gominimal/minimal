@@ -6625,11 +6625,25 @@ mod mint_tests {
         drop(std::os::unix::net::UnixListener::bind(&control).unwrap());
         assert!(control.exists());
         assert!(!crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        // The log's records are stamped from the time the socket was made,
+        // the start of the run that left it.
+        let made = std::fs::symlink_metadata(&control)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let at =
+            |secs: u64| crate::mint::run_start_stamp(made + std::time::Duration::from_secs(secs));
+        let before = crate::mint::run_start_stamp(made - std::time::Duration::from_secs(3600));
         std::fs::write(
             &log,
-            "2026-11-19T10:00:00Z  INFO bep::serve: listening\n\
-             2026-11-19T10:00:01Z \u{1b}[31mERROR\u{1b}[0m bep::serve: the TPM key was not read\n\
-             \n",
+            format!(
+                "{before}.000001Z ERROR bep::serve: an earlier run's failure\n\
+                 {}.000001Z  INFO bep::serve: listening\n\
+                 {}.000001Z \u{1b}[31mERROR\u{1b}[0m bep::serve: the TPM key was not read\n\
+                 \n",
+                at(0),
+                at(1)
+            ),
         )
         .unwrap();
         let reason = "bep::serve: the TPM key was not read";
@@ -6697,7 +6711,7 @@ mod mint_tests {
         )
         .unwrap();
         assert_eq!(
-            crate::mint::last_error_line(&log).as_deref(),
+            crate::mint::last_error_line(&log, None).as_deref(),
             Some("bep did not start, because it did not find your home directory.")
         );
         // The log keeps earlier runs. An error that a later record follows
@@ -6708,7 +6722,7 @@ mod mint_tests {
              2026-11-19T10:00:00Z  INFO bep::serve: listening\n",
         )
         .unwrap();
-        assert_eq!(crate::mint::last_error_line(&log), None);
+        assert_eq!(crate::mint::last_error_line(&log, None), None);
         // Lines with no level after a record: the first one is quoted, not
         // the tail of a backtrace.
         std::fs::write(
@@ -6719,19 +6733,54 @@ mod mint_tests {
         )
         .unwrap();
         assert_eq!(
-            crate::mint::last_error_line(&log).as_deref(),
+            crate::mint::last_error_line(&log, None).as_deref(),
             Some("bep stopped serving: the listener closed")
         );
-        // An ERROR record keeps its own text when a wrapped line follows it.
+        // An ERROR record takes the lines with no level after it as part
+        // of it, so a multi-line error is quoted whole.
         std::fs::write(
             &log,
             "2026-11-19T10:00:00Z ERROR bep::serve: the TPM key was not read\n\
+             \x20\x20\x20\x20caused by: the device is busy\n\
              \x20\x20\x20\x20at crates/bep/src/tpm.rs:10\n",
         )
         .unwrap();
         assert_eq!(
-            crate::mint::last_error_line(&log).as_deref(),
-            Some("bep::serve: the TPM key was not read")
+            crate::mint::last_error_line(&log, None).as_deref(),
+            Some(
+                "bep::serve: the TPM key was not read caused by: the device is busy \
+                 at crates/bep/src/tpm.rs:10"
+            )
+        );
+        // Only the run that left the socket counts. An ERROR from an earlier
+        // run, followed by INFO lines from a later start, is not quoted.
+        std::fs::write(
+            &log,
+            format!(
+                "{before}.000001Z ERROR bep::serve: an earlier run's failure\n\
+                 {}.000001Z  INFO bep::serve: listening\n\
+                 {}.000001Z  INFO bep::serve: holds the secret-store rules\n",
+                at(0),
+                at(1)
+            ),
+        )
+        .unwrap();
+        assert_eq!(crate::mint::last_error_line(&log, Some(&control)), None);
+        // An ERROR from an earlier run that ends the log, with nothing from
+        // this run after it, is not quoted either.
+        std::fs::write(
+            &log,
+            format!(
+                "{before}.000001Z ERROR bep::serve: an earlier run's failure\n\
+                 \x20\x20\x20\x20caused by: an old cause\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(crate::mint::last_error_line(&log, Some(&control)), None);
+        assert_eq!(
+            crate::mint::last_error_line(&log, None).as_deref(),
+            Some("bep::serve: an earlier run's failure caused by: an old cause"),
+            "with no socket the start is not known"
         );
         // With no log file, the text names no log and still gives the
         // restart step.

@@ -91,16 +91,24 @@ const LOG_TAIL_BYTES: u64 = 64 * 1024;
 const ERROR_LINE_CHARS: usize = 300;
 
 /// The error that ends the proxy's log at `log`, or `None` when the file
-/// is not read or does not end in an error. Only the end of the log
-/// counts, because `bep.log` keeps the records of earlier runs. When the
-/// last `tracing` record is an `ERROR`, its text after the level is kept,
-/// and lines with no level after it are taken as part of it. After any
-/// other record, lines with no level are what `bep` printed when it
-/// stopped, and the first of them is kept, so the tail of a backtrace is
-/// not quoted. An `INFO`, `WARN`, `DEBUG` or `TRACE` record with no such
-/// lines after it gives `None`: an error before it did not stop the proxy. Colour codes are removed, and other control
-/// characters are escaped.
-pub(crate) fn last_error_line(log: &Path) -> Option<String> {
+/// is not read or this run of the proxy did not end in an error.
+///
+/// `bep.log` keeps the records of earlier runs, so only the end of the
+/// log counts. When `control` is the socket file that the last `bep serve`
+/// made as it started to listen, its modification time is where that run
+/// starts: records time-stamped before it, and the lines before the first
+/// record after it, belong to earlier runs and are not read. With no such
+/// file, the start is not known, and only the end-of-log rule applies.
+///
+/// When the last `tracing` record is an `ERROR`, its text after the level
+/// is kept, with the lines with no level after it as part of it, joined by
+/// spaces. After any other record, lines with no level are what `bep`
+/// printed when it stopped, and the first of them is kept, so the tail of
+/// a backtrace is not quoted. An `INFO`, `WARN`, `DEBUG` or `TRACE` record
+/// with no such lines after it gives `None`: an error before it did not
+/// stop the proxy. Colour codes are removed, and other control characters
+/// are escaped.
+pub(crate) fn last_error_line(log: &Path, control: Option<&Path>) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(log).ok()?;
     let len = file.metadata().ok()?.len();
@@ -109,7 +117,11 @@ pub(crate) fn last_error_line(log: &Path) -> Option<String> {
     let mut tail = Vec::new();
     file.read_to_end(&mut tail).ok()?;
     let tail = String::from_utf8_lossy(&tail);
-    let line = final_error(&tail)?;
+    let since = control
+        .and_then(|control| std::fs::symlink_metadata(control).ok())
+        .and_then(|meta| meta.modified().ok())
+        .map(run_start_stamp);
+    let line = final_error(&tail, since.as_deref())?;
     let line: String = line
         .chars()
         .flat_map(|c| {
@@ -124,29 +136,70 @@ pub(crate) fn last_error_line(log: &Path) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// The length of a `tracing` time stamp to the second:
+/// `YYYY-MM-DDTHH:MM:SS`.
+const STAMP_LEN: usize = 19;
+
+/// `at` in UTC to the second, in the form that starts a `tracing` record,
+/// so the two compare as strings.
+pub(crate) fn run_start_stamp(at: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(at)
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string()
+}
+
+/// The time stamp, to the second, that starts `line`, when it has one.
+fn record_stamp(line: &str) -> Option<&str> {
+    let word = line.split_whitespace().next()?;
+    let stamp = word.get(..STAMP_LEN)?;
+    let shape = stamp.bytes().enumerate().all(|(i, b)| match i {
+        4 | 7 => b == b'-',
+        10 => b == b'T',
+        13 | 16 => b == b':',
+        _ => b.is_ascii_digit(),
+    });
+    shape.then_some(stamp)
+}
+
 /// The error that ends `tail`, a run of log lines, as [`last_error_line`]
-/// describes it, before its characters are escaped.
-fn final_error(tail: &str) -> Option<String> {
+/// describes it, before its characters are escaped. `since` is the start
+/// of this run as [`run_start_stamp`] gives it: the lines before the first
+/// record stamped at or after it are not read, and with no such record
+/// nothing is.
+fn final_error(tail: &str, since: Option<&str>) -> Option<String> {
     const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
-    // The first line with no level after the last record, seen so far.
-    let mut printed: Option<String> = None;
-    for line in tail.lines().rev() {
-        let line = strip_ansi(line);
-        let words: Vec<&str> = line.split_whitespace().take(3).collect();
-        if words.is_empty() {
-            continue;
-        }
-        match words.iter().find(|word| LEVELS.contains(word)) {
-            Some(&"ERROR") => {
-                return line
-                    .split_once("ERROR")
-                    .map(|(_, rest)| rest.trim().to_owned());
-            }
-            Some(_) => return printed,
-            None => printed = Some(line.trim().to_owned()),
-        }
+    let lines: Vec<String> = tail
+        .lines()
+        .map(strip_ansi)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let start = match since {
+        Some(since) => lines
+            .iter()
+            .position(|line| record_stamp(line).is_some_and(|stamp| stamp >= since))?,
+        None => 0,
+    };
+    let lines = &lines[start..];
+    let level = |line: &str| {
+        line.split_whitespace()
+            .take(3)
+            .find(|word| LEVELS.contains(word))
+            .map(str::to_owned)
+    };
+    let last = lines.iter().rposition(|line| level(line).is_some());
+    let Some(last) = last else {
+        return lines.first().map(|line| line.trim().to_owned());
+    };
+    let after = &lines[last + 1..];
+    if level(&lines[last]).as_deref() == Some("ERROR") {
+        let (_, text) = lines[last].split_once("ERROR")?;
+        let parts: Vec<&str> = std::iter::once(text.trim())
+            .chain(after.iter().map(|line| line.trim()))
+            .filter(|part| !part.is_empty())
+            .collect();
+        return Some(parts.join(" "));
     }
-    printed
+    after.first().map(|line| line.trim().to_owned())
 }
 
 /// `line` with its ANSI colour sequences (`ESC [ ... letter`) removed.
@@ -293,7 +346,7 @@ impl MintError {
         match self {
             Self::NotRunning { path, error, .. } => {
                 let log = log.filter(|log| log.exists());
-                let last_error = log.and_then(last_error_line);
+                let last_error = log.and_then(|log| last_error_line(log, Some(&path)));
                 Self::NotRunning {
                     path,
                     error,
