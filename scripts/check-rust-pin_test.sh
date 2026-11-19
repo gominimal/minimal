@@ -5,7 +5,9 @@
 #
 # The fixture cases serve a fake pkgs tree over file://, so they need no
 # network. The last case checks the real checkout against the real pkgs
-# commit; off CI it skips when GitHub is unreachable, on CI (CI set) it fails.
+# commit; it skips when GitHub is unreachable, except on GitHub Actions
+# (GITHUB_ACTIONS set), where it fails. Not CI: a sandbox with no network,
+# such as the agent runtime's verify box, must not fail on the fetch.
 # Run directly or via `just test-shell`.
 
 set -euo pipefail
@@ -61,8 +63,8 @@ got=0
 "$script" "$here/.." >"$root/out" 2>&1 || got=$?
 if [ "$got" = 0 ]; then
     ok "this tree: $(cat "$root/out")"
-elif [ "$got" = 2 ] && [ -z "${CI:-}" ]; then
-    echo "skip - this tree: pkgs unreachable off CI: $(cat "$root/out")"
+elif [ "$got" = 2 ] && [ -z "${GITHUB_ACTIONS:-}" ]; then
+    echo "skip - this tree: pkgs unreachable off GitHub Actions: $(cat "$root/out")"
 else
     bad "this tree: $(cat "$root/out")"
 fi
