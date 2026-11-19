@@ -22812,8 +22812,9 @@ const DECLARED_EXPORTS_FILE: &str = "[tasks.build]\nexec = [\"make\"]\n\n\
     [[sessions.dev.file_exports]]\npath = \"notes.md\"\n";
 
 /// The stored spec of a run of `argv`, `min task run build` or `min box run
-/// build`, built as `task::run_entry` builds it: the declared task's spec,
-/// then the expansion's exports from the task entry.
+/// build`, built as `task::run_entry` builds it, through
+/// `task::put_task_spec`: the declared task's spec, the expansion's exports
+/// from the task entry, then any `--vpn-network-names` values.
 fn run_spec(project: &std::path::Path, argv: &[&str]) -> serde_json_lenient::Value {
     let root = camino::Utf8Path::from_path(project).unwrap();
     let run = parsed_run(argv);
@@ -22834,9 +22835,42 @@ fn run_spec(project: &std::path::Path, argv: &[&str]) -> serde_json_lenient::Val
     let expanded = crate::task_box_entry(root, &run.entry, true)
         .expect("the task entry expands")
         .expect("the project declares the task");
-    task::take_expanded_exports(&mut spec, &expanded.spec);
-    crate::put_spec(&mut request, &spec).expect("the spec encodes");
+    task::put_task_spec(
+        &mut request,
+        &run.entry,
+        Some(&mut spec),
+        Some(&expanded.spec),
+        &run.other.vpn_network_names,
+    )
+    .expect("the spec encodes");
     request.spec.expect("the run stores a spec")
+}
+
+// BOX-203, BCLI-024: `min task run --vpn-network-names corp build` stores a
+// spec with both the names and the task's declared export. The exports go
+// on the spec before it is stored, so the names stay.
+#[test]
+fn task_run_stores_vpn_network_names_with_declared_file_exports() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        DECLARED_EXPORTS_FILE,
+    )
+    .unwrap();
+    let spec = run_spec(
+        project.path(),
+        &["min", "task", "run", "--vpn-network-names", "corp", "build"],
+    );
+    assert_eq!(
+        cmd::stored_export_paths(&spec),
+        ["out/report.txt"],
+        "the stored spec declares the export: {spec}"
+    );
+    assert_eq!(
+        spec["network"]["vpn_network_names"],
+        serde_json_lenient::json!(["corp"]),
+        "the stored spec keeps the names: {spec}"
+    );
 }
 
 /// Creates the box of `argv` from [`DECLARED_EXPORTS_FILE`] on a harness
