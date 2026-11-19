@@ -541,7 +541,7 @@ PAR_OWN_SEED_DIR="" # its own-address target box's seed; removed on teardown
 PAR_CALLER_SEED_DIR="" # its denied-caller box's seed; removed on teardown
 RECOVER_SEED_DIR="" # the hostnames-recovery proof's seed; removed on teardown
 SECOND_SEED_DIR="" # its second-daemon box's seed; removed on teardown
-RECOVER_STATE2_DIR="" # the second daemon's state base; `mnl2 stop` on teardown
+RECOVER_STATE2_DIR="" # the second daemon's state base; `mnl2 host stop` on teardown
 RECOVER_HOLDER_PID="" # the port holder the recovery proof starts; killed
 RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
@@ -13636,7 +13636,7 @@ proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
 
   # The stand-in is a daemon-side flag: the daemon this case's activation
   # autospawns must inherit it, so stop whatever daemon an earlier case left
-  # on this host — both of the pair, the session daemon `mnl stop` reaches
+  # on this host — both of the pair, the session daemon `mnl host stop` reaches
   # and, on a VM lane, the host daemon `minvmd stop`, the one whose
   # environment the flag must reach — and let the activation below spawn one
   # carrying it, the same discipline the proxy-source and credentialed-lane
@@ -32177,8 +32177,8 @@ for row in lines:
   TWO_VM_FWD_PID=""
 
   # ---- a name no VM holds -------------------------------------------------
-  # NET-058: this step and the stopped-VM step below stay on
-  # `min session policy`. `min box show` answers a box on a stopped VM as not
+  # NET-058: this step and the stopped-VM step below keep the old policy
+  # verb of `min session`. `min box show` answers a box on a stopped VM as not
   # found, and NET-058 refuses that answer. They move when a box verb gives
   # NET-058's refusal: gominimal/minimal#3589. Each line that names the verb
   # carries the marker that the test
