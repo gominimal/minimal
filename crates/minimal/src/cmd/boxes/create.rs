@@ -5869,7 +5869,8 @@ mod tests {
 
         // A create under the fixed name is not a fresh instance: a second
         // registration of the name a live registration holds is refused.
-        register("dev".to_string())
+        // The held registration's lease stays open while it is bound here.
+        let _held = register("dev".to_string())
             .await
             .expect("answered")
             .expect("registered");
