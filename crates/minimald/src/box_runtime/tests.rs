@@ -9250,3 +9250,70 @@ async fn stop_while_attached_ends_binding_without_shell_exit_prompt() {
         let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
     }
 }
+
+/// NET-079: an exec into a host-address box with a classifier leaf and a
+/// hook into it both join that leaf. The exec's command is the one the
+/// host builds for every injection, and the hook's commands carry the
+/// host's leaf and its host-address enforcement, so the hook takes the
+/// `host_ip` cohort's UDP 443 check as the exec does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exec_and_a_hook_into_a_placed_box_join_its_leaf() {
+    let (mut host, _handle) = Host::build(
+        MockLauncher::with_host_ip_enforcement(minimald_rpc::HostIpEnforcement::PerBox),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
+            ends_with_entrypoint: false,
+            session_id: boxes::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host");
+    let leaf = sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
+    host.leaf = Some(leaf.clone());
+
+    // A plain host process shares every namespace with us, so the join set
+    // is empty and nothing privileged is asked of the runner.
+    let mut hold = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawning a stand-in session leader");
+    let exec = host
+        .injected_command(crate::nsenter::Injection::new(
+            hold.id(),
+            "/bin/true",
+            Vec::<String>::new(),
+        ))
+        .expect("building the exec's command");
+    let hook = host.hook_commands(hold.id());
+    let _ = hold.kill();
+    let _ = hold.wait();
+
+    let argv: Vec<String> = exec
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let at = argv
+        .iter()
+        .position(|arg| arg == "--classifier-leaf")
+        .unwrap_or_else(|| panic!("an exec names the box's leaf to the shim: {argv:?}"));
+    assert_eq!(argv[at + 1], leaf.dir().to_string_lossy());
+
+    assert_eq!(hook.leaf, Some(leaf), "a hook joins the box's leaf");
+    assert!(
+        hook.host_ip_enforced,
+        "a hook into a host-address box takes the UDP 443 check"
+    );
+    assert_eq!(hook.box_id, host.session_id.to_string());
+}

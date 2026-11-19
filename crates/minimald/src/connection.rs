@@ -930,7 +930,7 @@ async fn dial_in_box(
             return Err(russh::ChannelOpenFailure::ConnectFailed);
         }
     };
-    Ok(ChildStdio::new(child))
+    Ok(ChildStdio::new(child, host, port))
 }
 
 /// The envp the in-box dial layers over the session's own variables.
@@ -973,24 +973,95 @@ const TEST_RELAY_PATH_VAR: &str = "MINIMALD_TEST_RELAY_PATH";
 /// relay process. Reads are the bytes the box port sent back; writes are the
 /// bytes being forwarded to it.
 ///
-/// The child is held — boxed, so this stays `Unpin` for [`relay_streams`] —
-/// because its drop is the kill: `kill_on_drop` on the injection shim, whose
-/// PDEATHSIG takes the in-box program with it. Never read on purpose.
+/// The child itself goes to [`watch_in_box_dial`], which reaps it and logs
+/// how it ended. Dropping this drops `_stop`, which kills the injection
+/// shim, whose PDEATHSIG takes the in-box program with it. Never read on
+/// purpose.
 struct ChildStdio {
     stdin: tokio::process::ChildStdin,
     stdout: tokio::process::ChildStdout,
-    _child: Pin<Box<tokio::process::Child>>,
+    _stop: tokio::sync::oneshot::Sender<()>,
 }
 
 impl ChildStdio {
-    fn new(mut child: tokio::process::Child) -> Self {
+    fn new(mut child: tokio::process::Child, host: &str, port: u16) -> Self {
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
+        let (stop, _) = watch_in_box_dial(child, host.to_string(), port);
         Self {
             stdin,
             stdout,
-            _child: Box::pin(child),
+            _stop: stop,
         }
+    }
+}
+
+/// Reaps the in-box dial's injected `child` and logs how it ended, so a
+/// forward whose channel closes at once has a cause in the daemon's log.
+/// The child is killed when the returned sender is dropped, if it has not
+/// ended by then. The handle ends once the child is reaped.
+fn watch_in_box_dial(
+    mut child: tokio::process::Child,
+    host: String,
+    port: u16,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let watcher = crate::traced::spawn(async move {
+        let status = tokio::select! {
+            biased;
+            status = child.wait() => status,
+            _ = stopped => {
+                // A child that ended on its own is not killed: its own
+                // status is the one reaped below.
+                let _ = child.start_kill();
+                child.wait().await
+            }
+        };
+        log_in_box_dial_end(&host, port, status);
+    });
+    (stop, watcher)
+}
+
+/// The log line for how the in-box dial to `host`:`port` ended. The two
+/// exit codes the injection shim leaves with when it cannot join the box's
+/// classifier leaf are warnings: the dial never ran. Any other failure is
+/// the relay's own.
+fn log_in_box_dial_end(host: &str, port: u16, status: std::io::Result<std::process::ExitStatus>) {
+    use minimald_rpc::exec::{INJECTION_BOX_STOPPED_EXIT, INJECTION_UNPLACED_EXIT};
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::warn!(host, port, %error, "direct-tcpip: cannot reap the in-box dial");
+            return;
+        }
+    };
+    match status.code() {
+        Some(code) if code == i32::from(INJECTION_BOX_STOPPED_EXIT) => tracing::warn!(
+            host,
+            port,
+            exit_code = code,
+            "direct-tcpip: the in-box dial did not run: the box's classifier leaf is gone, \
+             so the box stopped"
+        ),
+        Some(code) if code == i32::from(INJECTION_UNPLACED_EXIT) => tracing::warn!(
+            host,
+            port,
+            exit_code = code,
+            "direct-tcpip: the in-box dial did not run: it could not join the box's \
+             classifier leaf"
+        ),
+        Some(0) | None => {
+            tracing::debug!(host, port, %status, "direct-tcpip: the in-box dial ended")
+        }
+        Some(code) => tracing::info!(
+            host,
+            port,
+            exit_code = code,
+            "direct-tcpip: the in-box dial exited with a failure"
+        ),
     }
 }
 
@@ -1046,6 +1117,41 @@ fn attach_refusal_line(cause: &impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An in-box dial whose injection could not join the box's classifier
+    /// leaf ends at once. The daemon logs why, with the exit code, so the
+    /// forward that closed has a cause in its log.
+    #[tokio::test]
+    async fn an_in_box_dial_that_did_not_run_is_logged_with_its_exit_code() {
+        let log = crate::test_harness::captured_log();
+        for (code, port, cause) in [
+            (
+                minimald_rpc::exec::INJECTION_UNPLACED_EXIT,
+                40_501,
+                "could not join the box's classifier leaf",
+            ),
+            (
+                minimald_rpc::exec::INJECTION_BOX_STOPPED_EXIT,
+                40_502,
+                "so the box stopped",
+            ),
+        ] {
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .expect("spawning a stand-in dial");
+            let (_stop, watcher) = super::watch_in_box_dial(child, "127.0.0.1".to_string(), port);
+            watcher.await.expect("the watcher reaps the dial");
+            let logged = log.contents();
+            assert!(
+                logged.lines().any(|line| line.contains("WARN")
+                    && line.contains(cause)
+                    && line.contains(&format!("port={port}"))
+                    && line.contains(&format!("exit_code={code}"))),
+                "one warning names the cause and the exit code: {logged}"
+            );
+        }
+    }
+
     /// An attach refusal sends an exit status, so the client's ssh never
     /// ends with its transport status 255. A row that minvmd released keeps
     /// its text, and a refused resume keeps its own status.

@@ -309,19 +309,6 @@ pub enum NsenterError {
         source: nix::Error,
     },
 
-    /// The shim could not move itself into the box's classifier leaf before
-    /// joining its namespaces. The join is the one write that must precede
-    /// `setns` (see [`shim_main`]), and no verdict survives it failing: a
-    /// process left outside the leaf runs in the daemon's own leaf, under the
-    /// node plane's identity rather than the box's verdict, so the injected
-    /// run stops, whatever the box's declaration (NET-079).
-    #[error("joining the box's classifier leaf {}", leaf.display())]
-    JoinLeaf {
-        leaf: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
     /// The injected program could not be started for a reason a shell would
     /// not report as its own (those are exit codes 127/126). `ENOMEM` from the
     /// fork means the sandbox's PID namespace has no live init left to
@@ -686,32 +673,37 @@ fn release_stdin() {
     unsafe { libc::close(null) };
 }
 
-/// Moves this process into the box's classifier leaf `leaf`.
-///
-/// Fatal whatever the leaf: a process that stays out of the box's leaf
-/// stays in the daemon's own, and runs under the node plane's identity
-/// rather than the box's verdict (NET-079). A deny-all box's process would
-/// run where nothing refuses its connections, and any other box's would
-/// leave the verdict and the UDP 443 block its leaf carries, so the
-/// injected run stops rather than run outside them. This shim has no logger
-/// (it runs before any runtime is built), so the line goes to the inherited
-/// stderr.
+/// Moves this process into the box's classifier leaf `leaf`, by writing its
+/// pid to the leaf's `cgroup.procs`.
 ///
 /// # Errors
 ///
-/// [`NsenterError::JoinLeaf`] if the leaf's `cgroup.procs` refuses the move
-/// or is not there.
-fn join_classifier_leaf(leaf: &sandbox::config::ClassifierLeaf) -> Result<(), NsenterError> {
-    sandbox::classifier::place_pid(&leaf.procs(), std::process::id()).map_err(|source| {
-        eprintln!(
-            "minimald: joining the box's classifier leaf {}: {source}",
-            leaf.dir().display()
+/// The error of the write: the leaf's `cgroup.procs` refused the move, or
+/// is not there.
+fn join_classifier_leaf(leaf: &sandbox::config::ClassifierLeaf) -> std::io::Result<()> {
+    sandbox::classifier::place_pid(&leaf.procs(), std::process::id())
+}
+
+/// The line the shim prints and the exit code it leaves with when it cannot
+/// join the box's classifier leaf (NET-079). A leaf that is not there is a
+/// box that stopped: the leaf goes with the box. Any other error is a
+/// refusal: the box's network rules would not apply to the program, so it
+/// never runs. Both lines are ones `min box exec` reads as a refusal.
+fn join_refusal(source: &std::io::Error) -> (String, i32) {
+    use minimald_rpc::exec::{
+        INJECTION_BOX_STOPPED_EXIT, INJECTION_BOX_STOPPED_TEXT, INJECTION_UNPLACED_EXIT,
+        INJECTION_UNPLACED_TEXT,
+    };
+    if source.kind() == std::io::ErrorKind::NotFound {
+        return (
+            INJECTION_BOX_STOPPED_TEXT.to_string(),
+            i32::from(INJECTION_BOX_STOPPED_EXIT),
         );
-        NsenterError::JoinLeaf {
-            leaf: leaf.dir().to_path_buf(),
-            source,
-        }
-    })
+    }
+    (
+        format!("{INJECTION_UNPLACED_TEXT} ({source}).\n"),
+        i32::from(INJECTION_UNPLACED_EXIT),
+    )
 }
 
 /// Joins the session's namespaces and runs the requested program there,
@@ -728,13 +720,14 @@ fn join_classifier_leaf(leaf: &sandbox::config::ClassifierLeaf) -> Result<(), Ns
 ///
 /// # Errors
 ///
-/// [`NsenterError::JoinLeaf`] if the box's classifier leaf cannot be
-/// joined, [`NsenterError::Setns`] if the namespaces cannot be
-/// joined, [`NsenterError::Spawn`] if the program cannot be started for a
-/// reason a shell would not report, and [`NsenterError::Wait`] if the started
-/// program cannot be reaped. A program that is missing, not executable, or not
-/// an executable format is reported on stderr and returned as the shell's exit
-/// code (127/126) rather than as an error.
+/// [`NsenterError::Setns`] if the namespaces cannot be joined,
+/// [`NsenterError::Spawn`] if the program cannot be started for a reason a
+/// shell would not report, and [`NsenterError::Wait`] if the started program
+/// cannot be reaped. A program that is missing, not executable, or not an
+/// executable format is reported on stderr and returned as the shell's exit
+/// code (127/126) rather than as an error. A box's classifier leaf that
+/// cannot be joined is reported on stderr and returned as its own exit code
+/// ([`join_refusal`]).
 pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // SAFETY: `command_in_session` placed a pidfd on this descriptor and it
     // survived the exec; nothing else in this freshly-exec'd process owns it.
@@ -751,8 +744,20 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // our pid here, from the daemon's own namespaces, moves this shim into
     // the leaf, and the program forked below inherits it with everything
     // else.
-    if let Some(leaf) = &args.classifier_leaf {
-        join_classifier_leaf(&sandbox::config::ClassifierLeaf::new(leaf))?;
+    //
+    // Fatal whatever the leaf: a process that stays out of the box's leaf
+    // stays in the daemon's own, and runs under the node plane's identity
+    // rather than the box's verdict, outside the UDP 443 block its leaf
+    // carries. So the program never starts. The refusal is one line, in one
+    // write so it reaches a reader whole, and an exit code of its own
+    // ([`join_refusal`]). This shim has no logger (it runs before any
+    // runtime is built), so the line goes to the inherited stderr.
+    if let Some(leaf) = &args.classifier_leaf
+        && let Err(source) = join_classifier_leaf(&sandbox::config::ClassifierLeaf::new(leaf))
+    {
+        let (line, code) = join_refusal(&source);
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+        return Ok(code);
     }
 
     // The daemon's procfs, opened before the join: the grace period below scans
@@ -1819,28 +1824,33 @@ mod tests {
         );
     }
 
-    /// NET-079: an injected process that cannot join its box's leaf never
-    /// runs, whatever the box's declaration. A leaf with no `cgroup.procs`
-    /// stands in for one the kernel refuses: a deny-all box's and an
-    /// allow-all box's both stop the shim, so neither runs in the daemon's
-    /// own leaf.
+    /// NET-079: a leaf that is gone reads as a box that stopped, with the
+    /// exit code of a box that is not running. Any other failed join is a
+    /// refusal with an exit code of its own, never the 1 a failed command
+    /// leaves with, and its line names the error. Each is one line.
+    /// `nsenter_integration` drives the shim itself.
     #[test]
-    fn an_injection_that_cannot_join_its_box_leaf_is_refused_for_every_verdict() {
-        let tree = tempfile::tempdir().expect("a stand-in classifier tree");
-        for verdict in ["deny", "allow"] {
-            let dir = tree.path().join("boxes").join(verdict).join("b");
-            std::fs::create_dir_all(&dir).expect("the stand-in leaf");
-            let leaf = sandbox::config::ClassifierLeaf::new(&dir);
-            match join_classifier_leaf(&leaf) {
-                Err(NsenterError::JoinLeaf {
-                    leaf: named,
-                    source,
-                }) => {
-                    assert_eq!(named, dir, "the error names the {verdict} leaf");
-                    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-                }
-                other => panic!("a {verdict} leaf the shim cannot join must refuse: {other:?}"),
-            }
+    fn a_failed_leaf_join_is_one_line_and_an_exit_code_of_its_own() {
+        let gone = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(
+            join_refusal(&gone),
+            (
+                "The box stopped before the command started.\n".to_string(),
+                2
+            )
+        );
+        for errno in [libc::EACCES, libc::EPERM, libc::EBUSY] {
+            let source = std::io::Error::from_raw_os_error(errno);
+            let (line, code) = join_refusal(&source);
+            assert_eq!(code, 5, "errno {errno}");
+            assert_eq!(
+                line,
+                format!(
+                    "Did not run the command: the host could not apply the box's network \
+                     rules to it ({source}).\n"
+                )
+            );
+            assert_eq!(line.lines().count(), 1, "{line}");
         }
     }
 

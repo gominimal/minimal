@@ -12012,6 +12012,52 @@ async fn box_exec_runs_command_and_exits_with_its_code() {
     }
 }
 
+// NET-079: an exec whose injection could not join the box's classifier leaf
+// never ran its command. The daemon's one line and exit code become the
+// CLI's own refusal: exit 2 when the box stopped before the command
+// started, exit 5 when the box's network rules could not be applied to it.
+// The same line under another exit code is the command's own stderr.
+#[tokio::test]
+async fn box_exec_reports_an_injection_that_never_started_as_a_refusal() {
+    use minimald_rpc::exec::{INJECTION_BOX_STOPPED_TEXT, INJECTION_UNPLACED_TEXT};
+
+    let unplaced = format!("{INJECTION_UNPLACED_TEXT} (Permission denied (os error 13)).\n");
+    for (line, code, message) in [
+        (
+            INJECTION_BOX_STOPPED_TEXT.to_string(),
+            2,
+            "web stopped before the command started.",
+        ),
+        (
+            unplaced.clone(),
+            5,
+            "Did not run the command in web: the host could not apply the box's network \
+             rules to it.",
+        ),
+    ] {
+        let (run, _) = run_scripted_exec(
+            &box_exec_request("web", &[], &["make"]),
+            vec![answer(b"", line.as_bytes(), code)],
+        )
+        .await;
+        assert_eq!(u32::from(run.exit), code, "{run}");
+        assert_eq!(run.message().as_deref(), Some(message), "{run}");
+        assert_eq!(run.stdout, "", "{run}");
+        assert_eq!(run.stderr, "", "no other words\n{run}");
+    }
+
+    for line in [INJECTION_BOX_STOPPED_TEXT, unplaced.as_str()] {
+        let (run, _) = run_scripted_exec(
+            &box_exec_request("web", &[], &["make"]),
+            vec![answer(b"", line.as_bytes(), 1)],
+        )
+        .await;
+        assert_eq!(run.exit, 1, "{run}");
+        assert!(run.error.is_none(), "{run}");
+        assert_eq!(run.stderr, line, "{run}");
+    }
+}
+
 // BCLI-053: `min box exec -t` with a stdin that is not a terminal is refused
 // with exit 2 before the box resolves. The refusal says why and what to do,
 // and no exec starts in the box.

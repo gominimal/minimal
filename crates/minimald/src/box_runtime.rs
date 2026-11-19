@@ -344,7 +344,8 @@ pub(crate) fn injection_leaf(
 /// box takes this path, an exec and a lifecycle hook alike, so none of them
 /// runs in the daemon's own leaf (NET-079). `host_ip_enforced` says whether
 /// the box runs with host-address enforcement, which is what makes it a
-/// member of the `host_ip` cohort.
+/// member of the `host_ip` cohort `cohort`: the daemon's one
+/// ([`crate::net::classifier::cohort_quic443`]) outside tests.
 ///
 /// # Errors
 ///
@@ -354,6 +355,7 @@ pub(crate) fn placed_injection_command(
     box_id: &str,
     leaf: Option<&sandbox::config::ClassifierLeaf>,
     host_ip_enforced: bool,
+    cohort: &'static std::sync::Mutex<crate::net::classifier::CohortQuic443>,
 ) -> Result<std::process::Command, crate::nsenter::NsenterError> {
     // NET-079: the box's leaf, so the injected process joins it in the
     // shim before it joins the namespaces — the only place the join can
@@ -361,11 +363,7 @@ pub(crate) fn placed_injection_command(
     // while the `host_ip` cohort blocks UDP 443, the cohort's blocked
     // leaf instead, so an exec or a hook cannot escape the block.
     let box_id = box_id.to_string();
-    let (joined_leaf, adopt) = injection_leaf(
-        &box_id,
-        leaf.cloned(),
-        crate::net::classifier::cohort_quic443(),
-    );
+    let (joined_leaf, adopt) = injection_leaf(&box_id, leaf.cloned(), cohort);
     let injection = match joined_leaf {
         Some(leaf) => injection.with_classifier_leaf(leaf),
         None => injection,
@@ -397,7 +395,6 @@ pub(crate) fn placed_injection_command(
                 .is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH));
             let shim = pin.ok();
             let moves = crate::net::classifier::KernelMoves;
-            let cohort = crate::net::classifier::cohort_quic443();
             let blocked = cohort
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1143,6 +1140,22 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         let injection = crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
             .with_env(vars);
+        self.injected_command(injection)
+    }
+
+    /// The command that runs `injection` in this box: sealed as the box's
+    /// launch is, and placed in the box's classifier leaf (NET-079), with
+    /// the `host_ip` cohort's UDP 443 check (BEP-018). Built apart from
+    /// [`Self::command_in_session`] so a test can build it: under test that
+    /// method builds a host-side command instead.
+    ///
+    /// # Errors
+    ///
+    /// The injection's own errors; see [`crate::nsenter::Injection::command`].
+    fn injected_command(
+        &self,
+        injection: crate::nsenter::Injection,
+    ) -> Result<std::process::Command, crate::nsenter::NsenterError> {
         // Every injection is sealed: a none box's full seal is named
         // explicitly, and any other box's confined-families seal is the
         // shim's default — either way the shim reinstalls the filter the
@@ -1157,6 +1170,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             &self.session_id.to_string(),
             self.leaf.as_ref(),
             self.attrs.host_ip_enforcement.is_some(),
+            crate::net::classifier::cohort_quic443(),
         )
     }
 
@@ -1215,24 +1229,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 return None;
             }
         };
-        let environment = self.guard.command_environment();
         Some(HookPlan {
             event,
-            commands: crate::hooks::InjectedCommands {
-                leader_pid,
-                cwd: environment.cwd,
-                vars: environment.vars,
-                // A hook joins the namespaces rather than being forked from the
-                // filtered shell, so the box's seal has to be handed to it the
-                // same way the interactive attach path hands it to an injected
-                // command: the none box's full seal by flag, the shim's
-                // confined-families default for the rest.
-                seal_none_box: self.seal_injection,
-                // NET-079: a hook runs in the box's leaf, as an exec does.
-                box_id: self.session_id.to_string(),
-                leaf: self.leaf.clone(),
-                host_ip_enforced: self.attrs.host_ip_enforcement.is_some(),
-            },
+            commands: self.hook_commands(leader_pid),
             composition,
             session_id: self.session_id,
             session_name: self.session_name.clone(),
@@ -1240,6 +1239,28 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             workspace: self.workspace_dir.clone(),
             output: crate::hooks::HookOutput::Tty(self.tty_path.clone()),
         })
+    }
+
+    /// How a hook of this box is injected into it, by joining the
+    /// namespaces of `leader_pid`, the box's session leader.
+    fn hook_commands(&self, leader_pid: u32) -> crate::hooks::InjectedCommands {
+        let environment = self.guard.command_environment();
+        crate::hooks::InjectedCommands {
+            leader_pid,
+            cwd: environment.cwd,
+            vars: environment.vars,
+            // A hook joins the namespaces rather than being forked from the
+            // filtered shell, so the box's seal has to be handed to it the
+            // same way the interactive attach path hands it to an injected
+            // command: the none box's full seal by flag, the shim's
+            // confined-families default for the rest.
+            seal_none_box: self.seal_injection,
+            // NET-079: a hook runs in the box's leaf, as an exec does.
+            box_id: self.session_id.to_string(),
+            leaf: self.leaf.clone(),
+            host_ip_enforced: self.attrs.host_ip_enforcement.is_some(),
+            cohort: crate::net::classifier::cohort_quic443(),
+        }
     }
 
     /// Snapshot a plan and run it, if there is anything to run.

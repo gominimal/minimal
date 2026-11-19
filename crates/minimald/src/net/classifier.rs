@@ -1383,6 +1383,15 @@ impl CohortQuic443 {
         }
     }
 
+    /// Whether `pid` is recorded under `box_id`, to go home with the box
+    /// when the block lifts.
+    #[cfg(test)]
+    pub(crate) fn records(&self, box_id: &str, pid: i32) -> bool {
+        self.moved
+            .get(box_id)
+            .is_some_and(|pids| pids.contains(&pid))
+    }
+
     /// [`Self::join`], and the move that keeps the rule in step with it:
     /// when the cohort turns blocked every member's processes move into
     /// the blocked leaf, and when it already was, the joining box's do.

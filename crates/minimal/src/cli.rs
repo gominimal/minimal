@@ -897,8 +897,10 @@ pub struct BoxExecArgs {
 }
 
 /// Why `min box exec` ran no command in the box: `-t` without a terminal
-/// (exit 2), the box is not running (BOX-149, exit 2), or its spec turns
-/// exec off (BOX-153, exit 5). `target` is the box as the user named it.
+/// (exit 2), the box is not running or stopped before the command started
+/// (BOX-149, exit 2), its spec turns exec off (BOX-153, exit 5), or the
+/// box's network rules could not be applied to the command (NET-079, exit
+/// 5). `target` is the box as the user named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoxExecRefusal {
     /// `-t` ran with a stdin that is not a terminal, so nothing started.
@@ -924,6 +926,18 @@ pub enum BoxExecRefusal {
         /// The box as the user named it.
         target: String,
     },
+    /// The box stopped after the exec reached it, before the command
+    /// started. Exit 2.
+    StoppedBeforeStart {
+        /// The box as the user named it.
+        target: String,
+    },
+    /// The box's host could not apply the box's network rules to the
+    /// command, so the command never started. Exit 5.
+    NetworkRulesNotApplied {
+        /// The box as the user named it.
+        target: String,
+    },
 }
 
 impl BoxExecRefusal {
@@ -932,8 +946,12 @@ impl BoxExecRefusal {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::NoTerminal { .. } | Self::NotRunning { .. } => 2,
-            Self::ExecDisabled { .. } | Self::SpecUnreadable { .. } => 5,
+            Self::NoTerminal { .. } | Self::NotRunning { .. } | Self::StoppedBeforeStart { .. } => {
+                2
+            }
+            Self::ExecDisabled { .. }
+            | Self::SpecUnreadable { .. }
+            | Self::NetworkRulesNotApplied { .. } => 5,
         }
     }
 
@@ -945,6 +963,8 @@ impl BoxExecRefusal {
             Self::NotRunning { .. } => "not running",
             Self::ExecDisabled { .. } => "exec disabled",
             Self::SpecUnreadable { .. } => "spec unreadable",
+            Self::StoppedBeforeStart { .. } => "stopped before start",
+            Self::NetworkRulesNotApplied { .. } => "network rules not applied",
         }
     }
 }
@@ -970,6 +990,14 @@ impl std::fmt::Display for BoxExecRefusal {
             Self::SpecUnreadable { target } => write!(
                 f,
                 "{target} does not allow exec: its spec cannot be read, so exec stays off."
+            ),
+            Self::StoppedBeforeStart { target } => {
+                write!(f, "{target} stopped before the command started.")
+            }
+            Self::NetworkRulesNotApplied { target } => write!(
+                f,
+                "Did not run the command in {target}: the host could not apply the \
+                 box's network rules to it."
             ),
         }
     }
