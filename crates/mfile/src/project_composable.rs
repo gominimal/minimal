@@ -170,13 +170,15 @@ mod tests {
     /// [`Loadout::contribute`]: boxes::core::loadout::Loadout::contribute
     #[test]
     fn inherit_without_env_surfaces_as_error() {
-        let mf = crate::File::from_toml_bytes(indoc! {
-            r#"
+        let mf = crate::File::from_toml_bytes(
+            indoc! {
+                r#"
             [defaults.session.env_vars]
             DATABASE_URL = { inherit = true }
             "#
-        }
-        .as_bytes())
+            }
+            .as_bytes(),
+        )
         .unwrap();
         let session = mf.session.expect("populated block parses");
         let comp = ProjectComposable::new(HostPath::try_new("/proj").unwrap(), session);
@@ -198,13 +200,15 @@ mod tests {
     /// [`ResolvedVar::resolve_with`]: boxes::core::primitives::ResolvedVar::resolve_with
     #[test]
     fn inherit_with_default_falls_back_when_absent() {
-        let mf = crate::File::from_toml_bytes(indoc! {
-            r#"
+        let mf = crate::File::from_toml_bytes(
+            indoc! {
+                r#"
             [defaults.session.env_vars]
             DATABASE_URL = { inherit = true, default = "postgres://localhost/dev" }
             "#
-        }
-        .as_bytes())
+            }
+            .as_bytes(),
+        )
         .unwrap();
         let session = mf.session.expect("populated block parses");
         let comp = ProjectComposable::new(HostPath::try_new("/proj").unwrap(), session);

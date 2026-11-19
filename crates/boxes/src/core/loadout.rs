@@ -158,8 +158,9 @@ impl EnvVars {
 impl serde::Serialize for EnvVars {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut map =
-            serializer.serialize_map(Some(self.strict.len() + self.lenient.len() + self.unusable.len()))?;
+        let mut map = serializer.serialize_map(Some(
+            self.strict.len() + self.lenient.len() + self.unusable.len(),
+        ))?;
         for (name, value) in &self.strict {
             map.serialize_entry(name.as_ref(), value)?;
         }
@@ -775,7 +776,10 @@ mod tests {
         )
         .unwrap();
         let l = retired.into_loadout(LoadoutName::try_new("old").unwrap());
-        assert_eq!(l.retired_var_keys().collect::<Vec<_>>(), ["vars", "vars_lenient"]);
+        assert_eq!(
+            l.retired_var_keys().collect::<Vec<_>>(),
+            ["vars", "vars_lenient"]
+        );
         assert_eq!(l.all_vars().count(), 0, "a retired key sets no variable");
         let table = toml::Table::try_from(&l).unwrap();
         assert!(table.contains_key("vars") && table.contains_key("vars_lenient"));

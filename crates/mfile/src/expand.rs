@@ -1084,14 +1084,19 @@ fn var_place(
             let path = loadouts
                 .iter()
                 .find(|l| l.name == name)
-                .and_then(|l| l.path.as_ref());
-            let file = match path {
-                Some(path) => format!("the loadout file {}", path.display()),
-                None => format!("the loadout `{name}`"),
-            };
-            (None, file)
+                .and_then(|l| l.path.as_deref());
+            (None, loadout_file(name, path))
         }
         Layer::Overrides => (None, "a command-line flag".to_owned()),
+    }
+}
+
+/// A loadout's file, as a refusal names it: its path, or its name when no
+/// file holds it.
+fn loadout_file(name: &str, path: Option<&std::path::Path>) -> String {
+    match path {
+        Some(path) => format!("the loadout file {}", path.display()),
+        None => format!("the loadout `{name}`"),
     }
 }
 
@@ -1109,38 +1114,63 @@ fn check_var_tables(
     loadouts: &[LoadoutLayer],
 ) -> Result<(), Error> {
     for (origin, layer) in ordered {
-        if let Some(key) = RETIRED_VAR_KEYS.iter().find(|k| layer.contains_key(**k)) {
-            let (table, file) = var_place(entry, origin, loadouts);
-            tracing::debug!(
-                rule = "BOX-206",
-                key = *key,
-                layer = ?origin.layer,
-                loadout = ?origin.loadout,
-                file = %file,
-                "a layer sets a retired variable key"
-            );
-            return Err(Error::RetiredVarKey {
-                key: (*key).to_owned(),
-                table,
-                file,
-            });
-        }
-        if let Some((name, _)) = layer_vars(layer).find(|(name, _)| !is_posix_var_name(name)) {
-            let (table, file) = var_place(entry, origin, loadouts);
-            tracing::debug!(
-                rule = "BOX-207",
-                variable = name,
-                layer = ?origin.layer,
-                loadout = ?origin.loadout,
-                file = %file,
-                "a variable name is not POSIX-shaped"
-            );
-            return Err(Error::InvalidVarName {
-                name: name.to_owned(),
-                table,
-                file,
-            });
-        }
+        check_layer_vars(origin, layer, || var_place(entry, origin, loadouts))?;
+    }
+    Ok(())
+}
+
+/// Refuses the layer of one selected loadout as [`expand`] does (BOX-206,
+/// BOX-207), for a caller that applies the loadout with no entry to
+/// expand, such as a start in a folder with no minimal.toml.
+///
+/// # Errors
+///
+/// [`Error::RetiredVarKey`] and [`Error::InvalidVarName`], each naming the
+/// loadout's file. Both exit 3.
+pub fn check_loadout_vars(loadout: &LoadoutLayer) -> Result<(), Error> {
+    check_layer_vars(&Origin::loadout(&loadout.name), &loadout.table, || {
+        (None, loadout_file(&loadout.name, loadout.path.as_deref()))
+    })
+}
+
+/// The checks of [`check_var_tables`] for one layer. `place` gives the
+/// table and the file that a refusal names.
+fn check_layer_vars(
+    origin: &Origin,
+    layer: &toml::Table,
+    place: impl Fn() -> (Option<String>, String),
+) -> Result<(), Error> {
+    if let Some(key) = RETIRED_VAR_KEYS.iter().find(|k| layer.contains_key(**k)) {
+        let (table, file) = place();
+        tracing::debug!(
+            rule = "BOX-206",
+            key = *key,
+            layer = ?origin.layer,
+            loadout = ?origin.loadout,
+            file = %file,
+            "a layer sets a retired variable key"
+        );
+        return Err(Error::RetiredVarKey {
+            key: (*key).to_owned(),
+            table,
+            file,
+        });
+    }
+    if let Some((name, _)) = layer_vars(layer).find(|(name, _)| !is_posix_var_name(name)) {
+        let (table, file) = place();
+        tracing::debug!(
+            rule = "BOX-207",
+            variable = name,
+            layer = ?origin.layer,
+            loadout = ?origin.loadout,
+            file = %file,
+            "a variable name is not POSIX-shaped"
+        );
+        return Err(Error::InvalidVarName {
+            name: name.to_owned(),
+            table,
+            file,
+        });
     }
     Ok(())
 }
@@ -3656,7 +3686,10 @@ mod tests {
         ];
         for (what, file, name, msg) in cases {
             let err = expand_in(file, name, Layers::default()).expect_err(what);
-            assert!(matches!(err, Error::RetiredVarKey { .. }), "{what}: {err:?}");
+            assert!(
+                matches!(err, Error::RetiredVarKey { .. }),
+                "{what}: {err:?}"
+            );
             assert_eq!(err.exit_code(), Some(3), "{what}");
             assert_eq!(err.to_string(), msg, "{what}");
         }
@@ -3725,7 +3758,10 @@ mod tests {
         for name in ["my.var", "1A", "A-B", "", "É", "A B"] {
             let file = format!("[sessions.dev]\nenv_vars = {{ {name:?} = \"1\" }}\n");
             let err = expand_in(&file, "dev", Layers::default()).expect_err(name);
-            assert!(matches!(err, Error::InvalidVarName { .. }), "{name}: {err:?}");
+            assert!(
+                matches!(err, Error::InvalidVarName { .. }),
+                "{name}: {err:?}"
+            );
             assert_eq!(err.exit_code(), Some(3), "{name}");
             let variable = if name.is_empty() {
                 "a variable with an empty name".to_owned()
