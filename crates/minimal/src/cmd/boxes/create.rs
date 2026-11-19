@@ -1344,11 +1344,12 @@ pub(crate) struct ProjectEgress {
     /// layer sets the key. A session box takes them, and each `--ingress`
     /// adds one mapping after them (#3238).
     pub(crate) ingress: Option<Vec<boxes::PortMapping>>,
-    /// The table whose `network` the expanded entry holds, as the file
-    /// names it: `[defaults]`, `[defaults.<type>]` or the entry's own, such
-    /// as `[tasks.build]`. A later layer replaces the whole `network` table
-    /// of an earlier one, so one table holds all of it. `None` when no
-    /// layer declares `network`.
+    /// The table that set the expanded entry's `network.egress`, as the
+    /// file names it: `[defaults]`, `[defaults.<type>]` or the entry's own,
+    /// such as `[tasks.build]`. The `network` table merges by sub-table, so
+    /// each sub-table can come from its own layer (#3597). With no egress,
+    /// the last table that declares `network`. `None` when no layer
+    /// declares `network`.
     pub(crate) layer: Option<String>,
 }
 
@@ -1578,9 +1579,9 @@ fn entry_egress(
         body: network_of(&entry.body),
         ..entry
     };
-    // The merge replaces a table whole, so the last layer that declares
-    // `network` holds the expanded entry's `network` table.
-    let layer = if !entry.body.is_empty() {
+    // The last layer that declares `network`, for a key whose layer the
+    // report does not name.
+    let last_layer = if !entry.body.is_empty() {
         format!("[{}.{}]", entry.table.key(), entry.name)
     } else if !layers.defaults_type.is_empty() {
         format!(
@@ -1598,6 +1599,24 @@ fn entry_egress(
     // start with exit 3, as every invalid `minimal.toml` does.
     let hints = mfile::network::canonicalize(&mut expansion.spec)
         .map_err(|error| network_key_invalid(&expansion.spec, error))?;
+    // The merge keeps each key below `network` from the layer that set it
+    // (#3597), so the layer named is the one that set `network.egress`.
+    let layer_of = |key: &str| {
+        expansion
+            .report
+            .network
+            .get(key)
+            .and_then(|origin| network_layer_words(origin, &entry))
+            .unwrap_or_else(|| last_layer.clone())
+    };
+    // A flat `egress_*` key, which `canonicalize` folded into `egress`,
+    // sets egress too. The latest layer of them names the egress.
+    let egress_key = std::iter::once("egress")
+        .chain(mfile::network::FLAT_EGRESS_KEYS.iter().map(|(flat, _)| *flat))
+        .filter_map(|key| Some((expansion.report.network.get(key)?.layer, key)))
+        .max()
+        .map_or("egress", |(_, key)| key);
+    let layer = layer_of(egress_key);
     let network = expansion.spec.get("network");
     // `canonicalize` has rewritten a legacy spelling and refused a value
     // that is not a mode, so the word is a current one.
@@ -1639,6 +1658,24 @@ fn entry_egress(
         ingress,
         layer: Some(layer),
     })
+}
+
+/// The minimal.toml table of `origin`, a layer that [`entry_egress`]
+/// reads. `None` for a layer that the read does not hold.
+fn network_layer_words(
+    origin: &mfile::expand::Origin,
+    entry: &mfile::entry::BoxEntry,
+) -> Option<String> {
+    use mfile::expand::Layer;
+    match origin.layer {
+        Layer::Entry => Some(format!("[{}.{}]", entry.table.key(), entry.name)),
+        Layer::DefaultsType => Some(format!(
+            "[defaults.{}]",
+            entry.box_type.as_deref().unwrap_or_default()
+        )),
+        Layer::Defaults => Some("[defaults]".to_owned()),
+        _ => None,
+    }
 }
 
 /// One `network.ingress` item of a `minimal.toml`, as `box.toml` writes it:

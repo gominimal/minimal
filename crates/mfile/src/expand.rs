@@ -1328,6 +1328,21 @@ fn merge_network(
         return;
     };
     for (sub, item) in add {
+        // A flat egress key and its nested `egress.*` key set one value, so
+        // the later layer's spelling replaces the earlier one.
+        for (flat, nested) in crate::network::FLAT_EGRESS_KEYS {
+            if sub == flat
+                && let Some(toml::Value::Table(egress)) = have.get_mut("egress")
+            {
+                egress.remove(nested);
+            }
+            if sub == "egress"
+                && item.as_table().is_some_and(|t| t.contains_key(nested))
+                && have.remove(flat).is_some()
+            {
+                report.network.remove(flat);
+            }
+        }
         match (have.get_mut(sub), item) {
             (Some(toml::Value::Table(old)), toml::Value::Table(new)) => {
                 for (k, v) in new {
@@ -2035,7 +2050,10 @@ mod tests {
         );
 
         // Without the entry's table, each sub-table keeps its own layer.
-        let file = file.split("[sessions.dev.network]").next().unwrap_or_default();
+        let file = file
+            .split("[sessions.dev.network]")
+            .next()
+            .unwrap_or_default();
         let file = format!("{file}[sessions.dev]\n");
         let e = expand_in(&file, "dev", Layers::default()).expect("expands");
         let network = e.spec["network"].as_table().expect("a table");
@@ -2052,11 +2070,48 @@ mod tests {
 
         // A value that is not a table replaces the whole `network` value.
         let replaced = fold(&[
-            (Origin::of(Layer::Defaults), &table("network = { mode = \"none\" }")),
+            (
+                Origin::of(Layer::Defaults),
+                &table("network = { mode = \"none\" }"),
+            ),
             (Origin::of(Layer::Entry), &table("network = \"x\"")),
         ]);
         assert_eq!(replaced.spec["network"].as_str(), Some("x"));
         assert!(replaced.report.network.is_empty());
+
+        // A flat egress key in a later layer replaces the nested key it
+        // spells, and the other way round.
+        let flat = fold(&[
+            (
+                Origin::of(Layer::Defaults),
+                &table("network = { egress = { allow_dns_hosts = [\"a\"], deny_subnets = [] } }"),
+            ),
+            (
+                Origin::of(Layer::Entry),
+                &table("network = { egress_allow_dns = [\"b\"] }"),
+            ),
+        ]);
+        assert_eq!(
+            flat.spec["network"],
+            toml::Value::Table(table(
+                "egress = { deny_subnets = [] }\negress_allow_dns = [\"b\"]"
+            ))
+        );
+        let nested = fold(&[
+            (
+                Origin::of(Layer::Defaults),
+                &table("network = { egress_allow_dns = [\"b\"] }"),
+            ),
+            (
+                Origin::of(Layer::Entry),
+                &table("network = { egress = { allow_dns_hosts = [\"a\"] } }"),
+            ),
+        ]);
+        assert_eq!(
+            nested.spec["network"],
+            toml::Value::Table(table("egress = { allow_dns_hosts = [\"a\"] }"))
+        );
+        assert!(!nested.report.network.contains_key("egress_allow_dns"));
     }
 
     // BOX-065: one file and one set of overrides expand to the same bytes
