@@ -290,13 +290,7 @@ impl Cache<LocalDir> {
 
     /// Invalidates (deletes) a directory cache entry with the given spec hash.
     pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
-        let hash_hex = hash.0.to_hex();
-        // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
-        let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
-            .iter()
-            .collect();
-
-        let p = self.inner().fs.path().join(subpath);
+        let p = self.entry_path(hash);
         std::fs::remove_dir_all(p).map_err(CacheErr::from)
     }
 
