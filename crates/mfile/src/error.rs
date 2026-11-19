@@ -127,8 +127,8 @@ pub enum Error {
     NetworkTableDropsKeys {
         later: String,
         earlier: String,
-        dropped: Vec<String>,
-        later_keys: Vec<String>,
+        dropped: Box<[String]>,
+        later_keys: Box<[String]>,
         move_to: String,
     },
 }

@@ -600,8 +600,8 @@ fn refuse_dropped_network_keys(entry: &BoxEntry, layers: &Layers) -> Result<(), 
                 return Err(Error::NetworkTableDropsKeys {
                     later: header.clone(),
                     earlier: earlier_header.to_owned(),
-                    dropped,
-                    later_keys,
+                    dropped: dropped.into_boxed_slice(),
+                    later_keys: later_keys.into_boxed_slice(),
                     move_to,
                 });
             }
