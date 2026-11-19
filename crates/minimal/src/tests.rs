@@ -973,6 +973,7 @@ fn scripts_and_cli_reference_use_no_removed_session_verb() {
         "scripts/bulk-upload-e2e.sh",
         "scripts/stress-session-e2e.sh",
         "scripts/kernel-bump-review.sh",
+        "justfile",
     ]
     .iter()
     .map(|file| root.join(file))
@@ -1014,7 +1015,13 @@ fn scripts_and_cli_reference_use_no_removed_session_verb() {
                 }
             }
         }
+        // A `#` comment in the justfile can name an old verb as history. A
+        // recipe line or an echo there is what a person runs, so it is read.
+        let is_justfile = file.ends_with("justfile");
         for (n, line) in text.lines().enumerate() {
+            if is_justfile && line.trim_start().starts_with('#') {
+                continue;
+            }
             for spelling in removed_spellings_in_line(line) {
                 hits.push(format!(
                     "{}:{}: {spelling}: {}",
