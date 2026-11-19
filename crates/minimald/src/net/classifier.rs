@@ -103,6 +103,18 @@ pub(crate) fn task_box_leaf(
     Some((leaf, verdict))
 }
 
+/// The decision a task in `leaf`, the existing leaf of its box, plans over
+/// (NET-079). A native deny leaf of a running box exists only when its launch
+/// decided per box: a launch that did not is refused, or places no leaf. So
+/// the task carries a decided decision with the carve-out the tree records
+/// now, and its plan repeats the stale carve-out check of the box launch. The
+/// task does not probe the table again. `None` for an allow leaf, whose plan
+/// makes no such check.
+pub(crate) fn task_box_decision(leaf: &sandbox::config::ClassifierLeaf) -> Option<Decision> {
+    leaf.is_deny()
+        .then(|| Decision::decided().with_carve_out(recorded_carve_out(&leaf.tree_root())))
+}
+
 /// Which cohort subtree `declaration` places a box's leaf in (NET-079): the
 /// deny subtree is for the declaration that admits no destination — the one
 /// shape `boxes::EgressPolicy::deny_all` materializes, every `allow_*`

@@ -1596,6 +1596,80 @@ mod tests {
         );
     }
 
+    /// NET-079: a task in the deny leaf of its box repeats the stale
+    /// carve-out check of the box launch. The decision it plans over carries
+    /// the carve-out the leaf's tree records, so a task started after the
+    /// answerer moved, or stopped, is refused and never falls back to the
+    /// constant answerer address.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn task_in_a_deny_leaf_refuses_a_stale_carve_out() {
+        use crate::net::classifier::{clear_live_answerer, set_live_answerer, task_box_decision};
+        use sandbox::config::{ClassifierLeaf, Verdict};
+
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let recorded = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7656);
+        std::fs::create_dir(tree.path().join("carve-out-127.0.0.1-7656"))
+            .expect("the carve-out record the privileged step writes");
+        let deny = ClassifierLeaf::under(tree.path(), "b", Verdict::Deny);
+        let allow = ClassifierLeaf::under(tree.path(), "b", Verdict::Allow);
+        assert_eq!(
+            task_box_decision(&deny).and_then(|decision| decision.carve_out()),
+            Some(recorded),
+            "a deny leaf gives the carve-out its tree records"
+        );
+        assert!(
+            task_box_decision(&allow).is_none(),
+            "an allow leaf gives no decision"
+        );
+
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+        let plan = || {
+            task_network_for(
+                NetworkMode::HostNet,
+                &native,
+                "s-task",
+                None,
+                Vec::new(),
+                Some(Verdict::Deny),
+                task_box_decision(&deny),
+            )
+        };
+
+        set_live_answerer(std::net::SocketAddr::V4(recorded));
+        let live = plan()
+            .plan()
+            .await
+            .expect("a carve-out naming the live bind plans the task");
+        assert_eq!(
+            live.resolver(),
+            &Resolver::Nameservers(vec![*recorded.ip()]),
+            "the task resolves through the live bind"
+        );
+
+        set_live_answerer(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            7700,
+        ));
+        let refusal = plan()
+            .plan()
+            .await
+            .expect_err("a carve-out naming another bind refuses the task");
+        assert!(
+            refusal.to_string().contains("its name lookups would fail"),
+            "the task is refused as a stale carve-out: {refusal}"
+        );
+
+        clear_live_answerer();
+        assert!(
+            plan().plan().await.is_err(),
+            "no live answerer refuses the task"
+        );
+    }
+
     /// NET-079: on a native host, a deny-all host-address box resolves through
     /// the box zone's answerer — the resolver Minimal owns for it, the one
     /// destination its connections are admitted to — never through the host's
