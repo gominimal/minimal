@@ -828,7 +828,7 @@ fi
 # VM-backed run must drive the CLI with `--provider local-minvmd`, because
 # the flag is what makes the CLI treat minvmd as minvmd for its OWN
 # bookkeeping too. `GlobalArgs::use_minvmd()`
-# (crates/minimal/src/cli.rs) is a strict check of the flag, and it gates
+# (crates/minimal/src/cli.rs) reads the provider choice, and it gates
 # the box registration with the VM host daemon and its withdrawal (T66,
 # crates/minimal/src/cmd/session.rs): an own_ip box that activates without
 # them runs UNREGISTERED — the guest self-allocates its switch address

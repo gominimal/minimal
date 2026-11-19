@@ -535,10 +535,12 @@ async fn plan_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> P
 /// scoping both readers share: the user-namespace profile unless the
 /// configured provider is the Linux VM provider, then the `kvm` group
 /// membership for that provider or the classifier tree for the native one,
-/// in that order. The native provider also gets the `kvm` group item when
-/// `/dev/kvm` is there but does not open for this user: joining the group
-/// is what makes the VM provider the default
-/// ([`crate::hosts::resolve_default_provider`]). [`plan_for_this_host`] slots the names item in among them
+/// in that order. A native provider that the `/dev/kvm` fallback chose
+/// (no `--provider`, `MINIMAL_PROVIDER` or `provider` key) also gets the
+/// `kvm` group item when `/dev/kvm` is there but does not open for this
+/// user: joining the group is what makes the VM provider the default
+/// ([`crate::hosts::resolve_default_provider`]). The host line leaves that
+/// item out ([`host_install_for_this_host`]). [`plan_for_this_host`] slots the names item in among them
 /// and the host line ([`host_install_for_this_host`]) reads them whole, so
 /// the two read the same items by construction. Every item is Linux-only,
 /// so a macOS host reads none.
@@ -550,7 +552,6 @@ fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> 
             items.extend(linux::userns_item_on_this_host());
         }
         let kvm = crate::hosts::open_kvm_device();
-        let offer_kvm = linux::offers_kvm_item(global.use_minvmd(), &kvm);
         if global.use_minvmd() {
             // Formerly BEP-047 (gominimal/inbox#1184): the vm-users item is
             // not offered until minvmd starts the VM and gvproxy through
@@ -559,8 +560,8 @@ fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> 
             items.push(linux::kvm_item_on_this_host(kvm));
         } else {
             items.extend(linux::classifier_items_on_this_host(global, ct_mark_mask));
-            if offer_kvm {
-                items.push(linux::kvm_item_on_this_host(kvm));
+            if linux::offers_native_kvm_item(global.provider.is_none(), &kvm) {
+                items.push(linux::native_kvm_item(linux::kvm_item_on_this_host(kvm)));
             }
         }
     }
@@ -577,8 +578,12 @@ fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> 
 /// holds). Every item is Linux-only, so a macOS host reads `false`.
 pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver::HostInstall {
     crate::resolver::HostInstall {
+        // A native host's `kvm` item is an offer, not unfinished setup: the
+        // native provider runs without it, so it never turns the host line
+        // into a note on a healthy start.
         other_items_unfinished: other_items_for_this_host(global, None)
             .iter()
+            .filter(|item| global.use_minvmd() || item.id != KVM_ID)
             .any(|item| item.state != ItemState::Done),
         ..crate::resolver::HostInstall::default()
     }
@@ -1981,15 +1986,30 @@ pub(crate) mod linux {
             })
     }
 
-    /// Whether the plan offers the `kvm` group item: always for the VM
-    /// provider, and for the native one when `/dev/kvm` is there but did not
-    /// open (`open`), so the host that could boot VMs is told how.
-    pub(crate) fn offers_kvm_item(use_minvmd: bool, open: &std::io::Result<()>) -> bool {
-        use_minvmd
-            || open
+    /// Whether the native provider's plan offers the `kvm` group item: only
+    /// when the `/dev/kvm` fallback chose the native provider (`defaulted`:
+    /// no `--provider`, `MINIMAL_PROVIDER` or `provider` key named it) and
+    /// `/dev/kvm` is there but did not open (`open`) for lack of permission.
+    pub(crate) fn offers_native_kvm_item(defaulted: bool, open: &std::io::Result<()>) -> bool {
+        defaulted
+            && open
                 .as_ref()
-                .is_err_and(|err| err.kind() != std::io::ErrorKind::NotFound)
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
     }
+
+    /// The `kvm` item as the native provider's plan offers it: a missing
+    /// step says what joining the group changes for a host that runs no VM.
+    pub(crate) fn native_kvm_item(mut item: Item) -> Item {
+        if item.state == ItemState::Missing {
+            item.today = Some(NATIVE_KVM_TODAY.to_string());
+        }
+        item
+    }
+
+    /// What a native host loses while the operator is outside the `kvm`
+    /// group, as the native provider's `kvm` item says it.
+    pub(crate) const NATIVE_KVM_TODAY: &str = "min uses the native provider, not the VM \
+        provider, because /dev/kvm does not open for you";
 
     /// [`kvm_item_over`] this host's reads, with `open` the result of
     /// opening `/dev/kvm` for reading and writing
@@ -4452,25 +4472,36 @@ mod tests {
     /// native one when `/dev/kvm` is there but does not open.
     #[test]
     fn kvm_item_is_offered_where_kvm_is_there_but_closed() {
-        use linux::offers_kvm_item;
+        use linux::{kvm_item_over, native_kvm_item, offers_native_kvm_item};
         use std::io::{Error, ErrorKind};
-        assert!(offers_kvm_item(true, &Ok(())));
-        assert!(offers_kvm_item(
-            true,
-            &Err(Error::from(ErrorKind::NotFound))
-        ));
+        let denied = || Err(Error::from(ErrorKind::PermissionDenied));
         assert!(
-            !offers_kvm_item(false, &Ok(())),
+            !offers_native_kvm_item(true, &Ok(())),
             "a usable /dev/kvm needs no step"
         );
         assert!(
-            !offers_kvm_item(false, &Err(Error::from(ErrorKind::NotFound))),
+            !offers_native_kvm_item(true, &Err(Error::from(ErrorKind::NotFound))),
             "a host with no /dev/kvm has nothing to join"
         );
         assert!(
-            offers_kvm_item(false, &Err(Error::from(ErrorKind::PermissionDenied))),
+            offers_native_kvm_item(true, &denied()),
             "a /dev/kvm this user cannot open gets the kvm group step"
         );
+        assert!(
+            !offers_native_kvm_item(false, &denied()),
+            "a native provider the user named gets no kvm step"
+        );
+        let item = native_kvm_item(kvm_item_over(denied(), "alice", false));
+        assert_eq!(item.state, ItemState::Missing);
+        assert_eq!(
+            item.today.as_deref(),
+            Some(
+                "min uses the native provider, not the VM provider, because /dev/kvm does not \
+                 open for you"
+            )
+        );
+        let done = native_kvm_item(kvm_item_over(Ok(()), "alice", false));
+        assert_eq!(done.today, None);
     }
 
     /// The KVM item's table: done when the device opens, a group step on

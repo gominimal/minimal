@@ -142,8 +142,10 @@ cargo build --release --locked --target "$TARGET" --package minzoned
 # so the release ships it next to minvmd. On Linux it keeps its keys in the
 # TPM or Secret Service. The Linux release jobs ship this build. The macOS
 # release builds bep in a step of its own, because bep ships there inside a
-# signed bundle.
-cargo build --release --locked --target "$TARGET" --package bep --bin bep
+# signed bundle, so a non-Linux target skips it.
+case "$TARGET" in
+    *-linux-*) cargo build --release --locked --target "$TARGET" --package bep --bin bep ;;
+esac
 
 # THE link gate on what this script just built (the rule
 # scripts/check-zoned-links.sh documents): the answerer runs as a root
@@ -205,4 +207,4 @@ else
     echo "dist-build: completions -> $COMPLETIONS_DIR"
 fi
 
-echo "dist-build: $TARGET built -> $BIN_DIR (mip, min, minimald, minvmd, minzoned, bep)"
+echo "dist-build: $TARGET built -> $BIN_DIR (mip, min, minimald, minvmd, minzoned; bep on Linux)"

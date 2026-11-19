@@ -302,8 +302,8 @@ pub async fn cmd_session_policy(
         resolve_box_on_any_vm(global, client, &args.session, &example).await?;
     // Keyed on the backend this command actually talks to —
     // `client_host_kind`, the same key `resolve_socket_path` turns on — not
-    // on `use_minvmd()`, which is true only under an explicit `--provider
-    // local-minvmd`.
+    // on `use_minvmd()`, which reads only the Linux provider choice and is
+    // false on macOS.
     let mut out = std::io::stdout();
     write_box_network(
         &mut out,
