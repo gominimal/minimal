@@ -421,15 +421,24 @@ mod tests {
         (dir, state, maintenance)
     }
 
-    /// Writes an entry into the daemon's local cache under `hash`, rewinding
-    /// its directory's mtime past the clean's cutoff: no read is ever recorded
-    /// against it, so its write time is what a clean judges it by.
+    /// Writes an entry into the daemon's local cache under `hash`. No read is
+    /// ever recorded against it, and its write time is past the clean's
+    /// cutoff: the metadata says twice [`UNUSED_FOR`] ago, and its directory's
+    /// mtime, which a clean judges it by, is rewound just past the cutoff. An
+    /// unread entry written after the cutoff stays.
     fn write_entry(cache: &mctx::Cache, hash: &SpecHash) {
+        let written = std::time::SystemTime::now()
+            .checked_sub(2 * UNUSED_FOR)
+            .unwrap();
         let w = cache.write_dir(hash).unwrap();
         w.open_write("f").unwrap().write_all(b"x").unwrap();
         w.finalize(EntryMeta {
             inner: MetaInner::Spec("test".to_string()),
             fetched: false,
+            epoch_millis: written
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
             ..Default::default()
         })
         .unwrap();

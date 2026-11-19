@@ -470,6 +470,46 @@ mod tests {
         assert_eq!(left, want);
     }
 
+    /// An entry with no recorded read is stale only when its write time, the
+    /// directory's mtime, is before the cutoff. One written after the cutoff
+    /// stays, and one written before it goes.
+    #[test]
+    fn clean_keeps_an_unread_entry_written_after_the_cutoff() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let (fresh, aged) = (hash(1), hash(2));
+        write_entry(&cache, &fresh, "fresh");
+        let w = cache.write_dir(&aged).unwrap();
+        w.open_write("f").unwrap().write_all(b"x").unwrap();
+        w.finalize(EntryMeta {
+            inner: MetaInner::Spec("aged".to_string()),
+            fetched: false,
+            epoch_millis: u128::from(secs_ago(Duration::from_secs(30 * 24 * 60 * 60))) * 1000,
+            ..Default::default()
+        })
+        .unwrap();
+        backdate_entry(&cache, &aged, Duration::from_secs(30 * 24 * 60 * 60));
+
+        let report = CleanCache {
+            older_than: Duration::from_secs(14 * 24 * 60 * 60),
+            keep: HashSet::new(),
+            sweep: vec![],
+            daemon_id: None,
+            events: None,
+        }
+        .run(&cache)
+        .unwrap();
+
+        assert_eq!(
+            report,
+            CleanReport {
+                entries: 1,
+                dirs: 0
+            }
+        );
+        assert_eq!(cache.iter_entries().collect::<Vec<_>>(), vec![fresh]);
+    }
+
     #[test]
     fn reports_deletions_as_events() {
         let tmp = TempDir::new().unwrap();
