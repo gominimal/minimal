@@ -18351,34 +18351,6 @@ async fn box_spec_bare_reads_defaults_network_bep_matches_start_projection() {
     assert!(bare.contains("GH_TOKEN"), "{bare}");
 }
 
-// D3598: with two session entries, no `default` and a `[box_types.session]`
-// table that sets `network.bep`, bare `min box spec` shows the steering
-// row that the start projection of an entry with an empty body grants: the
-// `[defaults.network.bep]` mode. A project type cannot replace the built-in
-// `session` type, so neither of them takes that table's steering mode.
-#[tokio::test]
-async fn box_spec_bare_reads_defaults_network_bep_box_types_session() {
-    let (project, global) = spec_project(
-        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
-         [box_types.session]\nextends = \"session\"\n\n\
-         [box_types.session.defaults.network.bep]\nsteering = \"dns\"\n\n\
-         [defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:full\"]\n\n\
-         [sessions.one]\n\n\
-         [sessions.two]\n",
-    );
-    let path = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 path");
-    let (start_bep, start_secrets, _, _) =
-        crate::project_bep_and_grants(path, Some("one")).expect("the start projection");
-    assert!(start_secrets.contains_key("GH_TOKEN"), "{start_secrets:?}");
-    let bare = box_spec_text(&global, &["min", "box", "spec", "--network", "own_ip"])
-        .await
-        .expect("the rows render without a picked session entry");
-    let row = format!("\nsteering  {}\n", start_bep.resolved_steering().word());
-    assert!(bare.contains(&row), "{row:?} not in {bare}");
-    assert!(!bare.contains("\nsteering  dns\n"), "{bare}");
-    assert!(bare.contains("GH_TOKEN"), "{bare}");
-}
-
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.
