@@ -2042,7 +2042,10 @@ impl BoxActor {
     }
 
     /// Writes the box's `started` event (BOX-040): its entrypoint started
-    /// on a new host. `op` names the operation that started it in the log.
+    /// on a new host. An attach that keeps a hooks host (a host kept for its
+    /// host-side row, or an attach that declares no terminal) releases the
+    /// shell without a `started` event yet. Issue #3604 tracks that gap.
+    /// `op` names the operation that started it in the log.
     /// A failed write is logged and does not stop the box, which runs.
     pub(super) async fn record_started(&self, op: &'static str) {
         match self.record.object().await {
