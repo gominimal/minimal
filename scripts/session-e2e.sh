@@ -32169,18 +32169,12 @@ for row in lines:
   TWO_VM_FWD_PID=""
 
   # ---- a name no VM holds -------------------------------------------------
-  # NET-058: this step and the stopped-VM step below keep the old policy
-  # verb of `min session`. `min box show` answers a box on a stopped VM as not
-  # found, and NET-058 refuses that answer. They move when a box verb gives
-  # NET-058's refusal: gominimal/minimal#3589. Each line that names the verb
-  # carries the marker that the test
-  # `scripts_and_cli_reference_use_no_removed_session_verb` allows.
-  lt_run unknown mnl session policy "$lt_nobody"  # removed-verb-ok: gominimal/minimal#3589
-  lt_want_rc refused "min session policy $lt_nobody"  # removed-verb-ok: gominimal/minimal#3589
-  lt_want_line "the unknown-box refusal says no running VM has the box" \
-    "no running VM has a box named '$lt_nobody'." "$LT_ERR"
-  lt_want_line "the unknown-box refusal shows the --vm form of the command" \
-    "min --vm <vm> session policy $lt_nobody" "$LT_ERR"  # removed-verb-ok: gominimal/minimal#3589
+  lt_run unknown mnl box show "$lt_nobody" --network
+  lt_want_rc refused "min box show $lt_nobody --network"
+  lt_want_line "the unknown-box refusal says no box has the name" \
+    "No box named $lt_nobody." "$LT_ERR"
+  lt_want_line "the unknown-box refusal names the command that lists every box" \
+    "Run \`min box list --all\` to see the boxes of every project." "$LT_ERR"
 
   # ---- the expose refusals inside the box ---------------------------------
   lt_run expose-public lt_mn box exec "$lt_b_sid" -- bash -c "/usr/bin/min net expose --public $lt_port"
@@ -32273,8 +32267,8 @@ $LT_ERR"
     printf '%s\n' "$LT_OUT"
     lt_fail
   fi
-  lt_run policy-stopped mnl session policy "$lt_b"  # removed-verb-ok: gominimal/minimal#3589
-  lt_want_rc refused "min session policy $lt_b, with VM $lt_vm stopped"  # removed-verb-ok: gominimal/minimal#3589
+  lt_run policy-stopped mnl box show "$lt_b" --network
+  lt_want_rc refused "min box show $lt_b --network, with VM $lt_vm stopped"
   lt_want_line "the stopped-VM refusal names the box and its VM" \
     "box '$lt_b' is on VM '$lt_vm', which is stopped." "$LT_ERR"
   lt_want_line "the stopped-VM refusal gives the command that starts the VM" \
