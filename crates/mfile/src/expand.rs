@@ -1777,7 +1777,10 @@ mod tests {
         let dev = expand_in(superset, "dev", Layers::default()).expect("dev expands");
         let network = dev.spec["network"].as_table().expect("a network table");
         assert_eq!(network["mode"].as_str(), Some("own_ip"));
-        assert_eq!(strings(network["egress"].get("allow_dns_hosts")), ["c.example"]);
+        assert_eq!(
+            strings(network["egress"].get("allow_dns_hosts")),
+            ["c.example"]
+        );
         assert_eq!(network["bep"]["steering"].as_str(), Some("dns"));
     }
 
