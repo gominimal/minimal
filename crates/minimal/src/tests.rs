@@ -265,7 +265,7 @@ fn every_daemon_connection_is_classified() {
             // so a skewed host still answers which boxes it holds.
             "cmd/boxes/address.rs::connect_box_host = gated",
             "cmd/boxes/address.rs::probe_other_host = ungated",
-            "cmd/boxes/address.rs::read_host_boxes = ungated",
+            "cmd/boxes/address.rs::read_host = ungated",
             // A read-only look at a box after `min box attach` ended, to say
             // why the host ended it. The attach itself went through the
             // address resolution above, and the read builds nothing.
@@ -7753,6 +7753,137 @@ async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
             .await
             .expect("--vm picks the selected VM's box");
     assert_eq!(record.id, shared);
+}
+
+/// BCLI-002, NET-058: a box verb that names a box on a stopped VM is refused
+/// with the VM's name and the command that starts it, and exits 4. The box
+/// is found by its name, its id and its `provider/host/name`. A name that a
+/// running VM's box and a stopped VM's records both hold resolves to the
+/// running box. A name that a running VM holds only as a box that does not
+/// run, and that a stopped VM's records hold too, is ambiguous and exits 2.
+/// `min box spec` refuses the box on the stopped VM as `min box show` does,
+/// and a name that no VM holds is not found.
+#[tokio::test]
+async fn box_verb_on_stopped_vm_box_refuses_with_start_hint() {
+    let (state, default_vm) = running_default_vm().await;
+    let api = create_box_on(&default_vm, "api").await;
+    let beta = boxes::SessionId::mint();
+    stopped_vm_with_boxes(
+        state.path(),
+        "alpha",
+        &[("beta", beta), ("api", boxes::SessionId::mint())],
+    );
+    let global = vm_globals(state.path(), None);
+    let expected = "box 'beta' is on VM 'alpha', which is stopped. \
+                    Start it with: min --vm alpha session attach beta";
+
+    for address in [
+        "beta".to_owned(),
+        beta.to_string(),
+        "local-minvmd/alpha.local-minvmd0/beta".to_owned(),
+    ] {
+        let err = cmd::resolve_box_on_local_hosts(&global, &address, "box show")
+            .await
+            .expect_err("a box on a stopped VM is refused");
+        assert_eq!(err.to_string(), expected, "{address}");
+        let refusal = err
+            .downcast_ref::<BoxAddressRefusal>()
+            .expect("the refusal is a box address refusal");
+        assert_eq!(
+            refusal,
+            &BoxAddressRefusal::OnStoppedVm {
+                name: "beta".to_owned(),
+                vm: "alpha".to_owned(),
+            },
+            "{address}"
+        );
+        assert_eq!(refusal.exit_code(), 4, "{address}");
+        assert_eq!(refusal.code(), "not_found", "{address}");
+    }
+
+    // A running VM's box wins over a stopped VM's record of the same name.
+    let resolved = cmd::resolve_box_on_local_hosts(&global, "api", "box show")
+        .await
+        .expect("the running box resolves");
+    assert_eq!(resolved.box_id, api);
+    assert!(resolved.host.selected, "{}", resolved.host.host);
+
+    // `min box spec` resolves through the same lookup, so it refuses the box
+    // on the stopped VM the same way.
+    let err = box_spec_text(&global, &["min", "box", "spec", "beta"])
+        .await
+        .expect_err("box spec refuses a box on a stopped VM");
+    assert_eq!(err.to_string(), expected);
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .expect("box spec's refusal is a box address refusal");
+    assert_eq!(refusal.exit_code(), 4);
+    assert_eq!(
+        refusal.hint(),
+        "Start it with: min --vm alpha session attach beta"
+    );
+
+    // A name that a running VM holds only as a box that is not running, and
+    // that a stopped VM's records also hold, is ambiguous across the two
+    // hosts: the refusal exits 2 and lists both boxes with their states.
+    let web = create_box_on(&default_vm, "web").await;
+    cmd::stop_box_on_hosts(
+        local_hosts(&global).expect("the local hosts"),
+        &mut Vec::new(),
+        "web",
+        false,
+    )
+    .await
+    .expect("stop the running VM's 'web'");
+    let stopped_web = boxes::SessionId::mint();
+    stopped_vm_with_boxes(state.path(), "delta", &[("web", stopped_web)]);
+    let err = cmd::resolve_box_on_local_hosts(&global, "web", "box show")
+        .await
+        .expect_err("two hosts hold 'web' and neither box runs");
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .expect("the refusal is a box address refusal");
+    assert!(
+        matches!(refusal, BoxAddressRefusal::Ambiguous { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.exit_code(), 2);
+    let text = err.to_string();
+    let rows: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter(|l| l.starts_with("  "))
+        .collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    let default_row = rows
+        .iter()
+        .find(|row| row.contains(&web.to_string()))
+        .unwrap_or_else(|| panic!("the running VM's 'web' is listed: {text}"));
+    assert_eq!(
+        *default_row,
+        format!("  local-minvmd/local-minvmd0/web  stopped  {web}"),
+        "{text}"
+    );
+    let delta_row = rows
+        .iter()
+        .find(|row| row.contains(&stopped_web.to_string()))
+        .unwrap_or_else(|| panic!("the stopped VM's 'web' is listed: {text}"));
+    assert_eq!(
+        *delta_row,
+        format!("  local-minvmd/delta.local-minvmd0/web  stopped  {stopped_web}"),
+        "{text}"
+    );
+
+    // A name that no VM holds is not found.
+    let err = cmd::resolve_box_on_local_hosts(&global, "nobody", "box show")
+        .await
+        .expect_err("an unknown name is not found");
+    assert_eq!(
+        err.downcast_ref::<BoxAddressRefusal>(),
+        Some(&BoxAddressRefusal::NotFound {
+            address: "nobody".to_owned(),
+        })
+    );
 }
 
 /// NET-152: `min ls` lists a stopped VM's boxes from its persisted records:
