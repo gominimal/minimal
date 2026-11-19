@@ -374,6 +374,10 @@ fn every_daemon_connection_is_classified() {
             // connections to a test Box Egress Proxy's control socket.
             "tests.rs::a_failed_box_reply_forgets_the_box_again = ungated",
             "tests.rs::a_refused_client_key_forgets_the_box_again = ungated",
+            // The stale-socket test connects to a proxy control socket that
+            // nothing serves, to read the refusal the mint gives for it.
+            "tests.rs::a_stale_control_socket_names_the_proxy_log = ungated",
+            "tests.rs::a_stale_control_socket_names_the_proxy_log = ungated",
             // Test-only: the box address tests read a box's state straight
             // from an in-process daemon of the same build.
             "tests.rs::address_state = ungated",
