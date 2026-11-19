@@ -1016,9 +1016,9 @@ pub struct File {
 }
 
 /// The entry keys that `[session]` and a task keep among their unknown
-/// fields but that a box spec reads (BOX-049), so they are not reported
-/// as unknown.
-const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout"];
+/// fields but that a box spec reads (BOX-049, BOX-203), so they are not
+/// reported as unknown.
+const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout", "file_exports"];
 
 /// An entry's unknown fields, in key order, less the ones a box spec reads.
 fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
@@ -4766,6 +4766,30 @@ mod tests {
             let parsed: File = toml::from_str(&file).unwrap();
             parsed.validate().expect(&file);
         }
+    }
+
+    /// BOX-203: `[[file_exports]]` on a task is a box setting, so the load
+    /// does not report it as an unknown field.
+    #[test]
+    fn file_exports_entry_key_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.build]\nexec = [\"make\"]\n\n[[tasks.build.file_exports]]\npath = \"out.txt\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("file_exports on a task loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
     }
 
     /// BOX-049: `timeout` in `[session]` or a task is a box setting, so the
