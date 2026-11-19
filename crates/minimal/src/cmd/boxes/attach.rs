@@ -513,9 +513,8 @@ impl std::fmt::Display for RowNotBack {
             RowNotBack::NameHeld { name, held } => write!(
                 f,
                 "box {name} cannot get its network addresses back. Another box, {held}, \
-                 holds its name now. Rename that box with `min box rename {held} <new-name>` \
-                 or remove it with `min box rm --force {held}`, then run \
-                 `min box attach {name}` again."
+                 holds its name now. Give that box another name with \
+                 `min box rename {held} <new-name>`, then run `min box attach {name}` again."
             ),
             RowNotBack::NotBack { name } => write!(
                 f,

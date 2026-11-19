@@ -24195,8 +24195,9 @@ async fn an_attach_retries_once_when_its_row_comes_back() {
 }
 
 /// The text an interactive attach ends with when another box holds its
-/// box's name now (NET-138): it names both boxes and the commands that free
-/// the name, so a second attach does not fail the same way.
+/// box's name now (NET-138): it names both boxes and the rename that frees
+/// the name, so a second attach does not fail the same way. It never offers
+/// to remove the other box, which is running and holds its own data.
 #[test]
 fn row_not_back_names_the_box_that_holds_the_name() {
     let held = RowNotBack::NameHeld {
@@ -24206,7 +24207,7 @@ fn row_not_back_names_the_box_that_holds_the_name() {
     assert_eq!(
         held.to_string(),
         "box web cannot get its network addresses back. Another box, Web, holds its name \
-         now. Rename that box with `min box rename Web <new-name>` or remove it with \
-         `min box rm --force Web`, then run `min box attach web` again."
+         now. Give that box another name with `min box rename Web <new-name>`, then run \
+         `min box attach web` again."
     );
 }
