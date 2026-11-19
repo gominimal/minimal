@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use clap::{Args, Subcommand};
 
+pub mod answerer;
 pub mod collect;
 pub mod guest;
 pub mod net;
@@ -205,6 +206,11 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     // ── Host-side collectors: independent, each failure becomes a
     // manifest error rather than aborting the run.
     collect_step!(w, "host.system", collect::system(&mut w, &paths));
+    collect_step!(
+        w,
+        "host.answerer",
+        answerer::answerer(&mut w, created_at, args.log_tail_bytes)
+    );
     collect_step!(w, "host.terminal", collect::terminal(&mut w));
     collect_step!(w, "host.env", collect::env(&mut w));
     collect_step!(w, "host.dirs", dirs_report(&mut w, global));

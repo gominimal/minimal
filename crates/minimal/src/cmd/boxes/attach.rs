@@ -248,8 +248,9 @@ async fn box_via_ssh_with(
         None => None,
     };
     // A VM host that cannot be reached fails the attach or the exec
-    // closed (#1790); one that answers late or refuses is a warn line, and
-    // the attach or the exec goes on (NET-138).
+    // closed (#1790). One that refuses fails it with its own reason, which
+    // `main` prints before any terminal is taken, so it stays on screen.
+    // One that answers late is a warn line, and the attach goes on (NET-138).
     resume_box_row(sock, record.as_ref()).await?;
     // The name hold a `host_ip` session without a row depends on may not
     // have survived a VM host daemon restart; re-make it before the
@@ -495,6 +496,11 @@ pub(crate) fn mark_relay_not_started(
 /// terminal ([`crate::attach::TerminalNotTaken`]) or never started ssh's
 /// session on it ([`crate::attach::RelayNotStarted`]) stands the guard
 /// down, because nothing of the session reached the terminal.
+///
+/// An attach that the daemon refuses prints its refusal through ssh, and
+/// the daemon sends an exit status with it. So ssh does not end with 255,
+/// the guard is stood down, and no blind cursor restore moves the cursor
+/// back over the refusal line.
 pub(crate) fn interactive_attach<W: std::io::Write>(
     ssh: std::process::Command,
     stdin_is_tty: bool,
@@ -1426,7 +1432,8 @@ async fn attach_exec_by_id(
     config_dir: Option<&std::path::Path>,
 ) -> Result<i32, anyhow::Error> {
     // A VM-backed box gets its row and its name hold back first, as
-    // `min box exec` does.
+    // `min box exec` does. A refused resume ends here with the VM host's
+    // reason, before the terminal is taken.
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
         Some(_) => attached_box_record(sock, id).await.unwrap_or_else(|error| {
             tracing::warn!(
@@ -1489,6 +1496,9 @@ where
         host = %target.host.host,
         outcome = "attaching"
     );
+    // BOX-204: a box that ended before the attach resumes in it. The
+    // attach then copies only a later end, never the end it resumed from.
+    let ends_before = ended_box_end_count(&target).await;
     let code = attach(&target).await.inspect_err(|err| {
         tracing::info!(verb = name, box_id = %target.box_id, outcome = "error", "{err:#}");
     })?;
@@ -1525,11 +1535,9 @@ where
     let mut copied = None;
     if let BoxAfterAttach::Listed(entry) = &ended
         && matches!(entry.state.as_str(), "stopped" | "exited")
+        && ended_again(&target, ends_before).await
     {
         let root = entry.project_root.as_ref();
-        // Interim: the outcomes go to no `file_exported` event, and no
-        // claim gates the copy (BOX-195 and BOX-198,
-        // gominimal/minimal#3446). See `copy_box_exports`.
         let outcomes = copy_box_exports_on_host(
             &target.host,
             target.box_id,
@@ -1542,7 +1550,16 @@ where
         let exited_clean = entry.state == "exited" && entry.exit_code == Some(0);
         copied = Some((exited_clean, outcomes));
     }
-    match attach_ending(&target, code, &after) {
+    // BCLI-068: a box that runs again after the host ended the attach, and
+    // whose count of ends rose, was restarted, not taken by another terminal.
+    // Only a 254 reads the count, since only a 254 can name a restart.
+    let ends_after = if code == DAEMON_ENDED_ATTACH {
+        box_end_count(&target).await
+    } else {
+        None
+    };
+    let restarted = attach_restart(code, &after, ends_before, ends_after);
+    match box_attach_ending(&target, code, &after, restarted) {
         Ok(mut ending) => {
             if let Some((exited_clean, outcomes)) = &copied {
                 ending.code = exit_code_after_exports(ending.code, *exited_clean, outcomes);
@@ -1566,6 +1583,163 @@ where
             Err(refusal.into())
         }
     }
+}
+
+/// What the attach knew of the box's ends before it started (BOX-204).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndsBefore {
+    /// The box ran, so any end it reaches is a new end. The count is how
+    /// many times it had ended, `None` when the host did not give it. A
+    /// restart while the attach runs raises it (BCLI-068).
+    Running(Option<u64>),
+    /// The box was stopped or exited, and had ended this many times.
+    Ended(u64),
+    /// The host did not give the box's state or its count of ends.
+    Unread,
+}
+
+/// What the attach knew of the box `target` before it started: running,
+/// ended a number of times, or not read.
+async fn ended_box_end_count(target: &BoxAttachTarget) -> EndsBefore {
+    let BoxAfterAttach::Listed(entry) = box_after_attach(&target.host, target.box_id).await else {
+        tracing::warn!(box_id = %target.box_id, "box ends: the host did not give the box's state");
+        return EndsBefore::Unread;
+    };
+    let running = !matches!(entry.state.as_str(), "stopped" | "exited");
+    let count = box_end_count(target).await;
+    if running {
+        return EndsBefore::Running(count);
+    }
+    count.map_or(EndsBefore::Unread, EndsBefore::Ended)
+}
+
+/// How many times the box `target` ended, `None` when its host does not
+/// give the count.
+async fn box_end_count(target: &BoxAttachTarget) -> Option<u64> {
+    let mut client = box_host_client(&target.host)
+        .await
+        .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
+        .ok()?;
+    box_ends(&mut client, target.box_id)
+        .await
+        .map(|ends| ends.count)
+}
+
+/// Whether a box that runs after its attach ended was restarted while the
+/// attach ran (BCLI-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxRestart {
+    /// The box's count of ends rose while the attach ran.
+    Restarted,
+    /// The count did not rise, or the box did not run when the attach
+    /// started.
+    NotRestarted,
+    /// The count before or after the attach was not read, so nothing
+    /// says why the attach ended.
+    Unread,
+}
+
+/// Whether a box that the attach knew as `before` was restarted while the
+/// attach ran: its count of ends rose from `before` to `after`. A count
+/// that was not read, before or after, gives [`BoxRestart::Unread`]
+/// (BCLI-068).
+pub(crate) fn ends_show_restart(before: EndsBefore, after: Option<u64>) -> BoxRestart {
+    match (before, after) {
+        (EndsBefore::Running(Some(before)), Some(after)) if after > before => BoxRestart::Restarted,
+        (EndsBefore::Running(Some(_)), Some(_)) | (EndsBefore::Ended(_), _) => {
+            BoxRestart::NotRestarted
+        }
+        (EndsBefore::Running(_), _) | (EndsBefore::Unread, _) => BoxRestart::Unread,
+    }
+}
+
+/// Whether the attach that ended with ssh's `code` was ended by a restart
+/// of its box. Only a 254 against a box that the settled read `after`
+/// lists as running can be a restart. Then the count of ends decides, from
+/// `before` the attach to `ends_after` it, as [`ends_show_restart`] says
+/// (BCLI-068).
+pub(crate) fn attach_restart(
+    code: i32,
+    after: &BoxAfterAttach,
+    before: EndsBefore,
+    ends_after: Option<u64>,
+) -> BoxRestart {
+    let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
+    if code == DAEMON_ENDED_ATTACH && running {
+        ends_show_restart(before, ends_after)
+    } else {
+        BoxRestart::NotRestarted
+    }
+}
+
+/// How an attach that ended with ssh's `code` ends the command, as
+/// [`attach_ending`] says, except for a 254 against a box that runs again.
+/// A box that was `restarted` ends with 254 and a line that names the
+/// restart, not another terminal. A box whose count of ends was not read
+/// ends with 254 and the line for a host that ended the attach, since
+/// nothing says why (BCLI-068).
+pub(crate) fn box_attach_ending(
+    target: &BoxAttachTarget,
+    code: i32,
+    after: &BoxAfterAttach,
+    restarted: BoxRestart,
+) -> Result<AttachEnding, BoxAttachRefusal> {
+    let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
+    if code != DAEMON_ENDED_ATTACH || !running {
+        return attach_ending(target, code, after);
+    }
+    match restarted {
+        BoxRestart::Restarted => {
+            let label = &target.label;
+            Ok(AttachEnding {
+                code: DAEMON_ENDED_ATTACH,
+                notice: Some(format!(
+                    "Detached: {label} was restarted. Run min box attach {label} to attach again."
+                )),
+            })
+        }
+        BoxRestart::NotRestarted => attach_ending(target, code, after),
+        BoxRestart::Unread => attach_ending(target, code, &BoxAfterAttach::Unread),
+    }
+}
+
+/// Whether a box that the attach knew as `before` ended again, when the
+/// host now gives `after` ends. A box that ran counts as ended again. A
+/// count that is not read, before or after, counts as no new end. Then the
+/// attach copies nothing, and a later `min box wait` can copy that end
+/// (BOX-204).
+pub(crate) fn ends_show_new_end(before: EndsBefore, after: Option<u64>) -> bool {
+    match before {
+        EndsBefore::Running(_) => true,
+        EndsBefore::Ended(before) => after.is_some_and(|after| after > before),
+        EndsBefore::Unread => false,
+    }
+}
+
+/// Whether the box `target`, which the attach knew as `before`, ended
+/// again since. See [`ends_show_new_end`].
+async fn ended_again(target: &BoxAttachTarget, before: EndsBefore) -> bool {
+    if let EndsBefore::Running(_) = before {
+        return true;
+    }
+    let mut after = None;
+    if let EndsBefore::Ended(_) = before
+        && let Ok(mut client) = box_host_client(&target.host).await
+    {
+        after = box_ends(&mut client, target.box_id)
+            .await
+            .map(|ends| ends.count);
+    }
+    let again = ends_show_new_end(before, after);
+    if !again {
+        tracing::info!(
+            box_id = %target.box_id,
+            ends_before = ?before,
+            ends_after = ?after,
+            "file exports: the attach did not see a new end of the box, so it copies nothing"
+        );
+    }
+    again
 }
 
 /// The box an attach of `verb` goes to, among the boxes the verb sees. A
