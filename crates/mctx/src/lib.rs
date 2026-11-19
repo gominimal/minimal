@@ -1169,10 +1169,14 @@ impl Context {
                 }
                 // The key is one directory name, so the state directory's path
                 // failed to resolve: a symlink on it, or a path that cannot be read.
+                // The reason follows a colon, so each of its three forms ("resolves
+                // to ..., which is outside the state base ...", "cannot resolve the
+                // state base ...", "cannot resolve ... under the state base ...")
+                // reads as a statement of its own.
                 Error::Other(anyhow!(
-                    "The state directory for task `{name}` and state key {key:?} {reason}. \
-                     Check that path for a symlink or a permission problem, then run the \
-                     task again."
+                    "The state directory for task `{name}` and state key {key:?} cannot be used: \
+                     {reason}. Check that path for a symlink or a permission problem, then \
+                     run the task again."
                 ))
             })?
             .ok_or_else(|| {
@@ -1893,7 +1897,7 @@ mod tests {
         let msg = make_env_refusal(&mut ctx, "dev").await;
         assert!(
             msg.starts_with(
-                "The state directory for task `build` and state key \"dev\" resolves to "
+                "The state directory for task `build` and state key \"dev\" cannot be used: resolves to "
             ),
             "{msg}"
         );
