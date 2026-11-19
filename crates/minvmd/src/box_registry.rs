@@ -227,13 +227,29 @@ const HOST_IP_RULES_FILE_VERSION: u32 = 1;
 pub const HELD_NAME_RECONFIRM_BOUND: Duration = RESUME_ATTACH_BOUND;
 
 /// How long a `host_ip` registration name stands while no box is admitted
-/// under its id ([`BoxRegistry::register_host_ip_box`]). A `host_ip`
-/// registration holds no connection, so a creator that dies between its
-/// register and its box's admission leaves the name with nothing to
-/// withdraw it. Past this bound a new registration under the name takes it.
+/// under its id ([`BoxRegistry::register_host_ip_box`]). A held
+/// registration ends at its lease's close: a creator that dies between its
+/// register and its commit frees the name at once
+/// ([`BoxRegistry::withdraw_unadmitted_host_ip_name`]). The bound is for a
+/// name nothing else withdraws: a one-shot registration from a client that
+/// holds no lease, or a committed one whose box was never admitted. Past
+/// this bound a new registration under the name takes it.
 /// The bound is [`RESUME_ATTACH_BOUND`]'s: the in-VM create and the
 /// admission that follows it come inside one slow boot.
 pub const HOST_IP_UNADMITTED_NAME_BOUND: Duration = RESUME_ATTACH_BOUND;
+
+/// What the close of an uncommitted `host_ip` registration lease did with
+/// its name ([`BoxRegistry::withdraw_unadmitted_host_ip_name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseNameWithdrawal {
+    /// The name was withdrawn: a new registration under it succeeds.
+    Withdrawn,
+    /// A box is admitted under the id, so the name stays with that box.
+    Admitted,
+    /// The name no longer answers the id: the box retired, the creator
+    /// withdrew it, or a later registration took it.
+    NotNamed,
+}
 
 /// One relay's end, as the host reports it: the switch addresses whose
 /// relayed traffic that connection carried, each with the id of the box
@@ -5317,6 +5333,34 @@ impl BoxRegistry {
         }
         ids.by_name.remove(name);
         true
+    }
+
+    /// Withdraws the `host_ip` registration name `name` while it still
+    /// answers `id` and no box is admitted under `id`: the registration's
+    /// lease closed before its commit, so the creator's activation ended.
+    /// The name of an admitted box stays, because that box is live and its
+    /// retire withdraws the name ([`Self::retire_host_ip_box`]). The id
+    /// stays for the collision check (BEP-082).
+    pub fn withdraw_unadmitted_host_ip_name(&self, name: &str, id: BoxId) -> LeaseNameWithdrawal {
+        // The resident set's read lock is taken before the ids' lock, as
+        // the registration takes them, so an admission cannot land between
+        // the check and the remove.
+        let resident = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        let mut ids = self.host_ip_id_set();
+        if ids.by_name.get(name).map(|named| named.id) != Some(id) {
+            return LeaseNameWithdrawal::NotNamed;
+        }
+        if resident
+            .boxes
+            .contains_key(&boxes::SessionId::from_bytes(id))
+        {
+            return LeaseNameWithdrawal::Admitted;
+        }
+        ids.by_name.remove(name);
+        LeaseNameWithdrawal::Withdrawn
     }
 
     /// [`Self::register_client_box_at`] with the freshly minted `id` it

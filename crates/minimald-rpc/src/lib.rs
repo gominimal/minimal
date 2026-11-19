@@ -840,7 +840,10 @@ pub struct RegisterBoxRequest {
     /// connection open: the client writes one `commit` line once its
     /// session is active, and a close or an error before that line
     /// withdraws the row, so an activation that dies between registering
-    /// and committing leaves no row holding its name. A client that omits
+    /// and committing leaves no row holding its name. A `host_ip`
+    /// registration has no row and is held the same way: a close before
+    /// the commit withdraws its registration name, unless a box is already
+    /// admitted under its id. A client that omits
     /// the field, or a daemon that predates it, keeps the one-shot
     /// registration: one line each way, and the row lives until its
     /// creator withdraws it.

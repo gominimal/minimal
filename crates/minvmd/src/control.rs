@@ -2116,7 +2116,9 @@ fn resume_reply(
 /// Serve a held registration ([`RegisterBoxRequest::hold`]): register the
 /// box, then hand the connection to a thread of its own that writes the
 /// reply and holds the connection as the row's lease until its client
-/// commits it ([`hold_registration_lease`]). `slot` is the lease's place
+/// commits it ([`hold_registration_lease`]). A `host_ip` registration's
+/// lease holds its name the same way: a close before the commit withdraws
+/// the name, unless a box is admitted under the id. `slot` is the lease's place
 /// under [`MAX_REGISTRATION_LEASES`], held for the lease's life. A refused
 /// registration holds nothing: its reply is written here and the
 /// connection closes. A thread that cannot be spawned withdraws the row it
@@ -2133,19 +2135,28 @@ fn serve_held_registration(
     let name = request.name.clone();
     let build_row = request.stays_detached.then_some(BuildRow::Requester);
     let reply = registration_reply(boxes, answerer, order, request, build_row);
-    let BoxControlReply::Registered(registered) = &reply else {
-        return write_reply(&mut stream, &reply);
-    };
     // The lease's withdrawal names the id the registration minted, so a
-    // lease that ends late never removes a newer row under the same pair.
-    let withdrawal = WithdrawBoxRequest {
-        name,
-        switch_address: registered.switch_address,
-        loopback_address: registered.loopback_address,
-        box_id: Some(registered.box_id),
+    // lease that ends late never removes a newer row under the same pair,
+    // nor a newer registration's name. A `host_ip` registration has no
+    // row: its lease withdraws its name, by the unspecified pair and the
+    // id, as its creator's own withdrawal does (BEP-082).
+    let withdrawal = match &reply {
+        BoxControlReply::Registered(registered) => WithdrawBoxRequest {
+            name,
+            switch_address: registered.switch_address,
+            loopback_address: registered.loopback_address,
+            box_id: Some(registered.box_id),
+        },
+        BoxControlReply::BoxIdMinted { minted_box_id } => WithdrawBoxRequest {
+            name,
+            switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+            loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+            box_id: Some(*minted_box_id),
+        },
+        _ => return write_reply(&mut stream, &reply),
     };
     let not_held = |stream: &mut UnixStream, error: std::io::Error| {
-        order.apply(|| withdraw_box(boxes, answerer, withdrawal.clone()));
+        order.apply(|| withdraw_lease(boxes, answerer, withdrawal.clone()));
         write_reply(
             stream,
             &BoxControlReply::Error {
@@ -2227,12 +2238,21 @@ fn hold_registration_lease(
             Err(error) => format!("its reply could not be written: {error}"),
             Ok(()) => match read_request_line(&mut stream) {
                 Ok(Some(line)) if line.trim() == minimald_rpc::REGISTRATION_COMMIT_LINE => {
-                    tracing::info!(
-                        box = %withdrawal.name,
-                        switch_address = %withdrawal.switch_address,
-                        "committed the box's registration lease; the row stays until its \
-                         creator withdraws it"
-                    );
+                    match host_ip_withdrawal(&withdrawal) {
+                        Some(id) => tracing::info!(
+                            box = %withdrawal.name,
+                            box_id = %id,
+                            network = "host_ip",
+                            "committed the box's registration lease; the host_ip registration \
+                             name stays until the box retires or its creator withdraws it"
+                        ),
+                        None => tracing::info!(
+                            box = %withdrawal.name,
+                            switch_address = %withdrawal.switch_address,
+                            "committed the box's registration lease; the row stays until its \
+                             creator withdraws it"
+                        ),
+                    }
                     return;
                 }
                 Ok(Some(_)) => "its client sent a line that is not the commit".to_string(),
@@ -2241,13 +2261,57 @@ fn hold_registration_lease(
             },
         },
     };
-    tracing::info!(
-        box = %withdrawal.name,
-        switch_address = %withdrawal.switch_address,
-        cause = %ended,
-        "the box's registration lease ended uncommitted; withdrawing its row"
-    );
-    order.apply(|| withdraw_box(boxes, answerer, withdrawal));
+    match host_ip_withdrawal(&withdrawal) {
+        Some(id) => tracing::info!(
+            box = %withdrawal.name,
+            box_id = %id,
+            network = "host_ip",
+            cause = %ended,
+            "the box's registration lease ended uncommitted; withdrawing its host_ip \
+             registration name unless a box is admitted under its id"
+        ),
+        None => tracing::info!(
+            box = %withdrawal.name,
+            switch_address = %withdrawal.switch_address,
+            cause = %ended,
+            "the box's registration lease ended uncommitted; withdrawing its row"
+        ),
+    }
+    order.apply(|| withdraw_lease(boxes, answerer, withdrawal));
+}
+
+/// Withdraw what an uncommitted lease held: the row, through the path a
+/// client's withdrawal takes ([`withdraw_box`]), or a `host_ip`
+/// registration's name ([`host_ip_withdrawal`]). The name of a box already
+/// admitted under the id stays: that box is live, and its retire withdraws
+/// the name ([`BoxRegistry::withdraw_unadmitted_host_ip_name`]).
+fn withdraw_lease(boxes: &BoxRegistry, answerer: &AnswererStatus, withdrawal: WithdrawBoxRequest) {
+    let Some(id) = host_ip_withdrawal(&withdrawal) else {
+        withdraw_box(boxes, answerer, withdrawal);
+        return;
+    };
+    let box_id = id.to_string();
+    match boxes.withdraw_unadmitted_host_ip_name(&withdrawal.name, id.to_bytes()) {
+        crate::box_registry::LeaseNameWithdrawal::Withdrawn => tracing::info!(
+            box = %withdrawal.name,
+            box_id = %box_id,
+            network = "host_ip",
+            "withdrew the host_ip registration name its uncommitted lease held; a later box \
+             under the name takes a fresh id"
+        ),
+        crate::box_registry::LeaseNameWithdrawal::Admitted => tracing::info!(
+            box = %withdrawal.name,
+            box_id = %box_id,
+            network = "host_ip",
+            "kept the host_ip registration name its uncommitted lease held: a box is admitted \
+             under its id"
+        ),
+        crate::box_registry::LeaseNameWithdrawal::NotNamed => tracing::debug!(
+            box = %withdrawal.name,
+            box_id = %box_id,
+            "no host_ip registration name answers the lease's id; already withdrawn"
+        ),
+    }
 }
 
 /// Refuse a verb that arrived on a door that does not serve it (NET-138):
@@ -2663,8 +2727,8 @@ fn register_box(
 /// Register a `host_ip` box (BEP-082): mint its id, with no switch address
 /// and no row in the address table, and answer with the id alone. The id
 /// takes the collision check an own-address box's id takes. A held
-/// registration holds nothing here: the box has no row for a lease to
-/// withdraw, so the reply is written and the connection closes.
+/// registration keeps its connection as the name's lease
+/// ([`serve_held_registration`]).
 fn register_host_ip_box(boxes: &BoxRegistry, request: &RegisterBoxRequest) -> BoxControlReply {
     match boxes.register_host_ip_box(&request.name) {
         Ok(id) => {
@@ -4912,10 +4976,111 @@ mod tests {
         }
     }
 
+    /// Open a held `host_ip` registration of `name`: the lease connection,
+    /// kept open, and the id read off its reply.
+    fn register_host_ip_holding(sock_path: &Path, name: &str) -> (TestStream, BoxControlReply) {
+        let mut stream = TestStream::connect(sock_path).expect("the door accepts");
+        let request = BoxControlRequest::Register(RegisterBoxRequest {
+            host_ip: true,
+            hold: true,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: 0,
+            ..box_request(name)
+        });
+        let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");
+        line.push('\n');
+        stream
+            .write_all(line.as_bytes())
+            .expect("the request is written");
+        let mut reply = String::new();
+        BufReader::new(stream.try_clone().expect("the lease clones"))
+            .read_line(&mut reply)
+            .expect("the reply is read");
+        let reply = serde_json_lenient::from_str(reply.trim()).expect("the reply parses");
+        (stream, reply)
+    }
+
+    /// A held `host_ip` registration keeps its name only while its lease
+    /// connection or its admitted box is alive. A lease closed before its
+    /// commit, with no box admitted, frees the name at once: a new
+    /// registration under it succeeds with a fresh id and no wait for the
+    /// unadmitted bound. A lease closed after its box was admitted keeps
+    /// the name, and so does a committed lease.
+    #[test]
+    fn host_ip_registration_lease_close_frees_the_name() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let minted = |reply: BoxControlReply| match reply {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let settled = || {
+            assert!(
+                registry.ask_gauges().leases.wait_idle(ASK_WAIT),
+                "every registration lease ends once its connection does"
+            );
+        };
+
+        // The lease holds the name while it is open.
+        let (lease, reply) = register_host_ip_holding(&sock_path, "agent");
+        let first = minted(reply);
+        assert_eq!(registry.host_ip_id_for("agent"), Some(first.to_bytes()));
+        let (_refused, reply) = register_host_ip_holding(&sock_path, "agent");
+        assert!(
+            matches!(reply, BoxControlReply::Error { .. }),
+            "an open lease keeps its name, got {reply:?}"
+        );
+
+        // A close before the commit, with no box admitted, frees the name.
+        drop(lease);
+        settled();
+        assert_eq!(
+            registry.host_ip_id_for("agent"),
+            None,
+            "a lease closed before its commit withdraws its name"
+        );
+        assert!(
+            registry.holds_host_ip_id(first.to_bytes()),
+            "the withdrawn id stays for the collision check"
+        );
+        let (lease, reply) = register_host_ip_holding(&sock_path, "agent");
+        let second = minted(reply);
+        assert_ne!(first, second, "the new creation gets its own id");
+
+        // A close after the box was admitted keeps the name with the box.
+        assert!(registry.admit_host_ip_box_with_lane(
+            boxes::SessionId::from_bytes(second.to_bytes()),
+            None,
+            true,
+        ));
+        drop(lease);
+        settled();
+        assert_eq!(
+            registry.host_ip_id_for("agent"),
+            Some(second.to_bytes()),
+            "an admitted box keeps its name when the lease closes"
+        );
+
+        // A committed lease keeps the name when its connection closes.
+        let (mut lease, reply) = register_host_ip_holding(&sock_path, "scout");
+        let scout = minted(reply);
+        lease
+            .write_all(format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE).as_bytes())
+            .expect("the commit is written");
+        drop(lease);
+        settled();
+        assert_eq!(
+            registry.host_ip_id_for("scout"),
+            Some(scout.to_bytes()),
+            "a committed lease keeps its name"
+        );
+    }
+
     /// BEP-082: a `host_ip` registration is answered with a box id and no
     /// address. Each registration is a new creation with its own id, and
-    /// none of them puts a row in the address table. A held registration
-    /// holds no lease: the reply is written and the connection closes.
+    /// none of them puts a row in the address table. The registrations here
+    /// are one-shot, so the name stays after the connection closes.
     /// BOX-163 parity: a second registration of a live name is refused with
     /// the held-name text, and after the box retires the name registers
     /// again under a fresh id.
@@ -4956,7 +5121,7 @@ mod tests {
             boxes::SessionId::from_bytes(first.to_bytes()),
             minimald_rpc::HostIpBoxEnd::Destroyed,
         );
-        let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
+        let second = minted(register(&sock_path, &host_ip(false)).expect("answered"));
         assert_ne!(first, second, "each creation gets its own id");
         assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
         // An admitted box keeps its name past the unadmitted bound.
