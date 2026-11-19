@@ -18824,7 +18824,30 @@ async fn box_spec_bare_reads_defaults_network_bep_undecided_entry_own_ip_egress(
     assert!(bare.contains("GH_TOKEN"), "{bare}");
 }
 
-// BCLI-021:`min box spec <entry>` with the `[network]` override flags
+// D3598: bare `min box spec` falls back to the merged `[defaults]` rows
+// only for several session entries with no `default`. A `default` entry of
+// a project Box Type keeps the start's refusal and prints no proxy rows.
+#[tokio::test]
+async fn box_spec_bare_reads_defaults_network_bep_project_type_refuses() {
+    let (_project, global) = spec_project(
+        "[defaults.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [box_types.mydev]\nextends = \"session\"\n\n\
+         [boxes.default]\ntype = \"mydev\"\n",
+    );
+    let error = box_spec_text(&global, &["min", "box", "spec", "--network", "host_ip"])
+        .await
+        .expect_err("a project Box Type keeps the refusal");
+    assert!(
+        matches!(
+            error.downcast_ref::<crate::SessionEntryUndecided>(),
+            Some(crate::SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "default"
+        ),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("steering"), "{error:#}");
+}
+
+// BCLI-021: `min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.
 #[tokio::test]

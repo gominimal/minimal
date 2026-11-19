@@ -443,6 +443,8 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         .repo_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
+    // This parse only maps a missing or invalid project file to its
+    // message. The expansion below loads the file again.
     match mfile::File::from_dir_recursive(&project) {
         Ok(_) => {}
         Err(mfile::Error::NotFound) => anyhow::bail!(
@@ -465,14 +467,18 @@ fn project_rows(global: &GlobalArgs, args: &BoxSpecArgs, out: &mut Vec<u8>) -> a
         .ok_or_else(|| anyhow::anyhow!("The project path {} is not UTF-8.", project.display()))?;
     let (bep, secrets, quic443) = match crate::project_bep_and_grants(utf8_project, None) {
         Ok((bep, secrets, _, quic443)) => (bep, secrets, quic443),
-        // A project whose start cannot pick one session entry still gets
-        // its preview: the bare form is read-only and never refuses for
-        // the pick. The rows then read an entry with an empty body, so
+        // A project with several session entries and none named `default`
+        // still gets its preview: the bare form never refuses for that
+        // pick. The rows then read an entry with an empty body, so
         // `[defaults]` and `[defaults.session]` merge as for any entry.
+        // An entry of a project Box Type, or a `default` entry that is not
+        // a session, keeps the start's refusal: no implicit session entry
+        // applies there.
         Err(error)
-            if error
-                .downcast_ref::<crate::SessionEntryUndecided>()
-                .is_some() =>
+            if matches!(
+                error.downcast_ref::<crate::SessionEntryUndecided>(),
+                Some(crate::SessionEntryUndecided::NoDefault { .. })
+            ) =>
         {
             tracing::debug!(
                 project = %project.display(),
@@ -594,14 +600,16 @@ fn project_network(
     let mut project_egress = match super::box_verbs::project_egress(project, None) {
         Ok(project_egress) => project_egress,
         // The bare form is read-only and never refuses for the session
-        // entry pick (D3598). With no single entry, it previews the egress
-        // of the empty-body session entry that `session_defaults_rows`
-        // reads the grants from, so the check sees the `[defaults.network]`
-        // and `[defaults.session.network]` egress of those grants.
+        // entry pick (D3598). With several session entries and no
+        // `default`, it previews the egress of the empty-body session entry
+        // that `session_defaults_rows` reads the grants from, so the check
+        // sees the `[defaults.network]` and `[defaults.session.network]`
+        // egress of those grants.
         Err(error)
-            if error
-                .downcast_ref::<crate::SessionEntryUndecided>()
-                .is_some() =>
+            if matches!(
+                error.downcast_ref::<crate::SessionEntryUndecided>(),
+                Some(crate::SessionEntryUndecided::NoDefault { .. })
+            ) =>
         {
             tracing::debug!(
                 error = %error,
