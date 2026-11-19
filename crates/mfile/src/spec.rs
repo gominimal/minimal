@@ -108,6 +108,13 @@ pub struct BoxSpec {
     /// ends. The daemon only keeps them, so a box that declares exports
     /// can resume from its stored spec.
     pub file_exports: Option<Vec<StoredExport>>,
+    /// The keys of a stored spec that the schema of a spec names, but that
+    /// no field above types, such as `io.exec_enabled` or
+    /// `network.vpn_network_names`. Each value is kept as it was written,
+    /// by its dotted path, and a section with no typed keys, such as
+    /// `nesting`, is kept whole. A newer client can store such a key, and
+    /// the box still resumes from its stored spec.
+    pub kept_keys: std::collections::BTreeMap<String, StoredExport>,
 }
 
 /// One `[[file_exports]]` item of a stored spec, kept as it was written:
@@ -369,6 +376,7 @@ impl BoxSpec {
             },
             lifecycle_hooks: None,
             file_exports,
+            kept_keys: std::collections::BTreeMap::new(),
         }
     }
 
@@ -555,6 +563,40 @@ struct SpecDoc {
     /// Absent from a spec that declares no exports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_exports: Option<Vec<StoredExport>>,
+    /// The `[nesting]` section, kept whole. Absent when the spec sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nesting: Option<StoredExport>,
+}
+
+/// Declares the fields of a `Doc*` table that keep a schema key as it was
+/// written ([`BoxSpec::kept_keys`]), and the two functions that move them
+/// to and from the kept map, by the dotted path `<section>.<key>`.
+macro_rules! kept_fields {
+    ($doc:ident, $section:literal, [$($key:ident),* $(,)?]) => {
+        impl $doc {
+            /// Moves each kept key of this table into `kept`.
+            fn put_kept(
+                &mut self,
+                kept: &mut std::collections::BTreeMap<String, StoredExport>,
+            ) {
+                $(
+                    if let Some(value) = self.$key.take() {
+                        kept.insert(concat!($section, ".", stringify!($key)).to_owned(), value);
+                    }
+                )*
+            }
+
+            /// Takes each kept key of this table out of `kept`.
+            fn take_kept(
+                &mut self,
+                kept: &mut std::collections::BTreeMap<String, StoredExport>,
+            ) {
+                $(
+                    self.$key = kept.remove(concat!($section, ".", stringify!($key)));
+                )*
+            }
+        }
+    };
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -568,13 +610,38 @@ struct DocBox {
     /// `until_complete`.
     #[serde(default = "until_complete")]
     lifetime: Lifetime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loadout_mode: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volumes: Option<StoredExport>,
 }
+
+kept_fields!(DocBox, "box", [loadout_mode, volumes]);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocIo {
     pty_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec_enabled: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_mimetype: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdin_mimetype: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_mimetype: Option<StoredExport>,
 }
+
+kept_fields!(
+    DocIo,
+    "io",
+    [
+        exec_enabled,
+        stderr_mimetype,
+        stdin_mimetype,
+        stdout_mimetype
+    ]
+);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -584,16 +651,40 @@ struct DocExecution {
     /// Absent from a spec that does not set it, which reads as `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     hooks_on_resume: bool,
-    /// Absent from a spec that sets no timeout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Absent from a spec that sets no timeout. A read also takes a
+    /// duration string, as the schema of a spec allows.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stored_timeout"
+    )]
     timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_oom: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restart: Option<StoredExport>,
+}
+
+kept_fields!(DocExecution, "execution", [on_oom, restart]);
+
+/// A stored `execution.timeout`: whole seconds, or a duration string that
+/// [`crate::duration::spec_timeout`] reads.
+fn stored_timeout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = <toml::Value as serde::Deserialize>::deserialize(deserializer)?;
+    crate::duration::spec_timeout(&value).map_err(serde::de::Error::custom)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocInstall {
     packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_packages: Option<StoredExport>,
 }
+
+kept_fields!(DocInstall, "install", [raw_packages]);
 
 /// The `[network]` table. The policy's own keys are `egress`, `ingress`,
 /// and `credentialed_upstream` and `quic443` when it sets them, so it is
@@ -603,12 +694,76 @@ struct DocInstall {
 /// the same v0 exception as on [`SpecNetwork`]: `ingress` keeps the
 /// [`boxes::IngressPolicy`] shape, and `credentialed_upstream` is declared
 /// here. #2410 ends the interim.
+///
+/// The other keys of [`NETWORK_KEYS`] are kept as they were written,
+/// except the flat egress keys. Canonicalisation moves each one to its
+/// nested `egress.*` key before a spec is stored, and a resume reads only
+/// the policy. So a stored flat key is refused, never kept: a kept deny
+/// that no resume applies is a deny the box runs without.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DocNetwork {
     #[serde(with = "mode_word")]
     mode: boxes::NetworkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dynamic_ingress: Option<StoredExport>,
+    #[serde(default, skip_serializing, deserialize_with = "refuse_flat_allow_dns")]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_allow_dns: Option<()>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "refuse_flat_allow_subnets"
+    )]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_allow_subnets: Option<()>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "refuse_flat_deny_subnets"
+    )]
+    #[expect(dead_code, reason = "present only to refuse the key on a read")]
+    egress_deny_subnets: Option<()>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vpn_network_names: Option<StoredExport>,
     #[serde(flatten)]
     policy: boxes::BoxPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bep: Option<StoredExport>,
+}
+
+kept_fields!(
+    DocNetwork,
+    "network",
+    [dynamic_ingress, vpn_network_names, bep,]
+);
+
+/// Refuses the flat `[network]` egress key `flat` in a stored spec, and
+/// names the nested `egress.*` key that a stored spec carries in its place.
+fn refuse_flat_egress<E: serde::de::Error>(flat: &str) -> E {
+    let nested = crate::network::FLAT_EGRESS_KEYS
+        .iter()
+        .find(|(key, _)| *key == flat)
+        .map_or(flat, |(_, nested)| nested);
+    E::custom(format!(
+        "a stored spec does not carry `network.{flat}`. \
+         Write it as `network.egress.{nested}`."
+    ))
+}
+
+fn refuse_flat_allow_dns<'de, D: serde::Deserializer<'de>>(_: D) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_allow_dns"))
+}
+
+fn refuse_flat_allow_subnets<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_allow_subnets"))
+}
+
+fn refuse_flat_deny_subnets<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> Result<Option<()>, D::Error> {
+    Err(refuse_flat_egress("egress_deny_subnets"))
 }
 
 /// The `mode` key in its spec word, [`boxes::NetworkMode::word`], not the
@@ -640,41 +795,79 @@ mod mode_word {
 
 impl From<BoxSpec> for SpecDoc {
     fn from(spec: BoxSpec) -> Self {
+        let mut kept = spec.kept_keys;
+        let mut box_table = DocBox {
+            box_type: spec.box_type,
+            name: spec.name,
+            lifetime: spec.lifetime,
+            loadout_mode: None,
+            volumes: None,
+        };
+        box_table.take_kept(&mut kept);
+        let mut io = DocIo {
+            pty_enabled: spec.pty_enabled,
+            exec_enabled: None,
+            stderr_mimetype: None,
+            stdin_mimetype: None,
+            stdout_mimetype: None,
+        };
+        io.take_kept(&mut kept);
+        let mut execution = DocExecution {
+            exec: match spec.entrypoint {
+                Entrypoint::Shell => None,
+                Entrypoint::Exec(argv) => Some(argv),
+            },
+            hooks_on_resume: spec.hooks_on_resume,
+            timeout: spec.timeout,
+            on_oom: None,
+            restart: None,
+        };
+        execution.take_kept(&mut kept);
+        let mut install = DocInstall {
+            packages: spec.packages,
+            raw_packages: None,
+        };
+        install.take_kept(&mut kept);
+        let mut network = DocNetwork {
+            mode: spec.network.mode,
+            dynamic_ingress: None,
+            egress_allow_dns: None,
+            egress_allow_subnets: None,
+            egress_deny_subnets: None,
+            vpn_network_names: None,
+            policy: spec.network.policy,
+            bep: None,
+        };
+        network.take_kept(&mut kept);
         Self {
             v: spec.v,
             entry: spec.entry,
             hooks_enabled: spec.hooks_enabled,
-            box_table: DocBox {
-                box_type: spec.box_type,
-                name: spec.name,
-                lifetime: spec.lifetime,
-            },
-            io: DocIo {
-                pty_enabled: spec.pty_enabled,
-            },
-            execution: Some(DocExecution {
-                exec: match spec.entrypoint {
-                    Entrypoint::Shell => None,
-                    Entrypoint::Exec(argv) => Some(argv),
-                },
-                hooks_on_resume: spec.hooks_on_resume,
-                timeout: spec.timeout,
-            }),
-            install: DocInstall {
-                packages: spec.packages,
-            },
-            network: DocNetwork {
-                mode: spec.network.mode,
-                policy: spec.network.policy,
-            },
+            box_table,
+            io,
+            execution: Some(execution),
+            install,
+            network,
             lifecycle_hooks: spec.lifecycle_hooks,
             file_exports: spec.file_exports,
+            nesting: kept.remove("nesting"),
         }
     }
 }
 
 impl From<SpecDoc> for BoxSpec {
-    fn from(doc: SpecDoc) -> Self {
+    fn from(mut doc: SpecDoc) -> Self {
+        let mut kept = std::collections::BTreeMap::new();
+        doc.box_table.put_kept(&mut kept);
+        doc.io.put_kept(&mut kept);
+        if let Some(execution) = doc.execution.as_mut() {
+            execution.put_kept(&mut kept);
+        }
+        doc.install.put_kept(&mut kept);
+        doc.network.put_kept(&mut kept);
+        if let Some(nesting) = doc.nesting {
+            kept.insert("nesting".to_owned(), nesting);
+        }
         let hooks_on_resume = doc.execution.as_ref().is_some_and(|e| e.hooks_on_resume);
         let timeout = doc.execution.as_ref().and_then(|e| e.timeout);
         let entrypoint = match doc.execution {
@@ -700,6 +893,7 @@ impl From<SpecDoc> for BoxSpec {
             },
             lifecycle_hooks: doc.lifecycle_hooks,
             file_exports: doc.file_exports,
+            kept_keys: kept,
         }
     }
 }
@@ -1214,6 +1408,126 @@ mod tests {
         assert!(refused.to_string().contains("file_imports"), "{refused}");
     }
 
+    /// A value that fits `shape`, for a key the stored spec does not set.
+    fn sample(shape: KeyShape) -> toml::Value {
+        match shape {
+            KeyShape::Str => "corp".into(),
+            KeyShape::Bool => false.into(),
+            KeyShape::Int | KeyShape::StrOrInt => 3.into(),
+            KeyShape::StrList | KeyShape::StrOrStrList => vec![toml::Value::from("corp")].into(),
+            KeyShape::Word(words) => words[0].into(),
+            KeyShape::Keys(keys) | KeyShape::Owned(keys) => toml::Value::Table(
+                keys.iter()
+                    .map(|(key, shape)| ((*key).to_owned(), sample(*shape)))
+                    .collect(),
+            ),
+        }
+    }
+
+    // A stored spec that carries every key the schema of a spec names reads
+    // back, so a box whose spec a newer client wrote can resume. A read and
+    // a write keep each key the typed spec does not read.
+    #[test]
+    fn stored_spec_with_every_expansion_key_reads_back() {
+        let spec = BoxSpec::for_session(None, SpecFlags::default());
+        let mut stored = toml::Table::try_from(&spec).unwrap();
+        for (section, shape) in SECTIONS {
+            let KeyShape::Keys(keys) = shape else {
+                continue;
+            };
+            let table = stored
+                .entry((*section).to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .unwrap();
+            for (key, shape) in *keys {
+                // A stored spec never carries a flat egress key. The test
+                // below checks that a read refuses one.
+                if *section == "network"
+                    && crate::network::FLAT_EGRESS_KEYS
+                        .iter()
+                        .any(|(flat, _)| flat == key)
+                {
+                    continue;
+                }
+                // A sample does not replace a key that the typed spec
+                // wrote, such as `mode`.
+                table
+                    .entry((*key).to_owned())
+                    .or_insert_with(|| sample(*shape));
+            }
+        }
+        // The typed keys that `for_session` leaves out, in a shape that
+        // the typed spec reads.
+        stored["execution"]["exec"] = vec![toml::Value::from("make")].into();
+        stored["execution"]["timeout"] = 30.into();
+        stored["execution"]["hooks_on_resume"] = true.into();
+        stored["network"]["egress"] = sample(KeyShape::Keys(EGRESS_KEYS));
+        stored["network"]["egress"]["allow_protocols"] = vec![toml::Value::from("tcp")].into();
+        stored["network"]["quic443"] = "block".into();
+        // The typed policy reads `ingress` in its own shape, and a session
+        // spec sets none.
+        stored["network"].as_table_mut().unwrap().remove("ingress");
+
+        let read: BoxSpec = stored.clone().try_into().unwrap();
+        assert_eq!(read.entrypoint, Entrypoint::Exec(vec!["make".to_owned()]));
+        assert_eq!(read.timeout, Some(30));
+        assert_eq!(
+            read.kept_keys.get("io.exec_enabled"),
+            Some(&StoredExport(false.into()))
+        );
+        assert_eq!(
+            read.kept_keys.get("network.vpn_network_names"),
+            Some(&StoredExport(vec![toml::Value::from("corp")].into()))
+        );
+        assert!(read.kept_keys.contains_key("nesting"));
+
+        let written = toml::Table::try_from(&read).unwrap();
+        assert_eq!(written, stored, "a read and a write keep the stored spec");
+        let again: BoxSpec = written.try_into().unwrap();
+        assert_eq!(again, read);
+
+        // The stored spec also reads back from its text.
+        let text = toml::to_string(&stored).unwrap();
+        assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), read);
+
+        // A duration string is a timeout that the schema allows.
+        let mut duration = stored.clone();
+        duration["execution"]["timeout"] = "2m".into();
+        let read: BoxSpec = duration.try_into().unwrap();
+        assert_eq!(read.timeout, Some(120));
+
+        // A flat egress key is refused, and the error names its nested key.
+        for (flat, nested) in crate::network::FLAT_EGRESS_KEYS {
+            let mut legacy = stored.clone();
+            legacy["network"].as_table_mut().unwrap().insert(
+                flat.to_owned(),
+                vec![toml::Value::from("10.0.0.0/8")].into(),
+            );
+            let refused = legacy.try_into::<BoxSpec>().unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("network.egress.{nested}")),
+                "{flat}: {refused}"
+            );
+        }
+
+        // A key that no schema of a spec names is still refused. The
+        // `[network]` table flattens the policy in, so it does not refuse
+        // a key, as before.
+        for section in ["box", "io", "execution", "install"] {
+            let mut unknown = stored.clone();
+            unknown[section]
+                .as_table_mut()
+                .unwrap()
+                .insert("not_a_key".to_owned(), true.into());
+            let refused = unknown.try_into::<BoxSpec>().unwrap_err();
+            assert!(
+                refused.to_string().contains("not_a_key"),
+                "{section}: {refused}"
+            );
+        }
+    }
+
     // BOX-068: the first spec comes from the `[session]` table or a task,
     // with the flags as the last layer.
     #[test]
@@ -1264,6 +1578,7 @@ mod tests {
                 },
                 lifecycle_hooks: None,
                 file_exports: None,
+                kept_keys: std::collections::BTreeMap::new(),
             }
         );
 
@@ -1399,13 +1714,15 @@ mod tests {
             assert_eq!(&toml::from_str::<BoxSpec>(&text).unwrap(), spec, "{text}");
         }
 
-        // An unknown `[execution]` key is refused, as in every other table.
+        // An `[execution]` key that no schema of a spec names is refused,
+        // as in every other table. `restart` is a schema key, so it is kept.
         let mut value: toml::Value = toml::from_str(&toml::to_string(&lint).unwrap()).unwrap();
         value["execution"]
             .as_table_mut()
             .unwrap()
-            .insert("restart".to_string(), true.into());
-        assert!(toml::from_str::<BoxSpec>(&toml::to_string(&value).unwrap()).is_err());
+            .insert("retries".to_string(), true.into());
+        let refused = toml::from_str::<BoxSpec>(&toml::to_string(&value).unwrap()).unwrap_err();
+        assert!(refused.to_string().contains("retries"), "{refused}");
     }
 
     // BOX-028: an entry that sets `hooks_on_resume = true` carries the key
