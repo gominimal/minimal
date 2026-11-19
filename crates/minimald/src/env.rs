@@ -2186,18 +2186,20 @@ impl BoxChannel {
         // runs in a build box on the box's own rules and looks up nothing
         // (NET-169). It lists while it runs (NET-171), and the run ends it on
         // every way out of the build.
+        let spec_hash = graph.spec_hash(&bsr);
         let build_box = ctx.build_boxes().map(|boxes| {
             boxes.build_box(
                 pkg_name,
                 op::build_box::declared_packages(&graph, &bsr),
-                None,
+                &spec_hash,
+                false,
             )
         });
         let run = op::BuildBoxRun::start(
             ctx.build_boxes().cloned(),
             build_box.clone(),
             pkg_name,
-            graph.spec_hash(&bsr),
+            spec_hash,
         );
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;

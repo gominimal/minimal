@@ -12,10 +12,14 @@ use std::sync::{Arc, LazyLock, OnceLock, PoisonError};
 
 use tokio::sync::Mutex;
 
-/// The build boxes running now, by requesting box id then package. A build
+/// One running build in a box's listing: its package and its spec hash in
+/// hex. Two builds of one package at different spec hashes are two entries.
+type RunningKey = (String, String);
+
+/// The build boxes running now, by requesting box id then build. A build
 /// box keeps no record (BOX-186), so this is all that lists it (NET-171).
 static RUNNING: LazyLock<
-    std::sync::Mutex<HashMap<String, BTreeMap<String, minimald_rpc::RunningBuildBox>>>,
+    std::sync::Mutex<HashMap<String, BTreeMap<RunningKey, minimald_rpc::RunningBuildBox>>>,
 > = LazyLock::new(Default::default);
 
 /// The build boxes running for the box `box_id`, by package.
@@ -246,7 +250,10 @@ struct BoxReach {
     package: String,
     /// The build's declared dependencies, for its Box Spec.
     packages: Vec<String>,
+    /// The spec hash the host side looks up, in hex: `None` looks up nothing.
     spec_hash: Option<String>,
+    /// The build's entry in the box's listing.
+    listing: RunningKey,
     granted: OnceLock<Granted>,
 }
 
@@ -290,7 +297,7 @@ impl op::BuildReach for BoxReach {
                 return network;
             };
             self.log_spec(true, Some(granted.egress.clone()));
-            note_reach(&self.shared.record.id.to_string(), &self.package, &granted);
+            note_reach(&self.shared.record.id.to_string(), &self.listing, &granted);
             let network = self.granted_network(granted.egress.clone(), addresses);
             drop(self.granted.set(granted));
             Some(network)
@@ -308,7 +315,7 @@ impl op::BuildReach for BoxReach {
 
     fn close(&self) -> op::ReachFuture<'_, ()> {
         Box::pin(async move {
-            note_no_network(&self.shared.record.id.to_string(), &self.package);
+            note_no_network(&self.shared.record.id.to_string(), &self.listing);
             let Some(granted) = self.granted.get().filter(|granted| !granted.row.is_empty()) else {
                 return;
             };
@@ -316,6 +323,11 @@ impl op::BuildReach for BoxReach {
             crate::net::listeners::close_build_grant(&control, &granted.row).await;
         })
     }
+}
+
+/// The listing entry of the build of `package` at `spec_hash`.
+fn running_key(package: &str, spec_hash: &common::SpecHash) -> RunningKey {
+    (package.to_string(), spec_hash.0.to_hex().to_string())
 }
 
 /// An egress that admits no destination.
@@ -342,9 +354,9 @@ impl BoxReach {
 }
 
 /// Shows the reach a running build box was granted (NET-171).
-fn note_reach(box_id: &str, package: &str, granted: &Granted) {
+fn note_reach(box_id: &str, build: &RunningKey, granted: &Granted) {
     let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(running) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(package)) {
+    if let Some(running) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(build)) {
         running.egress = Some(granted.egress.clone());
         running.granted = true;
     }
@@ -352,9 +364,9 @@ fn note_reach(box_id: &str, package: &str, granted: &Granted) {
 
 /// Shows that a running build box has no network from here on (NET-171): its
 /// steps run with no address.
-fn note_no_network(box_id: &str, package: &str) {
+fn note_no_network(box_id: &str, build: &RunningKey) {
     let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(running) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(package)) {
+    if let Some(running) = all.get_mut(box_id).and_then(|boxes| boxes.get_mut(build)) {
         running.no_network = true;
     }
 }
@@ -364,27 +376,31 @@ impl op::BuildBoxes for BoxBuildBoxes {
         &self,
         package: &str,
         packages: Vec<String>,
-        spec_hash: Option<&common::SpecHash>,
+        spec_hash: &common::SpecHash,
+        look_up: bool,
     ) -> op::BuildBox {
+        let listing = running_key(package, spec_hash);
         op::BuildBox::new(
             fetch_program(),
             Arc::new(BoxReach {
                 shared: Arc::clone(&self.0),
                 package: package.to_string(),
                 packages,
-                spec_hash: spec_hash.map(|hash| hash.0.to_hex().to_string()),
+                spec_hash: look_up.then(|| listing.1.clone()),
+                listing,
                 granted: OnceLock::new(),
             }),
         )
     }
 
-    fn note_running(&self, package: &str, _spec_hash: &common::SpecHash, running: bool) {
+    fn note_running(&self, package: &str, spec_hash: &common::SpecHash, running: bool) {
         let box_id = self.0.record.id.to_string();
+        let build = running_key(package, spec_hash);
         let mut all = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
         if running {
             tracing::info!(box_name = %self.0.box_name(), package, "a build box started");
             all.entry(box_id).or_default().insert(
-                package.to_string(),
+                build,
                 minimald_rpc::RunningBuildBox {
                     package: package.to_string(),
                     egress: self.0.requester_egress(),
@@ -393,7 +409,7 @@ impl op::BuildBoxes for BoxBuildBoxes {
                 },
             );
         } else if let Some(running) = all.get_mut(&box_id) {
-            running.remove(package);
+            running.remove(&build);
             if running.is_empty() {
                 all.remove(&box_id);
             }

@@ -154,15 +154,18 @@ pub struct BuildBox {
 
 /// The build boxes of one box (NET-155, NET-169).
 pub trait BuildBoxes: Send + Sync + std::fmt::Debug {
-    /// The build box for the build of `package`, whose declared dependencies
-    /// are `packages`. `spec_hash` is the hash the host side looks up. `None`
-    /// never looks: a patched build's spec is one the box can change, so the
-    /// box's own rules decide it.
+    /// The build box for the build of `package` at `spec_hash`, whose
+    /// declared dependencies are `packages`. With `look_up`, the host side
+    /// looks `spec_hash` up. Without it, nothing is looked up: a patched
+    /// build's spec is one the box can change, so the box's own rules decide
+    /// it. Either way `spec_hash` names the build in the box's listing, as
+    /// [`Self::note_running`] does.
     fn build_box(
         &self,
         package: &str,
         packages: Vec<String>,
-        spec_hash: Option<&SpecHash>,
+        spec_hash: &SpecHash,
+        look_up: bool,
     ) -> BuildBox;
     /// Tells the box's listing that this build started or ended.
     fn note_running(&self, _package: &str, _spec_hash: &SpecHash, _running: bool) {}

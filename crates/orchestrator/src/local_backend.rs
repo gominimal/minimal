@@ -228,7 +228,8 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     boxes.build_box(
                         &name,
                         op::build_box::declared_packages(&shared.graph, &bsr),
-                        Some(&spec_hash),
+                        &spec_hash,
+                        true,
                     )
                 }),
                 patched: false,

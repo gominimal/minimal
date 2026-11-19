@@ -1807,7 +1807,8 @@ mod tests {
                 &self,
                 _: &str,
                 _: Vec<String>,
-                _: Option<&common::SpecHash>,
+                _: &common::SpecHash,
+                _: bool,
             ) -> op::BuildBox {
                 unreachable!("nothing builds here")
             }
