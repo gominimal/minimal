@@ -1049,6 +1049,25 @@ impl BoxProcesses {
         Self { root, scope }
     }
 
+    /// Whether `pid` is still one of the box's processes, read again from
+    /// `/proc` after a scan that found it: a process in the box's PID
+    /// namespace, or, in the daemon's own namespace, a child of a process in
+    /// `scanned`, the processes that scan found.
+    fn still_holds(&self, pid: i32, scanned: &[i32]) -> bool {
+        match self.scope {
+            ProcessScope::Gone => false,
+            ProcessScope::Namespace(namespace) => {
+                namespace_id(std::path::Path::new(&format!("/proc/{pid}/ns/pid")))
+                    == Some(namespace)
+            }
+            ProcessScope::Tree => u32::try_from(pid)
+                .ok()
+                .and_then(parent_of)
+                .and_then(|parent| i32::try_from(parent).ok())
+                .is_some_and(|parent| parent != pid && scanned.contains(&parent)),
+        }
+    }
+
     /// The box's live processes. A zombie has ended, so it is not one.
     pub(crate) fn pids(&self) -> Vec<i32> {
         match self.scope {
@@ -1311,6 +1330,9 @@ pub(crate) fn host_address_box_in_namespace(namespace: (u64, u64)) -> Option<box
 /// starts until that stop ends, a record is refused, and the run kills the
 /// container it just spawned. So the stop's one take sees every container
 /// that can run, and a multi-invocation task starts no invocation after it.
+/// A task run under way when the stop starts records no container after the
+/// stop ends either: its spawn may still be in flight when the stop ends,
+/// and nothing would stop the container it records then.
 ///
 /// A task run that spawned a container delivers an exit: after the
 /// container is reaped, the run still tears its network down and then
@@ -1322,8 +1344,9 @@ pub(crate) fn host_address_box_in_namespace(namespace: (u64, u64)) -> Option<box
 pub(crate) struct TaskContainers {
     by_box: BTreeMap<(boxes::SessionId, u32), std::sync::Arc<std::os::fd::OwnedFd>>,
     stopping: BTreeMap<boxes::SessionId, usize>,
-    /// The task runs under way, by box and run number.
-    runs: BTreeMap<TaskRunId, ()>,
+    /// The task runs under way, by box and run number. `true` for a run
+    /// that a stop of its box overtook: it records no container again.
+    runs: BTreeMap<TaskRunId, bool>,
     /// The runs among them whose container was reaped.
     exits_pending: BTreeMap<TaskRunId, ()>,
 }
@@ -1337,16 +1360,19 @@ pub(crate) struct TaskRunId {
 
 impl TaskContainers {
     /// Records the task container `supervisor` of box `id`, pinned by
-    /// `pidfd`. `false` when a stop of the box is under way, and nothing is
-    /// recorded.
+    /// `pidfd`. Refused, and nothing is recorded, while a stop of the box
+    /// is under way, and for a run that a stop overtook.
     fn record(
         &mut self,
         run: TaskRunId,
         supervisor: u32,
         pidfd: std::sync::Arc<std::os::fd::OwnedFd>,
-    ) -> bool {
+    ) -> Result<(), TaskContainerRefused> {
         if self.stopping.contains_key(&run.id) {
-            return false;
+            return Err(TaskContainerRefused::BoxStopping);
+        }
+        if self.runs.get(&run) == Some(&true) {
+            return Err(TaskContainerRefused::BoxStopped);
         }
         self.by_box.insert((run.id, supervisor), pidfd);
         // The run delivers an exit from now on, even once a stop has taken
@@ -1354,7 +1380,7 @@ impl TaskContainers {
         if self.runs.contains_key(&run) {
             self.exits_pending.insert(run, ());
         }
-        true
+        Ok(())
     }
 
     /// Drops the record of task run `run`'s container `supervisor`, which
@@ -1390,9 +1416,13 @@ impl TaskContainers {
         supervisors
     }
 
-    /// Marks a stop of box `id` as under way.
+    /// Marks a stop of box `id` as under way. It overtakes every task run
+    /// of the box under way now.
     fn begin_stop(&mut self, id: boxes::SessionId) {
         *self.stopping.entry(id).or_default() += 1;
+        for (_, overtaken) in self.runs.iter_mut().filter(|(run, _)| run.id == id) {
+            *overtaken = true;
+        }
     }
 
     /// Marks a stop of box `id` as over.
@@ -1473,7 +1503,7 @@ pub(crate) fn begin_task_run(id: boxes::SessionId) -> TaskRun {
         id,
         run: NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     };
-    task_containers().runs.insert(key, ());
+    task_containers().runs.insert(key, false);
     TaskRun { key }
 }
 
@@ -1513,6 +1543,9 @@ pub(crate) enum TaskContainerRefused {
     /// A stop of the box is under way.
     #[error("the box is stopping")]
     BoxStopping,
+    /// The box was stopped after the run started.
+    #[error("the box was stopped")]
+    BoxStopped,
     /// The container could not be pinned, and a stop could not signal it
     /// safely.
     #[error(
@@ -1545,11 +1578,8 @@ pub(crate) fn record_task_container_opening(
     open: impl FnOnce(u32) -> std::io::Result<std::os::fd::OwnedFd>,
 ) -> Result<TaskContainerRecord, TaskContainerRefused> {
     let pidfd = open(supervisor).map_err(TaskContainerRefused::Unpinned)?;
-    if task_containers().record(run, supervisor, std::sync::Arc::new(pidfd)) {
-        Ok(TaskContainerRecord { run, supervisor })
-    } else {
-        Err(TaskContainerRefused::BoxStopping)
-    }
+    task_containers().record(run, supervisor, std::sync::Arc::new(pidfd))?;
+    Ok(TaskContainerRecord { run, supervisor })
 }
 
 /// Opens a pidfd on `pid` (`pidfd_open(2)`).
@@ -1576,7 +1606,7 @@ pub(crate) fn pidfd_open(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
 /// Sends `signal` to the process `pidfd` names (`pidfd_send_signal(2)`).
 /// `false` when it is not delivered: the process was reaped, or the call
 /// failed.
-fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, signal: i32) -> bool {
+pub(crate) fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, signal: i32) -> bool {
     use std::os::fd::AsRawFd as _;
     // SAFETY: pidfd_send_signal(2) with a null siginfo and flags=0 is
     // kill(2) on the pinned process; it reads no memory of ours.
@@ -1636,10 +1666,22 @@ impl TaskContainer {
     /// soon as the supervisor is gone. Answers how many processes it
     /// reached.
     pub(crate) fn signal(&self, signal: i32) -> usize {
+        self.signal_scanned(&self.pids(), signal)
+    }
+
+    /// Sends `signal` to the processes a scan found, `scanned`.
+    ///
+    /// A descendant found by the scan can be reaped, and its pid given to
+    /// another process, before the signal. So each descendant is pinned
+    /// with a pidfd first, then checked again against `/proc`, and signalled
+    /// through that pidfd. When the pid was reused before the pin, the check
+    /// reads the new process and skips it. When it was reused after the pin,
+    /// the signal goes to the pinned process, which has ended.
+    pub(crate) fn signal_scanned(&self, scanned: &[i32], signal: i32) -> usize {
         let root = i32::try_from(self.processes.root).unwrap_or(i32::MAX);
         let mut reached = 0;
         let mut root_seen = false;
-        for pid in self.pids() {
+        for &pid in scanned {
             if pid == root {
                 root_seen = true;
                 continue;
@@ -1647,9 +1689,13 @@ impl TaskContainer {
             if !self.runs() {
                 return reached;
             }
-            // SAFETY: `kill` reads no memory of ours. A pid that is gone
-            // answers ESRCH, which the count leaves out.
-            if unsafe { libc::kill(pid, signal) } == 0 {
+            let Ok(pinned) = u32::try_from(pid)
+                .map_err(|_| ())
+                .and_then(|pid| pidfd_open(pid).map_err(|_| ()))
+            else {
+                continue;
+            };
+            if self.processes.still_holds(pid, scanned) && pidfd_send_signal(&pinned, signal) {
                 reached += 1;
             }
         }

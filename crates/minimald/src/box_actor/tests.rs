@@ -15399,18 +15399,29 @@ fn spawn_stand_in_box(trap: &str) -> std::process::Child {
     child
 }
 
-/// Sends SIGKILL to the stand-in `pid` when dropped, however the test
-/// ends, so a stand-in that a stop failed to end cannot leave its blocking
-/// waiter to hang the test. The waiter then reaps it.
-struct KillOnDrop(u32);
+/// A stand-in pinned by a pidfd, opened before its waiter can reap it. It
+/// sends the stand-in SIGKILL when dropped, however the test ends, so a
+/// stand-in that a stop failed to end cannot leave its blocking waiter to
+/// hang the test. The waiter then reaps it. Every signal goes through the
+/// pidfd, so one sent after the reap reaches no other process that got the
+/// stand-in's pid.
+struct KillOnDrop(std::os::fd::OwnedFd);
+
+impl KillOnDrop {
+    /// Pins `child`, which nothing has reaped yet.
+    fn pin(child: &std::process::Child) -> Self {
+        Self(crate::box_runtime::pidfd_open(child.id()).expect("pin the stand-in"))
+    }
+
+    /// Sends `signal` to the pinned stand-in, unless it was reaped.
+    fn signal(&self, signal: i32) {
+        crate::box_runtime::pidfd_send_signal(&self.0, signal);
+    }
+}
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        // SAFETY: `kill` reads no memory of ours. A stand-in already gone
-        // answers ESRCH, and its waiter holds the pid until it reaps it.
-        unsafe {
-            libc::kill(i32::try_from(self.0).unwrap_or(i32::MAX), libc::SIGKILL);
-        }
+        self.signal(libc::SIGKILL);
     }
 }
 
@@ -15727,7 +15738,7 @@ async fn stop_ends_the_recorded_task_containers() {
     // stand-in ignores TERM, so the proof ends it: kill, then reap.
     drop(_stop);
     let relay = spawn_stand_in_box("trap '' TERM");
-    let relay_pid = relay.id();
+    let relay_cleanup = KillOnDrop::pin(&relay);
     let entrypoint = stand_in_entrypoint(relay);
     let _stop = super::stop_task_containers(
         box_id,
@@ -15741,11 +15752,9 @@ async fn stop_ends_the_recorded_task_containers() {
         !entrypoint.is_finished(),
         "a stop without a recorded task container leaves the box alone"
     );
-    // SAFETY: `kill` reads no memory of ours. The stand-in ignores TERM, so
-    // SIGKILL is what ends it; the await reaps it.
-    unsafe {
-        libc::kill(i32::try_from(relay_pid).unwrap(), libc::SIGKILL);
-    }
+    // The stand-in ignores TERM, so SIGKILL is what ends it; the await
+    // reaps it.
+    drop(relay_cleanup);
     entrypoint.await.unwrap().unwrap();
 }
 
@@ -15755,10 +15764,14 @@ async fn stop_ends_the_recorded_task_containers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_forces_the_recorded_task_containers() {
     let box_id = SessionId::mint();
-    // A task that ignores TERM: only the forced SIGKILL ends it.
-    let child = spawn_stand_in_box("trap '' TERM");
+    // A task that ignores TERM, apart from noting it got it: only the
+    // forced SIGKILL ends it. The note is written to a file, because the
+    // stand-in's stdout pipe is closed.
+    let dir = tempfile::tempdir().unwrap();
+    let termed = dir.path().join("termed");
+    let child = spawn_stand_in_box(&format!("trap ': > {}' TERM", termed.display()));
     let task_pid = child.id();
-    let _cleanup = KillOnDrop(task_pid);
+    let _cleanup = KillOnDrop::pin(&child);
     let processes = crate::box_runtime::BoxProcesses::of_container(task_pid);
     let entrypoint = stand_in_entrypoint(child);
     let _record = crate::box_runtime::record_task_container(
@@ -15768,18 +15781,19 @@ async fn stop_forces_the_recorded_task_containers() {
     .unwrap();
     let forced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // The force arrives once the graceful stop is in its grace period: it
-    // took the record, sent SIGTERM, and polls.
+    // The force arrives once the graceful stop is in its grace period: the
+    // task got its SIGTERM, so the stop is past its check for a force at
+    // the start. The time is read before the flag is set, so the stop
+    // cannot end before it.
     let setter = std::sync::Arc::clone(&forced);
     let (set, set_at) = tokio::sync::oneshot::channel();
     let _setter = crate::traced::spawn(async move {
-        while crate::box_runtime::task_containers_recorded(box_id) > 0 {
+        while !termed.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let at = std::time::Instant::now();
         setter.store(true, std::sync::atomic::Ordering::SeqCst);
-        set.send(std::time::Instant::now())
-            .expect("the test waits for the force");
+        set.send(at).expect("the test waits for the force");
     });
     let _stop =
         super::stop_task_containers(box_id, &entrypoint, false, Duration::from_secs(60), &forced)
@@ -15824,7 +15838,7 @@ async fn stop_ends_the_task_containers_without_waiting_out_a_lasting_entrypoint(
     let task = stand_in_entrypoint(task);
     // The session's shell: it ignores TERM and does not end with the task.
     let shell = spawn_stand_in_box("trap '' TERM");
-    let shell_pid = shell.id();
+    let shell_cleanup = KillOnDrop::pin(&shell);
     let entrypoint = stand_in_entrypoint(shell);
 
     let started = std::time::Instant::now();
@@ -15848,12 +15862,14 @@ async fn stop_ends_the_task_containers_without_waiting_out_a_lasting_entrypoint(
         !entrypoint.is_finished(),
         "the session's shell is left to the box's own stop"
     );
-    // SAFETY: `kill` reads no memory of ours. The stand-in ignores TERM, so
-    // SIGKILL is what ends it; the await reaps it.
-    unsafe {
-        libc::kill(i32::try_from(shell_pid).unwrap(), libc::SIGKILL);
-    }
-    entrypoint.await.unwrap().unwrap();
+    // The stand-in ignores TERM, so SIGKILL is what ends it; the await
+    // reaps it.
+    drop(shell_cleanup);
+    tokio::time::timeout(Duration::from_secs(10), entrypoint)
+        .await
+        .expect("the SIGKILL ended the session's shell")
+        .unwrap()
+        .unwrap();
 }
 
 /// BOX-013: a task container that cannot be pinned with a pidfd is not
@@ -15913,8 +15929,7 @@ async fn a_stop_after_the_reap_waits_for_the_task_exit() {
         .read_line(&mut line)
         .unwrap();
     assert_eq!(line.trim(), "ready");
-    let helper_pid = helper.id();
-    let _cleanup = KillOnDrop(helper_pid);
+    let cleanup = KillOnDrop::pin(&helper);
     let entrypoint = stand_in_entrypoint(helper);
 
     // The run's container ran and was reaped. Its network teardown and the
@@ -15924,8 +15939,13 @@ async fn a_stop_after_the_reap_waits_for_the_task_exit() {
     let record = crate::box_runtime::record_task_container(run.id(), task.id()).unwrap();
     task.wait().unwrap();
     drop(record);
+    // The run delivers after the stop's wait for the entrypoint alone would
+    // have ended, and within its wait for the delivery: without that wait,
+    // the box's own stop signals the helper before the exit arrives.
+    let delivery = super::TASK_EXIT_RELAY_WAIT + Duration::from_millis(1500);
+    assert!(delivery < super::TASK_EXIT_DELIVERY_WAIT);
     let deliver = crate::traced::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(delivery).await;
         std::fs::write(&exit_line, b"7").unwrap();
         drop(run);
     });
@@ -15940,11 +15960,7 @@ async fn a_stop_after_the_reap_waits_for_the_task_exit() {
     .await;
     // The box's own stop signals the helper next.
     if !entrypoint.is_finished() {
-        // SAFETY: `kill` reads no memory of ours; the waiter has not reaped
-        // the helper, so its pid is still the helper's.
-        unsafe {
-            libc::kill(i32::try_from(helper_pid).unwrap(), libc::SIGTERM);
-        }
+        cleanup.signal(libc::SIGTERM);
     }
     let exit = tokio::time::timeout(Duration::from_secs(10), entrypoint)
         .await
@@ -16011,6 +16027,56 @@ async fn a_reaped_task_container_gets_no_signal_through_a_reused_pid() {
     holder.wait().unwrap();
 }
 
+/// BOX-013: a descendant of a task container that a scan found, and whose
+/// pid the kernel gave to another process before the signal, gets no
+/// signal: each descendant is pinned and checked again before it is
+/// signalled.
+#[test]
+fn a_task_container_descendant_whose_pid_was_reused_gets_no_signal() {
+    let box_id = SessionId::mint();
+    let container = spawn_stand_in_box("trap '' TERM");
+    let _container_cleanup = KillOnDrop::pin(&container);
+    let _record = crate::box_runtime::record_task_container(
+        crate::box_runtime::untracked_task_run(box_id),
+        container.id(),
+    )
+    .unwrap();
+    let taken = crate::box_runtime::take_task_containers(box_id);
+    let [task] = taken.as_slice() else {
+        panic!("one task container is recorded");
+    };
+    // Another child of the daemon, standing in for the process that got a
+    // reaped descendant's pid: it is not in the container's tree. SIGCONT
+    // stands in for the stop's signals, so a mistake leaves it running.
+    let holder = spawn_stand_in_box("trap 'exit 0' TERM");
+    let _holder_cleanup = KillOnDrop::pin(&holder);
+    let holder_pid = i32::try_from(holder.id()).unwrap();
+    let root = i32::try_from(task.supervisor()).unwrap();
+    assert_eq!(
+        task.signal_scanned(&[root, holder_pid], libc::SIGCONT),
+        1,
+        "the supervisor got the signal, the reused pid did not"
+    );
+    // SIGTERM would end the holder with 0.
+    assert_eq!(
+        task.signal_scanned(&[root, holder_pid], libc::SIGTERM),
+        1,
+        "the reused pid is skipped with every signal"
+    );
+    let mut holder = holder;
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        holder.try_wait().unwrap().is_none(),
+        "the process holding the reused pid got no signal"
+    );
+    drop(taken);
+    let mut container = container;
+    container.kill().unwrap();
+    container.wait().unwrap();
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
 /// BOX-013: once a stop of a box has started, the box records no new task
 /// container until that stop ends. A later invocation of a multi-invocation
 /// task, spawned after the stop took the box's containers, is refused, so
@@ -16020,7 +16086,7 @@ async fn a_reaped_task_container_gets_no_signal_through_a_reused_pid() {
 async fn a_stopping_box_records_no_new_task_container() {
     let box_id = SessionId::mint();
     let relay = spawn_stand_in_box("trap 'exit 0' TERM");
-    let relay_pid = relay.id();
+    let relay_cleanup = KillOnDrop::pin(&relay);
     let entrypoint = stand_in_entrypoint(relay);
     let first = spawn_stand_in_box("trap 'exit 0' TERM");
     let run = crate::box_runtime::untracked_task_run(box_id);
@@ -16080,11 +16146,36 @@ async fn a_stopping_box_records_no_new_task_container() {
         crate::box_runtime::take_task_containers(box_id).is_empty(),
         "a dropped record forgets its container"
     );
-    // SAFETY: `kill` reads no memory of ours; the await reaps the stand-in.
-    unsafe {
-        libc::kill(i32::try_from(relay_pid).unwrap(), libc::SIGKILL);
-    }
+    // The await reaps the stand-in.
+    drop(relay_cleanup);
     entrypoint.await.unwrap().unwrap();
+}
+
+/// BOX-013: a task run under way when a stop of its box starts records no
+/// container after that stop ends. Its spawn can still be in flight when the
+/// stop ends, and nothing would stop the container it records then. A run
+/// that starts after the stop records as before.
+#[test]
+fn a_task_run_a_stop_overtook_records_no_container_after_the_stop() {
+    let box_id = SessionId::mint();
+    // A stand-in pid, pinned by a pidfd on this process: never signalled.
+    let pin = |_| crate::box_runtime::pidfd_open(std::process::id());
+    let overtaken = crate::box_runtime::begin_task_run(box_id);
+    drop(crate::box_runtime::begin_task_stop(box_id));
+    assert!(
+        matches!(
+            crate::box_runtime::record_task_container_opening(overtaken.id(), 4_000_005, pin),
+            Err(crate::box_runtime::TaskContainerRefused::BoxStopped)
+        ),
+        "a run the stop overtook is refused once the stop has ended"
+    );
+    assert_eq!(crate::box_runtime::task_containers_recorded(box_id), 0);
+    let later = crate::box_runtime::begin_task_run(box_id);
+    let record = crate::box_runtime::record_task_container_opening(later.id(), 4_000_006, pin)
+        .expect("a run started after the stop records");
+    drop(record);
+    drop(later);
+    drop(overtaken);
 }
 
 /// BOX-013: a stop that ends the processes and cannot write the `stopped`
