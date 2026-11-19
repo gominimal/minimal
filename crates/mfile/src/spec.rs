@@ -110,7 +110,7 @@ pub struct BoxSpec {
     pub file_exports: Option<Vec<StoredExport>>,
     /// The keys of a stored spec that the schema of a spec names, but that
     /// no field above types, such as `io.exec_enabled` or
-    /// `network.vpn_network_names`. Each value is kept as it was written,
+    /// `network.dynamic_ingress`. Each value is kept as it was written,
     /// by its dotted path, and a section with no typed keys, such as
     /// `nesting`, is kept whole. A newer client can store such a key, and
     /// the box still resumes from its stored spec.
@@ -227,6 +227,11 @@ pub struct SpecNetwork {
     pub mode: boxes::NetworkMode,
     /// The egress and ingress policy the creating command resolved.
     pub policy: boxes::BoxPolicy,
+    /// The entry's `network.vpn_network_names`, in the order it lists
+    /// them, then each name a `--vpn-network-names` flag adds (BCLI-024).
+    /// Serialized as `vpn_network_names`, and left out when empty. The
+    /// daemon keeps the list and does not enforce it (BOX-076).
+    pub vpn_network_names: Vec<String>,
 }
 
 /// What the creating command's flags set on the spec. This is the last
@@ -373,6 +378,9 @@ impl BoxSpec {
             network: SpecNetwork {
                 mode: flags.network,
                 policy: flags.policy,
+                vpn_network_names: extra
+                    .map(|(t, _)| entry_vpn_network_names(t))
+                    .unwrap_or_default(),
             },
             lifecycle_hooks: None,
             file_exports,
@@ -386,6 +394,25 @@ impl BoxSpec {
     pub fn box_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.entry)
     }
+}
+
+/// The names an entry's `[network]` table lists in `vpn_network_names`
+/// (BCLI-024), each once, in the order the entry lists them. Empty when the
+/// entry sets none. The expansion refuses a value that is not a list of
+/// strings (see [`check_section`]), and a value that is not a string is
+/// left out here.
+fn entry_vpn_network_names(extra: &toml::Table) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let listed = extra
+        .get("network")
+        .and_then(|network| network.get("vpn_network_names"))
+        .and_then(toml::Value::as_array);
+    for name in listed.into_iter().flatten().filter_map(toml::Value::as_str) {
+        if !names.iter().any(|kept| kept == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
 }
 
 /// Whether an entry's own table sets `hooks_on_resume = true` (BOX-028).
@@ -723,8 +750,8 @@ struct DocNetwork {
     )]
     #[expect(dead_code, reason = "present only to refuse the key on a read")]
     egress_deny_subnets: Option<()>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    vpn_network_names: Option<StoredExport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    vpn_network_names: Vec<String>,
     #[serde(flatten)]
     policy: boxes::BoxPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -734,7 +761,7 @@ struct DocNetwork {
 kept_fields!(
     DocNetwork,
     "network",
-    [dynamic_ingress, vpn_network_names, bep,]
+    [dynamic_ingress, bep,]
 );
 
 /// Refuses the flat `[network]` egress key `flat` in a stored spec, and
@@ -834,7 +861,7 @@ impl From<BoxSpec> for SpecDoc {
             egress_allow_dns: None,
             egress_allow_subnets: None,
             egress_deny_subnets: None,
-            vpn_network_names: None,
+            vpn_network_names: spec.network.vpn_network_names,
             policy: spec.network.policy,
             bep: None,
         };
@@ -890,6 +917,7 @@ impl From<SpecDoc> for BoxSpec {
             network: SpecNetwork {
                 mode: doc.network.mode,
                 policy: doc.network.policy,
+                vpn_network_names: doc.network.vpn_network_names,
             },
             lifecycle_hooks: doc.lifecycle_hooks,
             file_exports: doc.file_exports,
@@ -1476,10 +1504,8 @@ mod tests {
             read.kept_keys.get("io.exec_enabled"),
             Some(&StoredExport(false.into()))
         );
-        assert_eq!(
-            read.kept_keys.get("network.vpn_network_names"),
-            Some(&StoredExport(vec![toml::Value::from("corp")].into()))
-        );
+        assert_eq!(read.network.vpn_network_names, ["corp"]);
+        assert!(!read.kept_keys.contains_key("network.vpn_network_names"));
         assert!(read.kept_keys.contains_key("nesting"));
 
         let written = toml::Table::try_from(&read).unwrap();
@@ -1575,6 +1601,7 @@ mod tests {
                 network: SpecNetwork {
                     mode: boxes::NetworkMode::OwnIp,
                     policy: policy.clone(),
+                    vpn_network_names: Vec::new(),
                 },
                 lifecycle_hooks: None,
                 file_exports: None,
@@ -2163,6 +2190,63 @@ mod tests {
             &std::collections::BTreeSet::new(),
         );
         crate::expand::expand(entry, &layers)
+    }
+
+    // BCLI-024: an entry's `network.vpn_network_names` reach the typed spec
+    // and its stored bytes, on a session entry and on a task. A stored spec
+    // reads the list back into the typed field, and an entry that sets none
+    // stores no key.
+    #[test]
+    fn spec_keeps_vpn_network_names() {
+        let file = r#"
+            [sessions.dev.network]
+            vpn_network_names = ["corp", "lab", "corp"]
+
+            [sessions.plain]
+        "#;
+        let dev = expand_in(file, "dev").expect("dev expands");
+        let spec =
+            BoxSpec::for_session_entry("dev", &dev.spec, &dev.report, &[], SpecFlags::default());
+        assert_eq!(spec.network.vpn_network_names, ["corp", "lab"]);
+
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert_eq!(
+            stored["network"]["vpn_network_names"],
+            toml::Value::from(vec!["corp", "lab"]),
+            "{stored:?}"
+        );
+        let read: BoxSpec = stored.try_into().unwrap();
+        assert_eq!(read, spec, "a stored spec reads the list back");
+        assert!(read.kept_keys.is_empty(), "{:?}", read.kept_keys);
+
+        let plain = expand_in(file, "plain").expect("plain expands");
+        let spec = BoxSpec::for_session_entry(
+            "plain",
+            &plain.spec,
+            &plain.report,
+            &[],
+            SpecFlags::default(),
+        );
+        assert!(spec.network.vpn_network_names.is_empty());
+        let stored = toml::Table::try_from(&spec).unwrap();
+        assert!(
+            stored["network"].get("vpn_network_names").is_none(),
+            "{stored:?}"
+        );
+
+        let task_file: crate::File = toml::from_str(
+            r#"
+            [tasks.build]
+            exec = ["make"]
+
+            [tasks.build.network]
+            vpn_network_names = ["corp"]
+            "#,
+        )
+        .unwrap();
+        let build =
+            BoxSpec::for_task("build", &task_file.tasks["build"], SpecFlags::default()).unwrap();
+        assert_eq!(build.network.vpn_network_names, ["corp"]);
     }
 
     // BOX-076: every Box Spec section expands with its keys, and

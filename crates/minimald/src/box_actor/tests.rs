@@ -16210,9 +16210,9 @@ async fn resume_restarts_from_stored_spec_same_id_and_name() {
 }
 
 /// BOX-025: a box whose stored spec carries a schema key that the typed
-/// spec does not read, such as `io.exec_enabled` or
-/// `network.vpn_network_names`, resumes. It does not stay stopped on an
-/// unknown field.
+/// spec does not read, such as `io.exec_enabled`, resumes. So does one
+/// with `network.vpn_network_names`, which the typed spec reads. It does
+/// not stay stopped on an unknown field.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_reads_stored_spec_with_exec_enabled_and_vpn_names() {
     use boxes::core::record::RecordState;
@@ -16233,7 +16233,7 @@ async fn resume_reads_stored_spec_with_exec_enabled_and_vpn_names() {
     let stored = std::fs::read(record_dir(&server, id).await.join("spec.json")).unwrap();
     let read = crate::box_runtime::stored_spec(&stored).expect("the daemon reads the stored spec");
     assert!(read.kept_keys.contains_key("io.exec_enabled"));
-    assert!(read.kept_keys.contains_key("network.vpn_network_names"));
+    assert_eq!(read.network.vpn_network_names, ["corp"]);
 
     stop_through_daemon(&server, id).await;
 
