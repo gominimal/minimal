@@ -16505,13 +16505,13 @@ fn conflicting_loadout_var_refused_before_create() {
     let project = tempfile::tempdir().expect("a project dir");
     std::fs::write(
         project.path().join(mfile::MFILE_NAME),
-        "[sessions.default]\nvars = { EDITOR = \"hx\" }\n",
+        "[sessions.default]\nenv_vars = { EDITOR = \"hx\" }\n",
     )
     .unwrap();
     let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
     // No `loadout_mode` in the file: the `session` type opens the box.
     let mut selected = crate::SelectedLoadouts {
-        loadouts: vec![named_loadout("ed", "vars = { EDITOR = \"vi\" }\n")],
+        loadouts: vec![named_loadout("ed", "env_vars = { EDITOR = \"vi\" }\n")],
         ignore: None,
     };
     let error = crate::session_box_expansion(root, None, true, &selected)
@@ -16533,6 +16533,94 @@ fn conflicting_loadout_var_refused_before_create() {
         .expect("an ignored name does not conflict");
 }
 
+// BOX-206, BOX-207: a loadout file that still sets `vars` or `vars_lenient`,
+// or an `env_vars` name that is not POSIX-shaped, refuses the start with
+// exit 3 and names the file. The entry's expansion refuses it, and so does
+// a start in a folder with no minimal.toml.
+#[test]
+fn loadout_file_with_retired_key_refused_exit3() {
+    let config = tempfile::tempdir().expect("a config dir");
+    let dir = config.path().join("minimal/loadouts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("ed.toml");
+    std::fs::write(&file, "[vars]\nEDITOR = \"vi\"\n").unwrap();
+    let global = GlobalArgs {
+        config_dir: Some(config.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+    let selection = || loadouts::LoadoutSelection::Cli(vec!["ed".to_owned()]);
+    let cfg = boxes::client::config::Config::default();
+    let active = loadouts::resolve_active_loadouts(selection(), &cfg, &global)
+        .expect("a file with a retired key still parses");
+    assert_eq!(active.loadouts[0].path(), Some(file.as_path()));
+    let retired = format!(
+        "the loadout file {} sets `vars` at its top level. This key is no longer \
+         read. Move its variables to an `[env_vars]` table in that file.",
+        file.display()
+    );
+
+    // The entry's expansion refuses it.
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        "[sessions.default]\n",
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    let selected = crate::SelectedLoadouts {
+        loadouts: active.loadouts,
+        ignore: None,
+    };
+    let error = crate::session_box_expansion(root, None, true, &selected)
+        .expect_err("the loadout sets vars");
+    let refusal = start_project_error(&error);
+    assert_eq!(refusal.exit_code(), Some(3));
+    assert_eq!(refusal.to_string(), retired);
+
+    // A start in a folder with no minimal.toml refuses it too.
+    let bare = tempfile::tempdir().expect("a folder with no minimal.toml");
+    let bare_root = camino::Utf8Path::from_path(bare.path()).expect("a UTF-8 path");
+    let start = || {
+        loadouts::prepare_activation_inputs(
+            &global,
+            bare_root,
+            selection(),
+            loadouts::HookPrep::Disabled,
+            Some(boxes::core::policy::UserPolicy::default()),
+        )
+    };
+    let Err(error) = start() else {
+        panic!("a loadout that sets vars must refuse the start");
+    };
+    let refusal = start_project_error(&error);
+    assert_eq!(refusal.exit_code(), Some(3));
+    assert_eq!(refusal.to_string(), retired);
+
+    // A name that is not POSIX-shaped is refused the same way.
+    std::fs::write(&file, "[env_vars]\n\"my.var\" = \"1\"\n").unwrap();
+    let Err(error) = start() else {
+        panic!("a loadout with the name my.var must refuse the start");
+    };
+    let refusal = start_project_error(&error);
+    assert_eq!(refusal.exit_code(), Some(3));
+    assert_eq!(
+        refusal.to_string(),
+        format!(
+            "the loadout file {} sets the variable `my.var` in `env_vars`. A variable \
+             name can hold only ASCII letters, digits and `_`, and cannot start with a \
+             digit. Rename the variable.",
+            file.display()
+        )
+    );
+
+    // The same file in `[env_vars]` starts.
+    std::fs::write(&file, "[env_vars]\nEDITOR = \"vi\"\n").unwrap();
+    if let Err(error) = start() {
+        panic!("a loadout with env_vars starts: {error:#}");
+    }
+}
+
 /// BOX-068 with BOX-048 and BOX-050: one `minimal.toml` declares a session
 /// and a task entry that share `[defaults]`. The client expands each entry
 /// and sends it, and the daemon composes and starts each box from its own
@@ -16548,7 +16636,7 @@ async fn expanded_session_and_task_entries_start_both_boxes() {
 lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo shared" } }]
 
 [defaults.session]
-vars = { EDITOR = "hx" }
+env_vars = { EDITOR = "hx" }
 
 [sessions.default]
 lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo session" } }]
@@ -16619,7 +16707,7 @@ echo = "ok"
     let legacy = tempfile::tempdir().expect("a legacy project dir");
     std::fs::write(
         legacy.path().join(mfile::MFILE_NAME),
-        "[session]\nvars = { EDITOR = \"vi\" }\n\n[tasks.check]\necho = \"ok\"\n",
+        "[session]\nenv_vars = { EDITOR = \"vi\" }\n\n[tasks.check]\necho = \"ok\"\n",
     )
     .unwrap();
     let legacy_root = camino::Utf8Path::from_path(legacy.path()).expect("a UTF-8 path");

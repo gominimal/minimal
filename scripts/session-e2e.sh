@@ -8045,11 +8045,11 @@ LOADOUT
   # match its own echo.
   echo "::group::session shell from a loadout's SHELL"
   mkdir -p "$XDG_CONFIG_HOME/minimal/loadouts"
-  printf 'description = "e2e session shell"\n\n[vars]\nSHELL = "/usr/bin/sh"\n' \
+  printf 'description = "e2e session shell"\n\n[env_vars]\nSHELL = "/usr/bin/sh"\n' \
     > "$XDG_CONFIG_HOME/minimal/loadouts/shelldev.toml"
   # Not installed in this session, so this one must fall back to bash and say
   # so on the terminal.
-  printf 'description = "e2e missing shell"\n\n[vars]\nSHELL = "/usr/bin/zsh"\n' \
+  printf 'description = "e2e missing shell"\n\n[env_vars]\nSHELL = "/usr/bin/zsh"\n' \
     > "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
   HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlsh.XXXXXX)"
   hook_seed_preamble > "$HOOK_SEED_DIR/minimal.toml"

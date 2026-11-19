@@ -1321,7 +1321,7 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "[session.vars]\nMIN_UNRESOLVABLE_INHERIT_581 = { inherit = true }\n",
+        "[defaults.session.env_vars]\nMIN_UNRESOLVABLE_INHERIT_581 = { inherit = true }\n",
     )
     .unwrap();
     let project_canon = project.path().canonicalize().unwrap();
@@ -4562,7 +4562,7 @@ fn session_list_decodes_without_mtls_field() {
 
 // --- helpers ---
 
-/// Creates a session whose workspace mfile declares a `[session.vars]`
+/// Creates a session whose workspace mfile declares a `[defaults.session.env_vars]`
 /// entry, which the daemon must route back to the client for gating — so
 /// configuring its loadout returns `Pending` and the session actor parks in
 /// its Draft state awaiting a verdict. Returns its ID.
@@ -4583,7 +4583,7 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
     let id = client.call::<CreateSession>(&request).await.unwrap().id;
     daemon
         .server
-        .seed_workspace_mfile(id, "[session.vars]\nRUST_LOG = \"info\"\n")
+        .seed_workspace_mfile(id, "[defaults.session.env_vars]\nRUST_LOG = \"info\"\n")
         .await;
     let resp = client
         .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
