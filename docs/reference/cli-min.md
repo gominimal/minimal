@@ -287,9 +287,10 @@ a shell's pipes, globs and `$VAR`, run the shell as the command:
 min box exec web -- sh -c 'echo $PWD'
 ```
 
-When a daemon shutdown stops the command, `min` prints
-`the daemon is shutting down, so the command was stopped` on stderr and
-exits with the command's own status.
+When a daemon shutdown stops a command that `min` is still attached to,
+`min` prints `the daemon is shutting down, so the command was stopped` on
+stderr and exits with the command's own status. With `--detach`, `min` has
+already returned and prints nothing.
 
 | Flag | Short | Description |
 |------|-------|-------------|
