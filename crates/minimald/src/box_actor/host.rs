@@ -2188,6 +2188,13 @@ pub(crate) struct StopOutcome {
 /// the box's own stop takes over once it passes.
 pub(crate) const TASK_EXIT_RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a graceful stop waits for a task run of the box to deliver its
+/// exit to the in-box helper (BOX-013), once its containers have ended. The
+/// run tears the container's network down before it sends the exit, and a
+/// stop that signalled the helper first would record the signal, not the
+/// task's exit. A run that has not delivered by then is left behind.
+pub(crate) const TASK_EXIT_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Ends the task containers the box's invocations run in (BOX-013): the
 /// containers a task run records beside the box, which the box's own PID
 /// namespace does not hold. A task box's entrypoint is the in-box relay, not
@@ -2204,12 +2211,16 @@ pub(crate) const TASK_EXIT_RELAY_WAIT: std::time::Duration = std::time::Duration
 /// invocation. So the one take holds every task container that can run.
 /// The caller holds it until the box's own processes are stopped.
 ///
-/// The grace period ends as soon as no task container is left. The stop
-/// then waits for the entrypoint for at most [`TASK_EXIT_RELAY_WAIT`],
-/// never for the whole grace period, because a session box's entrypoint
-/// does not end with a task. `entrypoint` is only read, never taken: the
-/// caller's [`stop_box_processes`] still consumes it. A box with no task
-/// container recorded is skipped at once.
+/// The grace period ends as soon as no task container is left. A graceful
+/// stop then waits, for at most [`TASK_EXIT_DELIVERY_WAIT`], until every
+/// task run of the box has delivered its exit: a run whose container was
+/// already reaped when the stop started is waited for too. It then waits
+/// for the entrypoint for at most [`TASK_EXIT_RELAY_WAIT`], never for the
+/// whole grace period, because a session box's entrypoint does not end
+/// with a task. A forced stop waits for neither. `entrypoint` is only read,
+/// never taken: the caller's [`stop_box_processes`] still consumes it. A
+/// box with no task container and no task run delivering its exit is
+/// skipped at once.
 pub(crate) async fn stop_task_containers(
     box_id: boxes::SessionId,
     entrypoint: &JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
@@ -2219,7 +2230,8 @@ pub(crate) async fn stop_task_containers(
 ) -> box_runtime::TaskStop {
     let stop = box_runtime::begin_task_stop(box_id);
     let containers = box_runtime::take_task_containers(box_id);
-    if containers.is_empty() {
+    let exit_pending = || box_runtime::task_exit_pending(box_id);
+    if containers.is_empty() && !exit_pending() {
         return stop;
     }
     let signal = |signal: i32| {
@@ -2235,26 +2247,40 @@ pub(crate) async fn stop_task_containers(
     let left = || containers.iter().map(|c| c.pids().len()).sum::<usize>();
     let forced_now = || forced.load(std::sync::atomic::Ordering::SeqCst);
     if force || forced_now() {
-        signal(libc::SIGKILL);
+        if !containers.is_empty() {
+            signal(libc::SIGKILL);
+        }
         return stop;
     }
-    signal(libc::SIGTERM);
-    let deadline = tokio::time::Instant::now() + grace;
-    loop {
-        if left() == 0 || tokio::time::Instant::now() >= deadline {
-            break;
+    if !containers.is_empty() {
+        signal(libc::SIGTERM);
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if left() == 0 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if forced_now() {
+                tracing::info!(
+                    box_id = %box_id,
+                    "stop: a forced stop arrived; the task containers' grace period ends now"
+                );
+                break;
+            }
+            tokio::time::sleep(STOP_POLL).await;
         }
-        if forced_now() {
-            tracing::info!(
-                box_id = %box_id,
-                "stop: a forced stop arrived; the task containers' grace period ends now"
-            );
-            break;
+        if left() > 0 {
+            signal(libc::SIGKILL);
         }
+    }
+    let delivery_deadline = tokio::time::Instant::now() + TASK_EXIT_DELIVERY_WAIT;
+    while exit_pending() && !forced_now() && tokio::time::Instant::now() < delivery_deadline {
         tokio::time::sleep(STOP_POLL).await;
     }
-    if left() > 0 {
-        signal(libc::SIGKILL);
+    if exit_pending() && !forced_now() {
+        tracing::info!(
+            box_id = %box_id,
+            "stop: a task run did not deliver its exit in time; the box's stop goes on"
+        );
     }
     let relay_deadline = tokio::time::Instant::now() + TASK_EXIT_RELAY_WAIT;
     while !entrypoint.is_finished() && !forced_now() && tokio::time::Instant::now() < relay_deadline

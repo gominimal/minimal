@@ -1311,10 +1311,28 @@ pub(crate) fn host_address_box_in_namespace(namespace: (u64, u64)) -> Option<box
 /// starts until that stop ends, a record is refused, and the run kills the
 /// container it just spawned. So the stop's one take sees every container
 /// that can run, and a multi-invocation task starts no invocation after it.
+///
+/// A task run that spawned a container delivers an exit: after the
+/// container is reaped, the run still tears its network down and then
+/// sends the exit code to the in-box helper. `exits_pending` holds those
+/// runs, from the first record until the run ends ([`TaskRun`]), so a stop
+/// waits for that delivery before it signals the box's own processes, even
+/// a stop that starts after the container was reaped.
 #[derive(Debug, Default)]
 pub(crate) struct TaskContainers {
-    by_box: BTreeMap<(boxes::SessionId, u32), Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
+    by_box: BTreeMap<(boxes::SessionId, u32), std::sync::Arc<std::os::fd::OwnedFd>>,
     stopping: BTreeMap<boxes::SessionId, usize>,
+    /// The task runs under way, by box and run number.
+    runs: BTreeMap<TaskRunId, ()>,
+    /// The runs among them whose container was reaped.
+    exits_pending: BTreeMap<TaskRunId, ()>,
+}
+
+/// One task run of a box ([`begin_task_run`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TaskRunId {
+    id: boxes::SessionId,
+    run: u64,
 }
 
 impl TaskContainers {
@@ -1323,32 +1341,47 @@ impl TaskContainers {
     /// recorded.
     fn record(
         &mut self,
-        id: boxes::SessionId,
+        run: TaskRunId,
         supervisor: u32,
-        pidfd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+        pidfd: std::sync::Arc<std::os::fd::OwnedFd>,
     ) -> bool {
-        if self.stopping.contains_key(&id) {
+        if self.stopping.contains_key(&run.id) {
             return false;
         }
-        self.by_box.insert((id, supervisor), pidfd);
+        self.by_box.insert((run.id, supervisor), pidfd);
+        // The run delivers an exit from now on, even once a stop has taken
+        // this record: the stop waits for it.
+        if self.runs.contains_key(&run) {
+            self.exits_pending.insert(run, ());
+        }
         true
     }
 
-    /// Drops the record of box `id`'s task container `supervisor`.
-    fn forget(&mut self, id: boxes::SessionId, supervisor: u32) {
-        self.by_box.remove(&(id, supervisor));
+    /// Drops the record of task run `run`'s container `supervisor`, which
+    /// was reaped. The run's exit stays pending until the run ends.
+    fn forget(&mut self, run: TaskRunId, supervisor: u32) {
+        self.by_box.remove(&(run.id, supervisor));
+    }
+
+    /// Ends task run `run`: its exit was delivered, or the run is gone.
+    fn end_run(&mut self, run: TaskRunId) {
+        self.runs.remove(&run);
+        self.exits_pending.remove(&run);
+    }
+
+    /// Whether a task run of box `id` spawned a container and has not
+    /// delivered its exit yet.
+    fn exit_pending(&self, id: boxes::SessionId) -> bool {
+        self.exits_pending.keys().any(|run| run.id == id)
     }
 
     /// Takes every task container record of box `id`, so the stop that
     /// signals them cannot race a second take.
-    fn take(
-        &mut self,
-        id: boxes::SessionId,
-    ) -> Vec<(u32, Option<std::sync::Arc<std::os::fd::OwnedFd>>)> {
+    fn take(&mut self, id: boxes::SessionId) -> Vec<(u32, std::sync::Arc<std::os::fd::OwnedFd>)> {
         let mut supervisors = Vec::new();
         self.by_box.retain(|(boxed, supervisor), pidfd| {
             if *boxed == id {
-                supervisors.push((*supervisor, pidfd.take()));
+                supervisors.push((*supervisor, std::sync::Arc::clone(pidfd)));
                 false
             } else {
                 true
@@ -1377,6 +1410,8 @@ impl TaskContainers {
 static TASK_CONTAINERS: std::sync::Mutex<TaskContainers> = std::sync::Mutex::new(TaskContainers {
     by_box: BTreeMap::new(),
     stopping: BTreeMap::new(),
+    runs: BTreeMap::new(),
+    exits_pending: BTreeMap::new(),
 });
 
 fn task_containers() -> std::sync::MutexGuard<'static, TaskContainers> {
@@ -1391,14 +1426,71 @@ fn task_containers() -> std::sync::MutexGuard<'static, TaskContainers> {
 #[derive(Debug)]
 #[must_use = "dropping the record forgets the task container at once"]
 pub(crate) struct TaskContainerRecord {
-    id: boxes::SessionId,
+    run: TaskRunId,
     supervisor: u32,
 }
 
 impl Drop for TaskContainerRecord {
     fn drop(&mut self) {
-        task_containers().forget(self.id, self.supervisor);
+        task_containers().forget(self.run, self.supervisor);
     }
+}
+
+/// A task run of a box under way (BOX-013), from before its first
+/// invocation until its exit is delivered to the in-box helper. Dropping it
+/// ends the run. The run's containers are recorded against it
+/// ([`record_task_container`]).
+#[derive(Debug)]
+#[must_use = "dropping the run ends it at once"]
+pub(crate) struct TaskRun {
+    key: TaskRunId,
+}
+
+impl TaskRun {
+    /// The run, as its container records name it.
+    pub(crate) fn id(&self) -> TaskRunId {
+        self.key
+    }
+}
+
+impl Drop for TaskRun {
+    fn drop(&mut self) {
+        task_containers().end_run(self.key);
+    }
+}
+
+/// A run of box `id` that no stop waits on: no [`TaskRun`] holds it, so
+/// its records mark no exit as pending. For tests of the signalling alone.
+#[cfg(test)]
+pub(crate) fn untracked_task_run(id: boxes::SessionId) -> TaskRunId {
+    TaskRunId { id, run: u64::MAX }
+}
+
+/// Starts a task run of box `id`. Drop it once the run's exit is delivered.
+pub(crate) fn begin_task_run(id: boxes::SessionId) -> TaskRun {
+    static NEXT_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = TaskRunId {
+        id,
+        run: NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    };
+    task_containers().runs.insert(key, ());
+    TaskRun { key }
+}
+
+/// How many task containers box `id` has recorded and no stop has taken.
+#[cfg(test)]
+pub(crate) fn task_containers_recorded(id: boxes::SessionId) -> usize {
+    task_containers()
+        .by_box
+        .keys()
+        .filter(|(boxed, _)| *boxed == id)
+        .count()
+}
+
+/// Whether a task run of box `id` spawned a container and has not
+/// delivered its exit yet ([`TaskRun`]).
+pub(crate) fn task_exit_pending(id: boxes::SessionId) -> bool {
+    task_containers().exit_pending(id)
 }
 
 /// A stop of a box under way ([`begin_task_stop`]). While it is held, the
@@ -1415,62 +1507,49 @@ impl Drop for TaskStop {
     }
 }
 
-/// The box `id` is stopping, so its task container `supervisor` was not
-/// recorded and must not run.
+/// Why a task container was not recorded, so it must not run.
 #[derive(Debug, thiserror::Error)]
-#[error("the box is stopping")]
-pub(crate) struct BoxStopping;
+pub(crate) enum TaskContainerRefused {
+    /// A stop of the box is under way.
+    #[error("the box is stopping")]
+    BoxStopping,
+    /// The container could not be pinned, and a stop could not signal it
+    /// safely.
+    #[error(
+        "the task cannot run in this box: this kernel cannot open a pidfd on its process, \
+         which `min box stop` needs to stop it ({0})"
+    )]
+    Unpinned(std::io::Error),
+}
 
-/// Records the task container `supervisor` that box `id`'s invocation just
+/// Records the task container `supervisor` that task run `run` just
 /// spawned (BOX-013), so `min box stop` can end it with the box. Refused
 /// while a stop of the box is under way ([`begin_task_stop`]).
 ///
 /// The caller has not reaped `supervisor` yet, so the pidfd opened here
 /// names that process for as long as the record exists, even after the
-/// kernel gives its pid to another process.
+/// kernel gives its pid to another process. A container with no pidfd is
+/// refused: a stop could only signal it by pid, which a reaped container
+/// may have left to another process.
 pub(crate) fn record_task_container(
-    id: boxes::SessionId,
+    run: TaskRunId,
     supervisor: u32,
-) -> Result<TaskContainerRecord, BoxStopping> {
-    let pidfd = match pidfd_open(supervisor) {
-        Ok(pidfd) => Some(std::sync::Arc::new(pidfd)),
-        Err(error) => {
-            // A kernel before 5.3 has no pidfd. The stop then signals the
-            // pid after the parent check alone, as it did before pidfds.
-            tracing::warn!(
-                container_pid = supervisor,
-                %error,
-                "opening a pidfd on a task container failed; a stop signals it by pid"
-            );
-            None
-        }
-    };
-    record_pinned_task_container(id, supervisor, pidfd)
+) -> Result<TaskContainerRecord, TaskContainerRefused> {
+    record_task_container_opening(run, supervisor, pidfd_open)
 }
 
-/// [`record_task_container`] with the pidfd already open.
-fn record_pinned_task_container(
-    id: boxes::SessionId,
+/// [`record_task_container`], pinning `supervisor` with `open`.
+pub(crate) fn record_task_container_opening(
+    run: TaskRunId,
     supervisor: u32,
-    pidfd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
-) -> Result<TaskContainerRecord, BoxStopping> {
-    if task_containers().record(id, supervisor, pidfd) {
-        Ok(TaskContainerRecord { id, supervisor })
+    open: impl FnOnce(u32) -> std::io::Result<std::os::fd::OwnedFd>,
+) -> Result<TaskContainerRecord, TaskContainerRefused> {
+    let pidfd = open(supervisor).map_err(TaskContainerRefused::Unpinned)?;
+    if task_containers().record(run, supervisor, std::sync::Arc::new(pidfd)) {
+        Ok(TaskContainerRecord { run, supervisor })
     } else {
-        Err(BoxStopping)
+        Err(TaskContainerRefused::BoxStopping)
     }
-}
-
-/// Records `supervisor` as a task container of box `id`, pinned by `pidfd`,
-/// which may name another process: what a record looks like once its
-/// container was reaped and the kernel gave its pid to `supervisor`.
-#[cfg(test)]
-pub(crate) fn record_task_container_pinned_to(
-    id: boxes::SessionId,
-    supervisor: u32,
-    pidfd: std::os::fd::OwnedFd,
-) -> Result<TaskContainerRecord, BoxStopping> {
-    record_pinned_task_container(id, supervisor, Some(std::sync::Arc::new(pidfd)))
 }
 
 /// Opens a pidfd on `pid` (`pidfd_open(2)`).
@@ -1524,7 +1603,7 @@ fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, signal: i32) -> bool {
 #[derive(Debug)]
 pub(crate) struct TaskContainer {
     processes: BoxProcesses,
-    pidfd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+    pidfd: std::sync::Arc<std::os::fd::OwnedFd>,
 }
 
 impl TaskContainer {
@@ -1537,11 +1616,8 @@ impl TaskContainer {
     /// Whether the supervisor is still the process the record pinned, and
     /// has not ended. A zombie has ended.
     fn runs(&self) -> bool {
-        let pinned = self
-            .pidfd
-            .as_deref()
-            .is_none_or(|pidfd| pidfd_send_signal(pidfd, 0));
-        pinned && is_live(i32::try_from(self.processes.root).unwrap_or(i32::MAX))
+        pidfd_send_signal(&self.pidfd, 0)
+            && is_live(i32::try_from(self.processes.root).unwrap_or(i32::MAX))
     }
 
     /// The container's live processes, none once the supervisor was reaped.
@@ -1577,15 +1653,8 @@ impl TaskContainer {
                 reached += 1;
             }
         }
-        if root_seen {
-            let delivered = match self.pidfd.as_deref() {
-                Some(pidfd) => pidfd_send_signal(pidfd, signal),
-                // SAFETY: `kill` reads no memory of ours.
-                None => unsafe { libc::kill(root, signal) == 0 },
-            };
-            if delivered {
-                reached += 1;
-            }
+        if root_seen && pidfd_send_signal(&self.pidfd, signal) {
+            reached += 1;
         }
         reached
     }
