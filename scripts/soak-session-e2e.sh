@@ -32,7 +32,7 @@
 #                       session_exec sandbox restart). `all` runs the whole
 #                       lane once per iteration instead.
 #   SOAK_CASE_TIMEOUT_SECS  time limit, in seconds, for one case's
-#                       session-e2e.sh run (default 600). A run that hangs
+#                       session-e2e.sh run (default 240). A run that hangs
 #                       past it counts as a failed case, and the soak goes on
 #                       to the next case instead of losing the rest of the
 #                       night to the job's time limit. Not applied with `all`.
@@ -97,7 +97,12 @@ for c in $CASES; do
   esac
 done
 
-CASE_TIMEOUT="${SOAK_CASE_TIMEOUT_SECS:-600}"
+# A healthy case takes well under a minute; a cold guest boot can spend up
+# to about 70 s probing hardware first. 240 s leaves room for that, and a
+# hang then costs at most this plus the kill grace below (5 minutes), so
+# the job's slack absorbs a few hangs and still reaches the steps after the
+# soak.
+CASE_TIMEOUT="${SOAK_CASE_TIMEOUT_SECS:-240}"
 case "$CASE_TIMEOUT" in
   '' | *[!0-9]*) echo "SOAK_CASE_TIMEOUT_SECS must be a positive integer, got: '$CASE_TIMEOUT'" >&2; exit 2 ;;
 esac
@@ -112,8 +117,8 @@ fi
 # daemon it can hang too, so SIGKILL follows if the case is still running
 # this long after the SIGTERM. Not exported: e2e_timeout reads it in this
 # shell, and session-e2e.sh's own calls of the helper keep their behaviour.
-# shellcheck disable=SC2034 # read by e2e_timeout, which is sourced above
-E2E_TIMEOUT_KILL_AFTER=120
+# shellcheck disable=SC2034 # read by e2e_timeout, which is sourced below
+E2E_TIMEOUT_KILL_AFTER=60
 # e2e_timeout: a host-side timeout that also works with no GNU timeout on
 # PATH, as on a stock Mac.
 # shellcheck disable=SC1091
