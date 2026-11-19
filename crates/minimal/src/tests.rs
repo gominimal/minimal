@@ -22228,7 +22228,8 @@ async fn box_spec_render_carries_client_store_rules() {
          id = \"npm-token\"\n\n\
          [sessions.default.secrets.OTHER]\nsource = \"store\"\nstore = \"keychain\"\n\
          id = \"no-rule\"\n\n\
-         [sessions.default.network.bep]\nsteering = \"proxy_env\"\n",
+         [sessions.default.network.bep]\nsteering = \"proxy_env\"\n\n\
+         [sessions.default.network.egress]\nallow_dns_hosts = [\"registry.npmjs.org\"]\n",
     );
     let config = global.config_dir.as_ref().unwrap().join("minimal");
     std::fs::create_dir_all(&config).unwrap();

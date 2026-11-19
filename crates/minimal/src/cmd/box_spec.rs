@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use boxes::core::bep::{
     ActivationSpec, BepSettings, BepTables, BepWarning, HostFacts, Quic443, SecretGrant,
-    SecretGrants, Steering, StoreAction, StoreRules, check_activation, store_references,
+    SecretGrants, Steering, StoreAction, StoreRules, check_activation, check_store_references,
+    store_references,
 };
 
 use crate::output::ObjectType;
@@ -65,7 +66,8 @@ pub(crate) struct SpecInputs<'a> {
 /// # Errors
 ///
 /// [`boxes::core::bep::ActivationRefused`] (exit 3) with every refusal that `min box start`
-/// gives for the same spec, network, egress and host, and the writer's
+/// gives for the same spec, network, egress and host, then the store
+/// reference refusals of the start (BEP-034, BEP-036), and the writer's
 /// error.
 pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     // BEP-057: every host is un-enrolled today.
@@ -87,6 +89,16 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         tables: inputs.tables,
     };
     check_activation(&spec, host, inputs.github_hosts)?;
+    // BEP-034, BEP-036: the start then checks each store reference against
+    // the deny set and the egress, so the preview does the same, in the
+    // same order.
+    let module_hosts = crate::config::store_module_hosts();
+    check_store_references(
+        inputs.secrets,
+        inputs.egress,
+        inputs.store_rules,
+        crate::config::store_deny_set(&module_hosts),
+    )?;
 
     let credentialed = inputs.secrets.values().any(SecretGrant::is_credentialed);
     if !credentialed {
@@ -997,42 +1009,46 @@ fn expand_entry(
             }
         }
     }
-    let mut rows_text = Vec::new();
-    if grants.values().any(SecretGrant::is_credentialed) {
-        let bep: BepSettings = network
-            .get("bep")
-            .cloned()
-            .map(toml::Value::try_into)
-            .transpose()
-            .map_err(|e| invalid(mfile::Error::Format(e)))?
-            .unwrap_or_default();
-        let quic443: Option<Quic443> = network
-            .get("quic443")
-            .cloned()
-            .map(toml::Value::try_into)
-            .transpose()
-            .map_err(|e| invalid(mfile::Error::Format(e)))?;
-        let mut rows = Vec::new();
-        let tables = BepTables {
-            secrets: &secrets_table,
-            network_bep: &bep_table,
-        };
-        proxy_rows(
-            global,
-            &bep,
-            quic443,
-            &grants,
-            mode,
-            egress.as_ref(),
-            tables,
-            read_rules.as_ref(),
-            &mut rows,
-        )?;
-        rows_text = String::from_utf8_lossy(&rows)
+    // #2445: every entry runs the start's whole check, with or without a
+    // grant, so a refusal of the start (BEP-010 needs no grant) is a
+    // refusal here. Only a credentialed grant prints rows.
+    let bep: BepSettings = network
+        .get("bep")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(|e| invalid(mfile::Error::Format(e)))?
+        .unwrap_or_default();
+    let quic443: Option<Quic443> = network
+        .get("quic443")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(|e| invalid(mfile::Error::Format(e)))?;
+    let mut rows = Vec::new();
+    let tables = BepTables {
+        secrets: &secrets_table,
+        network_bep: &bep_table,
+    };
+    proxy_rows(
+        global,
+        &bep,
+        quic443,
+        &grants,
+        mode,
+        egress.as_ref(),
+        tables,
+        read_rules.as_ref(),
+        &mut rows,
+    )?;
+    let rows_text = if grants.values().any(SecretGrant::is_credentialed) {
+        String::from_utf8_lossy(&rows)
             .lines()
             .map(str::to_owned)
-            .collect();
-    }
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(EntrySpec {
         entry: entry.name.clone(),
         box_type,
@@ -1478,6 +1494,15 @@ mod tests {
             basic_auth: None,
             action: None,
         };
+        // The egress admits the rule's upstream, so the start's store
+        // check (BEP-036) accepts the reference.
+        let egress = boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec![
+                "api.anthropic.com".into(),
+                "console.anthropic.com".into(),
+            ]),
+            ..boxes::EgressPolicy::default()
+        };
         let render_with = |rules: &StoreRules| {
             let mut out = Vec::new();
             render(
@@ -1488,7 +1513,7 @@ mod tests {
                     secrets: &secrets,
                     acknowledged: false,
                     network: boxes::NetworkMode::OwnIp,
-                    egress: Some(&github_egress()),
+                    egress: Some(&egress),
                     box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
@@ -1553,7 +1578,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
-                egress: Some(&github_egress()),
+                egress: Some(&egress),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
@@ -1583,7 +1608,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 network: boxes::NetworkMode::OwnIp,
-                egress: Some(&github_egress()),
+                egress: Some(&egress),
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,

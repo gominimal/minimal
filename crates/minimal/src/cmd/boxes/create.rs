@@ -6943,13 +6943,24 @@ mod tests {
     /// `project`, with the flags `flags`. It runs the start's own steps, in
     /// the start's order, up to the grant check.
     fn start_refusal(global: &GlobalArgs, project: &std::path::Path, flags: &[&str]) -> String {
+        start_refusal_of(global, project, None, flags)
+    }
+
+    /// [`start_refusal`] for the entry `entry` of the project, and with the
+    /// store reference check that follows the grant check.
+    fn start_refusal_of(
+        global: &GlobalArgs,
+        project: &std::path::Path,
+        entry: Option<&str>,
+        flags: &[&str],
+    ) -> String {
         let mut argv = vec!["min", "session", "activate"];
         argv.extend(flags);
         let mut args = parsed_activate_args(&argv);
         let path = camino::Utf8Path::from_path(project).expect("utf-8 path");
-        let (bep, secrets, spec_env, _) = project_bep_and_grants(path, None).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path, entry).expect("loads");
         let (port_mappings, flag_egress) = flag_network_overrides(&args).expect("flags parse");
-        let mut project_egress = project_egress(path, None).expect("egress loads");
+        let mut project_egress = project_egress(path, entry).expect("egress loads");
         let (network, port_mappings) =
             session_box_network(&args, &mut project_egress, port_mappings).expect("network");
         args.network = Some(network);
@@ -6967,6 +6978,7 @@ mod tests {
             resolver,
             &spec_env,
         )
+        .and_then(|_| check_store_grants(global, &secrets, policy.egress.as_ref(), false))
         .expect_err("the start refuses");
         let refused = err
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
@@ -7030,6 +7042,73 @@ mod tests {
             assert_eq!(refused.exit_code(), 3, "{case}");
             assert_eq!(refused.to_string(), started, "{case}: same refusal text");
             assert!(started.contains("github.com"), "{case}: {started}");
+            assert!(out.is_empty(), "{case}: no rows print");
+        }
+    }
+
+    // #2445: `min box spec <entry>` runs the start's whole check for every
+    // entry. An entry with no grant and `steering = "off"` with
+    // `proxy_env` (BEP-010), a store reference with no egress (BEP-036),
+    // and an `allow_dns_hosts` list on a `host_ip` box on a VM host
+    // (BEP-008) each give the start's refusal, with exit 3.
+    #[tokio::test]
+    async fn box_spec_entry_preview_refuses_like_start() {
+        let entry = "[sessions.dev]\npackages = [\"git\"]\n\n";
+        let off = "[defaults.session.network.bep]\nsteering = \"off\"\nproxy_env = true\n";
+        let store = "[defaults.session.network.bep]\nsteering = \"proxy_env\"\n\
+                     [defaults.session.secrets.OPENAI_KEY]\nsource = \"store\"\n\
+                     store = \"keychain\"\nid = \"openai-key\"\n";
+        let host_ip = "[defaults.session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                       scopes = [\"github:user-token\"]\n\
+                       [defaults.network.egress]\n\
+                       allow_dns_hosts = [\"example.com\"]\n";
+        let rule = "[secret-store-rules.openai-key]\nupstream = [\"api.openai.com\"]\n\
+                    header = \"Authorization\"\nprefix = \"Bearer \"\n";
+        let cases: [(&str, &[&str], bool, &str); 3] = [
+            (off, &[], false, "proxy_env"),
+            (store, &[], false, "api.openai.com"),
+            (host_ip, &["--network", "host_ip"], true, "github.com"),
+        ];
+        for (body, flags, vm, names) in cases {
+            let home = tempfile::tempdir().expect("home dir");
+            let config = home.path().join("config");
+            std::fs::create_dir_all(config.join("minimal")).expect("config dir");
+            std::fs::write(config.join("minimal/config.toml"), rule).expect("write config.toml");
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!("{entry}{body}"),
+            )
+            .expect("write minimal.toml");
+            let global = GlobalArgs {
+                repo_dir: Some(project.path().to_path_buf()),
+                minimal_dir: Some(home.path().join("state")),
+                config_dir: Some(config),
+                provider: vm.then_some(crate::Provider::LocalMinvmd),
+                no_input: true,
+                vm: None,
+            };
+            let case = format!("{body:?} {flags:?} vm={vm}");
+
+            let started = start_refusal_of(&global, project.path(), Some("dev"), flags);
+
+            let mut argv = vec!["min", "box", "spec", "dev"];
+            argv.extend(flags);
+            let mut out = Vec::new();
+            let err = crate::cmd::box_spec::box_spec_to(
+                &global,
+                parsed_box_spec_args(&argv),
+                false,
+                &mut out,
+            )
+            .await
+            .expect_err("min box spec refuses");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .unwrap_or_else(|| panic!("{case}: the box spec refusal: {err:#}"));
+            assert_eq!(refused.exit_code(), 3, "{case}");
+            assert_eq!(refused.to_string(), started, "{case}: same refusal text");
+            assert!(started.contains(names), "{case}: {started}");
             assert!(out.is_empty(), "{case}: no rows print");
         }
     }
