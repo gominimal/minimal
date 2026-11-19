@@ -18256,6 +18256,38 @@ async fn box_spec_path_form_renders_bep_rows() {
     );
 }
 
+// #3597, BOX-048: the merge replaces `network` whole, so
+// `[defaults.session.network.bep]` drops the `[defaults.network.egress]`
+// of an earlier layer. `min box spec dev` and the start refuse the file
+// with exit 3 and name both tables, rather than drop egress without a word.
+#[tokio::test]
+async fn box_spec_keeps_earlier_network_egress() {
+    let file = "[defaults.network.egress]\n\
+                allow_dns_hosts = [\"a.example\"]\n\n\
+                [defaults.session.network.bep]\n\
+                steering = \"proxy_env\"\n\n\
+                [sessions.dev]\n\
+                packages = [\"git\"]\n";
+    let (project, global) = spec_project(file);
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let message = "the network table in [defaults.session] replaces the network table \
+                   in [defaults], so egress from [defaults] is dropped. Set egress in \
+                   [defaults.session] too, or move bep to [defaults.network.bep].";
+
+    let err = box_spec_text(&global, &["min", "box", "spec", "dev"])
+        .await
+        .expect_err("the spec is refused");
+    let error = spec_project_error(&err);
+    assert_eq!(error.exit_code(), Some(3));
+    assert_eq!(error.to_string(), message);
+
+    // The start reads the same layers and refuses alike.
+    let err = project_egress(root, Some("dev")).expect_err("the start is refused");
+    let error = spec_project_error(&err);
+    assert_eq!(error.exit_code(), Some(3));
+    assert_eq!(error.to_string(), message);
+}
+
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.
