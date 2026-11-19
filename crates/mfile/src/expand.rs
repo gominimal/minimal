@@ -412,7 +412,6 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     }
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
     check_project_declarers(entry, &ordered)?;
-    refuse_dropped_network_keys(entry, layers)?;
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
     // BOX-071: the store references carry the client's authorities, so
@@ -557,56 +556,6 @@ fn refuse_store_authorities(
                 });
             }
         }
-    }
-    Ok(())
-}
-
-/// Refuses a `network` table in `[defaults.<type>]` or the entry that
-/// drops `network` keys an earlier layer sets (BOX-048). The merge
-/// replaces `network` whole, so those keys would vanish without a word.
-/// The layers, in order, are `[defaults]`, `[defaults.<type>]` and the
-/// entry. Exits 3.
-fn refuse_dropped_network_keys(entry: &BoxEntry, layers: &Layers) -> Result<(), Error> {
-    let defaults_type = format!(
-        "[defaults.{}]",
-        entry.box_type.as_deref().unwrap_or_default()
-    );
-    let entry_header = EntryHeader(entry.table.key(), &entry.name).to_string();
-    let ordered = [
-        ("[defaults]".to_owned(), &layers.defaults),
-        (defaults_type, &layers.defaults_type),
-        (entry_header, &entry.body),
-    ];
-    let mut earlier: Option<(&str, &toml::Table)> = None;
-    for (header, layer) in &ordered {
-        let Some(network) = layer.get("network").and_then(toml::Value::as_table) else {
-            continue;
-        };
-        if let Some((earlier_header, earlier_network)) = earlier {
-            let dropped: Vec<String> = earlier_network
-                .keys()
-                .filter(|k| !network.contains_key(k.as_str()))
-                .cloned()
-                .collect();
-            if !dropped.is_empty() {
-                let later_keys: Vec<String> = network.keys().cloned().collect();
-                // One sub-table moves to its own header. Anything else moves
-                // into the earlier `network` table.
-                let inner = earlier_header.trim_end_matches(']');
-                let move_to = match later_keys.as_slice() {
-                    [key] if network[key].is_table() => format!("{inner}.network.{key}]"),
-                    _ => format!("{inner}.network]"),
-                };
-                return Err(Error::NetworkTableDropsKeys {
-                    later: header.clone(),
-                    earlier: earlier_header.to_owned(),
-                    dropped: dropped.into_boxed_slice(),
-                    later_keys: later_keys.into_boxed_slice(),
-                    move_to,
-                });
-            }
-        }
-        earlier = Some((header.as_str(), network));
     }
     Ok(())
 }
@@ -1680,108 +1629,6 @@ mod tests {
             .iter()
             .map(|v| v.as_str().expect("a string"))
             .collect()
-    }
-
-    // BOX-048, #3597: `network` merges by replacing the whole table, so a
-    // later layer whose `network` table leaves out a key that an earlier
-    // layer sets is refused at load, never dropped without a word. The test
-    // name keeps the plan's filter; the merge itself stays whole-table.
-    #[test]
-    fn network_merges_by_sub_table_refuses_a_dropped_key() {
-        // (a) The issue's reproduce case.
-        let file = r#"
-            [defaults.network.egress]
-            allow_dns_hosts = ["a.example"]
-
-            [defaults.session.network.bep]
-            steering = "proxy_env"
-
-            [sessions.dev]
-            packages = ["git"]
-        "#;
-        let err = expand_in(file, "dev", Layers::default()).expect_err("egress is dropped");
-        assert_eq!(err.exit_code(), Some(3));
-        assert_eq!(
-            err.to_string(),
-            "the network table in [defaults.session] replaces the network table in \
-             [defaults], so egress from [defaults] is dropped. Set egress in \
-             [defaults.session] too, or move bep to [defaults.network.bep]."
-        );
-
-        // (b) An entry's inline table drops the defaults' egress too.
-        let file = r#"
-            [defaults.network.egress]
-            allow_dns_hosts = ["a.example"]
-
-            [tasks.offline]
-            exec = ["true"]
-            network = { mode = "none" }
-        "#;
-        let err = expand_in(file, "offline", Layers::default()).expect_err("egress is dropped");
-        assert_eq!(err.exit_code(), Some(3));
-        assert_eq!(
-            err.to_string(),
-            "the network table in [tasks.offline] replaces the network table in \
-             [defaults], so egress from [defaults] is dropped. Set egress in \
-             [tasks.offline] too, or move mode to [defaults.network]."
-        );
-
-        // Several dropped keys are each named.
-        let file = r#"
-            [defaults.network]
-            mode = "own_ip"
-            quic443 = "block"
-
-            [sessions.dev.network.bep]
-            steering = "dns"
-        "#;
-        let err = expand_in(file, "dev", Layers::default()).expect_err("two keys drop");
-        assert_eq!(
-            err.to_string(),
-            "the network table in [sessions.dev] replaces the network table in \
-             [defaults], so mode, quic443 from [defaults] are dropped. Set mode, \
-             quic443 in [sessions.dev] too, or move bep to [defaults.network.bep]."
-        );
-    }
-
-    // BOX-048, #3597: a file where one layer alone sets `network`, or where
-    // the later table sets every key of the earlier one, loads unchanged.
-    #[test]
-    fn network_merges_by_sub_table_loads_when_nothing_drops() {
-        let one_layer = r#"
-            [defaults.network.egress]
-            allow_dns_hosts = ["a.example"]
-
-            [sessions.dev]
-            packages = ["git"]
-        "#;
-        let dev = expand_in(one_layer, "dev", Layers::default()).expect("dev expands");
-        assert_eq!(
-            strings(dev.spec["network"]["egress"].get("allow_dns_hosts")),
-            ["a.example"]
-        );
-
-        let superset = r#"
-            [defaults.network.egress]
-            allow_dns_hosts = ["a.example"]
-
-            [defaults.session.network]
-            egress = { allow_dns_hosts = ["b.example"] }
-            bep = { steering = "proxy_env" }
-
-            [sessions.dev.network]
-            mode = "own_ip"
-            egress = { allow_dns_hosts = ["c.example"] }
-            bep = { steering = "dns" }
-        "#;
-        let dev = expand_in(superset, "dev", Layers::default()).expect("dev expands");
-        let network = dev.spec["network"].as_table().expect("a network table");
-        assert_eq!(network["mode"].as_str(), Some("own_ip"));
-        assert_eq!(
-            strings(network["egress"].get("allow_dns_hosts")),
-            ["c.example"]
-        );
-        assert_eq!(network["bep"]["steering"].as_str(), Some("dns"));
     }
 
     // BOX-048: `[defaults]` merges into every entry, `[defaults.<type>]`
