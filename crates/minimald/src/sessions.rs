@@ -3686,6 +3686,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// The compose-time read of a box's project `minimal.toml` stays
+    /// beneath the box's workspace: once the file is a link out of the
+    /// workspace, [`resolve_project_ctx_and_graph`] refuses it rather than
+    /// reading the file outside.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_project_ctx_and_graph_refuses_a_minimal_toml_that_links_out() {
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let content = "[session]\npackages = [\"cargo\"]\n";
+        std::fs::write(&mfile_path, content).unwrap();
+
+        let cache = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+
+        // Control: the same read of the regular file resolves.
+        let resolution = resolve_project_ctx_and_graph(&daemon, &path)
+            .expect("a stdlib-only mfile resolves offline");
+        assert!(matches!(resolution, ProjectResolution::Full(..)));
+
+        let outside = TempDir::new().unwrap();
+        let outside_path = outside.path().join(mfile::MFILE_NAME);
+        std::fs::write(&outside_path, content).unwrap();
+        let staged = project.path().join("minimal.toml.link");
+        std::os::unix::fs::symlink(&outside_path, &staged).unwrap();
+        std::fs::rename(&staged, &mfile_path).unwrap();
+
+        let Err(err) = resolve_project_ctx_and_graph(&daemon, &path) else {
+            panic!("a minimal.toml that links out of the workspace was read");
+        };
+
+        // Where every link is refused (off Linux, or a kernel without
+        // `openat2`) the refusal says only that it is a link.
+        let text = err.to_string();
+        assert!(
+            text.contains("leads outside its workspace")
+                || text.contains("cannot follow a link here"),
+            "error: {text}"
+        );
+        assert_eq!(std::fs::read_link(&mfile_path).unwrap(), outside_path);
+    }
+
     /// A project whose `minimal.toml` demands a newer standard
     /// library than the daemon ships fails graph resolution, and
     /// [`run_compose`] surfaces that as an `InvalidInput` error
