@@ -277,7 +277,7 @@ expect() { # crate expected_count
         exit 1
     }
 }
-expect boxes 13
+expect boxes 12
 expect rcache 3
 expect mlog 9
 expect minvmd 5

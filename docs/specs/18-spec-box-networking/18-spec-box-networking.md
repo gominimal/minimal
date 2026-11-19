@@ -799,11 +799,10 @@ box that holds it returns to `running`. These terms follow the decision in
       tier:   T0
       verify: cargo nextest run -p minvmd switch_request_refused_and_logged
       <!-- S10a/AC1; prose 51; unwanted; a zone request carrying several records is one request (NET-001's refusal form) -->
-    - IF a request from the in-VM daemon withdraws a port THEN THE SYSTEM SHALL apply it only for a port that the row at the withdrawn forward's own address declares or holds in its runtime-published set.
+    - IF a request from the in-VM daemon withdraws a port THEN THE SYSTEM SHALL apply it only for a port in the row's runtime-published set, and SHALL leave a declared port's forward in place whatever the request.
       tier:   T0
-      verify: cargo nextest run -p minvmd retract_of_declared_port_applied
-      verify: cargo nextest run -p boxes retract_of_declared_port_applied
-      <!-- S10a/AC1; prose 51; unwanted; NET-121 binds a declared port's forward at activation and holds it until the box stops, and the box's own withdrawal at its stop is applied, so the port is free on the host at once rather than at the row's withdrawal after DETACH_GRACE; the gate attributes a withdrawal to the address the forward's publish was applied at, so a box never withdraws a forward another row holds; the host still unbinds every forward the box did not withdraw when the row is withdrawn; the runtime-published set is NET-016/NET-017's listen-published ports -->
+      verify: cargo nextest run -p minvmd retract_of_declared_port_refused
+      <!-- S10a/AC1; prose 51; unwanted; design §7.1 bind discipline (sockets held for the session's lifetime, unbound only by host-side ingress revocation) and NET-121; the runtime-published set is NET-016/NET-017's listen-published ports; until listen-publishing lands the set is empty and every withdrawal of a declared port is refused -->
 
 - **NET-156** WHILE the box host is VM-backed, IF a flow from a box or from the host-address cohort targets the host-gateway alias at a destination that is not a configured host exposure, not the gateway resolver's port, and not a credentialed-lane box's steered flow to the node-local Box Egress Proxy THEN THE SYSTEM SHALL refuse the flow.
   tier:     T0
@@ -1038,10 +1037,14 @@ box that holds it returns to `running`. These terms follow the decision in
     verify: cargo nextest run -p minimal policy_shows_unset_egress_as_named_default
     <!-- state-driven; the effective default is `deny-all` for an own-address box under the deny-all default (NET-075) and `allow-all` for a host-address box or under the opt-out (NET-077); the policy view never shows an unset section as nothing, since a declared deny-all and an unset section admit opposite things -->
 
-- **NET-121** WHEN a box is activated THE SYSTEM SHALL bind a forwarder for each ingress port its declaration names before its name is registered, hold that forwarder until the box stops, and unbind it when the box stops.
+- **NET-121** WHEN a box is published THE SYSTEM SHALL bind a forwarder for each ingress port its declaration names before its name is registered, and hold that forwarder until the box stops.
   tier:     T0
   verify:   cargo nextest run -p minimald declared_ports_bound_before_name_registered
-  <!-- S1b-2c; design §7.1 (enforcement parity, bind discipline); event-driven; the bind is at activation, not at each launch of the box, so a port that something takes after the activation does not fail a later attach; on a VM-backed host the box's own withdrawal at its stop frees the port at once (NET-081's withdrawal rule); NET-016 covers ports a permit range allows and no declaration names -->
+  <!-- S1b-2c; design §7.1 (enforcement parity, bind discipline); event-driven; NET-016 covers ports a permit range allows and no declaration names -->
+  - WHILE the box host is VM-backed, WHEN a box is activated THE SYSTEM SHALL bind the forwarder for each ingress port its declaration names, and SHALL treat a forwarder that a later attach finds already bound as the box's own.
+    tier:   T0
+    verify: cargo nextest run -p minimald declared_ingress_bound_at_activation
+    <!-- S1b-2c; design §7.1 bind discipline; state-driven and event-driven; the bind is at activation, not at each attach, so a port that something takes after the activation does not fail a later attach; a native host still binds at the first attach, tracked in https://github.com/gominimal/minimal/issues/3646 -->
   - IF a declared port's ingress is revoked THEN THE SYSTEM SHALL unbind its forwarder and terminate the connections it holds.
     tier:   T0
     verify: cargo nextest run -p minimald ingress_revocation_unbinds_forwarder_and_terminates_connections
@@ -1302,9 +1305,9 @@ own-address and `none` boxes only: same-port collisions on a shared address are
 intrinsic to the mode and are reported, never translated. **Declared ports are
 bound before the name; permitted ports follow the listener.** Design §7.1's
 bind discipline holds for every port a declaration names: NET-121 binds its
-forwarder at activation, before the name is registered, and holds it until
-stop or revocation, so a connection to a declared port that nothing is
-listening on yet is refused by the box, not timed out at the host. A permit range that names no port cannot
+forwarder before the name is registered and holds it until stop or revocation,
+so a connection to a declared port that nothing is listening on yet is refused
+by the box, not timed out at the host. A permit range that names no port cannot
 be pre-bound, so there the story's port-on-listen shape applies: NET-016
 publishes when the process listens and NET-017 withdraws when it closes. Two
 alternatives were considered. Binding only declared ports narrows the story to

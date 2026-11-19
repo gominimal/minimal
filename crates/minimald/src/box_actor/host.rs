@@ -966,9 +966,8 @@ impl BoxActor {
         self.publications.revoke_all();
         // A declared port bound for this box at a shared-address port's
         // hand-over (NET-129) goes the way the forwards its attach bound
-        // go: unbound here on every host, so the port is free at once
-        // (NET-121). Only a publish the VM host keeps behind another box's
-        // row is left for the host.
+        // go: unbound here on a native host, left for the host on a
+        // VM-backed one.
         let handed = self.live_ingress.take_handed();
         if !handed.is_empty() {
             let control = self.switch_control().await;

@@ -77,16 +77,15 @@ pub enum ControlChannel {
 }
 
 impl ControlChannel {
-    /// Whether a host-side gate sits in front of the switch. On a VM-backed
-    /// host (the vsock channel) every control request passes the host's
-    /// egress gate first. The gate answers an expose of a listener it
-    /// already holds for the box as bound, and keeps a publish behind
-    /// another box's row until that row is withdrawn. It applies the box's
-    /// own withdrawal of a declared port, and unbinds any declared forward
-    /// the box did not withdraw when the box's row is withdrawn (design
-    /// §7.1). On a native host the daemon drives the switch directly.
+    /// Whether the host, not this daemon, unbinds a declared port's forward.
+    /// On a VM-backed host (the vsock channel) every control request passes
+    /// the host's egress gate first. The gate refuses any withdrawal of a
+    /// declared port (NET-081's withdrawal rule) and unbinds the declared
+    /// forwards itself when the box's row is withdrawn (design §7.1:
+    /// host-side ingress revocation). On a native host the daemon drives the
+    /// switch directly, and the unbind is its own job.
     #[must_use]
-    pub fn has_host_gate(&self) -> bool {
+    pub fn host_unbinds_declared_forwards(&self) -> bool {
         matches!(self, Self::Vsock { .. })
     }
 }
@@ -199,12 +198,6 @@ pub struct PortForwarder {
     /// to another box. Released when an unbind succeeds, or when the last
     /// clone drops. Shared by every clone, as `revoked` is.
     listener_hold: Arc<Mutex<Option<super::switch::MinimalListenerHold>>>,
-    /// Whether the VM host's gate keeps this publish behind another box's
-    /// row ([`HandedBind::HeldByHost`]). The listener is still that box's
-    /// forward, so a withdrawal of it would end the other box's forward.
-    /// The daemon never asks to unbind it, and the host binds or drops it
-    /// with the rows.
-    held_by_host: bool,
 }
 
 impl PortForwarder {
@@ -223,15 +216,7 @@ impl PortForwarder {
             gate,
             revoked: Arc::new(AtomicBool::new(false)),
             listener_hold: Arc::new(Mutex::new(listener_hold)),
-            held_by_host: false,
         }
-    }
-
-    /// The same forwarder, marked as a publish the VM host keeps behind
-    /// another box's row ([`HandedBind::HeldByHost`]).
-    fn kept_by_host(mut self) -> Self {
-        self.held_by_host = true;
-        self
     }
 
     /// Marks the forward unbound: the switch dropped it, so its port is no
@@ -278,13 +263,6 @@ impl PortForwarder {
     #[must_use]
     pub fn internal_port(&self) -> u16 {
         self.internal_port
-    }
-
-    /// Whether the VM host keeps this publish behind another box's row
-    /// ([`HandedBind::HeldByHost`]), so the daemon never asks to unbind it.
-    #[must_use]
-    pub fn is_kept_by_host(&self) -> bool {
-        self.held_by_host
     }
 
     /// Whether this forwarder's ingress was revoked already: its unbind ran
@@ -503,7 +481,7 @@ pub async fn apply_ingress_naming_holders(
 ) -> io::Result<Vec<PortForwarder>> {
     apply_declared(
         control,
-        control.has_host_gate(),
+        control.host_unbinds_declared_forwards(),
         published,
         ptask_ip,
         ingress,
@@ -525,9 +503,9 @@ pub async fn apply_ingress_naming_holders(
 ///
 /// The bound forwards stay on the host. The box's first attach posts the
 /// same exposes again, and the host's switch answers each one that the
-/// listener is already bound, which the attach takes as bound. The box's
-/// stop withdraws them ([`release_declared_ingress`]), and the host unbinds
-/// any the box did not withdraw when it withdraws the box's row.
+/// listener is already bound, which the attach takes as bound. The host
+/// unbinds the forwards when it withdraws the box's row, as it does for
+/// every declared forward ([`release_declared_ingress`]).
 ///
 /// # Errors
 ///
@@ -542,7 +520,7 @@ pub async fn bind_declared_at_publish(
 ) -> io::Result<Vec<PortForwarder>> {
     apply_declared(
         control,
-        control.has_host_gate(),
+        control.host_unbinds_declared_forwards(),
         published,
         switch_address,
         ingress,
@@ -554,7 +532,7 @@ pub async fn bind_declared_at_publish(
 }
 
 /// [`apply_ingress_naming_holders`], with `host_holds_listeners` read off the
-/// control channel ([`ControlChannel::has_host_gate`]) by
+/// control channel ([`ControlChannel::host_unbinds_declared_forwards`]) by
 /// the caller, so a test can drive the VM-backed answers over a unix socket.
 /// Behind a VM host's gate a listener the switch already holds is the
 /// box's own forward, bound at publish ([`bind_declared_at_publish`]), or
@@ -625,7 +603,7 @@ async fn apply_declared(
                 );
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
-                release_declared_ingress(control, &bound).await;
+                release_declared(control, host_holds_listeners, &bound).await;
                 // A taken host port fails the apply like any other refusal:
                 // NET-121 (docs/specs/18-spec-box-networking, design §7.1)
                 // makes a failed bind a surfaced error, never a silent
@@ -664,8 +642,8 @@ fn is_address_in_use(error: &io::Error) -> bool {
 /// holds at `published`, found by a short-lived bind of each one in this
 /// daemon's network namespace — the same bind the forwarder makes at the
 /// box's first spawn when `control` reaches a switch this daemon spawned.
-/// When a host-side gate sits in front of the switch
-/// ([`ControlChannel::has_host_gate`]), the forwarder
+/// When the host unbinds the declared forwards
+/// ([`ControlChannel::host_unbinds_declared_forwards`]), the forwarder
 /// binds on the host OS, not where this daemon runs, so a bind here would
 /// test the wrong ports: the probe reports nothing and the spawn's own
 /// apply says a taken port. A port in `yielded` is skipped, because another
@@ -681,7 +659,7 @@ pub fn host_ports_in_use(
     ingress: &IngressPolicy,
     yielded: &[u16],
 ) -> Vec<u16> {
-    if control.has_host_gate() {
+    if control.host_unbinds_declared_forwards() {
         return Vec::new();
     }
     ingress
@@ -830,13 +808,13 @@ pub async fn bind_handed_port(
         mapping.internal_port,
         gate.cloned(),
     );
-    handed_bind(control.has_host_gate(), answer, forwarder)
+    handed_bind(control.host_unbinds_declared_forwards(), answer, forwarder)
 }
 
 /// Reads the forwarder's answer to a hand-over's expose
 /// ([`bind_handed_port`]). `host_holds_listeners` is whether a host-side
 /// gate sits in front of the switch
-/// ([`ControlChannel::has_host_gate`]).
+/// ([`ControlChannel::host_unbinds_declared_forwards`]).
 fn handed_bind(
     host_holds_listeners: bool,
     answer: io::Result<()>,
@@ -845,7 +823,7 @@ fn handed_bind(
     match answer {
         Ok(()) => Ok(HandedBind::Bound(forwarder)),
         Err(error) if host_holds_listeners && is_already_running(&error) => {
-            Ok(HandedBind::HeldByHost(forwarder.kept_by_host()))
+            Ok(HandedBind::HeldByHost(forwarder))
         }
         Err(error) => Err(error),
     }
@@ -921,24 +899,29 @@ pub async fn unexpose_forwarder(
 }
 
 /// Ends the declared ports' forwards in `bound` when their box stops (NET-121)
-/// or when a partial apply rolls back. The daemon asks the switch to unbind
-/// each one through [`remove_ingress`], on every host. On a VM-backed host
-/// the host's egress gate applies the box's withdrawal of a port its row
-/// declares, so the port is free on the host at once, not only when the
-/// row is withdrawn after its grace.
+/// or when a partial apply rolls back. Who unbinds them depends on the host
+/// ([`ControlChannel::host_unbinds_declared_forwards`]):
 ///
-/// A forward the VM host keeps behind another box's row
-/// ([`HandedBind::HeldByHost`]) is not asked for: its listener is still the
-/// other box's forward, and the gate attributes a withdrawal by listener.
-/// The host binds or drops it with the rows. It gets one info line, so the
-/// log keeps NET-121's bind/unbind pair.
+/// - On a native host the daemon asks the switch itself, through
+///   [`remove_ingress`].
+/// - On a VM-backed host the daemon asks nothing. The host's egress gate
+///   refuses any withdrawal of a declared port, by dropping the request
+///   unanswered. Asking anyway only produced a misleading "malformed status
+///   line" warning per port. The host unbinds the forwards and terminates
+///   their connections when it withdraws the box's row. Each forward still
+///   gets one info line, so the log keeps NET-121's bind/unbind pair.
 pub async fn release_declared_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
-    let (kept, owned): (Vec<PortForwarder>, Vec<PortForwarder>) = bound
-        .iter()
-        .filter(|forwarder| !forwarder.is_revoked())
-        .cloned()
-        .partition(|forwarder| forwarder.held_by_host);
-    for forwarder in &kept {
+    release_declared(control, control.host_unbinds_declared_forwards(), bound).await;
+}
+
+/// [`release_declared_ingress`], with `host_unbinds` read off the control
+/// channel by the caller.
+async fn release_declared(control: &ControlChannel, host_unbinds: bool, bound: &[PortForwarder]) {
+    if !host_unbinds {
+        remove_ingress(control, bound).await;
+        return;
+    }
+    for forwarder in bound.iter().filter(|forwarder| !forwarder.is_revoked()) {
         let (host, external_port) = forwarder.host_port().unwrap_or(("", 0));
         tracing::info!(
             host,
@@ -947,7 +930,6 @@ pub async fn release_declared_ingress(control: &ControlChannel, bound: &[PortFor
             "left the declared ingress forwarder for the host to unbind"
         );
     }
-    remove_ingress(control, &owned).await;
 }
 
 /// NET-016's publish: exposes **one** mapping on the switch's forwarder —
@@ -1055,9 +1037,10 @@ async fn unexpose_closing(
 /// The caller refuses the port at the box's gate *first* — the
 /// order [`PortForwarder::revoke`] holds for a declared forward — so no new
 /// connection crosses the gap between a listener already gone and a gate
-/// that still admits the port. The watcher never withdraws a declared
-/// port's forward: nothing a process closing a listener does can withdraw
-/// what the declaration holds until the box stops (NET-121).
+/// that still admits the port. A declared port's forward never comes down
+/// this path: it is not the watcher's (NET-081's sub-requirement — a
+/// withdrawal applies only to the runtime-published set), and nothing a
+/// process closing a listener does can withdraw what the declaration holds.
 ///
 /// # Errors
 ///
@@ -3741,7 +3724,7 @@ mod tests {
             let sock = dir.path().join("gvproxy.sock");
             let forwarder = forwarder_answering_once(sock.clone(), 500, "proxy already running\n");
             let control = ControlChannel::Unix(sock);
-            assert!(!control.has_host_gate());
+            assert!(!control.host_unbinds_declared_forwards());
 
             let Err(native) = bind_handed_port(&control, PUBLISHED, LEASE, &mapping(), None).await
             else {
@@ -3789,7 +3772,6 @@ mod tests {
                 gate: None,
                 revoked: Arc::new(AtomicBool::new(false)),
                 listener_hold: Arc::new(std::sync::Mutex::new(None)),
-                held_by_host: false,
             }
         }
 
@@ -3903,8 +3885,42 @@ mod tests {
             fake.abort();
         }
 
+        /// On a VM-backed host the host's egress gate refuses any withdrawal
+        /// of a declared port and unbinds the forward itself at box end, so
+        /// the daemon asks the switch for nothing. It says one info line per
+        /// forward, and no "removing ingress port mapping" warning.
+        #[tokio::test]
+        async fn declared_forwards_left_to_the_host_on_a_vm_host() {
+            let log = crate::test_harness::captured_log();
+            let control = ControlChannel::Vsock { cid: 2, port: 1 };
+            assert!(control.host_unbinds_declared_forwards());
+            let bound = [declared_at("127.0.64.201:18201")];
+
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                release_declared_ingress(&control, &bound),
+            )
+            .await
+            .expect("releasing on a VM host asks nothing of the switch, so it returns at once");
+
+            let logged = log.contents();
+            assert!(
+                logged.lines().any(|line| line
+                    .contains("left the declared ingress forwarder for the host to unbind")
+                    && line.contains("port=18201")),
+                "each declared forward says it was left to the host, got: {logged}"
+            );
+            assert!(
+                !logged
+                    .lines()
+                    .any(|line| line.contains("127.0.64.201:18201")
+                        && line.contains("removing ingress port mapping")),
+                "no retraction was attempted, so none failed, got: {logged}"
+            );
+        }
+
         /// On a native host the daemon drives the switch directly, so it
-        /// unbinds a declared forward itself when the box stops.
+        /// still unbinds a declared forward itself when the box stops.
         #[tokio::test]
         async fn declared_forwards_unbound_by_the_daemon_on_a_native_host() {
             let dir = tempfile::TempDir::new().unwrap();
@@ -3912,7 +3928,7 @@ mod tests {
             let (forwarder, mut asked) =
                 spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 200);
             let control = ControlChannel::Unix(sock);
-            assert!(!control.has_host_gate());
+            assert!(!control.host_unbinds_declared_forwards());
 
             release_declared_ingress(&control, &[declared_at("127.0.64.202:18202")]).await;
             forwarder.abort();
@@ -4100,90 +4116,37 @@ mod tests {
             );
         }
 
-        /// NET-121 at box stop on a VM-backed host: the declared forward bound
-        /// at activation, which the attach tracked from the host's "already
-        /// bound" answer, is withdrawn by the daemon itself, so the host frees
-        /// the port at once. A publish the host keeps behind another box's
-        /// row is never asked for: its listener is still the other box's
-        /// forward, so it is left for the host and said in the log.
+        /// NET-121 on a VM-backed host: the activation binds the declared
+        /// forward, and a later attach that finds the listener already bound
+        /// takes it as the box's own. A port that something takes after the
+        /// activation therefore does not fail the attach.
         #[tokio::test]
-        async fn release_declared_ingress_unbinds_on_vm_host() {
-            use super::super::{HandedBind, expose_request, handed_bind, release_declared_ingress};
-            let log = crate::test_harness::captured_log();
+        async fn declared_ingress_bound_at_activation() {
             let dir = tempfile::TempDir::new().unwrap();
             let sock = dir.path().join("gvproxy.sock");
-            // The attach's expose, answered as the VM host answers a listener
-            // it holds for the box, then the stop's unexpose.
             let forwarder = forwarder_answering_in_turn(
                 sock.clone(),
-                vec![(500, "proxy already running\n"), (200, "")],
+                vec![(200, ""), (500, "proxy already running\n")],
             );
             let control = ControlChannel::Unix(sock);
-            let bound = apply_declared(
-                &control,
-                true,
-                PUBLISHED,
-                LEASE,
-                &ingress(&[18080]),
-                None,
-                &[],
-                &|_| minimald_rpc::PortHolder::Host,
-            )
-            .await
-            .expect("the forward bound at activation is the box's own");
-
-            // A hand-over the host keeps behind another box's row.
-            let kept_mapping = mapping(18081);
-            let kept_req = expose_request(&kept_mapping, PUBLISHED, LEASE);
-            let kept = match handed_bind(
-                true,
-                Err(io::Error::other(
-                    "POST /services/forwarder/expose returned HTTP 500: proxy already running",
-                )),
-                super::super::PortForwarder::bound(
-                    super::super::ExposedMapping {
-                        local: kept_req.local,
-                        protocol: kept_req.protocol,
-                    },
-                    80,
+            for round in ["activation", "attach"] {
+                let bound = apply_declared(
+                    &control,
+                    true,
+                    PUBLISHED,
+                    LEASE,
+                    &ingress(&[18080]),
                     None,
-                ),
-            ) {
-                Ok(HandedBind::HeldByHost(kept)) => kept,
-                Ok(HandedBind::Bound(_)) => panic!("the host's answer is a kept publish"),
-                Err(e) => panic!("the host's answer is a kept publish, got: {e}"),
-            };
-
-            let mut all = bound.clone();
-            all.push(kept);
-            release_declared_ingress(&control, &all).await;
+                    &[],
+                    &|_| minimald_rpc::PortHolder::Host,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("the {round} must not fail: {e}"));
+                assert_eq!(bound.len(), 1, "{round}");
+                assert_eq!(bound[0].local(), "127.0.64.9:18080", "{round}");
+            }
             let asked = forwarder.await.expect("the fake forwarder ran");
-            assert_eq!(asked.len(), 2, "one expose and one unexpose: {asked:?}");
-            assert!(
-                // An unexpose body names the listener and no remote.
-                asked[1].contains("\"local\":\"127.0.64.9:18080\"") && !asked[1].contains("remote"),
-                "the stop withdrew the forward bound at activation: {asked:?}"
-            );
-            assert!(
-                !asked
-                    .iter()
-                    .any(|request| request.contains("127.0.64.9:18081")),
-                "a publish kept behind another box's row is never withdrawn: {asked:?}"
-            );
-            let logged = log.contents();
-            assert!(
-                logged.lines().any(|line| line
-                    .contains("left the declared ingress forwarder for the host to unbind")
-                    && line.contains("port=18081")),
-                "the kept publish says it was left to the host, got: {logged}"
-            );
-            assert!(
-                logged
-                    .lines()
-                    .any(|line| line.contains("unbound ingress forwarder")
-                        && line.contains("port=18080")),
-                "the withdrawn forward says it was unbound, got: {logged}"
-            );
+            assert_eq!(asked.len(), 2, "one expose per round: {asked:?}");
         }
 
         /// After the bind at publish, the box's first attach posts the same
