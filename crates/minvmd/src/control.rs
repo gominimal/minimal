@@ -1957,12 +1957,21 @@ fn hold_registration_lease(
             Err(error) => format!("its reply could not be written: {error}"),
             Ok(()) => match read_request_line(&mut stream) {
                 Ok(Some(line)) if line.trim() == minimald_rpc::REGISTRATION_COMMIT_LINE => {
-                    tracing::info!(
-                        box = %withdrawal.name,
-                        switch_address = %withdrawal.switch_address,
-                        "committed the box's registration lease; the row stays until its \
-                         creator withdraws it"
-                    );
+                    match host_ip_withdrawal(&withdrawal) {
+                        Some(id) => tracing::info!(
+                            box = %withdrawal.name,
+                            box_id = %id,
+                            network = "host_ip",
+                            "committed the box's registration lease; the host_ip registration \
+                             name stays until the box retires or its creator withdraws it"
+                        ),
+                        None => tracing::info!(
+                            box = %withdrawal.name,
+                            switch_address = %withdrawal.switch_address,
+                            "committed the box's registration lease; the row stays until its \
+                             creator withdraws it"
+                        ),
+                    }
                     return;
                 }
                 Ok(Some(_)) => "its client sent a line that is not the commit".to_string(),
@@ -1971,12 +1980,22 @@ fn hold_registration_lease(
             },
         },
     };
-    tracing::info!(
-        box = %withdrawal.name,
-        switch_address = %withdrawal.switch_address,
-        cause = %ended,
-        "the box's registration lease ended uncommitted; withdrawing its row"
-    );
+    match host_ip_withdrawal(&withdrawal) {
+        Some(id) => tracing::info!(
+            box = %withdrawal.name,
+            box_id = %id,
+            network = "host_ip",
+            cause = %ended,
+            "the box's registration lease ended uncommitted; withdrawing its host_ip \
+             registration name unless a box is admitted under its id"
+        ),
+        None => tracing::info!(
+            box = %withdrawal.name,
+            switch_address = %withdrawal.switch_address,
+            cause = %ended,
+            "the box's registration lease ended uncommitted; withdrawing its row"
+        ),
+    }
     order.apply(|| withdraw_lease(boxes, answerer, withdrawal));
 }
 
@@ -4666,13 +4685,6 @@ mod tests {
         }
     }
 
-    /// BEP-082: a `host_ip` registration is answered with a box id and no
-    /// address. Each registration is a new creation with its own id, and
-    /// none of them puts a row in the address table. The registrations here
-    /// are one-shot, so the name stays after the connection closes.
-    /// BOX-163 parity: a second registration of a live name is refused with
-    /// the held-name text, and after the box retires the name registers
-    /// again under a fresh id.
     /// Open a held `host_ip` registration of `name`: the lease connection,
     /// kept open, and the id read off its reply.
     fn register_host_ip_holding(sock_path: &Path, name: &str) -> (TestStream, BoxControlReply) {
@@ -4774,6 +4786,13 @@ mod tests {
         );
     }
 
+    /// BEP-082: a `host_ip` registration is answered with a box id and no
+    /// address. Each registration is a new creation with its own id, and
+    /// none of them puts a row in the address table. The registrations here
+    /// are one-shot, so the name stays after the connection closes.
+    /// BOX-163 parity: a second registration of a live name is refused with
+    /// the held-name text, and after the box retires the name registers
+    /// again under a fresh id.
     #[test]
     fn host_ip_box_registration_mints_a_creation_unique_id() {
         let dir = tempfile::TempDir::new().expect("temp dir");
