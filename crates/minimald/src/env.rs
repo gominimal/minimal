@@ -1030,7 +1030,29 @@ impl SessionChannel {
     }
 
     /// Record and transmit a newly-acquired variable to the session shell.
+    ///
+    /// The name is passed through to the shell helper verbatim, where bash
+    /// evaluates a `declare`d name for array subscripts — a crafted one runs
+    /// commands in the user's live shell. Invalid names are refused here
+    /// rather than recorded or sent. A value opening with `(` is refused
+    /// too: the helpers refuse it, so recording it would leave the daemon
+    /// holding a variable the shell never exported.
     fn announce_env(&self, stream: &mut UnixStream, key: &str, value: &str) {
+        if !graph::is_valid_env_var_name(key) {
+            let _ = writeln!(
+                stream,
+                "msg:min: refusing to export environment variable with an invalid name: {}",
+                one_line(key)
+            );
+            return;
+        }
+        if value.starts_with('(') {
+            let _ = writeln!(
+                stream,
+                "msg:min: refusing to export {key}: a value starting with ( would be read as an array"
+            );
+            return;
+        }
         self.runtime_env.record(key, value);
         let _ = writeln!(stream, "set_env:{key}:{value}");
     }
@@ -2731,6 +2753,355 @@ mod tests {
         }
     }
 
+<<<<<<< HEAD
+=======
+    /// A helper request arrives as `traceparent%<tp>%<method>%<data>` when
+    /// the box has a `TRACEPARENT`, and bare otherwise; the prefix is taken
+    /// off before dispatch and the request's span is named for the method.
+    /// Without a subscriber the adopted ids are not observable here; the
+    /// shape of the request is.
+    #[test]
+    fn channel_request_span_strips_the_traceparent_prefix() {
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let expose = format!("traceparent%{tp}%net-expose%8770");
+        let (_, request, _) = super::channel_request_span(&expose, "b", None);
+        assert_eq!(request, "net-expose%8770");
+        let materialize = format!("traceparent%{tp}%materialize%/workbench%--output o o717b");
+        let (_, request, _) = super::channel_request_span(&materialize, "b", None);
+        assert_eq!(request, "materialize%/workbench%--output o o717b");
+        let (_, request, _) = super::channel_request_span("net-expose%8770", "b", None);
+        assert_eq!(request, "net-expose%8770");
+        // A prefix with no request after it is handed on as-is, to be refused
+        // by the dispatcher as unhandled input rather than guessed at.
+        let (_, request, _) = super::channel_request_span("traceparent%garbage", "b", None);
+        assert_eq!(request, "garbage");
+    }
+
+    /// A request from inside a box is served in a span that
+    /// names the box and the session it belongs to, as the host knows them
+    /// (the channel was built for that box by that session), whatever the
+    /// line says: the box-supplied traceparent parents the span and sets
+    /// nothing else.
+    #[test]
+    fn a_box_request_span_carries_the_host_side_box_identity() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let session_id =
+            boxes::SessionId::parse_str("7b3e1f2a-9c4d-4e5f-8a6b-1c2d3e4f5a6b").unwrap();
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = format!("traceparent%{tp}%net-expose%8770");
+        let (span, request, _) = super::channel_request_span(&line, "leaf-7", Some(session_id));
+        assert_eq!(request, "net-expose%8770");
+        drop(span);
+        let served = log.one("session.channel", "method", "net-expose");
+        assert_eq!(served.field("box.id"), Some("leaf-7"), "{served:?}");
+        assert_eq!(
+            served.field("session.id"),
+            Some(session_id.to_string().as_str()),
+            "{served:?}"
+        );
+        assert_eq!(
+            served.field("trace_id"),
+            Some("af79b928d8ae574b659f1fbf40208758"),
+            "the line's traceparent parents the span"
+        );
+
+        // Without a session id the field is simply absent; the box id stays.
+        let (span, _, _) = super::channel_request_span("net-expose%8770", "solo", None);
+        drop(span);
+        let bare = log.find("session.channel", "box.id", "solo");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].field("session.id"), None);
+    }
+
+    /// The span's `method` is one of the methods the channel
+    /// dispatches, or `other`: a line with no `%`, an unknown method, or a
+    /// long one never puts box-chosen text on the host's span.
+    #[test]
+    fn a_box_request_span_names_only_a_dispatched_method() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let long = "x".repeat(64 * 1024);
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        for (line, method) in [
+            ("net-expose%8770".to_string(), "net-expose"),
+            (format!("traceparent%{tp}%materialize%/w%o"), "materialize"),
+            ("add-session%jq".to_string(), "add-session"),
+            ("net-expose".to_string(), "other"),
+            ("no percent sign at all".to_string(), "other"),
+            ("rm-rf%/".to_string(), "other"),
+            (format!("{long}%x"), "other"),
+            (long.clone(), "other"),
+            (format!("traceparent%{tp}%{long}"), "other"),
+        ] {
+            let (span, _, _) = super::channel_request_span(&line, "m", None);
+            drop(span);
+            let served = log.find("session.channel", "box.id", "m");
+            let last = served.last().expect("a session.channel span");
+            assert_eq!(last.field("method"), Some(method), "{:.40}", line);
+        }
+        for method in super::CHANNEL_METHODS {
+            assert_eq!(super::channel_method(&format!("{method}%")), *method);
+        }
+    }
+
+    /// TEL-025: a `min` inside a box (the shipped helper, `__min_rpc`)
+    /// hands the box's inherited `TRACEPARENT` to the daemon as the request
+    /// line's `traceparent%` prefix, and the daemon serves the request in a
+    /// span that adopts it, so the daemon's work for it joins the outer
+    /// trace. The inner `min` is a shell function: it has no exporter and
+    /// exports nothing. The helper runs under bash with a `socat` stand-in
+    /// that records the line it would send; the span is the one the channel
+    /// actor serves that line in. A value that is not the 55-character W3C
+    /// form is not forwarded at all, so a `%` in it cannot shift the split.
+    /// A box handed the opt-out (`MINIMAL_OTEL=off`, TEL-045) sends the
+    /// `otel%off%` prefix instead, and never its `TRACEPARENT`.
+    #[cfg(unix)]
+    #[test]
+    fn a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+        let sent_line = tmp.path().join("line");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!("#!/bin/sh\ncat > '{}'\necho done:\n", sent_line.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let send_with = |traceparent: Option<&str>, otel: Option<&str>| -> String {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("-c")
+                .arg(format!(
+                    ". '{}'; __min_rpc net-expose 8770",
+                    helper.display()
+                ))
+                .env("PATH", &path)
+                .env_remove("TRACEPARENT")
+                .env_remove(minimald_rpc::trace::OTEL_ENV);
+            if let Some(tp) = traceparent {
+                cmd.env("TRACEPARENT", tp);
+            }
+            if let Some(otel) = otel {
+                cmd.env(minimald_rpc::trace::OTEL_ENV, otel);
+            }
+            let out = cmd.output().expect("run bash");
+            assert!(out.status.success(), "{out:?}");
+            std::fs::read_to_string(&sent_line)
+                .unwrap()
+                .trim_end_matches('\n')
+                .to_string()
+        };
+        let send = |traceparent: Option<&str>| send_with(traceparent, None);
+
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = send(Some(tp));
+        assert_eq!(line, format!("traceparent%{tp}%net-expose%8770"));
+
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (span, request, _) = super::channel_request_span(&line, "inner", None);
+        assert_eq!(request, "net-expose%8770");
+        drop(span);
+        let served = log.one("session.channel", "box.id", "inner");
+        assert_eq!(
+            served.field("trace_id"),
+            Some("af79b928d8ae574b659f1fbf40208758"),
+            "the daemon's span joins the outer trace: {served:?}"
+        );
+        assert_eq!(
+            served.field("parent_span_id"),
+            Some("ed105930ec67df47"),
+            "{served:?}"
+        );
+
+        // Not the W3C form: the request goes bare, and the daemon mints.
+        for bad in [
+            "",
+            "garbage",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-0",
+            "00-af79b928d8ae574b659f1fbf40208758%ed105930ec67df4-01",
+            "00-AF79B928D8AE574B659F1FBF40208758-ED105930EC67DF47-01",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01%x",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01 x",
+        ] {
+            assert_eq!(send(Some(bad)), "net-expose%8770", "{bad:?}");
+        }
+        assert_eq!(send(None), "net-expose%8770");
+
+        // TEL-045: a box handed the opt-out sends it, and never its
+        // TRACEPARENT; only `off` opts out, as the daemon reads the marker.
+        let off = minimald_rpc::trace::OTEL_OFF;
+        assert_eq!(send_with(Some(tp), Some(off)), "otel%off%net-expose%8770");
+        assert_eq!(send_with(None, Some(off)), "otel%off%net-expose%8770");
+        assert_eq!(
+            send_with(Some(tp), Some("on")),
+            format!("traceparent%{tp}%net-expose%8770")
+        );
+    }
+
+    /// A `set_env:` line hands the helper a variable name that began as
+    /// package metadata. Bash evaluates the name of a `declare`d variable
+    /// for array subscripts, so a crafted one — `X[$(touch /tmp/pwned)]` —
+    /// runs the command in the user's live shell. The helper must refuse
+    /// such a name without evaluating it, while still exporting the valid
+    /// names around it. Regression guard for the env_state_wiring path.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_with_a_crafted_name_is_refused_not_evaluated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // The payload's marker: the crafted name would `touch` it if bash
+        // evaluated the subscript. It must not exist after the helper runs.
+        let marker = tmp.path().join("pwned");
+
+        // A socat stand-in that answers a request with three `set_env:`
+        // lines — a crafted name, a valid one after it, then `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:X[$(touch {})]:/state/gocache\\n'\nprintf 'set_env:GOCACHE:/state/gocache\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'; __min_rpc status; rc=$?; echo \"GOCACHE=$GOCACHE\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("GOCACHE")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        assert!(!marker.exists(), "the crafted name ran its payload");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("min: refusing to export environment variable with an invalid name"),
+            "the refusal must say so in plain words, got: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GOCACHE=/state/gocache"),
+            "a valid name alongside must still export, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("pwned"),
+            "the crafted name must not join the export summary, got: {stdout}"
+        );
+    }
+
+    /// A valid name can still match a local of `__min_rpc` or of its
+    /// caller, and an assignment by name writes that local, not the shell's
+    /// variable. The helper must write and export the global whatever the
+    /// name. And since `declare` reads a value opening with `(` as an array
+    /// list when the global is an array, such a value is refused, not run.
+    /// The protocol reader's own `line` is one such local: were it the
+    /// global, the next read would overwrite a `set_env:line:` assignment.
+    /// The mctx helper has the same test.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_env_line_writes_the_global_even_when_a_local_shares_its_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+
+        // Created only if the parenthesised value were expanded.
+        let marker = tmp.path().join("ran");
+
+        // A socat stand-in that answers with a name the helper also uses
+        // for a local, a parenthesised value for an array global, then
+        // `done:`.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\nprintf 'set_env:varname:/state/varname\\n'\nprintf 'set_env:LIST:($(touch {}))\\n'\nprintf 'set_env:line:/state/line\\n'\nprintf 'done:\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "LIST=(one); . '{}'; __min_rpc status; rc=$?; \
+                 echo \"global=$varname exported=$(printenv varname) list=$LIST line=$line exported_line=$(printenv line)\"; exit $rc",
+                helper.display()
+            ))
+            .env("PATH", &path)
+            .env_remove("varname")
+            .env_remove("line")
+            .output();
+        let Ok(out) = out else {
+            eprintln!("no bash to run the min helper with — skipping");
+            return;
+        };
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("global=/state/varname exported=/state/varname"),
+            "a name shared with a local must still set and export the global, got: {stdout}"
+        );
+        assert!(!marker.exists(), "a parenthesised value was expanded");
+        assert!(
+            stdout.contains("list=one"),
+            "a refused value must leave the global as it was, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("line=/state/line exported_line=/state/line"),
+            "the reader's own `line` must not take or overwrite the shell's, got: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("would be read as an array"),
+            "the refusal must say so, got: {stderr}"
+        );
+    }
+
+>>>>>>> e7844f8 (fix(graph,minimald,mctx): validate env_state_wiring names before they reach a shell (#3405))
     /// Every session rootfs carries the per-attach environment hook for every
     /// shell we support, at that shell's own vendor/system integration point
     /// — installed by the daemon, so no loadout or project author has to know
@@ -3920,6 +4291,77 @@ exit $rc
                 .get("PYTHONPATH")
                 .map(String::as_str),
             Some("/second")
+        );
+    }
+
+    /// A variable name from package metadata is handed to the shell helper
+    /// verbatim, where bash evaluates a `declare`d name for array subscripts —
+    /// `X[$(touch /tmp/pwned)]` would run the command. An invalid name is
+    /// refused: not recorded, not sent as a `set_env:` line, only explained.
+    #[tokio::test]
+    async fn a_var_with_an_invalid_name_is_refused() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "X[$(touch /tmp/pwned)]", "/state/gocache");
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(
+            lines,
+            vec![
+                "msg:min: refusing to export environment variable with an invalid name: X[$(touch /tmp/pwned)]"
+            ],
+            "an invalid name must be explained and nothing else sent"
+        );
+        assert!(
+            chan.runtime_env.snapshot().is_empty(),
+            "an invalid name must not reach the daemon's environment"
+        );
+    }
+
+    /// The refusal echoes the name, so a name carrying a newline would add a
+    /// protocol line of its own, such as a `set_env:` the helper acts on.
+    /// The echo escapes control characters and stays one `msg:` line.
+    #[tokio::test]
+    async fn a_refused_name_is_echoed_on_one_line() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "A\nset_env:B", "/state/gocache");
+        drop(ours);
+
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "msg:min: refusing to export environment variable with an invalid name: A\\nset_env:B"
+            ],
+            "a refused name must not start a line of its own"
+        );
+        assert!(chan.runtime_env.snapshot().is_empty());
+    }
+
+    /// The helpers refuse a value opening with `(`, so the daemon must
+    /// refuse it too: a recorded value the shell never exported would reach
+    /// later injections and disagree with the session's own shell.
+    #[tokio::test]
+    async fn a_value_the_helpers_refuse_is_not_recorded() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "LIST", "(one two)");
+        drop(ours);
+
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "msg:min: refusing to export LIST: a value starting with ( would be read as an array"
+            ],
+            "a refused value must be explained and nothing else sent"
+        );
+        assert!(
+            chan.runtime_env.snapshot().is_empty(),
+            "a value the shell refuses must not reach the daemon's environment"
         );
     }
 
