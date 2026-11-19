@@ -1552,9 +1552,11 @@ where
     }
     // BCLI-068: a box that runs again after the host ended the attach, and
     // whose count of ends rose, was restarted, not taken by another terminal.
-    // Only a 254 reads the count, since only a 254 can name a restart.
+    // A box that reads stopped was restarted when its new end names the
+    // restart: the read fell between the restart's stop and its start.
+    // Only a 254 reads the ends, since only a 254 can name a restart.
     let ends_after = if code == DAEMON_ENDED_ATTACH {
-        box_end_count(&target).await
+        box_ends_settled(&target, &after, ends_before).await
     } else {
         None
     };
@@ -1625,6 +1627,89 @@ async fn box_end_count(target: &BoxAttachTarget) -> Option<u64> {
         .map(|ends| ends.count)
 }
 
+/// The ends on the record of a box after its attach ended, as its `exited`
+/// events give them (BCLI-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EndsAfter {
+    /// How many times the box ended: the count of its `exited` events.
+    pub(crate) count: u64,
+    /// Whether the last `exited` event is the stop half of a restart.
+    pub(crate) last_by_restart: bool,
+}
+
+/// The key of an `exited` event's `data` that names the stop half of a
+/// restart, and its value. The daemon writes them (`minimald`'s
+/// `STOPPED_BY` and `STOPPED_BY_RESTART`).
+const STOPPED_BY: &str = "stopped_by";
+const STOPPED_BY_RESTART: &str = "restart";
+
+/// The ends that the kept `events` of a box give.
+pub(crate) fn ends_of(events: &[boxes::events::BoxEvent]) -> EndsAfter {
+    let mut ends = EndsAfter {
+        count: 0,
+        last_by_restart: false,
+    };
+    for event in events {
+        if event.kind == boxes::events::BoxEventType::Exited {
+            ends.count += 1;
+            ends.last_by_restart =
+                event.data.get(STOPPED_BY).and_then(|v| v.as_str()) == Some(STOPPED_BY_RESTART);
+        }
+    }
+    ends
+}
+
+/// The ends of the box `target`, `None` when its host does not give every
+/// event.
+async fn box_ends_after(target: &BoxAttachTarget) -> Option<EndsAfter> {
+    let mut client = box_host_client(&target.host)
+        .await
+        .inspect_err(|e| tracing::warn!(box_id = %target.box_id, "box ends: could not reach the box's host: {e:#}"))
+        .ok()?;
+    read_kept_events(&mut client, target.box_id, &target.label)
+        .await
+        .ok()
+        .map(|events| ends_of(&events))
+}
+
+/// How long the read of a box's ends waits for the `exited` event of a box
+/// that reads `stopped`. A stop writes the stopped record first, and its
+/// `exited` event straight after it.
+const END_EVENT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The ends of the box `target` after its attach ended, where the settled
+/// read gave `after`. A box that ran before the attach and reads `stopped`
+/// now has a new end. Its `exited` event can land just after the record, so
+/// the read waits up to [`END_EVENT_SETTLE`] for the count to rise.
+async fn box_ends_settled(
+    target: &BoxAttachTarget,
+    after: &BoxAfterAttach,
+    before: EndsBefore,
+) -> Option<EndsAfter> {
+    let stopped = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "stopped");
+    let EndsBefore::Running(Some(count_before)) = before else {
+        return box_ends_after(target).await;
+    };
+    if !stopped {
+        return box_ends_after(target).await;
+    }
+    let deadline = tokio::time::Instant::now() + END_EVENT_SETTLE;
+    loop {
+        let ends = box_ends_after(target).await;
+        let rose = ends.is_some_and(|ends| ends.count > count_before);
+        if rose || tokio::time::Instant::now() >= deadline {
+            tracing::debug!(
+                box_id = %target.box_id,
+                ends_before = count_before,
+                ends_after = ?ends,
+                "read the ends of the stopped box"
+            );
+            return ends;
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
 /// Whether a box that runs after its attach ended was restarted while the
 /// attach ran (BCLI-068).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1653,31 +1738,54 @@ pub(crate) fn ends_show_restart(before: EndsBefore, after: Option<u64>) -> BoxRe
     }
 }
 
-/// Whether the attach that ended with ssh's `code` was ended by a restart
-/// of its box. Only a 254 against a box that the settled read `after`
-/// lists as running can be a restart. Then the count of ends decides, from
-/// `before` the attach to `ends_after` it, as [`ends_show_restart`] says
+/// Whether a box that the attach knew as `before`, and that reads
+/// `stopped` now, was stopped by a restart that has not started it yet: its
+/// count of ends rose to `after`, and its last end names the restart. Any
+/// other read is a stop, since the record says the box was stopped
 /// (BCLI-068).
+pub(crate) fn stop_shows_restart(before: EndsBefore, after: Option<EndsAfter>) -> BoxRestart {
+    match (before, after) {
+        (EndsBefore::Running(Some(before)), Some(after))
+            if after.count > before && after.last_by_restart =>
+        {
+            BoxRestart::Restarted
+        }
+        _ => BoxRestart::NotRestarted,
+    }
+}
+
+/// Whether the attach that ended with ssh's `code` was ended by a restart
+/// of its box. Only a 254 can be a restart. Against a box that the settled
+/// read `after` lists as running, the count of ends decides, from `before`
+/// the attach to `ends_after` it, as [`ends_show_restart`] says. Against a
+/// box that it lists as stopped, the last end decides, as
+/// [`stop_shows_restart`] says (BCLI-068).
 pub(crate) fn attach_restart(
     code: i32,
     after: &BoxAfterAttach,
     before: EndsBefore,
-    ends_after: Option<u64>,
+    ends_after: Option<EndsAfter>,
 ) -> BoxRestart {
-    let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
-    if code == DAEMON_ENDED_ATTACH && running {
-        ends_show_restart(before, ends_after)
-    } else {
-        BoxRestart::NotRestarted
+    if code != DAEMON_ENDED_ATTACH {
+        return BoxRestart::NotRestarted;
+    }
+    match after {
+        BoxAfterAttach::Listed(entry) if entry.state == "running" => {
+            ends_show_restart(before, ends_after.map(|ends| ends.count))
+        }
+        BoxAfterAttach::Listed(entry) if entry.state == "stopped" => {
+            stop_shows_restart(before, ends_after)
+        }
+        _ => BoxRestart::NotRestarted,
     }
 }
 
 /// How an attach that ended with ssh's `code` ends the command, as
-/// [`attach_ending`] says, except for a 254 against a box that runs again.
-/// A box that was `restarted` ends with 254 and a line that names the
-/// restart, not another terminal. A box whose count of ends was not read
-/// ends with 254 and the line for a host that ended the attach, since
-/// nothing says why (BCLI-068).
+/// [`attach_ending`] says, except for a 254 against a box that runs again
+/// or reads `stopped`. A box that was `restarted` ends with 254 and a line
+/// that names the restart, not another terminal or a stop. A running box
+/// whose count of ends was not read ends with 254 and the line for a host
+/// that ended the attach, since nothing says why (BCLI-068).
 pub(crate) fn box_attach_ending(
     target: &BoxAttachTarget,
     code: i32,
@@ -1685,7 +1793,8 @@ pub(crate) fn box_attach_ending(
     restarted: BoxRestart,
 ) -> Result<AttachEnding, BoxAttachRefusal> {
     let running = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "running");
-    if code != DAEMON_ENDED_ATTACH || !running {
+    let stopped = matches!(after, BoxAfterAttach::Listed(entry) if entry.state == "stopped");
+    if code != DAEMON_ENDED_ATTACH || !(running || stopped) {
         return attach_ending(target, code, after);
     }
     match restarted {
@@ -1699,6 +1808,8 @@ pub(crate) fn box_attach_ending(
             })
         }
         BoxRestart::NotRestarted => attach_ending(target, code, after),
+        // The stopped record still proves a stop.
+        BoxRestart::Unread if stopped => attach_ending(target, code, after),
         BoxRestart::Unread => attach_ending(target, code, &BoxAfterAttach::Unread),
     }
 }
