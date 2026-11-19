@@ -751,7 +751,11 @@ struct DocNetwork {
     )]
     #[expect(dead_code, reason = "present only to refuse the key on a read")]
     egress_deny_subnets: Option<()>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_names"
+    )]
     vpn_network_names: Vec<String>,
     #[serde(flatten)]
     policy: boxes::BoxPolicy,
@@ -760,6 +764,28 @@ struct DocNetwork {
 }
 
 kept_fields!(DocNetwork, "network", [dynamic_ingress, bep,]);
+
+/// Reads a stored spec's `network.vpn_network_names` leniently: the string
+/// items of a list, in order. A hand-edited stored spec can hold another
+/// shape. That value reads as no names, and the box still resumes from its
+/// stored spec.
+fn lenient_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <toml::Value as serde::Deserialize>::deserialize(deserializer)?;
+    let names = match value {
+        toml::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                toml::Value::String(name) => Some(name),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(names)
+}
 
 /// Refuses the flat `[network]` egress key `flat` in a stored spec, and
 /// names the nested `egress.*` key that a stored spec carries in its place.
@@ -2230,6 +2256,19 @@ mod tests {
             stored["network"].get("vpn_network_names").is_none(),
             "{stored:?}"
         );
+
+        // A hand-edited stored spec with another shape still reads: the
+        // string items of a list are kept, and any other value is no names.
+        let mut odd = toml::Table::try_from(&spec).unwrap();
+        odd["network"].as_table_mut().unwrap().insert(
+            "vpn_network_names".to_owned(),
+            vec![toml::Value::from("corp"), toml::Value::from(7)].into(),
+        );
+        let read: BoxSpec = odd.clone().try_into().unwrap();
+        assert_eq!(read.network.vpn_network_names, ["corp"]);
+        odd["network"]["vpn_network_names"] = "corp".into();
+        let read: BoxSpec = odd.try_into().unwrap();
+        assert!(read.network.vpn_network_names.is_empty());
 
         let task_file: crate::File = toml::from_str(
             r#"
