@@ -1024,16 +1024,22 @@ fn watch_in_box_dial(
     tokio::task::JoinHandle<()>,
 ) {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    // The reader keeps its prefix here rather than returning it, so the
+    // watcher still has it when a process the dial left behind holds the
+    // pipe open past the wait.
+    let kept = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let stderr = child.stderr.take().map(|mut stderr| {
+        let kept = std::sync::Arc::clone(&kept);
         crate::traced::spawn(async move {
             use tokio::io::AsyncReadExt as _;
-            let mut kept = Vec::new();
             let mut buf = [0u8; 1024];
             while let Ok(read @ 1..) = stderr.read(&mut buf).await {
+                let mut kept = kept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let room = IN_BOX_DIAL_STDERR_KEPT.saturating_sub(kept.len());
                 kept.extend_from_slice(&buf[..read.min(room)]);
             }
-            kept
         })
     });
     let watcher = crate::traced::spawn(async move {
@@ -1047,20 +1053,20 @@ fn watch_in_box_dial(
                 child.wait().await
             }
         };
-        let stderr = match stderr {
-            Some(reader) => {
-                let abort = reader.abort_handle();
-                match tokio::time::timeout(IN_BOX_DIAL_STDERR_WAIT, reader).await {
-                    Ok(Ok(kept)) => kept,
-                    Ok(Err(_)) => Vec::new(),
-                    Err(_) => {
-                        abort.abort();
-                        Vec::new()
-                    }
-                }
+        if let Some(reader) = stderr {
+            let abort = reader.abort_handle();
+            if tokio::time::timeout(IN_BOX_DIAL_STDERR_WAIT, reader)
+                .await
+                .is_err()
+            {
+                abort.abort();
             }
-            None => Vec::new(),
-        };
+        }
+        let stderr = std::mem::take(
+            &mut *kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let stderr = String::from_utf8_lossy(&stderr);
         log_in_box_dial_end(&host, port, status, stderr.trim_end());
     });
@@ -1219,6 +1225,35 @@ mod tests {
                 "one warning names the cause, the exit code and the stderr: {logged}"
             );
         }
+    }
+
+    /// A dial that leaves a process behind holding its stderr open is
+    /// still logged with what it wrote, once the wait for the pipe ends.
+    #[tokio::test]
+    async fn a_dial_whose_stderr_stays_open_is_logged_with_its_stderr() {
+        let log = crate::test_harness::captured_log();
+        let code = minimald_rpc::exec::INJECTION_UNPLACED_EXIT;
+        let port = 40_504;
+        let line = format!("stand-in dial stderr for port {port}");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", &format!("echo '{line}' >&2; sleep 5 & exit {code}")]);
+        let child = super::spawn_in_box_dial(command).expect("spawning a stand-in dial");
+        let (_stop, watcher) = super::watch_in_box_dial(child, "127.0.0.1".to_string(), port);
+        tokio::time::timeout(std::time::Duration::from_secs(3), watcher)
+            .await
+            .expect("the watcher ends within the stderr wait")
+            .expect("the watcher reaps the dial");
+        let logged = log.contents();
+        assert!(
+            warned(
+                &logged,
+                port,
+                "could not join the box's classifier leaf",
+                code,
+                &line
+            ),
+            "the warning keeps the stderr the dial wrote: {logged}"
+        );
     }
 
     /// The forward's box-side half hands its dial to the watcher, so a dial
