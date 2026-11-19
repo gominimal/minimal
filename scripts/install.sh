@@ -366,6 +366,30 @@ resolve_prefix() {
     esac
 }
 
+# The data/state/cache directory the runtime itself writes, which --purge
+# removes alongside the resolve_prefix one. Mirrors crates/paths
+# (minimal_data_dir, minimal_state_dir, minimal_cache_dir): an XDG variable
+# counts only when it is an absolute path, as the XDG spec says and the runtime
+# does, and the macOS cache is ~/Library/Caches/minimal whatever XDG_CACHE_HOME
+# says, because the runtime takes it from the platform cache directory.
+runtime_dir() {
+    case "$1" in
+        data)  _rd_xdg="${XDG_DATA_HOME:-}";  _rd_home="$HOME/.local/share" ;;
+        state) _rd_xdg="${XDG_STATE_HOME:-}"; _rd_home="$HOME/.local/state" ;;
+        cache)
+            if [ "$os" = darwin ]; then
+                printf '%s\n' "$HOME/Library/Caches/minimal"
+                return 0
+            fi
+            _rd_xdg="${XDG_CACHE_HOME:-}"; _rd_home="$HOME/.cache" ;;
+        *)     die "unknown runtime dir token: $1" ;;
+    esac
+    case "$_rd_xdg" in
+        /*) printf '%s\n' "$_rd_xdg/minimal" ;;
+        *)  printf '%s\n' "$_rd_home/minimal" ;;
+    esac
+}
+
 # The bin prefix, resolved once. Needed early: the pre-upgrade daemon stop
 # runs the `min` already installed there, before the component loop
 # replaces it.
@@ -827,16 +851,28 @@ do_uninstall() {
 
     # --purge additionally deletes the minimal-owned trees wholesale (build
     # cache included); they live at fixed .../minimal paths the tool owns. It
-    # never removes files outside those roots.
+    # never removes files outside those roots. Each tree is purged both where
+    # the installer resolves it and where the runtime writes it (runtime_dir):
+    # on macOS the runtime's cache is ~/Library/Caches/minimal, not the
+    # installer's XDG path. Only an absolute .../minimal path is purged, so a
+    # relative XDG value never resolves against the current directory.
     if [ "$uninstall_purge" -eq 1 ]; then
         for p in data state cache; do
-            d="$(resolve_prefix "$p")"
-            [ -d "$d" ] || continue
-            if [ "$dry_run" -eq 1 ]; then
-                say "  would purge $d"
-            else
-                rm -rf "$d"
-            fi
+            _pg_inst="$(resolve_prefix "$p")"
+            _pg_run="$(runtime_dir "$p")"
+            [ "$_pg_run" != "$_pg_inst" ] || _pg_run=
+            for d in "$_pg_inst" "$_pg_run"; do
+                case "$d" in
+                    /*/minimal) ;;
+                    *) continue ;;
+                esac
+                [ -d "$d" ] || continue
+                if [ "$dry_run" -eq 1 ]; then
+                    say "  would purge $d"
+                else
+                    rm -rf "$d"
+                fi
+            done
         done
     fi
 
