@@ -15787,19 +15787,32 @@ async fn stop_forces_the_recorded_task_containers() {
     // cannot end before it.
     let setter = std::sync::Arc::clone(&forced);
     let (set, set_at) = tokio::sync::oneshot::channel();
+    // A task that never notes its SIGTERM fails the test: the setter gives
+    // up, and the dropped sender fails the wait for the force.
     let _setter = crate::traced::spawn(async move {
-        while !termed.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        let termed = tokio::time::timeout(Duration::from_secs(10), async {
+            while !termed.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if termed.is_ok() {
+            let at = std::time::Instant::now();
+            setter.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = set.send(at);
         }
-        let at = std::time::Instant::now();
-        setter.store(true, std::sync::atomic::Ordering::SeqCst);
-        set.send(at).expect("the test waits for the force");
     });
-    let _stop =
-        super::stop_task_containers(box_id, &entrypoint, false, Duration::from_secs(60), &forced)
-            .await;
+    let _stop = tokio::time::timeout(
+        Duration::from_secs(20),
+        super::stop_task_containers(box_id, &entrypoint, false, Duration::from_secs(60), &forced),
+    )
+    .await
+    .expect("the forced stop ended the graceful stop");
     let ended = std::time::Instant::now();
-    let set_at = set_at.await.expect("the force was set");
+    let set_at = tokio::time::timeout(Duration::from_secs(10), set_at)
+        .await
+        .expect("the force was set in time")
+        .expect("the task noted its SIGTERM, and the force was set");
     assert!(
         ended >= set_at && ended - set_at < Duration::from_secs(5),
         "the graceful stop of the task containers ends when the forced stop arrives, not \
@@ -16149,6 +16162,38 @@ async fn a_stopping_box_records_no_new_task_container() {
     // The await reaps the stand-in.
     drop(relay_cleanup);
     entrypoint.await.unwrap().unwrap();
+}
+
+/// BOX-013: a process of a task container's tree that ends while the walk
+/// reads its children is left out, with the children read from it: once it
+/// ended, its pid can be another process's, and so can what it listed.
+#[test]
+fn a_task_container_process_that_ends_mid_walk_leaves_its_children_out() {
+    let mut root = Some(spawn_stand_in_box("trap '' TERM"));
+    let root_pid = root.as_ref().unwrap().id();
+    let walked = crate::box_runtime::tree_pids_reading(root_pid, |pid| {
+        assert_eq!(pid, i32::try_from(root_pid).unwrap());
+        let mut ended = root.take().expect("the root is read once");
+        ended.kill().unwrap();
+        ended.wait().unwrap();
+        vec![4_000_007]
+    });
+    assert!(
+        walked.is_empty(),
+        "the ended process and what it listed are left out: {walked:?}"
+    );
+
+    // A process that still runs after its children were read is kept.
+    let live = spawn_stand_in_box("trap '' TERM");
+    let _cleanup = KillOnDrop::pin(&live);
+    let live_pid = i32::try_from(live.id()).unwrap();
+    assert_eq!(
+        crate::box_runtime::tree_pids_reading(live.id(), |_| Vec::new()),
+        vec![live_pid]
+    );
+    let mut live = live;
+    live.kill().unwrap();
+    live.wait().unwrap();
 }
 
 /// BOX-013: a task run under way when a stop of its box starts records no

@@ -1080,18 +1080,7 @@ impl BoxProcesses {
                 })
                 .filter(|pid| is_live(*pid))
                 .collect(),
-            ProcessScope::Tree => {
-                let mut tree = Vec::new();
-                let mut next = vec![i32::try_from(self.root).unwrap_or(i32::MAX)];
-                while let Some(pid) = next.pop() {
-                    if tree.contains(&pid) || !is_live(pid) {
-                        continue;
-                    }
-                    tree.push(pid);
-                    next.extend(children_of(pid));
-                }
-                tree
-            }
+            ProcessScope::Tree => tree_pids_reading(self.root, children_of),
         }
     }
 
@@ -1108,6 +1097,42 @@ impl BoxProcesses {
             })
             .count()
     }
+}
+
+/// The live processes of the tree under `root`, a child of this daemon,
+/// with `children` reading the children of a process.
+///
+/// A process found in the walk can end, and its pid go to another process,
+/// before its children are read. So each process is pinned with a pidfd,
+/// checked to still be a child of the process the walk found it under, and
+/// checked through the pidfd to still run after its children were read.
+/// A process that fails a check is left out, and so are the children read
+/// from it.
+pub(crate) fn tree_pids_reading(root: u32, mut children: impl FnMut(i32) -> Vec<i32>) -> Vec<i32> {
+    let mut tree = Vec::new();
+    let mut next = vec![(i32::try_from(root).unwrap_or(i32::MAX), std::process::id())];
+    while let Some((pid, parent)) = next.pop() {
+        if tree.contains(&pid) {
+            continue;
+        }
+        let Ok(pinned) = u32::try_from(pid)
+            .map_err(|_| ())
+            .and_then(|pid| pidfd_open(pid).map_err(|_| ()))
+        else {
+            continue;
+        };
+        if u32::try_from(pid).ok().and_then(parent_of) != Some(parent) || !is_live(pid) {
+            continue;
+        }
+        let found = children(pid);
+        if !pidfd_send_signal(&pinned, 0) || !is_live(pid) {
+            continue;
+        }
+        tree.push(pid);
+        let pid_parent = u32::try_from(pid).unwrap_or(u32::MAX);
+        next.extend(found.into_iter().map(|child| (child, pid_parent)));
+    }
+    tree
 }
 
 /// The `(device, inode)` that names the namespace `link` points at.
