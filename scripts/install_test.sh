@@ -1533,6 +1533,32 @@ case_target_validation() {
     want_ok "--version is told the install is counted (R6.1b)" grep -q "no release notices for --version" "$OUT"
     want_ok "--version is told what is sent and the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
     want_ok "--version is told the channel it sends (R6.1b)" grep -q "(pinned), version, OS, architecture, install method" "$OUT"
+    # `v1` is not a release the card can place, so it gives the range.
+    want_ok "--version with a name the card cannot place gives the range (R6.1b)" \
+        grep -q "min 0.7.4 and later report this install once a day" "$OUT"
+    # A release the card can place is told which of the two it is. The mock
+    # serves the same bytes under two more version names.
+    ln -s v1 "$mock/versions/0.7.3"
+    ln -s v1 "$mock/versions/0.7.4"
+    HVO="$root/hvold"; mkdir -p "$HVO"
+    run versionold "$HVO" --version 0.7.3
+    check 0 "$rc" "--version 0.7.3 installs (R6.1b)"
+    want_ok "a release before 0.7.4 is told it sends nothing (R6.1b)" \
+        grep -q "min 0.7.3 does not check for updates and sends nothing" "$OUT"
+    want_ok "a release before 0.7.4 is told from when installs report (R6.1b)" \
+        grep -q "Releases from 0.7.4 on report an" "$OUT"
+    if grep -q "MINIMAL_TELEMETRY=0" "$OUT"; then
+        bad "a release before 0.7.4 is not told of a switch for a request it never makes (R6.1b)"
+    else
+        ok "a release before 0.7.4 is not told of a switch for a request it never makes (R6.1b)"
+    fi
+    HVN="$root/hvnew"; mkdir -p "$HVN"
+    run versionnew "$HVN" --version 0.7.4
+    check 0 "$rc" "--version 0.7.4 installs (R6.1b)"
+    want_ok "0.7.4 is told it reports, with no range (R6.1b)" \
+        grep -q "min reports this install once a day (no release notices for --version)" "$OUT"
+    want_ok "0.7.4 is told the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
+    rm "$mock/versions/0.7.3" "$mock/versions/0.7.4"
     HV2="$root/hv2"; mkdir -p "$HV2"
     run versioneq "$HV2" --force-stop --version=v1
     check 0 "$rc" "--version=VER with another flag installs (R2.5)"
