@@ -195,11 +195,6 @@ pub struct ExpansionReport {
     /// The layer that set each variable of `vars` and `vars_lenient`, by
     /// variable name (BOX-180).
     pub vars: BTreeMap<String, Origin>,
-    /// The layer that set each key of the `network` table, by the key's
-    /// name below `network`: `mode`, `egress`, `bep`. The `network` table
-    /// merges by these keys, so each one can come from its own layer.
-    /// `values["network"]` names the last layer that set any of them.
-    pub network: BTreeMap<String, Origin>,
     /// Whether the expanded entry is the implicit default session entry,
     /// which the file does not declare (BOX-165).
     pub implicit: bool,
@@ -417,6 +412,7 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     }
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
     check_project_declarers(entry, &ordered)?;
+    refuse_dropped_network_keys(entry, layers)?;
     let mut expansion = fold(&ordered);
     merge_vars(entry, &ordered, &layers.host_vars, &mut expansion)?;
     // BOX-071: the store references carry the client's authorities, so
@@ -561,6 +557,56 @@ fn refuse_store_authorities(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// Refuses a `network` table in `[defaults.<type>]` or the entry that
+/// drops `network` keys an earlier layer sets (BOX-048). The merge
+/// replaces `network` whole, so those keys would vanish without a word.
+/// The layers, in order, are `[defaults]`, `[defaults.<type>]` and the
+/// entry. Exits 3.
+fn refuse_dropped_network_keys(entry: &BoxEntry, layers: &Layers) -> Result<(), Error> {
+    let defaults_type = format!(
+        "[defaults.{}]",
+        entry.box_type.as_deref().unwrap_or_default()
+    );
+    let entry_header = EntryHeader(entry.table.key(), &entry.name).to_string();
+    let ordered = [
+        ("[defaults]".to_owned(), &layers.defaults),
+        (defaults_type, &layers.defaults_type),
+        (entry_header, &entry.body),
+    ];
+    let mut earlier: Option<(&str, &toml::Table)> = None;
+    for (header, layer) in &ordered {
+        let Some(network) = layer.get("network").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        if let Some((earlier_header, earlier_network)) = earlier {
+            let dropped: Vec<String> = earlier_network
+                .keys()
+                .filter(|k| !network.contains_key(k.as_str()))
+                .cloned()
+                .collect();
+            if !dropped.is_empty() {
+                let later_keys: Vec<String> = network.keys().cloned().collect();
+                // One sub-table moves to its own header. Anything else moves
+                // into the earlier `network` table.
+                let inner = earlier_header.trim_end_matches(']');
+                let move_to = match later_keys.as_slice() {
+                    [key] if network[key].is_table() => format!("{inner}.network.{key}]"),
+                    _ => format!("{inner}.network]"),
+                };
+                return Err(Error::NetworkTableDropsKeys {
+                    later: header.clone(),
+                    earlier: earlier_header.to_owned(),
+                    dropped,
+                    later_keys,
+                    move_to,
+                });
+            }
+        }
+        earlier = Some((header.as_str(), network));
     }
     Ok(())
 }
@@ -1258,14 +1304,9 @@ fn merge_vars(
 /// the command, so a layer replaces such a list whole and keeps every item.
 const ARGV_KEYS: &[&str] = &["cmdcmd", "exec"];
 
-/// The key of the spec's network settings, which merges by sub-table.
-const NETWORK_KEY: &str = "network";
-
 /// Merges one key of a layer into the spec: a list onto a list unions,
 /// each item once, and any other value replaces the spec's. An argument
-/// vector (`ARGV_KEYS`) always replaces, item for item. A `network` table
-/// merges onto a `network` table by its keys (`mode`, `egress`, `bep`), so
-/// a later layer replaces only the sub-tables and keys it sets.
+/// vector (`ARGV_KEYS`) always replaces, item for item.
 fn merge_value(
     spec: &mut toml::Table,
     report: &mut ExpansionReport,
@@ -1273,10 +1314,6 @@ fn merge_value(
     value: &toml::Value,
     origin: &Origin,
 ) {
-    if key == NETWORK_KEY {
-        merge_network(spec, report, value, origin);
-        return;
-    }
     if ARGV_KEYS.contains(&key) {
         let value_origin = match value {
             toml::Value::Array(items) => ValueOrigin::List(vec![origin.clone(); items.len()]),
@@ -1314,49 +1351,6 @@ fn merge_value(
     };
     spec.insert(key.to_owned(), value);
     report.values.insert(key.to_owned(), value_origin);
-}
-
-/// Merges a layer's `network` value into the spec. A table onto a table
-/// merges by key: each key the layer sets below `network`, such as `mode`,
-/// `egress` or `bep`, replaces the spec's key whole, and the keys the layer
-/// does not set stay. Any other value replaces the whole `network` value.
-/// The flat `egress_*` keys and `egress` spell one setting, so a layer that
-/// sets any of them replaces all of them. The report keeps the layer of
-/// each key below `network`.
-fn merge_network(
-    spec: &mut toml::Table,
-    report: &mut ExpansionReport,
-    value: &toml::Value,
-    origin: &Origin,
-) {
-    report
-        .values
-        .insert(NETWORK_KEY.to_owned(), ValueOrigin::Value(origin.clone()));
-    let (Some(toml::Value::Table(have)), toml::Value::Table(add)) =
-        (spec.get_mut(NETWORK_KEY), value)
-    else {
-        spec.insert(NETWORK_KEY.to_owned(), value.clone());
-        report.network.clear();
-        if let toml::Value::Table(add) = value {
-            for sub in add.keys() {
-                report.network.insert(sub.clone(), origin.clone());
-            }
-        }
-        return;
-    };
-    let egress_keys = || {
-        std::iter::once("egress").chain(crate::network::FLAT_EGRESS_KEYS.iter().map(|(f, _)| *f))
-    };
-    if egress_keys().any(|key| add.contains_key(key)) {
-        for key in egress_keys() {
-            have.remove(key);
-            report.network.remove(key);
-        }
-    }
-    for (sub, item) in add {
-        have.insert(sub.clone(), item.clone());
-        report.network.insert(sub.clone(), origin.clone());
-    }
 }
 
 /// A copy of `table` with every table, at every depth, in key order.
@@ -1688,6 +1682,105 @@ mod tests {
             .collect()
     }
 
+    // BOX-048, #3597: `network` merges by replacing the whole table, so a
+    // later layer whose `network` table leaves out a key that an earlier
+    // layer sets is refused at load, never dropped without a word. The test
+    // name keeps the plan's filter; the merge itself stays whole-table.
+    #[test]
+    fn network_merges_by_sub_table_refuses_a_dropped_key() {
+        // (a) The issue's reproduce case.
+        let file = r#"
+            [defaults.network.egress]
+            allow_dns_hosts = ["a.example"]
+
+            [defaults.session.network.bep]
+            steering = "proxy_env"
+
+            [sessions.dev]
+            packages = ["git"]
+        "#;
+        let err = expand_in(file, "dev", Layers::default()).expect_err("egress is dropped");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(
+            err.to_string(),
+            "the network table in [defaults.session] replaces the network table in \
+             [defaults], so egress from [defaults] is dropped. Set egress in \
+             [defaults.session] too, or move bep to [defaults.network.bep]."
+        );
+
+        // (b) An entry's inline table drops the defaults' egress too.
+        let file = r#"
+            [defaults.network.egress]
+            allow_dns_hosts = ["a.example"]
+
+            [tasks.offline]
+            exec = ["true"]
+            network = { mode = "none" }
+        "#;
+        let err = expand_in(file, "offline", Layers::default()).expect_err("egress is dropped");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(
+            err.to_string(),
+            "the network table in [tasks.offline] replaces the network table in \
+             [defaults], so egress from [defaults] is dropped. Set egress in \
+             [tasks.offline] too, or move mode to [defaults.network]."
+        );
+
+        // Several dropped keys are each named.
+        let file = r#"
+            [defaults.network]
+            mode = "own_ip"
+            quic443 = "block"
+
+            [sessions.dev.network.bep]
+            steering = "dns"
+        "#;
+        let err = expand_in(file, "dev", Layers::default()).expect_err("two keys drop");
+        assert_eq!(
+            err.to_string(),
+            "the network table in [sessions.dev] replaces the network table in \
+             [defaults], so mode, quic443 from [defaults] are dropped. Set mode, \
+             quic443 in [sessions.dev] too, or move bep to [defaults.network.bep]."
+        );
+    }
+
+    // BOX-048, #3597: a file where one layer alone sets `network`, or where
+    // the later table sets every key of the earlier one, loads unchanged.
+    #[test]
+    fn network_merges_by_sub_table_loads_when_nothing_drops() {
+        let one_layer = r#"
+            [defaults.network.egress]
+            allow_dns_hosts = ["a.example"]
+
+            [sessions.dev]
+            packages = ["git"]
+        "#;
+        let dev = expand_in(one_layer, "dev", Layers::default()).expect("dev expands");
+        assert_eq!(
+            strings(dev.spec["network"]["egress"].get("allow_dns_hosts")),
+            ["a.example"]
+        );
+
+        let superset = r#"
+            [defaults.network.egress]
+            allow_dns_hosts = ["a.example"]
+
+            [defaults.session.network]
+            egress = { allow_dns_hosts = ["b.example"] }
+            bep = { steering = "proxy_env" }
+
+            [sessions.dev.network]
+            mode = "own_ip"
+            egress = { allow_dns_hosts = ["c.example"] }
+            bep = { steering = "dns" }
+        "#;
+        let dev = expand_in(superset, "dev", Layers::default()).expect("dev expands");
+        let network = dev.spec["network"].as_table().expect("a network table");
+        assert_eq!(network["mode"].as_str(), Some("own_ip"));
+        assert_eq!(strings(network["egress"].get("allow_dns_hosts")), ["c.example"]);
+        assert_eq!(network["bep"]["steering"].as_str(), Some("dns"));
+    }
+
     // BOX-048: `[defaults]` merges into every entry, `[defaults.<type>]`
     // into entries of that type. Lists union, scalars and tables replace.
     #[test]
@@ -2014,105 +2107,6 @@ mod tests {
             overrides: table("timeout = \"30m\""),
             ..Layers::default()
         }
-    }
-
-    // BOX-048, #3597: a later layer that sets one `network` sub-table keeps
-    // the other sub-tables of an earlier layer. A sub-table that two layers
-    // set comes whole from the later one. The report names the layer of
-    // each key below `network`.
-    #[test]
-    fn network_merges_by_sub_table() {
-        let file = r#"
-            [defaults.network.egress]
-            allow_dns_hosts = ["a.example"]
-            deny_subnets = ["10.0.0.0/8"]
-
-            [defaults.session.network.bep]
-            proxy_env = true
-
-            [sessions.dev.network]
-            mode = "own_ip"
-            egress = { deny_subnets = ["192.168.0.0/16"] }
-        "#;
-        let e = expand_in(file, "dev", Layers::default()).expect("expands");
-        assert_eq!(
-            e.spec["network"],
-            toml::Value::Table(table(indoc::indoc! {r#"
-                mode = "own_ip"
-                bep = { proxy_env = true }
-                egress = { deny_subnets = ["192.168.0.0/16"] }
-            "#}))
-        );
-        let layer_of = |key: &str| e.report.network.get(key).map(|o| o.layer);
-        assert_eq!(layer_of("bep"), Some(Layer::DefaultsType));
-        assert_eq!(layer_of("egress"), Some(Layer::Entry));
-        assert_eq!(layer_of("mode"), Some(Layer::Entry));
-        assert_eq!(
-            e.report.values["network"],
-            ValueOrigin::Value(Origin::of(Layer::Entry))
-        );
-
-        // Without the entry's table, each sub-table keeps its own layer.
-        let file = file
-            .split("[sessions.dev.network]")
-            .next()
-            .unwrap_or_default();
-        let file = format!("{file}[sessions.dev]\n");
-        let e = expand_in(&file, "dev", Layers::default()).expect("expands");
-        let network = e.spec["network"].as_table().expect("a table");
-        assert!(network.contains_key("bep"));
-        assert!(network.contains_key("egress"));
-        assert_eq!(
-            e.report.network.get("egress").map(|o| o.layer),
-            Some(Layer::Defaults)
-        );
-        assert_eq!(
-            e.report.network.get("bep").map(|o| o.layer),
-            Some(Layer::DefaultsType)
-        );
-
-        // A value that is not a table replaces the whole `network` value.
-        let replaced = fold(&[
-            (
-                Origin::of(Layer::Defaults),
-                &table("network = { mode = \"none\" }"),
-            ),
-            (Origin::of(Layer::Entry), &table("network = \"x\"")),
-        ]);
-        assert_eq!(replaced.spec["network"].as_str(), Some("x"));
-        assert!(replaced.report.network.is_empty());
-
-        // A flat egress key in a later layer replaces an earlier `egress`
-        // table, and the other way round.
-        let flat = fold(&[
-            (
-                Origin::of(Layer::Defaults),
-                &table("network = { egress = { allow_dns_hosts = [\"a\"], deny_subnets = [] } }"),
-            ),
-            (
-                Origin::of(Layer::Entry),
-                &table("network = { egress_allow_dns = [\"b\"] }"),
-            ),
-        ]);
-        assert_eq!(
-            flat.spec["network"],
-            toml::Value::Table(table("egress_allow_dns = [\"b\"]"))
-        );
-        let nested = fold(&[
-            (
-                Origin::of(Layer::Defaults),
-                &table("network = { egress_allow_dns = [\"b\"] }"),
-            ),
-            (
-                Origin::of(Layer::Entry),
-                &table("network = { egress = { allow_dns_hosts = [\"a\"] } }"),
-            ),
-        ]);
-        assert_eq!(
-            nested.spec["network"],
-            toml::Value::Table(table("egress = { allow_dns_hosts = [\"a\"] }"))
-        );
-        assert!(!nested.report.network.contains_key("egress_allow_dns"));
     }
 
     // BOX-065: one file and one set of overrides expand to the same bytes

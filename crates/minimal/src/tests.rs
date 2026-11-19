@@ -18256,46 +18256,6 @@ async fn box_spec_path_form_renders_bep_rows() {
     );
 }
 
-// #3597, BOX-048: `[defaults.session.network.bep]` does not drop the
-// `[defaults.network.egress]` of an earlier layer. The spec of `dev` holds
-// both, each named by its own layer, and the start reads the egress hosts.
-#[tokio::test]
-async fn box_spec_keeps_earlier_network_egress() {
-    let file = "[defaults.network.egress]\n\
-                allow_dns_hosts = [\"a.example\"]\n\n\
-                [defaults.session.network.bep]\n\
-                steering = \"proxy_env\"\n\n\
-                [sessions.dev]\n\
-                packages = [\"git\"]\n";
-    let (project, global) = spec_project(file);
-    let root = camino::Utf8Path::from_path(project.path()).unwrap();
-
-    let toml = box_spec_text(&global, &["min", "box", "spec", "dev"])
-        .await
-        .expect("the entry renders");
-    assert!(
-        toml.contains("# network.bep: from [defaults.session]\n"),
-        "{toml}"
-    );
-    assert!(
-        toml.contains("# network.egress: from [defaults]\n"),
-        "{toml}"
-    );
-    let parsed: toml::Table = toml::from_str(&toml).expect("the render is TOML");
-    let network = parsed["network"].as_table().expect("a network table");
-    assert_eq!(network["bep"]["steering"].as_str(), Some("proxy_env"));
-    assert_eq!(
-        network["egress"]["allow_dns_hosts"],
-        toml::Value::Array(vec!["a.example".into()])
-    );
-
-    // The start reads the same egress, and names the table that set it.
-    let egress = project_egress(root, Some("dev")).expect("the project loads");
-    assert_eq!(egress.layer.as_deref(), Some("[defaults]"));
-    let policy = egress.policy.expect("the egress is declared");
-    assert_eq!(policy.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
-}
-
 // BCLI-021: `min box spec <entry>` with the `[network]` override flags
 // renders the network that `min box start` sends with the same flags:
 // the mode, the egress and the ingress, each flag marked as the source.

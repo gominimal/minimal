@@ -119,6 +119,18 @@ pub enum Error {
         path: String,
         layer: String,
     },
+    /// A later layer's `network` table replaces an earlier layer's whole,
+    /// and drops `network` keys that only the earlier layer sets
+    /// (BOX-048). Carries the later table's header, the earlier table's
+    /// header, the dropped keys and the place to move the later keys to.
+    /// Exits 3.
+    NetworkTableDropsKeys {
+        later: String,
+        earlier: String,
+        dropped: Vec<String>,
+        later_keys: Vec<String>,
+        move_to: String,
+    },
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -212,7 +224,8 @@ impl Error {
             | Error::BoxType(_)
             | Error::LoadoutVarConflict { .. }
             | Error::DuplicateVar { .. }
-            | Error::ExportOutsideProject { .. } => Some(3),
+            | Error::ExportOutsideProject { .. }
+            | Error::NetworkTableDropsKeys { .. } => Some(3),
             _ => None,
         }
     }
@@ -469,6 +482,23 @@ impl fmt::Display for Error {
                  that holds minimal.toml or names that folder itself. Give \
                  the path of a file or folder inside that folder."
             ),
+            Error::NetworkTableDropsKeys {
+                later,
+                earlier,
+                dropped,
+                later_keys,
+                move_to,
+            } => {
+                let dropped = dropped.join(", ");
+                let later_keys = later_keys.join(", ");
+                let verb = if dropped.contains(", ") { "are" } else { "is" };
+                write!(
+                    f,
+                    "the network table in {later} replaces the network table in \
+                     {earlier}, so {dropped} from {earlier} {verb} dropped. Set \
+                     {dropped} in {later} too, or move {later_keys} to {move_to}."
+                )
+            }
         }
     }
 }
@@ -502,6 +532,7 @@ impl std::error::Error for Error {
             Error::LoadoutVarConflict { .. } => None,
             Error::DuplicateVar { .. } => None,
             Error::ExportOutsideProject { .. } => None,
+            Error::NetworkTableDropsKeys { .. } => None,
         }
     }
 }

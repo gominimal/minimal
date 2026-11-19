@@ -527,13 +527,9 @@ fn setting_table(
 ) -> String {
     use mfile::expand::{Layer, ValueOrigin};
     let box_type = entry.box_type.as_deref().unwrap_or(boxes::SESSION_BOX_TYPE);
-    // A key below `network` has its own layer (#3597).
-    let origin = match key.strip_prefix("network.") {
-        Some(sub) => report.network.get(sub),
-        None => match report.values.get(key) {
-            Some(ValueOrigin::Value(origin)) => Some(origin),
-            _ => None,
-        },
+    let origin = match report.values.get(key) {
+        Some(ValueOrigin::Value(origin)) => Some(origin),
+        _ => None,
     };
     match origin.map(|origin| (origin.layer, origin.loadout.as_deref())) {
         Some((Layer::Defaults, _)) => format!("[defaults.{path}]"),
@@ -544,35 +540,6 @@ fn setting_table(
         _ if entry.implicit => format!("[defaults.{box_type}.{path}]"),
         _ => format!("[{}.{}.{path}]", entry.table.key(), entry.name),
     }
-}
-
-/// The source labels of each key below `network`, by the key's name, from
-/// the layer that set it. A flat `egress_*` key counts as `egress`, the key
-/// it is written as, so its labels join those of `egress`.
-fn network_sources(
-    report: &mfile::expand::ExpansionReport,
-    entry: &mfile::entry::BoxEntry,
-) -> std::collections::BTreeMap<String, Vec<String>> {
-    let mut origins: std::collections::BTreeMap<String, Vec<mfile::expand::Origin>> =
-        std::collections::BTreeMap::new();
-    for (key, origin) in &report.network {
-        let key = mfile::network::FLAT_EGRESS_KEYS
-            .iter()
-            .find(|(flat, _)| flat == key)
-            .map_or(key.as_str(), |_| "egress");
-        origins
-            .entry(key.to_owned())
-            .or_default()
-            .push(origin.clone());
-    }
-    origins
-        .into_iter()
-        .map(|(key, mut items)| {
-            items.sort_by_key(|origin| origin.layer);
-            let labels = origin_labels(&mfile::expand::ValueOrigin::List(items), entry);
-            (key, labels)
-        })
-        .collect()
 }
 
 /// The source of a value that an override flag sets.
@@ -799,21 +766,10 @@ fn expand_entry(
     for (key, origin) in &expansion.report.values {
         sources.insert(key.clone(), origin_labels(origin, entry));
     }
-    // #3597: `network` merges by sub-table, so each key below it names its
-    // own layer, and `network` names every layer that set one of them.
-    let network_origins = network_sources(&expansion.report, entry);
-    if !network_origins.is_empty() {
-        let all =
-            mfile::expand::ValueOrigin::List(expansion.report.network.values().cloned().collect());
-        sources.insert("network".to_owned(), origin_labels(&all, entry));
-    }
-    for (key, labels) in &network_origins {
-        sources.insert(format!("network.{key}"), labels.clone());
-    }
     // The tables a refusal names: the layer that set `secrets`, and the
-    // layer that set `network.bep`, the table the proxy reads.
+    // layer that set `network`, whose `bep` table the proxy reads.
     let secrets_table = setting_table(&expansion.report, entry, "secrets", "secrets");
-    let bep_table = setting_table(&expansion.report, entry, "network.bep", "network.bep");
+    let bep_table = setting_table(&expansion.report, entry, "network", "network.bep");
     for (var, id) in &store_ids {
         if layers.store_rules.contains_key(id) {
             for key in ["upstream", "inject"] {
@@ -833,7 +789,6 @@ fn expand_entry(
     // flags, from the functions it calls.
     let overrides = &args.overrides;
     let network_label = sources.get("network").cloned();
-    let network_source = |key: &str| network_origins.get(key).cloned().unwrap_or_default();
     if box_type == boxes::TASK_BOX_TYPE {
         // `min box start` refuses these two flags for a task entry, so the
         // spec refuses them the same way (`StartEntryRefusal::FlagUnsupported`).
@@ -897,7 +852,7 @@ fn expand_entry(
         );
         let (mode, source) = match (overrides.network, project_egress.mode) {
             (Some(flag), _) => (flag.into(), vec![COMMAND_LINE.to_owned()]),
-            (None, Some(mode)) => (mode, network_source("mode")),
+            (None, Some(mode)) => (mode, network_label.clone().unwrap_or_default()),
             (None, None) => (
                 crate::cli::default_network_mode().into(),
                 vec![DEFAULT_SOURCE.to_owned()],
@@ -917,7 +872,7 @@ fn expand_entry(
         let file_ingress = project_egress.ingress.take();
         let (mode, source) = match (overrides.network, project_egress.mode) {
             (Some(flag), _) => (flag.into(), vec![COMMAND_LINE.to_owned()]),
-            (None, Some(mode)) => (mode, network_source("mode")),
+            (None, Some(mode)) => (mode, network_label.clone().unwrap_or_default()),
             (None, None) => (
                 activate.network_mode().into(),
                 vec![DEFAULT_SOURCE.to_owned()],
@@ -925,7 +880,7 @@ fn expand_entry(
         };
         let mut ingress_source = Vec::new();
         if file_ingress.is_some() {
-            ingress_source.extend(network_source("ingress"));
+            ingress_source.extend(network_label.clone().unwrap_or_default());
         }
         if file_ingress.is_none() || !overrides.ingress.is_empty() {
             ingress_source.push(COMMAND_LINE.to_owned());
@@ -954,13 +909,13 @@ fn expand_entry(
     let egress_flagged = overrides.egress != crate::EgressArgs::default();
     match egress {
         Some(egress) => {
-            let had = network_origins.contains_key("egress");
+            let had = network.contains_key("egress");
             network.insert(
                 "egress".to_owned(),
                 toml::Value::try_from(&egress).context("Cannot encode the egress")?,
             );
             let mut source = if had {
-                network_source("egress")
+                network_label.clone().unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -971,7 +926,6 @@ fn expand_entry(
         }
         None => {
             network.remove("egress");
-            sources.remove("network.egress");
         }
     }
     if let Some(ingress) = ingress {
