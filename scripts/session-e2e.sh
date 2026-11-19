@@ -2238,7 +2238,14 @@ echo "::endgroup::"
 # shell that sleeps, so only the stop can end it. The stop ends the attach
 # with exit 254 and one line that names the stop. The shell-exit prompt never
 # shows: the box did not end by its shell.
-#
+
+# Removes the attach-end box, then fails the run, so a later run can reuse
+# the name.
+ae_fail() {
+  mnl box rm --force "$ae_sid" </dev/null >/dev/null 2>&1 || true
+  fail
+}
+
 # $1: the step (stop). $2: the box name. Starts the attach in the
 # background, waits until its shell runs, and sets AE_PID to the driver's pid.
 attach_end_start() {
@@ -2260,7 +2267,7 @@ attach_end_start() {
     wait "$AE_PID" 2>/dev/null || true
     echo "::error::the pty attach to $2 never reached its shell ($1 step)"
     cat "$WORK/ae-$1.out" "$WORK/ae-$1.err" 2>/dev/null || true
-    fail
+    ae_fail
   fi
 }
 
@@ -2271,13 +2278,13 @@ attach_end_wait() {
     echo "::error::the attach to $2 did not end with exit 254 after the $1 (BCLI-068)"
     echo "--- transcript ---"; cat "$WORK/ae-$1.out" 2>/dev/null || true
     echo "--- stderr ---"; cat "$WORK/ae-$1.err" 2>/dev/null || true
-    fail
+    ae_fail
   fi
   if grep -qF "Exit, leaving the session filesystem" "$WORK/ae-$1.out" \
     || grep -qF "No files changed since activation." "$WORK/ae-$1.out"; then
     echo "::error::the $1 of $2 showed the shell-exit prompt on the attached terminal"
     echo "--- transcript ---"; cat "$WORK/ae-$1.out" 2>/dev/null || true
-    fail
+    ae_fail
   fi
 }
 
@@ -2287,6 +2294,10 @@ proof_attach_ends_on_stop() {
 # can declare entries that the start cannot pick, so skip it there.
 if [ -z "$SEED_DIR" ] && [ -z "$SEEDED_MFILE" ]; then
   echo "::notice::attach-end proof skipped: $PROJECT_DIR has its own minimal.toml, and this proof runs only in a project that the script seeds"
+  return 0
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  not_run attach_ends_on_stop "python3 is not on PATH, and the attach needs it to drive a real pty"
   return 0
 fi
 echo "::group::attach-end proof (min box stop ends an attach)"
@@ -2307,14 +2318,14 @@ mnl box stop "$ae_name" </dev/null >"$WORK/ae-stop-cmd.out" 2>&1 || {
   echo "::error::'min box stop $ae_name' failed while a terminal was attached"
   cat "$WORK/ae-stop-cmd.out" 2>/dev/null || true
   kill "$AE_PID" 2>/dev/null || true
-  fail
+  ae_fail
 }
 attach_end_wait stop "$ae_name"
 ae_lines="$(grep -cF "Detached: $ae_name was stopped." "$WORK/ae-stop.out" || true)"
 if [ "$ae_lines" != 1 ]; then
   echo "::error::the attach that the stop ended printed 'Detached: $ae_name was stopped.' $ae_lines times (expected once)"
   echo "--- transcript ---"; cat "$WORK/ae-stop.out" 2>/dev/null || true
-  fail
+  ae_fail
 fi
 echo "stop while attached: exit 254, one line that names the stop"
 
