@@ -1283,7 +1283,7 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
     }
     .to_string();
 
-    let error = create_refusal(reply);
+    let error = create_refusal(reply, None, None, None);
     let refusal = error
         .downcast_ref::<minimald_rpc::HeldNameRefusal>()
         .expect("main.rs maps this error to its exit code");
@@ -1299,7 +1299,12 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
          or choose another name."
     );
 
-    let other = create_refusal("the project path is not a directory".to_string());
+    let other = create_refusal(
+        "the project path is not a directory".to_string(),
+        None,
+        None,
+        None,
+    );
     assert!(
         other
             .downcast_ref::<minimald_rpc::HeldNameRefusal>()
@@ -3237,7 +3242,11 @@ fn create_name_held_exit2_names_holder_hints_name_flag() {
     }
     .to_string();
 
-    let error = start_refusal(create_refusal(reply), StartVerb::Box, "default");
+    let error = start_refusal(
+        create_refusal(reply, None, None, None),
+        StartVerb::Box,
+        "default",
+    );
     let held = error
         .downcast_ref::<StartNameHeld>()
         .expect("main.rs maps this error to exit 2");
@@ -5061,8 +5070,10 @@ async fn create_box_on(
     );
     request.must_match_version = minimal_client::version_assertion();
     let id = match client.call::<CreateSession>(&request).await {
-        Errorable::Ok(created) => created.id,
-        Errorable::Err { error } => panic!("CreateSession failed: {error}"),
+        minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => {
+            panic!("CreateSession failed: {error}")
+        }
     };
     // The empty composition needs no workspace and no gating, so both steps
     // take their happy paths and leave an `Active`, durable record.
@@ -16457,8 +16468,8 @@ lifecycle_hooks = [{ on_activate = { type = "inline", value = "echo project" } }
     let server = minimald::test_harness::TestServer::new().await;
     let mut daemon = server.connect().await;
     let id = match daemon.call::<CreateSession>(&request).await {
-        Errorable::Ok(created) => created.id,
-        Errorable::Err { error } => panic!("the create failed: {error}"),
+        minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => panic!("the create failed: {error}"),
     };
     let stored = match daemon.call::<GetBoxSpec>(&GetBoxSpecRequest { id }).await {
         Errorable::Ok(reply) => reply.spec.expect("the box stores a spec"),
@@ -16840,8 +16851,10 @@ async fn network_flags_override_stored_spec_and_projection() {
 
         // The daemon keeps the overridden values on the box's record.
         let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
-            minimald_rpc::Errorable::Ok(created) => created.id,
-            minimald_rpc::Errorable::Err { error } => panic!("{verb}: the create failed: {error}"),
+            minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+            minimald_rpc::CreateSessionReply::Err { error, .. } => {
+                panic!("{verb}: the create failed: {error}")
+            }
         };
         let record = stored_box_record(&mut client, id)
             .await
@@ -17105,8 +17118,10 @@ async fn start_and_run_take_every_network_key_flag() {
 
         // The daemon keeps the overridden values on the box's record.
         let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
-            minimald_rpc::Errorable::Ok(created) => created.id,
-            minimald_rpc::Errorable::Err { error } => panic!("{verb}: the create failed: {error}"),
+            minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+            minimald_rpc::CreateSessionReply::Err { error, .. } => {
+                panic!("{verb}: the create failed: {error}")
+            }
         };
         let record = stored_box_record(&mut client, id)
             .await
@@ -17237,8 +17252,10 @@ async fn start_no_hooks_stores_no_hooks() {
         assert!(!spec.hooks_enabled, "{verb}: the stored spec runs no hook");
 
         let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
-            minimald_rpc::Errorable::Ok(created) => created.id,
-            minimald_rpc::Errorable::Err { error } => panic!("{verb}: the create failed: {error}"),
+            minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+            minimald_rpc::CreateSessionReply::Err { error, .. } => {
+                panic!("{verb}: the create failed: {error}")
+            }
         };
         let record = stored_box_record(&mut client, id)
             .await
@@ -17420,8 +17437,8 @@ async fn box_show_network_renders_effective_policy() {
     );
     request.config.network = boxes::NetworkMode::OwnIp;
     let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
-        minimald_rpc::Errorable::Ok(created) => created.id,
-        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+        minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => panic!("the create failed: {error}"),
     };
 
     let mut client = connect_daemon(&global).await.expect("the daemon answers");
@@ -19329,8 +19346,8 @@ async fn create_box_from(
 ) -> boxes::SessionId {
     let mut daemon = server.connect().await;
     match daemon.call::<minimald_rpc::CreateSession>(request).await {
-        minimald_rpc::Errorable::Ok(created) => created.id,
-        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+        minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => panic!("the create failed: {error}"),
     }
 }
 
@@ -21009,8 +21026,8 @@ async fn start_attach_resume_end_to_end() {
         let mut daemon = alpha.server.connect().await;
         let created = daemon.call::<CreateSession>(&request).await;
         let web = match created {
-            Errorable::Ok(created) => created.id,
-            Errorable::Err { error } => {
+            minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+            minimald_rpc::CreateSessionReply::Err { error, .. } => {
                 ran.push(&argv.join(" "), b"", error.as_bytes(), 1);
                 panic!("the create failed: {error}\n{ran}")
             }
@@ -22911,8 +22928,10 @@ async fn create_stores_client_digest_equal_to_daemon_digest() {
             "{what}: the client digest is the one of the spec it sends"
         );
         let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
-            minimald_rpc::Errorable::Ok(created) => created.id,
-            minimald_rpc::Errorable::Err { error } => panic!("{what}: the create failed: {error}"),
+            minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+            minimald_rpc::CreateSessionReply::Err { error, .. } => {
+                panic!("{what}: the create failed: {error}")
+            }
         };
         let record = stored_box_record(&mut client, id)
             .await
@@ -22944,10 +22963,10 @@ async fn create_stores_client_digest_equal_to_daemon_digest() {
     assert_ne!(client_expected, daemon_expected, "the change is projected");
     // BOX-072: the daemon refuses a create whose two digests differ.
     match daemon.call::<minimald_rpc::CreateSession>(&changed).await {
-        minimald_rpc::Errorable::Ok(created) => {
+        minimald_rpc::CreateSessionReply::Ok(created) => {
             panic!("changed: a create with two digests is refused, not {created:?}")
         }
-        minimald_rpc::Errorable::Err { error } => assert!(
+        minimald_rpc::CreateSessionReply::Err { error, .. } => assert!(
             error.to_string().starts_with("No box was created."),
             "changed: {error}"
         ),
@@ -23715,8 +23734,8 @@ async fn vpn_network_names_kept_and_flag_adds() {
     let mut daemon = server.connect().await;
     let request = started.expect("a start was planned");
     let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
-        minimald_rpc::Errorable::Ok(created) => created.id,
-        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+        minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => panic!("the create failed: {error}"),
     };
     let mut client = connect_daemon(&global).await.expect("the daemon answers");
     let record = stored_box_record(&mut client, id)
@@ -23768,8 +23787,8 @@ async fn vpn_network_names_kept_and_flag_adds() {
     };
     let request = planned_session_request(&args, &options, bare_root);
     let id = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
-        minimald_rpc::Errorable::Ok(created) => created.id,
-        minimald_rpc::Errorable::Err { error } => panic!("the create failed: {error}"),
+        minimald_rpc::CreateSessionReply::Ok(created) => created.id,
+        minimald_rpc::CreateSessionReply::Err { error, .. } => panic!("the create failed: {error}"),
     };
     let record = stored_box_record(&mut client, id)
         .await
@@ -24747,4 +24766,59 @@ fn box_verbs_complete_box_names() {
             );
         }
     }
+}
+
+// #3276: on a host with no identity plane that a node-local proxy serves,
+// `min` lets a brokered secret with no `github:` scope through, and only
+// the daemon refuses it. The refusal reaches `min` with its code and exit
+// code, so the command exits 5 with `gatehouse_unenrolled_node`, not 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_only_broker_refusal_exits_5() {
+    const ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n";
+    let server = minimald::test_harness::TestServer::new().await;
+    let mut daemon = server.connect().await;
+    let mut request = minimald::test_harness::create_session_req("brokered", "/tmp");
+    request.config.name = None;
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    request.config.root_certificate = Some(ROOT_PEM.to_string());
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+    spec.pty_enabled = false;
+    spec.entry = "brokered".to_string();
+    let mut spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    spec.as_object_mut().expect("a spec is an object").insert(
+        "secrets".to_string(),
+        serde_json_lenient::json!({ "aws": { "source": "broker", "scopes": ["aws:s3"] } }),
+    );
+    request.spec = Some(spec);
+
+    // The client-side check passes the grant: it is not a GitHub grant.
+    let error = match daemon.call::<minimald_rpc::CreateSession>(&request).await {
+        minimald_rpc::CreateSessionReply::Err {
+            error,
+            code,
+            exit_code,
+            hint,
+        } => crate::create_refusal(error, code, exit_code, hint),
+        minimald_rpc::CreateSessionReply::Ok(created) => {
+            panic!("the daemon refuses the grant, not {created:?}")
+        }
+    };
+    let refused = error
+        .downcast_ref::<crate::DaemonCreateRefusal>()
+        .unwrap_or_else(|| panic!("a coded refusal keeps its code: {error:#}"));
+    assert_eq!(refused.exit_code, 5, "{error:#}");
+    assert_eq!(
+        refused.code.as_deref(),
+        Some("gatehouse_unenrolled_node"),
+        "{error:#}"
+    );
+    assert!(!refused.hint.is_empty(), "{error:#}");
+    assert!(error.to_string().contains("aws"), "{error:#}");
+
+    // A refusal with no exit code, from a daemon that predates the field,
+    // is the daemon's text as it is.
+    let plain = crate::create_refusal(refused.message.clone(), None, None, None);
+    assert!(plain.downcast_ref::<crate::DaemonCreateRefusal>().is_none());
+    assert_eq!(plain.to_string(), refused.message);
 }

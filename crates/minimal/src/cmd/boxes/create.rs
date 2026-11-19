@@ -3522,23 +3522,66 @@ pub(crate) async fn daemon_box_name(
 }
 
 /// The error a refused create ends the command with. A held name ends it
-/// with exit 2, naming the holder (BOX-163). Any other refusal is the
-/// daemon's text as it is.
-pub(crate) fn create_refusal(error: String) -> anyhow::Error {
-    match minimal_client::box_name::held_name_refusal(&error) {
-        Some(refusal) => {
+/// with exit 2, naming the holder (BOX-163). A refusal the daemon gave an
+/// exit code keeps that code and its defined error (#3276). Any other
+/// refusal is the daemon's text as it is.
+pub(crate) fn create_refusal(
+    error: String,
+    code: Option<String>,
+    exit_code: Option<u8>,
+    hint: Option<String>,
+) -> anyhow::Error {
+    if let Some(refusal) = minimal_client::box_name::held_name_refusal(&error) {
+        tracing::info!(
+            name = %refusal.name,
+            holder = ?refusal.holder,
+            holder_name = %refusal.holder_name,
+            exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
+            "the create was refused: a running box holds the name"
+        );
+        return anyhow::Error::new(refusal);
+    }
+    match exit_code {
+        Some(exit_code) => {
             tracing::info!(
-                name = %refusal.name,
-                holder = ?refusal.holder,
-                holder_name = %refusal.holder_name,
-                exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
-                "the create was refused: a running box holds the name"
+                code = code.as_deref().unwrap_or(""),
+                exit_code,
+                "the create was refused by the daemon with an exit code"
             );
-            anyhow::Error::new(refusal)
+            anyhow::Error::new(DaemonCreateRefusal {
+                message: error,
+                code,
+                exit_code,
+                hint: hint.unwrap_or_default(),
+            })
         }
         None => anyhow::anyhow!("{error}"),
     }
 }
+
+/// A create the daemon refused and gave an exit code (#3276), such as a
+/// brokered secret on a host with no identity plane. `min` ends with
+/// `exit_code`, and `-o json` answers with `code` and `hint`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonCreateRefusal {
+    /// The daemon's refusal text: what was refused, why, and the next step.
+    pub message: String,
+    /// The refusal's defined error, when it has one.
+    pub code: Option<String>,
+    /// The exit code the command ends with.
+    pub exit_code: u8,
+    /// The next step alone, for the `-o json` hint. Empty when the daemon
+    /// sent none.
+    pub hint: String,
+}
+
+impl std::fmt::Display for DaemonCreateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DaemonCreateRefusal {}
 
 /// The id and name of the box that holds `held`, read from the daemon by
 /// name. `None` when the read fails or finds no box.
@@ -4388,8 +4431,13 @@ pub(crate) async fn activate_box(
                     }
                 };
                 match resp {
-                    minimald_rpc::Errorable::Ok(r) => r,
-                    minimald_rpc::Errorable::Err { error } => {
+                    minimald_rpc::CreateSessionReply::Ok(r) => r,
+                    minimald_rpc::CreateSessionReply::Err {
+                        error,
+                        code,
+                        exit_code,
+                        hint,
+                    } => {
                         // Any other create failure abandons the activation and
                         // its row the same way. A held name is one of them: it
                         // ends the command with exit 2, naming the holder.
@@ -4402,7 +4450,7 @@ pub(crate) async fn activate_box(
                                 .and_then(|registration| registration.box_id),
                         )
                         .await;
-                        return Err(create_refusal(error));
+                        return Err(create_refusal(error, code, exit_code, hint));
                     }
                 }
             };
