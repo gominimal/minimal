@@ -5301,3 +5301,43 @@ async fn an_unknown_min_provider_refuses_flagless_commands_only() {
         .unwrap();
     assert!(flagged.status.success(), "{flagged:?}");
 }
+
+/// A `MIN_PROVIDER` that names no provider leaves a command that reads no
+/// provider running, while a command that talks to a host still refuses.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unknown_min_provider_spares_commands_that_need_no_provider() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let loadouts_dir = tempfile::TempDir::new().unwrap();
+    let min = |args: &[&std::ffi::OsStr]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
+        command
+            .env("MIN_PROVIDER", "bogus")
+            .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+            .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+            .arg("--no-input")
+            .args(args);
+        command
+    };
+    let offline = min(&[
+        "loadout".as_ref(),
+        "list".as_ref(),
+        "--dir".as_ref(),
+        loadouts_dir.path().as_os_str(),
+    ])
+    .output()
+    .await
+    .unwrap();
+    assert!(offline.status.success(), "{offline:?}");
+    let refused = min(&["ls".as_ref()]).output().await.unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .lines()
+            .any(|line| line
+                == "error: MIN_PROVIDER=bogus names no provider. Set MIN_PROVIDER to local or \
+         local-minvmd, or unset it."),
+        "{refused:?}"
+    );
+}

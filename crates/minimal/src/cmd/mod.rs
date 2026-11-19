@@ -68,7 +68,13 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
             tracing::debug!(%error, "no provider resolved: no completions");
             return Ok(());
         }
-        return Err(error);
+        // A command that needs no provider runs without one, so a bad
+        // `MIN_PROVIDER` or config.toml blocks only the commands that
+        // would reach the wrong host.
+        if needs_provider(cli.command.as_ref()) {
+            return Err(error);
+        }
+        tracing::debug!(%error, "no provider resolved: the command reads none");
     }
     // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
     // prints after the command ends, never before an attached shell.
@@ -130,6 +136,30 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
         None => Ok(()),
         Some(handoff) => Err(handoff.finish()),
     }
+}
+
+/// Whether `command` needs the provider: it talks to a host, or reports
+/// the host the provider selects (`provider list`, `version`). The rest
+/// run when the default provider does not resolve. `dirs` is among them,
+/// because it is how a user finds the config.toml to repair.
+fn needs_provider(command: Option<&Command>) -> bool {
+    !matches!(
+        command,
+        Some(
+            Command::Loadout(_)
+                | Command::Type(_)
+                | Command::FinalizeInstall(_)
+                | Command::Dirs
+                | Command::Doctor
+                | Command::Bug(_)
+                | Command::Diag(_)
+                | Command::Auth(_)
+                | Command::Secret(_)
+                | Command::Login(_)
+                | Command::UpdateCheck(_)
+                | Command::Completions(_)
+        )
+    )
 }
 
 /// The verb a run dispatches, as the user typed it (`box show`,
