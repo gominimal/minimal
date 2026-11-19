@@ -1643,7 +1643,7 @@ fn refuse_unapplied_task_network(
 
 /// The egress of `entry` in the parsed `file`: its `[defaults]`,
 /// `[defaults.<type>]` and entry layers, read as [`project_egress`] says.
-fn entry_egress(
+pub(crate) fn entry_egress(
     file: &toml::Table,
     entry: mfile::entry::BoxEntry,
 ) -> anyhow::Result<ProjectEgress> {
@@ -2021,7 +2021,7 @@ pub(crate) fn task_box_entry(
 /// so a loadout that conflicts with the project fails here (BOX-183), and
 /// each hook of that spec names its declarer (BOX-179). The lists sent
 /// come from the expansion without the loadouts.
-fn box_entry(
+pub(crate) fn box_entry(
     project: &camino::Utf8Path,
     bytes: &[u8],
     entry: mfile::entry::BoxEntry,
