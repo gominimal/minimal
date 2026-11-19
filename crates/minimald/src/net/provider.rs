@@ -487,9 +487,9 @@ pub(crate) fn attached_lease(
 /// its frames to the session's row. `decision` carries the verdict decision this launch itself
 /// read for the box before it reserved anything (NET-079) — the launch's own
 /// fresh fact, never another launch's, which a process-wide memo left a
-/// concurrent launch free to read in its place. A task launch passes `None`
-/// deliberately too: it places no classifier leaf, so there is no per-box
-/// verdict for its plan to follow.
+/// concurrent launch free to read in its place. A task launch goes through
+/// [`task_network_for`], which builds its plan around the verdict of the
+/// box leaf the task joins.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
@@ -538,18 +538,33 @@ pub(crate) fn network_for(
 /// (`task_addresses`, off the session record) — each a host-side row
 /// carrying the box's id and egress — never at the box's own address and
 /// never at one it draws. No task addresses is the plain draw, which only a
-/// native switch makes ([`SwitchClient::attach_task_slot`]). Every other
-/// mode is [`network_for`]'s, with no reporter, no handed box addresses and
-/// no classifier decision: a task owns no proxy route and places no leaf.
+/// native switch makes ([`SwitchClient::attach_task_slot`]).
+///
+/// A `HostNet` task runs in the existing leaf of its box (NET-079), so its
+/// plan follows `box_verdict`, the verdict of that leaf, and `decision`, the
+/// box's decision when the caller holds one. A task with no box leaf gets
+/// the plan [`network_for`] builds from the policy. Every other mode is
+/// [`network_for`]'s, with no reporter and no handed box addresses: a task
+/// owns no proxy route.
 pub(crate) fn task_network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
     policy: Option<boxes::BoxPolicy>,
     task_addresses: Vec<std::net::Ipv4Addr>,
+    box_verdict: Option<sandbox::config::Verdict>,
+    decision: Option<crate::net::classifier::Decision>,
 ) -> Arc<dyn Network> {
-    match mode {
-        NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
+    match (mode, box_verdict) {
+        (NetworkMode::HostNet, Some(verdict)) => Arc::new(HostIpAddressNetwork {
+            switch: Arc::clone(switch),
+            verdict,
+            decision,
+            steering: steering_seed(identity, policy.as_ref()),
+            seams: SteeringSeams::default(),
+            answerer: std::sync::Mutex::new(None),
+        }),
+        (NetworkMode::OwnIp, _) => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
             identity: identity.to_string(),
             policy,
@@ -587,8 +602,8 @@ struct HostIpAddressNetwork {
     /// (NET-079) — carried in by the launch that builds the plan, so the
     /// plan follows its own launch's reading and never a concurrent
     /// launch's, which a process-wide memo let a later launch overwrite in
-    /// its place. `None` for a task launch: it places no classifier leaf,
-    /// so there is no per-box verdict for its plan to follow.
+    /// its place. A task runs in the leaf of its box and carries the box's
+    /// decision when its caller holds one, else `None`.
     decision: Option<crate::net::classifier::Decision>,
     /// The box's steered names (BEP-086), or `None` when the box's own
     /// spec declares no credentialed upstream or its steering is not
@@ -1578,6 +1593,80 @@ mod tests {
         assert!(
             plan(None).plan().await.is_ok(),
             "a box that is not deny-all is unaffected"
+        );
+    }
+
+    /// NET-079: a task in the deny leaf of its box repeats the stale
+    /// carve-out check of the box launch. The decision it plans over carries
+    /// the carve-out the leaf's tree records, so a task started after the
+    /// answerer moved, or stopped, is refused and never falls back to the
+    /// constant answerer address.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn task_in_a_deny_leaf_refuses_a_stale_carve_out() {
+        use crate::net::classifier::{clear_live_answerer, set_live_answerer, task_box_decision};
+        use sandbox::config::{ClassifierLeaf, Verdict};
+
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let recorded = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7656);
+        std::fs::create_dir(tree.path().join("carve-out-127.0.0.1-7656"))
+            .expect("the carve-out record the privileged step writes");
+        let deny = ClassifierLeaf::under(tree.path(), "b", Verdict::Deny);
+        let allow = ClassifierLeaf::under(tree.path(), "b", Verdict::Allow);
+        assert_eq!(
+            task_box_decision(&deny).and_then(|decision| decision.carve_out()),
+            Some(recorded),
+            "a deny leaf gives the carve-out its tree records"
+        );
+        assert!(
+            task_box_decision(&allow).is_none(),
+            "an allow leaf gives no decision"
+        );
+
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+        let plan = || {
+            task_network_for(
+                NetworkMode::HostNet,
+                &native,
+                "s-task",
+                None,
+                Vec::new(),
+                Some(Verdict::Deny),
+                task_box_decision(&deny),
+            )
+        };
+
+        set_live_answerer(std::net::SocketAddr::V4(recorded));
+        let live = plan()
+            .plan()
+            .await
+            .expect("a carve-out naming the live bind plans the task");
+        assert_eq!(
+            live.resolver(),
+            &Resolver::Nameservers(vec![*recorded.ip()]),
+            "the task resolves through the live bind"
+        );
+
+        set_live_answerer(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            7700,
+        ));
+        let refusal = plan()
+            .plan()
+            .await
+            .expect_err("a carve-out naming another bind refuses the task");
+        assert!(
+            refusal.to_string().contains("its name lookups would fail"),
+            "the task is refused as a stale carve-out: {refusal}"
+        );
+
+        clear_live_answerer();
+        assert!(
+            plan().plan().await.is_err(),
+            "no live answerer refuses the task"
         );
     }
 

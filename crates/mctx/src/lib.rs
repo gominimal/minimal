@@ -1241,28 +1241,36 @@ impl Context {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
         })?;
 
-        let mut env = Env::build(
-            self,
-            graph,
-            EnvArgs {
-                name,
-                state_base_dir,
-                transitives: transitive_deps,
-                cwd: wd,
-                wd_layout,
-                patches,
-                home,
-                env_vars,
-                hostname: Some(name.to_string()),
-                network,
-                ot: self.daemon.config.ot.clone(),
-            },
-        )
-        .await?;
+        let args = self.task_env_args(EnvArgs {
+            name,
+            state_base_dir,
+            transitives: transitive_deps,
+            cwd: wd,
+            wd_layout,
+            patches,
+            home,
+            env_vars,
+            hostname: Some(name.to_string()),
+            network,
+            classifier_leaf: None,
+            ot: self.daemon.config.ot.clone(),
+        });
+        let mut env = Env::build(self, graph, args).await?;
         env.associate_tempdirs(temp_dirs);
         env.associate_tempdirs([base]);
 
         Ok(env)
+    }
+
+    /// `args` placed in this context's classifier leaf, if it has one. A task
+    /// env made for a host-address box then runs in the leaf of its box, so
+    /// the box's egress verdict decides the task's connections, the same as
+    /// for the package builds the context starts (NET-155).
+    pub(crate) fn task_env_args<'a>(&self, args: EnvArgs<'a>) -> EnvArgs<'a> {
+        EnvArgs {
+            classifier_leaf: self.classifier_leaf.clone(),
+            ..args
+        }
     }
 
     /// Returns the list of all packages brought in through tasks, profiles and stacks.
@@ -1987,6 +1995,68 @@ mod tests {
             .unwrap();
         assert!(orchestrator.backend.box_network().is_some());
         assert_eq!(orchestrator.backend.classifier_leaf(), None);
+    }
+
+    /// A task env made from a context with a classifier leaf runs in that
+    /// leaf, so a task of a host-address box gets its box's egress. A context
+    /// made for no box gives a task env with no leaf.
+    #[test]
+    fn task_env_carries_the_box_classifier_leaf() {
+        let state = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let daemon = Arc::new(DaemonContext::init(config).unwrap());
+        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata")
+            .join("fakerepo");
+        let mfile = MFileSearchStrategy::Override(repo)
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+        let leaf = sandbox::config::ClassifierLeaf::under(
+            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Allow,
+        );
+        let args = || EnvArgs {
+            name: "task",
+            transitives: std::collections::HashMap::new(),
+            state_base_dir: state.path().to_path_buf(),
+            cwd: state.path().to_path_buf(),
+            wd_layout: WdLayout::BoundDir,
+            patches: None,
+            home: PatchHome::Ambient,
+            env_vars: None,
+            hostname: None,
+            network: Arc::new(sandbox::HostNet),
+            classifier_leaf: None,
+            ot: None,
+        };
+
+        let plain = Context::from_daemon(Arc::clone(&daemon), mfile);
+        let unplaced = plain.task_env_args(args());
+        assert_eq!(unplaced.classifier_leaf, None);
+        let config = env::place_in_classifier_leaf(
+            sandbox::config::Config::new("task"),
+            unplaced.classifier_leaf,
+        );
+        assert_eq!(config.classifier_leaf, None);
+
+        let boxed = plain.with_classifier_leaf(leaf.clone());
+        let placed = boxed.task_env_args(args());
+        assert_eq!(placed.classifier_leaf.as_ref(), Some(&leaf));
+        let config = env::place_in_classifier_leaf(
+            sandbox::config::Config::new("task"),
+            placed.classifier_leaf,
+        );
+        assert_eq!(config.classifier_leaf, Some(leaf));
     }
 
     #[test]
