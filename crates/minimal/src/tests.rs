@@ -23627,6 +23627,118 @@ fn run_spec(project: &std::path::Path, argv: &[&str]) -> serde_json_lenient::Val
     request.spec.expect("the run stores a spec")
 }
 
+/// A task with one brokered secret, as #3650 reports it.
+const BROKER_TASK_FILE: &str = "[tasks.ci]\nexec = [\"true\"]\n\n\
+    [tasks.ci.secrets.GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:contents:read\"]\n";
+
+// #3650, BOX-071: the spec of `min task run ci` carries the task's
+// expanded `[secrets]`, and its client digest equals the daemon's digest of
+// the sent spec.
+#[test]
+fn task_spec_carries_expanded_secrets() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), BROKER_TASK_FILE).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).unwrap();
+    let run = parsed_run(&["min", "task", "run", "ci"]);
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new(root.to_owned()).unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    let declared = task::declared_task(root, &run.entry).expect("the task is declared");
+    let mut spec = task::task_box_spec(
+        &run.entry,
+        &declared,
+        crate::spec_flags(&request),
+        &run.args,
+    )
+    .expect("a non-interactive task has a spec");
+    let expanded = crate::task_box_entry(root, &run.entry, true, None)
+        .expect("the task entry expands")
+        .expect("the project declares the task");
+    task::put_task_spec(
+        &mut request,
+        &run.entry,
+        Some(&mut spec),
+        Some(&expanded.spec),
+        &[],
+    )
+    .expect("the spec encodes");
+
+    let wire = request.spec.as_ref().expect("the run stores a spec");
+    assert_eq!(wire["secrets"]["GH_TOKEN"]["source"], "broker", "{wire}");
+    assert_eq!(
+        wire["secrets"]["GH_TOKEN"]["scopes"],
+        serde_json_lenient::json!(["github:contents:read"]),
+        "{wire}"
+    );
+    let daemon =
+        mfile::projection::spec_digest(wire, boxes::TASK_BOX_TYPE).expect("the sent spec projects");
+    assert_eq!(
+        request.config.client_projection_digest(),
+        Some(daemon.as_str())
+    );
+    let read: mfile::spec::BoxSpec =
+        serde_json_lenient::from_value(wire.clone()).expect("the daemon reads the sent spec");
+    assert!(read.kept_keys.contains_key("secrets"), "{read:?}");
+}
+
+// #3650, BOX-081: `min task run ci` of a task with a brokered secret, on a
+// host that is not enrolled and has no proxy, fails with exit 5, and no
+// box exists after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_run_broker_secret_unenrolled_exits_5() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(mfile::MFILE_NAME), BROKER_TASK_FILE).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let global = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: Some(config.path().to_path_buf()),
+        no_input: true,
+        ..Default::default()
+    };
+
+    let err = task::cmd_task_run(
+        &global,
+        TaskRunArgs {
+            task: "ci".into(),
+            path: None,
+            network: None,
+            egress: EgressArgs::default(),
+            other: crate::BoxOverrideArgs::default(),
+            detach: true,
+            args: vec![],
+        },
+    )
+    .await
+    .expect_err("a brokered secret on an un-enrolled host is refused");
+    let refused = err
+        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+        .unwrap_or_else(|| panic!("the refusal is an activation refusal: {err:#}"));
+    assert_eq!(refused.exit_code(), 5, "{err:#}");
+    assert_eq!(
+        refused.refusals[0].code(),
+        Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE),
+        "{err:#}"
+    );
+    assert!(err.to_string().contains("GH_TOKEN"), "{err:#}");
+
+    let listed = server
+        .connect()
+        .await
+        .call::<minimald_rpc::ListSessions>(&())
+        .await;
+    assert!(listed.sessions.is_empty(), "the refused run created no box");
+}
+
 // BOX-203, BCLI-024: `min task run --vpn-network-names corp build` stores a
 // spec with both the names and the task's declared export. The exports go
 // on the spec before it is stored, so the names stay.

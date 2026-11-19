@@ -163,6 +163,64 @@ pub(crate) fn put_task_spec(
     crate::add_vpn_network_names(request, vpn_network_names)
 }
 
+/// Refuses a run whose sent `spec` carries a `source = "broker"` secret
+/// where no node-local proxy serves boxes (BOX-081, #3650). `absence` says
+/// why no proxy serves boxes, or gives `None` when one does. It is read
+/// only for a spec with a brokered secret.
+///
+/// The refusal is the daemon's for the same spec: it names each brokered
+/// secret, in name order, and exits 5 (`gatehouse_unenrolled_node`).
+///
+/// # Errors
+///
+/// [`boxes::core::bep::ActivationRefused`] for a brokered secret with no
+/// proxy.
+pub(crate) fn refuse_unserved_broker_secrets(
+    spec: Option<&serde_json_lenient::Value>,
+    absence: impl FnOnce() -> Option<boxes::core::bep::ProxyAbsence>,
+) -> Result<(), boxes::core::bep::ActivationRefused> {
+    let Some(secrets) = spec
+        .and_then(|spec| spec.get("secrets"))
+        .and_then(serde_json_lenient::Value::as_object)
+    else {
+        return Ok(());
+    };
+    let brokered: std::collections::BTreeMap<&String, &serde_json_lenient::Value> = secrets
+        .iter()
+        .filter(|(_, grant)| grant.get("source").and_then(|s| s.as_str()) == Some("broker"))
+        .collect();
+    if brokered.is_empty() {
+        return Ok(());
+    }
+    let Some(cause) = absence() else {
+        return Ok(());
+    };
+    // The text says "secret" in place of "GitHub grant" when any of them
+    // asks for no `github:` scope.
+    let not_github = brokered.values().any(|grant| {
+        !grant
+            .get("scopes")
+            .and_then(|s| s.as_array())
+            .is_some_and(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(|scope| scope.as_str())
+                    .any(|scope| scope.starts_with("github:"))
+            })
+    });
+    let names: Vec<String> = brokered.keys().map(|name| (*name).clone()).collect();
+    tracing::info!(
+        secrets = ?names,
+        code = boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+        "refused a task run: the spec carries a brokered secret and no proxy serves boxes"
+    );
+    // The secrets can come from the task's table or from a default, so
+    // the refusal names no table.
+    Err(boxes::core::bep::unenrolled_node(
+        names, not_github, cause, None,
+    ))
+}
+
 /// The network a run gives task `task`'s box (NET-060), from
 /// [`task_box_network`].
 #[derive(Debug)]
@@ -1652,6 +1710,10 @@ pub(crate) async fn run_entry(
         expanded.as_ref().map(|expanded| &expanded.spec),
         &args.other.vpn_network_names,
     )?;
+    // BOX-081, #3650: the run sends no proxy root certificate. So where no
+    // proxy serves boxes, the daemon refuses each brokered secret of the
+    // spec. The run refuses it here first, with exit 5, before a box exists.
+    refuse_unserved_broker_secrets(request.spec.as_ref(), || crate::host_proxy_absence(global))?;
 
     // Loadouts and user policy, resolved before the daemon connection so a
     // broken loadout fails loudly client-side, and through the same shared

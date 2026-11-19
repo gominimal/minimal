@@ -2620,6 +2620,24 @@ pub(crate) fn proxy_present(
         && control.is_some_and(|control| std::os::unix::net::UnixStream::connect(control).is_ok())
 }
 
+/// [`proxy_absence`] of this host: the proxy's published identity and
+/// control socket, the `bep` program that `min secret` names, and the log
+/// the host daemon writes the proxy's output to.
+pub(crate) fn host_proxy_absence(global: &GlobalArgs) -> Option<boxes::core::bep::ProxyAbsence> {
+    let identity = crate::mint::identity_path();
+    let control = crate::mint::control_path();
+    let binary = bep::store::proxy_binary_on_path(
+        std::env::var_os(bep::store::PROXY_BIN_ENV).as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    );
+    proxy_absence(
+        identity.as_deref(),
+        control.as_deref(),
+        binary,
+        proxy_log_path(global.minimal_dir.as_deref()),
+    )
+}
+
 /// Why no node-local proxy serves boxes on this host, or `None` when one
 /// does ([`proxy_present`]). `binary` is the proxy program the host daemon
 /// starts, by `bep::store::proxy_binary_path`, and `log` is the file that
