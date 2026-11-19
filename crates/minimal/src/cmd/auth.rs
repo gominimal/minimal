@@ -760,17 +760,64 @@ fn parse_reply<T: serde::de::DeserializeOwned>(mut text: String) -> serde_json_l
     parsed
 }
 
+/// The OAuth error fields of a refused request's reply.
+#[derive(Deserialize)]
+struct Refusal {
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// The OAuth errors that go away when the same request is sent again later.
+fn transient(error: &str) -> bool {
+    matches!(error, "slow_down" | "temporarily_unavailable")
+}
+
+/// The message for a non-success reply. It carries GitHub's `error` and
+/// `error_description` when the reply has them, and zeroizes the text.
+/// `retry` is the command that sends the request again, when a transient
+/// error makes that the next step.
+fn refusal(
+    url: &str,
+    status: reqwest::StatusCode,
+    mut text: String,
+    retry: Option<&str>,
+) -> String {
+    let parsed = serde_json_lenient::from_str::<Refusal>(&text).ok();
+    text.zeroize();
+    let mut message = format!("GitHub refused the sign-in request to {url} ({status}).");
+    let Some(Refusal {
+        error: Some(error),
+        error_description,
+    }) = parsed
+    else {
+        return message;
+    };
+    message.push_str(&format!(" GitHub said: {error}"));
+    match error_description.as_deref().map(str::trim) {
+        Some(description) if !description.is_empty() => {
+            message.push_str(&format!(": {description}"));
+        }
+        _ => {}
+    }
+    if let Some(retry) = retry.filter(|_| transient(&error)) {
+        message.push_str(&format!(
+            "\nThis refusal is temporary. Wait a minute, then run `{retry}` again."
+        ));
+    }
+    message
+}
+
 async fn post_form<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
     url: &str,
     form: &[(&str, &str)],
+    retry: Option<&str>,
 ) -> anyhow::Result<T> {
-    let (status, mut text) = send_form(http, url, form)
+    let (status, text) = send_form(http, url, form)
         .await
         .with_context(|| format!("could not reach {url}"))?;
     if !status.is_success() {
-        text.zeroize();
-        bail!("GitHub refused the sign-in request to {url} ({status})");
+        bail!("{}", refusal(url, status, text, retry));
     }
     parse_reply(text).with_context(|| format!("GitHub answered {url} with an unexpected reply"))
 }
@@ -816,6 +863,7 @@ async fn device_flow(
         http,
         &format!("{}/login/device/code", endpoints.oauth),
         &[("client_id", CLIENT_ID)],
+        Some("min auth login --device"),
     )
     .await?;
     writeln!(
@@ -996,6 +1044,8 @@ impl Browser {
                     ("redirect_uri", &self.redirect_uri),
                     ("code_verifier", &self.verifier),
                 ],
+                // The caller's message already says to run `min auth login`.
+                None,
             )
             .await?;
             if let Some(e) = reply.error.as_deref() {
@@ -1622,6 +1672,8 @@ mod tests {
         RevokeRefused,
         /// The browser flow's token exchange fails with a 502.
         ExchangeFails,
+        /// The device code request is refused with a 400 and `slow_down`.
+        DeviceCodeSlowDown,
     }
 
     /// A local stand-in for github.com and api.github.com. The device flow
@@ -1667,6 +1719,10 @@ mod tests {
                     r#"{{"access_token":"{access}","expires_in":28800,"refresh_token":"{REFRESH}","refresh_token_expires_in":15897600,"token_type":"bearer","scope":""}}"#
                 );
                 let reply = match path.as_str() {
+                    "/login/device/code" if script == Script::DeviceCodeSlowDown => {
+                        status = "400 Bad Request";
+                        r#"{"error":"slow_down","error_description":"Too many requests have been made in the same timeframe."}"#.to_owned()
+                    }
                     "/login/device/code" => {
                         assert_eq!(field("client_id"), CLIENT_ID);
                         r#"{"device_code":"dc-1","user_code":"WDJB-MJHT","verification_uri":"https://github.com/login/device","expires_in":900,"interval":0}"#.to_owned()
@@ -1912,6 +1968,57 @@ mod tests {
         assert!(!text.contains("damaged"), "{text}");
         assert!(out.is_empty());
         assert_eq!(keychain.raw(), before);
+    }
+
+    // D3576: a refused device code request shows GitHub's error, its
+    // description, and the command to send the request again.
+    #[tokio::test]
+    async fn device_code_refusal_shows_github_error() {
+        let gh = fake_github_scripted("octocat", Script::DeviceCodeSlowDown).await;
+        let keychain = MemoryKeychain::default();
+        let login = Login {
+            keychain: &keychain,
+            endpoints: &gh.endpoints,
+            client_secret: None,
+            device: true,
+            open_browser: &no_browser,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let e = run_login(&login, &mut out, &mut err)
+            .await
+            .expect_err("a refused device code fails");
+        let text = format!("{e:#}");
+        let url = format!("{}/login/device/code", gh.endpoints.oauth);
+        assert_eq!(
+            text,
+            format!(
+                "GitHub refused the sign-in request to {url} (400 Bad Request). GitHub said: slow_down: Too many requests have been made in the same timeframe.\nThis refusal is temporary. Wait a minute, then run `min auth login --device` again."
+            )
+        );
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+        assert!(keychain.raw().is_none());
+    }
+
+    // A refusal with no OAuth error and a refusal with a permanent one get
+    // no retry hint.
+    #[test]
+    fn refusal_without_a_transient_error_has_no_retry_hint() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let retry = Some("min auth login --device");
+        assert_eq!(
+            refusal("u", status, "<html>no</html>".to_owned(), retry),
+            "GitHub refused the sign-in request to u (400 Bad Request)."
+        );
+        assert_eq!(
+            refusal(
+                "u",
+                status,
+                r#"{"error":"unauthorized_client"}"#.to_owned(),
+                retry
+            ),
+            "GitHub refused the sign-in request to u (400 Bad Request). GitHub said: unauthorized_client"
+        );
     }
 
     // BEP-001, the browser flow
