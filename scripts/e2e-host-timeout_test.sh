@@ -114,6 +114,16 @@ if command -v timeout >/dev/null 2>&1; then
   else
     bad "GNU timeout, TERM ignored: got exit $rc after ${elapsed}s, want 124 well before 30s"
   fi
+
+  # A command that ends with 137 on its own, before the limit, is not a
+  # timeout: its own code passes through.
+  rc=0
+  E2E_TIMEOUT_KILL_AFTER=1 e2e_timeout 5 sh -c 'exit 137' || rc=$?
+  if [ "$rc" -eq 137 ]; then
+    ok "GNU timeout: an early exit 137 passes through"
+  else
+    bad "GNU timeout, early exit 137: got exit $rc, want 137"
+  fi
 fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail"

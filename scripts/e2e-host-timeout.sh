@@ -34,10 +34,14 @@ e2e_timeout() {
       return
     fi
     # With -k, GNU timeout exits 137 when it had to send the SIGKILL. That
-    # is still a timeout, so it is reported as one.
-    local grc=0
+    # is still a timeout, so it is reported as one. A command that is killed
+    # some other way before the limit also ends with 137, so the elapsed
+    # time decides which it was.
+    local grc=0 started=$SECONDS
     "$gnu" -k "$kill_after" "$secs" "$@" || grc=$?
-    [ "$grc" -eq 137 ] && return 124
+    if [ "$grc" -eq 137 ] && [ $((SECONDS - started)) -ge "$secs" ]; then
+      return 124
+    fi
     return "$grc"
   fi
 
