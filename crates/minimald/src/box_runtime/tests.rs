@@ -9516,3 +9516,105 @@ async fn restart_records_restart_reason_before_start() {
     assert_eq!(exited[0].data["reason"], "stopped", "{added:?}");
     assert!(exited[0].data.get(STOPPED_BY).is_none(), "{added:?}");
 }
+
+/// NET-079: the supervisor's placement is confirmed by the leaf's own
+/// members, never assumed from the write. A pid counts only as a whole line,
+/// so a pid that shares digits with a member is not taken for it.
+#[test]
+fn a_supervisor_placement_is_confirmed_by_the_leafs_members() {
+    assert!(super::leaf_lists_pid("41\n4242\n", 4242).is_ok());
+    assert!(super::leaf_lists_pid("4242", 4242).is_ok());
+    for members in ["", "424\n", "42420\n", "14242\n"] {
+        assert!(
+            super::leaf_lists_pid(members, 4242).is_err(),
+            "{members:?} does not list 4242"
+        );
+    }
+}
+
+/// NET-079: a supervisor the daemon could not write into its leaf is an
+/// error, which the launch turns into a refused start. A stand-in leaf with
+/// no `cgroup.procs` refuses the write the way a removed leaf does.
+#[test]
+fn a_supervisor_placement_the_leaf_refuses_is_an_error() {
+    let dir = tempfile::tempdir().expect("a stand-in tree");
+    let leaf = sandbox::config::ClassifierLeaf::new(dir.path().join("boxes/deny/b1"));
+    let err = super::place_box_processes(&leaf, std::process::id())
+        .expect_err("no cgroup.procs to write the supervisor into");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// The text a launch fails with when its supervisor could not be placed:
+/// what failed, the cause the placement's error names, and one command.
+#[test]
+fn the_supervisor_placement_refusal_says_the_box_did_not_start() {
+    let refusal = |cause: std::io::Error| super::supervisor_placement_refusal(&cause).to_string();
+    let head = "the box did not start: Minimal could not move the box's supervisor \
+                process into the cgroup that decides the box's network access.";
+    let tail = "If it keeps failing, run `min bug` to collect a diagnostic bundle.";
+    assert_eq!(
+        refusal(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        format!("{head} The cgroup no longer exists. {tail}")
+    );
+    assert_eq!(
+        refusal(std::io::Error::from_raw_os_error(libc::EACCES)),
+        format!("{head} The kernel refused the move. {tail}")
+    );
+    assert_eq!(
+        refusal(super::leaf_lists_pid("41\n", 4242).expect_err("4242 is not listed")),
+        format!(
+            "{head} The move failed: the cgroup does not list process 4242 after the move. {tail}"
+        )
+    );
+}
+
+/// An abandoned launch kills its box's processes, not only the supervisor.
+/// A program that has not armed `PR_SET_PDEATHSIG` yet outlives a killed
+/// supervisor and would exec once its start gate is gone. The stand-in
+/// supervisor's child here never arms it, so only `kill_abandoned_box`
+/// ends it.
+#[test]
+fn an_abandoned_launch_kills_the_program_the_supervisor_forked() {
+    use std::io::BufRead as _;
+    let mut supervisor = std::process::Command::new("sh")
+        .args(["-c", "sleep 600 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("a stand-in supervisor");
+    let mut line = String::new();
+    std::io::BufReader::new(supervisor.stdout.take().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("the program's pid");
+    let program: i32 = line.trim().parse().expect("a pid");
+    let program_ends = |within: Duration| {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            // Gone, or a zombie its parent has not reaped: either has ended.
+            let ended =
+                std::fs::read_to_string(format!("/proc/{program}/stat")).map_or(true, |stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        .is_some_and(|state| matches!(state, "Z" | "X"))
+                });
+            if ended || std::time::Instant::now() >= deadline {
+                return ended;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert!(
+        !program_ends(Duration::ZERO),
+        "the program runs before the kill"
+    );
+
+    super::kill_abandoned_box(supervisor.id());
+
+    let ended = program_ends(Duration::from_secs(10));
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
+    if !ended {
+        // SAFETY: kill(2) reads no memory of ours.
+        unsafe { libc::kill(program, libc::SIGKILL) };
+    }
+    assert!(ended, "the program the supervisor forked is killed with it");
+}
