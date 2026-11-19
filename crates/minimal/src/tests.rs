@@ -4705,7 +4705,7 @@ fn dynamic_ingress_flags_parse() {
     );
 }
 
-/// The CLI reference documents the network flags on `session activate`
+/// The CLI reference documents the network flags on `session start`
 /// (NET-036), read from the real file so a docs edit cannot silently drop
 /// either row.
 #[test]
@@ -4715,8 +4715,8 @@ fn cli_reference_documents_network_flags() {
     let doc = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let section = doc
-        .split_once("### `session activate`")
-        .expect("a `session activate` section in the CLI reference")
+        .split_once("### `session start`")
+        .expect("a `session start` section in the CLI reference")
         .1;
     let section = section.split("### ").next().unwrap();
     // Table cells escape their pipes as `\|`; compare against the rendered
@@ -4730,7 +4730,7 @@ fn cli_reference_documents_network_flags() {
     ] {
         assert!(
             section.contains(row),
-            "the CLI reference's `session activate` rows must document `{row}`"
+            "the CLI reference's `session start` rows must document `{row}`"
         );
     }
 }
@@ -11205,6 +11205,216 @@ async fn attach_ended_from_other_side_notice_exit254() {
         }),
         "a host that answered with an error proves no cause, so the line names the host"
     );
+}
+
+/// BCLI-068: `min box restart` of a box that runs ends its attach with 254
+/// and a line that names the restart. The box runs again afterwards, as it
+/// does after another terminal takes it, so its count of ends decides. A
+/// count that rose is a restart. A count that did not rise is another
+/// terminal. A count that the host did not give names no cause, so the
+/// line names the host that ended the attach.
+#[test]
+fn attach_ended_by_restart_names_restart_exit254() {
+    use cmd::{BoxRestart, EndsBefore, attach_restart, box_attach_ending, ends_show_restart};
+
+    assert_eq!(
+        ends_show_restart(EndsBefore::Running(Some(1)), Some(2)),
+        BoxRestart::Restarted
+    );
+    assert_eq!(
+        ends_show_restart(EndsBefore::Running(Some(1)), Some(1)),
+        BoxRestart::NotRestarted
+    );
+    assert_eq!(
+        ends_show_restart(EndsBefore::Running(Some(1)), None),
+        BoxRestart::Unread
+    );
+    assert_eq!(
+        ends_show_restart(EndsBefore::Running(None), Some(2)),
+        BoxRestart::Unread
+    );
+    assert_eq!(
+        ends_show_restart(EndsBefore::Unread, Some(2)),
+        BoxRestart::Unread
+    );
+    assert_eq!(
+        ends_show_restart(EndsBefore::Ended(1), Some(2)),
+        BoxRestart::NotRestarted
+    );
+
+    let target = ending_target("local0");
+    let running = BoxAfterAttach::Listed(ending_entry("running"));
+    let ending = |before: EndsBefore, after: Option<u64>| {
+        box_attach_ending(
+            &target,
+            254,
+            &running,
+            attach_restart(254, &running, before, after),
+        )
+        .expect("an ending")
+    };
+    assert_eq!(
+        ending(EndsBefore::Running(Some(0)), Some(1)),
+        AttachEnding {
+            code: 254,
+            notice: Some(
+                "Detached: web was restarted. Run min box attach web to attach again.".to_owned()
+            ),
+        },
+        "a count of ends that rose is a restart"
+    );
+    assert_eq!(
+        ending(EndsBefore::Running(Some(1)), Some(1)),
+        AttachEnding {
+            code: 254,
+            notice: Some("Detached: another terminal attached to web.".to_owned()),
+        },
+        "a count of ends that did not rise is another terminal"
+    );
+    let host_ended = AttachEnding {
+        code: 254,
+        notice: Some("Detached: host local0 ended the attach to web.".to_owned()),
+    };
+    assert_eq!(
+        ending(EndsBefore::Running(None), Some(1)),
+        host_ended,
+        "a count before the attach that was not read names no cause"
+    );
+    assert_eq!(
+        ending(EndsBefore::Running(Some(0)), None),
+        host_ended,
+        "a count after the attach that was not read names no cause"
+    );
+    assert_eq!(
+        ending(EndsBefore::Unread, None),
+        host_ended,
+        "a box state that was not read names no cause"
+    );
+
+    // The count never changes an ending that is not a 254 against a box
+    // that runs.
+    let mut stopped = ending_entry("stopped");
+    stopped.reason = Some("stopped".to_owned());
+    let rose = (EndsBefore::Running(Some(0)), Some(1));
+    for (code, after) in [
+        (0, running.clone()),
+        (255, running.clone()),
+        (254, BoxAfterAttach::Listed(stopped.clone())),
+        (254, BoxAfterAttach::Listed(ending_entry("exited"))),
+        (254, BoxAfterAttach::Gone),
+        (254, BoxAfterAttach::Unread),
+    ] {
+        assert_eq!(
+            attach_restart(code, &after, rose.0, rose.1),
+            BoxRestart::NotRestarted,
+            "{code} {after:?}"
+        );
+    }
+    assert_eq!(
+        attach_restart(254, &running, rose.0, rose.1),
+        BoxRestart::Restarted
+    );
+    assert_eq!(
+        attach_restart(254, &running, EndsBefore::Running(Some(1)), Some(1)),
+        BoxRestart::NotRestarted
+    );
+    assert_eq!(
+        attach_restart(254, &running, EndsBefore::Running(Some(1)), None),
+        BoxRestart::Unread
+    );
+    assert_eq!(
+        box_attach_ending(
+            &target,
+            254,
+            &BoxAfterAttach::Listed(stopped),
+            BoxRestart::Restarted
+        ),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was stopped.".to_owned())
+        })
+    );
+    for restarted in [BoxRestart::Restarted, BoxRestart::Unread] {
+        assert_eq!(
+            box_attach_ending(&target, 0, &running, restarted),
+            Ok(AttachEnding {
+                code: 0,
+                notice: None
+            })
+        );
+    }
+}
+
+/// BCLI-068: `min box restart` of a box that an attach holds ends the
+/// attach with 254 and the line that names the restart, through a host.
+/// The host's restart stops the box, which raises its count of ends, and
+/// then starts it. This crate's harness daemon has no package store, so
+/// the start half fails and leaves the box stopped. The test does the
+/// start half itself: it writes back the record of the running box.
+///
+/// A restart stops the box and then starts it. When the command reads the
+/// box between the two, it reads `stopped` and prints the line for a stop.
+/// The second case pins that, with the box left stopped.
+#[tokio::test]
+async fn attach_ended_by_restart_names_restart_exit254_through_the_host() {
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let mut daemon = alpha.server.connect().await;
+    let id = create_box_with_spec(
+        &mut daemon,
+        "web",
+        alpha.project.path(),
+        Some(restart_spec(mfile::spec::Lifetime::UntilStopped)),
+    )
+    .await;
+    let hosts = vec![alpha.host.clone()];
+    let record = box_state_dir(&state, id).join("record.json");
+    let running = std::fs::read(&record).expect("the running box's record");
+
+    for (start_again, line) in [
+        (
+            true,
+            "Detached: web was restarted. Run min box attach web to attach again.",
+        ),
+        (false, "Detached: web was stopped."),
+    ] {
+        let (attached_tx, attached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (restarted_tx, restarted_rx) = tokio::sync::oneshot::channel::<()>();
+        let attach = box_attach_on_hosts(
+            hosts.clone(),
+            Some("web"),
+            None,
+            true,
+            async move |_: &BoxAttachTarget| {
+                let _ = attached_tx.send(());
+                // The restart's stop closes the attach's channel.
+                restarted_rx.await.expect("the restart ran");
+                Ok(254)
+            },
+        );
+        let restart = async {
+            attached_rx.await.expect("the attach ran");
+            let err = cmd::restart_box_on_hosts(hosts.clone(), &mut Vec::new(), "web")
+                .await
+                .expect_err("the harness cannot start the box again");
+            assert!(
+                format!("{err:#}").contains("did not start again"),
+                "the restart stopped the box: {err:#}"
+            );
+            if start_again {
+                std::fs::write(&record, &running).expect("the box runs again");
+            }
+            let _ = restarted_tx.send(());
+        };
+        let (ending, ()) = tokio::join!(attach, restart);
+        assert_eq!(
+            ending.expect("the attach ends"),
+            AttachEnding {
+                code: 254,
+                notice: Some(line.to_owned()),
+            },
+            "the box runs again: {start_again}"
+        );
+    }
 }
 
 /// BCLI-068: the daemon closes the attach's channel before it writes the
@@ -18446,6 +18656,101 @@ async fn box_spec_box_renders_stored_copy() {
     );
 }
 
+// BCLI-022, BOX-179: `min box spec <box>` lists each stored lifecycle
+// hook with its event, its command, its description and its declarer.
+// A description, a script path or the first line of an inline command
+// prints as a one-line TOML string, so a line break or a lone `\r` in it
+// cannot end the comment or forge a row.
+#[tokio::test]
+async fn box_spec_box_lists_hooks_with_declarer() {
+    let toml = r#"
+[sessions.default]
+loadout_mode = "open"
+lifecycle_hooks = [{ description = "Warm the cache", on_activate = { type = "inline", value = "echo project" }, on_destroy = { type = "inline", value = "echo bye\necho done" } }, { description = "x\n# on_attach: y (from minimal.toml)", on_attach = { type = "inline", value = "echo x" } }, { description = "Carriage", on_detach = { type = "inline", value = "echo a\rforged" } }]
+"#;
+    let project = tempfile::tempdir().expect("a project dir");
+    std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+    let root = camino::Utf8Path::from_path(project.path()).expect("a UTF-8 project path");
+    let selected = crate::SelectedLoadouts {
+        loadouts: vec![named_loadout(
+            "rust",
+            r#"[[lifecycle_hooks]]
+description = "Attach rust\nthen say \"hi\""
+on_attach = { type = "inline", value = "echo rust" }
+on_detach = { type = "external", value = "./cleanup.sh" }
+"#,
+        )],
+        ignore: None,
+    };
+    let expanded = crate::session_box_expansion(root, None, true, &selected)
+        .expect("the entry expands")
+        .expect("the project declares the entry");
+    let start = parsed_start(&["min", "box", "start"]);
+    let StartPlan::Session { args, options, .. } =
+        plan_start(&start, &start_entries(toml), true).expect("the start is planned")
+    else {
+        panic!("the default entry is a session");
+    };
+    let mut request = planned_session_request(&args, &options, root);
+    crate::put_spec_hooks(&mut request, expanded.spec_hooks().expect("the hooks read"))
+        .expect("the hooks go on the spec");
+
+    let (_state, mut global, server) = show_network_daemon().await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    global.repo_dir = Some(elsewhere.path().to_path_buf());
+    let id = create_box_from(&server, &request).await.to_string();
+
+    let text = box_spec_text(&global, &["min", "box", "spec", &id])
+        .await
+        .expect("the stored spec renders");
+    let header = format!(
+        "# The spec box {id} was created with.\n\
+         # Lifecycle hooks:\n\
+         #   on_activate \"Warm the cache\": inline \"echo project\" (from minimal.toml)\n\
+         #   on_destroy \"Warm the cache\": inline \"echo bye\" ... (from minimal.toml)\n\
+         #   on_attach \"x\\n# on_attach: y (from minimal.toml)\": inline \"echo x\" (from minimal.toml)\n\
+         #   on_detach \"Carriage\": inline \"echo a\\rforged\" (from minimal.toml)\n\
+         #   on_attach \"Attach rust\\nthen say \\\"hi\\\"\": inline \"echo rust\" (from loadout rust)\n\
+         #   on_detach \"Attach rust\\nthen say \\\"hi\\\"\": external \"./cleanup.sh\" (from loadout rust)\n"
+    );
+    assert!(text.starts_with(&header), "{text}");
+    // The list is comments, so the render stays TOML with the hooks in it.
+    let parsed: toml::Table = toml::from_str(&text).expect("the render is TOML");
+    let hooks = parsed["lifecycle_hooks"]
+        .as_array()
+        .expect("the hooks render");
+    assert_eq!(hooks.len(), 4);
+    assert_eq!(hooks[3]["declared_by"]["name"].as_str(), Some("rust"));
+    // The description with a line break in it gives one row, not a forged second one.
+    let project_rows = text
+        .lines()
+        .filter(|line| line.ends_with("(from minimal.toml)"))
+        .count();
+    assert_eq!(project_rows, 4, "{text}");
+    // A lone `\r` in an inline command prints escaped, never raw.
+    assert!(text.lines().all(|line| !line.contains('\r')), "{text:?}");
+    let echo_x_rows = text
+        .lines()
+        .filter(|line| line.starts_with('#') && line.contains("echo x"))
+        .count();
+    assert_eq!(echo_x_rows, 1, "{text}");
+
+    // A box stored with an empty hook list says it has none.
+    let mut unhooked = request.clone();
+    unhooked.config.name = Some("unhooked".to_owned());
+    crate::put_spec_hooks(&mut unhooked, Vec::new()).expect("the hooks go on the spec");
+    let unhooked_id = create_box_from(&server, &unhooked).await.to_string();
+    let text = box_spec_text(&global, &["min", "box", "spec", &unhooked_id])
+        .await
+        .expect("the stored spec renders");
+    assert!(
+        text.starts_with(&format!(
+            "# The spec box {unhooked_id} was created with.\n# Lifecycle hooks: none.\n"
+        )),
+        "{text}"
+    );
+}
+
 // BCLI-022: an argument is an entry of the project that `--repo-dir`
 // names first, and a box address second. It is never a directory.
 #[tokio::test]
@@ -19542,6 +19847,69 @@ fn type_commands_refuse_invalid_project_types_with_exit_3() {
         assert!(out.is_empty(), "{kind}: a refusal writes nothing to stdout");
     }
     assert_eq!(cmd::types::BoxTypesInvalid::EXIT_CODE, 3);
+}
+
+/// gominimal/inbox#1237: `min type list` refuses a `[box_types.<name>]`
+/// with a key a type does not take, with exit 3 and the type's message,
+/// and lists a type that carries all four keys.
+#[test]
+fn type_list_refuses_unknown_box_type_key_with_exit_3() {
+    let control = tempfile::tempdir().unwrap();
+    std::fs::write(
+        control.path().join(mfile::MFILE_NAME),
+        "[box_types.ci]\ndescription = \"Bounded CI run\"\nextends = \"task\"\n\
+         defaults = { timeout = \"10m\" }\nconstraints = { pty_enabled = false }\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    cmd::types::cmd_type_list(
+        &type_globals(control.path()),
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect("a type with all four keys lists");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>()
+                == ["ci", "project", "task", "task"]),
+        "{text}"
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(mfile::MFILE_NAME),
+        "[box_types.ci]\nextends = \"task\"\ndefault = { timeout = \"10m\" }\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let err = cmd::types::cmd_type_list(
+        &type_globals(project.path()),
+        &TypeListArgs::default(),
+        &mut out,
+    )
+    .expect_err("the list refuses");
+    let invalid = err
+        .downcast_ref::<cmd::types::BoxTypesInvalid>()
+        .unwrap_or_else(|| panic!("not a typed refusal: {err:#}"));
+    assert!(
+        matches!(
+            &invalid.cause,
+            cmd::types::BoxTypesCause::Resolve(mfile::box_types::BoxTypeError::UnknownKey {
+                name,
+                key,
+            }) if name == "ci" && key == "default"
+        ),
+        "{invalid:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Cannot list the box types: `[box_types.ci]` in minimal.toml sets `default`, \
+         which is not a key of a box type. A box type takes `extends`, `defaults`, \
+         `constraints` and `description`. Remove the key or correct its name."
+    );
+    assert_eq!(cmd::types::BoxTypesInvalid::EXIT_CODE, 3);
+    assert!(out.is_empty(), "a refusal writes nothing to stdout");
 }
 
 /// What `min type show <name>` resolves in `project`: the same load and
@@ -22119,6 +22487,287 @@ async fn exports_not_copied_from_another_project() {
     );
 }
 
+// BOX-203: one wait on several boxes copies their exports box by box in
+// the order the boxes ended, so where two boxes export one path, the file
+// of the later end stays. The wait names the boxes in the other order. A
+// wait from another project copies nothing of either box (BOX-199).
+#[tokio::test]
+async fn multi_box_wait_copies_in_order_of_ends() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let other = tempfile::tempdir().expect("a temp folder of another project");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let other_root = paths::HostAbsPath::try_new(other.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let mut ids = Vec::new();
+    for name in ["early", "late"] {
+        let id = create_spec_box(
+            &mut daemon,
+            name,
+            project.path(),
+            Some(export_spec(false, &["report.txt"])),
+            minimald_rpc::CreatingVerb::Task,
+        )
+        .await;
+        let contents = format!("from {name}");
+        put_box_files(
+            &mut daemon,
+            id,
+            &[],
+            &[("/workbench/report.txt", contents.as_bytes())],
+        )
+        .await;
+        ids.push(id);
+    }
+    let (early, late) = (ids[0], ids[1]);
+    for name in ["early", "late"] {
+        cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), name, false)
+            .await
+            .expect("the box stops");
+        // The ends are written in whole milliseconds, so they must differ.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    let targets = ["late".to_owned(), "early".to_owned()];
+
+    // From another project, the wait copies nothing and claims no end.
+    let elsewhere = cmd::box_wait_all_on_hosts(
+        local_hosts(&global).unwrap(),
+        &targets,
+        Some(&other_root),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees both boxes end");
+    assert_eq!(elsewhere.len(), 2);
+    assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+    assert!(file_exported_lines(&global, "early").await.is_empty());
+    assert!(file_exported_lines(&global, "late").await.is_empty());
+
+    let waited = cmd::box_wait_all_on_hosts(
+        local_hosts(&global).unwrap(),
+        &targets,
+        Some(&here),
+        None,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .expect("the wait sees both boxes end");
+    let order: Vec<_> = waited.iter().map(|one| one.box_id).collect();
+    assert_eq!(order, vec![early, late], "copied in the order of the ends");
+    assert_eq!(
+        std::fs::read(project.path().join("report.txt")).unwrap(),
+        b"from late",
+        "the file of the later end stays"
+    );
+    for name in ["early", "late"] {
+        let events = file_exported_lines(&global, name).await;
+        assert_eq!(events.len(), 1, "{name}: {events:?}");
+        assert_eq!(events[0]["data"]["copied"], true, "{name}");
+    }
+}
+
+// BOX-204: an attach that resumes a box with a terminal copies only an end
+// that comes after the resume, never the end the box resumed from. The box
+// stores a whole spec that declares the export, so a resume reads it. The
+// attach resumes the box through its shell. This crate's harness daemon has
+// no package store, so the launch fails after the spec is read, and the
+// host writes back the record the box resumed from. The attach copies
+// nothing and claims nothing, so a later wait still copies that end once.
+// minimald's own tests drive a resume that launches (BOX-025). A last
+// attach resumes the box again, and the box ends again while it runs, with
+// new contents in its export. That attach copies the new contents, once.
+#[tokio::test]
+async fn resumed_box_copies_at_next_end_only() {
+    // A count of ends that the host did not give is no new end, so the
+    // attach leaves the end it resumed from unclaimed.
+    use cmd::{EndsBefore, ends_show_new_end};
+    assert!(ends_show_new_end(EndsBefore::Running(None), None));
+    assert!(ends_show_new_end(EndsBefore::Ended(1), Some(2)));
+    assert!(!ends_show_new_end(EndsBefore::Ended(1), Some(1)));
+    assert!(!ends_show_new_end(EndsBefore::Ended(1), None));
+    assert!(!ends_show_new_end(EndsBefore::Unread, Some(2)));
+    assert!(!ends_show_new_end(EndsBefore::Unread, None));
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_dir = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let here = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let mut daemon = server.connect().await;
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = true;
+    let mut spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    spec["file_exports"] = serde_json_lenient::json!([{ "path": "notes.md" }]);
+    let dev = create_spec_box(
+        &mut daemon,
+        "dev",
+        project.path(),
+        Some(spec),
+        minimald_rpc::CreatingVerb::Session,
+    )
+    .await;
+    put_box_files(
+        &mut daemon,
+        dev,
+        &[],
+        &[("/workbench/notes.md", b"first end")],
+    )
+    .await;
+    cmd::stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "dev", false)
+        .await
+        .expect("the box stops");
+
+    for code in [0, 1] {
+        let mut refusal = Vec::new();
+        let _ = attach_on_hosts(
+            AttachVerb::BoxResume,
+            local_hosts(&global).unwrap(),
+            Some("dev"),
+            None,
+            Some(&here),
+            true,
+            async |_target: &BoxAttachTarget| {
+                let mut channel = daemon.open_shell(dev).await;
+                while let Ok(Some(msg)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), channel.wait()).await
+                {
+                    if let russh::ChannelMsg::Data { data } = msg {
+                        refusal.extend_from_slice(&data);
+                    }
+                }
+                Ok(code)
+            },
+        )
+        .await;
+        let refusal = String::from_utf8_lossy(&refusal);
+        assert!(
+            refusal.contains("no such package"),
+            "code {code}: the resume read the stored spec and reached the launch: {refusal:?}"
+        );
+        assert!(
+            !refusal.contains("settings it was created with"),
+            "code {code}: the stored spec with exports is read: {refusal:?}"
+        );
+        assert!(
+            !project.path().join("notes.md").exists(),
+            "code {code}: the end the box resumes from gets no copy"
+        );
+        assert!(file_exported_lines(&global, "dev").await.is_empty());
+    }
+
+    // The end is not claimed, so a wait copies it, once.
+    for _ in 0..2 {
+        cmd::box_wait_on_hosts(
+            local_hosts(&global).unwrap(),
+            "dev",
+            Some(&here),
+            None,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("the wait sees the box end");
+    }
+    assert_eq!(
+        std::fs::read(project.path().join("notes.md")).unwrap(),
+        b"first end"
+    );
+    assert_eq!(file_exported_lines(&global, "dev").await.len(), 1);
+
+    // The next end after a resume copies what the box holds then, once.
+    // The attach resumes the box. While the attach runs, the box gets new
+    // contents in its export and ends again: a second `exited` event, as
+    // the daemon writes it.
+    let mut refusal = Vec::new();
+    let code = attach_on_hosts(
+        AttachVerb::BoxResume,
+        local_hosts(&global).unwrap(),
+        Some("dev"),
+        None,
+        Some(&here),
+        true,
+        async |_target: &BoxAttachTarget| {
+            let mut channel = daemon.open_shell(dev).await;
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), channel.wait()).await
+            {
+                if let russh::ChannelMsg::Data { data } = msg {
+                    refusal.extend_from_slice(&data);
+                }
+            }
+            // A stopped box takes no SFTP write, so the new contents go
+            // straight into the files the host keeps for the box.
+            rewrite_kept_box_file(&state_dir, "notes.md", b"first end", b"next end");
+            write_box_exited_event(&state_dir, dev);
+            Ok(0)
+        },
+    )
+    .await;
+    assert!(code.is_ok(), "the attach ends: {code:?}");
+    assert_eq!(
+        std::fs::read(project.path().join("notes.md")).unwrap(),
+        b"next end",
+        "the next end copies what the box holds then"
+    );
+    let exported = file_exported_lines(&global, "dev").await;
+    let next_end: Vec<_> = exported
+        .iter()
+        .filter(|line| line["data"]["end"] == 2)
+        .collect();
+    assert_eq!(
+        next_end.len(),
+        1,
+        "one export event for the next end: {exported:?}"
+    );
+    assert_eq!(next_end[0]["data"]["copied"], true, "{exported:?}");
+    assert_eq!(exported.len(), 2, "{exported:?}");
+}
+
+/// Writes `new` over the one file named `name` with the contents `old`
+/// that the daemon under the state dir `state` keeps for a box.
+fn rewrite_kept_box_file(state: &std::path::Path, name: &str, old: &[u8], new: &[u8]) {
+    fn walk(dir: &std::path::Path, name: &str, old: &[u8], found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(&path, name, old, found);
+            } else if kind.is_file()
+                && entry.file_name() == name
+                && std::fs::read(&path).is_ok_and(|contents| contents == old)
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(state, name, old, &mut found);
+    assert_eq!(found.len(), 1, "one kept copy of {name}: {found:?}");
+    std::fs::write(&found[0], new).expect("the kept file is written");
+}
+
+/// Appends an `exited` event to the events of box `id` under the daemon
+/// state dir `state`, as the daemon writes one when the box ends.
+fn write_box_exited_event(state: &std::path::Path, id: boxes::SessionId) {
+    let box_dir = box_state_dir(state, id);
+    let record: boxes::Record =
+        serde_json_lenient::from_slice(&std::fs::read(box_dir.join("record.json")).unwrap())
+            .expect("the box's record");
+    let event = boxes::events::BoxEvent::for_record(&record, boxes::events::BoxEventType::Exited);
+    let events = camino::Utf8PathBuf::from_path_buf(box_dir.join(boxes::events::EVENTS_FILE))
+        .expect("a UTF-8 path");
+    boxes::store::append_event_at(&events, &event).expect("the event is written");
+}
+
 /// The harness host that `global` selects.
 fn selected_host(global: &GlobalArgs) -> LocalHost {
     local_hosts(global)
@@ -22838,4 +23487,105 @@ async fn skipped_export_keeps_failed_task_exit_code() {
     assert_ne!(code, 0, "a stop is not a clean exit");
     assert_ne!(code, 125, "a stop keeps its own code");
     assert!(!project.path().join("never-made.txt").exists());
+}
+
+// BCLI-028: one command model drives completion, so every `min box` verb
+// that takes a box completes box names exactly as `min session attach` does.
+#[test]
+fn box_verbs_complete_box_names() {
+    use clap::CommandFactory as _;
+    use clap_complete::engine::ArgValueCompleter;
+
+    fn completer<'a>(cli: &'a clap::Command, path: &[&str], arg: &str) -> &'a ArgValueCompleter {
+        let mut cmd = cli;
+        for name in path {
+            cmd = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("`min {}` exists", path.join(" ")));
+        }
+        let found = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == arg)
+            .unwrap_or_else(|| panic!("`min {}` takes `{arg}`", path.join(" ")));
+        found
+            .get::<ArgValueCompleter>()
+            .unwrap_or_else(|| panic!("`min {}` completes `{arg}`", path.join(" ")))
+    }
+
+    fn values(completer: &ArgValueCompleter, prefix: &str) -> Vec<String> {
+        completer
+            .complete(std::ffi::OsStr::new(prefix))
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // A fixed box list in place of the daemon: a running box named `web`,
+    // one named `api`, and one with no name.
+    let web_id = "019f5d80-ff86-7322-8846-18b49b6aae89";
+    let _boxes = crate::completion::test_boxes::set(vec![
+        twin_entry(web_id, Some("web"), None, boxes::BoxState::Active),
+        twin_entry(
+            "019f5d80-ff86-7322-8846-000000000002",
+            Some("api"),
+            None,
+            boxes::BoxState::Active,
+        ),
+        twin_entry(
+            "abcdef01-0000-7000-8000-000000000000",
+            None,
+            None,
+            boxes::BoxState::Active,
+        ),
+    ]);
+
+    let cli = Cli::command();
+    let reference = completer(&cli, &["session", "attach"], "session");
+
+    // The reference itself offers `web` for `w`, so the comparison below
+    // compares real candidates and not two empty lists.
+    assert_eq!(values(reference, "w"), vec!["web".to_string()]);
+    assert_eq!(
+        values(reference, ""),
+        vec![
+            "web".to_string(),
+            "api".to_string(),
+            "abcdef01-0000-7000-8000-000000000000".to_string(),
+        ],
+    );
+    assert_eq!(
+        values(reference, "019f5d80-ff86-7322-8846-18"),
+        vec![web_id.to_string()]
+    );
+
+    let box_args: &[(&[&str], &str)] = &[
+        (&["box", "attach"], "target"),
+        (&["box", "exec"], "target"),
+        (&["box", "logs"], "target"),
+        (&["box", "show"], "target"),
+        (&["box", "spec"], "target"),
+        (&["box", "audit"], "target"),
+        (&["box", "audit"], "parent"),
+        (&["box", "stop"], "target"),
+        (&["box", "rm"], "target"),
+        (&["box", "restart"], "target"),
+        (&["box", "resume"], "target"),
+        (&["box", "wait"], "target"),
+        (&["box", "events"], "target"),
+        (&["box", "events"], "parent"),
+        (&["box", "rename"], "target"),
+        (&["box", "prune"], "parent"),
+    ];
+
+    for prefix in ["", "w", "019f5d80-ff86-7322-8846-18"] {
+        let expected = values(reference, prefix);
+        for (path, arg) in box_args {
+            assert_eq!(
+                values(completer(&cli, path, arg), prefix),
+                expected,
+                "`min {} <{arg}>` offers what `min session attach` offers for {prefix:?}",
+                path.join(" "),
+            );
+        }
+    }
 }

@@ -15092,6 +15092,62 @@ async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_pl
         .expect("a box that was never placed starts a check");
 }
 
+/// inbox#1245: the context the box actor builds for a box confines its
+/// `minimal.toml` edits to the box's workspace. Once the box replaces its
+/// `minimal.toml` with a link to a file outside the workspace, `min add` in
+/// the box (`add_deps` on that context) is refused, and neither the file
+/// outside nor the link changes. Without `build_context`'s
+/// `confine_mfile_edits_to` the edit follows the link out of the workspace
+/// and the add succeeds, so this test fails.
+///
+/// The context is built while `minimal.toml` is still a regular file, so
+/// the test reaches the edit whether or not the context's read of the file
+/// is confined too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_context_refuses_an_add_through_a_minimal_toml_that_links_out() {
+    let server = TestServer::new().await;
+    let mngr = server.state.sessions_manager().await;
+    let id =
+        crate::box_manager::tests::active_session_needing(&mngr, "confined-add", "pkg-a").await;
+    let handle = box_handle(&server, id).await;
+    let workspace = handle.paths().await.unwrap().working;
+    let mut ctx = handle
+        .context()
+        .await
+        .expect("an active box builds its context");
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().join(mfile::MFILE_NAME);
+    let content = "[stack]\nname = \"base\"\n";
+    std::fs::write(&outside_path, content).unwrap();
+    let mfile_path = workspace.as_utf8_path().join(mfile::MFILE_NAME);
+    let staged = workspace.as_utf8_path().join("minimal.toml.link");
+    std::os::unix::fs::symlink(&outside_path, &staged).unwrap();
+    std::fs::rename(&staged, &mfile_path).unwrap();
+
+    let err = ctx
+        .add_deps(
+            &graph::Graph::new(),
+            Vec::<graph::BuildSpecRef>::new(),
+            mctx::AddDepMode::BuildPackages,
+        )
+        .expect_err("an add through a link out of the workspace is refused");
+
+    // Where every link is refused (off Linux, or a kernel without
+    // `openat2`) the refusal says only that it is a link.
+    let text = err.to_string();
+    assert!(
+        text.contains("leads outside its workspace") || text.contains("cannot follow a link here"),
+        "error: {text}"
+    );
+    assert!(
+        !text.contains(workspace.as_utf8_path().as_str()),
+        "the refusal shows the daemon's path to the workspace: {text}"
+    );
+    assert_eq!(std::fs::read_to_string(&outside_path).unwrap(), content);
+    assert_eq!(std::fs::read_link(&mfile_path).unwrap(), outside_path);
+}
+
 /// gominimal/minimal#1373: the context a box builds keys its task state on
 /// the record's host project, so a run's state survives the next session's
 /// freshly laid-out tree. A context made from the fixture repo carries no
@@ -16153,6 +16209,43 @@ async fn resume_restarts_from_stored_spec_same_id_and_name() {
     assert_eq!(events[resumed].data["from"], "stopped");
 }
 
+/// BOX-025: a box whose stored spec carries a schema key that the typed
+/// spec does not read, such as `io.exec_enabled` or
+/// `network.vpn_network_names`, resumes. It does not stay stopped on an
+/// unknown field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_reads_stored_spec_with_exec_enabled_and_vpn_names() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resume-kept-keys"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let mut spec = resume_spec(true);
+    spec["io"]["exec_enabled"] = serde_json_lenient::json!(false);
+    spec["network"]["vpn_network_names"] = serde_json_lenient::json!(["corp"]);
+    rewrite_spec(&server, id, &spec).await;
+    let stored = std::fs::read(record_dir(&server, id).await.join("spec.json")).unwrap();
+    let read = crate::box_runtime::stored_spec(&stored).expect("the daemon reads the stored spec");
+    assert!(read.kept_keys.contains_key("io.exec_enabled"));
+    assert!(read.kept_keys.contains_key("network.vpn_network_names"));
+
+    stop_through_daemon(&server, id).await;
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach to a stopped box with these keys resumes it");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
 /// BOX-025: a resume whose launch fails writes back the record it read,
 /// byte for byte, and records no `resumed` event, so the box never reads
 /// as running with no processes and keeps the settings it had. The next
@@ -16337,6 +16430,100 @@ async fn resume_refuses_unsatisfiable_spec_keeps_state() {
         3,
     )
     .await;
+}
+
+/// BOX-025, BOX-160: a resume meets the admission check a create of its
+/// stored spec meets, against the constraints of the spec's built-in root
+/// and of the type the record is filed under. A stored spec that check
+/// refuses is refused with the create's exit status 3, and the record stays
+/// as it was, byte for byte. Each refused spec keeps `pty_enabled`, so the
+/// terminal check passes it on. The control: the spec the create accepted
+/// resumes once it is stored again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_stored_spec_its_root_excludes_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("root-spec"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+    let record_path = record_dir(&server, id).await.join("record.json");
+    let pty_spec_of_type = |box_type: &str| {
+        let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+        spec.pty_enabled = true;
+        spec.box_type = box_type.to_string();
+        serde_json_lenient::to_value(&spec).expect("a spec serializes")
+    };
+
+    // The `task` root allows no terminal.
+    rewrite_spec(&server, id, &pty_spec_of_type(boxes::TASK_BOX_TYPE)).await;
+    let before = std::fs::read(&record_path).unwrap();
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &[
+            "session `root-spec`",
+            "`io.pty_enabled` to `true`",
+            "the built-in type `task` allows only `false`",
+            "min session destroy root-spec",
+        ],
+        3,
+    )
+    .await;
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+
+    // A type with no built-in root.
+    rewrite_spec(&server, id, &pty_spec_of_type("no-such-root")).await;
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &["`box.type` to `no-such-root`", "names no built-in type"],
+        3,
+    )
+    .await;
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+
+    // A `session` spec on a record filed as a `task`: the record's type is
+    // checked as a create checks the creating verb's.
+    rewrite_spec(&server, id, &resume_spec(true)).await;
+    rewrite_record(&server, id, |record| {
+        record.box_type = Some(boxes::TASK_BOX_TYPE.to_string());
+    })
+    .await;
+    let before = std::fs::read(&record_path).unwrap();
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &["the built-in type `task` allows only `false`"],
+        3,
+    )
+    .await;
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+
+    // The control: the box as the create filed it resumes.
+    rewrite_record(&server, id, |record| {
+        record.box_type = Some(boxes::SESSION_BOX_TYPE.to_string());
+    })
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("a stored spec the create accepted resumes");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
 }
 
 /// BOX-025: a resume is refused while a running box holds the box's name,
@@ -18628,4 +18815,34 @@ async fn restart_argv_box_behind_hook_shell_with_host_row_fails_stopped() {
     let added: Vec<_> = events[before..].iter().map(|e| e.kind).collect();
     assert_eq!(added, [BoxEventType::Exited], "{added:?}");
     assert_eq!(events[before].data["reason"], "stopped");
+}
+
+/// The default `minimal.toml` is written inside the box's workspace only:
+/// over a link that leads out of it, the scaffold is refused, the file
+/// outside is left as it was and the link is kept.
+#[test]
+fn a_scaffold_over_a_link_out_of_the_workspace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    let outside = dir.path().join("outside.toml");
+    std::fs::write(&outside, "# outside\n").unwrap();
+    let link = workspace.join(mfile::MFILE_NAME);
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let err = super::setup::write_default_mfile(
+        &workspace,
+        &link,
+        "[defaults.session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+    )
+    .unwrap_err();
+
+    // Where every link is refused (off Linux, or a kernel without
+    // `openat2`) the refusal says only that it is a link.
+    assert!(
+        err.contains("leads outside its workspace") || err.contains("cannot follow a link here"),
+        "error: {err}"
+    );
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# outside\n");
+    assert_eq!(std::fs::read_link(&link).unwrap(), outside);
 }
