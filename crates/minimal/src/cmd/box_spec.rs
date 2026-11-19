@@ -529,7 +529,11 @@ fn proxy_rows(
     read_rules: Option<&StoreRules>,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
-    let acknowledged = crate::config::full_breadth_acknowledged(global)?;
+    // BEP-057: the client configuration is read only when a grant needs the
+    // acknowledgement, as the start reads it, so an entry with no narrow
+    // grant never depends on config.toml.
+    let acknowledged = secrets.values().any(SecretGrant::is_narrower_than_full)
+        && crate::config::full_breadth_acknowledged(global)?;
     let store_rules = match read_rules {
         Some(rules) => rules.clone(),
         None if boxes::core::bep::store_references(secrets).next().is_some() => {
@@ -1064,9 +1068,22 @@ fn expand_entry(
             }
         }
     }
-    // #2445: every entry runs the start's whole check, with or without a
-    // grant, so a refusal of the start (BEP-010 needs no grant) is a
-    // refusal here. Only a credentialed grant prints rows.
+    // #2445: every session entry runs the start's whole check, with or
+    // without a grant, so a refusal of the start (BEP-010 needs no grant) is
+    // a refusal here. `min task run` makes no such check, so a task entry is
+    // checked only for a credentialed grant, as before. Only a credentialed
+    // grant prints rows.
+    let credentialed = grants.values().any(SecretGrant::is_credentialed);
+    if box_type == boxes::TASK_BOX_TYPE && !credentialed {
+        return Ok(EntrySpec {
+            entry: entry.name.clone(),
+            box_type,
+            spec,
+            sources,
+            proxy_rows: Vec::new(),
+            loadouts,
+        });
+    }
     let bep: BepSettings = network
         .get("bep")
         .cloned()
@@ -1096,7 +1113,7 @@ fn expand_entry(
         read_rules.as_ref(),
         &mut rows,
     )?;
-    let rows_text = if grants.values().any(SecretGrant::is_credentialed) {
+    let rows_text = if credentialed {
         String::from_utf8_lossy(&rows)
             .lines()
             .map(str::to_owned)

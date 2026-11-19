@@ -7113,6 +7113,41 @@ mod tests {
         }
     }
 
+    // #2445: `min task run` makes no grant check, so `min box spec <entry>`
+    // does not refuse a task entry with no grant that sets `steering =
+    // "off"` with `proxy_env`. The same settings on a session entry are
+    // refused, as the test above shows.
+    #[tokio::test]
+    async fn box_spec_task_entry_preview_accepts_what_task_run_accepts() {
+        let home = tempfile::tempdir().expect("home dir");
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[tasks.build]\necho = 'x'\n\n\
+             [tasks.build.network.bep]\nsteering = \"off\"\nproxy_env = true\n",
+        )
+        .expect("write minimal.toml");
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            minimal_dir: Some(home.path().join("state")),
+            config_dir: Some(home.path().join("config")),
+            provider: None,
+            no_input: true,
+            vm: None,
+        };
+        let mut out = Vec::new();
+        crate::cmd::box_spec::box_spec_to(
+            &global,
+            parsed_box_spec_args(&["min", "box", "spec", "build"]),
+            false,
+            &mut out,
+        )
+        .await
+        .expect("min box spec shows the task entry");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("proxy_env"), "{text}");
+    }
+
     // BEP-032: a box whose only proxy-served secrets are store references
     // is refused in words that name no GitHub grant. A GitHub grant box
     // keeps the GitHub wording.
