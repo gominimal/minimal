@@ -5321,6 +5321,7 @@ exit $rc
             .args(args)
             .current_dir(cwd)
             .env_remove("TRACEPARENT")
+            .env_remove(minimald_rpc::trace::OTEL_ENV)
             .env("PWD", cwd)
             .envs(envs.iter().copied())
             .env(
@@ -5368,6 +5369,7 @@ exit $rc
                 .args(["task", "run", "lint"])
                 .current_dir(rootfs)
                 .env_remove("TRACEPARENT")
+                .env_remove(minimald_rpc::trace::OTEL_ENV)
                 .env("PWD", rootfs)
                 .env(
                     "PATH",
@@ -5481,6 +5483,7 @@ exit $rc
             .args(["net", "expose", "8080"])
             .current_dir(rootfs)
             .env_remove("TRACEPARENT")
+            .env_remove(minimald_rpc::trace::OTEL_ENV)
             .env("PWD", rootfs)
             .env(
                 "PATH",
