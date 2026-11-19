@@ -7292,12 +7292,12 @@ mod tests {
         }
     }
 
-    // #2445: `min task run` makes no grant check, so `min box spec <entry>`
-    // does not refuse a task entry with no grant that sets `steering =
-    // "off"` with `proxy_env`. The same settings on a session entry are
-    // refused, as the test above shows.
+    // #2445: `min box spec <entry>` of a task entry gives the answer that
+    // `min task run` gives. A task box does not apply `network.bep`, so
+    // both commands refuse it with the same text and exit 3, and no rows
+    // print. The grant check of a session entry does not apply here.
     #[tokio::test]
-    async fn box_spec_task_entry_preview_accepts_what_task_run_accepts() {
+    async fn box_spec_task_entry_preview_refuses_what_task_run_refuses() {
         let home = tempfile::tempdir().expect("home dir");
         let project = tempfile::tempdir().expect("project dir");
         std::fs::write(
@@ -7306,6 +7306,8 @@ mod tests {
              [tasks.build.network.bep]\nsteering = \"off\"\nproxy_env = true\n",
         )
         .expect("write minimal.toml");
+        let root = camino::Utf8Path::from_path(project.path()).expect("utf-8 project dir");
+        let run = task_project_egress(root, "build").expect_err("min task run refuses");
         let global = GlobalArgs {
             repo_dir: Some(project.path().to_path_buf()),
             minimal_dir: Some(home.path().join("state")),
@@ -7315,16 +7317,24 @@ mod tests {
             vm: None,
         };
         let mut out = Vec::new();
-        crate::cmd::box_spec::box_spec_to(
+        let err = crate::cmd::box_spec::box_spec_to(
             &global,
             parsed_box_spec_args(&["min", "box", "spec", "build"]),
             false,
             &mut out,
         )
         .await
-        .expect("min box spec shows the task entry");
-        let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("proxy_env"), "{text}");
+        .expect_err("min box spec refuses the task entry");
+        let refused = err
+            .downcast_ref::<TaskNetworkUnapplied>()
+            .unwrap_or_else(|| panic!("the box spec refusal: {err:#}"));
+        assert_eq!(refused.to_string(), run.to_string(), "same refusal text");
+        assert_eq!(
+            refused.to_string(),
+            "[tasks.build] in minimal.toml sets network.bep, which is not applied to a \
+             task box. Remove network.bep from [tasks.build]."
+        );
+        assert!(out.is_empty(), "no rows print");
     }
 
     // BEP-032: a box whose only proxy-served secrets are store references
