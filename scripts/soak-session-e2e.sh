@@ -31,6 +31,11 @@
 #                       order, separated by spaces (default: lifecycle
 #                       session_exec sandbox restart). `all` runs the whole
 #                       lane once per iteration instead.
+#   SOAK_CASE_TIMEOUT_SECS  time limit, in seconds, for one case's
+#                       session-e2e.sh run (default 600). A run that hangs
+#                       past it counts as a failed case, and the soak goes on
+#                       to the next case instead of losing the rest of the
+#                       night to the job's time limit. Not applied with `all`.
 #   SOAK_MIN_FREE_MIB   free-space floor, in MiB, for the filesystem holding the
 #                       per-iteration state dirs (default 4096). See the
 #                       headroom check below for why this harness needs one.
@@ -62,9 +67,27 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CASES="${SOAK_CASES-lifecycle session_exec sandbox restart}"
 case "$CASES" in
   all) CASES="" ;;  # session-e2e.sh with no argument runs the whole lane
-  *[!\ ]*) ;;
+  *[![:space:]]*) ;;
   *) echo "SOAK_CASES names no case; set it to case names or 'all'" >&2; exit 2 ;;
 esac
+# Check every name once, up front: session-e2e.sh refuses an unknown case
+# only when it runs, so a misspelt name would fail the same case in every
+# iteration. Each case is the suffix of a proof_<case> function there.
+for c in $CASES; do
+  if ! grep -q "^proof_${c}() {" "$ROOT/scripts/session-e2e.sh"; then
+    echo "SOAK_CASES names '$c', which is not a case of scripts/session-e2e.sh" >&2
+    exit 2
+  fi
+done
+
+CASE_TIMEOUT="${SOAK_CASE_TIMEOUT_SECS:-600}"
+case "$CASE_TIMEOUT" in
+  '' | *[!0-9]* | 0) echo "SOAK_CASE_TIMEOUT_SECS must be a positive integer, got: '$CASE_TIMEOUT'" >&2; exit 2 ;;
+esac
+# e2e_timeout: a host-side timeout that also works with no GNU timeout on
+# PATH, as on a stock Mac.
+# shellcheck disable=SC1091
+source "$ROOT/scripts/e2e-host-timeout.sh"
 
 # Reap leftovers a failed boot may strand (the detached __krun-vmm grandchild
 # and the gvproxy switch can linger and wedge the next iteration's bridge).
@@ -140,9 +163,18 @@ for i in $(seq 1 "$ITER"); do
   if [ -z "$CASES" ]; then
     MINVMD_BOOT_LOG="$LOGDIR/boot-$i.log" "$ROOT/scripts/session-e2e.sh" || iter_ok=0
   else
+    first=1
     for c in $CASES; do
-      reap
-      if ! MINVMD_BOOT_LOG="$LOGDIR/boot-$i-$c.log" "$ROOT/scripts/session-e2e.sh" "$c"; then
+      # The iteration's own reap above already cleared the first case's way.
+      [ "$first" -eq 1 ] || reap
+      first=0
+      rc=0
+      MINVMD_BOOT_LOG="$LOGDIR/boot-$i-$c.log" \
+        e2e_timeout "$CASE_TIMEOUT" "$ROOT/scripts/session-e2e.sh" "$c" || rc=$?
+      if [ "$rc" -eq 124 ]; then
+        iter_ok=0
+        echo "::warning::soak iteration $i: case $c did not finish within ${CASE_TIMEOUT}s and was stopped (boot log: boot-$i-$c.log)"
+      elif [ "$rc" -ne 0 ]; then
         iter_ok=0
         echo "::warning::soak iteration $i: case $c FAILED"
       fi
