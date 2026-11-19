@@ -600,6 +600,10 @@ impl fmt::Display for ProxyAbsence {
 /// Writes the proxy's last error, when there is one, and the step that
 /// starts the proxy again: `minvmd` starts `bep serve` when it starts.
 /// The mint's own refusal writes the same sentences.
+///
+/// # Errors
+///
+/// The error of the formatter `f`.
 pub fn write_restart_step(f: &mut fmt::Formatter<'_>, last_error: Option<&str>) -> fmt::Result {
     match last_error {
         Some(line) => {

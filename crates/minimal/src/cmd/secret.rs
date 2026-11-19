@@ -806,7 +806,7 @@ fn recertify(
             );
             return Ok(());
         }
-        Err(MintError::NotRunning { path, error }) => {
+        Err(MintError::NotRunning { path, error, .. }) => {
             tracing::debug!(path = %path.display(), %error, "no proxy to re-certify its root; bep serve reads the rule when it starts");
             return Ok(());
         }

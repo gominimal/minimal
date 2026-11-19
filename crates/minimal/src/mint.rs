@@ -84,6 +84,76 @@ pub fn control_path() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".minimal/bep/control.sock"))
 }
 
+/// How much of the end of `bep.log` [`last_error_line`] reads.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The longest error line a refusal quotes, in characters.
+const ERROR_LINE_CHARS: usize = 300;
+
+/// The last error line in the proxy's log at `log`, or `None` when the
+/// file is not read or has none. A `tracing` record counts when its level
+/// is `ERROR`, and its text after the level is kept. A line that is no
+/// record is what `bep` printed when it stopped, and counts as an error.
+/// Colour codes are removed, and other control characters are escaped.
+pub(crate) fn last_error_line(log: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(log).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES)))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let line = tail.lines().rev().find_map(|line| {
+        let line = strip_ansi(line);
+        let words: Vec<&str> = line.split_whitespace().take(3).collect();
+        if words.is_empty() {
+            return None;
+        }
+        const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+        match words.iter().find(|word| LEVELS.contains(word)) {
+            Some(&"ERROR") => line
+                .split_once("ERROR")
+                .map(|(_, rest)| rest.trim().to_owned()),
+            Some(_) => None,
+            None => Some(line.trim().to_owned()),
+        }
+    })?;
+    let line: String = line
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .take(ERROR_LINE_CHARS)
+        .collect();
+    (!line.is_empty()).then_some(line)
+}
+
+/// `line` with its ANSI colour sequences (`ESC [ ... letter`) removed.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.clone().next() == Some('[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Why a box's members were not minted, or the box was not registered.
 #[derive(Debug)]
 pub enum MintError {
@@ -104,6 +174,11 @@ pub enum MintError {
         path: PathBuf,
         /// Why.
         error: io::Error,
+        /// The proxy's log file, `bep.log`, when the caller knows it and
+        /// it exists.
+        log: Option<PathBuf>,
+        /// The last error line in that log, when it has one.
+        last_error: Option<String>,
     },
     /// The control socket connection failed during a request.
     Control(io::Error),
@@ -195,6 +270,25 @@ impl fmt::Display for StoreOnlyMintError {
 impl std::error::Error for StoreOnlyMintError {}
 
 impl MintError {
+    /// Gives a [`MintError::NotRunning`] the proxy's log at `log`, when that
+    /// file exists, and its last error line. Other errors are unchanged.
+    #[must_use]
+    pub(crate) fn with_proxy_log(self, log: Option<&Path>) -> Self {
+        match self {
+            Self::NotRunning { path, error, .. } => {
+                let log = log.filter(|log| log.exists());
+                let last_error = log.and_then(last_error_line);
+                Self::NotRunning {
+                    path,
+                    error,
+                    log: log.map(Path::to_owned),
+                    last_error,
+                }
+            }
+            other => other,
+        }
+    }
+
     /// The error's text. `stored` says the box declares store references
     /// only, so the text names no GitHub grant.
     fn write_for(&self, f: &mut fmt::Formatter<'_>, stored: bool) -> fmt::Result {
@@ -226,12 +320,23 @@ impl MintError {
             Self::Identity { error, .. } => {
                 write!(f, "Cannot start the box: it declares {declares}. {error}")
             }
-            Self::NotRunning { path, error } => write!(
-                f,
-                "Cannot start the box: it declares {declares}, and the Box Egress Proxy \
-                 does not answer on {}: {error}.",
-                path.display()
-            ),
+            Self::NotRunning {
+                path,
+                error,
+                log,
+                last_error,
+            } => {
+                write!(
+                    f,
+                    "Cannot start the box: it declares {declares}, and the Box Egress Proxy \
+                     does not answer on {}: {error}.",
+                    path.display()
+                )?;
+                if let Some(log) = log {
+                    write!(f, " The proxy's log is at {}.", log.display())?;
+                }
+                boxes::core::bep::write_restart_step(f, last_error.as_deref())
+            }
             Self::Control(error) => write!(
                 f,
                 "Cannot start the box: the connection to the Box Egress Proxy failed: {error}."
@@ -941,6 +1046,8 @@ impl ControlClient {
         let not_running = |error| MintError::NotRunning {
             path: path.to_owned(),
             error,
+            log: None,
+            last_error: None,
         };
         let stream = UnixStream::connect(path).map_err(not_running)?;
         stream

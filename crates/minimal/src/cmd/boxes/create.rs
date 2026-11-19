@@ -2578,13 +2578,16 @@ fn proxy_stance(network: boxes::NetworkMode) -> Option<bep::boxes::Stance> {
 }
 
 /// Whether a node-local Box Egress Proxy serves boxes on this host: the
-/// proxy published its identity at `identity`, and its control socket is
-/// at `control`. A missing home directory gives neither path.
+/// proxy published its identity at `identity`, and something answers a
+/// connection on its control socket at `control`. A socket file that a
+/// stopped `bep serve` left behind refuses the connection, so it does not
+/// count. A missing home directory gives neither path.
 pub(crate) fn proxy_present(
     identity: Option<&std::path::Path>,
     control: Option<&std::path::Path>,
 ) -> bool {
-    identity.is_some_and(std::path::Path::exists) && control.is_some_and(std::path::Path::exists)
+    identity.is_some_and(std::path::Path::exists)
+        && control.is_some_and(|control| std::os::unix::net::UnixStream::connect(control).is_ok())
 }
 
 /// Why no node-local proxy serves boxes on this host, or `None` when one
@@ -2607,10 +2610,15 @@ pub(crate) fn proxy_absence(
     }
     let absence = match binary {
         // The text names the log only when the host daemon wrote it.
-        Ok(path) if path.exists() => ProxyAbsence::NotAnswering {
-            path,
-            log: log.filter(|log| log.exists()),
-        },
+        Ok(path) if path.exists() => {
+            let log = log.filter(|log| log.exists());
+            let last_error = log.as_deref().and_then(crate::mint::last_error_line);
+            ProxyAbsence::NotAnswering {
+                path,
+                log,
+                last_error,
+            }
+        }
         Ok(path) => ProxyAbsence::NotInstalled { path: Some(path) },
         Err(ProxyLookupError::RelativeEnv(path)) => ProxyAbsence::RelativePath { path },
         Err(ProxyLookupError::NoMinvmd) => ProxyAbsence::NotInstalled { path: None },
@@ -2883,6 +2891,7 @@ fn mint_grants(
     box_id: Option<String>,
     egress: Vec<String>,
     network: boxes::NetworkMode,
+    proxy_log: Option<&std::path::Path>,
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
         ControlClient, GrantBox, HostClientKeyStore, MintError, ProxyRegistration,
@@ -2902,8 +2911,10 @@ fn mint_grants(
         "a GitHub grant"
     };
     // A box with store references only is told about its secrets, not
-    // about a GitHub grant it does not declare.
+    // about a GitHub grant it does not declare. A proxy that does not
+    // answer is named with its log and that log's last error.
     let mint_error = |error: MintError| -> anyhow::Error {
+        let error = error.with_proxy_log(proxy_log);
         if stored {
             StoreOnlyMintError(error).into()
         } else {
@@ -3062,7 +3073,12 @@ fn proxy_egress(
 /// override, which the store mint checks `bep serve` agrees with. No box
 /// exists yet, so a failure only withdraws the row the box's registration
 /// bought (T66). `box_name` is the name that row was registered under. A
-/// box with no `--name` has none on the request (BOX-163).
+/// box with no `--name` has none on the request (BOX-163). `proxy_log` is
+/// the proxy's `bep.log`, which the refusal names when the proxy does not
+/// answer.
+// Each argument is one fact the activation already holds, and a struct
+// for one caller only moves the list.
+#[allow(clippy::too_many_arguments)]
 async fn mint_into_request(
     request: &mut minimald_rpc::CreateSessionRequest,
     box_name: Option<&str>,
@@ -3071,6 +3087,7 @@ async fn mint_into_request(
     store_grants: &[crate::mint::StoreGrant],
     config_dir: Option<std::path::PathBuf>,
     control_sock: Option<std::path::PathBuf>,
+    proxy_log: Option<std::path::PathBuf>,
 ) -> Result<Option<crate::mint::ProxyRegistration>, anyhow::Error> {
     let grants = github_grants.to_vec();
     let stores = store_grants.to_vec();
@@ -3093,6 +3110,7 @@ async fn mint_into_request(
             box_id,
             egress,
             network,
+            proxy_log.as_deref(),
         )
     })
     .await
@@ -4323,6 +4341,7 @@ pub(crate) async fn activate_box(
             &store_grants,
             global.config_dir.clone(),
             control_sock.clone(),
+            proxy_log_path(global.minimal_dir.as_deref()),
         ))
         .await?;
 
@@ -5727,6 +5746,7 @@ mod tests {
             &[],
             None,
             Some(sock_path.clone()),
+            None,
         )
         .await;
         assert!(result.is_err(), "the grant mint fails");
@@ -6946,6 +6966,8 @@ mod tests {
         let not_running = || MintError::NotRunning {
             path: "/home/me/.minimal/bep/control.sock".into(),
             error: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            log: None,
+            last_error: None,
         };
         let store = StoreOnlyMintError(not_running()).to_string();
         assert!(

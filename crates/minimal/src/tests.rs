@@ -6597,6 +6597,113 @@ mod mint_tests {
             .unwrap_or_else(|| panic!("not a refused box spec: {err}"))
     }
 
+    // D3572: a control socket that a stopped `bep serve` left behind is no
+    // proxy. The refusal at creation and the mint at activation both name
+    // bep.log, its last error line, and the restart step.
+    #[test]
+    fn a_stale_control_socket_names_the_proxy_log() {
+        use boxes::core::bep::ProxyAbsence;
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.json");
+        let control = dir.path().join("control.sock");
+        let binary = dir.path().join("bep");
+        let log = dir.path().join("bep.log");
+        std::fs::write(&identity, "{}").unwrap();
+        std::fs::write(&binary, "").unwrap();
+        // A `bep serve` that stopped leaves its socket file, and nothing
+        // answers on it.
+        drop(std::os::unix::net::UnixListener::bind(&control).unwrap());
+        assert!(control.exists());
+        assert!(!crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        std::fs::write(
+            &log,
+            "2026-11-19T10:00:00Z  INFO bep::serve: listening\n\
+             2026-11-19T10:00:01Z \u{1b}[31mERROR\u{1b}[0m bep::serve: the TPM key was not read\n\
+             2026-11-19T10:00:02Z  INFO bep::serve: stopping\n\n",
+        )
+        .unwrap();
+        let reason = "bep::serve: the TPM key was not read";
+
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Ok(binary.clone()),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::NotAnswering {
+                path: binary.clone(),
+                log: Some(log.clone()),
+                last_error: Some(reason.to_owned()),
+            })
+        );
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
+                 Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
+                 serves boxes on this machine. The proxy's log is at {}. The proxy's last \
+                 error is: {reason}. Fix that error, then restart minvmd, which starts the \
+                 proxy again. To create the box without the grant, remove GH_TOKEN from \
+                 [defaults.session.secrets] in minimal.toml.",
+                binary.display(),
+                log.display()
+            )
+        );
+
+        // The mint at activation: the refused connection names the same
+        // log, error line and restart step.
+        let err = ControlClient::connect(&control)
+            .err()
+            .expect("nothing answers on a stale socket")
+            .with_proxy_log(Some(&log));
+        assert!(
+            matches!(
+                &err,
+                MintError::NotRunning { log: Some(named), last_error: Some(line), .. }
+                    if *named == log && line == reason
+            ),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.ends_with(&format!(
+                " The proxy's log is at {}. The proxy's last error is: {reason}. Fix that \
+                 error, then restart minvmd, which starts the proxy again.",
+                log.display()
+            )),
+            "{text}"
+        );
+
+        // A line that is no log record is what `bep` printed as it stopped.
+        std::fs::write(
+            &log,
+            "bep did not start, because it did not find your home directory.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::mint::last_error_line(&log).as_deref(),
+            Some("bep did not start, because it did not find your home directory.")
+        );
+        // With no log file, the text names no log and still gives the
+        // restart step.
+        let text = ControlClient::connect(&control)
+            .err()
+            .unwrap()
+            .with_proxy_log(Some(&dir.path().join("missing.log")))
+            .to_string();
+        assert!(!text.contains("log is at"), "{text}");
+        assert!(
+            text.ends_with(" Restart minvmd, which starts the proxy again."),
+            "{text}"
+        );
+    }
+
     // Gatehouse §6.2: where no node-local proxy exists, a GitHub grant is
     // refused with `gatehouse_unenrolled_node` and exit 5, even with a
     // sign-in held. `github_sign_in_required` is only for a host that has a
@@ -6707,7 +6814,8 @@ mod mint_tests {
             absence,
             Some(ProxyAbsence::NotAnswering {
                 path: binary.clone(),
-                log: None
+                log: None,
+                last_error: None
             })
         );
         let err =
@@ -6719,8 +6827,9 @@ mod mint_tests {
             format!(
                 "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
                  Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
-                 serves boxes on this machine. To create the box without the grant, remove \
-                 GH_TOKEN from [defaults.session.secrets] in minimal.toml.",
+                 serves boxes on this machine. Restart minvmd, which starts the proxy again. \
+                 To create the box without the grant, remove GH_TOKEN from \
+                 [defaults.session.secrets] in minimal.toml.",
                 binary.display()
             )
         );
@@ -6736,7 +6845,8 @@ mod mint_tests {
             absence,
             Some(ProxyAbsence::NotAnswering {
                 path: binary.clone(),
-                log: Some(log.clone())
+                log: Some(log.clone()),
+                last_error: None
             })
         );
         let err =
@@ -6748,8 +6858,9 @@ mod mint_tests {
             format!(
                 "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
                  Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
-                 serves boxes on this machine. The proxy's log is at {}. To create the box \
-                 without the grant, remove GH_TOKEN from [defaults.session.secrets] in minimal.toml.",
+                 serves boxes on this machine. The proxy's log is at {}. Restart minvmd, which \
+                 starts the proxy again. To create the box without the grant, remove GH_TOKEN \
+                 from [defaults.session.secrets] in minimal.toml.",
                 binary.display(),
                 log.display()
             )
@@ -6766,9 +6877,10 @@ mod mint_tests {
             Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
         );
 
-        // With a proxy, no sign-in held is refused with its own error.
+        // With a proxy, no sign-in held is refused with its own error. The
+        // proxy is one that answers on its control socket.
         std::fs::write(&identity, "{}").unwrap();
-        std::fs::write(&control, "").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
         assert!(crate::cmd::proxy_present(Some(&identity), Some(&control)));
         assert_eq!(
             crate::cmd::proxy_absence(Some(&identity), Some(&control), Ok(binary), Some(log)),
