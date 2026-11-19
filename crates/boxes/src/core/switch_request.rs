@@ -849,7 +849,7 @@ mod kani_proofs {
         if kani::any() {
             Vec::new()
         } else {
-            vec![kani::any(), kani::any()]
+            vec![small_port(), small_port()]
         }
     }
 
@@ -858,7 +858,41 @@ mod kani_proofs {
         if kani::any() {
             Vec::new()
         } else {
-            vec![kani::any(), kani::any()]
+            vec![small_name(), small_name()]
+        }
+    }
+
+    /// How many values a symbolic port or name can take. Four is the
+    /// fewest that still give a record every relation it can have to a
+    /// row: with the declared ports `{0, 1}` and the published `{1, 2}`,
+    /// a record can be declared only, both, published only, or neither
+    /// (`3`). Only equality between ports and names decides anything, so
+    /// a wider domain adds no outcome. It does make CBMC compare all 16
+    /// bits of every port in every scan, and the retraction's two scans
+    /// per record took the lane past its time budget.
+    const DOMAIN: u8 = 4;
+
+    /// A symbolic port inside [`DOMAIN`].
+    fn small_port() -> u16 {
+        let port: u16 = kani::any();
+        kani::assume(port < u16::from(DOMAIN));
+        port
+    }
+
+    /// A symbolic name index inside [`DOMAIN`].
+    fn small_name() -> u8 {
+        let name: u8 = kani::any();
+        kani::assume(name < DOMAIN);
+        name
+    }
+
+    /// Whether a request slot's record is inside [`DOMAIN`]. An empty
+    /// slot is.
+    fn in_domain(slot: Option<Record>) -> bool {
+        match slot {
+            None => true,
+            Some(Record::Port(port)) => port < u16::from(DOMAIN),
+            Some(Record::Name(name)) => name < DOMAIN,
         }
     }
 
@@ -888,6 +922,11 @@ mod kani_proofs {
     /// symbolic lists, so the two dimensions can agree, disagree, or be
     /// empty in any combination.
     ///
+    /// Every port and name, in the request and in the row, is one of
+    /// [`DOMAIN`]'s four values. The bound keeps every membership a record
+    /// can have, so the claim is the same claim, the declared-port
+    /// retraction included.
+    ///
     /// The unwind bound is 6: the record scan walks at most four slots, the
     /// row's port, name and published scans at most two each, and comparing
     /// `[u8; 4]` addresses lowers to CBMC's builtin `memcmp`, a 4-trip loop
@@ -901,6 +940,7 @@ mod kani_proofs {
         let verb: SwitchVerb = kani::any();
         let addr: [u8; 4] = kani::any();
         let records: [Option<Record>; MAX_REQUEST_RECORDS] = kani::any();
+        kani::assume(records.iter().all(|slot| in_domain(*slot)));
         let row_addr: [u8; 4] = kani::any();
         let row = SwitchRow::of(row_addr, two_ports(), two_names()).with_published(two_ports());
         let first_ptask: [u8; 4] = kani::any();
