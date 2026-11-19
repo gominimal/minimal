@@ -761,9 +761,11 @@ pub struct BoxActor {
 
     /// Whether the last [`Self::host_row_lost`] read found the binding
     /// launch's host gone and the VM host daemon's row still standing, so
-    /// the launch that follows rejoins that row. The next attach or exec
-    /// launch takes it and marks its host as holding the row; a hook launch,
-    /// which reads nothing first, drops it.
+    /// the launch that follows rejoins that row. A task run that replaces a
+    /// hook shell sets it too, when the VM host daemon confirms the row
+    /// stands before the shell ends (#3077). The next attach or exec launch
+    /// takes it and marks its host as holding the row; a hook launch, which
+    /// reads nothing first, drops it.
     relaunch_row_confirmed: bool,
 
     /// The spec stored beside this box's record (BOX-068), as the first
@@ -1987,7 +1989,15 @@ impl BoxActor {
             }
             self.restart_launch(session_hnd, conn_username)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    // The restart's own refusal prints bare, without the
+                    // spawn-failure prefix.
+                    if host::RestartBehindHookShell::is(&error) {
+                        host::RESTART_BEHIND_HOOK_SHELL.to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })
         }
         .await;
         if let Err(why) = launched {
