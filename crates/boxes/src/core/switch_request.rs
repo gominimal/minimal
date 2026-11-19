@@ -839,12 +839,37 @@ mod kani_proofs {
         SwitchVerb, applied,
     };
 
-    /// A row's declared ports: none, or two symbolic ports — two being what
-    /// catches a scan that reads only one element or stops one short of the
-    /// end, the same shape the frame verdict's harness pins its lists at.
-    /// The publish dimension has no absent-and-allow-all arm: a row admits
-    /// exactly the ports its enumeration holds, so `None`-shaped lists have
-    /// no meaning to model.
+    /// How many values a symbolic port or name can take. Only equality
+    /// between ports and names decides anything, and each row list below is
+    /// symbolic, so two values already give a record every relation it can
+    /// have to a row: in a list or not, in one list and not the other. A
+    /// wider domain adds no outcome, and it makes CBMC compare more bits in
+    /// every scan.
+    const DOMAIN: u8 = 2;
+
+    /// How many request slots the harnesses fill. Two catch a scan that
+    /// reads only the first record or stops one short. The other slots are
+    /// empty, and the unit tests pin the wide requests.
+    const RECORDS: usize = 2;
+
+    /// A symbolic port inside [`DOMAIN`].
+    fn small_port() -> u16 {
+        let port: u16 = kani::any();
+        kani::assume(port < u16::from(DOMAIN));
+        port
+    }
+
+    /// A symbolic name index inside [`DOMAIN`].
+    fn small_name() -> u8 {
+        let name: u8 = kani::any();
+        kani::assume(name < DOMAIN);
+        name
+    }
+
+    /// A row's ports: none, or two symbolic ports. Two catch a scan that
+    /// reads only one element or stops one short of the end. The publish
+    /// dimension has no absent-and-allow-all arm: a row admits exactly the
+    /// ports its enumeration holds.
     fn two_ports() -> Vec<u16> {
         if kani::any() {
             Vec::new()
@@ -862,131 +887,127 @@ mod kani_proofs {
         }
     }
 
-    /// How many values a symbolic port or name can take. Four is the
-    /// fewest that still give a record every relation it can have to a
-    /// row: with the declared ports `{0, 1}` and the published `{1, 2}`,
-    /// a record can be declared only, both, published only, or neither
-    /// (`3`). Only equality between ports and names decides anything, so
-    /// a wider domain adds no outcome. It does make CBMC compare all 16
-    /// bits of every port in every scan, and the retraction's two scans
-    /// per record took the lane past its time budget.
-    const DOMAIN: u8 = 4;
-
-    /// A symbolic port inside [`DOMAIN`].
-    fn small_port() -> u16 {
-        let port: u16 = kani::any();
-        kani::assume(port < u16::from(DOMAIN));
-        port
-    }
-
-    /// A symbolic name index inside [`DOMAIN`].
-    fn small_name() -> u8 {
-        let name: u8 = kani::any();
-        kani::assume(name < DOMAIN);
-        name
-    }
-
-    /// Whether a request slot's record is inside [`DOMAIN`]. An empty
-    /// slot is.
-    fn in_domain(slot: Option<Record>) -> bool {
-        match slot {
-            None => true,
-            Some(Record::Port(port)) => port < u16::from(DOMAIN),
-            Some(Record::Name(name)) => name < DOMAIN,
+    /// A symbolic record inside [`DOMAIN`], or an empty slot.
+    fn small_slot() -> Option<Record> {
+        let empty: bool = kani::any();
+        let port: bool = kani::any();
+        match (empty, port) {
+            (true, _) => None,
+            (false, true) => Some(Record::Port(small_port())),
+            (false, false) => Some(Record::Name(small_name())),
         }
     }
 
-    /// A request is applied exactly when the table admits it: stated as an
-    /// iff so neither arm can silently become unreachable (the rcache
-    /// harness pattern). The admitting half is restated over the same
-    /// request and table, per address and for every verb alike — the row at
-    /// the request's own address first, then the records it admits — so a
-    /// decision that keys a retraction by some other row's address, or
-    /// table-wide by *any* row that happens to hold its records, or that
-    /// checks in a different order, or that reads an empty row dimension as
-    /// allow-all, fails here. What "admits" means is the verb's: a publish
-    /// is admitted by the row's declaration, a retraction by the row's
-    /// declared ports and its runtime-published set — so a decision that
-    /// refuses a box's withdrawal of its own declared forward at its stop
-    /// (NET-121), one that refuses a listen-published port's teardown, or
-    /// one that retracts a name, fails here. The interim's arm carries the
-    /// nothing-holds bound: a request at a held address whose row refuses a
-    /// record must not be read as the interim's to apply.
-    ///
-    /// The table is one fully symbolic row beside symbolic plan bounds. One
-    /// row is what the per-address decision needs — a retraction keyed by
-    /// the row's address is admitted, one keyed by any other address is the
-    /// phase's or refused — and a second adds no failure shape while it
-    /// multiplies CBMC's search; the multi-row shapes are the unit test's.
-    /// The row's declared and runtime-published ports are independent
-    /// symbolic lists, so the two dimensions can agree, disagree, or be
-    /// empty in any combination.
-    ///
-    /// Every port and name, in the request and in the row, is one of
-    /// [`DOMAIN`]'s four values. The bound keeps every membership a record
-    /// can have, so the claim is the same claim, the declared-port
-    /// retraction included.
-    ///
-    /// The unwind bound is 6: the record scan walks at most four slots, the
-    /// row's port, name and published scans at most two each, and comparing
-    /// `[u8; 4]` addresses lowers to CBMC's builtin `memcmp`, a 4-trip loop
-    /// — so a bound of 4 fails an unwinding assertion even though every
-    /// loop the harness itself writes has exited by its fourth check. The
-    /// bound has to clear every trip the compiler generates, not only the
-    /// ones the source shows.
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn kani_switch_request_applied_iff_table_admits() {
-        let verb: SwitchVerb = kani::any();
-        let addr: [u8; 4] = kani::any();
-        let records: [Option<Record>; MAX_REQUEST_RECORDS] = kani::any();
-        kani::assume(records.iter().all(|slot| in_domain(*slot)));
-        let row_addr: [u8; 4] = kani::any();
-        let row = SwitchRow::of(row_addr, two_ports(), two_names()).with_published(two_ports());
-        let first_ptask: [u8; 4] = kani::any();
-        let last_ptask: [u8; 4] = kani::any();
-        let table = SwitchTable::of(vec![row], first_ptask, last_ptask);
-        // The phase the build ships is a constant, but the decision reads
-        // both its arms — the harness pins the cutover over both, derived
-        // from one symbolic bit.
-        let phase = if kani::any() {
+    /// A request slot array with the first [`RECORDS`] slots symbolic and
+    /// the rest empty.
+    fn small_records() -> [Option<Record>; MAX_REQUEST_RECORDS] {
+        let mut records = [None; MAX_REQUEST_RECORDS];
+        for slot in records.iter_mut().take(RECORDS) {
+            *slot = small_slot();
+        }
+        records
+    }
+
+    /// The phase the build ships is a constant, but the decision reads both
+    /// its arms. The harnesses pin the cutover over both, from one symbolic
+    /// bit.
+    fn any_phase() -> EgressDefaultPhase {
+        if kani::any() {
             EgressDefaultPhase::Announced
         } else {
             EgressDefaultPhase::InForce
+        }
+    }
+
+    /// The decision's outcome against the restated admission, for one
+    /// request and a one-row table. `admits` is the verb's own reading of
+    /// the row. The interim is the phase's decision over an address no row
+    /// holds, never a second chance past the row that does: a held address
+    /// whose row refuses a record is refused under either phase.
+    fn assert_applied_iff_admits(
+        request: &SwitchRequest,
+        table: &SwitchTable,
+        phase: EgressDefaultPhase,
+        admits: impl Fn(&SwitchRow, Record) -> bool,
+    ) {
+        let applied_ok = applied(request, table, phase).is_ok();
+        let declared = table
+            .row_at(request.switch_addr())
+            .is_some_and(|row| request.records().all(|record| admits(row, record)));
+        let interim = phase == EgressDefaultPhase::Announced
+            && table.row_at(request.switch_addr()).is_none()
+            && table.in_plan(request.switch_addr());
+        assert_eq!(applied_ok, declared || interim);
+    }
+
+    /// A publish is applied exactly when the table admits it: stated as an
+    /// iff so neither arm can silently become unreachable (the rcache
+    /// harness pattern). The admission is restated per address: the row at
+    /// the request's own address first, then the records its declaration
+    /// holds. So a decision that keys a publish by some other row's address,
+    /// or table-wide by any row that holds its records, or that reads an
+    /// empty row dimension as allow-all, fails here.
+    ///
+    /// The table is one symbolic row beside symbolic plan bounds. One row is
+    /// what the per-address decision needs, and the multi-row shapes are the
+    /// unit test's. The row has declared ports and names and no runtime
+    /// publications: a publish never reads them. The retraction is
+    /// [`kani_switch_request_retract_iff_row_withdraws`]'s, so neither
+    /// harness models both paths.
+    ///
+    /// The unwind bound is 5: the record scan walks at most four slots, the
+    /// row's scans at most two elements, and comparing `[u8; 4]` addresses
+    /// lowers to CBMC's builtin `memcmp`, a 4-trip loop. The bound clears
+    /// every trip the compiler generates, not only the ones the source
+    /// shows.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn kani_switch_request_applied_iff_table_admits() {
+        let verb = if kani::any() {
+            SwitchVerb::Publish
+        } else {
+            SwitchVerb::PublishName
         };
+        let row_addr: [u8; 4] = kani::any();
+        let row = SwitchRow::of(row_addr, two_ports(), two_names());
+        let table = SwitchTable::of(vec![row], kani::any(), kani::any());
         let request = SwitchRequest {
             verb,
-            switch_addr: addr,
-            records,
+            switch_addr: kani::any(),
+            records: small_records(),
         };
+        assert_applied_iff_admits(&request, &table, any_phase(), SwitchRow::holds);
+    }
 
-        let outcome = applied(&request, &table, phase);
-        let applied_ok = outcome.is_ok();
-
-        // The same row, at the request's own address, for every verb: a
-        // publish and a retraction are admitted by the row that holds the
-        // address they carry, and by no other — a publish by what the row
-        // declares, a retraction by the ports it declares or its runtime
-        // published.
-        // The retract arm reads the row through `withdraws`, as the publish
-        // arm reads it through `holds`: the restatement shares the row's
-        // own scans with the decision, so CBMC proves the routing and the
-        // order of checks, not two encodings of one scan equal. A field
-        // restatement here ran the CI lane past its limit. What
-        // `withdraws` admits is the unit test's to pin.
-        let admits = |row: &SwitchRow, record: Record| match verb {
-            SwitchVerb::Publish | SwitchVerb::PublishName => row.holds(record),
-            SwitchVerb::Retract => row.withdraws(record),
+    /// A retraction is applied exactly when the row at its own address
+    /// withdraws every record it names: a port the row declares, whose
+    /// forward the box releases at its stop (NET-121), or a port its
+    /// runtime published. So a decision that refuses a box's withdrawal of
+    /// its own declared port, one that refuses a listen-published port's
+    /// teardown, one that retracts a name, or one that keys a retraction by
+    /// another row's address, fails here.
+    ///
+    /// The restatement reads the row through `withdraws`, as the decision
+    /// does. CBMC proves the routing and the order of checks, and the unit
+    /// test pins what `withdraws` admits. The row has no declared names: a
+    /// retraction never reads them, and a name record is refused whatever
+    /// the row declares. The declared and runtime-published ports are
+    /// independent symbolic lists, so they can agree, disagree, or be empty
+    /// in any combination.
+    ///
+    /// The unwind bound is 5, for the same loops as
+    /// [`kani_switch_request_applied_iff_table_admits`].
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn kani_switch_request_retract_iff_row_withdraws() {
+        let row_addr: [u8; 4] = kani::any();
+        let row = SwitchRow::of(row_addr, two_ports(), Vec::new()).with_published(two_ports());
+        let table = SwitchTable::of(vec![row], kani::any(), kani::any());
+        let request = SwitchRequest {
+            verb: SwitchVerb::Retract,
+            switch_addr: kani::any(),
+            records: small_records(),
         };
-        let declared = table
-            .row_at(addr)
-            .is_some_and(|row| request.records().all(|record| admits(row, record)));
-        // The interim is the phase's decision over an address no row holds,
-        // never a second chance past the row that does: a held address whose
-        // declaration refuses a record is refused under either phase.
-        let interim = phase == EgressDefaultPhase::Announced
-            && table.row_at(addr).is_none()
-            && table.in_plan(addr);
-        assert_eq!(applied_ok, declared || interim);
+        assert_applied_iff_admits(&request, &table, any_phase(), SwitchRow::withdraws);
     }
 }
