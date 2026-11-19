@@ -785,11 +785,12 @@ pub async fn resume_box_row_after_row_ended(
 /// host that is not VM-backed, a record that names no box row, a row that
 /// stands, and an answer that says neither, which the caller reads as the
 /// shell's own status. Bounded by [`BOX_CONTROL_TIMEOUT`]; a read that
-/// does not finish in time is `false` too.
+/// does not finish in time, or that cannot reach the VM host daemon, is
+/// `false` too.
 ///
 /// # Errors
 ///
-/// [`HostUnreachable`] when the VM host daemon cannot be reached.
+/// When the blocking row read cannot run.
 pub async fn box_row_withdrawn(
     sock: &Path,
     record: Option<&boxes::Record>,
@@ -811,7 +812,16 @@ pub async fn box_row_withdrawn(
     )
     .await;
     match read {
-        Ok(Ok(stands)) => Ok(stands? == Some(false)),
+        Ok(Ok(Ok(stands))) => Ok(stands == Some(false)),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(
+                box = %name,
+                error = %format!("{error:#}"),
+                "the row read did not reach the VM host daemon; \
+                 the attach's exit status passes through unchecked"
+            );
+            Ok(false)
+        }
         Ok(Err(join)) => Err(anyhow::Error::new(join).context("the box row read did not run")),
         Err(_) => {
             tracing::warn!(
@@ -1889,6 +1899,22 @@ mod tests {
             .await
             .unwrap(),
             "a native host has no row to read"
+        );
+    }
+
+    /// NET-138: a row read that cannot reach the VM host daemon says
+    /// neither, so the row-ended status passes through as the shell's own.
+    #[tokio::test]
+    async fn box_row_withdrawn_reads_an_unreachable_host_as_the_shells_status() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // The socket file stays, but nothing listens on it.
+        drop(silent_vm_host(&dir));
+        let mut record = own_ip_record(PAIR);
+        record.box_id = Some(minimald_rpc::BoxId::from_bytes([5; 16]));
+        assert!(
+            !box_row_withdrawn(&dir.path().join(paths::SSH_SOCK_FILE), Some(&record))
+                .await
+                .expect("an unreachable host is the shell's own status, not an error"),
         );
     }
 
