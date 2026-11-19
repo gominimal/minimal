@@ -1718,8 +1718,8 @@ echo "warm 'min ls': $((t1 - t0))ms"
 }
 
 # ---------------------------------------------------------------------------
-# Non-interactive exec proof: `min box exec <sid> '<cmd>'` runs the
-# command in the session's namespaces and relays its stdout and exit code. The
+# Non-interactive exec proof: `min box exec <sid> -- <argv>` runs the argv,
+# with no shell, in the session's namespaces and relays its stdout and exit code. The
 # daemon services this by re-execing ITSELF as the nsenter shim, which is a
 # different path from the interactive attach below and the one that broke in
 # #1175 (in the VM, pid-1's `current_exe()` is the unreachable initramfs
@@ -1768,8 +1768,10 @@ fi
 # session. The daemon used to claim every string starting with `min ` and refuse
 # what it did not recognise, which made the session's own `min` unreachable
 # through exec; only the `min://` scheme addresses the daemon now.
+# The argv itself starts with `min`, so the box receives the lookalike: a
+# `bash -c` wrapper hands it `bash` and makes this check prove nothing.
 lookalike_err="$WORK/exec-lookalike.err"
-mnl box exec "$sid" -- bash -c 'min --version' >"$WORK/exec-lookalike.out" 2>"$lookalike_err"
+mnl box exec "$sid" -- min --version >"$WORK/exec-lookalike.out" 2>"$lookalike_err"
 if grep -q "unsupported command" "$lookalike_err"; then
   echo "::error::the daemon hijacked a session command instead of routing it"
   echo "--- stderr ---"; cat "$lookalike_err"
@@ -2280,6 +2282,13 @@ attach_end_wait() {
 }
 
 proof_attach_ends_on_stop_and_restart() {
+# The proof starts a box from the project that this script seeds. A
+# project that E2E_PROJECT_DIR names and that brings its own minimal.toml
+# can declare entries that the start cannot pick, so skip it there.
+if [ -z "$SEED_DIR" ] && [ -z "$SEEDED_MFILE" ]; then
+  echo "::notice::attach-end proof skipped: $PROJECT_DIR has its own minimal.toml, and this proof runs only in a project that the script seeds"
+  return 0
+fi
 echo "::group::attach-end proof (min box stop ends an attach)"
 ae_name="e2e-attach-end"
 # shellcheck disable=SC2086
@@ -7111,7 +7120,12 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   #
   # A running box is not removed without --force: `min box rm` refuses it
   # headless and names the flag, so a script cannot remove a live box by
-  # accident.
+  # accident (BCLI-004).
+  #
+  # Changed assertion: this step used to write into the box and assert that a
+  # headless remove without --force refused a box with changed files. `min box
+  # rm` has no gate for changed files yet. T63 (gominimal/minimal#3638) adds
+  # that gate and moves this step back to it.
   sr_sid="$(cd "$TASK_SEED_DIR" && mnl session start --detach --no-input \
     --name e2e-task-sr 2>"$WORK/session-rm-start.err")" || {
     echo "::error::'min session start' for the box rm refusal step failed"
@@ -7222,15 +7236,13 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
 fi
 }
 
-# A task run against an EXISTING session inherits that session's network
-# MODE (exec.rs task_network): a task in an own-IP session gets an own-IP
-# namespace of its own beside the session's box — its loopback is its own,
-# not the host's — while its egress still works through the switch; a task
-# in a none session has no network at all. Each refusal leg asserts curl's
-# exit code, so a task that fails for another reason (curl missing, the task
-# never starting) cannot pass for a refused connection. A host_ip control
-# task reaches the same host listener, so the own-IP refusal is shown to
-# depend on the mode. The same loopback task then runs with no session, as
+# A task box's network mode. The legs that ran a task inside a running
+# session (an own-IP one and a none one) are gone until
+# gominimal/minimal#3216 brings back a box verb for them. An own-IP box
+# checks that egress works through the switch. Each refusal leg asserts
+# curl's exit code, so a task that fails for another reason (curl missing,
+# the task never starting) cannot pass for a refused connection. The
+# loopback task runs with no session, as
 # `min task run --network own_ip` and `--network host_ip` (NET-060): the
 # own-IP box cannot reach the host listener, whose port no [host-exposures]
 # entry opens, and the host_ip box can. Then the task box's egress rules:
@@ -7241,7 +7253,8 @@ fi
 # native-only: on a VM lane a task self-allocates a switch address the
 # host-side table holds no row for, so the egress gate drops its traffic
 # (NET-085, until NET-138 registers every box), and the listener is on the
-# CI host while every task runs in the guest. The none leg runs on every lane. Own seeded project (the
+# CI host while every task runs in the guest. So a VM lane asserts nothing
+# here: it prints the known_gap line and no OK line. Own seeded project (the
 # shared seed declares no tasks), switch-gated like the own-IP proofs above
 # (a task in an own-IP session needs the tap the switch carries):
 # MINVMD_GVPROXY_BIN on a VM lane, E2E_NATIVE_SWITCH on the native one.
@@ -7516,9 +7529,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     tn_taskrun_egress="task-run egress skipped as weather"
     [ -n "$tn_egress_proven" ] && tn_taskrun_egress="a task run takes its entry's own_ip mode and allow_dns_hosts, and an own_ip task run with no rules gets the deny-all default"
     echo "task network proof OK (own-IP box: egress via the switch; 'min task run --network own_ip': host loopback unreachable; $tn_taskrun_egress; host_ip task run: host loopback reachable; the in-session task legs wait on gominimal/minimal#3216)"
-  else
-    echo "task network proof OK (own-IP and host_ip legs known_gap on this VM lane; the in-session task legs wait on gominimal/minimal#3216)"
   fi
+  # On a VM lane no leg asserted anything, so the known_gap line above is the
+  # whole report and the proof prints no OK line there.
   echo "::endgroup::"
   fi
 fi
