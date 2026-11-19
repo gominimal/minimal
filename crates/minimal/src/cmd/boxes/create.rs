@@ -5940,6 +5940,68 @@ mod tests {
         assert!(ensure_registered_id(Some(&registration(false, Some(minted))), other).is_ok());
     }
 
+    /// A `min create` of a `host_ip` grant box that dies between its
+    /// registration and its box's admission drops its lease uncommitted.
+    /// The VM host daemon then withdraws the name at once, so a new create
+    /// of the same name registers with a fresh id and gets no held-name
+    /// refusal.
+    #[tokio::test]
+    async fn host_ip_grant_box_on_vm_host_frees_its_name_when_the_lease_drops() {
+        use minimal_client::box_registration::register_box_for_activation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("host-ip-lease-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let grant_policy = boxes::BoxPolicy {
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            ..boxes::BoxPolicy::default()
+        };
+        let register = || {
+            register_box_for_activation(
+                paths::HostKind::Minvmd,
+                Some(dir.path()),
+                boxes::NetworkMode::HostNet,
+                "agent",
+                &grant_policy,
+            )
+        };
+
+        let killed = register()
+            .await
+            .expect("the control server answers the registration")
+            .expect("a host_ip grant box on a VM host registers");
+        let killed_id = killed.box_id.expect("the host minted an id");
+        assert!(killed.lease.is_some(), "the registration holds a lease");
+        // The create dies before the admit: its registration, lease and
+        // all, is dropped uncommitted.
+        drop(killed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.host_ip_id_for("agent").is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lease's close withdraws the name"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let again = register()
+            .await
+            .expect("a new create of the name is not refused")
+            .expect("a host_ip grant box on a VM host registers");
+        let again_id = again.box_id.expect("the host minted an id");
+        assert_ne!(again_id, killed_id, "the new create gets a fresh id");
+        assert_eq!(registry.host_ip_id_for("agent"), Some(again_id.to_bytes()));
+    }
+
     /// BEP-082: a GitHub grant box with `--network host_ip` on a VM host
     /// registers for a box id, with no address and no row in the host's
     /// address table. With that id the proxy serves it, so the grant check
@@ -5979,7 +6041,10 @@ mod tests {
         .expect("a host_ip grant box on a VM host registers");
         assert!(registered.host_ip);
         assert_eq!(registered.row_addresses(), None, "the box has no row");
-        assert!(registered.lease.is_none(), "no row, so no lease to hold");
+        assert!(
+            registered.lease.is_some(),
+            "the registration's connection is the name's lease"
+        );
         let id = registered.box_id.expect("the host minted an id");
         assert!(registry.holds_host_ip_id(id.to_bytes()));
         assert!(
