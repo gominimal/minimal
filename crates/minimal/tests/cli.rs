@@ -5337,7 +5337,11 @@ async fn an_unknown_min_provider_spares_commands_that_need_no_provider() {
                    local-minvmd, or unset it.";
     // The refusal comes before the command runs, so `finalize-install`
     // never reaches its root step here.
-    for args in [&["ls"][..], &["finalize-install"]] {
+    for args in [
+        &["ls"][..],
+        &["finalize-install"],
+        &["finalize-install", "--show"],
+    ] {
         let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
         let refused = min(&args).output().await.unwrap();
         assert!(!refused.status.success(), "{args:?}: {refused:?}");
