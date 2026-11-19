@@ -81,10 +81,10 @@
 #   box_exec                         `min box exec`: plain with its exit code,
 #                                    -t on a pty and off one, --detach,
 #                                    --timeout 124, a stopped box refused
-#   attach_ends_on_stop_and_restart  `min box stop` and `min box restart` end
-#                                    an attach with exit 254 and a line that
-#                                    names the cause, never the shell-exit
-#                                    prompt (#3526, #3547)
+#   attach_ends_on_stop_and_restart  `min box stop` ends an attach with exit
+#                                    254 and a line that names the stop, never
+#                                    the shell-exit prompt (#3526). T62
+#                                    (#3635) adds the restart step.
 #   session_rename                   `min box rename`; rename-to-self refused
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
@@ -667,12 +667,6 @@ if [ -n "$SEED_DIR" ] || { [ ! -e "$PROJECT_DIR/minimal.toml" ] && [ ! -e "$PROJ
       grab                       { print }
     ' "$ROOT/.minimal/minimal.toml"
     printf '\n[stack]\nuse = "shell"\n'
-    # The attach-end proof restarts its box, and min box restart restarts
-    # only a box whose spec sets lifetime = "until_stopped". A declared
-    # session entry replaces the implicit default, and a start that names
-    # no entry picks the only declared one. So the empty [sessions.default]
-    # keeps every other start in this script on the default entry.
-    printf '\n[sessions.default]\n\n[sessions.attach-end]\nlifetime = "until_stopped"\n'
   } > "$PROJECT_DIR/minimal.toml"
   # The upstream MUST be pinned — `min session start` uploads this and the graph
   # loader rejects an unpinned upstream.
@@ -2237,14 +2231,13 @@ echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
-# Attach-end proof: a stop and a restart from another terminal end an attach
-# (T57, gominimal/minimal#3526, and T58, gominimal/minimal#3547; BCLI-068).
-# The attach runs over a real pty, with a shell that sleeps, so only the stop
-# or the restart can end it. Each one ends the attach with exit 254 and one
-# line that names the cause. The shell-exit prompt never shows: the box did
-# not end by its shell.
+# Attach-end proof: a stop from another terminal ends an attach (T57,
+# gominimal/minimal#3526; BCLI-068). The attach runs over a real pty, with a
+# shell that sleeps, so only the stop can end it. The stop ends the attach
+# with exit 254 and one line that names the stop. The shell-exit prompt never
+# shows: the box did not end by its shell.
 #
-# $1: the step (stop or restart). $2: the box name. Starts the attach in the
+# $1: the step (stop). $2: the box name. Starts the attach in the
 # background, waits until its shell runs, and sets AE_PID to the driver's pid.
 attach_end_start() {
   local ae_live=""
@@ -2287,54 +2280,17 @@ attach_end_wait() {
 }
 
 proof_attach_ends_on_stop_and_restart() {
-echo "::group::attach-end proof (min box stop and min box restart end an attach)"
+echo "::group::attach-end proof (min box stop ends an attach)"
 ae_name="e2e-attach-end"
-# min box restart restarts only a box whose spec sets
-# lifetime = "until_stopped" (BCLI-074). The project's default entry sets
-# none, so this proof starts the seed's attach-end entry, which sets it.
 # shellcheck disable=SC2086
-out="$(cd "$PROJECT_DIR" && mnl session start attach-end --detach --name "$ae_name" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/ae-start.err")" || {
-  echo "::error::'min session start attach-end --detach --name $ae_name' failed for the attach-end proof"
+out="$(cd "$PROJECT_DIR" && mnl session start --detach --name "$ae_name" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/ae-start.err")" || {
+  echo "::error::'min session start --detach --name $ae_name' failed for the attach-end proof"
   echo "--- stderr ---"; cat "$WORK/ae-start.err" 2>/dev/null || true
   fail
 }
 ae_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
 
-# T58: a restart ends the attach with a line that names the restart. The
-# attach reads the box after it ends. When that read lands between the
-# restart's stop and its start, the line says the box was stopped. That
-# is the code's answer for that order, so the step tries again. It fails
-# when no try shows the restart line, so a restart that always says
-# stopped does not pass.
-ae_restarted=""
-for ae_try in 1 2 3; do
-  # A restart can keep /home, so clear the last try's marker first.
-  mnl box exec "$ae_name" -- rm -f /home/ae-restart-live </dev/null >/dev/null 2>&1 || true
-  attach_end_start restart "$ae_name"
-  mnl box restart "$ae_name" </dev/null >"$WORK/ae-restart-cmd.out" 2>&1 || {
-    echo "::error::'min box restart $ae_name' failed while a terminal was attached"
-    cat "$WORK/ae-restart-cmd.out" 2>/dev/null || true
-    kill "$AE_PID" 2>/dev/null || true
-    fail
-  }
-  attach_end_wait restart "$ae_name"
-  if grep -qF "Detached: $ae_name was restarted. Run min box attach $ae_name to attach again." "$WORK/ae-restart.out"; then
-    echo "restart while attached: exit 254, and the line names the restart (try $ae_try)"
-    ae_restarted=1
-    break
-  elif grep -qF "Detached: $ae_name was stopped." "$WORK/ae-restart.out"; then
-    echo "::warning::try $ae_try: the attach read $ae_name between the restart's stop and its start, so its line says stopped; trying again"
-  else
-    echo "::error::the attach that the restart ended printed no line that names the restart"
-    echo "--- transcript ---"; cat "$WORK/ae-restart.out" 2>/dev/null || true
-    fail
-  fi
-done
-if [ -z "$ae_restarted" ]; then
-  echo "::error::in $ae_try tries, the attach that the restart ended never printed the line that names the restart"
-  echo "--- transcript ---"; cat "$WORK/ae-restart.out" 2>/dev/null || true
-  fail
-fi
+# T62 (gominimal/minimal#3635) adds the restart-while-attached step.
 
 # T57: a stop ends the attach with exit 254 and one line that names the stop.
 attach_end_start stop "$ae_name"
