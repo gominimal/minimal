@@ -16209,6 +16209,43 @@ async fn resume_restarts_from_stored_spec_same_id_and_name() {
     assert_eq!(events[resumed].data["from"], "stopped");
 }
 
+/// BOX-025: a box whose stored spec carries a schema key that the typed
+/// spec does not read, such as `io.exec_enabled` or
+/// `network.vpn_network_names`, resumes. It does not stay stopped on an
+/// unknown field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_reads_stored_spec_with_exec_enabled_and_vpn_names() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resume-kept-keys"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let mut spec = resume_spec(true);
+    spec["io"]["exec_enabled"] = serde_json_lenient::json!(false);
+    spec["network"]["vpn_network_names"] = serde_json_lenient::json!(["corp"]);
+    rewrite_spec(&server, id, &spec).await;
+    let stored = std::fs::read(record_dir(&server, id).await.join("spec.json")).unwrap();
+    let read = crate::box_runtime::stored_spec(&stored).expect("the daemon reads the stored spec");
+    assert!(read.kept_keys.contains_key("io.exec_enabled"));
+    assert!(read.kept_keys.contains_key("network.vpn_network_names"));
+
+    stop_through_daemon(&server, id).await;
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach to a stopped box with these keys resumes it");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
 /// BOX-025: a resume whose launch fails writes back the record it read,
 /// byte for byte, and records no `resumed` event, so the box never reads
 /// as running with no processes and keeps the settings it had. The next
